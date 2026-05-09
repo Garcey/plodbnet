@@ -229,6 +229,13 @@ def main() -> None:
     parser.add_argument("--num-layers", type=int, default=4)
     parser.add_argument("--num-envs", type=int, default=1536)
     parser.add_argument("--rollout-length", type=int, default=262_144)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=256,
+        help="PPO minibatch size. Default 256 matches TrainingConfig.batch_size.",
+    )
+    parser.add_argument("--ppo-epochs", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--snapshot-every", type=int, default=50)
     parser.add_argument(
@@ -436,6 +443,8 @@ def main() -> None:
         num_layers=args.num_layers,
         num_envs=args.num_envs,
         rollout_length=args.rollout_length,
+        batch_size=args.batch_size,
+        ppo_epochs=args.ppo_epochs,
         seed=args.seed,
         snapshot_every=args.snapshot_every,
         ev_runout_samples=args.ev_runout_samples,
