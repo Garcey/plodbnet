@@ -1,0 +1,114 @@
+{
+  "_doc": [
+    "Hand-labeled ground truth for Phase-1 OCR tests.",
+    "chip values use integer cents (1 chip = 1 cent) since ClubGG stacks are in USD.",
+    "fixtures cover frames already opened in-context by Claude while planning.",
+    "more fixtures should be added by the user via plo5bp.ocr.tools.label_cards",
+    "and by hand-editing this file -- do not pull more than 25 frames/batch into Claude.",
+    "SEAT NUMBERING (post-Option-B, 2026-04-24): seat 0=bottom-center (hero),",
+    "1=bottom-left, 2=top-left, 3=top-center, 4=top-right, 5=bottom-right.",
+    "Increasing seat index = physical-clockwise, matching engine's (actor+1)%n."
+  ],
+  "fixtures": [
+    {
+      "frame": "screenrecords/frames/frame_0060.png",
+      "note": "Bomb pot flop. Hero (ShoveDeez) sitting out. Seat 4 empty. Button on Israelforlife69 (seat 2, top-left).",
+      "num_seats": 6,
+      "state": {
+        "board_a": ["Qd", "Qs", "2h", null, null],
+        "board_b": ["Ah", "6c", "Kc", null, null],
+        "hero_hole": [null, null, null, null, null],
+        "button_seat": 2,
+        "pot_total_chips": 24000,
+        "seats": [
+          {"seat": 0, "stack_chips": 40000,  "committed_chips": 0},
+          {"seat": 1, "stack_chips": 19000,  "committed_chips": 0},
+          {"seat": 2, "stack_chips": 26113,  "committed_chips": 0},
+          {"seat": 3, "stack_chips": 22265,  "committed_chips": 0},
+          {"seat": 4, "stack_chips": null,   "committed_chips": null},
+          {"seat": 5, "stack_chips": 175559, "committed_chips": 0}
+        ]
+      }
+    },
+    {
+      "frame": "screenrecords/frames/frame_0840.png",
+      "note": "Bomb pot flop, hero active on the button. All 6 seats occupied.",
+      "num_seats": 6,
+      "state": {
+        "board_a": ["Kh", "8h", "Jh", null, null],
+        "board_b": ["7d", "9h", "3d", null, null],
+        "hero_hole": ["Td", "9d", "9c", "5h", "3c"],
+        "button_seat": 0,
+        "pot_total_chips": 70000,
+        "seats": [
+          {"seat": 0, "stack_chips": 58003,  "committed_chips": 0},
+          {"seat": 1, "stack_chips": 28000,  "committed_chips": 0},
+          {"seat": 2, "stack_chips": 30581,  "committed_chips": 0},
+          {"seat": 3, "stack_chips": null,   "committed_chips": 0},
+          {"seat": 4, "stack_chips": 219652, "committed_chips": 0},
+          {"seat": 5, "stack_chips": 238496, "committed_chips": 0}
+        ]
+      }
+    },
+    {
+      "frame": "screenrecords/frames/frame_0300.png",
+      "note": "Flop, hero active (ShoveDeez seat 0). Button on hero.",
+      "num_seats": 6,
+      "state": {
+        "board_a": ["5d", "5s", "Jh", null, null],
+        "board_b": ["9c", "Ad", "Qs", null, null],
+        "hero_hole": ["Ah", "Th", "3d", "3c", "2h"],
+        "button_seat": 0,
+        "pot_total_chips": 68452,
+        "seats": [
+          {"seat": 0, "stack_chips": 34000,  "committed_chips": 0},
+          {"seat": 1, "stack_chips": 28000,  "committed_chips": 0},
+          {"seat": 2, "stack_chips": 0,      "committed_chips": 0},
+          {"seat": 3, "stack_chips": 19887,  "committed_chips": 0},
+          {"seat": 4, "stack_chips": 86887,  "committed_chips": 0},
+          {"seat": 5, "stack_chips": 280006, "committed_chips": 0}
+        ]
+      }
+    },
+    {
+      "frame": "screenrecords/frames/frame_1050.png",
+      "note": "Flop, hero active. Button on redbullfly (seat 3, top-center).",
+      "num_seats": 6,
+      "state": {
+        "board_a": ["5c", "Ac", "6s", null, null],
+        "board_b": ["Qc", "Ah", "Js", null, null],
+        "hero_hole": ["Jc", "4s", "3s", "3h", "2s"],
+        "button_seat": 3,
+        "pot_total_chips": 36000,
+        "seats": [
+          {"seat": 0, "stack_chips": 90343,  "committed_chips": 0},
+          {"seat": 1, "stack_chips": 10000,  "committed_chips": 0},
+          {"seat": 2, "stack_chips": 29081,  "committed_chips": 0},
+          {"seat": 3, "stack_chips": 49000,  "committed_chips": 0},
+          {"seat": 4, "stack_chips": 201652, "committed_chips": 0},
+          {"seat": 5, "stack_chips": 220496, "committed_chips": 0}
+        ]
+      }
+    },
+    {
+      "frame": "screenrecords/frames/frame_1440.png",
+      "note": "Flop, hero active. Button on Hulk222 (seat 1, bottom-left).",
+      "num_seats": 6,
+      "state": {
+        "board_a": ["9d", "3s", "6c", null, null],
+        "board_b": ["4c", "Ks", "2c", null, null],
+        "hero_hole": ["Tc", "7h", "3c", "2d", "2h"],
+        "button_seat": 1,
+        "pot_total_chips": 205949,
+        "seats": [
+          {"seat": 0, "stack_chips": 0,      "committed_chips": 0},
+          {"seat": 1, "stack_chips": 22000,  "committed_chips": 0},
+          {"seat": 2, "stack_chips": 89000,  "committed_chips": 0},
+          {"seat": 3, "stack_chips": 0,      "committed_chips": 0},
+          {"seat": 4, "stack_chips": 216967, "committed_chips": 0},
+          {"seat": 5, "stack_chips": 171496, "committed_chips": 0}
+        ]
+      }
+    }
+  ]
+}

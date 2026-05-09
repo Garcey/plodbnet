@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PLO5 Bomb-Pot Study Tool</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <header id="top-bar">
+      <div class="top-bar-item">
+        <label>Seats</label>
+        <div class="seat-ctl">
+          <button id="seats-dec" type="button" aria-label="Fewer seats">−</button>
+          <span id="seats-count">6</span>
+          <button id="seats-inc" type="button" aria-label="More seats">+</button>
+        </div>
+      </div>
+      <div class="top-bar-item">
+        <label for="unit-toggle">Units</label>
+        <button id="unit-toggle" type="button">bb</button>
+      </div>
+      <div class="top-bar-item">
+        <label for="dpb-input">$ / bb</label>
+        <input id="dpb-input" type="number" step="0.01" min="0.01" value="20.00" />
+      </div>
+      <div class="top-bar-item">
+        <label for="ante-input">Ante</label>
+        <input id="ante-input" type="number" step="0.01" min="0" value="3.00" />
+      </div>
+      <div class="top-bar-item top-bar-spacer"></div>
+      <div class="top-bar-item ocr-group">
+        <label for="ocr-window-match">OCR</label>
+        <select id="ocr-window-match"><option value="">— pick window —</option></select>
+        <button id="ocr-refresh-windows" type="button" title="Refresh window list">&#x21bb;</button>
+        <button id="ocr-toggle" type="button" aria-pressed="false">Off</button>
+        <button id="ocr-simple-toggle" type="button" aria-pressed="true"
+                title="Skip OCR action inference; manual action entry only">Simple: On</button>
+        <span id="ocr-status" class="muted"></span>
+      </div>
+      <div class="top-bar-item">
+        <button id="new-hand-btn" type="button">New Hand</button>
+      </div>
+    </header>
+
+    <main>
+      <section id="table-area">
+        <div id="table-wrap">
+          <svg id="table-svg" viewBox="0 0 800 560" xmlns="http://www.w3.org/2000/svg">
+            <ellipse cx="400" cy="260" rx="340" ry="190" class="table-edge" />
+
+            <g id="board-a" transform="translate(280 207)"></g>
+            <g id="board-b" transform="translate(280 285)"></g>
+
+            <text id="pot-label" x="400" y="180" text-anchor="middle" class="pot-label">Pot 0bb</text>
+
+            <g id="seats"></g>
+            <g id="hero-hole" transform="translate(400 500)"></g>
+            <g id="dealer-button"><circle r="14" class="dealer-circle" /><text class="dealer-text" text-anchor="middle" dy="5">D</text></g>
+            <g id="insert-icon" hidden>
+              <circle r="14" class="insert-icon-bg" />
+              <text class="insert-icon-plus" text-anchor="middle" dy="6">+</text>
+            </g>
+          </svg>
+        </div>
+
+        <div id="actor-banner" class="actor-banner" hidden></div>
+
+        <div class="panels">
+          <div id="action-panel" class="panel">
+            <h3>Actions</h3>
+            <div class="panel-controls">
+              <button id="undo-btn" disabled>Undo</button>
+            </div>
+            <div id="gate-buttons"></div>
+            <div id="raise-section" hidden>
+              <div class="raise-bounds muted" id="raise-bounds-label"></div>
+              <div class="raise-input-row">
+                <input id="raise-input" type="number" step="0.01" />
+                <span id="raise-unit" class="raise-unit">bb</span>
+                <button id="raise-submit" class="primary">Raise</button>
+              </div>
+              <div id="raise-shortcuts" class="raise-shortcuts"></div>
+            </div>
+            <div id="terminal-pane" hidden>
+              <div id="terminal-message"></div>
+            </div>
+          </div>
+
+          <div id="info-panel" class="panel">
+            <h3>Recommendation</h3>
+            <div id="recommendation">
+              <p class="muted">Place hero's 5 hole cards to see network output.</p>
+            </div>
+            <h3>History</h3>
+            <div id="history"></div>
+          </div>
+        </div>
+      </section>
+
+      <aside id="card-grid-panel">
+        <div class="card-grid-header">
+          <span>Cards</span>
+          <span id="slot-hint" class="muted">Click a slot to place cards</span>
+        </div>
+        <div id="card-grid"></div>
+      </aside>
+    </main>
+
+    <div id="toast-container"></div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

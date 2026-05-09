@@ -1,0 +1,38 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "plo5bp"
+version = "0.1.0"
+description = "PLO5 double-board bomb-pot self-play PPO pipeline"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.26",
+  # CPU wheel by default; CUDA install lives in CLAUDE.md (cu128 for RTX 3070).
+  "torch>=2.2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "maturin>=1.7",
+]
+ui = [
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.27",
+]
+ocr = [
+  "pytesseract>=0.3.10",
+  "opencv-python-headless>=4.8",
+  "Pillow>=10.0",
+  "mss>=9.0",
+  "pygetwindow>=0.0.9",
+  "windows-capture>=2.0",
+]
+
+[tool.maturin]
+module-name = "plo5bp._engine"
+python-source = "python"
+manifest-path = "rust_engine/Cargo.toml"
+features = ["pyo3/extension-module"]

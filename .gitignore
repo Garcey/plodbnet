@@ -1,0 +1,36 @@
+# Build artifacts
+target/
+dist/
+build/
+*.egg-info/
+*.pyd
+*.so
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+
+# Training outputs (huge; pull via scp instead)
+checkpoints/
+*.pt
+logs/
+runs/
+
+# Local OCR captures and debug artifacts
+screenrecords/
+tmp/
+tmp_sweep/
+_*.png
+_*.log
+_diag_*/
+debug_*.png
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
