@@ -2,7 +2,7 @@
 //! Python environment and training loop.
 
 use numpy::ndarray::{Array1, Array2};
-use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1};
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -285,6 +285,237 @@ impl PyGameState {
 
         Ok(d)
     }
+}
+
+/// Mirror of `python/plo5bp/rollout.py:_aggression_bonus_bb`. Pot-fraction
+/// bonus on voluntary aggression: chips committed beyond the actor's
+/// amount-to-call, capped at the pre-step pot. Zero for non-RAISE gates
+/// or non-positive `c`.
+const GATE_RAISE_U8: u8 = 2;
+
+#[inline]
+fn aggression_bonus_bb_inner(
+    gate: u8,
+    commit_delta_chips: i64,
+    bet_to_call_chips: i64,
+    street_commit_actor_chips: i64,
+    pot_chips_pre: i64,
+    c: f64,
+) -> f64 {
+    if c <= 0.0 || gate != GATE_RAISE_U8 {
+        return 0.0;
+    }
+    let call_chips = (bet_to_call_chips - street_commit_actor_chips).max(0);
+    let aggressive = (commit_delta_chips - call_chips).max(0);
+    if aggressive <= 0 || pot_chips_pre <= 0 {
+        return 0.0;
+    }
+    let mut ratio = aggressive as f64 / pot_chips_pre as f64;
+    if ratio > 1.0 {
+        ratio = 1.0;
+    }
+    c * ratio
+}
+
+/// Per-env aggression-bonus computation for the batched rollout driver,
+/// parallelized via rayon with the GIL released. Replaces the linear
+/// per-env Python loop in `collect_rollout_batched`.
+///
+/// Inputs (all length `N` along axis 0):
+/// - `actors`: current actor seat (-1 for terminal).
+/// - `dones`: env terminated flag.
+/// - `learner_mask`: `(N, num_seats)` — true where seat is a learner seat
+///   in env `i`.
+/// - `gates`: emitted hybrid gate per env.
+/// - `pre_total_commit` / `post_total_commit`: `(N, num_seats)` cumulative
+///   per-seat chip commit, snapshotted before/after the current step.
+/// - `pre_bet_to_call`: env-level max street_commit before the step.
+/// - `pre_street_commit`: `(N, num_seats)` per-seat street_commit before.
+/// - `pre_street`: street index before the step (0=preflop ... 3=river).
+/// - `c`: aggression-bonus coefficient.
+/// - `reward_norm`: `1 / bb`, applied to per-step delta and pot to keep
+///   the trajectory in bb units.
+///
+/// Returns a dict with per-env arrays plus pre-reduced scalar diagnostics:
+/// - `valid`: `(N,)` bool — true iff the env contributed a learner step.
+/// - `cost_increment`: `(N,)` f64 — `-(delta_chips * reward_norm) + bonus_bb`.
+/// - `pot_pre_bb`: `(N,)` f64 — pre-step pot in bb.
+/// - `street_pre`: `(N,)` i8 — engine street index, copied from input.
+/// - `bonus_bb`: `(N,)` f64 — per-env bonus contribution (zero where
+///   `!valid`).
+/// - `total_bonus_bb`, `total_steps`, `bonus_steps`: serial reductions.
+/// - `steps_by_street` / `bonus_steps_by_street`: 3-elem u64 arrays
+///   bucketed by `(street_pre - 1)`.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+pub fn compute_aggression_bonus_batch<'py>(
+    py: Python<'py>,
+    actors: PyReadonlyArray1<'_, i8>,
+    dones: PyReadonlyArray1<'_, bool>,
+    learner_mask: PyReadonlyArray2<'_, bool>,
+    gates: PyReadonlyArray1<'_, u8>,
+    pre_total_commit: PyReadonlyArray2<'_, i64>,
+    post_total_commit: PyReadonlyArray2<'_, i64>,
+    pre_bet_to_call: PyReadonlyArray1<'_, u64>,
+    pre_street_commit: PyReadonlyArray2<'_, u64>,
+    pre_street: PyReadonlyArray1<'_, u8>,
+    c: f64,
+    reward_norm: f64,
+) -> PyResult<Bound<'py, PyDict>> {
+    let actors_s = actors.as_slice()?;
+    let dones_s = dones.as_slice()?;
+    let gates_s = gates.as_slice()?;
+    let pre_btc_s = pre_bet_to_call.as_slice()?;
+    let pre_street_s = pre_street.as_slice()?;
+    let n = actors_s.len();
+    if dones_s.len() != n
+        || gates_s.len() != n
+        || pre_btc_s.len() != n
+        || pre_street_s.len() != n
+    {
+        return Err(PyValueError::new_err(
+            "1-D input lengths must all equal num_envs",
+        ));
+    }
+
+    let lm_view = learner_mask.as_array();
+    let pre_tc_view = pre_total_commit.as_array();
+    let post_tc_view = post_total_commit.as_array();
+    let pre_sc_view = pre_street_commit.as_array();
+    if pre_tc_view.shape()[0] != n {
+        return Err(PyValueError::new_err(
+            "pre_total_commit shape[0] must equal num_envs",
+        ));
+    }
+    let num_seats = pre_tc_view.shape()[1];
+    if lm_view.shape() != [n, num_seats]
+        || post_tc_view.shape() != [n, num_seats]
+        || pre_sc_view.shape() != [n, num_seats]
+    {
+        return Err(PyValueError::new_err(
+            "2-D input shapes must all equal (num_envs, num_seats)",
+        ));
+    }
+
+    // Materialise owned copies so the parallel section can run with the
+    // GIL released. The arrays are small relative to the rollout work.
+    let actors_v = actors_s.to_vec();
+    let dones_v = dones_s.to_vec();
+    let gates_v = gates_s.to_vec();
+    let pre_btc_v = pre_btc_s.to_vec();
+    let pre_street_v = pre_street_s.to_vec();
+    let lm_owned = lm_view.to_owned();
+    let pre_tc_owned = pre_tc_view.to_owned();
+    let post_tc_owned = post_tc_view.to_owned();
+    let pre_sc_owned = pre_sc_view.to_owned();
+
+    // Per-env outputs computed in parallel; the serial reduction below
+    // is O(N) and cheap relative to the per-env arithmetic + i64 row sum.
+    let per_env: Vec<(bool, f64, f64, i8, f64)> = py.allow_threads(|| {
+        (0..n)
+            .into_par_iter()
+            .map(|i| {
+                if dones_v[i] {
+                    return (false, 0.0, 0.0, -1i8, 0.0);
+                }
+                let a = actors_v[i];
+                if a < 0 {
+                    return (false, 0.0, 0.0, -1i8, 0.0);
+                }
+                let actor = a as usize;
+                if actor >= num_seats || !lm_owned[[i, actor]] {
+                    return (false, 0.0, 0.0, -1i8, 0.0);
+                }
+
+                let pre_a = pre_tc_owned[[i, actor]];
+                let post_a = post_tc_owned[[i, actor]];
+                let delta = (post_a - pre_a).max(0);
+
+                let mut pot_pre: i64 = 0;
+                for s in 0..num_seats {
+                    pot_pre += pre_tc_owned[[i, s]];
+                }
+                let pot_pre = pot_pre.max(0);
+
+                let bet_to_call_pre = pre_btc_v[i] as i64;
+                let sc_actor_pre = pre_sc_owned[[i, actor]] as i64;
+                let gate = gates_v[i];
+
+                let bonus_bb = aggression_bonus_bb_inner(
+                    gate,
+                    delta,
+                    bet_to_call_pre,
+                    sc_actor_pre,
+                    pot_pre,
+                    c,
+                );
+                let cost_inc = -(delta as f64) * reward_norm + bonus_bb;
+                let pot_pre_bb = pot_pre as f64 * reward_norm;
+                let street_pre = pre_street_v[i] as i8;
+                (true, cost_inc, pot_pre_bb, street_pre, bonus_bb)
+            })
+            .collect()
+    });
+
+    let mut valid_v: Vec<bool> = Vec::with_capacity(n);
+    let mut cost_inc_v: Vec<f64> = Vec::with_capacity(n);
+    let mut pot_pre_bb_v: Vec<f64> = Vec::with_capacity(n);
+    let mut street_pre_v: Vec<i8> = Vec::with_capacity(n);
+    let mut bonus_bb_v: Vec<f64> = Vec::with_capacity(n);
+    let mut total_bonus_bb: f64 = 0.0;
+    let mut total_steps: u64 = 0;
+    let mut bonus_steps: u64 = 0;
+    let mut steps_by_street: [u64; 3] = [0, 0, 0];
+    let mut bonus_steps_by_street: [u64; 3] = [0, 0, 0];
+    for (v, ci, pp, sp, bb) in per_env.into_iter() {
+        valid_v.push(v);
+        cost_inc_v.push(ci);
+        pot_pre_bb_v.push(pp);
+        street_pre_v.push(sp);
+        bonus_bb_v.push(bb);
+        if v {
+            total_steps += 1;
+            total_bonus_bb += bb;
+            if bb > 0.0 {
+                bonus_steps += 1;
+            }
+            let bucket = sp as i64 - 1;
+            if (0..3).contains(&bucket) {
+                steps_by_street[bucket as usize] += 1;
+                if bb > 0.0 {
+                    bonus_steps_by_street[bucket as usize] += 1;
+                }
+            }
+        }
+    }
+
+    let d = PyDict::new(py);
+    d.set_item("valid", Array1::from_vec(valid_v).into_pyarray(py))?;
+    d.set_item(
+        "cost_increment",
+        Array1::from_vec(cost_inc_v).into_pyarray(py),
+    )?;
+    d.set_item(
+        "pot_pre_bb",
+        Array1::from_vec(pot_pre_bb_v).into_pyarray(py),
+    )?;
+    d.set_item(
+        "street_pre",
+        Array1::from_vec(street_pre_v).into_pyarray(py),
+    )?;
+    d.set_item("bonus_bb", Array1::from_vec(bonus_bb_v).into_pyarray(py))?;
+    d.set_item("total_bonus_bb", total_bonus_bb)?;
+    d.set_item("total_steps", total_steps)?;
+    d.set_item("bonus_steps", bonus_steps)?;
+    d.set_item(
+        "steps_by_street",
+        Array1::from_vec(steps_by_street.to_vec()).into_pyarray(py),
+    )?;
+    d.set_item(
+        "bonus_steps_by_street",
+        Array1::from_vec(bonus_steps_by_street.to_vec()).into_pyarray(py),
+    )?;
+    Ok(d)
 }
 
 /// Diagnostic hook: compute layered side-pot payouts for an arbitrary

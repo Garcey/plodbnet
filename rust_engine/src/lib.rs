@@ -27,5 +27,9 @@ fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
         crate::bindings::compute_double_board_payout,
         m
     )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        crate::bindings::compute_aggression_bonus_batch,
+        m
+    )?)?;
     Ok(())
 }
