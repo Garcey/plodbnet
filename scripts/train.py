@@ -230,10 +230,19 @@ def main() -> None:
     parser.add_argument("--num-envs", type=int, default=1536)
     parser.add_argument("--rollout-length", type=int, default=262_144)
     parser.add_argument(
+        "--num-minibatches",
+        type=int,
+        default=32,
+        help="PPO minibatches per epoch. batch_size is derived as "
+        "ceil(rollout_length / num_minibatches) when --batch-size is not set. "
+        "Default 32 auto-scales across rollout sizes.",
+    )
+    parser.add_argument(
         "--batch-size",
         type=int,
-        default=256,
-        help="PPO minibatch size. Default 256 matches TrainingConfig.batch_size.",
+        default=None,
+        help="PPO minibatch size override. When unset, derived from "
+        "--num-minibatches and --rollout-length.",
     )
     parser.add_argument("--ppo-epochs", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
@@ -396,10 +405,30 @@ def main() -> None:
         choices=("cpu", "cuda"),
         help="Torch device for the learner + rollout buffers.",
     )
+    parser.add_argument(
+        "--profile-one-update",
+        action="store_true",
+        help="Wrap update 0 in torch.profiler, export Chrome trace to "
+        "runs/profile_update0.json, print a top-40 summary, and exit. "
+        "Adds ~10-30%% overhead; use only when diagnosing per-step CPU/GPU "
+        "attribution.",
+    )
     args = parser.parse_args()
 
     if args.aggression_bonus_c is None:
         args.aggression_bonus_c = 5.0 if args.stack_dist == "agro_deep" else 0.0
+
+    if args.batch_size is None:
+        if args.num_minibatches <= 0:
+            raise SystemExit("--num-minibatches must be > 0")
+        args.batch_size = max(
+            1,
+            (args.rollout_length + args.num_minibatches - 1) // args.num_minibatches,
+        )
+        print(
+            f"[batch-size] derived {args.batch_size} from "
+            f"rollout_length={args.rollout_length} / num_minibatches={args.num_minibatches}"
+        )
 
     blocks = _parse_block_rotation(args.block_rotation)
     if blocks and args.block_size <= 0:
@@ -581,6 +610,19 @@ def main() -> None:
             stack_dist=active_tier,
             seats_dist=args.seats_dist,
         )
+        _profile_this = args.profile_one_update and update == 0
+        _prof = None
+        if _profile_this:
+            _prof = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                with_stack=False,
+                record_shapes=False,
+            )
+            _prof.__enter__()
+
         batch = collector(model, pool, sampled_game_cfg, train_cfg, rng)
         if blocks:
             update_entropy_coef = active_ent_coef
@@ -601,6 +643,17 @@ def main() -> None:
         if args.snapshot_every_sec > 0 and now - last_snapshot_sec >= args.snapshot_every_sec:
             pool.snapshot(model)
             last_snapshot_sec = now
+
+        if _prof is not None:
+            _prof.__exit__(None, None, None)
+            trace_path = Path("runs/profile_update0.json")
+            trace_path.parent.mkdir(parents=True, exist_ok=True)
+            _prof.export_chrome_trace(str(trace_path))
+            print(_prof.key_averages().table(
+                sort_by="self_cuda_time_total", row_limit=40
+            ))
+            print(f"[profile] chrome trace -> {trace_path}")
+            stop_requested["flag"] = True
 
         # Mid-run checkpoints: update-count + wall-clock variants.
         if args.checkpoint_every > 0 and update > 0 and update % args.checkpoint_every == 0:

@@ -843,6 +843,11 @@ def _network_obs() -> np.ndarray | None:
         for (s, a, c, st) in raw["history"]
         if s in phys_to_comp
     ]
+    # Mirror env._pack_obs: the Rust observation_dict() omits hero_category_*;
+    # without these the encoder defaults both boards to high-card (cat 0).
+    raw_actor = int(raw["actor"])
+    proj["hero_category_a"] = int(env._rs.hero_category(raw_actor, 0))
+    proj["hero_category_b"] = int(env._rs.hero_category(raw_actor, 1))
 
     compressed_cfg = GameConfig(
         num_seats=n,

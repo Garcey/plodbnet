@@ -21,6 +21,7 @@ from typing import Iterable
 
 import numpy as np
 import torch
+from torch.profiler import record_function
 
 from plo5bp._engine import compute_aggression_bonus_batch  # type: ignore[attr-defined]
 from plo5bp.actions import ALL_IN, GATE_ACTIONS, GATE_CHECK_CALL, GATE_RAISE
@@ -261,6 +262,64 @@ def _finalize_batch(
     adv_mean = adv_t.mean()
     adv_std = adv_t.std().clamp(min=1e-8)
     adv_t = (adv_t - adv_mean) / adv_std
+
+    return Batch(
+        obs=obs_t,
+        gate_masks=gm_t,
+        gate_actions=ga_t,
+        raise_chips=rc_t,
+        raise_bounds=rb_t,
+        log_probs=lp_t,
+        values=v_t,
+        returns=ret_t,
+        advantages=adv_t,
+        aggr_bonus_total_bb=float(aggr_bonus_total_bb),
+        aggr_steps_total=int(aggr_steps_total),
+        aggr_bonus_steps=int(aggr_bonus_steps),
+        aggr_steps_total_by_street=tuple(int(x) for x in aggr_steps_total_by_street),
+        aggr_bonus_steps_by_street=tuple(int(x) for x in aggr_bonus_steps_by_street),
+    )
+
+
+def _finalize_batch_arr(
+    all_obs_arr: np.ndarray,
+    all_gm_arr: np.ndarray,
+    all_ga_arr: np.ndarray,
+    all_rc_arr: np.ndarray,
+    all_rb_arr: np.ndarray,
+    all_lp_arr: np.ndarray,
+    all_v_arr: np.ndarray,
+    all_ret_arr: np.ndarray,
+    all_adv_arr: np.ndarray,
+    wcursor: int,
+    device: torch.device | str = "cpu",
+    aggr_bonus_total_bb: float = 0.0,
+    aggr_steps_total: int = 0,
+    aggr_bonus_steps: int = 0,
+    aggr_steps_total_by_street: tuple[int, int, int] = (0, 0, 0),
+    aggr_bonus_steps_by_street: tuple[int, int, int] = (0, 0, 0),
+) -> Batch:
+    """Slab-based finalize: each `all_*_arr` is preallocated and written
+    contiguously. Slice to `[:wcursor]` and copy once to `device` per
+    slab. No `np.stack` over millions of small arrays.
+    """
+    # When the source slabs are pinned (CUDA path) `non_blocking=True`
+    # lets the H2D copies queue against the default stream and overlap
+    # downstream compute; on CPU device the flag is a no-op.
+    with record_function("step11/finalize_h2d"):
+        obs_t = torch.from_numpy(all_obs_arr[:wcursor]).to(device, non_blocking=True)
+        gm_t = torch.from_numpy(all_gm_arr[:wcursor]).to(device, non_blocking=True)
+        ga_t = torch.from_numpy(all_ga_arr[:wcursor]).to(device, non_blocking=True)
+        rc_t = torch.from_numpy(all_rc_arr[:wcursor]).to(device, non_blocking=True)
+        rb_t = torch.from_numpy(all_rb_arr[:wcursor]).to(device, non_blocking=True)
+        lp_t = torch.from_numpy(all_lp_arr[:wcursor]).to(device, non_blocking=True)
+        v_t = torch.from_numpy(all_v_arr[:wcursor]).to(device, non_blocking=True)
+        ret_t = torch.from_numpy(all_ret_arr[:wcursor]).to(device, non_blocking=True)
+        adv_t = torch.from_numpy(all_adv_arr[:wcursor]).to(device, non_blocking=True)
+
+        adv_mean = adv_t.mean()
+        adv_std = adv_t.std().clamp(min=1e-8)
+        adv_t = (adv_t - adv_mean) / adv_std
 
     return Batch(
         obs=obs_t,
@@ -644,44 +703,62 @@ def collect_rollout_batched(
     )
     env.reset_batch(init_seeds, init_buttons)
 
-    # Array-backed per-(env, seat) trajectory storage. Replaces the old
-    # `trajectories[i][seat]` list-of-tuples — every per-step append is
-    # now a vectorized fancy-index write. `MAX_STEPS_PER_SEAT` caps the
-    # per-(env, seat) action count for one hand. PLO5 hands cap out
-    # well below this even with deep stacks; the assertion in the
-    # snapshot block flags overflow rather than silently corrupting data.
+    # Array-backed per-(env, seat) trajectory storage. Every per-step
+    # append is a vectorized fancy-index write. `MAX_STEPS_PER_SEAT`
+    # caps the per-(env, seat) action count for one hand; PLO5 hands
+    # cap well below this even at deep stacks.
     MAX_STEPS_PER_SEAT = 32
     traj_lengths = np.zeros((n_envs, n_seats), dtype=np.int32)
-    traj_chunk_idx = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.int32)
-    traj_slot = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.int32)
+    # Absolute index into `step_obs_pool` / `step_gm_pool` per (env, seat, slot).
+    traj_obs_idx = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.int64)
     traj_gate = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.int8)
     traj_chips = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.int64)
     traj_min_raise = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.int64)
     traj_max_raise = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.int64)
     traj_log_p = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.float32)
     traj_value = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.float32)
-    # Aggression-bonus parallel arrays, mirrored shape.
+    # Per-step cost / pot / street parallel arrays, mirrored shape.
     costs_arr = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.float32)
     pots_arr = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.float32)
     streets_arr = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.int8)
 
-    # Per-step chunked obs / gate-mask storage. Each step appends ONE
-    # (k_step, OBS_DIM) f32 chunk and ONE (k_step, GATE_ACTIONS) bool
-    # chunk where `k_step` is the count of active learner envs that
-    # step. Trajectories store `(chunk_idx, slot)` integer pointers
-    # into these chunks; flush time gathers via `chunks[ci][sl]`.
-    step_obs_chunks: list[np.ndarray] = []
-    step_gm_chunks: list[np.ndarray] = []
+    # Flat pre-allocated obs / gate-mask pool. Each step appends
+    # `learner_idx_np.size` rows at `pool_cursor`; trajectory slots
+    # store the absolute pool index. One contiguous buffer makes the
+    # terminal-flush gather a single `np.take` rather than a Python
+    # walk over chunked storage.
+    rollout_target = int(train_config.rollout_length)
+    pool_cap = rollout_target + n_envs * MAX_STEPS_PER_SEAT
+    step_obs_pool = np.empty((pool_cap, OBS_DIM), dtype=np.float32)
+    step_gm_pool = np.empty((pool_cap, GATE_ACTIONS), dtype=bool)
+    pool_cursor = 0
 
-    all_obs: list[np.ndarray] = []
-    all_gate_masks: list[np.ndarray] = []
-    all_gate_actions: list[int] = []
-    all_raise_chips: list[int] = []
-    all_raise_bounds: list[np.ndarray] = []
-    all_log_probs: list[float] = []
-    all_values: list[float] = []
-    all_returns: list[float] = []
-    all_advantages: list[float] = []
+    # Pre-allocated output slabs. Eliminates the `np.stack` over millions
+    # of small arrays at finalize time. `wcursor` tracks the count of
+    # transitions written so far across all terminal flushes. On CUDA,
+    # back the slabs with pinned host memory so the finalize transfer
+    # can run with `non_blocking=True` and overlap the first PPO forward.
+    out_cap = rollout_target + n_envs * MAX_STEPS_PER_SEAT
+    _pin = device.type == "cuda" if isinstance(device, torch.device) else str(device).startswith("cuda")
+    _pinned_keepalive: list[torch.Tensor] = []
+
+    def _alloc_slab(shape, np_dtype, torch_dtype):
+        if _pin:
+            t = torch.empty(shape, dtype=torch_dtype, pin_memory=True)
+            _pinned_keepalive.append(t)
+            return t.numpy()
+        return np.empty(shape, dtype=np_dtype)
+
+    all_obs_arr = _alloc_slab((out_cap, OBS_DIM), np.float32, torch.float32)
+    all_gm_arr = _alloc_slab((out_cap, GATE_ACTIONS), bool, torch.bool)
+    all_ga_arr = _alloc_slab(out_cap, np.int64, torch.int64)
+    all_rc_arr = _alloc_slab(out_cap, np.int64, torch.int64)
+    all_rb_arr = _alloc_slab((out_cap, 2), np.int64, torch.int64)
+    all_lp_arr = _alloc_slab(out_cap, np.float32, torch.float32)
+    all_v_arr = _alloc_slab(out_cap, np.float32, torch.float32)
+    all_ret_arr = _alloc_slab(out_cap, np.float32, torch.float32)
+    all_adv_arr = _alloc_slab(out_cap, np.float32, torch.float32)
+    wcursor = 0
 
     aggression_bonus_c = float(train_config.aggression_bonus_c)
     retroactive_bonus_c = float(train_config.retroactive_bonus_c)
@@ -704,21 +781,24 @@ def collect_rollout_batched(
             [min_raise_arr[group].astype(np.int64), max_raise_arr[group].astype(np.int64)],
             axis=-1,
         )
-        o_t = torch.from_numpy(b_obs).to(device)
-        m_t = torch.from_numpy(b_gm).to(device)
-        b_t = torch.from_numpy(b_bounds).to(device)
-        with torch.no_grad():
-            g_t, c_t, lp_t, v_t = model.act(o_t, m_t, b_t)
-        return (
-            g_t.cpu().numpy().astype(np.uint8),
-            c_t.cpu().numpy().astype(np.int64),
-            lp_t.cpu().numpy(),
-            v_t.cpu().numpy(),
-        )
+        with record_function("step2/learner_h2d"):
+            o_t = torch.from_numpy(b_obs).to(device)
+            m_t = torch.from_numpy(b_gm).to(device)
+            b_t = torch.from_numpy(b_bounds).to(device)
+        with record_function("step3/learner_forward"):
+            with torch.no_grad():
+                g_t, c_t, lp_t, v_t = model.act(o_t, m_t, b_t)
+        with record_function("step5/action_d2h"):
+            return (
+                g_t.cpu().numpy().astype(np.uint8),
+                c_t.cpu().numpy().astype(np.int64),
+                lp_t.cpu().numpy(),
+                v_t.cpu().numpy(),
+            )
 
     env_idx_range = np.arange(n_envs)
 
-    while len(all_obs) < train_config.rollout_length:
+    while wcursor < rollout_target:
         obs = env._obs
         gate_masks = env._gate_mask
         min_raise = env._min_raise
@@ -758,24 +838,28 @@ def collect_rollout_batched(
         # Group active opponent envs by snapshot index. `np.unique` over
         # the masked column replaces the per-env dict-build loop.
         if is_opp_active.any():
-            opp_snap_col = np.where(is_opp_active, env_snapshot_idx_arr, -1)
-            for sd_idx in np.unique(opp_snap_col[opp_snap_col >= 0]):
-                sd_idx_int = int(sd_idx)
-                group = np.nonzero(opp_snap_col == sd_idx)[0]
-                m = _get_snapshot_model(sd_idx_int)
-                g_np, c_np, _, _ = _forward(
-                    m, group, obs, gate_masks, min_raise, max_raise
-                )
-                gates_per_env[group] = g_np
-                chips_per_env[group] = np.maximum(c_np, 0).astype(np.uint64)
+            with record_function("step4/opp_forwards"):
+                opp_snap_col = np.where(is_opp_active, env_snapshot_idx_arr, -1)
+                for sd_idx in np.unique(opp_snap_col[opp_snap_col >= 0]):
+                    sd_idx_int = int(sd_idx)
+                    group = np.nonzero(opp_snap_col == sd_idx)[0]
+                    m = _get_snapshot_model(sd_idx_int)
+                    g_np, c_np, _, _ = _forward(
+                        m, group, obs, gate_masks, min_raise, max_raise
+                    )
+                    gates_per_env[group] = g_np
+                    chips_per_env[group] = np.maximum(c_np, 0).astype(np.uint64)
 
-        # Vectorized trajectory snapshot: one bulk obs/gm copy per step,
-        # plus fancy-index writes into the per-(env, seat) arrays. No
-        # per-env Python loop.
+        # Vectorized trajectory snapshot: one bulk obs/gm copy into the
+        # flat pool, plus fancy-index writes into the per-(env, seat)
+        # arrays. The (env, seat, slot) -> pool index map is one int.
         if learner_idx_np.size:
-            chunk_idx = len(step_obs_chunks)
-            step_obs_chunks.append(obs[learner_idx_np].copy())
-            step_gm_chunks.append(gate_masks[learner_idx_np].copy())
+            k_step = learner_idx_np.size
+            pool_end = pool_cursor + k_step
+            step_obs_pool[pool_cursor:pool_end] = obs[learner_idx_np]
+            step_gm_pool[pool_cursor:pool_end] = gate_masks[learner_idx_np]
+            pool_indices = np.arange(pool_cursor, pool_end, dtype=np.int64)
+            pool_cursor = pool_end
 
             learner_actors = safe_actors[learner_idx_np]
             slots = traj_lengths[learner_idx_np, learner_actors]
@@ -787,10 +871,7 @@ def collect_rollout_batched(
 
             l_gates = gates_per_env[learner_idx_np]
             l_chips = chips_per_env[learner_idx_np]
-            traj_chunk_idx[learner_idx_np, learner_actors, slots] = chunk_idx
-            traj_slot[learner_idx_np, learner_actors, slots] = np.arange(
-                learner_idx_np.size, dtype=np.int32
-            )
+            traj_obs_idx[learner_idx_np, learner_actors, slots] = pool_indices
             traj_gate[learner_idx_np, learner_actors, slots] = l_gates.astype(np.int8)
             traj_chips[learner_idx_np, learner_actors, slots] = np.where(
                 l_gates == GATE_RAISE, l_chips.astype(np.int64), 0
@@ -824,61 +905,65 @@ def collect_rollout_batched(
         if short_shove.any():
             gates_dispatch = gates_per_env.copy()
             gates_dispatch[short_shove] = 3
-        newly_terminal = np.asarray(
-            env._be.apply_hybrid_batch(gates_dispatch, chips_per_env), dtype=bool
-        )
+        with record_function("step6+7/rust_apply"):
+            newly_terminal = np.asarray(
+                env._be.apply_hybrid_batch(gates_dispatch, chips_per_env), dtype=bool
+            )
         # Refresh now to capture post-step total_commit (and everything
         # else) BEFORE reset_terminal_batch wipes terminal envs.
-        env._refresh()
+        with record_function("step1a/refresh"):
+            env._refresh()
         post_total_commit = env._total_commit
 
         # Rust-parallel aggression bonus + per-step cost/pot/street
         # bookkeeping. Replaces the per-env Python arithmetic loop.
-        agg = compute_aggression_bonus_batch(
-            actors,
-            dones,
-            learner_seats_mask,
-            gates_per_env,
-            pre_total_commit,
-            post_total_commit.astype(np.int64) if post_total_commit.dtype != np.int64 else post_total_commit,
-            pre_bet_to_call,
-            pre_street_commit,
-            pre_street,
-            float(aggression_bonus_c),
-            float(reward_norm),
-        )
-        valid_arr = np.asarray(agg["valid"], dtype=bool)
-        valid_idx = np.nonzero(valid_arr)[0]
-        if valid_idx.size:
-            cost_inc_arr = np.asarray(agg["cost_increment"], dtype=np.float32)
-            pot_pre_bb_arr = np.asarray(agg["pot_pre_bb"], dtype=np.float32)
-            street_pre_arr = np.asarray(agg["street_pre"], dtype=np.int8)
-            valid_actors = safe_actors[valid_idx]
-            valid_slots = traj_lengths[valid_idx, valid_actors]
-            costs_arr[valid_idx, valid_actors, valid_slots] = cost_inc_arr[valid_idx]
-            pots_arr[valid_idx, valid_actors, valid_slots] = pot_pre_bb_arr[valid_idx]
-            streets_arr[valid_idx, valid_actors, valid_slots] = street_pre_arr[valid_idx]
-            traj_lengths[valid_idx, valid_actors] += 1
+        with record_function("step8/aggression_bonus"):
+            agg = compute_aggression_bonus_batch(
+                actors,
+                dones,
+                learner_seats_mask,
+                gates_per_env,
+                pre_total_commit,
+                post_total_commit.astype(np.int64) if post_total_commit.dtype != np.int64 else post_total_commit,
+                pre_bet_to_call,
+                pre_street_commit,
+                pre_street,
+                float(aggression_bonus_c),
+                float(reward_norm),
+            )
+            valid_arr = np.asarray(agg["valid"], dtype=bool)
+            valid_idx = np.nonzero(valid_arr)[0]
+            if valid_idx.size:
+                cost_inc_arr = np.asarray(agg["cost_increment"], dtype=np.float32)
+                pot_pre_bb_arr = np.asarray(agg["pot_pre_bb"], dtype=np.float32)
+                street_pre_arr = np.asarray(agg["street_pre"], dtype=np.int8)
+                valid_actors = safe_actors[valid_idx]
+                valid_slots = traj_lengths[valid_idx, valid_actors]
+                costs_arr[valid_idx, valid_actors, valid_slots] = cost_inc_arr[valid_idx]
+                pots_arr[valid_idx, valid_actors, valid_slots] = pot_pre_bb_arr[valid_idx]
+                streets_arr[valid_idx, valid_actors, valid_slots] = street_pre_arr[valid_idx]
+                traj_lengths[valid_idx, valid_actors] += 1
 
-        aggr_bonus_total_bb += float(agg["total_bonus_bb"])
-        aggr_steps_total += int(agg["total_steps"])
-        aggr_bonus_steps += int(agg["bonus_steps"])
-        sbs = np.asarray(agg["steps_by_street"])
-        bbs = np.asarray(agg["bonus_steps_by_street"])
-        for s in range(3):
-            aggr_steps_total_by_street[s] += int(sbs[s])
-            aggr_bonus_steps_by_street[s] += int(bbs[s])
+            aggr_bonus_total_bb += float(agg["total_bonus_bb"])
+            aggr_steps_total += int(agg["total_steps"])
+            aggr_bonus_steps += int(agg["bonus_steps"])
+            sbs = np.asarray(agg["steps_by_street"])
+            bbs = np.asarray(agg["bonus_steps_by_street"])
+            for s in range(3):
+                aggr_steps_total_by_street[s] += int(sbs[s])
+                aggr_bonus_steps_by_street[s] += int(bbs[s])
 
         if newly_terminal.any():
-            if env._ev_runout_samples > 0:
-                ev_seeds = env._reset_seeds ^ np.uint64(0x9E3779B97F4A7C15)
-                payouts_f32 = np.asarray(
-                    env._be.payouts_ev_batch(env._ev_runout_samples, ev_seeds),
-                    dtype=np.float32,
-                )
-            else:
-                payouts_f32 = np.asarray(env._be.payouts_batch(), dtype=np.float32)
-            won_f32 = payouts_f32 + post_total_commit.astype(np.float32)
+            with record_function("step9a/payouts"):
+                if env._ev_runout_samples > 0:
+                    ev_seeds = env._reset_seeds ^ np.uint64(0x9E3779B97F4A7C15)
+                    payouts_f32 = np.asarray(
+                        env._be.payouts_ev_batch(env._ev_runout_samples, ev_seeds),
+                        dtype=np.float32,
+                    )
+                else:
+                    payouts_f32 = np.asarray(env._be.payouts_batch(), dtype=np.float32)
+                won_f32 = payouts_f32 + post_total_commit.astype(np.float32)
 
             reset_mask = newly_terminal
             new_seeds = rng.integers(
@@ -888,99 +973,129 @@ def collect_rollout_batched(
                 0, n_seats, size=n_envs, dtype=np.int64
             ).astype(np.uint8)
 
-            for i in np.nonzero(newly_terminal)[0]:
-                i_int = int(i)
-                total_pot_chips = int(post_total_commit[i_int].sum())
-                # Materialize per-(env, seat) trajectory back into the
-                # tuple-list form that `_apply_retroactive_bonus` /
-                # `_flush_trajectory` accept. Per-step Python iteration
-                # here is bounded by hand length (small) × learner seats
-                # (≤ n_seats) and only fires on terminal envs, so it's a
-                # small fraction of the per-step work.
-                for seat in learner_seats[i_int]:
-                    L = int(traj_lengths[i_int, seat])
-                    if L == 0:
-                        continue
-                    traj_list: list[tuple] = []
-                    for t in range(L):
-                        ci = int(traj_chunk_idx[i_int, seat, t])
-                        sl = int(traj_slot[i_int, seat, t])
-                        bounds_t = np.array(
-                            [
-                                int(traj_min_raise[i_int, seat, t]),
-                                int(traj_max_raise[i_int, seat, t]),
-                            ],
-                            dtype=np.int64,
-                        )
-                        traj_list.append(
-                            (
-                                step_obs_chunks[ci][sl],
-                                step_gm_chunks[ci][sl],
-                                int(traj_gate[i_int, seat, t]),
-                                int(traj_chips[i_int, seat, t]),
-                                bounds_t,
-                                float(traj_log_p[i_int, seat, t]),
-                                float(traj_value[i_int, seat, t]),
-                            )
-                        )
-                    cost_list = costs_arr[i_int, seat, :L].astype(float).tolist()
-                    pot_list = pots_arr[i_int, seat, :L].astype(float).tolist()
-                    street_list = streets_arr[i_int, seat, :L].astype(int).tolist()
+            # Vectorized terminal flush: process every newly-terminal env
+            # in one numpy block. Replaces the per-(env, seat, t) Python
+            # walk that built tuple lists for `_apply_retroactive_bonus`
+            # and `_flush_trajectory`. Net work: one (T, S, MAX) bonus
+            # mask + a 32-step backward GAE scan vectorized over T*S +
+            # one np.take per output slab.
+            term_envs = np.nonzero(newly_terminal)[0]
+            T = int(term_envs.size)
+            if T:
+                MAX = MAX_STEPS_PER_SEAT
+                S = n_seats
+                lengths = traj_lengths[term_envs]                       # (T, S)
+                flush_mask = learner_seats_mask[term_envs] & (lengths > 0)  # (T, S)
+                t_idx = np.arange(MAX, dtype=np.int32)
+                active_step = (
+                    (t_idx[None, None, :] < lengths[..., None])
+                    & flush_mask[..., None]
+                )  # (T, S, MAX)
 
-                    added, bumped_by_street = _apply_retroactive_bonus(
-                        traj_list,
-                        cost_list,
-                        pot_list,
-                        street_list,
-                        int(round(float(won_f32[i_int, seat]))),
-                        total_pot_chips,
-                        retroactive_bonus_c,
+                # Retroactive bonus (vectorized over (T, S, MAX)).
+                with record_function("step9b/retroactive_bonus"):
+                    payout_chips = np.rint(won_f32[term_envs]).astype(np.int64)  # (T, S)
+                    total_pot_chips = post_total_commit[term_envs].astype(np.int64).sum(axis=1)  # (T,)
+                    two_pay = 2 * payout_chips
+                    share_eq = (two_pay == total_pot_chips[:, None]) & (
+                        total_pot_chips[:, None] > 0
+                    )  # (T, S)
+                    share_gt = two_pay > total_pot_chips[:, None]            # (T, S)
+
+                    gates_t = traj_gate[term_envs]                           # (T, S, MAX)
+                    costs_t = costs_arr[term_envs].copy()                    # (T, S, MAX)
+                    pots_t = pots_arr[term_envs]                             # (T, S, MAX)
+                    streets_t = streets_arr[term_envs]                       # (T, S, MAX)
+
+                    is_raise = (gates_t == GATE_RAISE)
+                    is_call_with_chips = (gates_t == GATE_CHECK_CALL) & (costs_t < 0.0)
+                    qualified = active_step & (
+                        (share_gt[..., None] & is_raise)
+                        | (share_eq[..., None] & (is_raise | is_call_with_chips))
                     )
-                    aggr_bonus_total_bb += added
-                    aggr_bonus_steps += sum(bumped_by_street)
-                    for s in range(3):
-                        aggr_bonus_steps_by_street[s] += bumped_by_street[s]
+                    # Counter updates are unconditional — even with c=0 we
+                    # report the count of steps that *would* receive a bonus
+                    # so disabled-bonus runs can still measure aggression
+                    # share by street. Cost mutation is gated on c.
+                    aggr_bonus_steps += int(qualified.sum())
+                    for s_idx in range(3):
+                        aggr_bonus_steps_by_street[s_idx] += int(
+                            ((streets_t == (s_idx + 1)) & qualified).sum()
+                        )
+                    if retroactive_bonus_c != 0.0:
+                        bonus = qualified.astype(np.float32) * (
+                            np.float32(retroactive_bonus_c) * pots_t
+                        )
+                        costs_t += bonus
+                        aggr_bonus_total_bb += float(bonus.sum())
 
-                    terminal_won_bb = float(won_f32[i_int, seat]) * reward_norm
-                    _flush_trajectory(
-                        traj_list,
-                        cost_list,
-                        terminal_won_bb,
-                        gamma,
-                        lam,
-                        all_obs=all_obs,
-                        all_gate_masks=all_gate_masks,
-                        all_gate_actions=all_gate_actions,
-                        all_raise_chips=all_raise_chips,
-                        all_raise_bounds=all_raise_bounds,
-                        all_log_probs=all_log_probs,
-                        all_values=all_values,
-                        all_returns=all_returns,
-                        all_advantages=all_advantages,
-                    )
+                # GAE backward scan vectorized over (T, S).
+                with record_function("step9c/gae_scan"):
+                    vals_t = traj_value[term_envs]                           # (T, S, MAX)
+                    won_bb = won_f32[term_envs].astype(np.float32) * np.float32(reward_norm)
+                    last_gae = np.zeros((T, S), dtype=np.float32)
+                    advs_t = np.zeros((T, S, MAX), dtype=np.float32)
+                    last_t_arr = (lengths.astype(np.int32) - 1)              # (T, S)
+                    gamma_f = np.float32(gamma)
+                    lam_f = np.float32(lam)
+                    for t in range(MAX - 1, -1, -1):
+                        is_last = (t == last_t_arr) & flush_mask
+                        active_tm = (t <= last_t_arr) & flush_mask
+                        reward_t = costs_t[..., t] + np.where(is_last, won_bb, np.float32(0.0))
+                        if t + 1 < MAX:
+                            next_v = np.where(is_last, np.float32(0.0), vals_t[..., t + 1])
+                        else:
+                            next_v = np.zeros((T, S), dtype=np.float32)
+                        delta = reward_t + gamma_f * next_v - vals_t[..., t]
+                        new_gae = delta + gamma_f * lam_f * last_gae
+                        last_gae = np.where(active_tm, new_gae, last_gae)
+                        advs_t[..., t] = np.where(active_tm, last_gae, np.float32(0.0))
+                    rets_t = advs_t + vals_t
 
-                # Reset trajectory state for this env. Underlying chunk
-                # storage is kept; entries owned by this env's flushed
-                # trajectories are now referenced through `all_obs`.
-                traj_lengths[i_int, :] = 0
-                _assign_pool_mix(i_int)
+                # Gather the (T, S, MAX) → (n_new,) flat slab and copy
+                # into the preallocated output arrays at `wcursor`.
+                with record_function("step9d/slab_copies"):
+                    flat = active_step.ravel()
+                    n_new = int(flat.sum())
+                    if n_new:
+                        sel = np.nonzero(flat)[0]
+                        obs_idx = traj_obs_idx[term_envs].ravel()[sel]
+                        end = wcursor + n_new
+                        np.take(step_obs_pool, obs_idx, axis=0, out=all_obs_arr[wcursor:end])
+                        np.take(step_gm_pool, obs_idx, axis=0, out=all_gm_arr[wcursor:end])
+                        all_ga_arr[wcursor:end] = traj_gate[term_envs].ravel()[sel].astype(np.int64)
+                        all_rc_arr[wcursor:end] = traj_chips[term_envs].ravel()[sel]
+                        all_rb_arr[wcursor:end, 0] = traj_min_raise[term_envs].ravel()[sel]
+                        all_rb_arr[wcursor:end, 1] = traj_max_raise[term_envs].ravel()[sel]
+                        all_lp_arr[wcursor:end] = traj_log_p[term_envs].ravel()[sel]
+                        all_v_arr[wcursor:end] = vals_t.ravel()[sel]
+                        all_ret_arr[wcursor:end] = rets_t.ravel()[sel]
+                        all_adv_arr[wcursor:end] = advs_t.ravel()[sel]
+                        wcursor = end
 
-            env._be.reset_terminal_batch(new_seeds, new_buttons, reset_mask)
-            env._reset_seeds = np.where(reset_mask, new_seeds, env._reset_seeds)
-            # Second refresh to pick up the post-reset state for the next
-            # iteration. Only paid on iterations that triggered a reset.
-            env._refresh()
+                with record_function("step9e/pool_mix"):
+                    traj_lengths[term_envs] = 0
+                    for i_int in term_envs.tolist():
+                        _assign_pool_mix(int(i_int))
 
-    return _finalize_batch(
-        all_obs,
-        all_gate_masks,
-        all_gate_actions,
-        all_raise_chips,
-        all_raise_bounds,
-        all_log_probs,
-        all_values,
-        all_returns,
-        all_advantages,
+            with record_function("step9f/reset_terminal"):
+                env._be.reset_terminal_batch(new_seeds, new_buttons, reset_mask)
+                env._reset_seeds = np.where(reset_mask, new_seeds, env._reset_seeds)
+                # Second refresh to pick up the post-reset state for the next
+                # iteration. Only paid on iterations that triggered a reset.
+                env._refresh()
+
+    return _finalize_batch_arr(
+        all_obs_arr,
+        all_gm_arr,
+        all_ga_arr,
+        all_rc_arr,
+        all_rb_arr,
+        all_lp_arr,
+        all_v_arr,
+        all_ret_arr,
+        all_adv_arr,
+        wcursor,
         device=device,
         aggr_bonus_total_bb=aggr_bonus_total_bb,
         aggr_steps_total=aggr_steps_total,

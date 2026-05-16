@@ -6,6 +6,8 @@ import copy
 import random
 from typing import Any
 
+from torch.profiler import record_function
+
 from plo5bp.network import ActorCritic
 
 
@@ -17,10 +19,11 @@ class OpponentPool:
         self.snapshots: list[dict[str, Any]] = []
 
     def snapshot(self, model: ActorCritic) -> None:
-        sd = {k: v.detach().clone().cpu() for k, v in model.state_dict().items()}
-        if len(self.snapshots) >= self.capacity:
-            self.snapshots.pop(0)
-        self.snapshots.append(sd)
+        with record_function("step14/pool_snapshot"):
+            sd = {k: v.detach().clone().cpu() for k, v in model.state_dict().items()}
+            if len(self.snapshots) >= self.capacity:
+                self.snapshots.pop(0)
+            self.snapshots.append(sd)
 
     def sample(self) -> dict[str, Any] | None:
         if not self.snapshots:

@@ -28,6 +28,14 @@ _*.png
 _*.log
 _diag_*/
 debug_*.png
+ui.log
+
+# Claude Code workspace state (plans/memory live elsewhere)
+.claude/
+
+# Backup files
+*.bak
+*.bak.*
 
 # Editor / OS
 .vscode/

@@ -954,8 +954,7 @@ impl GameState {
         const QUARTER_OPP: usize = 1;
         const SCOOP_HERO: usize = 2;
         const QUARTER_HERO: usize = 3;
-        const MC_THRESHOLD: usize = 10_000;
-        const MC_SAMPLES_K4: usize = 1024;
+        const MC_SAMPLES: usize = 1024;
 
         let hero_seat = match self.actor {
             Some(s) => s,
@@ -1037,13 +1036,14 @@ impl GameState {
         };
 
         for (idx_k, &k) in [2usize, 3, 4].iter().enumerate() {
-            let total = n_choose_k(n_unseen, k);
             let mut counters = [0u32; 4];
             let mut samples: u32 = 0;
 
-            // k=2,3 exhaustive at any street (within MC_THRESHOLD).
-            // k=4 falls back to MC.
-            if total <= MC_THRESHOLD {
+            // k=2 exhaustive (C(<=41, 2) <= 820 is cheap); k=3,4 always
+            // MC. Previously k=3 was exhaustive at turn+river (C(39,3) and
+            // C(37,3) both <= 10k), but that's ~18k evals/env vs ~2k for
+            // MC=1024 — dominated bundle cost.
+            if k == 2 {
                 let mut idx: Vec<usize> = (0..k).collect();
                 loop {
                     opp_buf.clear();
@@ -1052,7 +1052,6 @@ impl GameState {
                     }
                     classify(&opp_buf, &self.board_a, &self.board_b, &mut counters);
                     samples += 1;
-                    // Advance to next combination.
                     let mut pos = k;
                     let advanced = loop {
                         if pos == 0 {
@@ -1072,10 +1071,8 @@ impl GameState {
                     }
                 }
             } else {
-                // MC: rejection sampling with a 64-bit mask
-                // (n_unseen ≤ 41 ≤ 64).
                 debug_assert!(n_unseen <= 64);
-                for _ in 0..MC_SAMPLES_K4 {
+                for _ in 0..MC_SAMPLES {
                     let mut mask: u64 = 0;
                     opp_buf.clear();
                     let mut written = 0;
@@ -1320,20 +1317,6 @@ impl GameState {
         self.street = Street::Showdown;
         self.actor = None;
     }
-}
-
-/// Compute `C(n, k)`. Returns 0 when `k > n`. Saturates at `usize::MAX`
-/// on overflow (only relevant for very large k that we don't use here).
-fn n_choose_k(n: usize, k: usize) -> usize {
-    if k > n {
-        return 0;
-    }
-    let k = k.min(n - k);
-    let mut result: usize = 1;
-    for i in 0..k {
-        result = result.saturating_mul(n - i) / (i + 1);
-    }
-    result
 }
 
 /// Per-seat hand-start effective-stack cap. For seat `i`:

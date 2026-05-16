@@ -31,5 +31,21 @@ fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
         crate::bindings::compute_aggression_bonus_batch,
         m
     )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        crate::bindings::straight_flush_features_batch,
+        m
+    )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        crate::bindings::cross_board_straight_batch,
+        m
+    )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        crate::bindings::draw_flags_batch,
+        m
+    )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        crate::bindings::pair_features_batch,
+        m
+    )?)?;
     Ok(())
 }

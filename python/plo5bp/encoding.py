@@ -89,6 +89,12 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from plo5bp._engine import (  # type: ignore[attr-defined]
+    cross_board_straight_batch as _rust_cross_board_straight,
+    draw_flags_batch as _rust_draw_flags,
+    pair_features_batch as _rust_pair_features,
+    straight_flush_features_batch as _rust_sf_features,
+)
 from plo5bp.actions import CHECK_CALL, FOLD
 from plo5bp.config import GameConfig
 
@@ -243,6 +249,74 @@ def _cross_board_straight(
     )
     mixed = bool(mixed_pairs)
     return float(made_both), float(draw_both), float(mixed)
+
+
+# Bitmasks reused by `_cross_board_straight_batch`. Built at import.
+_PAIR_BITS_13 = np.array(
+    [(1 << r1) | (1 << r2) for r1 in range(13) for r2 in range(r1 + 1, 13)],
+    dtype=np.uint16,
+)  # (78,) — every 2-rank subset of {0..12}.
+_WINDOW_BITS_13 = np.array(
+    [sum(1 << r for r in W) for W in _STRAIGHT_WINDOWS],
+    dtype=np.uint16,
+)  # (10,)
+_RANK_WEIGHTS_13 = (1 << np.arange(13, dtype=np.uint16)).astype(np.uint16)
+
+
+def _cross_board_straight_batch(
+    hole_rank_mask: np.ndarray,
+    ba_rank_mask: np.ndarray,
+    bb_rank_mask: np.ndarray,
+    valid: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Vectorized `_cross_board_straight` over all envs.
+
+    Inputs are `(n, 13)` bool rank-presence masks plus `(n,)` bool gate
+    that is True only when both boards have at least one visible card
+    (matches the scalar's `if not board_a_idx or not board_b_idx`
+    short-circuit). Returns three `(n,)` float32 arrays:
+    `(made_both, draw_both, mixed)`.
+
+    Pairs are encoded as 78 13-bit masks; windows as 10 13-bit masks.
+    `np.bitwise_count` lets `cov` reduce to a popcount over `pair |
+    (board & window)`, so the per-env / per-window / per-pair classifier
+    is a few `(n, 78)` boolean reductions.
+    """
+    n = hole_rank_mask.shape[0]
+    hero_bits = (hole_rank_mask.astype(np.uint16) * _RANK_WEIGHTS_13).sum(axis=1).astype(np.uint16)
+    ba_bits = (ba_rank_mask.astype(np.uint16) * _RANK_WEIGHTS_13).sum(axis=1).astype(np.uint16)
+    bb_bits = (bb_rank_mask.astype(np.uint16) * _RANK_WEIGHTS_13).sum(axis=1).astype(np.uint16)
+
+    hero_has_pair = (hero_bits[:, None] & _PAIR_BITS_13[None, :]) == _PAIR_BITS_13[None, :]
+    made_a = np.zeros((n, _PAIR_BITS_13.shape[0]), dtype=bool)
+    draw_a = np.zeros((n, _PAIR_BITS_13.shape[0]), dtype=bool)
+    made_b = np.zeros((n, _PAIR_BITS_13.shape[0]), dtype=bool)
+    draw_b = np.zeros((n, _PAIR_BITS_13.shape[0]), dtype=bool)
+    for w_idx in range(_WINDOW_BITS_13.shape[0]):
+        W = _WINDOW_BITS_13[w_idx]
+        pair_in_W = (_PAIR_BITS_13 & W) == _PAIR_BITS_13
+        if not pair_in_W.any():
+            continue
+        ba_W = (ba_bits & W).astype(np.uint16)
+        bb_W = (bb_bits & W).astype(np.uint16)
+        cov_a = np.bitwise_count(ba_W[:, None] | _PAIR_BITS_13[None, :])
+        cov_b = np.bitwise_count(bb_W[:, None] | _PAIR_BITS_13[None, :])
+        gate = hero_has_pair & pair_in_W[None, :]
+        made_a |= (cov_a >= 5) & gate
+        draw_a |= (cov_a == 4) & gate
+        made_b |= (cov_b >= 5) & gate
+        draw_b |= (cov_b == 4) & gate
+
+    draw_only_a = draw_a & ~made_a
+    draw_only_b = draw_b & ~made_b
+    made_both = (made_a & made_b).any(axis=1) & valid
+    draw_both = (draw_only_a & draw_only_b).any(axis=1) & valid
+    mixed = ((made_a & draw_only_b) | (made_b & draw_only_a)).any(axis=1) & valid
+    return (
+        made_both.astype(np.float32),
+        draw_both.astype(np.float32),
+        mixed.astype(np.float32),
+    )
 
 
 def _cross_board_features(
@@ -1245,16 +1319,14 @@ def encode_observation_batch(
             out[rows, off + cats[rows]] = 1.0
 
     # Draw flags.
-    f_a, s_a = _draw_flags_batch(hole, ba)
-    f_b, s_b = _draw_flags_batch(hole, bb)
+    f_a, s_a, f_b, s_b = _rust_draw_flags(hole, ba, bb)
     out[live_mask, _DRAW_A_OFF + 0] = f_a[live_mask]
     out[live_mask, _DRAW_A_OFF + 1] = s_a[live_mask]
     out[live_mask, _DRAW_B_OFF + 0] = f_b[live_mask]
     out[live_mask, _DRAW_B_OFF + 1] = s_b[live_mask]
 
     # Pair-with-board counts + board pair structure.
-    counts_a, struct_a = _pair_features_batch(hole, ba)
-    counts_b, struct_b = _pair_features_batch(hole, bb)
+    counts_a, struct_a, counts_b, struct_b = _rust_pair_features(hole, ba, bb)
     out[live_mask, _PAIR_COUNT_A_OFF : _PAIR_COUNT_A_OFF + 5] = counts_a[live_mask]
     out[live_mask, _PAIR_COUNT_B_OFF : _PAIR_COUNT_B_OFF + 5] = counts_b[live_mask]
     out[live_mask, _BOARD_STRUCT_A_OFF : _BOARD_STRUCT_A_OFF + 4] = struct_a[live_mask]
@@ -1272,18 +1344,18 @@ def encode_observation_batch(
     out[live_mask, _HERO_RANK_HIST_OFF : _HERO_RANK_HIST_OFF + 13] = hist[live_mask]
 
     # Straight / flush / SF block — needs (N, 13, 4) cross-board visibility.
+    # Flatten the per-slot loop: one fancy-index assignment per source.
     visible_count_batch = np.zeros((n, 13, 4), dtype=np.int8)
     for src in (hole, ba, bb):
-        valid = src < 52
-        for k in range(5):
-            vk = valid[:, k]
-            if vk.any():
-                idx = np.nonzero(vk)[0]
-                rk = (src[vk, k] >> 2).astype(np.int64)
-                sk = (src[vk, k] & 3).astype(np.int64)
-                visible_count_batch[idx, rk, sk] = 1
-    sf_a = _straight_flush_features_batch(hole, ba, visible_count_batch)
-    sf_b = _straight_flush_features_batch(hole, bb, visible_count_batch)
+        src_valid = src < 52
+        if not src_valid.any():
+            continue
+        env_idx, slot_idx = np.nonzero(src_valid)
+        cards = src[env_idx, slot_idx]
+        rk = (cards >> 2).astype(np.intp)
+        sk = (cards & 3).astype(np.intp)
+        visible_count_batch[env_idx, rk, sk] = 1
+    sf_a, sf_b = _rust_sf_features(hole, ba, bb, visible_count_batch)
     out[live_mask, _FLUSH_NUT_DIST_A_OFF : _FLUSH_NUT_DIST_A_OFF + 38] = sf_a[
         live_mask
     ]
@@ -1324,11 +1396,9 @@ def encode_observation_batch(
         btn_rel = (button[rows] - hero_idx[rows]) % num_seats
         out[rows, _HERO_BTN_DIST_OFF + btn_rel] = 1.0
 
-    # Cross-board interactions. The shared-rank mask + per-suit hero-involved
-    # flush blocks vectorize cleanly. Cross-board straight is bounded but
-    # awkward to vectorize (per-pair / per-window set ops); fall back to the
-    # scalar helper per live env — bit-exact with the scalar path by
-    # construction.
+    # Cross-board interactions. Shared-rank mask, per-suit hero-involved
+    # flush blocks, and the cross-board straight indicators all vectorize
+    # via 13-bit rank-presence masks per env.
     hole_valid = hole < 52
     ba_valid = ba < 52
     bb_valid = bb < 52
@@ -1336,9 +1406,13 @@ def encode_observation_batch(
     ba_ranks_idx = np.where(ba_valid, ba >> 2, 0)
     bb_ranks_idx = np.where(bb_valid, bb >> 2, 0)
 
+    hole_rank_mask = np.zeros((n, 13), dtype=bool)
     ba_rank_mask = np.zeros((n, 13), dtype=bool)
     bb_rank_mask = np.zeros((n, 13), dtype=bool)
     for k in range(5):
+        vh = hole_valid[:, k]
+        if vh.any():
+            hole_rank_mask[np.nonzero(vh)[0], hole_ranks_idx[vh, k]] = True
         va = ba_valid[:, k]
         if va.any():
             ba_rank_mask[np.nonzero(va)[0], ba_ranks_idx[va, k]] = True
@@ -1382,15 +1456,13 @@ def encode_observation_batch(
     ].astype(np.float32)
 
     if live_mask.any():
-        live_rows = np.nonzero(live_mask)[0]
-        for i in live_rows:
-            hole_list_i = [int(c) for c in hole[i] if c < 52]
-            ba_list_i = [int(c) for c in ba[i] if c < 52]
-            bb_list_i = [int(c) for c in bb[i] if c < 52]
-            md, dr, mx = _cross_board_straight(hole_list_i, ba_list_i, bb_list_i)
-            out[i, _STRAIGHT_MADE_BOTH_OFF] = md
-            out[i, _STRAIGHT_DRAW_BOTH_OFF] = dr
-            out[i, _STRAIGHT_MIXED_OFF] = mx
+        boards_visible = ba_valid.any(axis=1) & bb_valid.any(axis=1)
+        cb_md, cb_dr, cb_mx = _rust_cross_board_straight(
+            hole_rank_mask, ba_rank_mask, bb_rank_mask, boards_visible
+        )
+        out[live_mask, _STRAIGHT_MADE_BOTH_OFF] = cb_md[live_mask]
+        out[live_mask, _STRAIGHT_DRAW_BOTH_OFF] = cb_dr[live_mask]
+        out[live_mask, _STRAIGHT_MIXED_OFF] = cb_mx[live_mask]
 
     opp_fr = obs_arrays.get("opp_outcome_fractions")
     if opp_fr is not None:

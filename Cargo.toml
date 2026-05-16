@@ -5,3 +5,8 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 rust-version = "1.75"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true

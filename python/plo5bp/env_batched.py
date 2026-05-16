@@ -21,6 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+from torch.profiler import record_function
 
 from plo5bp._engine import BatchedEngine  # type: ignore[attr-defined]
 from plo5bp.actions import (
@@ -249,29 +250,32 @@ class BatchedBombPotEnv:
 
     def _refresh(self) -> None:
         """Re-encode observations and refresh cached arrays from the engine."""
-        bundle = self._be.observation_and_features_batch()
-        actors = np.asarray(bundle["actor"], dtype=np.int8)
-        dones = actors == -1
+        with record_function("step1a_bundle/obs_features_batch"):
+            bundle = self._be.observation_and_features_batch()
+        with record_function("step1a_unpack/actor"):
+            actors = np.asarray(bundle["actor"], dtype=np.int8)
+            dones = actors == -1
+            cat_a = np.asarray(bundle["hero_cat_a"])
+            cat_b = np.asarray(bundle["hero_cat_b"])
 
-        cat_a = np.asarray(bundle["hero_cat_a"])
-        cat_b = np.asarray(bundle["hero_cat_b"])
-
-        self._obs = encode_observation_batch(
-            bundle, cat_a, cat_b, self.config
-        )
-        self._legal = np.asarray(bundle["legal_mask"], dtype=bool)
-        self._min_raise = np.asarray(bundle["min_raise"], dtype=np.uint64)
-        self._max_raise = np.asarray(bundle["max_raise"], dtype=np.uint64)
-        self._gate_mask = gate_mask_from_bounds(self._legal, self._max_raise)
-        # Terminal envs: zero everything so downstream code can rely on
-        # "dones → no legal action".
-        self._gate_mask[dones] = False
-        self._actors = actors
-        self._dones = dones
-        self._total_commit = np.asarray(bundle["total_commit"], dtype=np.int64)
-        self._bet_to_call = np.asarray(bundle["bet_to_call"], dtype=np.uint64)
-        self._street_commit = np.asarray(bundle["street_commit"], dtype=np.uint64)
-        self._street = np.asarray(bundle["street"], dtype=np.uint8)
+        with record_function("step1/encoder"):
+            self._obs = encode_observation_batch(
+                bundle, cat_a, cat_b, self.config
+            )
+        with record_function("step1a_unpack/post"):
+            self._legal = np.asarray(bundle["legal_mask"], dtype=bool)
+            self._min_raise = np.asarray(bundle["min_raise"], dtype=np.uint64)
+            self._max_raise = np.asarray(bundle["max_raise"], dtype=np.uint64)
+            self._gate_mask = gate_mask_from_bounds(self._legal, self._max_raise)
+            # Terminal envs: zero everything so downstream code can rely on
+            # "dones → no legal action".
+            self._gate_mask[dones] = False
+            self._actors = actors
+            self._dones = dones
+            self._total_commit = np.asarray(bundle["total_commit"], dtype=np.int64)
+            self._bet_to_call = np.asarray(bundle["bet_to_call"], dtype=np.uint64)
+            self._street_commit = np.asarray(bundle["street_commit"], dtype=np.uint64)
+            self._street = np.asarray(bundle["street"], dtype=np.uint8)
 
     # ------------------------------------------------------------------
     # Read-only accessors mirroring the scalar env's helpers.

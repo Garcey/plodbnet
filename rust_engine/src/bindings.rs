@@ -2,7 +2,9 @@
 //! Python environment and training loop.
 
 use numpy::ndarray::{Array1, Array2};
-use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+use numpy::{
+    IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3,
+};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -766,6 +768,7 @@ impl PyBatchedEngine {
         let mask_vec: Vec<bool> = mask_slice.to_vec();
         let new_states: Vec<Option<GameState>> = py.allow_threads(move || {
             (0..n)
+                .into_par_iter()
                 .map(|i| {
                     if mask_vec[i] {
                         Some(GameState::new_hand(
@@ -939,29 +942,29 @@ impl PyBatchedEngine {
         }
         let gates_vec: Vec<u8> = gates_slice.to_vec();
         let chips_vec: Vec<u64> = chips_slice.to_vec();
-        let terminal: Array1<bool> = py.allow_threads(|| {
-            let mut term = Array1::<bool>::default(n);
-            for i in 0..n {
-                let state = self.states[i].as_mut().expect("validated above");
-                if state.is_terminal() {
-                    term[i] = false;
-                    continue;
-                }
-                match gates_vec[i] {
-                    0 => state.apply(Action::Fold),
-                    1 => state.apply(Action::CheckCall),
-                    2 => state
-                        .apply_raise_chips(chips_vec[i])
-                        .expect("validated above"),
-                    3 => state.apply(Action::AllIn),
-                    _ => unreachable!(),
-                }
-                if state.is_terminal() {
-                    term[i] = true;
-                }
-            }
-            term
+        let term_vec: Vec<bool> = py.allow_threads(|| {
+            self.states
+                .par_iter_mut()
+                .enumerate()
+                .map(|(i, state_opt)| {
+                    let state = state_opt.as_mut().expect("validated above");
+                    if state.is_terminal() {
+                        return false;
+                    }
+                    match gates_vec[i] {
+                        0 => state.apply(Action::Fold),
+                        1 => state.apply(Action::CheckCall),
+                        2 => state
+                            .apply_raise_chips(chips_vec[i])
+                            .expect("validated above"),
+                        3 => state.apply(Action::AllIn),
+                        _ => unreachable!(),
+                    }
+                    state.is_terminal()
+                })
+                .collect()
         });
+        let terminal = Array1::from_vec(term_vec);
         Ok(terminal.into_pyarray(py))
     }
 
@@ -1090,16 +1093,19 @@ impl PyBatchedEngine {
     fn payouts_batch<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<i64>>> {
         let n = self.states.len();
         let s = self.config.num_seats;
+        let states_ref = &self.states;
         let arr: Array2<i64> = py.allow_threads(|| {
+            let rows: Vec<Vec<i64>> = states_ref
+                .par_iter()
+                .map(|state_opt| match state_opt.as_ref() {
+                    Some(state) if state.is_terminal() => state.payouts(),
+                    _ => vec![0i64; s],
+                })
+                .collect();
             let mut arr = Array2::<i64>::zeros((n, s));
-            for i in 0..n {
-                if let Some(state) = self.states[i].as_ref() {
-                    if state.is_terminal() {
-                        let p = state.payouts();
-                        for k in 0..s {
-                            arr[[i, k]] = p[k];
-                        }
-                    }
+            for (i, row) in rows.iter().enumerate() {
+                for k in 0..s {
+                    arr[[i, k]] = row[k];
                 }
             }
             arr
@@ -1127,16 +1133,22 @@ impl PyBatchedEngine {
             )));
         }
         let seeds_vec: Vec<u64> = seeds_slice.to_vec();
+        let states_ref = &self.states;
         let arr: Array2<i64> = py.allow_threads(move || {
-            let mut arr = Array2::<i64>::zeros((n, s));
-            for i in 0..n {
-                if let Some(state) = self.states[i].as_ref() {
-                    if state.is_terminal() {
-                        let p = state.payouts_ev(num_samples, seeds_vec[i]);
-                        for k in 0..s {
-                            arr[[i, k]] = p[k];
-                        }
+            let rows: Vec<Vec<i64>> = states_ref
+                .par_iter()
+                .enumerate()
+                .map(|(i, state_opt)| match state_opt.as_ref() {
+                    Some(state) if state.is_terminal() => {
+                        state.payouts_ev(num_samples, seeds_vec[i])
                     }
+                    _ => vec![0i64; s],
+                })
+                .collect();
+            let mut arr = Array2::<i64>::zeros((n, s));
+            for (i, row) in rows.iter().enumerate() {
+                for k in 0..s {
+                    arr[[i, k]] = row[k];
                 }
             }
             arr
@@ -1424,62 +1436,144 @@ impl PyBatchedEngine {
             }
         }
 
-        for i in 0..n {
+        // Per-env packing in parallel: each row pulls scalars + s seat
+        // fields + up to HISTORY_CAP history entries from its state and
+        // writes directly into the output ndarrays via raw pointers.
+        // Each iteration owns a disjoint row slice (row stride = s for
+        // seat fields, HISTORY_CAP for history, 5 for cards), so the
+        // writes never alias. No intermediate Vec allocations.
+        struct OutPtrs {
+            hero_hole: *mut u8,
+            board_a: *mut u8,
+            board_b: *mut u8,
+            board_a_len: *mut u8,
+            board_b_len: *mut u8,
+            street: *mut u8,
+            pot: *mut u64,
+            stacks: *mut u64,
+            folded: *mut bool,
+            all_in: *mut bool,
+            bet_to_call: *mut u64,
+            street_commit: *mut u64,
+            total_commit: *mut u64,
+            min_bet: *mut u64,
+            max_bet: *mut u64,
+            min_raise: *mut u64,
+            max_raise: *mut u64,
+            eff_stack_cap: *mut u64,
+            actor: *mut i8,
+            button: *mut u8,
+            last_aggressor: *mut i8,
+            history_seat: *mut i8,
+            history_action: *mut i8,
+            history_chips: *mut u64,
+            history_street: *mut i8,
+            history_len: *mut u8,
+        }
+        unsafe impl Send for OutPtrs {}
+        unsafe impl Sync for OutPtrs {}
+
+        let ptrs = OutPtrs {
+            hero_hole: hero_hole.as_mut_ptr(),
+            board_a: board_a.as_mut_ptr(),
+            board_b: board_b.as_mut_ptr(),
+            board_a_len: board_a_len.as_mut_ptr(),
+            board_b_len: board_b_len.as_mut_ptr(),
+            street: street.as_mut_ptr(),
+            pot: pot.as_mut_ptr(),
+            stacks: stacks.as_mut_ptr(),
+            folded: folded.as_mut_ptr(),
+            all_in: all_in.as_mut_ptr(),
+            bet_to_call: bet_to_call.as_mut_ptr(),
+            street_commit: street_commit.as_mut_ptr(),
+            total_commit: total_commit.as_mut_ptr(),
+            min_bet: min_bet.as_mut_ptr(),
+            max_bet: max_bet.as_mut_ptr(),
+            min_raise: min_raise.as_mut_ptr(),
+            max_raise: max_raise.as_mut_ptr(),
+            eff_stack_cap: eff_stack_cap.as_mut_ptr(),
+            actor: actor.as_mut_ptr(),
+            button: button.as_mut_ptr(),
+            last_aggressor: last_aggressor.as_mut_ptr(),
+            history_seat: history_seat.as_mut_ptr(),
+            history_action: history_action.as_mut_ptr(),
+            history_chips: history_chips.as_mut_ptr(),
+            history_street: history_street.as_mut_ptr(),
+            history_len: history_len.as_mut_ptr(),
+        };
+
+        (0..n).into_par_iter().for_each(|i| {
+            // Force the closure to capture `ptrs` as a whole binding
+            // rather than as disjoint fields. Otherwise Rust 2021's
+            // disjoint capture rules pick up each `*mut T` field
+            // individually, which is `!Sync` despite the unsafe Sync
+            // impl on the wrapping struct.
+            let ptrs = &ptrs;
             let state = match self.states[i].as_ref() {
-                Some(s) => s,
-                None => continue,
+                Some(state) => state,
+                None => return,
             };
-            street[i] = state.street.index() as u8;
-            pot[i] = state.pot;
-            bet_to_call[i] = state.bet_to_call;
-            min_bet[i] = state.min_bet_total();
-            max_bet[i] = state.max_bet_total();
-            min_raise[i] = state.min_raise_chips();
-            max_raise[i] = state.max_raise_chips();
-            button[i] = state.button as u8;
-            last_aggressor[i] = state.last_aggressor.map(|s| s as i8).unwrap_or(-1);
-            let a_opt = state.current_actor();
-            if let Some(a) = a_opt {
-                actor[i] = a as i8;
-                for (j, c) in state.hole_cards[a].iter().enumerate() {
-                    hero_hole[[i, j]] = c.index();
+            // SAFETY: every write below indexes into a disjoint slice
+            // of its target array (row i for 1D arrays; row stride
+            // {5, s, HISTORY_CAP} for 2D arrays). No two parallel
+            // iterations touch the same byte. All output buffers are
+            // C-contiguous (default ndarray layout).
+            unsafe {
+                *ptrs.street.add(i) = state.street.index() as u8;
+                *ptrs.pot.add(i) = state.pot;
+                *ptrs.bet_to_call.add(i) = state.bet_to_call;
+                *ptrs.min_bet.add(i) = state.min_bet_total();
+                *ptrs.max_bet.add(i) = state.max_bet_total();
+                *ptrs.min_raise.add(i) = state.min_raise_chips();
+                *ptrs.max_raise.add(i) = state.max_raise_chips();
+                *ptrs.button.add(i) = state.button as u8;
+                *ptrs.last_aggressor.add(i) =
+                    state.last_aggressor.map(|s| s as i8).unwrap_or(-1);
+
+                if let Some(a) = state.current_actor() {
+                    *ptrs.actor.add(i) = a as i8;
+                    let hole_base = i * 5;
+                    for (j, c) in state.hole_cards[a].iter().enumerate() {
+                        *ptrs.hero_hole.add(hole_base + j) = c.index();
+                    }
+                }
+
+                let la = state.board_a.len().min(5);
+                let lb = state.board_b.len().min(5);
+                *ptrs.board_a_len.add(i) = la as u8;
+                *ptrs.board_b_len.add(i) = lb as u8;
+                let ba_base = i * 5;
+                for j in 0..la {
+                    *ptrs.board_a.add(ba_base + j) = state.board_a[j].index();
+                }
+                for j in 0..lb {
+                    *ptrs.board_b.add(ba_base + j) = state.board_b[j].index();
+                }
+
+                let seat_base = i * s;
+                for k in 0..s {
+                    *ptrs.stacks.add(seat_base + k) = state.stacks[k];
+                    *ptrs.folded.add(seat_base + k) = state.folded[k];
+                    *ptrs.all_in.add(seat_base + k) = state.all_in[k];
+                    *ptrs.street_commit.add(seat_base + k) = state.street_commit[k];
+                    *ptrs.total_commit.add(seat_base + k) = state.total_commit[k];
+                    *ptrs.eff_stack_cap.add(seat_base + k) =
+                        state.eff_stack_cap_at_hand_start[k];
+                }
+
+                let hist_len = state.history.len();
+                let start = hist_len.saturating_sub(HISTORY_CAP);
+                let kept = hist_len - start;
+                *ptrs.history_len.add(i) = kept as u8;
+                let hist_base = i * HISTORY_CAP;
+                for (slot, rec) in state.history[start..].iter().enumerate() {
+                    *ptrs.history_seat.add(hist_base + slot) = rec.seat as i8;
+                    *ptrs.history_action.add(hist_base + slot) = rec.action.index() as i8;
+                    *ptrs.history_chips.add(hist_base + slot) = rec.chips;
+                    *ptrs.history_street.add(hist_base + slot) = rec.street.index() as i8;
                 }
             }
-            let la = state.board_a.len().min(5);
-            let lb = state.board_b.len().min(5);
-            board_a_len[i] = la as u8;
-            board_b_len[i] = lb as u8;
-            for j in 0..la {
-                board_a[[i, j]] = state.board_a[j].index();
-            }
-            for j in 0..lb {
-                board_b[[i, j]] = state.board_b[j].index();
-            }
-            for k in 0..s {
-                stacks[[i, k]] = state.stacks[k];
-                folded[[i, k]] = state.folded[k];
-                all_in[[i, k]] = state.all_in[k];
-                street_commit[[i, k]] = state.street_commit[k];
-                total_commit[[i, k]] = state.total_commit[k];
-                eff_stack_cap[[i, k]] = state.eff_stack_cap_at_hand_start[k];
-            }
-            // Keep the last HISTORY_CAP entries oldest-first, matching the
-            // scalar encoder's slice semantics.
-            let hist_len = state.history.len();
-            let start = if hist_len > HISTORY_CAP {
-                hist_len - HISTORY_CAP
-            } else {
-                0
-            };
-            let kept = hist_len - start;
-            history_len[i] = kept as u8;
-            for (slot, rec) in state.history[start..].iter().enumerate() {
-                history_seat[[i, slot]] = rec.seat as i8;
-                history_action[[i, slot]] = rec.action.index() as i8;
-                history_chips[[i, slot]] = rec.chips;
-                history_street[[i, slot]] = rec.street.index() as i8;
-            }
-        }
+        });
 
         PackedObservation {
             hero_hole,
@@ -1510,5 +1604,1114 @@ impl PyBatchedEngine {
             history_len,
             opp_outcome_fractions,
         }
+    }
+}
+
+// =============================================================================
+// Straight / flush / SF features (vectorized port of
+// `_straight_flush_features_batch` in python/plo5bp/encoding.py).
+// =============================================================================
+
+const SF_RANK_MASK_13: u16 = 0x1FFF;
+
+// 10 straight windows; each is a 13-bit mask over ranks. Window 0 is the
+// wheel (A-2-3-4-5 = ranks {12,0,1,2,3}); window 9 is the broadway
+// (T-J-Q-K-A = ranks {8,9,10,11,12}).
+const SF_W_MASKS: [u16; 10] = [
+    0x100F, 0x001F, 0x003E, 0x007C, 0x00F8, 0x01F0, 0x03E0, 0x07C0, 0x0F80, 0x1F00,
+];
+
+#[inline]
+fn sf_ranks_above(h_max: i8) -> u16 {
+    // 13-bit mask of ranks r where r > h_max.
+    if h_max < 0 {
+        SF_RANK_MASK_13
+    } else if h_max >= 12 {
+        0
+    } else {
+        let cutoff = (h_max + 1) as u32;
+        SF_RANK_MASK_13 & !((1u16 << cutoff) - 1)
+    }
+}
+
+#[inline]
+fn sf_derive_card_state(row: &[u8]) -> (u16, [u16; 4], [u8; 4], [i8; 4]) {
+    // Returns (rank_mask, rank_suit_per_suit, suit_count, max_rank_per_suit).
+    let mut rank_mask: u16 = 0;
+    let mut rank_suit: [u16; 4] = [0; 4];
+    let mut suit_count: [u8; 4] = [0; 4];
+    let mut max_per_suit: [i8; 4] = [-1, -1, -1, -1];
+    for &c in row {
+        if c < 52 {
+            let r = (c >> 2) as usize; // 0..13
+            let s = (c & 3) as usize;  // 0..4
+            rank_mask |= 1u16 << r;
+            rank_suit[s] |= 1u16 << r;
+            suit_count[s] += 1;
+            if (r as i8) > max_per_suit[s] {
+                max_per_suit[s] = r as i8;
+            }
+        }
+    }
+    (rank_mask, rank_suit, suit_count, max_per_suit)
+}
+
+#[inline]
+fn sf_compute_board(
+    hole_rank_mask: u16,
+    hole_rank_suit: &[u16; 4],
+    hole_suit_count: &[u8; 4],
+    hole_max_per_suit: &[i8; 4],
+    board_row: &[u8],
+    vct: &[u8; 13],
+    unseen_suit: &[u16; 4],
+    visible_per_suit: &[u8; 4],
+    out: &mut [f32],
+) {
+    debug_assert!(out.len() >= 38);
+
+    let (board_rm, board_rs, board_sc, _) = sf_derive_card_state(board_row);
+
+    let mut makes_window: [bool; 10] = [false; 10];
+    let mut straight_outs: [u32; 10] = [0; 10];
+    let mut straight_possible: [u32; 10] = [0; 10];
+    let mut sf_cand: [u16; 4] = [0; 4];
+
+    for (w_i, &w_mask) in SF_W_MASKS.iter().enumerate() {
+        // Suit-agnostic straight in this window.
+        let b_w = board_rm & w_mask;
+        let h_w = hole_rank_mask & w_mask;
+        let l_mask = w_mask & !board_rm;
+        let m_mask = l_mask & !hole_rank_mask;
+        let n_b_w = b_w.count_ones();
+        let n_h_w = h_w.count_ones();
+        let n_l = l_mask.count_ones();
+        let n_m = m_mask.count_ones();
+
+        let makes = n_m == 0 && n_h_w >= 2 && n_l <= 2;
+        makes_window[w_i] = makes;
+        if n_b_w >= 3 {
+            straight_possible[w_i] = 1;
+        }
+
+        let gate = !makes && n_h_w >= 2;
+        let cond_3_0 = n_l == 3 && n_m == 0 && gate;
+        let cond_m1 = n_m == 1 && (1..=3).contains(&n_l) && gate;
+        if cond_3_0 {
+            let mut total: u32 = 0;
+            let mut bits = l_mask;
+            while bits != 0 {
+                let r = bits.trailing_zeros() as usize;
+                total += 4u32 - vct[r] as u32;
+                bits &= bits - 1;
+            }
+            straight_outs[w_i] = total;
+        } else if cond_m1 {
+            let r = m_mask.trailing_zeros() as usize;
+            straight_outs[w_i] = 4u32 - vct[r] as u32;
+        }
+
+        // Suit-restricted (SF) per-suit candidates for this window.
+        for s in 0..4 {
+            let h_s = hole_rank_suit[s] & w_mask;
+            let l_s = w_mask & !board_rs[s];
+            let m_s = l_s & !hole_rank_suit[s];
+            let n_h_s = h_s.count_ones();
+            let n_l_s = l_s.count_ones();
+            let n_m_s = m_s.count_ones();
+            let already_s = n_m_s == 0 && n_h_s >= 2 && n_l_s <= 2;
+            let gate_s = !already_s && n_h_s >= 2;
+            let cond_3_0_s = n_l_s == 3 && n_m_s == 0 && gate_s;
+            let cond_m1_s = n_m_s == 1 && (1..=3).contains(&n_l_s) && gate_s;
+            if cond_3_0_s {
+                sf_cand[s] |= l_s;
+            } else if cond_m1_s {
+                sf_cand[s] |= m_s;
+            }
+        }
+    }
+
+    // Straight nut distance: only counted when hero has a made straight.
+    let mut h_max_straight: i32 = -1;
+    for w in 0..10 {
+        if makes_window[w] {
+            h_max_straight = w as i32;
+        }
+    }
+    let any_made_straight = h_max_straight >= 0;
+    let mut straight_nut_dist: u32 = 0;
+    if any_made_straight {
+        for w in 0..10 {
+            if (w as i32) > h_max_straight && straight_possible[w] != 0 {
+                straight_nut_dist += 1;
+            }
+        }
+    }
+
+    // Flush features.
+    let mut flush_possible: [u32; 4] = [0; 4];
+    let mut flush_draw_mask: [bool; 4] = [false; 4];
+    let mut flush_draw_outs: [u32; 4] = [0; 4];
+    let mut nut_flush_draw_outs: [u32; 4] = [0; 4];
+    for s in 0..4 {
+        if board_sc[s] >= 3 {
+            flush_possible[s] = 1;
+        }
+        let is_draw = hole_suit_count[s] >= 2 && board_sc[s] == 2;
+        flush_draw_mask[s] = is_draw;
+        if is_draw {
+            flush_draw_outs[s] = 13u32 - visible_per_suit[s] as u32;
+            let above_mask = sf_ranks_above(hole_max_per_suit[s]);
+            let blockers = (unseen_suit[s] & above_mask).count_ones();
+            nut_flush_draw_outs[s] = match blockers {
+                0 => flush_draw_outs[s],
+                1 => 1,
+                _ => 0,
+            };
+        }
+    }
+
+    // Made-flush nut distance: first suit where hero has >=2 + board has >=3.
+    // At most one suit per env can satisfy (each player holds 5 cards but the
+    // numpy oracle takes argmax = first True so we preserve that ordering).
+    let mut flush_nut_dist: u32 = 0;
+    for s in 0..4 {
+        if board_sc[s] >= 3 && hole_suit_count[s] >= 2 {
+            let above_mask = sf_ranks_above(hole_max_per_suit[s]);
+            flush_nut_dist = (unseen_suit[s] & above_mask).count_ones();
+            break;
+        }
+    }
+
+    // SF outs per suit (gated by flush draw on that suit).
+    let mut sf_outs_per_suit: [u32; 4] = [0; 4];
+    for s in 0..4 {
+        if flush_draw_mask[s] {
+            sf_outs_per_suit[s] = (sf_cand[s] & unseen_suit[s]).count_ones();
+        }
+    }
+
+    out[0] = flush_nut_dist as f32;
+    out[1] = straight_nut_dist as f32;
+    for w in 0..10 {
+        out[2 + w] = straight_outs[w] as f32;
+        out[12 + w] = straight_possible[w] as f32;
+    }
+    for s in 0..4 {
+        out[22 + s] = flush_possible[s] as f32;
+        out[26 + s] = flush_draw_outs[s] as f32;
+        out[30 + s] = nut_flush_draw_outs[s] as f32;
+        out[34 + s] = sf_outs_per_suit[s] as f32;
+    }
+}
+
+#[pyfunction]
+pub fn straight_flush_features_batch<'py>(
+    py: Python<'py>,
+    hole: PyReadonlyArray2<'_, u8>,
+    board_a: PyReadonlyArray2<'_, u8>,
+    board_b: PyReadonlyArray2<'_, u8>,
+    visible_count: PyReadonlyArray3<'_, i8>,
+) -> PyResult<(Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<f32>>)> {
+    let hole_v = hole.as_array();
+    let ba_v = board_a.as_array();
+    let bb_v = board_b.as_array();
+    let vc_v = visible_count.as_array();
+
+    let n = hole_v.shape()[0];
+    if hole_v.shape() != [n, 5] {
+        return Err(PyValueError::new_err("hole shape must be (N, 5)"));
+    }
+    if ba_v.shape() != [n, 5] || bb_v.shape() != [n, 5] {
+        return Err(PyValueError::new_err(
+            "board_a and board_b shapes must be (N, 5) matching hole",
+        ));
+    }
+    if vc_v.shape() != [n, 13, 4] {
+        return Err(PyValueError::new_err(
+            "visible_count shape must be (N, 13, 4)",
+        ));
+    }
+
+    // Materialize owned copies so the parallel section runs GIL-free.
+    let hole_owned = hole_v.to_owned();
+    let ba_owned = ba_v.to_owned();
+    let bb_owned = bb_v.to_owned();
+    let vc_owned = vc_v.to_owned();
+
+    let mut sf_a = vec![0f32; n * 38];
+    let mut sf_b = vec![0f32; n * 38];
+
+    py.allow_threads(|| {
+        sf_a.par_chunks_exact_mut(38)
+            .zip(sf_b.par_chunks_exact_mut(38))
+            .enumerate()
+            .for_each(|(i, (a_out, b_out))| {
+                let hole_row = hole_owned.row(i);
+                let ba_row = ba_owned.row(i);
+                let bb_row = bb_owned.row(i);
+                let hole_slice = hole_row.as_slice().unwrap();
+                let ba_slice = ba_row.as_slice().unwrap();
+                let bb_slice = bb_row.as_slice().unwrap();
+
+                let (h_rm, h_rs, h_sc, h_mps) = sf_derive_card_state(hole_slice);
+
+                // Per-env visibility summaries derived from vc_owned[i].
+                let mut vct: [u8; 13] = [0; 13];
+                let mut unseen_suit: [u16; 4] = [0; 4];
+                let mut visible_per_suit: [u8; 4] = [0; 4];
+                for r in 0..13 {
+                    for s in 0..4 {
+                        if vc_owned[[i, r, s]] == 0 {
+                            unseen_suit[s] |= 1u16 << r;
+                        } else {
+                            vct[r] += 1;
+                            visible_per_suit[s] += 1;
+                        }
+                    }
+                }
+
+                sf_compute_board(
+                    h_rm, &h_rs, &h_sc, &h_mps,
+                    ba_slice,
+                    &vct, &unseen_suit, &visible_per_suit,
+                    a_out,
+                );
+                sf_compute_board(
+                    h_rm, &h_rs, &h_sc, &h_mps,
+                    bb_slice,
+                    &vct, &unseen_suit, &visible_per_suit,
+                    b_out,
+                );
+            });
+    });
+
+    let sf_a_arr = Array2::from_shape_vec((n, 38), sf_a)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sf_b_arr = Array2::from_shape_vec((n, 38), sf_b)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    Ok((sf_a_arr.into_pyarray(py), sf_b_arr.into_pyarray(py)))
+}
+
+#[cfg(test)]
+mod sf_tests {
+    use super::*;
+
+    fn build_vc(hole: &[u8], boards: &[&[u8]]) -> [[i8; 4]; 13] {
+        let mut vc = [[0i8; 4]; 13];
+        for &c in hole.iter().chain(boards.iter().flat_map(|b| b.iter())) {
+            if c < 52 {
+                let r = (c >> 2) as usize;
+                let s = (c & 3) as usize;
+                vc[r][s] = 1;
+            }
+        }
+        vc
+    }
+
+    fn summarize_vc(vc: &[[i8; 4]; 13]) -> ([u8; 13], [u16; 4], [u8; 4]) {
+        let mut vct = [0u8; 13];
+        let mut unseen = [0u16; 4];
+        let mut vps = [0u8; 4];
+        for r in 0..13 {
+            for s in 0..4 {
+                if vc[r][s] == 0 {
+                    unseen[s] |= 1u16 << r;
+                } else {
+                    vct[r] += 1;
+                    vps[s] += 1;
+                }
+            }
+        }
+        (vct, unseen, vps)
+    }
+
+    fn run_one(hole: &[u8], board_a: &[u8], board_b: &[u8]) -> ([f32; 38], [f32; 38]) {
+        let vc = build_vc(hole, &[board_a, board_b]);
+        let (vct, unseen, vps) = summarize_vc(&vc);
+        let mut hole_arr = [255u8; 5];
+        let mut ba_arr = [255u8; 5];
+        let mut bb_arr = [255u8; 5];
+        for (i, &c) in hole.iter().enumerate().take(5) { hole_arr[i] = c; }
+        for (i, &c) in board_a.iter().enumerate().take(5) { ba_arr[i] = c; }
+        for (i, &c) in board_b.iter().enumerate().take(5) { bb_arr[i] = c; }
+        let (h_rm, h_rs, h_sc, h_mps) = sf_derive_card_state(&hole_arr);
+        let mut out_a = [0f32; 38];
+        let mut out_b = [0f32; 38];
+        sf_compute_board(h_rm, &h_rs, &h_sc, &h_mps, &ba_arr, &vct, &unseen, &vps, &mut out_a);
+        sf_compute_board(h_rm, &h_rs, &h_sc, &h_mps, &bb_arr, &vct, &unseen, &vps, &mut out_b);
+        (out_a, out_b)
+    }
+
+    // Card encoding helper: rank * 4 + suit. Ranks 0..13 (2=0, A=12).
+    fn card(r: u8, s: u8) -> u8 { r * 4 + s }
+
+    #[test]
+    fn empty_inputs_produce_zero_rows() {
+        let (out_a, out_b) = run_one(&[], &[], &[]);
+        assert!(out_a.iter().all(|&x| x == 0.0));
+        assert!(out_b.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn ranks_above_edges() {
+        assert_eq!(sf_ranks_above(-1), 0x1FFF);
+        assert_eq!(sf_ranks_above(12), 0);
+        // h_max = 8 -> ranks 9..12 set: bits 9,10,11,12 = 0x1E00
+        assert_eq!(sf_ranks_above(8), 0x1E00);
+        // h_max = 0 -> ranks 1..12 set: bits 1..12 = 0x1FFE
+        assert_eq!(sf_ranks_above(0), 0x1FFE);
+    }
+
+    #[test]
+    fn broadway_made_straight_no_higher_possible() {
+        // Hole: Ac Kc (12,11 of suit 0). Board A: Q,J,T of suit 0. Board B empty.
+        // This is also a made flush — but we're checking straight features here.
+        // Straight window 9 (T-J-Q-K-A): hero has 2 (K,A), board has 3 (T,J,Q).
+        // makes_window[9] = true. Higher windows: none. straight_nut_dist = 0.
+        let hole = [card(12, 0), card(11, 0)];
+        let ba = [card(10, 0), card(9, 0), card(8, 0)]; // T,J,Q
+        let (out_a, _) = run_one(&hole, &ba, &[]);
+        // index 1 = straight_nut_dist
+        assert_eq!(out_a[1], 0.0);
+        // index 12+9 = 21 = straight_possible[9]
+        assert_eq!(out_a[21], 1.0);
+    }
+
+    #[test]
+    fn flush_draw_with_nut_blockers_reported_separately() {
+        // Hole: Th, 2h (suit 1). Board A: Ah, 5h, 9c.
+        // Hole suit-1 count = 2. Board suit-1 count = 2 -> flush draw.
+        // Highest hero heart = T (rank 8). Above-h_max unseen suit-1 cards:
+        // J,Q,K,A of hearts. Board contains Ah (rank 12, suit 1). So visible
+        // includes Ah; unseen above T are J,Q,K = 3 blockers.
+        // flush_draw_outs = 13 - visible_per_suit[1] = 13 - (Th + 2h + Ah + 5h) = 13 - 4 = 9.
+        // nut_flush_draw_outs: blockers = 3 -> 0.
+        let hole = [card(8, 1), card(0, 1)]; // Th, 2h
+        let ba = [card(12, 1), card(3, 1), card(7, 2)]; // Ah, 5h, 9c (rank 7 = 9, suit 2 = c)
+        let (out_a, _) = run_one(&hole, &ba, &[]);
+        // index 26+1 = 27 = flush_draw_outs[1]
+        assert_eq!(out_a[27], 9.0);
+        // index 30+1 = 31 = nut_flush_draw_outs[1]
+        assert_eq!(out_a[31], 0.0);
+    }
+
+    #[test]
+    fn made_flush_nut_distance_counts_higher_unseen() {
+        // Hole: Kh, Qh. Board A: 2h, 5h, 9h (three of hearts).
+        // hole suit-1 count = 2, board suit-1 count = 3 -> made flush.
+        // h_max for suit 1 = K (rank 11). Above-K unseen suit-1 cards:
+        // only Ah (rank 12). visible suit-1: Kh, Qh, 2h, 5h, 9h. Ah is unseen.
+        // flush_nut_dist = 1.
+        let hole = [card(11, 1), card(10, 1)]; // Kh, Qh
+        let ba = [card(0, 1), card(3, 1), card(7, 1)]; // 2h, 5h, 9h
+        let (out_a, _) = run_one(&hole, &ba, &[]);
+        // index 0 = flush_nut_dist
+        assert_eq!(out_a[0], 1.0);
+        // flush_possible[1] at index 22+1=23 should be 1
+        assert_eq!(out_a[23], 1.0);
+    }
+}
+
+// =============================================================================
+// Cross-board straight features (vectorized port of
+// `_cross_board_straight_batch` in python/plo5bp/encoding.py).
+// =============================================================================
+
+const fn build_pair_bits_78() -> [u16; 78] {
+    let mut out = [0u16; 78];
+    let mut idx = 0;
+    let mut r1: u16 = 0;
+    while r1 < 13 {
+        let mut r2: u16 = r1 + 1;
+        while r2 < 13 {
+            out[idx] = (1u16 << r1) | (1u16 << r2);
+            idx += 1;
+            r2 += 1;
+        }
+        r1 += 1;
+    }
+    out
+}
+
+static PAIR_BITS_78: [u16; 78] = build_pair_bits_78();
+
+const fn build_pair_in_w() -> [u128; 10] {
+    let mut out = [0u128; 10];
+    let pairs = build_pair_bits_78();
+    let mut w_idx = 0;
+    while w_idx < 10 {
+        let w = SF_W_MASKS[w_idx];
+        let mut bits: u128 = 0;
+        let mut p = 0;
+        while p < 78 {
+            if pairs[p] & w == pairs[p] {
+                bits |= 1u128 << p;
+            }
+            p += 1;
+        }
+        out[w_idx] = bits;
+        w_idx += 1;
+    }
+    out
+}
+
+static PAIR_IN_W: [u128; 10] = build_pair_in_w();
+
+#[inline]
+fn pack_rank_mask(row: &[bool]) -> u16 {
+    let mut bits: u16 = 0;
+    for (r, &b) in row.iter().enumerate().take(13) {
+        if b {
+            bits |= 1u16 << r;
+        }
+    }
+    bits
+}
+
+#[inline]
+fn cross_board_straight_per_env(
+    hero_bits: u16,
+    ba_bits: u16,
+    bb_bits: u16,
+    valid: bool,
+) -> (f32, f32, f32) {
+    if !valid {
+        return (0.0, 0.0, 0.0);
+    }
+
+    let mut hero_has_pair: u128 = 0;
+    for p in 0..78 {
+        let pb = PAIR_BITS_78[p];
+        if hero_bits & pb == pb {
+            hero_has_pair |= 1u128 << p;
+        }
+    }
+    if hero_has_pair == 0 {
+        return (0.0, 0.0, 0.0);
+    }
+
+    let mut made_a: u128 = 0;
+    let mut draw_a: u128 = 0;
+    let mut made_b: u128 = 0;
+    let mut draw_b: u128 = 0;
+
+    for w_idx in 0..10 {
+        let w = SF_W_MASKS[w_idx];
+        let gate = hero_has_pair & PAIR_IN_W[w_idx];
+        if gate == 0 {
+            continue;
+        }
+        let ba_w = ba_bits & w;
+        let bb_w = bb_bits & w;
+
+        let mut bits = gate;
+        while bits != 0 {
+            let p = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let pb = PAIR_BITS_78[p];
+            let cov_a = (ba_w | pb).count_ones();
+            let cov_b = (bb_w | pb).count_ones();
+            let pmask = 1u128 << p;
+            if cov_a >= 5 {
+                made_a |= pmask;
+            } else if cov_a == 4 {
+                draw_a |= pmask;
+            }
+            if cov_b >= 5 {
+                made_b |= pmask;
+            } else if cov_b == 4 {
+                draw_b |= pmask;
+            }
+        }
+    }
+
+    let draw_only_a = draw_a & !made_a;
+    let draw_only_b = draw_b & !made_b;
+    let made_both = (made_a & made_b) != 0;
+    let draw_both = (draw_only_a & draw_only_b) != 0;
+    let mixed = ((made_a & draw_only_b) | (made_b & draw_only_a)) != 0;
+
+    (
+        if made_both { 1.0 } else { 0.0 },
+        if draw_both { 1.0 } else { 0.0 },
+        if mixed { 1.0 } else { 0.0 },
+    )
+}
+
+#[pyfunction]
+pub fn cross_board_straight_batch<'py>(
+    py: Python<'py>,
+    hole_rank_mask: PyReadonlyArray2<'_, bool>,
+    ba_rank_mask: PyReadonlyArray2<'_, bool>,
+    bb_rank_mask: PyReadonlyArray2<'_, bool>,
+    valid: PyReadonlyArray1<'_, bool>,
+) -> PyResult<(
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<f32>>,
+)> {
+    let hole_v = hole_rank_mask.as_array();
+    let ba_v = ba_rank_mask.as_array();
+    let bb_v = bb_rank_mask.as_array();
+    let valid_v = valid.as_array();
+
+    let n = hole_v.shape()[0];
+    if hole_v.shape() != [n, 13] {
+        return Err(PyValueError::new_err("hole_rank_mask shape must be (N, 13)"));
+    }
+    if ba_v.shape() != [n, 13] || bb_v.shape() != [n, 13] {
+        return Err(PyValueError::new_err(
+            "ba_rank_mask and bb_rank_mask shapes must be (N, 13) matching hole",
+        ));
+    }
+    if valid_v.shape() != [n] {
+        return Err(PyValueError::new_err("valid shape must be (N,)"));
+    }
+
+    let hole_owned = hole_v.to_owned();
+    let ba_owned = ba_v.to_owned();
+    let bb_owned = bb_v.to_owned();
+    let valid_owned = valid_v.to_owned();
+
+    let mut made_both = vec![0f32; n];
+    let mut draw_both = vec![0f32; n];
+    let mut mixed = vec![0f32; n];
+
+    py.allow_threads(|| {
+        made_both
+            .par_iter_mut()
+            .zip(draw_both.par_iter_mut())
+            .zip(mixed.par_iter_mut())
+            .enumerate()
+            .for_each(|(i, ((md, dr), mx))| {
+                let h_bits = pack_rank_mask(hole_owned.row(i).as_slice().unwrap());
+                let a_bits = pack_rank_mask(ba_owned.row(i).as_slice().unwrap());
+                let b_bits = pack_rank_mask(bb_owned.row(i).as_slice().unwrap());
+                let v = valid_owned[i];
+                let (m, d, x) = cross_board_straight_per_env(h_bits, a_bits, b_bits, v);
+                *md = m;
+                *dr = d;
+                *mx = x;
+            });
+    });
+
+    Ok((
+        Array1::from_vec(made_both).into_pyarray(py),
+        Array1::from_vec(draw_both).into_pyarray(py),
+        Array1::from_vec(mixed).into_pyarray(py),
+    ))
+}
+
+// =============================================================================
+// Draw flags (vectorized port of `_draw_flags_batch` in encoding.py).
+// =============================================================================
+
+#[inline]
+fn draw_flags_one_board(
+    hole_suit_count: &[u8; 4],
+    hole_rank_mask: u16,
+    board_row: &[u8],
+) -> (f32, f32) {
+    let mut board_suit_count: [u8; 4] = [0; 4];
+    let mut board_rank_mask: u16 = 0;
+    let mut board_has_cards = false;
+    for &c in board_row {
+        if c < 52 {
+            let r = (c >> 2) as usize;
+            let s = (c & 3) as usize;
+            board_suit_count[s] += 1;
+            board_rank_mask |= 1u16 << r;
+            board_has_cards = true;
+        }
+    }
+    if !board_has_cards {
+        return (0.0, 0.0);
+    }
+
+    let mut flush = false;
+    for s in 0..4 {
+        if hole_suit_count[s] >= 2 && board_suit_count[s] == 2 {
+            flush = true;
+            break;
+        }
+    }
+
+    let rank_mask = hole_rank_mask | board_rank_mask;
+    // Ace-low shadow: if bit 12 (ace) is set, also set bit 13. Window check
+    // looks for 4 consecutive ranks across bits {0..13}, matching the
+    // scalar `_draw_flags` (popcount>=4 over a 4-bit window).
+    let ace_bit = (rank_mask >> 12) & 1;
+    let extended = rank_mask | (ace_bit << 13);
+    let mut straight = false;
+    for start in 0..11u32 {
+        if (extended >> start) & 0b1111 == 0b1111 {
+            straight = true;
+            break;
+        }
+    }
+
+    (
+        if flush { 1.0 } else { 0.0 },
+        if straight { 1.0 } else { 0.0 },
+    )
+}
+
+#[pyfunction]
+pub fn draw_flags_batch<'py>(
+    py: Python<'py>,
+    hole: PyReadonlyArray2<'_, u8>,
+    board_a: PyReadonlyArray2<'_, u8>,
+    board_b: PyReadonlyArray2<'_, u8>,
+) -> PyResult<(
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<f32>>,
+)> {
+    let hole_v = hole.as_array();
+    let ba_v = board_a.as_array();
+    let bb_v = board_b.as_array();
+
+    let n = hole_v.shape()[0];
+    if hole_v.shape() != [n, 5] {
+        return Err(PyValueError::new_err("hole shape must be (N, 5)"));
+    }
+    if ba_v.shape() != [n, 5] || bb_v.shape() != [n, 5] {
+        return Err(PyValueError::new_err(
+            "board_a and board_b shapes must be (N, 5) matching hole",
+        ));
+    }
+
+    let hole_owned = hole_v.to_owned();
+    let ba_owned = ba_v.to_owned();
+    let bb_owned = bb_v.to_owned();
+
+    let mut flush_a = vec![0f32; n];
+    let mut straight_a = vec![0f32; n];
+    let mut flush_b = vec![0f32; n];
+    let mut straight_b = vec![0f32; n];
+
+    py.allow_threads(|| {
+        flush_a
+            .par_iter_mut()
+            .zip(straight_a.par_iter_mut())
+            .zip(flush_b.par_iter_mut())
+            .zip(straight_b.par_iter_mut())
+            .enumerate()
+            .for_each(|(i, (((fa, sa), fb), sb))| {
+                let hole_slice = hole_owned.row(i);
+                let hole_slice = hole_slice.as_slice().unwrap();
+                let mut hole_suit_count: [u8; 4] = [0; 4];
+                let mut hole_rank_mask: u16 = 0;
+                for &c in hole_slice {
+                    if c < 52 {
+                        let r = (c >> 2) as usize;
+                        let s = (c & 3) as usize;
+                        hole_suit_count[s] += 1;
+                        hole_rank_mask |= 1u16 << r;
+                    }
+                }
+
+                let ba_slice = ba_owned.row(i);
+                let bb_slice = bb_owned.row(i);
+                let (fa_v, sa_v) =
+                    draw_flags_one_board(&hole_suit_count, hole_rank_mask, ba_slice.as_slice().unwrap());
+                let (fb_v, sb_v) =
+                    draw_flags_one_board(&hole_suit_count, hole_rank_mask, bb_slice.as_slice().unwrap());
+                *fa = fa_v;
+                *sa = sa_v;
+                *fb = fb_v;
+                *sb = sb_v;
+            });
+    });
+
+    Ok((
+        Array1::from_vec(flush_a).into_pyarray(py),
+        Array1::from_vec(straight_a).into_pyarray(py),
+        Array1::from_vec(flush_b).into_pyarray(py),
+        Array1::from_vec(straight_b).into_pyarray(py),
+    ))
+}
+
+// =============================================================================
+// Pair features (vectorized port of `_pair_features_batch` in encoding.py).
+// =============================================================================
+
+#[inline]
+fn pair_features_one_board(
+    hole_rank_counts: &[u8; 13],
+    board_row: &[u8],
+    counts_out: &mut [f32],   // length 5
+    struct_out: &mut [f32],   // length 4
+) {
+    let mut board_rank_counts: [u8; 13] = [0; 13];
+    let mut board_ranks: [u8; 5] = [0; 5];
+    let mut valid_count: usize = 0;
+    for &c in board_row.iter().take(5) {
+        if c < 52 {
+            let r = c >> 2;
+            board_ranks[valid_count] = r;
+            board_rank_counts[r as usize] += 1;
+            valid_count += 1;
+        }
+    }
+
+    // Pre-zero outputs (caller may reuse buffers).
+    for slot in 0..5 {
+        counts_out[slot] = 0.0;
+    }
+    for slot in 0..4 {
+        struct_out[slot] = 0.0;
+    }
+
+    if valid_count == 0 {
+        return;
+    }
+
+    // Sort the valid prefix descending.
+    board_ranks[..valid_count].sort_unstable_by(|a, b| b.cmp(a));
+
+    for slot in 0..valid_count {
+        counts_out[slot] = hole_rank_counts[board_ranks[slot] as usize] as f32;
+    }
+
+    let mut paired = false;
+    let mut tripled = false;
+    let mut quadded = false;
+    let mut pairs: u32 = 0;
+    for &c in &board_rank_counts {
+        if c >= 2 {
+            paired = true;
+            pairs += 1;
+        }
+        if c >= 3 {
+            tripled = true;
+        }
+        if c >= 4 {
+            quadded = true;
+        }
+    }
+    struct_out[0] = if paired { 1.0 } else { 0.0 };
+    struct_out[1] = if pairs >= 2 { 1.0 } else { 0.0 };
+    struct_out[2] = if tripled { 1.0 } else { 0.0 };
+    struct_out[3] = if quadded { 1.0 } else { 0.0 };
+}
+
+#[pyfunction]
+pub fn pair_features_batch<'py>(
+    py: Python<'py>,
+    hole: PyReadonlyArray2<'_, u8>,
+    board_a: PyReadonlyArray2<'_, u8>,
+    board_b: PyReadonlyArray2<'_, u8>,
+) -> PyResult<(
+    Bound<'py, PyArray2<f32>>,
+    Bound<'py, PyArray2<f32>>,
+    Bound<'py, PyArray2<f32>>,
+    Bound<'py, PyArray2<f32>>,
+)> {
+    let hole_v = hole.as_array();
+    let ba_v = board_a.as_array();
+    let bb_v = board_b.as_array();
+
+    let n = hole_v.shape()[0];
+    if hole_v.shape() != [n, 5] {
+        return Err(PyValueError::new_err("hole shape must be (N, 5)"));
+    }
+    if ba_v.shape() != [n, 5] || bb_v.shape() != [n, 5] {
+        return Err(PyValueError::new_err(
+            "board_a and board_b shapes must be (N, 5) matching hole",
+        ));
+    }
+
+    let hole_owned = hole_v.to_owned();
+    let ba_owned = ba_v.to_owned();
+    let bb_owned = bb_v.to_owned();
+
+    let mut counts_a = vec![0f32; n * 5];
+    let mut struct_a = vec![0f32; n * 4];
+    let mut counts_b = vec![0f32; n * 5];
+    let mut struct_b = vec![0f32; n * 4];
+
+    py.allow_threads(|| {
+        counts_a
+            .par_chunks_exact_mut(5)
+            .zip(struct_a.par_chunks_exact_mut(4))
+            .zip(counts_b.par_chunks_exact_mut(5))
+            .zip(struct_b.par_chunks_exact_mut(4))
+            .enumerate()
+            .for_each(|(i, (((ca, sa), cb), sb))| {
+                let hole_row = hole_owned.row(i);
+                let hole_slice = hole_row.as_slice().unwrap();
+                let mut hole_rank_counts: [u8; 13] = [0; 13];
+                for &c in hole_slice {
+                    if c < 52 {
+                        hole_rank_counts[(c >> 2) as usize] += 1;
+                    }
+                }
+
+                let ba_row = ba_owned.row(i);
+                let bb_row = bb_owned.row(i);
+                pair_features_one_board(
+                    &hole_rank_counts,
+                    ba_row.as_slice().unwrap(),
+                    ca,
+                    sa,
+                );
+                pair_features_one_board(
+                    &hole_rank_counts,
+                    bb_row.as_slice().unwrap(),
+                    cb,
+                    sb,
+                );
+            });
+    });
+
+    let counts_a_arr = Array2::from_shape_vec((n, 5), counts_a)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let struct_a_arr = Array2::from_shape_vec((n, 4), struct_a)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let counts_b_arr = Array2::from_shape_vec((n, 5), counts_b)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let struct_b_arr = Array2::from_shape_vec((n, 4), struct_b)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    Ok((
+        counts_a_arr.into_pyarray(py),
+        struct_a_arr.into_pyarray(py),
+        counts_b_arr.into_pyarray(py),
+        struct_b_arr.into_pyarray(py),
+    ))
+}
+
+#[cfg(test)]
+mod encoder_port_tests {
+    use super::*;
+
+    fn card(r: u8, s: u8) -> u8 {
+        r * 4 + s
+    }
+
+    fn pad5(cards: &[u8]) -> [u8; 5] {
+        let mut out = [255u8; 5];
+        for (i, &c) in cards.iter().enumerate().take(5) {
+            out[i] = c;
+        }
+        out
+    }
+
+    fn rank_mask(cards: &[u8]) -> [bool; 13] {
+        let mut out = [false; 13];
+        for &c in cards {
+            if c < 52 {
+                out[(c >> 2) as usize] = true;
+            }
+        }
+        out
+    }
+
+    // ---- cross_board_straight ----
+
+    #[test]
+    fn cross_board_empty_inputs() {
+        let (md, dr, mx) =
+            cross_board_straight_per_env(0, 0, 0, true);
+        assert_eq!(md, 0.0);
+        assert_eq!(dr, 0.0);
+        assert_eq!(mx, 0.0);
+    }
+
+    #[test]
+    fn cross_board_invalid_returns_zero() {
+        // valid=false short-circuits even if everything else fires.
+        let hero = rank_mask(&[card(10, 0), card(11, 0)]);
+        let ba = rank_mask(&[card(8, 0), card(9, 0), card(12, 0)]);
+        let bb = rank_mask(&[card(8, 1), card(9, 1), card(12, 1)]);
+        let hb = pack_rank_mask(&hero);
+        let ab = pack_rank_mask(&ba);
+        let bb_ = pack_rank_mask(&bb);
+        let (md, dr, mx) = cross_board_straight_per_env(hb, ab, bb_, false);
+        assert_eq!(md, 0.0);
+        assert_eq!(dr, 0.0);
+        assert_eq!(mx, 0.0);
+    }
+
+    #[test]
+    fn cross_board_made_both_broadway() {
+        // Hero K,Q. Boards both A,J,T. Window 9 (T-J-Q-K-A): pair {K,Q}
+        // in window; cov = popcount(board & W | pair). board has A,J,T
+        // = bits 12,9,8; pair = bits 11,10. Union = 0x1F00 (5 bits) on
+        // each board → cov_a == 5 → made; cov_b == 5 → made. made_both.
+        let hero = rank_mask(&[card(11, 0), card(10, 0)]); // K=11, Q=10
+        let ba = rank_mask(&[card(12, 0), card(9, 0), card(8, 0)]); // A,J,T
+        let bb = rank_mask(&[card(12, 1), card(9, 1), card(8, 1)]); // A,J,T
+        let (md, dr, mx) = cross_board_straight_per_env(
+            pack_rank_mask(&hero),
+            pack_rank_mask(&ba),
+            pack_rank_mask(&bb),
+            true,
+        );
+        assert_eq!(md, 1.0);
+        assert_eq!(dr, 0.0);
+        assert_eq!(mx, 0.0);
+    }
+
+    #[test]
+    fn cross_board_mixed() {
+        // Hero K,Q. Board A has A,J,T (made). Board B has A,J (draw only:
+        // cov = 4). → mixed.
+        let hero = rank_mask(&[card(11, 0), card(10, 0)]); // K, Q
+        let ba = rank_mask(&[card(12, 0), card(9, 0), card(8, 0)]); // A,J,T (5 covered)
+        let bb = rank_mask(&[card(12, 1), card(9, 1)]); // A,J (4 covered with pair)
+        let (md, dr, mx) = cross_board_straight_per_env(
+            pack_rank_mask(&hero),
+            pack_rank_mask(&ba),
+            pack_rank_mask(&bb),
+            true,
+        );
+        assert_eq!(md, 0.0);
+        assert_eq!(dr, 0.0);
+        assert_eq!(mx, 1.0);
+    }
+
+    // ---- draw_flags ----
+
+    #[test]
+    fn draw_flags_empty_board() {
+        let hole = pad5(&[card(11, 0), card(10, 0)]);
+        let empty_board = pad5(&[]);
+        let mut hsc: [u8; 4] = [0; 4];
+        let mut hrm: u16 = 0;
+        for &c in &hole {
+            if c < 52 {
+                hsc[(c & 3) as usize] += 1;
+                hrm |= 1u16 << (c >> 2);
+            }
+        }
+        let (f, s) = draw_flags_one_board(&hsc, hrm, &empty_board);
+        assert_eq!(f, 0.0);
+        assert_eq!(s, 0.0);
+    }
+
+    #[test]
+    fn draw_flags_flush_draw_fires() {
+        // Hero: Ah, Kh (suit 1, ranks 12, 11). Board: 2h, 5h, 9c
+        // (suit 1 has 2 cards on board). hero_suit[1] = 2, board_suit[1] = 2 → flush.
+        let hole = pad5(&[card(12, 1), card(11, 1)]);
+        let board = pad5(&[card(0, 1), card(3, 1), card(7, 2)]);
+        let mut hsc: [u8; 4] = [0; 4];
+        let mut hrm: u16 = 0;
+        for &c in &hole {
+            if c < 52 {
+                hsc[(c & 3) as usize] += 1;
+                hrm |= 1u16 << (c >> 2);
+            }
+        }
+        let (f, _) = draw_flags_one_board(&hsc, hrm, &board);
+        assert_eq!(f, 1.0);
+    }
+
+    #[test]
+    fn draw_flags_straight_draw_fires() {
+        // Hero+board union covers ranks 4,5,6,7 (consecutive 4) → straight draw.
+        // Hero: 6c, 7c (ranks 4,5, suit 2). Board: 8d, 9d, 2c (ranks 6,7,0).
+        let hole = pad5(&[card(4, 2), card(5, 2)]);
+        let board = pad5(&[card(6, 3), card(7, 3), card(0, 2)]);
+        let mut hsc: [u8; 4] = [0; 4];
+        let mut hrm: u16 = 0;
+        for &c in &hole {
+            if c < 52 {
+                hsc[(c & 3) as usize] += 1;
+                hrm |= 1u16 << (c >> 2);
+            }
+        }
+        let (_, s) = draw_flags_one_board(&hsc, hrm, &board);
+        assert_eq!(s, 1.0);
+    }
+
+    // ---- pair_features ----
+
+    #[test]
+    fn pair_features_empty_board() {
+        let hole = pad5(&[card(11, 0), card(10, 0)]);
+        let mut hrc: [u8; 13] = [0; 13];
+        for &c in &hole {
+            if c < 52 {
+                hrc[(c >> 2) as usize] += 1;
+            }
+        }
+        let mut counts = [0f32; 5];
+        let mut struct_out = [0f32; 4];
+        pair_features_one_board(&hrc, &pad5(&[]), &mut counts, &mut struct_out);
+        assert!(counts.iter().all(|&x| x == 0.0));
+        assert!(struct_out.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn pair_features_top_pair() {
+        // Hero: Kh, Qd (ranks 11, 10). Board: Kc, 9h, 4s (ranks 11, 7, 2).
+        // Sorted descending: 11, 7, 2. counts: hero K count = 1, hero 9 = 0, hero 4 = 0.
+        let hole = pad5(&[card(11, 1), card(10, 3)]);
+        let board = pad5(&[card(11, 2), card(7, 1), card(2, 0)]);
+        let mut hrc: [u8; 13] = [0; 13];
+        for &c in &hole {
+            if c < 52 {
+                hrc[(c >> 2) as usize] += 1;
+            }
+        }
+        let mut counts = [0f32; 5];
+        let mut struct_out = [0f32; 4];
+        pair_features_one_board(&hrc, &board, &mut counts, &mut struct_out);
+        assert_eq!(counts[0], 1.0);  // K-slot
+        assert_eq!(counts[1], 0.0);  // 9-slot
+        assert_eq!(counts[2], 0.0);  // 4-slot
+        assert_eq!(counts[3], 0.0);  // unused
+        assert_eq!(counts[4], 0.0);  // unused
+        // No pairs on board.
+        assert_eq!(struct_out[0], 0.0);  // paired
+    }
+
+    #[test]
+    fn pair_features_paired_board_repeats_slots() {
+        // Hero: Kh, Qd. Board: Kc, Kd, 4s (K paired). Sorted: 11,11,2.
+        // counts: 1, 1, 0.
+        let hole = pad5(&[card(11, 1), card(10, 3)]);
+        let board = pad5(&[card(11, 2), card(11, 3), card(2, 0)]);
+        let mut hrc: [u8; 13] = [0; 13];
+        for &c in &hole {
+            if c < 52 {
+                hrc[(c >> 2) as usize] += 1;
+            }
+        }
+        let mut counts = [0f32; 5];
+        let mut struct_out = [0f32; 4];
+        pair_features_one_board(&hrc, &board, &mut counts, &mut struct_out);
+        assert_eq!(counts[0], 1.0);
+        assert_eq!(counts[1], 1.0);
+        assert_eq!(counts[2], 0.0);
+        assert_eq!(struct_out[0], 1.0);  // paired
+        assert_eq!(struct_out[1], 0.0);  // double_paired
+        assert_eq!(struct_out[2], 0.0);  // tripled
+        assert_eq!(struct_out[3], 0.0);  // quadded
+    }
+
+    #[test]
+    fn pair_features_quadded_board() {
+        // Board: four Kings + 4. Struct: paired, tripled, quadded all 1.
+        // double_paired = 0 (only one rank has count>=2).
+        let hole = pad5(&[card(10, 0), card(9, 0)]);
+        let board = pad5(&[card(11, 0), card(11, 1), card(11, 2), card(11, 3), card(2, 0)]);
+        let mut hrc: [u8; 13] = [0; 13];
+        for &c in &hole {
+            if c < 52 {
+                hrc[(c >> 2) as usize] += 1;
+            }
+        }
+        let mut counts = [0f32; 5];
+        let mut struct_out = [0f32; 4];
+        pair_features_one_board(&hrc, &board, &mut counts, &mut struct_out);
+        assert_eq!(struct_out[0], 1.0);  // paired
+        assert_eq!(struct_out[1], 0.0);  // double_paired (only Ks have c>=2)
+        assert_eq!(struct_out[2], 1.0);  // tripled
+        assert_eq!(struct_out[3], 1.0);  // quadded
     }
 }

@@ -25,7 +25,10 @@ def _step(gate: int) -> tuple:
     return (None, None, gate, 0, None, 0.0, 0.0)
 
 
-def test_c_zero_disables_bonus() -> None:
+def test_c_zero_zero_chips_but_counters_track_qualifying() -> None:
+    # c=0 zeroes the chip bonus but counters still track qualifying steps
+    # so the trainer can report bonus%(F/T/R) even with the bonus disabled.
+    # payout=200, total=200 → 2*payout > total → share > 50% → RAISE qualifies.
     steps = [_step(GATE_RAISE), _step(GATE_CHECK_CALL), _step(GATE_FOLD)]
     costs = [0.0, -0.5, 0.0]
     pots = [10.0, 10.0, 10.0]
@@ -35,7 +38,7 @@ def test_c_zero_disables_bonus() -> None:
         payout_chips=200, total_pot_chips=200, c=0.0,
     )
     assert added == 0.0
-    assert bumped == [0, 0, 0]
+    assert bumped == [1, 0, 0]
     assert costs == [0.0, -0.5, 0.0]
 
 
