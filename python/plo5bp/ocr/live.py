@@ -70,6 +70,21 @@ def list_window_titles() -> list[str]:
     return seen
 
 
+def is_window_alive(hwnd: int | None) -> bool:
+    """True if `hwnd` is still a valid top-level window (False once closed).
+
+    Stays True while the window is merely minimized/occluded — we only want
+    to auto-stop OCR on actual destruction, not when the table is tucked away.
+    ctypes is imported lazily (and only resolves on Windows, where this whole
+    capture stack runs) to match the file's lazy-import idiom.
+    """
+    if not hwnd:
+        return False
+    import ctypes
+
+    return bool(ctypes.windll.user32.IsWindow(int(hwnd)))
+
+
 def _candidate_windows(match: str) -> list:
     import pygetwindow as gw
 

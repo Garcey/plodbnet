@@ -80,8 +80,66 @@ def _reset_session():
     server.session._pending_mask_additions = frozenset()
     server.session._pending_mask_additions_ticks = 0
     server.ocr_runner._reconstructor = None
+    server.ocr_runner.running = False
+    server.ocr_runner.latest_frame = None
+    import asyncio as _asyncio
+    server.ocr_runner._tick_lock = _asyncio.Lock()
     server._new_session_defaults()
     yield
+
+
+# --- card-slot stability debounce ---------------------------------------
+# The auto mirror path requires _CARD_STABLE_TICKS identical reads before a
+# card slot commits + locks, so a transient mid-reveal misread (dark flipping
+# card -> spurious spade) can't latch. Manual rescan stays single-shot.
+
+
+def test_card_debounce_commits_only_after_n_stable_ticks():
+    n = server._CARD_STABLE_TICKS
+    idx = 42
+    for _ in range(n - 1):
+        server._ocr_apply_card_slot("hero_hole", 0, idx, debounce=True)
+        assert server.session.hero_hole[0] is None
+        assert server.session._card_slot_locked["hero_hole"][0] is False
+    server._ocr_apply_card_slot("hero_hole", 0, idx, debounce=True)
+    assert server.session.hero_hole[0] == idx
+    assert server.session._card_slot_locked["hero_hole"][0] is True
+
+
+def test_card_debounce_varied_reads_never_lock():
+    # Simulate the reveal animation: a different (wrong) card every tick.
+    for t in range(server._CARD_STABLE_TICKS * 3):
+        server._ocr_apply_card_slot("hero_hole", 0, 10 + t, debounce=True)
+    assert server.session.hero_hole[0] is None
+    assert server.session._card_slot_locked["hero_hole"][0] is False
+
+
+def test_card_debounce_none_tick_resets_the_run():
+    n = server._CARD_STABLE_TICKS
+    idx = 42
+    for _ in range(n - 1):
+        server._ocr_apply_card_slot("hero_hole", 0, idx, debounce=True)
+    # A no-read tick breaks the streak.
+    server._ocr_apply_card_slot("hero_hole", 0, None, debounce=True)
+    server._ocr_apply_card_slot("hero_hole", 0, idx, debounce=True)
+    assert server.session.hero_hole[0] is None  # streak restarted, not enough yet
+    for _ in range(n - 1):
+        server._ocr_apply_card_slot("hero_hole", 0, idx, debounce=True)
+    assert server.session.hero_hole[0] == idx
+
+
+def test_card_apply_is_immediate_when_not_debounced():
+    # Rescan / explicit edits commit on a single read.
+    server._ocr_apply_card_slot("hero_hole", 1, 42, debounce=False)
+    assert server.session.hero_hole[1] == 42
+    assert server.session._card_slot_locked["hero_hole"][1] is True
+
+
+def test_card_debounce_does_not_overwrite_a_locked_slot():
+    server._ocr_apply_card_slot("hero_hole", 2, 40, debounce=False)  # lock it
+    for _ in range(server._CARD_STABLE_TICKS + 2):
+        server._ocr_apply_card_slot("hero_hole", 2, 7, debounce=True)
+    assert server.session.hero_hole[2] == 40  # unchanged
 
 
 # --- unit conversion ----------------------------------------------------
@@ -947,3 +1005,142 @@ def test_real_hand_boundary_still_fires_when_button_moves():
 
     # Trigger fired: button updated.
     assert server.session.button_seat == 4
+
+
+def _pump_into_lock(button: int, hero):
+    """Bootstrap + lock a hand on `button` so the next move is the locked path."""
+    seats_full = tuple(_seat(i, stack=100_000) for i in range(6))
+    fs = _fs(seats=seats_full, hero=hero, button=button)
+    server._mirror_observable_state(fs)
+    server._mirror_observable_state(fs)
+    for _ in range(server._LOCK_AFTER_TICKS):
+        server._mirror_observable_state(fs)
+    assert server.session.button_seat == button
+
+
+def test_button_move_fires_despite_sitting_out_flicker():
+    """A button move fires a new hand even while sitting_out churns every tick.
+
+    Previously the (button, sitting_out) snapshot reset on each flicker and the
+    locked 6-tick gate never committed — the core slowness/no-trigger bug.
+    """
+    h1 = (_c(8, 1), _c(7, 1), _c(7, 0), _c(3, 2), _c(1, 2))
+    h2 = (_c(11, 0), _c(10, 0), _c(9, 1), _c(2, 0), _c(4, 3))
+    _pump_into_lock(2, h1)
+
+    # Button rotates 2 -> 4; a DIFFERENT non-hero seat reads folded each tick.
+    for k in range(server._BUTTON_STABLE_TICKS_LOCKED):
+        flick = tuple(
+            _seat(i, stack=100_000, folded=(i == 1 + (k % 3))) for i in range(6)
+        )
+        server._mirror_observable_state(_fs(seats=flick, hero=h2, button=4))
+    assert server.session.button_seat == 4  # fired despite the flicker
+
+
+def test_button_glitch_below_threshold_does_not_fire():
+    """A 1-2 tick spurious button read must NOT trigger a new hand."""
+    h1 = (_c(8, 1), _c(7, 1), _c(7, 0), _c(3, 2), _c(1, 2))
+    _pump_into_lock(2, h1)
+    seats_full = tuple(_seat(i, stack=100_000) for i in range(6))
+    glitch = _fs(seats=seats_full, hero=h1, button=5)
+    for _ in range(server._BUTTON_STABLE_TICKS_LOCKED - 1):
+        server._mirror_observable_state(glitch)
+    assert server.session.button_seat == 2  # too few stable ticks → no fire
+
+
+# --- POST /ocr/rescan ---------------------------------------------------
+
+
+def test_rescan_hole_preserves_action_log_button_and_board(monkeypatch):
+    """Rescan Hole replaces hero cards from a fresh OCR read without
+    touching action_log, button_seat, hand_in_hand_mask, or the board."""
+    import asyncio as _asyncio
+
+    server.session.action_log = [
+        {"gate": 1, "chips": 0},
+        {"gate": 1, "chips": 0},
+    ]
+    server.session.button_seat = 3
+    server.session.hand_in_hand_mask = frozenset({0, 1, 3})
+
+    pre_flop_a = [10, 20, 30]
+    pre_flop_b = [11, 21, 31]
+    server.session.flop_a = list(pre_flop_a)
+    server.session.flop_b = list(pre_flop_b)
+    server.session._card_slot_locked["flop_a"] = [True, True, True]
+    server.session._card_slot_locked["flop_b"] = [True, True, True]
+
+    server.session.hero_hole = [None] * 5
+    server.session._card_slot_locked["hero_hole"] = [False] * 5
+
+    server.ocr_runner.running = True
+    server.ocr_runner.latest_frame = object()
+
+    # Hero cards picked to avoid colliding with the pre-set board
+    # (which uses idx 10, 11, 20, 21, 30, 31). Kings and Queens, idx >= 40.
+    fake_fs = _fs(
+        seats=tuple(_seat(i) for i in range(6)),
+        button=3,
+        hero=(_c(12, 0), _c(12, 1), _c(11, 0), _c(11, 1), _c(10, 0)),
+        flop_a_visible=False,
+    )
+    monkeypatch.setattr(
+        "plo5bp.ocr.extract.extract_frame_state",
+        lambda img, num_seats: fake_fs,
+    )
+
+    req = server.OcrRescanRequest(target="hole")
+    _asyncio.run(server.ocr_rescan(req))
+
+    expected_hero = [
+        12 * 4 + 0, 12 * 4 + 1, 11 * 4 + 0, 11 * 4 + 1, 10 * 4 + 0,
+    ]
+    assert server.session.hero_hole == expected_hero
+    assert len(server.session.action_log) == 2
+    assert server.session.button_seat == 3
+    assert server.session.hand_in_hand_mask == frozenset({0, 1, 3})
+    assert server.session.flop_a == pre_flop_a
+    assert server.session.flop_b == pre_flop_b
+
+
+def test_rescan_hole_rolls_back_on_duplicate_card(monkeypatch):
+    """A rescan that would duplicate an existing board card must roll
+    back the targeted group's spec + locks, raise 400, and leave the
+    engine state intact (rebuilt from the pre-call spec)."""
+    import asyncio as _asyncio
+    from fastapi import HTTPException
+
+    server.session.action_log = []
+    server.session.flop_a = [10, 20, 30]
+    server.session.flop_b = [11, 21, 31]
+    server.session._card_slot_locked["flop_a"] = [True, True, True]
+    server.session._card_slot_locked["flop_b"] = [True, True, True]
+
+    pre_hero = [40, 41, 42, 43, 44]
+    pre_locks = [True] * 5
+    server.session.hero_hole = list(pre_hero)
+    server.session._card_slot_locked["hero_hole"] = list(pre_locks)
+
+    server.ocr_runner.running = True
+    server.ocr_runner.latest_frame = object()
+
+    # Card(rank=2, suit=2) → engine idx 2*4+2 = 10, collides with flop_a[0].
+    fake_fs = _fs(
+        seats=tuple(_seat(i) for i in range(6)),
+        button=0,
+        hero=(_c(2, 2), _c(3, 0), _c(4, 0), _c(5, 0), _c(6, 0)),
+        flop_a_visible=False,
+    )
+    monkeypatch.setattr(
+        "plo5bp.ocr.extract.extract_frame_state",
+        lambda img, num_seats: fake_fs,
+    )
+
+    req = server.OcrRescanRequest(target="hole")
+    with pytest.raises(HTTPException) as excinfo:
+        _asyncio.run(server.ocr_rescan(req))
+    assert excinfo.value.status_code == 400
+    assert "rescan hole failed" in str(excinfo.value.detail)
+    assert server.session.hero_hole == pre_hero
+    assert server.session._card_slot_locked["hero_hole"] == pre_locks
+    assert server.session.flop_a == [10, 20, 30]

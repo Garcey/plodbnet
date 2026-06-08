@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 from concurrent.futures import Future, ThreadPoolExecutor
 
+import cv2
 import numpy as np
 
 from plo5bp.ocr import cards as card_mod
@@ -82,12 +83,82 @@ _HERO_HOLE_SLOT0_WIDE = roi_mod.ROI(
 )
 
 
+# The 5 hole cards are dealt in a FAN, so each is physically rotated: the
+# leftmost tilts ~-8deg and the rightmost ~+8deg (cv2 positive = CCW), the
+# middle cards progressively less. The rank templates are upright, so the
+# tilted edge cards match poorly (8->9 at slot 0; "10" unread / 8->6 / 6->5 at
+# slot 4). De-rotating each crop before matching fixes this. The exact tilt
+# isn't perfectly rigid frame-to-frame (a single fixed angle over-rotates some
+# cards), so per slot we try a SMALL SET of candidate de-rotations spanning the
+# observed range and keep the read with the HIGHEST rank confidence — each card
+# self-selects its best rotation. Sets calibrated across labeled frames (see
+# tests/ocr/test_hero_rotation). Hero-only; board cards render flat.
+# Candidate angles per slot, ordered CALIBRATED-CENTER FIRST so a clean card
+# short-circuits on the first try (see _best_over_angles). The remaining angles
+# span the per-card tilt variation for the harder cases.
+_HERO_HOLE_ROTATIONS: tuple[tuple[float, ...], ...] = (
+    (-8.0, -4.0, -12.0, 0.0),  # slot 0 (leftmost), center ~-8
+    (-4.0, -8.0, 0.0),         # slot 1, center ~-4
+    (-2.0, -6.0, 2.0),         # slot 2 (center), ~-2
+    (0.0, -4.0, 4.0),          # slot 3, ~0
+    (8.0, 4.0, 0.0, 12.0),     # slot 4 (rightmost), center ~+8
+)
+
+# A read at/above this confidence is an unambiguous match; stop searching angles.
+# Kept above the ambiguous-misread band (~0.76, e.g. 5/6 and 8/6 ties) so those
+# still do the full multi-angle search.
+_CARD_SHORTCIRCUIT_CONF = 0.85
+
+
+def _rotate(crop: np.ndarray, deg: float) -> np.ndarray:
+    """Rotate a BGR crop about its center (edge pixels replicated). No-op at 0."""
+    if deg == 0.0 or crop.size == 0:
+        return crop
+    h, w = crop.shape[:2]
+    m = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), deg, 1.0)
+    return cv2.warpAffine(
+        crop, m, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
+    )
+
+
+def _classify_card_conf(crop: np.ndarray) -> tuple[Card | None, float]:
+    """`classify_card` but returning the rank-match confidence for ranking."""
+    if not card_mod.is_card_present(crop):
+        return None, 0.0
+    suit = card_mod.classify_suit(crop)
+    rank, conf = card_mod.classify_rank(crop)
+    if suit is None or rank is None:
+        return None, 0.0
+    return Card(rank=rank, suit=suit), conf
+
+
+def _best_over_angles(crop: np.ndarray, slot: int) -> Card | None:
+    """Classify a hole-card crop at each candidate de-rotation; keep the
+    highest-confidence read (the angle where the glyph best matches a template).
+
+    Short-circuits as soon as a read clears `_CARD_SHORTCIRCUIT_CONF` — a clean
+    card matches confidently at its true angle (tried first), so the common case
+    costs one rotation, not all of them. Ambiguous cards stay below the
+    threshold and fall through to the full search.
+    """
+    best_card: Card | None = None
+    best_conf = 0.0
+    for deg in _HERO_HOLE_ROTATIONS[slot]:
+        card, conf = _classify_card_conf(_rotate(crop, deg))
+        if card is not None and conf > best_conf:
+            best_card, best_conf = card, conf
+            if conf >= _CARD_SHORTCIRCUIT_CONF:
+                break
+    return best_card
+
+
 def _classify_hero_hole(img: np.ndarray) -> tuple[Card | None, ...]:
     out: list[Card | None] = []
     for i, roi in enumerate(roi_mod.HERO_HOLE):
-        card = card_mod.classify_card(roi.crop(img))
+        card = _best_over_angles(roi.crop(img), i)
         if card is None and i == 0:
-            card = card_mod.classify_card(_HERO_HOLE_SLOT0_WIDE.crop(img))
+            # Slot 0 also needs the wider ROI for some glyphs (e.g. K).
+            card = _best_over_angles(_HERO_HOLE_SLOT0_WIDE.crop(img), 0)
         out.append(card)
     return tuple(out)
 
@@ -200,7 +271,41 @@ def _detect_button(img: np.ndarray, seat_rois: tuple[roi_mod.SeatROIs, ...]) -> 
     return best_seat
 
 
-def extract_frame_state(img: np.ndarray, num_seats: int = 6) -> FrameState:
+def _crop_fp(crop: np.ndarray) -> int | None:
+    """Cheap content fingerprint of a crop (None for empty)."""
+    return hash(crop.tobytes()) if crop.size else None
+
+
+def _submit_cached(pool, cache, key, crop, read_fn):
+    """Return a no-arg resolver for an OCR read.
+
+    With ``cache=None`` (stateless default) it always submits ``read_fn(crop)``
+    to ``pool``. With a cache dict it submits only when the crop's pixels differ
+    from the cached fingerprint; an unchanged crop reuses the stored value and
+    skips Tesseract entirely. Cache writes happen on the calling (collect)
+    thread only, so no locking is needed.
+    """
+    if cache is None:
+        fut = pool.submit(read_fn, crop)
+        return lambda: _safe_future_result(fut)
+    fp = _crop_fp(crop)
+    entry = cache.get(key)
+    if entry is not None and entry[0] == fp:
+        cached_val = entry[1]
+        return lambda: cached_val
+    fut = pool.submit(read_fn, crop)
+
+    def _resolve():
+        val = _safe_future_result(fut)
+        cache[key] = (fp, val)
+        return val
+
+    return _resolve
+
+
+def extract_frame_state(
+    img: np.ndarray, num_seats: int = 6, cache: dict | None = None
+) -> FrameState:
     """Parse a single BGR frame into a `FrameState`.
 
     Parameters
@@ -209,6 +314,12 @@ def extract_frame_state(img: np.ndarray, num_seats: int = 6) -> FrameState:
         BGR image (H, W, 3), as returned by `cv2.imread`.
     num_seats : int
         Seat count for layout selection. Phase 1 supports 6 only.
+    cache : dict | None
+        Optional per-crop read cache for the live polling loop. When provided,
+        a stack/commit/pot crop whose pixels are unchanged since last tick reuses
+        its prior Tesseract result instead of re-running OCR (stacks only change
+        on an action, so most ticks skip all 13 reads). ``None`` = stateless;
+        callers that want a guaranteed-fresh read (rescan, CLI, tests) omit it.
 
     Tesseract reads (``num_seats`` stack labels + ``num_seats`` committed
     ovals + 1 pot banner) run on a shared worker pool so their per-call
@@ -243,22 +354,26 @@ def extract_frame_state(img: np.ndarray, num_seats: int = 6) -> FrameState:
         # every crop (same behavior as today).
         pass
 
-    # Dispatch phase.
+    # Dispatch phase. Each resolver submits to the pool only on a cache miss;
+    # all misses are in flight before the collect phase begins, preserving the
+    # original parallelism.
     pool = _get_ocr_pool()
-    stack_futures = [
-        pool.submit(text_mod.read_chip_amount, crop) for crop in stack_crops
+    stack_res = [
+        _submit_cached(pool, cache, f"stack_{i}", crop, text_mod.read_chip_amount)
+        for i, crop in enumerate(stack_crops)
     ]
-    commit_futures = [
-        pool.submit(text_mod.read_seat_commit, crop) for crop in commit_crops
+    commit_res = [
+        _submit_cached(pool, cache, f"commit_{i}", crop, text_mod.read_seat_commit)
+        for i, crop in enumerate(commit_crops)
     ]
-    pot_future = pool.submit(text_mod.read_pot_amount, pot_crop)
+    pot_res = _submit_cached(pool, cache, "pot", pot_crop, text_mod.read_pot_amount)
 
     # Collect phase. Indexing keeps per-seat assembly order-independent
     # of completion order.
     seats: list[SeatObs] = []
     for i, sr in enumerate(seat_rois):
-        stack = _safe_future_result(stack_futures[i])
-        committed = _safe_future_result(commit_futures[i])
+        stack = stack_res[i]()
+        committed = commit_res[i]()
         seats.append(
             _build_seat_obs(
                 sr, hero_hole, stack, committed,
@@ -267,7 +382,7 @@ def extract_frame_state(img: np.ndarray, num_seats: int = 6) -> FrameState:
         )
 
     button_seat = _detect_button(img, seat_rois)
-    pot_total = _safe_future_result(pot_future)
+    pot_total = pot_res()
 
     return FrameState(
         board_a=board_a,

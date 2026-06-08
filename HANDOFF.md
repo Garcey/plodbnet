@@ -1,6 +1,6 @@
 # Handoff — hero's silent CHECK on the flop undetected by UI
 
-## Status
+## Status (updated 2026-05-17)
 
 **Active bug**: Hero CHECKs on the flop in heads-up bomb-pot
 (first-to-act, OOP). The check goes undetected by the UI; engine
@@ -12,6 +12,98 @@ CHECK reconciler back-fills via `_reconcile_missed_checks_on_street_reveal`).
 **Tasks A/B shipped earlier (working). Task C shipped but is dead
 code — see "Confirmed wrong" below.** No banner-detection fix has
 been written yet.
+
+## Laptop setup (2026-05-17)
+
+Relocated from desktop (in storage) to laptop. Environment fully set
+up on this machine:
+- `.venv` created, `pip install -e ".[dev,ui,ocr]"` done.
+- `maturin develop --release` built (Rust extension cached).
+- Tests: 383 pass, 2 pre-existing card-template failures (no rank
+  templates on this machine), 13 skipped.
+- SSH key generated (`~/.ssh/id_ed25519`, comment `themi@laptop`),
+  added to RunPod pod via web terminal `>> authorized_keys`.
+- Tesseract installed 2026-05-18 via
+  `winget install --id UB-Mannheim.TesseractOCR` (v5.4.0.20240606,
+  `C:\Program Files\Tesseract-OCR\tesseract.exe`). Without it, OCR
+  text reads silently return None and every seat displays $74 (40bb
+  default minus 3bb ante at $2/bb). Rank templates still absent on
+  this laptop.
+
+## Training status (2026-05-28)
+
+- SSH: `ssh -i ~/.ssh/id_ed25519 -p 11798 root@205.196.144.26`
+
+### Active run: phase 3 (PID 21358, since 2026-05-25 ~22:30 UTC)
+
+- Launch script at `/workspace/plodbnet/launch_optimized3.sh`
+  (local copy at repo root).
+- Warm-started from `optimized_1485.pt`, writing
+  `checkpoints/optimized3.pt` and `optimized3_<u>.pt` every 5.
+- Settings: `--rollout-length 6266880 --num-minibatches 48
+  --block-rotation clubgg:0.07,clubgg_deep:0.09,deep:0.12
+  --block-size 50` (phase-1 envelope + lowered ent floors).
+- Cadence ~16-17 min/update (pool=6 now; slows as pool grows).
+- Currently at **u283** at handoff time. Healthy throughout:
+  H 0.43-0.69, kl mostly <0.01, v_loss noisy but in-band.
+- Resolved watch flag: u250 deep transition absorbed cleanly
+  (kl peak 0.018 vs u100's 0.0959 — first-touch shock hypothesis
+  confirmed).
+
+### Imminent action: stop at u300 → launch phase 4
+
+User asked to stop at u300 to lower entropy again. ETA from u283
+at ~17 min/update ≈ a couple of hours.
+
+Phase 4 settings (user confirmed 2026-05-28):
+- `--block-rotation clubgg:0.06,clubgg_deep:0.075,deep:0.10`
+- All other flags identical to phase 3.
+- Output stem `checkpoints/optimized4.pt`.
+
+**Procedure when u300 hits:**
+1. SIGTERM PID 21358; escalate to SIGKILL after ~60s if it doesn't
+   take (phase-1 kill needed SIGKILL — train.py has no fast SIGTERM
+   handler during compute).
+2. Copy `launch_optimized3.sh` → `launch_optimized4.sh` on the pod,
+   patch `--block-rotation` and `--checkpoint`, scp/run.
+3. The launcher's auto-warm-start picks `optimized_<N>.pt` not
+   `optimized3_<N>.pt` — that's intentional in the existing script
+   but for phase 4 we want the latest `optimized3_<N>.pt`. Update
+   the glob to `optimized3_*.pt` OR pass `--load-checkpoint
+   checkpoints/optimized3_300.pt` explicitly.
+
+### Multi-phase entropy convergence (saved in memory)
+
+User is on a multi-week annealing plan: continue stepping down the
+three tier floors with the deep tier moving fastest, converging
+toward ~0.025/0.03/0.035 (spread ~0.01). See
+`memory/project_late_stage_entropy_plan.md` for the full rationale.
+Don't propose uniform-step reductions; default to convergence
+steps (clubgg Δ0.01, clubgg_deep Δ0.015, deep Δ0.02 ish).
+
+### Local UI state
+
+- Running on **http://127.0.0.1:8765** (PID 31556).
+- Serving `checkpoints/stub.pt` = `optimized3_210.pt` (promoted
+  this session at u210 of warm-start, = u1485 phase-1 + 210).
+- Worth re-promoting after phase 4 produces a healthy checkpoint
+  with the lowered entropy.
+
+### Orphans on RunPod
+
+- `checkpoints/optimized2_5.pt` and `optimized2_10.pt` from the
+  crashed phase-2 OOM run. Safe to delete; not auto-cleaned.
+
+### Verification (still valid)
+
+- `rollout.py:801` (`while wcursor < rollout_target`) confirms
+  `--rollout-length` is total transitions, not per-env. Phase 3 at
+  6.27M / 49,134 envs ≈ 127 transitions/env average.
+- VRAM math for rollout-size changes must include the **full obs
+  slab at finalize** (`rollout.py:310`), not just minibatch peak.
+  At OBS_DIM 959, keep obs slab ≲ 28-30 GB ⇒ rollout ≲ ~7.5-8M to
+  fit alongside everything else on the 97 GiB GPU. (Phase 2's
+  9.4M rollout OOM'd here — that's what we learned from.)
 
 ## Confirmed wrong this session (2026-04-26)
 

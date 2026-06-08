@@ -61,7 +61,7 @@ def _preprocess_chip_crop(bgr: np.ndarray) -> np.ndarray:
     return cv2.bitwise_not(binm)
 
 
-_TESSERACT_CFG = "--psm 7 -c tessedit_char_whitelist=0123456789.,$"
+_TESSERACT_CFG = "--psm 8 -c tessedit_char_whitelist=0123456789.,$"
 
 
 def _parse_chip_text(raw: str) -> int | None:

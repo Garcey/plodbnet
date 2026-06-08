@@ -103,20 +103,20 @@ def _load_templates() -> dict[int, list[np.ndarray]]:
     return out
 
 
-def _preprocess_rank_glyph(card_bgr: np.ndarray) -> np.ndarray | None:
-    """Extract and binarize the top rank glyph from a card crop.
+_RANK_CROP_Y1 = 0.55  # default top-corner crop height (fraction of card).
+_RANK_CROP_Y1_TALL = 0.72  # adaptive retry when the digit is bottom-clipped.
 
-    Crops the top corner generously and uses connected-components to
-    keep only the topmost cluster — the rank digit/letter. This drops
-    the suit pip below the digit (ClubGG hero hole crops have aspect
-    ~1.82 so the rank corner crop also catches the pip), making the
-    extracted glyph suit-color-independent.
+
+def _extract_rank_glyph(card_bgr: np.ndarray, y1_frac: float):
+    """Binarize + isolate the top rank glyph from `card_bgr[:y1_frac*h]`.
+
+    Returns ``(glyph_mask, clipped)`` or ``None``. `clipped` is True when the
+    extracted glyph touches the bottom edge of the crop (i.e. the digit likely
+    extends below the crop and was cut off).
     """
-    if card_bgr.size == 0:
-        return None
     h, w = card_bgr.shape[:2]
     # Crop generously; CC isolation handles the suit pip below the digit.
-    y0, y1 = 0, int(h * 0.55)
+    y0, y1 = 0, int(h * y1_frac)
     x0, x1 = 0, int(w * 0.95)
     corner = card_bgr[y0:y1, x0:x1]
     if corner.size == 0:
@@ -166,7 +166,37 @@ def _preprocess_rank_glyph(card_bgr: np.ndarray) -> np.ndarray | None:
     x_lo, x_hi = int(xs.min()), int(xs.max()) + 1
     if (y_hi - y_lo) < 12 or (x_hi - x_lo) < 6:
         return None
-    return mask[y_lo:y_hi, x_lo:x_hi]
+    clipped = y_hi >= corner.shape[0]
+    return mask[y_lo:y_hi, x_lo:x_hi], clipped
+
+
+def _preprocess_rank_glyph(card_bgr: np.ndarray) -> np.ndarray | None:
+    """Extract and binarize the top rank glyph from a card crop.
+
+    Crops the top corner generously and uses connected-components to
+    keep only the topmost cluster — the rank digit/letter. This drops
+    the suit pip below the digit (ClubGG hero hole crops have aspect
+    ~1.82 so the rank corner crop also catches the pip), making the
+    extracted glyph suit-color-independent.
+
+    Adaptive bottom-crop: the fanned bottom hole card (slot 0) sits lower in
+    its ROI, so the fixed 0.55 crop clips the digit's bottom — an "8" loses its
+    lower loop and reads as "9". When the extracted glyph touches the crop's
+    bottom edge we re-extract from a taller crop; the suit pip below stays
+    rejected by the height-ratio merge guard, so non-clipped glyphs (other
+    slots, board cards) are unchanged.
+    """
+    if card_bgr.size == 0:
+        return None
+    res = _extract_rank_glyph(card_bgr, _RANK_CROP_Y1)
+    if res is None:
+        return None
+    glyph, clipped = res
+    if clipped:
+        taller = _extract_rank_glyph(card_bgr, _RANK_CROP_Y1_TALL)
+        if taller is not None:
+            return taller[0]
+    return glyph
 
 
 _CANON_GLYPH_SIZE = (32, 48)  # (w, h)
@@ -228,6 +258,9 @@ def classify_rank(card_bgr: np.ndarray) -> tuple[int | None, float]:
     # in-hand debug frames). The hero avatar art at idle hits the H4 ROI
     # and scores ~0.483 against the rank-J template — a stable false
     # positive that 0.40 lets through. 0.55 cleanly separates them.
+    # (The fanned edge hole cards used to dip below this floor when tilted;
+    # that is now handled at the source by per-slot de-rotation in
+    # extract._classify_hero_hole, so the strict floor stands.)
     if best_score < 0.55:
         return None, best_score
     if best_score - runner_up < 0.03 and best_score < 0.65:

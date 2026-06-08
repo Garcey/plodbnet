@@ -61,6 +61,14 @@ function formatUnit(chips, state) {
   const str = val.toFixed(2);
   return UI.unit === "bb" ? `${str}bb` : `$${str}`;
 }
+// Chips the current actor has already committed THIS street. Engine raise
+// bounds / recommendation are DELTAS on top of this; the UI displays totals,
+// where total = delta + actorCommitChips. Returns 0 (-> total == delta, a safe
+// no-op) for opening bets or when there is no actor.
+function actorCommitChips(s) {
+  return (s && s.actor !== null && s.actor !== undefined && s.seats[s.actor])
+    ? s.seats[s.actor].committed_this_street_chips : 0;
+}
 function showToast(msg) {
   const container = document.getElementById("toast-container");
   const toast = document.createElement("div");
@@ -83,6 +91,8 @@ const UI = {
   ocrLastStatus: null,
   ocrToggleBusy: false,
   ocrPollMs: 200,
+  ocrWindowMatch: "",
+  ocrMenuOpen: false,
   simpleOcrMode: true,
   simpleOcrToggleBusy: false,
   raiseUserSet: false,
@@ -148,6 +158,14 @@ async function postUndo() {
 async function postReset() {
   try { const data = await postJSON("/reset", {}); applyState(data.state); }
   catch (e) { showToast(e.message); }
+}
+async function postRescan(target) {
+  try {
+    const data = await postJSON("/ocr/rescan", { target });
+    applyState(data.state);
+  } catch (e) {
+    showToast(`Rescan ${target} failed: ${e.message}`);
+  }
 }
 async function postConfig(body) {
   try { const data = await postJSON("/config", body); applyState(data.state); }
@@ -593,6 +611,9 @@ function renderActions(s) {
 function renderRaiseSection(s, actorSeat) {
   const minChips = s.raise_bounds.min_chips;
   const maxChips = s.raise_bounds.max_chips;
+  // Engine bounds are raise-BY deltas; the UI shows raise-TO totals.
+  // total = delta + ac. Arithmetic stays in chips; format only at the edge.
+  const ac = actorCommitChips(s);
   const input = document.getElementById("raise-input");
   const inputRow = input.parentElement;
   const unitLabel = document.getElementById("raise-unit");
@@ -613,17 +634,19 @@ function renderRaiseSection(s, actorSeat) {
     const isAllIn = actorSeat
       && maxChips >= actorSeat.stack_chips + actorSeat.committed_this_street_chips;
     const verb = s.to_call_chips > 0 ? "Raise" : "Bet";
+    // Display the raise-TO total (delta + ac); still post the DELTA.
     submit.textContent = isAllIn
-      ? `All-in ${formatUnit(maxChips, s)}`
-      : `${verb} ${formatUnit(maxChips, s)}`;
+      ? `All-in ${formatUnit(maxChips + ac, s)}`
+      : `${verb} ${formatUnit(maxChips + ac, s)}`;
     submit.onclick = () => postAction({ gate: "raise", chips: maxChips });
     return;
   }
   inputRow.querySelectorAll("input, .raise-unit").forEach(el => el.style.display = "");
   submit.textContent = "Raise";
 
-  const minDisp = chipsToCurrentUnit(minChips, s);
-  const maxDisp = chipsToCurrentUnit(maxChips, s);
+  // Bounds shown as raise-TO totals (delta + ac).
+  const minDisp = chipsToCurrentUnit(minChips + ac, s);
+  const maxDisp = chipsToCurrentUnit(maxChips + ac, s);
   boundsLabel.textContent = `Raise to: ${minDisp.toFixed(2)} – ${maxDisp.toFixed(2)} ${UI.unit === "bb" ? "bb" : "$"}`;
   input.min = minDisp.toFixed(2);
   input.max = maxDisp.toFixed(2);
@@ -642,29 +665,41 @@ function renderRaiseSection(s, actorSeat) {
     if (rec && rec.gate === "raise" && rec.chips !== null && rec.chips !== undefined) {
       preset = Math.max(minChips, Math.min(maxChips, rec.chips));
     }
-    input.value = chipsToCurrentUnit(preset, s).toFixed(2);
+    // preset is a DELTA; display it as a raise-TO total.
+    input.value = chipsToCurrentUnit(preset + ac, s).toFixed(2);
   } else if (!userTyping) {
-    const cur = parseToChips(input.value, s);
-    if (cur !== null && (cur < minChips || cur > maxChips)) {
-      const clamped = Math.max(minChips, Math.min(maxChips, cur));
-      input.value = chipsToCurrentUnit(clamped, s).toFixed(2);
+    // The input holds a TOTAL; clamp in delta space, redisplay as total.
+    const curTotal = parseToChips(input.value, s);
+    if (curTotal !== null) {
+      const curDelta = curTotal - ac;
+      if (curDelta < minChips || curDelta > maxChips) {
+        const clampedDelta = Math.max(minChips, Math.min(maxChips, curDelta));
+        input.value = chipsToCurrentUnit(clampedDelta + ac, s).toFixed(2);
+      }
     }
   }
 
   submit.onclick = () => {
-    const chips = parseToChips(input.value, s);
-    if (chips === null) { showToast("invalid raise amount"); return; }
-    const clamped = Math.max(minChips, Math.min(maxChips, chips));
+    // The user typed a raise-TO total; convert to the engine's raise-BY delta.
+    const total = parseToChips(input.value, s);
+    if (total === null) { showToast("invalid raise amount"); return; }
+    const delta = total - ac;
+    const clamped = Math.max(minChips, Math.min(maxChips, delta));
     UI.raiseUserSet = false;
     postAction({ gate: "raise", chips: clamped });
   };
 
   shortcuts.innerHTML = "";
+  // Returns a raise-TO total (matches the now-total-space input). A pot-fraction
+  // bet means: call (toCall) then raise BY mult*(pot+toCall) on top, so the
+  // final commitment is ac + toCall + extra. Clamp in total space. (The input is
+  // total and submit subtracts ac, so the commitment equals this exactly — this
+  // also fixes the old over-commit where a total was posted as a delta.)
   const potSize = (mult) => {
-    const actorCommit = actorSeat.committed_this_street_chips;
     const toCall = s.to_call_chips;
     const extra = Math.round(mult * (s.pot_chips + toCall));
-    return Math.max(minChips, Math.min(maxChips, actorCommit + toCall + extra));
+    const total = ac + toCall + extra;
+    return Math.max(minChips + ac, Math.min(maxChips + ac, total));
   };
   const items = [
     { label: "b25", chips: potSize(0.25) },
@@ -713,7 +748,9 @@ function renderRecommendation(s) {
     const isAllIn = actorSeat
       && rec.chips >= actorSeat.stack_chips + actorSeat.committed_this_street_chips;
     const suffix = isAllIn ? " (all-in)" : "";
-    actionText = `${verb} ${formatUnit(rec.chips, s)}${suffix}`;
+    // rec.chips is a raise-BY delta; display the raise-TO total (delta + ac).
+    const ac = actorCommitChips(s);
+    actionText = `${verb} ${formatUnit(rec.chips + ac, s)}${suffix}`;
   }
   const dist = rec.gate_distribution || [];
   const distFmt = dist.map((p, i) => {
@@ -1004,7 +1041,10 @@ function setupTopBar() {
   document.getElementById("new-hand-btn").addEventListener("click", () => postReset());
   document.getElementById("ocr-toggle").addEventListener("click", () => toggleOcr());
   document.getElementById("ocr-simple-toggle").addEventListener("click", () => toggleSimpleOcr());
-  document.getElementById("ocr-refresh-windows").addEventListener("click", () => refreshOcrWindows());
+  document.getElementById("ocr-save-frame").addEventListener("click", () => saveOcrFrame());
+  document.getElementById("ocr-window-button").addEventListener("click", () => openOcrWindowPicker());
+  document.getElementById("ocr-rescan-hole-btn").addEventListener("click", () => postRescan("hole"));
+  document.getElementById("ocr-rescan-board-btn").addEventListener("click", () => postRescan("board"));
 }
 
 // --- OCR ---------------------------------------------------------------
@@ -1022,23 +1062,91 @@ function clearOcrStatusError() {
   el.classList.add("muted");
 }
 
-async function refreshOcrWindows() {
-  const select = document.getElementById("ocr-window-match");
-  const prev = select.value;
+// Custom window picker (replaces the native <select> + Refresh button).
+// Clicking the button fetches a *fresh* window list and shows a popup menu;
+// there is no background polling — the only fetch is the one this click
+// triggers. Mirrors the openStackEditor overlay idiom (DOM-mutation popup,
+// Esc / click-outside dismissal).
+
+const PICK_WINDOW_LABEL = "— pick window —";
+
+function setOcrWindowSelection(match) {
+  UI.ocrWindowMatch = match || "";
+  const btn = document.getElementById("ocr-window-button");
+  if (btn) {
+    btn.textContent = UI.ocrWindowMatch || PICK_WINDOW_LABEL;
+    btn.title = UI.ocrWindowMatch || "Pick the window to screen-read";
+  }
+}
+
+function closeOcrWindowPicker() {
+  UI.ocrMenuOpen = false;
+  const picker = document.querySelector(".ocr-window-picker");
+  const menu = picker ? picker.querySelector(".ocr-window-menu") : null;
+  if (menu) menu.remove();
+  const btn = document.getElementById("ocr-window-button");
+  if (btn) btn.setAttribute("aria-expanded", "false");
+  document.removeEventListener("pointerdown", onOcrPickerOutside, true);
+  document.removeEventListener("keydown", onOcrPickerKey, true);
+}
+
+function onOcrPickerOutside(e) {
+  const picker = document.querySelector(".ocr-window-picker");
+  if (picker && !picker.contains(e.target)) closeOcrWindowPicker();
+}
+
+function onOcrPickerKey(e) {
+  if (e.key === "Escape") { e.preventDefault(); closeOcrWindowPicker(); }
+}
+
+async function openOcrWindowPicker() {
+  if (UI.ocrMenuOpen) { closeOcrWindowPicker(); return; }
+  const picker = document.querySelector(".ocr-window-picker");
+  const btn = document.getElementById("ocr-window-button");
+  if (!picker || !btn) return;
+
+  let titles = [];
   try {
     const data = await getJSON("/ocr/windows");
-    const titles = data.windows || [];
-    select.innerHTML = '<option value="">— pick window —</option>';
-    for (const t of titles) {
-      const opt = document.createElement("option");
-      opt.value = t;
-      opt.textContent = t;
-      select.appendChild(opt);
-    }
-    if (prev && titles.includes(prev)) select.value = prev;
+    titles = data.windows || [];
+    clearOcrStatusError();
   } catch (e) {
     setOcrStatusError(`Window list failed: ${e.message}`);
+    return;
   }
+  // A late click that resolved after another open/close — bail if stale.
+  if (UI.ocrMenuOpen) return;
+
+  const menu = document.createElement("div");
+  menu.className = "ocr-window-menu";
+  menu.setAttribute("role", "listbox");
+
+  const addItem = (label, value, cls) => {
+    const row = document.createElement("div");
+    row.className = "item" + (cls ? ` ${cls}` : "");
+    row.textContent = label;
+    if (cls !== "empty") {
+      row.title = label;
+      row.addEventListener("click", () => {
+        setOcrWindowSelection(value);
+        closeOcrWindowPicker();
+      });
+    }
+    menu.appendChild(row);
+  };
+
+  addItem(PICK_WINDOW_LABEL, "", "placeholder");
+  if (titles.length === 0) {
+    addItem("(no windows found)", "", "empty");
+  } else {
+    for (const t of titles) addItem(t, t, null);
+  }
+
+  picker.appendChild(menu);
+  UI.ocrMenuOpen = true;
+  btn.setAttribute("aria-expanded", "true");
+  document.addEventListener("pointerdown", onOcrPickerOutside, true);
+  document.addEventListener("keydown", onOcrPickerKey, true);
 }
 
 async function toggleOcr() {
@@ -1053,7 +1161,7 @@ async function toggleOcr() {
 }
 
 async function startOcr() {
-  const match = document.getElementById("ocr-window-match").value;
+  const match = UI.ocrWindowMatch;
   if (!match) {
     setOcrStatusError("Pick a window first");
     return;
@@ -1096,6 +1204,21 @@ function setOcrToggleUI() {
   btn.classList.toggle("active", UI.ocrRunning);
 }
 
+async function saveOcrFrame() {
+  const btn = document.getElementById("ocr-save-frame");
+  if (btn) btn.disabled = true;
+  try {
+    const data = await postJSON("/ocr/save_frame", {});
+    const name = (data.path || "").split(/[\\/]/).pop() || "frame";
+    const sz = data.frame_size ? ` (${data.frame_size.width}x${data.frame_size.height})` : "";
+    showToast(`Saved ${name}${sz}`);
+  } catch (e) {
+    showToast(`Save frame failed: ${e.message}`);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 async function toggleSimpleOcr() {
   if (UI.simpleOcrToggleBusy) return;
   UI.simpleOcrToggleBusy = true;
@@ -1116,6 +1239,8 @@ function setSimpleOcrToggleUI() {
   btn.textContent = UI.simpleOcrMode ? "Simple: On" : "Simple: Off";
   btn.setAttribute("aria-pressed", UI.simpleOcrMode ? "true" : "false");
   btn.classList.toggle("active", UI.simpleOcrMode);
+  const grp = document.getElementById("ocr-rescan-group");
+  if (grp) grp.style.display = UI.simpleOcrMode ? "" : "none";
 }
 
 function renderOcrStatus(st) {
@@ -1140,12 +1265,22 @@ function startOcrPolling() {
   UI.ocrPollTimer = setInterval(async () => {
     try {
       const st = await getJSON("/ocr/status");
+      const wasRunning = UI.ocrRunning;
       UI.ocrLastStatus = st;
       UI.ocrRunning = !!st.running;
       setOcrToggleUI();
       renderOcrStatus(st);
-      if (st.running) await fetchState();
-      else stopOcrPolling();
+      if (st.running) {
+        await fetchState();
+      } else {
+        // Auto-off because the captured window was closed: reset the picker
+        // back to the placeholder (a manual Off leaves the selection intact).
+        if (wasRunning && st.stopped_reason === "window_closed") {
+          setOcrWindowSelection("");
+          showToast("OCR stopped — window closed");
+        }
+        stopOcrPolling();
+      }
     } catch (_) { /* ignore transient polling errors */ }
   }, 500);
 }
@@ -1164,6 +1299,9 @@ async function refreshOcrStatusOnLoad() {
     UI.ocrRunning = !!st.running;
     setOcrToggleUI();
     renderOcrStatus(st);
+    // Reflect an already-running session in the picker label (e.g. after a
+    // browser reload while OCR is on).
+    if (st.running && st.window_match) setOcrWindowSelection(st.window_match);
     if (st.running) startOcrPolling();
   } catch (_) { /* ocr endpoints may be unavailable; ignore */ }
 }
@@ -1190,7 +1328,6 @@ async function init() {
   setupInsertHover();
   setupRaiseInput();
   fetchState();
-  refreshOcrWindows();
   refreshOcrStatusOnLoad();
 }
 

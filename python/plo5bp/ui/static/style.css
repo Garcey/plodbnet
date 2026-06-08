@@ -80,24 +80,56 @@ body { display: flex; flex-direction: column; min-height: 100vh; }
 }
 #ocr-toggle:hover { background: var(--border); }
 #ocr-toggle.active { background: var(--ok); color: #0b1320; border-color: var(--ok); }
-#ocr-window-match {
+.ocr-window-picker { position: relative; display: inline-block; }
+#ocr-window-button {
   width: 180px; padding: 5px 7px;
   background: var(--panel-2); color: var(--text);
   border: 1px solid var(--border); border-radius: 4px; font-size: 13px;
-  cursor: pointer;
+  cursor: pointer; text-align: left;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-#ocr-window-match:focus { outline: 1px solid var(--accent); outline-offset: -1px; }
-#ocr-refresh-windows {
-  padding: 4px 8px; background: var(--panel-2); color: var(--text);
+#ocr-window-button:hover { background: var(--border); }
+#ocr-window-button:focus,
+#ocr-window-button[aria-expanded="true"] {
+  outline: 1px solid var(--accent); outline-offset: -1px;
+}
+.ocr-window-menu {
+  position: absolute; z-index: 20; top: calc(100% + 2px); left: 0;
+  min-width: 180px; max-width: 360px; max-height: 320px; overflow-y: auto;
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--accent); border-radius: 4px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+  padding: 3px;
+}
+.ocr-window-menu .item {
+  padding: 5px 8px; font-size: 13px; border-radius: 3px; cursor: pointer;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ocr-window-menu .item:hover { background: var(--border); }
+.ocr-window-menu .item.placeholder { color: var(--muted); font-style: italic; }
+.ocr-window-menu .item.empty { color: var(--muted); cursor: default; }
+.ocr-window-menu .item.empty:hover { background: transparent; }
+#ocr-save-frame {
+  padding: 5px 10px; background: var(--panel-2); color: var(--text);
   border: 1px solid var(--border); border-radius: 4px; cursor: pointer;
-  font-size: 14px; line-height: 1;
+  font-size: 13px;
 }
-#ocr-refresh-windows:hover { background: var(--border); }
+#ocr-save-frame:hover { background: var(--border); }
+#ocr-save-frame:disabled { opacity: 0.5; cursor: default; }
 #ocr-status {
   font-size: 12px; color: var(--muted);
   max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 #ocr-status.error { color: var(--danger); }
+.rescan-btn {
+  width: 100%; height: 100%;
+  padding: 4px 6px;
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px;
+  cursor: pointer; font-size: 12px; line-height: 1;
+  font-family: inherit;
+}
+.rescan-btn:hover { background: var(--border); }
 
 /* --- Main layout --- */
 main {
@@ -137,13 +169,25 @@ main {
   display: block;
   max-width: none;
 }
-.table-edge { fill: #0f2a2a; stroke: #254545; stroke-width: 2; }
-.pot-label { fill: var(--text); font-size: 15px; font-weight: 600; }
+.table-rim { fill: url(#rim-gradient); stroke: rgba(0,0,0,0.55); stroke-width: 1; }
+.table-edge { fill: url(#felt-gradient); stroke: rgba(11, 56, 54, 0.85); stroke-width: 1.5; }
+.table-glow {
+  fill: rgba(255, 255, 255, 0.04); stroke: none; pointer-events: none;
+}
+.pot-badge-rect {
+  fill: url(#pot-badge-gradient);
+  stroke: rgba(255, 255, 255, 0.10); stroke-width: 1;
+}
+.pot-label {
+  fill: var(--text); font-size: 14px; font-weight: 700;
+  letter-spacing: 0.4px;
+}
 
 /* Board card slots inside SVG */
 .slot-rect {
-  fill: var(--slot); stroke: var(--slot-border); stroke-width: 1.5;
+  fill: var(--slot); stroke: var(--slot-border); stroke-width: 1;
   cursor: pointer;
+  filter: drop-shadow(0 1.5px 2px rgba(0, 0, 0, 0.45));
 }
 .slot-rect.selected { stroke: var(--slot-selected); stroke-width: 2.5; }
 .slot-rect.empty { stroke-dasharray: 3 3; }
@@ -155,15 +199,20 @@ main {
 
 /* Seat nodes */
 .seat-node .seat-bg {
-  fill: var(--panel-2); stroke: var(--border); stroke-width: 1.5;
+  fill: url(#seat-gradient); stroke: rgba(255, 255, 255, 0.08); stroke-width: 1;
 }
-.seat-node.actor .seat-bg { stroke: var(--accent); stroke-width: 2.5; }
-.seat-node.folded .seat-bg { opacity: 0.4; }
+.seat-node.actor .seat-bg {
+  stroke: var(--accent); stroke-width: 2;
+  filter: drop-shadow(0 0 6px rgba(59, 130, 246, 0.55));
+}
+.seat-node.folded .seat-bg { opacity: 0.35; }
 .seat-node .seat-position {
-  fill: var(--muted); font-size: 11px; text-anchor: middle;
+  fill: var(--muted); font-size: 10.5px; text-anchor: middle;
+  text-transform: uppercase; letter-spacing: 0.6px; font-weight: 600;
 }
 .seat-node .seat-stack {
-  fill: var(--text); font-size: 12px; font-weight: 600; text-anchor: middle;
+  fill: #f3f6fb; font-size: 13px; font-weight: 700; text-anchor: middle;
+  letter-spacing: 0.2px;
 }
 .seat-node .seat-stack.editable {
   text-decoration: underline dotted rgba(215, 221, 230, 0.45);
@@ -213,10 +262,18 @@ main {
 #insert-icon:hover .insert-icon-plus { fill: #fff; }
 
 /* Dealer button */
-#dealer-button { cursor: grab; }
+#dealer-button {
+  cursor: grab;
+  filter: drop-shadow(0 2px 3px rgba(0, 0, 0, 0.55));
+}
 #dealer-button.dragging { cursor: grabbing; }
-.dealer-circle { fill: #f8fafc; stroke: #0e1116; stroke-width: 2; }
-.dealer-text { fill: #0e1116; font-weight: 700; font-size: 14px; }
+.dealer-circle {
+  fill: url(#dealer-gradient); stroke: rgba(0, 0, 0, 0.65); stroke-width: 1.5;
+}
+.dealer-text {
+  fill: #1c1206; font-weight: 800; font-size: 13px;
+  letter-spacing: 0.5px;
+}
 
 /* --- Actor banner --- */
 .actor-banner {
@@ -226,10 +283,17 @@ main {
 .actor-banner.hero { border-left-color: var(--ok); }
 
 /* --- Panels --- */
-.panels { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.panels {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+  height: 300px;
+  flex-shrink: 0;
+}
 .panel {
   background: var(--panel); border: 1px solid var(--border);
   border-radius: 8px; padding: 12px;
+  display: flex; flex-direction: column;
+  overflow: hidden;
+  min-height: 0;
 }
 .panel h3 {
   margin: 0 0 8px 0; font-size: 12px; text-transform: uppercase;
@@ -289,8 +353,13 @@ main {
 
 /* History */
 #history {
-  max-height: 220px; overflow-y: auto; font-size: 12px;
+  flex: 1; min-height: 0;
+  overflow-y: auto; font-size: 12px;
   display: flex; flex-direction: column; gap: 3px;
+}
+#recommendation {
+  flex: 0 0 auto; max-height: 120px; overflow-y: auto;
+  margin-bottom: 4px;
 }
 .history-entry {
   padding: 3px 6px; background: var(--panel-2);

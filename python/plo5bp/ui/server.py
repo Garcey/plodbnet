@@ -17,7 +17,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -190,6 +190,13 @@ class Session:
     _pending_button: int | None = None
     _pending_sitting_out: frozenset[int] | None = None
     _pending_stable_ticks: int = 0
+    # Button-ONLY stability counter, decoupled from the (button, sitting_out)
+    # snapshot above. The button is a strong, discrete new-hand signal that
+    # never moves mid-hand, so the button-change trigger debounces on this
+    # short counter — sitting_out flicker (folds/banners during the deal)
+    # no longer resets it. See `_mirror_observable_state`.
+    _last_observed_button: int | None = None
+    _button_stable_ticks: int = 0
     # Frame captured the tick a new pending snapshot first appeared —
     # used as the pre-commit baseline for stack-seeding and reconstructor
     # rebaselining when the 2-tick stability gate finally commits. Without
@@ -245,9 +252,26 @@ class Session:
         "turn_cards": [False, False],
         "river_cards": [False, False],
     }
+    # Per-slot stability debounce for the AUTO mirror path: (card_idx, count)
+    # of consecutive identical OCR reads, or None. A slot only commits+locks
+    # after `_CARD_STABLE_TICKS` identical reads, so a transient mid-reveal
+    # misread (dark flipping card -> spurious spade) never latches. Manual
+    # rescan bypasses this. Reset by `_new_session_defaults`.
+    _card_slot_pending: dict[str, list[tuple[int, int] | None]] = {
+        "hero_hole": [None] * 5,
+        "flop_a": [None] * 3,
+        "flop_b": [None] * 3,
+        "turn_cards": [None, None],
+        "river_cards": [None, None],
+    }
 
 
 session = Session()
+
+# Consecutive identical auto-OCR reads required before a card slot commits and
+# locks. ~600ms at 200ms poll / 300ms at 100ms. Raise if misreads still slip
+# through; lower if the commit feels sluggish.
+_CARD_STABLE_TICKS = 3
 
 
 _CARD_SPEC_ATTRS: tuple[tuple[str, int], ...] = (
@@ -257,6 +281,11 @@ _CARD_SPEC_ATTRS: tuple[tuple[str, int], ...] = (
     ("turn_cards", 2),
     ("river_cards", 2),
 )
+
+
+def _blank_card_pending() -> dict[str, list[tuple[int, int] | None]]:
+    """Fresh per-slot debounce state (all slots empty)."""
+    return {attr: [None] * n for attr, n in _CARD_SPEC_ATTRS}
 
 
 def _lock_filled_card_slots() -> None:
@@ -269,14 +298,37 @@ def _lock_filled_card_slots() -> None:
                 locks[i] = True
 
 
-def _ocr_apply_card_slot(attr: str, idx: int, ocr_card_idx: int | None) -> None:
-    """Write an OCR-detected card into the spec slot if it isn't locked."""
-    if ocr_card_idx is None:
-        return
+def _ocr_apply_card_slot(
+    attr: str, idx: int, ocr_card_idx: int | None, debounce: bool = False
+) -> None:
+    """Write an OCR-detected card into the spec slot if it isn't locked.
+
+    With ``debounce=True`` (the automatic mirror path) the read must repeat
+    identically for ``_CARD_STABLE_TICKS`` consecutive ticks before it commits
+    and locks — so a transient mid-reveal misread can't latch. ``debounce=False``
+    (manual rescan, explicit edits) commits immediately, as before.
+    """
     if session._card_slot_locked[attr][idx]:
         return
-    getattr(session, attr)[idx] = ocr_card_idx
-    session._card_slot_locked[attr][idx] = True
+    if not debounce:
+        if ocr_card_idx is None:
+            return
+        getattr(session, attr)[idx] = ocr_card_idx
+        session._card_slot_locked[attr][idx] = True
+        return
+
+    pending = session._card_slot_pending[attr]
+    if ocr_card_idx is None:
+        # No confident read this tick — break the run.
+        pending[idx] = None
+        return
+    prev = pending[idx]
+    count = prev[1] + 1 if (prev is not None and prev[0] == ocr_card_idx) else 1
+    pending[idx] = (ocr_card_idx, count)
+    if count >= _CARD_STABLE_TICKS:
+        getattr(session, attr)[idx] = ocr_card_idx
+        session._card_slot_locked[attr][idx] = True
+        pending[idx] = None
 
 
 def _new_session_defaults() -> None:
@@ -299,6 +351,8 @@ def _new_session_defaults() -> None:
     session._ticks_since_hand_start = 0
     session._pending_hero_hole_rotation = None
     session._pending_hero_hole_rotation_ticks = 0
+    session._last_observed_button = None
+    session._button_stable_ticks = 0
     session._card_slot_locked = {
         "hero_hole": [False] * 5,
         "flop_a": [False] * 3,
@@ -306,6 +360,7 @@ def _new_session_defaults() -> None:
         "turn_cards": [False, False],
         "river_cards": [False, False],
     }
+    session._card_slot_pending = _blank_card_pending()
 
 
 def _clear_hand_state_keep_cards() -> None:
@@ -1321,6 +1376,16 @@ class OcrSimpleRequest(BaseModel):
     enabled: bool
 
 
+class OcrRescanRequest(BaseModel):
+    target: Literal["hole", "board"]
+
+
+_RESCAN_GROUPS: dict[str, tuple[str, ...]] = {
+    "hole": ("hero_hole",),
+    "board": ("flop_a", "flop_b", "turn_cards", "river_cards"),
+}
+
+
 class OcrRunner:
     """WGC-fed OCR session that mutates `session` once per polling tick.
 
@@ -1347,6 +1412,13 @@ class OcrRunner:
         self.window_match: str | None = None
         self.window_title: str | None = None
         self.candidates: list[str] = []
+        # HWND of the captured window, persisted so `_loop` can poll its
+        # liveness each tick. None when not running.
+        self._hwnd: int | None = None
+        # Why the runner last stopped: None for manual/never, "window_closed"
+        # when it auto-stopped because the captured window was destroyed. The
+        # frontend uses this to reset the picker only on auto-off.
+        self.stopped_reason: str | None = None
         self.last_error: str | None = None
         self.last_tick_at: float | None = None
         self.frames_seen: int = 0
@@ -1355,9 +1427,18 @@ class OcrRunner:
         # `_tick` under `_frame_lock`.
         self.latest_frame: Any = None
         self._frame_lock: threading.Lock = threading.Lock()
+        # Serializes the background `_tick` (run via `asyncio.to_thread`)
+        # against handlers that mutate the same session state (cards,
+        # locks, `session.env`). Acquire in the event loop before
+        # dispatching the threadpool work.
+        self._tick_lock: asyncio.Lock = asyncio.Lock()
         self._capture_control: Any = None
         self._reconstructor: Any = None
         self.task: asyncio.Task | None = None
+        # Per-crop OCR read cache (stack/commit/pot). Lets `_tick` skip the
+        # Tesseract subprocess for any chip ROI whose pixels are unchanged
+        # since the last tick — most ticks then do ~0 reads. Cleared on start().
+        self._ocr_read_cache: dict = {}
 
     def status(self) -> dict[str, Any]:
         return {
@@ -1368,6 +1449,7 @@ class OcrRunner:
             "candidates": list(self.candidates),
             "last_tick_at": self.last_tick_at,
             "last_error": self.last_error,
+            "stopped_reason": self.stopped_reason,
             "frames_seen": self.frames_seen,
             "events_applied": self.events_applied,
         }
@@ -1382,11 +1464,14 @@ class OcrRunner:
         self.window_match = window_match
         self.poll_ms = int(poll_ms)
         self.last_error = None
+        self.stopped_reason = None
         self.frames_seen = 0
         self.events_applied = 0
         self.candidates = []
         self.window_title = None
+        self._hwnd = None
         self.latest_frame = None
+        self._ocr_read_cache = {}
 
         try:
             wm = await asyncio.to_thread(ocr_live.find_window, window_match)
@@ -1403,6 +1488,7 @@ class OcrRunner:
             raise HTTPException(status_code=400, detail=str(e)) from e
 
         self.window_title = wm.title
+        self._hwnd = int(wm.hwnd)
 
         def _on_frame(bgr: Any) -> None:
             with self._frame_lock:
@@ -1441,9 +1527,25 @@ class OcrRunner:
         self.running = True
         self.task = asyncio.create_task(self._loop())
 
+    async def _release_capture(self) -> None:
+        """Stop the WGC capture session if one is live (idempotent).
+
+        Shared by the manual `stop()` path and the auto-off
+        `_handle_window_closed()` path; the `cc is None` guard makes a second
+        call a no-op if a manual Off races a window close.
+        """
+        cc = self._capture_control
+        self._capture_control = None
+        if cc is not None:
+            try:
+                await asyncio.to_thread(cc.stop)
+            except Exception as e:
+                logger.warning("WGC stop raised: %s", e)
+
     async def stop(self) -> None:
         was_running = self.running
         self.running = False
+        self.stopped_reason = None  # manual stop
         task = self.task
         self.task = None
         if task is not None:
@@ -1453,25 +1555,54 @@ class OcrRunner:
             except (asyncio.CancelledError, Exception):
                 pass
 
-        cc = self._capture_control
-        self._capture_control = None
-        if cc is not None:
-            try:
-                await asyncio.to_thread(cc.stop)
-            except Exception as e:
-                logger.warning("WGC stop raised: %s", e)
+        await self._release_capture()
+        self._hwnd = None
         if was_running:
             self.window_match = None
             self.window_title = None
 
+    async def _handle_window_closed(self) -> None:
+        """Auto-stop path: the captured window was destroyed.
+
+        Runs *inside* `_loop`, so it must NOT cancel its own task — it tears
+        down the capture and lets `_loop` return normally. The frontend reads
+        `stopped_reason == "window_closed"` (via `status()`) to reset the
+        picker only on this path, not on a manual Off.
+        """
+        self.running = False
+        self.stopped_reason = "window_closed"
+        self.task = None
+        await self._release_capture()
+        self._hwnd = None
+        self.window_match = None
+        self.window_title = None
+
     async def _loop(self) -> None:
+        from plo5bp.ocr import live as ocr_live
+
         try:
             while self.running:
                 await asyncio.sleep(self.poll_ms / 1000.0)
                 if not self.running:
                     return
+                # Auto-stop if the captured window has been destroyed. Both
+                # signals are sub-microsecond, so run them directly on the
+                # asyncio side (no to_thread) before any per-tick work.
+                # IsWindow is authoritative (stays True on minimize); the
+                # WGC is_finished() is a defensive secondary signal.
+                cc = self._capture_control
+                cc_finished = False
+                if cc is not None:
+                    try:
+                        cc_finished = bool(cc.is_finished())
+                    except Exception:
+                        cc_finished = False
+                if cc_finished or not ocr_live.is_window_alive(self._hwnd):
+                    await self._handle_window_closed()
+                    return
                 try:
-                    await asyncio.to_thread(self._tick)
+                    async with self._tick_lock:
+                        await asyncio.to_thread(self._tick)
                 except BaseException as e:
                     # PyO3 panics inherit from BaseException; surface
                     # them via last_error rather than killing the loop.
@@ -1496,7 +1627,9 @@ class OcrRunner:
         if img is None:
             return
 
-        fs = extract_frame_state(img, num_seats=session.num_seats)
+        fs = extract_frame_state(
+            img, num_seats=session.num_seats, cache=self._ocr_read_cache
+        )
         self.frames_seen += 1
 
         # Mirror directly-observable card / button state from the frame
@@ -1574,6 +1707,11 @@ _STABILITY_TICKS_REQUIRED = 2
 # 1-2-tick chip-settle / banner OCR flicker doesn't.
 _LOCK_AFTER_TICKS = 3
 _STABILITY_TICKS_REQUIRED_LOCKED = 6
+# Consecutive identical button reads required to trust a mid-hand button MOVE
+# as a new-hand trigger. Decoupled from the 6-tick snapshot above: a button
+# move persists all hand, so 3 reads reject a 1-2 frame glitch while keeping
+# new-hand latency low and immune to sitting_out churn.
+_BUTTON_STABLE_TICKS_LOCKED = 3
 
 # Minimum plausible stack_chips read (cents) for an in-hand seat's
 # anchor OCR. Live ClubGG frames captured during the chip-settle
@@ -1616,15 +1754,15 @@ def _mirror_observable_state(fs: Any) -> None:
     the current OCR numbers and rebaseline the reconstructor.
     """
     for i, c in enumerate(fs.hero_hole):
-        _ocr_apply_card_slot("hero_hole", i, _card_idx(c))
+        _ocr_apply_card_slot("hero_hole", i, _card_idx(c), debounce=True)
     for i, c in enumerate(fs.board_a[:3]):
-        _ocr_apply_card_slot("flop_a", i, _card_idx(c))
+        _ocr_apply_card_slot("flop_a", i, _card_idx(c), debounce=True)
     for i, c in enumerate(fs.board_b[:3]):
-        _ocr_apply_card_slot("flop_b", i, _card_idx(c))
-    _ocr_apply_card_slot("turn_cards", 0, _card_idx(fs.board_a[3]))
-    _ocr_apply_card_slot("turn_cards", 1, _card_idx(fs.board_b[3]))
-    _ocr_apply_card_slot("river_cards", 0, _card_idx(fs.board_a[4]))
-    _ocr_apply_card_slot("river_cards", 1, _card_idx(fs.board_b[4]))
+        _ocr_apply_card_slot("flop_b", i, _card_idx(c), debounce=True)
+    _ocr_apply_card_slot("turn_cards", 0, _card_idx(fs.board_a[3]), debounce=True)
+    _ocr_apply_card_slot("turn_cards", 1, _card_idx(fs.board_b[3]), debounce=True)
+    _ocr_apply_card_slot("river_cards", 0, _card_idx(fs.board_a[4]), debounce=True)
+    _ocr_apply_card_slot("river_cards", 1, _card_idx(fs.board_b[4]), debounce=True)
 
     session.observed_stacks = tuple(s.stack_chips for s in fs.seats)
     session.observed_pot = fs.pot_total_chips
@@ -1650,6 +1788,15 @@ def _mirror_observable_state(fs: Any) -> None:
     observed_button = (
         int(fs.button_seat) if fs.button_seat is not None else session.button_seat
     )
+
+    # Button-ONLY stability, decoupled from the (button, sitting_out) snapshot
+    # below. The button never moves mid-hand, so a stable button MOVE is a
+    # strong new-hand signal that must not wait on sitting_out churn.
+    if observed_button == session._last_observed_button:
+        session._button_stable_ticks += 1
+    else:
+        session._last_observed_button = observed_button
+        session._button_stable_ticks = 1
 
     hero_hole_indices: tuple[int, ...] | None = None
     if all(c is not None for c in fs.hero_hole):
@@ -1694,8 +1841,18 @@ def _mirror_observable_state(fs: Any) -> None:
             "hand-start delayed: anchor_fs has glitched stack reads"
         )
         committed_ready = False
+    # A button MOVE (off its prior seat), confirmed by a short run of identical
+    # reads, fires a new hand — gated on the button alone, not the 6-tick
+    # snapshot, so sitting_out flicker during the deal no longer delays it.
+    # Still require the seeding anchor to have plausible stacks (the same guard
+    # `committed_ready` applies for `first_commit`).
+    button_threshold = (
+        _BUTTON_STABLE_TICKS_LOCKED if is_locked else _STABILITY_TICKS_REQUIRED
+    )
     button_changed = (
-        committed_ready and observed_button != int(session.button_seat)
+        observed_button != int(session.button_seat)
+        and session._button_stable_ticks >= button_threshold
+        and _anchor_fs_stacks_plausible(session._pending_anchor_fs or fs)
     )
 
     # Rewind-proof fallback: hero hole re-appears with cards that differ
@@ -1759,6 +1916,17 @@ def _mirror_observable_state(fs: Any) -> None:
             and int(fs.button_seat) == int(session.button_seat)
         ):
             trigger_fired = False
+
+    if os.environ.get("PLO5BP_OCR_DEBUG_HANDSTART"):
+        logger.info(
+            "ocr.handstart: raw_btn=%s obs_btn=%s sess_btn=%s btn_ticks=%d "
+            "locked=%s snap_ticks=%d | btn_chg=%s hole_rot=%s first=%s -> %s",
+            fs.button_seat, observed_button, session.button_seat,
+            session._button_stable_ticks, is_locked,
+            session._pending_stable_ticks,
+            button_changed, hero_hole_rotated, first_commit,
+            "FIRED" if trigger_fired else "-",
+        )
 
     if trigger_fired:
         anchor_fs = session._pending_anchor_fs or fs
@@ -1958,6 +2126,77 @@ async def ocr_stop() -> dict[str, Any]:
 @app.post("/ocr/simple")
 def ocr_simple(req: OcrSimpleRequest) -> dict[str, Any]:
     session.simple_ocr_mode = bool(req.enabled)
+    return {"state": _state_dict()}
+
+
+@app.post("/ocr/rescan")
+async def ocr_rescan(req: OcrRescanRequest) -> dict[str, Any]:
+    """Re-OCR a single card group from the current frame; preserve hand state.
+
+    Used in simple OCR mode when a card group was misread (capture
+    landed mid-reveal animation). Clears the per-slot lock for the
+    target group, applies a fresh OCR read, re-latches filled slots,
+    and rebuilds the engine. `action_log`, `button_seat`, participant
+    mask, observed stacks/pot all survive untouched.
+    """
+    if not ocr_runner.running:
+        raise HTTPException(status_code=400, detail="OCR not running")
+    async with ocr_runner._tick_lock:
+        with ocr_runner._frame_lock:
+            img = ocr_runner.latest_frame
+        if img is None:
+            raise HTTPException(
+                status_code=400,
+                detail="no frame received yet; let one WGC frame land first",
+            )
+
+        from plo5bp.ocr.extract import extract_frame_state
+
+        groups = _RESCAN_GROUPS[req.target]
+        prev_spec = {g: list(getattr(session, g)) for g in groups}
+        prev_locks = {g: list(session._card_slot_locked[g]) for g in groups}
+
+        try:
+            fs = extract_frame_state(img, num_seats=session.num_seats)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"rescan {req.target} failed: extract: {e}",
+            ) from e
+
+        for g in groups:
+            session._card_slot_locked[g] = [False] * len(prev_locks[g])
+            session._card_slot_pending[g] = [None] * len(prev_locks[g])
+
+        if "hero_hole" in groups:
+            for i, c in enumerate(fs.hero_hole):
+                _ocr_apply_card_slot("hero_hole", i, _card_idx(c))
+        if "flop_a" in groups:
+            for i, c in enumerate(fs.board_a[:3]):
+                _ocr_apply_card_slot("flop_a", i, _card_idx(c))
+            for i, c in enumerate(fs.board_b[:3]):
+                _ocr_apply_card_slot("flop_b", i, _card_idx(c))
+            _ocr_apply_card_slot("turn_cards", 0, _card_idx(fs.board_a[3]))
+            _ocr_apply_card_slot("turn_cards", 1, _card_idx(fs.board_b[3]))
+            _ocr_apply_card_slot("river_cards", 0, _card_idx(fs.board_a[4]))
+            _ocr_apply_card_slot("river_cards", 1, _card_idx(fs.board_b[4]))
+
+        _lock_filled_card_slots()
+
+        try:
+            _rebuild_env()
+        except Exception as e:
+            for g in groups:
+                setattr(session, g, prev_spec[g])
+                session._card_slot_locked[g] = prev_locks[g]
+            try:
+                _rebuild_env()
+            except Exception:
+                logger.exception("rescan rollback rebuild also failed")
+            detail = e.detail if isinstance(e, HTTPException) else str(e)
+            raise HTTPException(
+                status_code=400, detail=f"rescan {req.target} failed: {detail}"
+            )
     return {"state": _state_dict()}
 
 
