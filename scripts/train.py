@@ -85,6 +85,39 @@ def _parse_block_rotation(spec: str) -> list[tuple[str, float]]:
     return blocks
 
 
+def _anneal_decision(
+    now_ftr: tuple[float, float, float],
+    baseline: tuple[float, float, float] | None,
+    ent: float,
+    step: float,
+    floor: float,
+    tol: float,
+) -> tuple[float, tuple[float, float, float] | None, str]:
+    """Decide a tier's next entropy coef from this block's F/T/R vs its baseline.
+
+    Pure function (no I/O) so it is unit-testable. `now_ftr`/`baseline` are
+    (flop%, turn%, river%) aggression rates. Returns
+    ``(new_ent, new_baseline, action)``:
+
+      - No baseline yet (first block of this tier): record it, leave ent.
+      - All three streets HELD within `tol` (each >= baseline - tol): lower ent
+        by `step` (clamped at `floor`) and ADVANCE the baseline to now_ftr — so
+        each successive cut must keep paying for the aggression it had.
+      - Any street DROPPED: HOLD ent and KEEP the old baseline. The next block
+        must recover to the pre-drop level before lowering resumes; this stops
+        the anneal from chasing F/T/R downward into passivity.
+    """
+    if baseline is None:
+        return ent, (now_ftr[0], now_ftr[1], now_ftr[2]), "record-baseline"
+    held = all(now_ftr[s] >= baseline[s] - tol for s in range(3))
+    if held:
+        if ent > floor:
+            new_ent = max(floor, ent - step)
+            return new_ent, (now_ftr[0], now_ftr[1], now_ftr[2]), "lowered"
+        return floor, (now_ftr[0], now_ftr[1], now_ftr[2]), "held@floor"
+    return ent, baseline, "drop:hold"
+
+
 # ClubGG-realistic per-seat stack bands (bb). Weights sum to 1.
 # Reflects table conditions at $20/bb: most stacks hover 20-40bb after
 # a few orbits; deep stacks (75bb+) present in ~50% of hands by
@@ -344,6 +377,36 @@ def main() -> None:
         help="Updates per block when --block-rotation is set.",
     )
     parser.add_argument(
+        "--anneal-entropy",
+        action="store_true",
+        help="Automatically lower each tier's block-rotation entropy coef by "
+        "--anneal-step whenever that tier's F/T/R (per-street aggression) held "
+        "or rose vs its previous same-tier block. Annealed floors, per-tier "
+        "F/T/R baselines, the in-block accumulator, and the update counter are "
+        "persisted in the checkpoint and restored on warm-start (so block "
+        "position + annealed floors survive a relaunch). When absent, behavior "
+        "is identical to static --block-rotation.",
+    )
+    parser.add_argument(
+        "--anneal-step",
+        type=float,
+        default=0.002,
+        help="Entropy-coef decrement per successful block (default 0.002).",
+    )
+    parser.add_argument(
+        "--anneal-floor",
+        type=float,
+        default=0.0,
+        help="Minimum entropy coef the anneal will reach (default 0.0).",
+    )
+    parser.add_argument(
+        "--anneal-tolerance",
+        type=float,
+        default=0.5,
+        help="F/T/R points a street may slip and still count as 'held' "
+        "(default 0.5; block F/T/R is large-sample and stable).",
+    )
+    parser.add_argument(
         "--seats-dist",
         type=str,
         choices=("uniform", "clubgg"),
@@ -490,6 +553,11 @@ def main() -> None:
     )
     model.to(train_cfg.device)
     print(f"[device] learner on {train_cfg.device}")
+    # Annealing state restored from the checkpoint (None when absent / cold).
+    restored_update: int | None = None
+    restored_tier_ent: dict | None = None
+    restored_baseline: dict | None = None
+    restored_block_acc: dict | None = None
     if args.load_checkpoint is not None:
         ckpt = torch.load(args.load_checkpoint, map_location="cpu", weights_only=False)
         ckpt_cfg = ckpt.get("config") or {}
@@ -512,6 +580,47 @@ def main() -> None:
         model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt)
         prior_game = ckpt.get("game_config")
         print(f"warm-started from {args.load_checkpoint} (prior game_config: {prior_game})")
+        restored_update = ckpt.get("update_counter")
+        restored_tier_ent = ckpt.get("anneal_tier_ent")
+        restored_baseline = ckpt.get("anneal_baseline")
+        restored_block_acc = ckpt.get("anneal_block_acc")
+
+    # Per-tier entropy-anneal state. `tier_ent` is always seeded from the
+    # --block-rotation initial values and is what the loop reads for the entropy
+    # coef (so with --anneal-entropy OFF it stays static == today's behavior).
+    # Restore from the checkpoint only when annealing, so an anneal-off run is
+    # byte-for-byte unchanged.
+    tier_ent: dict[str, float] = {tier: ent for tier, ent in blocks}
+    tier_baseline: dict[str, tuple[float, float, float] | None] = {
+        tier: None for tier, _ in blocks
+    }
+    block_acc: dict = {"bonus_steps": [0, 0, 0], "steps": [0, 0, 0], "tier": None}
+    if args.anneal_entropy:
+        if restored_tier_ent:
+            tier_ent.update(
+                {k: float(v) for k, v in restored_tier_ent.items() if k in tier_ent}
+            )
+        if restored_baseline:
+            tier_baseline.update(
+                {
+                    k: (tuple(v) if v is not None else None)
+                    for k, v in restored_baseline.items()
+                    if k in tier_baseline
+                }
+            )
+        if restored_block_acc:
+            block_acc = {
+                "bonus_steps": list(restored_block_acc.get("bonus_steps", [0, 0, 0])),
+                "steps": list(restored_block_acc.get("steps", [0, 0, 0])),
+                "tier": restored_block_acc.get("tier"),
+            }
+        print(
+            f"[anneal] enabled step={args.anneal_step} floor={args.anneal_floor} "
+            f"tol={args.anneal_tolerance} start_update="
+            f"{restored_update if restored_update is not None else 0} "
+            f"tier_ent={tier_ent} baselines={tier_baseline}"
+        )
+
     trainer = PPOTrainer(model, train_cfg)
     pool = OpponentPool(capacity=train_cfg.opponent_pool_size)
     rng = np.random.default_rng(args.seed)
@@ -533,11 +642,22 @@ def main() -> None:
                 "config": train_cfg.__dict__,
                 "game_config": game_cfg_snap,
                 "gate_count": GATE_ACTIONS,
+                "update_counter": update_idx,
+                "anneal_tier_ent": tier_ent,
+                "anneal_baseline": tier_baseline,
+                "anneal_block_acc": block_acc,
             },
             mid_path,
         )
 
-    update = 0
+    # Restore the update counter only when annealing, so the block cycle
+    # continues across a relaunch instead of resetting to block 1 (which
+    # under-trains the deep tier). Anneal-off keeps today's reset-to-0.
+    update = (
+        int(restored_update)
+        if (args.anneal_entropy and restored_update is not None)
+        else 0
+    )
     sampled_game_cfg, sampled_eff_dist = _sample_game_config(
         seats_choices,
         stack_lo,
@@ -594,11 +714,10 @@ def main() -> None:
 
         if blocks:
             block_idx = (update // args.block_size) % len(blocks)
-            active_tier, active_ent_coef = blocks[block_idx]
+            active_tier = blocks[block_idx][0]
         else:
             block_idx = -1
             active_tier = args.stack_dist
-            active_ent_coef = None
 
         sampled_game_cfg, sampled_eff_dist = _sample_game_config(
             seats_choices,
@@ -625,12 +744,23 @@ def main() -> None:
 
         batch = collector(model, pool, sampled_game_cfg, train_cfg, rng)
         if blocks:
-            update_entropy_coef = active_ent_coef
+            # tier_ent[tier] == the static block value when --anneal-entropy is
+            # off (it is never mutated then), so this is identical to today.
+            update_entropy_coef = tier_ent[active_tier]
         else:
             update_entropy_coef = (
                 entropy_coef_deep if sampled_eff_dist == "deep" else args.entropy_coef
             )
         stats = trainer.update(batch, rng, entropy_coef=update_entropy_coef)
+
+        # Accumulate this update's per-street aggression counts into the current
+        # block's bucket (reset whenever a new tier's block begins).
+        if blocks and args.anneal_entropy:
+            if block_acc["tier"] != active_tier:
+                block_acc = {"bonus_steps": [0, 0, 0], "steps": [0, 0, 0], "tier": active_tier}
+            for s in range(3):
+                block_acc["bonus_steps"][s] += int(batch.aggr_bonus_steps_by_street[s])
+                block_acc["steps"][s] += int(batch.aggr_steps_total_by_street[s])
 
         assert not np.isnan(stats.policy_loss), "NaN in policy loss"
         assert not np.isnan(stats.value_loss), "NaN in value loss"
@@ -687,6 +817,37 @@ def main() -> None:
                 + (f"  block={block_idx + 1}/{len(blocks)}({active_tier})" if blocks else "")
             )
 
+        # End-of-block entropy anneal: this tier's 50-update block just finished.
+        if blocks and args.anneal_entropy and (update + 1) % args.block_size == 0:
+            st = block_acc["steps"]
+            bn = block_acc["bonus_steps"]
+            now_ftr = (
+                100.0 * bn[0] / max(1, st[0]),
+                100.0 * bn[1] / max(1, st[1]),
+                100.0 * bn[2] / max(1, st[2]),
+            )
+            base = tier_baseline.get(active_tier)
+            new_ent, new_base, action = _anneal_decision(
+                now_ftr,
+                base,
+                tier_ent[active_tier],
+                args.anneal_step,
+                args.anneal_floor,
+                args.anneal_tolerance,
+            )
+            tier_ent[active_tier] = new_ent
+            tier_baseline[active_tier] = new_base
+            base_str = (
+                "--/--/--" if base is None
+                else f"{base[0]:.1f}/{base[1]:.1f}/{base[2]:.1f}"
+            )
+            print(
+                f"[anneal] tier={active_tier} "
+                f"F/T/R={now_ftr[0]:.1f}/{now_ftr[1]:.1f}/{now_ftr[2]:.1f} "
+                f"base={base_str} -> {action} ent={new_ent:.4f}"
+            )
+            block_acc = {"bonus_steps": [0, 0, 0], "steps": [0, 0, 0], "tier": None}
+
         update += 1
 
     args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
@@ -696,6 +857,10 @@ def main() -> None:
             "config": train_cfg.__dict__,
             "game_config": sampled_game_cfg.__dict__,
             "gate_count": GATE_ACTIONS,
+            "update_counter": update,
+            "anneal_tier_ent": tier_ent,
+            "anneal_baseline": tier_baseline,
+            "anneal_block_acc": block_acc,
         },
         args.checkpoint,
     )

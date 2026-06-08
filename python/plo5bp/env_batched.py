@@ -18,6 +18,7 @@ Design goals:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -59,6 +60,16 @@ class BatchedBombPotEnv:
     ):
         self.n = int(num_envs)
         self.config = config or GameConfig()
+        # Default-off switch for the Rust observation encoder. When set, the
+        # finished obs comes straight from the engine (one FFI call, no numpy
+        # assembly); otherwise the numpy `encode_observation_batch` reference
+        # path runs. Bit-exact equivalent (test_encoding_batch.py); the switch
+        # exists so a bit-mismatch surfacing in a long run can be reverted
+        # instantly with `PLO5_RUST_ENCODER=0` and a restart — no rebuild.
+        # Falls back to numpy if the rebuilt engine lacks the method.
+        self._use_rust_encoder = bool(
+            int(os.environ.get("PLO5_RUST_ENCODER", "0"))
+        ) and hasattr(BatchedEngine, "observation_encoded_batch")
         stacks = np.asarray(self.config.resolved_stacks, dtype=np.uint64)
         self._be = BatchedEngine(
             self.n,
@@ -250,19 +261,23 @@ class BatchedBombPotEnv:
 
     def _refresh(self) -> None:
         """Re-encode observations and refresh cached arrays from the engine."""
-        with record_function("step1a_bundle/obs_features_batch"):
-            bundle = self._be.observation_and_features_batch()
-        with record_function("step1a_unpack/actor"):
+        if self._use_rust_encoder:
+            with record_function("step1a_bundle/obs_features_batch"):
+                bundle = self._be.observation_encoded_batch()
+            self._obs = np.asarray(bundle["obs"], dtype=np.float32)
+        else:
+            with record_function("step1a_bundle/obs_features_batch"):
+                bundle = self._be.observation_and_features_batch()
+            with record_function("step1a_unpack/actor"):
+                cat_a = np.asarray(bundle["hero_cat_a"])
+                cat_b = np.asarray(bundle["hero_cat_b"])
+            with record_function("step1/encoder"):
+                self._obs = encode_observation_batch(
+                    bundle, cat_a, cat_b, self.config
+                )
+        with record_function("step1a_unpack/post"):
             actors = np.asarray(bundle["actor"], dtype=np.int8)
             dones = actors == -1
-            cat_a = np.asarray(bundle["hero_cat_a"])
-            cat_b = np.asarray(bundle["hero_cat_b"])
-
-        with record_function("step1/encoder"):
-            self._obs = encode_observation_batch(
-                bundle, cat_a, cat_b, self.config
-            )
-        with record_function("step1a_unpack/post"):
             self._legal = np.asarray(bundle["legal_mask"], dtype=bool)
             self._min_raise = np.asarray(bundle["min_raise"], dtype=np.uint64)
             self._max_raise = np.asarray(bundle["max_raise"], dtype=np.uint64)
@@ -276,6 +291,69 @@ class BatchedBombPotEnv:
             self._bet_to_call = np.asarray(bundle["bet_to_call"], dtype=np.uint64)
             self._street_commit = np.asarray(bundle["street_commit"], dtype=np.uint64)
             self._street = np.asarray(bundle["street"], dtype=np.uint8)
+
+    def _refresh_subset(self, mask: np.ndarray) -> None:
+        """Partial `_refresh`: re-pack + re-encode ONLY the envs selected by
+        `mask`, scattering the results into the cached arrays in place and
+        leaving every other env's cached state untouched.
+
+        This is bit-exact-equivalent to a full `_refresh()` whenever the
+        non-masked envs' engine state is unchanged since the previous full
+        refresh — which is exactly the situation after
+        `reset_terminal_batch(mask)`: that call mutates only the masked
+        (terminal) envs, and the rollout loop performs no engine mutation of
+        non-masked envs between the two refreshes. The whole-batch
+        `encode_observation_batch` is purely per-row, so encoding the masked
+        subset and scattering gives results identical to encoding the full
+        batch and slicing. Parity is asserted in
+        `tests/python/test_refresh_subset_parity.py`.
+
+        Skips all work when `mask` selects nothing.
+        """
+        idx = np.nonzero(np.ascontiguousarray(mask, dtype=bool))[0]
+        if idx.size == 0:
+            return
+        idx_i64 = idx.astype(np.int64)
+        if self._use_rust_encoder:
+            with record_function("step1a_bundle/obs_features_subset"):
+                bundle = self._be.observation_encoded_subset_batch(idx_i64)
+            obs_sub = np.asarray(bundle["obs"], dtype=np.float32)
+            actors_sub = np.asarray(bundle["actor"], dtype=np.int8)
+        else:
+            with record_function("step1a_bundle/obs_features_subset"):
+                bundle = self._be.observation_and_features_subset_batch(idx_i64)
+            with record_function("step1a_unpack/actor"):
+                actors_sub = np.asarray(bundle["actor"], dtype=np.int8)
+                cat_a = np.asarray(bundle["hero_cat_a"])
+                cat_b = np.asarray(bundle["hero_cat_b"])
+            with record_function("step1/encoder"):
+                obs_sub = encode_observation_batch(bundle, cat_a, cat_b, self.config)
+
+        with record_function("step1a_unpack/post"):
+            dones_sub = actors_sub == -1
+            legal_sub = np.asarray(bundle["legal_mask"], dtype=bool)
+            min_raise_sub = np.asarray(bundle["min_raise"], dtype=np.uint64)
+            max_raise_sub = np.asarray(bundle["max_raise"], dtype=np.uint64)
+            gate_sub = gate_mask_from_bounds(legal_sub, max_raise_sub)
+            # Mirror the full-refresh terminal rule on the subset rows.
+            gate_sub[dones_sub] = False
+
+            # Scatter compact (k-row) results back into the full cached
+            # arrays at the masked indices. Non-masked rows are left as-is
+            # (still valid from the preceding full refresh).
+            self._obs[idx] = obs_sub
+            self._legal[idx] = legal_sub
+            self._gate_mask[idx] = gate_sub
+            self._min_raise[idx] = min_raise_sub
+            self._max_raise[idx] = max_raise_sub
+            self._actors[idx] = actors_sub
+            self._dones[idx] = dones_sub
+            self._total_commit[idx] = np.asarray(bundle["total_commit"], dtype=np.int64)
+            self._bet_to_call[idx] = np.asarray(bundle["bet_to_call"], dtype=np.uint64)
+            self._street_commit[idx] = np.asarray(
+                bundle["street_commit"], dtype=np.uint64
+            )
+            self._street[idx] = np.asarray(bundle["street"], dtype=np.uint8)
 
     # ------------------------------------------------------------------
     # Read-only accessors mirroring the scalar env's helpers.

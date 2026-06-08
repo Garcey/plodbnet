@@ -16,6 +16,7 @@ opponent seats do not store anything.
 from __future__ import annotations
 
 import copy
+import os
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -739,7 +740,20 @@ def collect_rollout_batched(
     # back the slabs with pinned host memory so the finalize transfer
     # can run with `non_blocking=True` and overlap the first PPO forward.
     out_cap = rollout_target + n_envs * MAX_STEPS_PER_SEAT
-    _pin = device.type == "cuda" if isinstance(device, torch.device) else str(device).startswith("cuda")
+    # Pinned host memory makes the finalize H2D copy overlap downstream compute
+    # (via non_blocking=True), but PINNING THE ~36GB obs slab can cost 60+ SECONDS
+    # PER UPDATE on some hosts (measured: torch 2.11 / AMD EPYC pins 36GB in ~64s,
+    # single-threaded — it was the dominant per-update cost and looked like a
+    # hang). The pinning tax dwarfs the few seconds non_blocking saves at the
+    # finalize, so pinning is DEFAULT OFF. Re-enable with PLO5BP_PIN_ROLLOUT=1 on
+    # hosts where large-buffer pinning is cheap. Output is bit-identical either
+    # way (non_blocking=True on non-pinned memory simply degrades to a blocking
+    # copy — same data).
+    _pin = (
+        (device.type == "cuda" if isinstance(device, torch.device)
+         else str(device).startswith("cuda"))
+        and os.environ.get("PLO5BP_PIN_ROLLOUT", "0") == "1"
+    )
     _pinned_keepalive: list[torch.Tensor] = []
 
     def _alloc_slab(shape, np_dtype, torch_dtype):
@@ -786,14 +800,21 @@ def collect_rollout_batched(
             m_t = torch.from_numpy(b_gm).to(device)
             b_t = torch.from_numpy(b_bounds).to(device)
         with record_function("step3/learner_forward"):
-            with torch.no_grad():
+            with torch.inference_mode():
                 g_t, c_t, lp_t, v_t = model.act(o_t, m_t, b_t)
         with record_function("step5/action_d2h"):
+            # Coalesce four separate device->host copies (each forces a full
+            # CUDA sync) into two by stacking same-dtype outputs: one int64
+            # transfer for (gate, chips) and one float32 transfer for
+            # (log_prob, value). Bit-identical to the per-tensor copies — only
+            # the number of syncs serializing against compute changes.
+            ints = torch.stack((g_t, c_t), dim=0).cpu().numpy()
+            floats = torch.stack((lp_t, v_t), dim=0).cpu().numpy()
             return (
-                g_t.cpu().numpy().astype(np.uint8),
-                c_t.cpu().numpy().astype(np.int64),
-                lp_t.cpu().numpy(),
-                v_t.cpu().numpy(),
+                ints[0].astype(np.uint8),
+                ints[1].astype(np.int64),
+                floats[0],
+                floats[1],
             )
 
     env_idx_range = np.arange(n_envs)
@@ -1038,7 +1059,14 @@ def collect_rollout_batched(
                     last_t_arr = (lengths.astype(np.int32) - 1)              # (T, S)
                     gamma_f = np.float32(gamma)
                     lam_f = np.float32(lam)
-                    for t in range(MAX - 1, -1, -1):
+                    # Slots beyond the longest trajectory stay zero: advs_t is
+                    # zero-initialized and `is_last`/`active_tm` are all-False
+                    # there, so those iterations are no-ops for both last_gae
+                    # and advs_t. Bounding the scan to the max trajectory
+                    # length is bit-identical to scanning all MAX slots, but
+                    # skips the empty tail on every flush.
+                    max_len = int(lengths.max()) if lengths.size else 0
+                    for t in range(max_len - 1, -1, -1):
                         is_last = (t == last_t_arr) & flush_mask
                         active_tm = (t <= last_t_arr) & flush_mask
                         reward_t = costs_t[..., t] + np.where(is_last, won_bb, np.float32(0.0))
@@ -1082,8 +1110,13 @@ def collect_rollout_batched(
                 env._be.reset_terminal_batch(new_seeds, new_buttons, reset_mask)
                 env._reset_seeds = np.where(reset_mask, new_seeds, env._reset_seeds)
                 # Second refresh to pick up the post-reset state for the next
-                # iteration. Only paid on iterations that triggered a reset.
-                env._refresh()
+                # iteration. `reset_terminal_batch` mutates ONLY the masked
+                # (terminal) envs, and nothing above mutated non-masked envs'
+                # engine state since the post-apply refresh — so only the
+                # reset rows need re-packing/re-encoding. The subset refresh
+                # is bit-exact-equivalent to a full `_refresh()` here (see
+                # `_refresh_subset` docstring + test_refresh_subset_parity).
+                env._refresh_subset(reset_mask)
 
     return _finalize_batch_arr(
         all_obs_arr,

@@ -1351,6 +1351,106 @@ impl PyBatchedEngine {
         d.set_item("hero_cat_b", cat_b.into_pyarray(py))?;
         Ok(d)
     }
+
+    /// Subset variant of `observation_and_features_batch`: packs + features
+    /// ONLY the envs in `indices`, returning compact (k = indices.len()) rows
+    /// in the SAME dict layout / dtypes. The Python rollout uses this to
+    /// refresh just the reset-terminal envs after `reset_terminal_batch`,
+    /// since every other env's state is byte-identical to the preceding full
+    /// refresh. Keys and dtypes mirror `observation_and_features_batch`
+    /// exactly — keep the two in lockstep if either gains a field.
+    fn observation_and_features_subset_batch<'py>(
+        &self,
+        py: Python<'py>,
+        indices: PyReadonlyArray1<'_, i64>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let idx: Vec<usize> = indices.as_slice()?.iter().map(|&x| x as usize).collect();
+        let k = idx.len();
+        let s = self.config.num_seats;
+
+        let (packed, legal_mask, cat_a, cat_b) = py.allow_threads(|| {
+            let packed = self.pack_observation_indexed(&idx, s);
+            let mut legal_mask = Array2::<bool>::default((k, NUM_ACTIONS));
+            let mut cat_a = Array1::<u8>::zeros(k);
+            let mut cat_b = Array1::<u8>::zeros(k);
+            for j in 0..k {
+                let state = match self.states[idx[j]].as_ref() {
+                    Some(s) => s,
+                    None => continue,
+                };
+                if !state.is_terminal() {
+                    let mask = state.legal_action_mask();
+                    for t in 0..NUM_ACTIONS {
+                        legal_mask[[j, t]] = mask[t];
+                    }
+                }
+                if let Some(a) = state.current_actor() {
+                    cat_a[j] = state.hero_category(a, 0);
+                    cat_b[j] = state.hero_category(a, 1);
+                }
+            }
+            (packed, legal_mask, cat_a, cat_b)
+        });
+
+        let d = PyDict::new(py);
+        d.set_item("hero_hole", packed.hero_hole.into_pyarray(py))?;
+        d.set_item("board_a", packed.board_a.into_pyarray(py))?;
+        d.set_item("board_b", packed.board_b.into_pyarray(py))?;
+        d.set_item("board_a_len", packed.board_a_len.into_pyarray(py))?;
+        d.set_item("board_b_len", packed.board_b_len.into_pyarray(py))?;
+        d.set_item("street", packed.street.into_pyarray(py))?;
+        d.set_item("pot", packed.pot.into_pyarray(py))?;
+        d.set_item("stacks", packed.stacks.into_pyarray(py))?;
+        d.set_item("folded", packed.folded.into_pyarray(py))?;
+        d.set_item("all_in", packed.all_in.into_pyarray(py))?;
+        d.set_item("bet_to_call", packed.bet_to_call.into_pyarray(py))?;
+        d.set_item("street_commit", packed.street_commit.into_pyarray(py))?;
+        d.set_item("total_commit", packed.total_commit.into_pyarray(py))?;
+        d.set_item("min_bet", packed.min_bet.into_pyarray(py))?;
+        d.set_item("max_bet", packed.max_bet.into_pyarray(py))?;
+        d.set_item("min_raise", packed.min_raise.into_pyarray(py))?;
+        d.set_item("max_raise", packed.max_raise.into_pyarray(py))?;
+        d.set_item("eff_stack_cap", packed.eff_stack_cap.into_pyarray(py))?;
+        d.set_item("actor", packed.actor.into_pyarray(py))?;
+        d.set_item("button", packed.button.into_pyarray(py))?;
+        d.set_item("last_aggressor", packed.last_aggressor.into_pyarray(py))?;
+        d.set_item("history_seat", packed.history_seat.into_pyarray(py))?;
+        d.set_item("history_action", packed.history_action.into_pyarray(py))?;
+        d.set_item("history_chips", packed.history_chips.into_pyarray(py))?;
+        d.set_item("history_street", packed.history_street.into_pyarray(py))?;
+        d.set_item("history_len", packed.history_len.into_pyarray(py))?;
+        d.set_item(
+            "opp_outcome_fractions",
+            packed.opp_outcome_fractions.into_pyarray(py),
+        )?;
+        d.set_item("legal_mask", legal_mask.into_pyarray(py))?;
+        d.set_item("hero_cat_a", cat_a.into_pyarray(py))?;
+        d.set_item("hero_cat_b", cat_b.into_pyarray(py))?;
+        Ok(d)
+    }
+
+    /// One-FFI encoder: returns the finished (N, OBS_DIM) f32 observation plus
+    /// the aux fields the rollout reads, replacing pack + 4 feature calls +
+    /// the numpy assembly. Bit-exact with `encode_observation_batch`.
+    fn observation_encoded_batch<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let idx: Vec<usize> = (0..self.states.len()).collect();
+        self.encode_indexed(py, &idx)
+    }
+
+    /// Subset variant: encodes ONLY the envs in `indices` into compact
+    /// (k = indices.len()) rows. Used by the rollout's post-reset refresh to
+    /// re-encode just the reset-terminal envs.
+    fn observation_encoded_subset_batch<'py>(
+        &self,
+        py: Python<'py>,
+        indices: PyReadonlyArray1<'_, i64>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let idx: Vec<usize> = indices.as_slice()?.iter().map(|&x| x as usize).collect();
+        self.encode_indexed(py, &idx)
+    }
 }
 
 struct PackedObservation {
@@ -1384,7 +1484,19 @@ struct PackedObservation {
 }
 
 impl PyBatchedEngine {
+    /// Pack the full batch (identity index). Thin wrapper over the indexed
+    /// core so the per-env packing logic lives in exactly one place.
     fn pack_observation(&self, n: usize, s: usize) -> PackedObservation {
+        let idx: Vec<usize> = (0..n).collect();
+        self.pack_observation_indexed(&idx, s)
+    }
+
+    /// Pack ONLY the envs listed in `idx` into compact (k = idx.len()) rows.
+    /// Output row j is built from `self.states[idx[j]]`. Used by
+    /// `observation_and_features_subset_batch` to re-pack just the envs that
+    /// changed (e.g. the reset-terminal subset) without touching the rest.
+    fn pack_observation_indexed(&self, idx: &[usize], s: usize) -> PackedObservation {
+        let n = idx.len();
         let mut hero_hole = Array2::<u8>::from_elem((n, 5), 255u8);
         let mut board_a = Array2::<u8>::from_elem((n, 5), 255u8);
         let mut board_b = Array2::<u8>::from_elem((n, 5), 255u8);
@@ -1421,7 +1533,7 @@ impl PyBatchedEngine {
             .into_par_iter()
             .map(|i| {
                 let mut out = [0.0f32; 12];
-                if let Some(state) = self.states[i].as_ref() {
+                if let Some(state) = self.states[idx[i]].as_ref() {
                     let fr = state.opp_outcome_fractions();
                     for j in 0..12 {
                         out[j] = fr[j];
@@ -1509,7 +1621,7 @@ impl PyBatchedEngine {
             // individually, which is `!Sync` despite the unsafe Sync
             // impl on the wrapping struct.
             let ptrs = &ptrs;
-            let state = match self.states[i].as_ref() {
+            let state = match self.states[idx[i]].as_ref() {
                 Some(state) => state,
                 None => return,
             };
@@ -1604,6 +1716,436 @@ impl PyBatchedEngine {
             history_len,
             opp_outcome_fractions,
         }
+    }
+
+    /// Full Rust port of `encode_observation_batch` (python/plo5bp/encoding.py).
+    /// Packs the indexed envs, computes legal masks + hero categories, then
+    /// builds the finished (k, OBS_DIM) f32 observation in one rayon pass —
+    /// collapsing pack + 4 feature FFI calls + the numpy assembly into a
+    /// single FFI crossing. Returns a dict with `obs` plus the aux fields the
+    /// rollout reads (actor, legal_mask, min/max_raise, total_commit,
+    /// bet_to_call, street_commit, street). Bit-exact with the numpy encoder
+    /// (asserted by tests/python/test_encoding_batch.py); the feature blocks
+    /// reuse the same inner fns the numpy path's Rust helpers call.
+    fn encode_indexed<'py>(
+        &self,
+        py: Python<'py>,
+        idx: &[usize],
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let n = idx.len();
+        let s = self.config.num_seats;
+        let bb = self.config.bb;
+        let starting = self.config.starting_stacks.clone();
+
+        let (obs_vec, packed, legal_mask) = py.allow_threads(|| {
+            let packed = self.pack_observation_indexed(idx, s);
+
+            // Legal mask + hero categories (serial; cheap per env). Mirrors
+            // observation_and_features_batch's loop.
+            let mut legal_mask = Array2::<bool>::default((n, NUM_ACTIONS));
+            let mut cat_a = vec![0u8; n];
+            let mut cat_b = vec![0u8; n];
+            for j in 0..n {
+                let state = match self.states[idx[j]].as_ref() {
+                    Some(st) => st,
+                    None => continue,
+                };
+                if !state.is_terminal() {
+                    let mask = state.legal_action_mask();
+                    for t in 0..NUM_ACTIONS {
+                        legal_mask[[j, t]] = mask[t];
+                    }
+                }
+                if let Some(a) = state.current_actor() {
+                    cat_a[j] = state.hero_category(a, 0);
+                    cat_b[j] = state.hero_category(a, 1);
+                }
+            }
+
+            // Per-row encode in parallel. Each row is a disjoint OBS_DIM slice.
+            let inv_bb = 1.0f64 / (bb as f64);
+            let mut obs_vec = vec![0f32; n * obs_layout::OBS_DIM];
+            obs_vec
+                .par_chunks_exact_mut(obs_layout::OBS_DIM)
+                .enumerate()
+                .for_each(|(j, row)| {
+                    encode_obs_row(&packed, j, s, cat_a[j], cat_b[j], inv_bb, &starting, row);
+                });
+
+            (obs_vec, packed, legal_mask)
+        });
+
+        let obs_arr = Array2::from_shape_vec((n, obs_layout::OBS_DIM), obs_vec)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        let d = PyDict::new(py);
+        d.set_item("obs", obs_arr.into_pyarray(py))?;
+        d.set_item("actor", packed.actor.into_pyarray(py))?;
+        d.set_item("legal_mask", legal_mask.into_pyarray(py))?;
+        d.set_item("min_raise", packed.min_raise.into_pyarray(py))?;
+        d.set_item("max_raise", packed.max_raise.into_pyarray(py))?;
+        d.set_item("total_commit", packed.total_commit.into_pyarray(py))?;
+        d.set_item("bet_to_call", packed.bet_to_call.into_pyarray(py))?;
+        d.set_item("street_commit", packed.street_commit.into_pyarray(py))?;
+        d.set_item("street", packed.street.into_pyarray(py))?;
+        Ok(d)
+    }
+}
+
+// =============================================================================
+// Observation layout (single source of truth; mirrors the offset constants in
+// python/plo5bp/encoding.py lines 101-179). A wrong value here silently
+// misplaces a whole feature block, so keep in lockstep with the Python side.
+// =============================================================================
+mod obs_layout {
+    pub const OBS_DIM: usize = 959;
+    pub const HOLE_OFF: usize = 0;
+    pub const BOARD_A_OFF: usize = 52;
+    pub const BOARD_B_OFF: usize = 104;
+    pub const STREET_OFF: usize = 156;
+    pub const ACTIVE_OFF: usize = 160;
+    pub const ALLIN_OFF: usize = 168;
+    pub const STACKS_OFF: usize = 176;
+    pub const SCALARS_OFF: usize = 184;
+    pub const REL_POS_OFF: usize = 188;
+    pub const HISTORY_OFF: usize = 196;
+    pub const HISTORY_DEPTH: usize = 32;
+    pub const HISTORY_SLOT_DIM: usize = 17;
+    pub const HISTORY_SEAT_OFF_REL: usize = 0;
+    pub const HISTORY_GATE_OFF_REL: usize = 8;
+    pub const HISTORY_STREET_OFF_REL: usize = 12;
+    pub const HISTORY_CHIPS_OFF_REL: usize = 16;
+    pub const NUM_STREET_ONEHOT: usize = 4;
+    pub const NUM_CATEGORIES: usize = 9;
+    pub const SPR_OFF: usize = 740;
+    pub const POT_ODDS_OFF: usize = 748;
+    pub const CAT_A_OFF: usize = 749;
+    pub const CAT_B_OFF: usize = 758;
+    pub const DRAW_A_OFF: usize = 767;
+    pub const DRAW_B_OFF: usize = 769;
+    pub const PAIR_COUNT_A_OFF: usize = 771;
+    pub const PAIR_COUNT_B_OFF: usize = 776;
+    pub const BOARD_STRUCT_A_OFF: usize = 781;
+    pub const BOARD_STRUCT_B_OFF: usize = 785;
+    pub const HERO_RANK_HIST_OFF: usize = 789;
+    pub const FLUSH_NUT_DIST_A_OFF: usize = 802;
+    pub const FLUSH_NUT_DIST_B_OFF: usize = 840;
+    pub const SEAT_EXISTS_OFF: usize = 878;
+    pub const TOTAL_COMMIT_OFF: usize = 886;
+    pub const STREET_COMMIT_OFF: usize = 894;
+    pub const LAST_AGGRESSOR_OFF: usize = 902;
+    pub const HERO_BTN_DIST_OFF: usize = 910;
+    pub const SHARED_RANKS_OFF: usize = 918;
+    pub const FLUSH_MADE_BOTH_OFF: usize = 931;
+    pub const FLUSH_DRAW_BOTH_OFF: usize = 935;
+    pub const FLUSH_MIXED_OFF: usize = 939;
+    pub const STRAIGHT_MADE_BOTH_OFF: usize = 943;
+    pub const STRAIGHT_DRAW_BOTH_OFF: usize = 944;
+    pub const STRAIGHT_MIXED_OFF: usize = 945;
+    pub const OPP_OUTCOME_OFF: usize = 946;
+    pub const OPP_OUTCOME_DIM: usize = 12;
+    pub const BET_PCT_POT_OFF: usize = 958;
+}
+
+/// Encode one env's observation into `out` (length OBS_DIM, pre-zeroed). A
+/// bit-exact per-env port of the scalar `encode_observation`
+/// (python/plo5bp/encoding.py:652) — the ground-truth reference the numpy
+/// batch encoder is validated against. Reads row `j` of the packed arrays.
+/// Terminal rows (actor < 0) are left all-zero, matching the scalar early
+/// return.
+///
+/// Bit-exactness discipline: all scalar arithmetic is done in f64 and cast to
+/// f32 ONLY at the store (`(x as f64 * inv_bb) as f32`), matching the numpy
+/// path which keeps `inv_bb` in f64 and casts on assignment. Hero rotation
+/// uses non-negative modulo to match numpy/Python `%`.
+#[allow(clippy::too_many_arguments)]
+fn encode_obs_row(
+    packed: &PackedObservation,
+    j: usize,
+    num_seats: usize,
+    cat_a: u8,
+    cat_b: u8,
+    inv_bb: f64,
+    starting: &[u64],
+    out: &mut [f32],
+) {
+    use obs_layout::*;
+
+    let hero_i = packed.actor[j];
+    if hero_i < 0 {
+        return; // terminal env -> all-zero row
+    }
+    let hero = hero_i as usize;
+    let ns_i = num_seats as i64;
+    let rel = |x: i64| -> usize { (x - hero as i64).rem_euclid(ns_i) as usize };
+
+    // Row slices for cards.
+    let hole_view = packed.hero_hole.row(j);
+    let hole_slice = hole_view.as_slice().unwrap();
+    let ba_view = packed.board_a.row(j);
+    let ba_slice = ba_view.as_slice().unwrap();
+    let bb_view = packed.board_b.row(j);
+    let bb_slice = bb_view.as_slice().unwrap();
+
+    // --- Card multi-hots (hole / board A / board B). ---
+    for slot in 0..5 {
+        let c = hole_slice[slot];
+        if c < 52 {
+            out[HOLE_OFF + c as usize] = 1.0;
+        }
+        let ca = ba_slice[slot];
+        if ca < 52 {
+            out[BOARD_A_OFF + ca as usize] = 1.0;
+        }
+        let cb = bb_slice[slot];
+        if cb < 52 {
+            out[BOARD_B_OFF + cb as usize] = 1.0;
+        }
+    }
+
+    // --- Street one-hot. ---
+    let street = packed.street[j] as usize;
+    if street < NUM_STREET_ONEHOT {
+        out[STREET_OFF + street] = 1.0;
+    }
+
+    // --- Effective stack per seat (dead-chips chain), absolute seat index. ---
+    // dead = max(0, starting - eff_cap); eff = max(0, stacks - dead). All f64;
+    // chip magnitudes are exact integers in f64 range.
+    let mut eff_per_seat = [0f64; 8];
+    for seat in 0..num_seats {
+        let st = starting[seat] as f64;
+        let ec = packed.eff_stack_cap[[j, seat]] as f64;
+        let dead = (st - ec).max(0.0);
+        let stk = packed.stacks[[j, seat]] as f64;
+        eff_per_seat[seat] = (stk - dead).max(0.0);
+    }
+
+    // --- Active / all-in / stacks (hero-rotated). ---
+    for k in 0..num_seats {
+        let seat = (hero + k) % num_seats;
+        if !packed.folded[[j, seat]] {
+            out[ACTIVE_OFF + k] = 1.0;
+        }
+        if packed.all_in[[j, seat]] {
+            out[ALLIN_OFF + k] = 1.0;
+        }
+        out[STACKS_OFF + k] = (eff_per_seat[seat] * inv_bb) as f32;
+    }
+
+    // --- Scalars: pot, bet_to_call, min_bet, max_bet (all / bb). ---
+    let pot = packed.pot[j] as f64;
+    let btc = packed.bet_to_call[j] as f64;
+    out[SCALARS_OFF] = (pot * inv_bb) as f32;
+    out[SCALARS_OFF + 1] = (btc * inv_bb) as f32;
+    out[SCALARS_OFF + 2] = (packed.min_bet[j] as f64 * inv_bb) as f32;
+    out[SCALARS_OFF + 3] = (packed.max_bet[j] as f64 * inv_bb) as f32;
+
+    // --- Relative position one-hot: actor is always slot 0 (hero == actor). ---
+    out[REL_POS_OFF] = 1.0;
+
+    // --- History (oldest-first, already truncated to last HISTORY_DEPTH). ---
+    let hlen = (packed.history_len[j] as usize).min(HISTORY_DEPTH);
+    for slot in 0..hlen {
+        let base = HISTORY_OFF + slot * HISTORY_SLOT_DIM;
+        let hseat = packed.history_seat[[j, slot]] as i64;
+        out[base + HISTORY_SEAT_OFF_REL + rel(hseat)] = 1.0;
+        let action = packed.history_action[[j, slot]];
+        let chips = packed.history_chips[[j, slot]];
+        // Gate (matches _gate_from_action): FOLD(0)->0; CHECK_CALL(1) & chips==0
+        // ->Check(1), &chips>0 ->Call(2); anything else ->Raise(3).
+        let gate = if action == 0 {
+            0
+        } else if action == 1 {
+            if chips == 0 {
+                1
+            } else {
+                2
+            }
+        } else {
+            3
+        };
+        out[base + HISTORY_GATE_OFF_REL + gate] = 1.0;
+        let s_idx = packed.history_street[[j, slot]];
+        if s_idx >= 0 && (s_idx as usize) < NUM_STREET_ONEHOT {
+            out[base + HISTORY_STREET_OFF_REL + s_idx as usize] = 1.0;
+        }
+        out[base + HISTORY_CHIPS_OFF_REL] = (chips as f64 * inv_bb) as f32;
+    }
+
+    // --- SPR per seat (hero-rotated), clip [0, 4]. ---
+    let pot_safe = pot.max(1.0);
+    for k in 0..num_seats {
+        let seat = (hero + k) % num_seats;
+        let spr = eff_per_seat[seat] / pot_safe;
+        out[SPR_OFF + k] = spr.max(0.0).min(4.0) as f32;
+    }
+
+    // --- Pot odds + bet-faced-as-fraction-of-pot. ---
+    let hero_street_commit = packed.street_commit[[j, hero]] as f64;
+    let to_call = (btc - hero_street_commit).max(0.0);
+    if to_call > 0.0 {
+        out[POT_ODDS_OFF] = (to_call / (pot + to_call)) as f32;
+        let pot_before_bet = (pot - to_call).max(1.0);
+        out[BET_PCT_POT_OFF] = (to_call / pot_before_bet).min(4.0) as f32;
+    }
+
+    // --- Hand-category one-hots. ---
+    if (cat_a as usize) < NUM_CATEGORIES {
+        out[CAT_A_OFF + cat_a as usize] = 1.0;
+    }
+    if (cat_b as usize) < NUM_CATEGORIES {
+        out[CAT_B_OFF + cat_b as usize] = 1.0;
+    }
+
+    // --- Hole-derived summaries reused by feature blocks. ---
+    let mut hole_suit_count = [0u8; 4];
+    let mut hole_rank_mask: u16 = 0;
+    let mut hole_rank_counts = [0u8; 13];
+    for &c in hole_slice {
+        if c < 52 {
+            hole_suit_count[(c & 3) as usize] += 1;
+            hole_rank_mask |= 1u16 << (c >> 2);
+            hole_rank_counts[(c >> 2) as usize] += 1;
+        }
+    }
+
+    // --- Draw flags (per board). ---
+    let (fa, sa) = draw_flags_one_board(&hole_suit_count, hole_rank_mask, ba_slice);
+    let (fb, sb) = draw_flags_one_board(&hole_suit_count, hole_rank_mask, bb_slice);
+    out[DRAW_A_OFF] = fa;
+    out[DRAW_A_OFF + 1] = sa;
+    out[DRAW_B_OFF] = fb;
+    out[DRAW_B_OFF + 1] = sb;
+
+    // --- Pair-with-board counts + board pair structure. ---
+    let mut counts_a = [0f32; 5];
+    let mut struct_a = [0f32; 4];
+    let mut counts_b = [0f32; 5];
+    let mut struct_b = [0f32; 4];
+    pair_features_one_board(&hole_rank_counts, ba_slice, &mut counts_a, &mut struct_a);
+    pair_features_one_board(&hole_rank_counts, bb_slice, &mut counts_b, &mut struct_b);
+    for i in 0..5 {
+        out[PAIR_COUNT_A_OFF + i] = counts_a[i];
+        out[PAIR_COUNT_B_OFF + i] = counts_b[i];
+    }
+    for i in 0..4 {
+        out[BOARD_STRUCT_A_OFF + i] = struct_a[i];
+        out[BOARD_STRUCT_B_OFF + i] = struct_b[i];
+    }
+
+    // --- Hero rank histogram (board-agnostic). ---
+    for &c in hole_slice {
+        if c < 52 {
+            out[HERO_RANK_HIST_OFF + (c >> 2) as usize] += 1.0;
+        }
+    }
+
+    // --- Straight / flush / SF block: needs global (hole+A+B) visibility. ---
+    let mut seen_per_suit = [0u16; 4];
+    for slice in [hole_slice, ba_slice, bb_slice] {
+        for &c in slice {
+            if c < 52 {
+                seen_per_suit[(c & 3) as usize] |= 1u16 << (c >> 2);
+            }
+        }
+    }
+    let mut vct = [0u8; 13];
+    for r in 0..13 {
+        let mut cnt = 0u8;
+        for s in seen_per_suit.iter() {
+            if (s >> r) & 1 == 1 {
+                cnt += 1;
+            }
+        }
+        vct[r] = cnt;
+    }
+    let mut unseen_suit = [0u16; 4];
+    let mut visible_per_suit = [0u8; 4];
+    for s in 0..4 {
+        unseen_suit[s] = !seen_per_suit[s] & 0x1FFF;
+        visible_per_suit[s] = seen_per_suit[s].count_ones() as u8;
+    }
+    let (h_rm, h_rs, h_sc, h_mps) = sf_derive_card_state(hole_slice);
+    sf_compute_board(
+        h_rm, &h_rs, &h_sc, &h_mps, ba_slice, &vct, &unseen_suit, &visible_per_suit,
+        &mut out[FLUSH_NUT_DIST_A_OFF..FLUSH_NUT_DIST_A_OFF + 38],
+    );
+    sf_compute_board(
+        h_rm, &h_rs, &h_sc, &h_mps, bb_slice, &vct, &unseen_suit, &visible_per_suit,
+        &mut out[FLUSH_NUT_DIST_B_OFF..FLUSH_NUT_DIST_B_OFF + 38],
+    );
+
+    // --- Structural seat-exists mask. ---
+    for k in 0..num_seats {
+        out[SEAT_EXISTS_OFF + k] = 1.0;
+    }
+
+    // --- Per-seat commits (hero-rotated). ---
+    for k in 0..num_seats {
+        let seat = (hero + k) % num_seats;
+        out[TOTAL_COMMIT_OFF + k] = (packed.total_commit[[j, seat]] as f64 * inv_bb) as f32;
+        out[STREET_COMMIT_OFF + k] = (packed.street_commit[[j, seat]] as f64 * inv_bb) as f32;
+    }
+
+    // --- Last aggressor (hero-relative one-hot). ---
+    let la = packed.last_aggressor[j];
+    if la >= 0 && (la as usize) < num_seats {
+        out[LAST_AGGRESSOR_OFF + rel(la as i64)] = 1.0;
+    }
+
+    // --- Hero distance to button. ---
+    out[HERO_BTN_DIST_OFF + rel(packed.button[j] as i64)] = 1.0;
+
+    // --- Cross-board interactions. ---
+    let mut ba_rank_mask: u16 = 0;
+    let mut bb_rank_mask: u16 = 0;
+    let mut ba_suit = [0u8; 4];
+    let mut bb_suit = [0u8; 4];
+    for &c in ba_slice {
+        if c < 52 {
+            ba_rank_mask |= 1u16 << (c >> 2);
+            ba_suit[(c & 3) as usize] += 1;
+        }
+    }
+    for &c in bb_slice {
+        if c < 52 {
+            bb_rank_mask |= 1u16 << (c >> 2);
+            bb_suit[(c & 3) as usize] += 1;
+        }
+    }
+    let shared = ba_rank_mask & bb_rank_mask;
+    for r in 0..13 {
+        if (shared >> r) & 1 == 1 {
+            out[SHARED_RANKS_OFF + r] = 1.0;
+        }
+    }
+    for s in 0..4 {
+        if hole_suit_count[s] < 2 {
+            continue;
+        }
+        let a3 = ba_suit[s] >= 3;
+        let b3 = bb_suit[s] >= 3;
+        let a2 = ba_suit[s] == 2;
+        let b2 = bb_suit[s] == 2;
+        if a3 && b3 {
+            out[FLUSH_MADE_BOTH_OFF + s] = 1.0;
+        } else if a2 && b2 {
+            out[FLUSH_DRAW_BOTH_OFF + s] = 1.0;
+        } else if (a3 && b2) || (a2 && b3) {
+            out[FLUSH_MIXED_OFF + s] = 1.0;
+        }
+    }
+    let boards_visible = ba_rank_mask != 0 && bb_rank_mask != 0;
+    let (cm, cd, cx) =
+        cross_board_straight_per_env(hole_rank_mask, ba_rank_mask, bb_rank_mask, boards_visible);
+    out[STRAIGHT_MADE_BOTH_OFF] = cm;
+    out[STRAIGHT_DRAW_BOTH_OFF] = cd;
+    out[STRAIGHT_MIXED_OFF] = cx;
+
+    // --- Opp-outcome fractions (already f32; live rows only). ---
+    for t in 0..OPP_OUTCOME_DIM {
+        out[OPP_OUTCOME_OFF + t] = packed.opp_outcome_fractions[[j, t]];
     }
 }
 
