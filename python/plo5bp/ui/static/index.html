@@ -8,7 +8,15 @@
   </head>
   <body>
     <header id="top-bar">
-      <div class="top-bar-item">
+      <div class="brand">
+        <span class="brand-mark">&#9824;</span>
+        <span class="brand-name">PLO5 <span class="sub">Bomb-Pot Study</span></span>
+      </div>
+      <div id="mode-tabs">
+        <button id="tab-study" class="mode-tab active" type="button">Study</button>
+        <button id="tab-trainer" class="mode-tab" type="button">Trainer</button>
+      </div>
+      <div class="top-bar-item study-only">
         <label>Seats</label>
         <div class="seat-ctl">
           <button id="seats-dec" type="button" aria-label="Fewer seats">−</button>
@@ -20,16 +28,21 @@
         <label for="unit-toggle">Units</label>
         <button id="unit-toggle" type="button">bb</button>
       </div>
-      <div class="top-bar-item">
+      <div class="top-bar-item study-only">
         <label for="dpb-input">$ / bb</label>
         <input id="dpb-input" type="number" step="0.01" min="0.01" value="20.00" />
       </div>
-      <div class="top-bar-item">
+      <div class="top-bar-item study-only">
         <label for="ante-input">Ante</label>
         <input id="ante-input" type="number" step="0.01" min="0" value="3.00" />
       </div>
       <div class="top-bar-item top-bar-spacer"></div>
-      <div class="top-bar-item ocr-group">
+      <div class="top-bar-item trainer-only">
+        <button id="trainer-settings-btn" type="button" title="Trainer settings">Settings</button>
+        <button id="trainer-repeat-btn" type="button" title="Re-deal the same hand (excluded from stats)">Repeat</button>
+        <button id="trainer-new-hand-btn" type="button">New Hand</button>
+      </div>
+      <div class="top-bar-item ocr-group study-only">
         <label for="ocr-window-button">OCR</label>
         <div class="ocr-window-picker">
           <button id="ocr-window-button" type="button" aria-haspopup="listbox"
@@ -42,7 +55,7 @@
                 title="Save the current OCR frame to screenrecords/frames/">Save frame</button>
         <span id="ocr-status" class="muted"></span>
       </div>
-      <div class="top-bar-item">
+      <div class="top-bar-item study-only">
         <button id="new-hand-btn" type="button">New Hand</button>
       </div>
     </header>
@@ -52,19 +65,19 @@
         <div id="table-wrap">
           <svg id="table-svg" viewBox="0 0 800 560" xmlns="http://www.w3.org/2000/svg">
             <defs>
-              <radialGradient id="felt-gradient" cx="50%" cy="38%" r="65%">
-                <stop offset="0%" stop-color="#1e4f4a" />
-                <stop offset="55%" stop-color="#103231" />
-                <stop offset="100%" stop-color="#061a1a" />
+              <radialGradient id="felt-gradient" cx="50%" cy="36%" r="70%">
+                <stop offset="0%" stop-color="#2c6e5c" />
+                <stop offset="50%" stop-color="#175044" />
+                <stop offset="100%" stop-color="#0a2b25" />
               </radialGradient>
               <linearGradient id="rim-gradient" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stop-color="#5a3d2b" />
-                <stop offset="40%" stop-color="#3d2a1f" />
-                <stop offset="100%" stop-color="#1f1410" />
+                <stop offset="0%" stop-color="#6e4c33" />
+                <stop offset="35%" stop-color="#4a3122" />
+                <stop offset="100%" stop-color="#221610" />
               </linearGradient>
               <linearGradient id="seat-gradient" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stop-color="#262d38" />
-                <stop offset="100%" stop-color="#161a22" />
+                <stop offset="0%" stop-color="#2b3442" />
+                <stop offset="100%" stop-color="#161b24" />
               </linearGradient>
               <radialGradient id="dealer-gradient" cx="35%" cy="30%" r="80%">
                 <stop offset="0%" stop-color="#ffffff" />
@@ -72,8 +85,8 @@
                 <stop offset="100%" stop-color="#a8a8b0" />
               </radialGradient>
               <linearGradient id="pot-badge-gradient" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stop-color="rgba(20, 28, 36, 0.85)" />
-                <stop offset="100%" stop-color="rgba(8, 14, 22, 0.85)" />
+                <stop offset="0%" stop-color="rgba(18, 27, 36, 0.92)" />
+                <stop offset="100%" stop-color="rgba(7, 13, 20, 0.92)" />
               </linearGradient>
               <filter id="table-shadow" x="-10%" y="-10%" width="120%" height="120%">
                 <feGaussianBlur in="SourceAlpha" stdDeviation="6" />
@@ -97,14 +110,15 @@
 
             <ellipse cx="400" cy="260" rx="352" ry="202" class="table-rim" filter="url(#table-shadow)" />
             <ellipse cx="400" cy="260" rx="340" ry="190" class="table-edge" />
-            <ellipse cx="400" cy="225" rx="270" ry="120" class="table-glow" />
+            <ellipse cx="400" cy="260" rx="300" ry="153" class="table-line" />
+            <ellipse cx="400" cy="222" rx="266" ry="116" class="table-glow" />
 
             <g id="board-a" transform="translate(280 207)"></g>
             <g id="board-b" transform="translate(280 285)"></g>
 
             <g id="pot-badge">
-              <rect x="350" y="158" width="100" height="30" rx="15" class="pot-badge-rect" />
-              <text id="pot-label" x="400" y="178" text-anchor="middle" class="pot-label">Pot 0bb</text>
+              <rect x="338" y="154" width="124" height="32" rx="16" class="pot-badge-rect" />
+              <text id="pot-label" x="400" y="175" text-anchor="middle" class="pot-label">Pot 0bb</text>
             </g>
 
             <g id="seats"></g>
@@ -127,9 +141,42 @@
               <text class="insert-icon-plus" text-anchor="middle" dy="6">+</text>
             </g>
           </svg>
+          <div id="feedback-flash" hidden>
+            <span id="feedback-marks"></span>
+            <span id="feedback-text"></span>
+            <span id="feedback-sub"></span>
+          </div>
         </div>
 
         <div id="actor-banner" class="actor-banner" hidden></div>
+
+        <div id="review-panel" class="panel" hidden>
+          <div class="review-left">
+            <svg class="score-ring" viewBox="0 0 64 64" width="64" height="64">
+              <circle class="ring-bg" cx="32" cy="32" r="26" />
+              <circle id="review-ring-fill" class="ring-fill" cx="32" cy="32" r="26" />
+              <text id="review-score-num" x="32" y="37" text-anchor="middle">—</text>
+            </svg>
+            <span class="review-score-caption">GTO score</span>
+          </div>
+          <div class="review-mid">
+            <div class="review-step-row">
+              <button id="review-prev" type="button" aria-label="Previous decision">‹</button>
+              <span id="review-step-label"></span>
+              <button id="review-next" type="button" aria-label="Next decision">›</button>
+            </div>
+            <div id="review-chips"></div>
+            <div id="review-whatif-bar" hidden>
+              <span class="whatif-tag">What-if cards active</span>
+              <button id="review-whatif-reset" type="button">Reset cards</button>
+            </div>
+          </div>
+          <div id="review-detail"></div>
+          <div class="review-actions">
+            <button id="review-repeat-hand" type="button">Repeat Hand</button>
+            <button id="review-next-hand" class="primary" type="button">Next Hand</button>
+          </div>
+        </div>
 
         <div class="panels">
           <div id="action-panel" class="panel">
@@ -170,7 +217,83 @@
         </div>
         <div id="card-grid"></div>
       </aside>
+
+      <aside id="trainer-stats-panel">
+        <div class="card-grid-header"><span>Stats</span></div>
+        <div id="stats-session" class="stats-block"></div>
+        <div id="stats-lifetime" class="stats-block"></div>
+      </aside>
     </main>
+
+    <div id="trainer-settings-modal" class="modal-backdrop" hidden>
+      <div class="modal">
+        <h3>Trainer Settings</h3>
+        <div class="ts-row">
+          <label>Seats</label>
+          <select id="ts-seats-mode">
+            <option value="random">Random range</option>
+            <option value="fixed">Fixed</option>
+          </select>
+          <span class="ts-sub" id="ts-seats-fixed-wrap">
+            <input id="ts-seats-fixed" type="number" min="2" max="6" step="1" />
+          </span>
+          <span class="ts-sub" id="ts-seats-range-wrap">
+            <input id="ts-seats-min" type="number" min="2" max="6" step="1" /> –
+            <input id="ts-seats-max" type="number" min="2" max="6" step="1" />
+          </span>
+        </div>
+        <div class="ts-row">
+          <label>Stacks (bb)</label>
+          <select id="ts-stacks-mode">
+            <option value="fixed">Fixed</option>
+            <option value="random">Random range</option>
+            <option value="per_seat">Per seat</option>
+          </select>
+          <span class="ts-sub" id="ts-stack-fixed-wrap">
+            <input id="ts-stack-bb" type="number" min="1" max="1000" step="0.5" />
+          </span>
+          <span class="ts-sub" id="ts-stack-range-wrap">
+            <input id="ts-stack-min-bb" type="number" min="1" max="1000" step="0.5" /> –
+            <input id="ts-stack-max-bb" type="number" min="1" max="1000" step="0.5" />
+          </span>
+        </div>
+        <div class="ts-row" id="ts-per-seat-wrap">
+          <label>Per-seat ranges</label>
+          <div id="ts-per-seat"></div>
+        </div>
+        <div class="ts-row">
+          <label>Hero position</label>
+          <select id="ts-hero-mode">
+            <option value="random">Random seat</option>
+            <option value="kth">Fixed (k-th to act)</option>
+          </select>
+          <span class="ts-sub" id="ts-hero-kth-wrap">
+            <select id="ts-hero-kth">
+              <option value="1">1st to act</option>
+              <option value="2">2nd to act</option>
+              <option value="3">3rd to act</option>
+              <option value="4">4th to act</option>
+              <option value="5">5th to act</option>
+              <option value="6">6th to act</option>
+            </select>
+          </span>
+        </div>
+        <div class="ts-row">
+          <label>Ante (bb)</label>
+          <input id="ts-ante-bb" type="number" min="0" max="100" step="0.5" />
+        </div>
+        <div class="ts-row">
+          <label>EV rollouts</label>
+          <input id="ts-mc-rollouts" type="number" min="0" max="256" step="1"
+                 title="Monte-Carlo rollouts per EV-loss estimate; 0 disables EV loss" />
+        </div>
+        <p class="muted">Changes apply from the next hand.</p>
+        <div class="modal-buttons">
+          <button id="ts-cancel" type="button">Cancel</button>
+          <button id="ts-save" class="primary" type="button">Save</button>
+        </div>
+      </div>
+    </div>
 
     <div id="toast-container"></div>
 

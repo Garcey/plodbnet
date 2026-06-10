@@ -69,10 +69,10 @@ function actorCommitChips(s) {
   return (s && s.actor !== null && s.actor !== undefined && s.seats[s.actor])
     ? s.seats[s.actor].committed_this_street_chips : 0;
 }
-function showToast(msg) {
+function showToast(msg, kind = "error") {
   const container = document.getElementById("toast-container");
   const toast = document.createElement("div");
-  toast.className = "toast";
+  toast.className = `toast toast-${kind}`;
   toast.textContent = msg;
   container.appendChild(toast);
   setTimeout(() => toast.remove(), 4000);
@@ -80,6 +80,11 @@ function showToast(msg) {
 
 const UI = {
   unit: "$",
+  mode: (() => {
+    const q = new URLSearchParams(location.search).get("mode");
+    if (q === "trainer" || q === "study") return q;
+    return localStorage.getItem("plo5bp-mode") === "trainer" ? "trainer" : "study";
+  })(),
   selectedSlot: null,
   lastState: null,
   lastStateKey: null,
@@ -97,7 +102,22 @@ const UI = {
   simpleOcrToggleBusy: false,
   raiseUserSet: false,
   raiseLastActor: null,
+  // Trainer
+  feedbackShownIdx: -1,
+  feedbackTimer: null,
+  reviewDecision: null,   // decision index currently shown in review, or null
+  trainerPick: false,     // card grid open for a what-if swap
+  settingsOpen: false,
+  animSeq: 0,             // bumped to cancel an in-flight frame animation
+  animating: false,
 };
+
+const TRAINER_ANIM_MS = 1200;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function apiBase() {
+  return UI.mode === "trainer" ? "/trainer" : "";
+}
 
 async function postJSON(url, body) {
   const res = await fetch(url, {
@@ -107,7 +127,12 @@ async function postJSON(url, body) {
   });
   if (!res.ok) {
     let detail = res.statusText;
-    try { detail = (await res.json()).detail ?? detail; } catch (_) {}
+    try {
+      const d = (await res.json()).detail;
+      if (typeof d === "string") detail = d;
+      else if (Array.isArray(d)) detail = d.map(x => x.msg ?? JSON.stringify(x)).join("; ");
+      else if (d !== undefined) detail = JSON.stringify(d);
+    } catch (_) {}
     throw new Error(`${res.status} ${detail}`);
   }
   return res.json();
@@ -119,7 +144,7 @@ async function getJSON(url) {
 }
 
 async function fetchState() {
-  try { const data = await getJSON("/state"); applyState(data.state); }
+  try { const data = await getJSON(`${apiBase()}/state`); applyState(data.state); }
   catch (e) { showToast(e.message); }
 }
 async function postCards() {
@@ -148,8 +173,59 @@ async function postSeats(body) {
   catch (e) { showToast(e.message); }
 }
 async function postAction(body) {
+  if (UI.mode === "trainer") {
+    if (UI.animating) return;
+    try {
+      const data = await postJSON("/trainer/act", body);
+      await animateTrainerResponse(data);
+    } catch (e) { showToast(e.message); }
+    return;
+  }
   try { const data = await postJSON("/action", body); applyState(data.state); }
   catch (e) { showToast(e.message); }
+}
+async function postTrainer(path, body) {
+  try {
+    const data = await postJSON(`/trainer/${path}`, body ?? {});
+    await animateTrainerResponse(data);
+    return true;
+  } catch (e) { showToast(e.message); return false; }
+}
+
+// Play the per-action frames the trainer returns (one snapshot per
+// opponent action), then settle on the authoritative final state. Any
+// applyState from elsewhere bumps animSeq and cancels the playback.
+async function animateTrainerResponse(data) {
+  const frames = data.frames || [];
+  const final = data.state;
+  if (UI.mode !== "trainer" || frames.length === 0) {
+    applyState(final);
+    return;
+  }
+  const seq = ++UI.animSeq;
+  UI.animating = true;
+  try {
+    // Hero's verdict flashes immediately, while opponents play out.
+    if (final.trainer && final.trainer.feedback) {
+      renderFeedbackFlash(final, true);
+    }
+    for (let i = 0; i < frames.length; i++) {
+      if (UI.animSeq !== seq) return;
+      render(frames[i]);
+      if (i < frames.length - 1) await sleep(TRAINER_ANIM_MS);
+    }
+    if (UI.animSeq !== seq) return;
+  } finally {
+    UI.animating = false;
+  }
+  applyState(final);
+}
+async function trainerReviewGoto(decision) {
+  try {
+    const data = await getJSON(`/trainer/review?decision=${decision}`);
+    UI.reviewDecision = decision;
+    applyState(data.state);
+  } catch (e) { showToast(e.message); }
 }
 async function postUndo() {
   try { const data = await postJSON("/undo", {}); applyState(data.state); }
@@ -173,6 +249,7 @@ async function postConfig(body) {
 }
 
 function applyState(s) {
+  UI.animSeq++;  // an authoritative state cancels any frame animation
   UI.lastState = s;
   if (UI.selectedSlot) {
     const cur = s.card_spec[UI.selectedSlot.key][UI.selectedSlot.index];
@@ -216,14 +293,27 @@ function render(s) {
   renderRecommendation(s);
   renderHistory(s);
   renderCardGrid(s);
+  renderTrainer(s);
   document.getElementById("undo-btn").disabled = !s.can_undo;
   const insertIcon = document.getElementById("insert-icon");
-  if (s.num_seats >= 6) {
+  if (s.num_seats >= 6 || s.trainer) {
     insertIcon.setAttribute("hidden", "");
     insertIcon.style.display = "none";
   } else {
     insertIcon.style.display = "";
   }
+}
+
+function renderTrainer(s) {
+  const reviewPanel = document.getElementById("review-panel");
+  if (!s.trainer) {
+    reviewPanel.hidden = true;
+    hideFeedbackFlash();
+    return;
+  }
+  renderFeedbackFlash(s);
+  renderTrainerStats(s);
+  renderReviewPanel(s);
 }
 
 function renderTopBar(s) {
@@ -257,6 +347,75 @@ function seatPositions(numSeats, heroSeat) {
   return positions;
 }
 
+// Committed-bet marker: a poker chip in front of the seat (toward the
+// table center) with the amount labeled beside it, GTO-Wizard style.
+// `p` is the seat's absolute table position; the returned group uses
+// seat-local coordinates (the caller's node is translated to `p`).
+function makeBetChip(chips, s, p) {
+  const dx = TABLE_CENTER.x - p.x;
+  const dy = TABLE_CENTER.y - p.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const offset = 64; // dealer button sits at 38 on the same ray
+  let ax = p.x + (dx / len) * offset;
+  let ay = p.y + (dy / len) * offset;
+
+  const label = formatUnit(chips, s);
+  // Label goes on the side of the chip facing the table center so it
+  // never runs back over the seat plate / dealer button.
+  let labelLeft = dx < -10;
+  const textW = label.length * 6.6;
+
+  // Keep-out around the pot badge (rect 338-462 × 154-186, padded): the
+  // top-center seat's ray lands on it — slide the block sideways past
+  // the badge edge, label facing away from it.
+  const POT = { x1: 326, y1: 142, x2: 474, y2: 198 };
+  const bx1 = labelLeft ? ax - 12 - textW : ax - 10;
+  const bx2 = labelLeft ? ax + 10 : ax + 12 + textW;
+  if (ay > POT.y1 && ay < POT.y2 && bx2 > POT.x1 && bx1 < POT.x2) {
+    if (p.x >= TABLE_CENTER.x) {
+      labelLeft = false;
+      ax = POT.x2 + 18;
+    } else {
+      labelLeft = true;
+      ax = POT.x1 - 18;
+    }
+  }
+
+  const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+  g.setAttribute("class", "bet-chip");
+  g.setAttribute("transform", `translate(${ax - p.x} ${ay - p.y})`);
+
+  const under = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+  under.setAttribute("cy", 2.6); under.setAttribute("r", 8);
+  under.setAttribute("class", "bet-chip-under");
+  g.appendChild(under);
+
+  const base = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+  base.setAttribute("r", 8);
+  base.setAttribute("class", "bet-chip-base");
+  g.appendChild(base);
+
+  const stripes = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+  stripes.setAttribute("r", 8);
+  stripes.setAttribute("class", "bet-chip-stripes");
+  g.appendChild(stripes);
+
+  const inner = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+  inner.setAttribute("r", 4.2);
+  inner.setAttribute("class", "bet-chip-inner");
+  g.appendChild(inner);
+
+  const amount = document.createElementNS("http://www.w3.org/2000/svg", "text");
+  amount.setAttribute("x", labelLeft ? -13 : 13);
+  amount.setAttribute("y", 4);
+  amount.setAttribute("text-anchor", labelLeft ? "end" : "start");
+  amount.setAttribute("class", "bet-chip-amount");
+  amount.textContent = label;
+  g.appendChild(amount);
+
+  return g;
+}
+
 function renderSeats(s) {
   const g = document.getElementById("seats");
   g.innerHTML = "";
@@ -267,14 +426,18 @@ function renderSeats(s) {
     const node = document.createElementNS("http://www.w3.org/2000/svg", "g");
     node.classList.add("seat-node");
     if (seat.is_actor) node.classList.add("actor");
+    if (seat.is_hero) node.classList.add("hero");
     if (seat.folded) node.classList.add("folded");
     if (seat.all_in) node.classList.add("all-in");
+    if (s.trainer && s.trainer.anim_action && s.trainer.anim_action.seat === seat.seat) {
+      node.classList.add("acted");
+    }
     node.setAttribute("transform", `translate(${p.x} ${p.y})`);
 
     const bg = document.createElementNS("http://www.w3.org/2000/svg", "rect");
     bg.setAttribute("x", -46); bg.setAttribute("y", -26);
     bg.setAttribute("width", 92); bg.setAttribute("height", 52);
-    bg.setAttribute("rx", 6); bg.setAttribute("class", "seat-bg");
+    bg.setAttribute("rx", 10); bg.setAttribute("class", "seat-bg");
     node.appendChild(bg);
 
     const pos = document.createElementNS("http://www.w3.org/2000/svg", "text");
@@ -284,9 +447,10 @@ function renderSeats(s) {
 
     const stack = document.createElementNS("http://www.w3.org/2000/svg", "text");
     stack.setAttribute("y", 6);
-    stack.setAttribute("class", seat.all_in ? "seat-stack" : "seat-stack editable");
+    const editable = !seat.all_in && !s.trainer;
+    stack.setAttribute("class", editable ? "seat-stack editable" : "seat-stack");
     stack.textContent = seat.all_in ? "all-in" : formatUnit(seat.stack_chips, s);
-    if (!seat.all_in) {
+    if (editable) {
       stack.style.cursor = "pointer";
       stack.addEventListener("click", (e) => {
         e.stopPropagation();
@@ -296,13 +460,51 @@ function renderSeats(s) {
     node.appendChild(stack);
 
     if (seat.committed_this_street_chips > 0) {
-      const commit = document.createElementNS("http://www.w3.org/2000/svg", "text");
-      commit.setAttribute("y", 20); commit.setAttribute("class", "seat-commit");
-      commit.textContent = `+${formatUnit(seat.committed_this_street_chips, s)}`;
-      node.appendChild(commit);
+      node.appendChild(makeBetChip(seat.committed_this_street_chips, s, p));
     }
 
-    if (!seat.is_hero && s.num_seats > 2) {
+    // Trainer: revealed opponent hole cards. Drawn on the OUTSIDE of the
+    // table (above the plate for top-half seats, below for bottom-half)
+    // so they never collide with the dealer button / bet chips, which
+    // live on the inside ray.
+    if (seat.hole && !seat.is_hero) {
+      const mini = document.createElementNS("http://www.w3.org/2000/svg", "g");
+      mini.setAttribute("class", "seat-hole");
+      const cw = 24, ch = 33, gap = 3;
+      const total = seat.hole.length * cw + (seat.hole.length - 1) * gap;
+      // Keep the row on-canvas for far-left/right seats.
+      const rowCenterX = Math.max(total / 2 + 4,
+        Math.min(800 - total / 2 - 4, p.x)) - p.x;
+      const above = p.y < TABLE_CENTER.y;
+      const rowY = above ? -(26 + 7 + ch) : 26 + 7;
+      const x0 = rowCenterX - total / 2;
+      for (let i = 0; i < seat.hole.length; i++) {
+        const card = cardToString(seat.hole[i]);
+        const x = x0 + i * (cw + gap);
+        const r = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+        r.setAttribute("x", x); r.setAttribute("y", rowY);
+        r.setAttribute("width", cw); r.setAttribute("height", ch);
+        r.setAttribute("rx", 3.5);
+        r.setAttribute("class", "seat-hole-card");
+        r.style.fill = card.color;
+        mini.appendChild(r);
+        const t = document.createElementNS("http://www.w3.org/2000/svg", "text");
+        t.setAttribute("x", x + cw / 2); t.setAttribute("y", rowY + 15);
+        t.setAttribute("text-anchor", "middle");
+        t.setAttribute("class", "seat-hole-rank");
+        t.textContent = card.rank;
+        mini.appendChild(t);
+        const gl = document.createElementNS("http://www.w3.org/2000/svg", "text");
+        gl.setAttribute("x", x + cw / 2); gl.setAttribute("y", rowY + 28);
+        gl.setAttribute("text-anchor", "middle");
+        gl.setAttribute("class", "seat-hole-suit");
+        gl.textContent = card.glyph;
+        mini.appendChild(gl);
+      }
+      node.appendChild(mini);
+    }
+
+    if (!seat.is_hero && s.num_seats > 2 && !s.trainer) {
       const rm = document.createElementNS("http://www.w3.org/2000/svg", "g");
       rm.setAttribute("class", "seat-remove");
       rm.setAttribute("transform", "translate(38 -18)");
@@ -446,7 +648,7 @@ function renderSlotRect(parent, key, index, value, s, x, y, w, h) {
   const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
   rect.setAttribute("x", x); rect.setAttribute("y", y);
   rect.setAttribute("width", w); rect.setAttribute("height", h);
-  rect.setAttribute("rx", 4);
+  rect.setAttribute("rx", 5);
   let cls = "slot-rect" + (value === null ? " empty" : "");
   const isSelected = UI.selectedSlot && UI.selectedSlot.key === key && UI.selectedSlot.index === index;
   if (isSelected) cls += " selected";
@@ -537,8 +739,40 @@ function renderPotLabel(s) {
   document.getElementById("pot-label").textContent = `Pot ${formatUnit(s.pot_chips, s)}`;
 }
 
+function animActionText(s) {
+  const a = s.trainer.anim_action;
+  const seat = s.seats[a.seat];
+  if (a.gate === "fold") return `${a.position} folds`;
+  if (a.gate === "check_call") {
+    return a.to_call > 0 ? `${a.position} calls` : `${a.position} checks`;
+  }
+  const committed = seat ? seat.committed_this_street_chips : a.chips;
+  const verb = seat && seat.all_in ? "is all-in"
+    : a.to_call > 0 ? "raises to" : "bets";
+  const amt = committed > 0 ? ` ${formatUnit(committed, s)}` : "";
+  return `${a.position} ${verb}${amt}`;
+}
+
 function renderActorBanner(s) {
   const banner = document.getElementById("actor-banner");
+  // Trainer animation frame: narrate the opponent action that just landed.
+  if (s.trainer && s.trainer.anim_action) {
+    banner.hidden = false;
+    banner.classList.toggle("hero", false);
+    banner.textContent = animActionText(s);
+    return;
+  }
+  // Trainer review: the state is a mid-hand reconstruction, not a live turn.
+  if (s.trainer && !s.trainer.hand_active && s.trainer.review) {
+    const rv = s.trainer.review;
+    const cur = rv.current;
+    banner.hidden = false;
+    banner.classList.toggle("hero", true);
+    banner.textContent =
+      `Reviewing decision ${rv.decision + 1} / ${rv.num_decisions} — ${cur.street}` +
+      ` · you chose ${cur.user_label}`;
+    return;
+  }
   if (s.actor === null || s.actor === undefined) {
     banner.hidden = true;
     return;
@@ -567,6 +801,21 @@ function renderActions(s) {
     return;
   }
   terminalPane.hidden = true;
+
+  // Trainer review reconstruction: the hand is over; this state is a
+  // replayed decision node. Show the choice, don't allow acting.
+  if (s.trainer && !s.trainer.hand_active) {
+    raiseSection.hidden = true;
+    gate.innerHTML = '<p class="muted">Reviewing — actions disabled. Use Next Hand to continue.</p>';
+    return;
+  }
+
+  // Trainer animation frame: an opponent is acting.
+  if (s.trainer && s.actor !== null && s.actor !== undefined && s.actor !== s.hero_seat) {
+    raiseSection.hidden = true;
+    gate.innerHTML = '<p class="muted">Opponents acting…</p>';
+    return;
+  }
 
   if (s.actor === null || s.actor === undefined) {
     raiseSection.hidden = true;
@@ -598,7 +847,7 @@ function renderActions(s) {
   const toCallLabel = s.to_call_chips > 0 ? `Call ${formatUnit(s.to_call_chips, s)}` : "Check";
 
   gate.appendChild(mkBtn("Fold", "fold", s.legal.fold && !heroBlocked, "fold"));
-  gate.appendChild(mkBtn(toCallLabel, "check_call", s.legal.check_call && !heroBlocked));
+  gate.appendChild(mkBtn(toCallLabel, "check_call", s.legal.check_call && !heroBlocked, "call"));
 
   if (s.legal.raise && !heroBlocked) {
     raiseSection.hidden = false;
@@ -720,8 +969,63 @@ function renderRaiseSection(s, actorSeat) {
   }
 }
 
+function distRowsHTML(dist, callName) {
+  const distNames = ["Fold", callName, "Raise"];
+  const distClasses = ["fold", "call", "raise"];
+  return (dist || []).map((p, i) => `
+    <div class="rec-dist-row">
+      <span class="rec-dist-name">${distNames[i] ?? "?"}</span>
+      <div class="rec-dist-track">
+        <div class="rec-dist-fill ${distClasses[i] ?? ""}" style="width:${(p * 100).toFixed(1)}%"></div>
+      </div>
+      <span class="rec-dist-pct">${(p * 100).toFixed(0)}%</span>
+    </div>`).join("");
+}
+
+function renderTrainerReviewRecommendation(s, el) {
+  const rv = s.trainer.review;
+  const cur = rv.current;
+  const whatif = rv.whatif;
+  const callName = cur.to_call_chips > 0 ? "Call" : "Check";
+  let actionText, dist, alpha, beta, valueBB, tag = "";
+  if (whatif) {
+    const rec = whatif.recommendation;
+    actionText = rec.chips !== null && rec.chips !== undefined
+      ? `${cur.to_call_chips > 0 ? "Raise" : "Bet"} ${formatUnit(rec.chips, s)}`
+      : (rec.gate === "fold" ? "Fold" : callName);
+    dist = rec.gate_distribution;
+    alpha = rec.beta_alpha; beta = rec.beta_beta; valueBB = rec.value_bb;
+    tag = `<span class="whatif-tag">what-if</span> `;
+  } else {
+    actionText = cur.rec_label;
+    dist = cur.gate_probs;
+    alpha = cur.beta_alpha; beta = cur.beta_beta; valueBB = cur.value_bb;
+  }
+  const sign = valueBB >= 0 ? "+" : "-";
+  const absBB = Math.abs(valueBB);
+  const vDisp = UI.unit === "bb"
+    ? `${sign}${absBB.toFixed(2)}bb`
+    : `${sign}$${(absBB * (s?.chip_scale?.dollars_per_bb ?? 2)).toFixed(2)}`;
+  el.innerHTML = `
+    <div class="rec-line">
+      ${tag}<span class="rec-action">${actionText}</span>
+      <span class="rec-value">value ${vDisp}</span>
+    </div>
+    <div class="rec-dist">${distRowsHTML(dist, callName)}</div>
+    <div class="rec-detail">β(${(alpha ?? 0).toFixed(1)}, ${(beta ?? 0).toFixed(1)})</div>
+  `;
+}
+
 function renderRecommendation(s) {
   const el = document.getElementById("recommendation");
+  if (s.trainer) {
+    if (s.trainer.review && s.trainer.review.current) {
+      renderTrainerReviewRecommendation(s, el);
+      return;
+    }
+    el.innerHTML = '<p class="muted">Hidden during play — revealed in the post-hand review.</p>';
+    return;
+  }
   const REC_PROMPTS = {
     hole:  "Place hero's 5 hole cards to see network output.",
     flop:  "Place the flop cards to see network output.",
@@ -752,11 +1056,10 @@ function renderRecommendation(s) {
     const ac = actorCommitChips(s);
     actionText = `${verb} ${formatUnit(rec.chips + ac, s)}${suffix}`;
   }
-  const dist = rec.gate_distribution || [];
-  const distFmt = dist.map((p, i) => {
-    const names = ["F", "C", "R"];
-    return `${names[i]} ${(p * 100).toFixed(0)}%`;
-  }).join("  ");
+  const distRows = distRowsHTML(
+    rec.gate_distribution || [],
+    s.to_call_chips > 0 ? "Call" : "Check",
+  );
   const vBB = rec.value_bb;
   const sign = vBB >= 0 ? "+" : "-";
   const absBB = Math.abs(vBB);
@@ -764,10 +1067,12 @@ function renderRecommendation(s) {
     ? `${sign}${absBB.toFixed(2)}bb`
     : `${sign}$${(absBB * (s?.chip_scale?.dollars_per_bb ?? 2)).toFixed(2)}`;
   el.innerHTML = `
-    <div class="rec-line">Network: <span class="rec-action">${actionText}</span>
-      <span class="muted">· value ${vDisp}</span>
+    <div class="rec-line">
+      <span class="rec-action">${actionText}</span>
+      <span class="rec-value">value ${vDisp}</span>
     </div>
-    <div class="rec-detail">${distFmt} · \u03B2(${rec.beta_alpha.toFixed(1)}, ${rec.beta_beta.toFixed(1)})</div>
+    <div class="rec-dist">${distRows}</div>
+    <div class="rec-detail">\u03B2(${rec.beta_alpha.toFixed(1)}, ${rec.beta_beta.toFixed(1)})</div>
   `;
 }
 
@@ -800,8 +1105,9 @@ function renderHistory(s) {
     const h = s.history[i];
     const row = document.createElement("div");
     row.className = "history-entry";
+    const streetClass = `h-${String(h.street).toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
     row.innerHTML = `
-      <span class="h-street">${h.street}</span>
+      <span class="h-street ${streetClass}">${h.street}</span>
       <span class="h-pos">${h.position}</span>
       <span class="h-action">${actionLabel(h, s, i)}</span>
     `;
@@ -850,6 +1156,25 @@ function renderCardGrid(s) {
 // --- Slot / grid interactions ----------------------------------------------
 
 function onSlotClick(key, index) {
+  const s = UI.lastState;
+  if (s && s.trainer) {
+    // Trainer: card slots are display-only mid-hand; in review a click
+    // selects the card for a what-if swap.
+    const rv = s.trainer.review;
+    if (!rv) return;
+    const spec = s.card_spec[key];
+    if (!spec || spec[index] === null || spec[index] === undefined) return;
+    if (UI.selectedSlot && UI.selectedSlot.key === key && UI.selectedSlot.index === index) {
+      UI.selectedSlot = null;
+      cancelTrainerPick();
+    } else {
+      UI.selectedSlot = { key, index };
+      UI.trainerPick = true;
+      document.body.classList.add("trainer-pick");
+    }
+    render(s);
+    return;
+  }
   if (UI.selectedSlot && UI.selectedSlot.key === key && UI.selectedSlot.index === index) {
     UI.selectedSlot = null;
   } else {
@@ -860,7 +1185,7 @@ function onSlotClick(key, index) {
 
 function onSlotDoubleClick(key, index) {
   const s = UI.lastState;
-  if (!s) return;
+  if (!s || s.trainer) return;
   const spec = s.card_spec[key];
   if (spec[index] === null) return;
   spec[index] = null;
@@ -871,6 +1196,25 @@ function onSlotDoubleClick(key, index) {
 function onGridCardClick(cardInt) {
   const s = UI.lastState;
   if (!s) return;
+  if (s.trainer) {
+    const rv = s.trainer.review;
+    const sel = UI.selectedSlot;
+    if (!rv || !sel || !UI.trainerPick) return;
+    const used = collectUsedCards(s);
+    if (used.has(cardInt)) return;
+    // Send the full current spec as absolute overrides so earlier
+    // what-if swaps survive; the server re-validates against originals.
+    const base = rv.whatif ? rv.whatif.card_spec : s.card_spec;
+    const body = { decision: rv.decision };
+    for (const k of ["hero_hole", "flop_a", "flop_b", "turn", "river"]) {
+      body[k] = (base[k] || []).slice();
+    }
+    body[sel.key][sel.index] = cardInt;
+    UI.selectedSlot = null;
+    cancelTrainerPick();
+    postTrainer("whatif", body);
+    return;
+  }
   const sel = UI.selectedSlot;
   if (!sel) { showToast("Click a slot first"); return; }
   const used = collectUsedCards(s);
@@ -915,7 +1259,7 @@ function setupInsertHover() {
 
   svg.addEventListener("mousemove", (e) => {
     const s = UI.lastState;
-    if (!s || s.num_seats >= 6) { icon.setAttribute("hidden", ""); return; }
+    if (!s || s.num_seats >= 6 || s.trainer) { icon.setAttribute("hidden", ""); return; }
     const pt = svgPoint(svg, e.clientX, e.clientY);
     const r = ellipseRadius(pt.x, pt.y);
     if (r < 0.55 || r > 1.25) { icon.setAttribute("hidden", ""); return; }
@@ -962,6 +1306,7 @@ function setupDealerDrag() {
     return ctm ? pt.matrixTransform(ctm.inverse()) : { x: evt.clientX, y: evt.clientY };
   };
   button.addEventListener("pointerdown", (e) => {
+    if (UI.mode === "trainer") return;
     e.preventDefault();
     UI.draggingButton = true;
     button.classList.add("dragging");
@@ -1211,7 +1556,7 @@ async function saveOcrFrame() {
     const data = await postJSON("/ocr/save_frame", {});
     const name = (data.path || "").split(/[\\/]/).pop() || "frame";
     const sz = data.frame_size ? ` (${data.frame_size.width}x${data.frame_size.height})` : "";
-    showToast(`Saved ${name}${sz}`);
+    showToast(`Saved ${name}${sz}`, "info");
   } catch (e) {
     showToast(`Save frame failed: ${e.message}`);
   } finally {
@@ -1277,7 +1622,7 @@ function startOcrPolling() {
         // back to the placeholder (a manual Off leaves the selection intact).
         if (wasRunning && st.stopped_reason === "window_closed") {
           setOcrWindowSelection("");
-          showToast("OCR stopped — window closed");
+          showToast("OCR stopped — window closed", "info");
         }
         stopOcrPolling();
       }
@@ -1306,6 +1651,316 @@ async function refreshOcrStatusOnLoad() {
   } catch (_) { /* ocr endpoints may be unavailable; ignore */ }
 }
 
+// --- Trainer mode -------------------------------------------------------
+
+function applyModeUI() {
+  const trainer = UI.mode === "trainer";
+  document.body.classList.toggle("trainer-mode", trainer);
+  document.getElementById("tab-study").classList.toggle("active", !trainer);
+  document.getElementById("tab-trainer").classList.toggle("active", trainer);
+}
+
+function setMode(mode) {
+  if (UI.mode === mode) return;
+  UI.mode = mode;
+  localStorage.setItem("plo5bp-mode", mode);
+  UI.lastState = null;
+  UI.lastStateKey = null;
+  UI.selectedSlot = null;
+  UI.reviewDecision = null;
+  cancelTrainerPick();
+  applyModeUI();
+  fetchState();
+}
+
+function cancelTrainerPick() {
+  UI.trainerPick = false;
+  document.body.classList.remove("trainer-pick");
+}
+
+function hideFeedbackFlash() {
+  const el = document.getElementById("feedback-flash");
+  if (el) el.hidden = true;
+}
+
+function renderFeedbackFlash(s, force = false) {
+  // During frame playback the frames carry the previous decision's
+  // feedback — only the explicit (forced) call may flash.
+  if (UI.animating && !force) return;
+  const fb = s.trainer.feedback;
+  if (!fb) return;
+  const key = `${s.trainer.hand_no}:${fb.decision_idx}`;
+  if (key === UI.feedbackShownIdx) return;
+  UI.feedbackShownIdx = key;
+  const el = document.getElementById("feedback-flash");
+  document.getElementById("feedback-marks").textContent = fb.marks;
+  document.getElementById("feedback-text").textContent =
+    `${fb.label} · ${Math.round(fb.score)}%`;
+  const bits = [];
+  if (fb.category !== "best" && fb.rec_label) bits.push(`best: ${fb.rec_label}`);
+  if (fb.ev_loss_bb !== null && fb.ev_loss_bb !== undefined && fb.ev_loss_bb > 0) {
+    bits.push(`EV −${fb.ev_loss_bb.toFixed(2)}bb`);
+  }
+  document.getElementById("feedback-sub").textContent = bits.join(" · ");
+  el.className = `flash-${fb.category}`;
+  el.hidden = false;
+  if (UI.feedbackTimer) clearTimeout(UI.feedbackTimer);
+  UI.feedbackTimer = setTimeout(() => { el.hidden = true; }, 2000);
+}
+
+const CAT_LABELS = [
+  ["best", "Best move"],
+  ["correct", "Correct"],
+  ["inaccuracy", "Inaccuracy"],
+  ["wrong", "Wrong move"],
+  ["blunder", "Blunder"],
+];
+
+function statsBlockHTML(title, st, scope) {
+  const moves = st.moves || 0;
+  const rows = CAT_LABELS.map(([k, label]) => {
+    const c = (st.cat_counts && st.cat_counts[k]) || 0;
+    const pct = moves > 0 ? (100 * c) / moves : 0;
+    return `<div class="stat-cat-row">
+      <span class="stat-cat-count">${c}</span>
+      <div class="rec-dist-track"><div class="rec-dist-fill cat-${k}" style="width:${pct.toFixed(1)}%"></div></div>
+      <span class="stat-cat-label">${label}</span>
+    </div>`;
+  }).join("");
+  const score = (st.gto_score !== null && st.gto_score !== undefined)
+    ? `${st.gto_score.toFixed(1)}%` : "—";
+  const evTotal = st.ev_loss_total_bb ?? 0;
+  const evHand = st.ev_loss_per_hand_bb;
+  const evLine = `EV loss ${evTotal.toFixed(2)}bb total` +
+    ((evHand !== null && evHand !== undefined) ? ` · ${evHand.toFixed(2)}bb / hand` : "");
+  return `
+    <div class="stats-title">${title}
+      <button class="stats-reset" data-scope="${scope}" type="button">Reset</button>
+    </div>
+    <div class="stats-top">
+      <div><span class="stats-num">${st.hands ?? 0}</span><span class="stats-cap">hands</span></div>
+      <div><span class="stats-num">${moves}</span><span class="stats-cap">moves</span></div>
+      <div><span class="stats-num stats-score">${score}</span><span class="stats-cap">GTO score</span></div>
+    </div>
+    ${rows}
+    <div class="stats-ev muted">${evLine}</div>
+  `;
+}
+
+function renderTrainerStats(s) {
+  const stats = s.trainer.stats || {};
+  const se = document.getElementById("stats-session");
+  const lt = document.getElementById("stats-lifetime");
+  se.innerHTML = statsBlockHTML("Session", stats.session || {}, "session");
+  lt.innerHTML = statsBlockHTML("Lifetime", stats.lifetime || {}, "lifetime");
+  for (const btn of document.querySelectorAll("#trainer-stats-panel .stats-reset")) {
+    btn.addEventListener("click", () => {
+      const scope = btn.dataset.scope;
+      if (scope === "lifetime" &&
+          !confirm("Reset lifetime stats? This clears the saved stats file.")) {
+        return;
+      }
+      postTrainer("stats/reset", { scope });
+    });
+  }
+}
+
+function ringClass(pct) {
+  return pct >= 80 ? "ring-good" : pct >= 50 ? "ring-mid" : "ring-bad";
+}
+
+function renderReviewPanel(s) {
+  const panel = document.getElementById("review-panel");
+  const rv = s.trainer.review;
+  if (!rv) {
+    panel.hidden = true;
+    UI.reviewDecision = null;
+    return;
+  }
+  panel.hidden = false;
+  UI.reviewDecision = rv.decision;
+
+  const C = 2 * Math.PI * 26;
+  const pct = rv.hand_score ?? 0;
+  const fill = document.getElementById("review-ring-fill");
+  fill.style.strokeDasharray = `${((C * pct) / 100).toFixed(1)} ${C.toFixed(1)}`;
+  fill.setAttribute("class", `ring-fill ${ringClass(pct)}`);
+  document.getElementById("review-score-num").textContent =
+    (rv.hand_score !== null && rv.hand_score !== undefined)
+      ? `${Math.round(rv.hand_score)}%` : "—";
+
+  document.getElementById("review-step-label").textContent =
+    `Decision ${rv.decision + 1} / ${rv.num_decisions}`;
+  document.getElementById("review-prev").disabled = rv.decision <= 0;
+  document.getElementById("review-next").disabled = rv.decision >= rv.num_decisions - 1;
+
+  const chips = document.getElementById("review-chips");
+  chips.innerHTML = "";
+  rv.decisions.forEach((d, i) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = `review-chip cat-border-${d.category}` + (i === rv.decision ? " current" : "");
+    b.innerHTML = `<span class="rc-street">${d.street}</span>${d.user_label}` +
+      ` <span class="rc-score">${Math.round(d.score)}%</span>`;
+    b.addEventListener("click", () => trainerReviewGoto(i));
+    chips.appendChild(b);
+  });
+
+  document.getElementById("review-whatif-bar").hidden = !rv.whatif;
+
+  const cur = rv.current;
+  const detail = document.getElementById("review-detail");
+  let evRow = "";
+  if (cur.ev_loss_bb !== null && cur.ev_loss_bb !== undefined) {
+    const detailBit = (cur.ev_user_bb !== null && cur.ev_user_bb !== undefined)
+      ? ` <span class="muted">(you ${cur.ev_user_bb.toFixed(2)} vs best ${cur.ev_best_bb.toFixed(2)})</span>`
+      : "";
+    evRow = `<div class="review-ev">EV loss <b>${cur.ev_loss_bb.toFixed(2)}bb</b>${detailBit}</div>`;
+  }
+  const rescored = rv.whatif
+    ? `<div class="review-rescored">What-if rescore: <b class="cat-text-${rv.whatif.rescored.category}">` +
+      `${rv.whatif.rescored.category}</b> ${Math.round(rv.whatif.rescored.score)}%</div>`
+    : "";
+  detail.innerHTML = `
+    <div class="review-verdict cat-text-${cur.category}">${cur.marks} ${cur.category.toUpperCase()} · ${Math.round(cur.score)}%</div>
+    <div class="review-moves">You: <b>${cur.user_label}</b> · Network: <b>${cur.rec_label}</b></div>
+    ${evRow}${rescored}
+    <div class="muted review-hint">Click a board or hero card to try a what-if swap.</div>
+  `;
+}
+
+// --- Trainer settings modal ----------------------------------------------
+
+function _tsVal(id) { return document.getElementById(id).value; }
+function _tsNum(id) { return parseFloat(document.getElementById(id).value); }
+function _tsInt(id) { return parseInt(document.getElementById(id).value, 10); }
+function _tsShow(id, on) { document.getElementById(id).style.display = on ? "" : "none"; }
+
+function syncSettingsVisibility() {
+  const seatsMode = _tsVal("ts-seats-mode");
+  _tsShow("ts-seats-fixed-wrap", seatsMode === "fixed");
+  _tsShow("ts-seats-range-wrap", seatsMode === "random");
+  const stacksMode = _tsVal("ts-stacks-mode");
+  _tsShow("ts-stack-fixed-wrap", stacksMode === "fixed");
+  _tsShow("ts-stack-range-wrap", stacksMode === "random");
+  _tsShow("ts-per-seat-wrap", stacksMode === "per_seat");
+  _tsShow("ts-hero-kth-wrap", _tsVal("ts-hero-mode") === "kth");
+}
+
+function openTrainerSettings() {
+  const s = UI.lastState;
+  const t = s && s.trainer ? s.trainer.settings : null;
+  if (!t) return;
+  document.getElementById("ts-seats-mode").value = t.seats_mode;
+  document.getElementById("ts-seats-fixed").value = t.seats_fixed;
+  document.getElementById("ts-seats-min").value = t.seats_min;
+  document.getElementById("ts-seats-max").value = t.seats_max;
+  document.getElementById("ts-stacks-mode").value = t.stacks_mode;
+  document.getElementById("ts-stack-bb").value = t.stack_bb;
+  document.getElementById("ts-stack-min-bb").value = t.stack_min_bb;
+  document.getElementById("ts-stack-max-bb").value = t.stack_max_bb;
+  document.getElementById("ts-hero-mode").value = t.hero_position_mode;
+  document.getElementById("ts-hero-kth").value = String(t.hero_kth);
+  document.getElementById("ts-ante-bb").value = t.ante_bb;
+  document.getElementById("ts-mc-rollouts").value = t.mc_rollouts;
+  const wrap = document.getElementById("ts-per-seat");
+  wrap.innerHTML = "";
+  for (let i = 0; i < 6; i++) {
+    const [lo, hi] = t.stacks_per_seat_bb[i] || [20, 20];
+    const row = document.createElement("div");
+    row.className = "ts-seat-row";
+    row.innerHTML = `<span>Seat ${i + 1}</span>
+      <input type="number" class="ts-ps-lo" data-i="${i}" min="1" max="1000" step="0.5" value="${lo}" /> –
+      <input type="number" class="ts-ps-hi" data-i="${i}" min="1" max="1000" step="0.5" value="${hi}" />`;
+    wrap.appendChild(row);
+  }
+  syncSettingsVisibility();
+  UI.settingsOpen = true;
+  document.getElementById("trainer-settings-modal").hidden = false;
+}
+
+function closeTrainerSettings() {
+  UI.settingsOpen = false;
+  document.getElementById("trainer-settings-modal").hidden = true;
+}
+
+async function saveTrainerSettings() {
+  const perSeat = [];
+  for (let i = 0; i < 6; i++) {
+    const lo = parseFloat(document.querySelector(`.ts-ps-lo[data-i="${i}"]`).value);
+    const hi = parseFloat(document.querySelector(`.ts-ps-hi[data-i="${i}"]`).value);
+    perSeat.push([lo, hi]);
+  }
+  const body = {
+    seats_mode: _tsVal("ts-seats-mode"),
+    seats_fixed: _tsInt("ts-seats-fixed"),
+    seats_min: _tsInt("ts-seats-min"),
+    seats_max: _tsInt("ts-seats-max"),
+    stacks_mode: _tsVal("ts-stacks-mode"),
+    stack_bb: _tsNum("ts-stack-bb"),
+    stack_min_bb: _tsNum("ts-stack-min-bb"),
+    stack_max_bb: _tsNum("ts-stack-max-bb"),
+    stacks_per_seat_bb: perSeat,
+    hero_position_mode: _tsVal("ts-hero-mode"),
+    hero_kth: _tsInt("ts-hero-kth"),
+    ante_bb: _tsNum("ts-ante-bb"),
+    mc_rollouts: _tsInt("ts-mc-rollouts"),
+  };
+  const ok = await postTrainer("settings", body);
+  if (ok) closeTrainerSettings();
+}
+
+function setupTrainerControls() {
+  document.getElementById("tab-study").addEventListener("click", () => setMode("study"));
+  document.getElementById("tab-trainer").addEventListener("click", () => setMode("trainer"));
+  const newHand = () => {
+    cancelTrainerPick();
+    UI.reviewDecision = null;
+    UI.selectedSlot = null;
+    postTrainer("new_hand");
+  };
+  const repeatHand = () => {
+    cancelTrainerPick();
+    UI.reviewDecision = null;
+    UI.selectedSlot = null;
+    postTrainer("repeat");
+  };
+  document.getElementById("trainer-new-hand-btn").addEventListener("click", newHand);
+  document.getElementById("trainer-repeat-btn").addEventListener("click", repeatHand);
+  document.getElementById("review-next-hand").addEventListener("click", newHand);
+  document.getElementById("review-repeat-hand").addEventListener("click", repeatHand);
+  document.getElementById("review-prev").addEventListener("click", () => {
+    const rv = UI.lastState?.trainer?.review;
+    if (rv && rv.decision > 0) trainerReviewGoto(rv.decision - 1);
+  });
+  document.getElementById("review-next").addEventListener("click", () => {
+    const rv = UI.lastState?.trainer?.review;
+    if (rv && rv.decision < rv.num_decisions - 1) trainerReviewGoto(rv.decision + 1);
+  });
+  document.getElementById("review-whatif-reset").addEventListener("click", () => {
+    const rv = UI.lastState?.trainer?.review;
+    if (rv) trainerReviewGoto(rv.decision);
+  });
+  document.getElementById("trainer-settings-btn").addEventListener("click", openTrainerSettings);
+  document.getElementById("ts-cancel").addEventListener("click", closeTrainerSettings);
+  document.getElementById("ts-save").addEventListener("click", saveTrainerSettings);
+  for (const id of ["ts-seats-mode", "ts-stacks-mode", "ts-hero-mode"]) {
+    document.getElementById(id).addEventListener("change", syncSettingsVisibility);
+  }
+  document.getElementById("trainer-settings-modal").addEventListener("pointerdown", (e) => {
+    if (e.target === e.currentTarget) closeTrainerSettings();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    if (UI.settingsOpen) { closeTrainerSettings(); return; }
+    if (UI.trainerPick) {
+      UI.selectedSlot = null;
+      cancelTrainerPick();
+      if (UI.lastState) render(UI.lastState);
+    }
+  });
+}
+
 function setupRaiseInput() {
   const input = document.getElementById("raise-input");
   input.addEventListener("input", () => { UI.raiseUserSet = true; });
@@ -1327,6 +1982,8 @@ async function init() {
   setupDealerDrag();
   setupInsertHover();
   setupRaiseInput();
+  setupTrainerControls();
+  applyModeUI();
   fetchState();
   refreshOcrStatusOnLoad();
 }

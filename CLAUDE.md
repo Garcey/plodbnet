@@ -113,6 +113,46 @@ Start the UI with:
 (Drop `--reload` in a scripted background start — it spawns a reloader
 subprocess that complicates clean shutdown.)
 
+## Trainer mode (GTO-Wizard-style practice)
+
+`python/plo5bp/ui/trainer.py` — a second UI mode (tab next to Study, or
+`/?mode=trainer`) that deals random bomb-pot hands and drills the user
+against network opponents. Backend rides on the same app/MODEL under
+`/trainer/*` (`create_trainer_router`), state fully separate from the
+study `Session`. Shared pure helpers live in `python/plo5bp/ui/common.py`.
+
+Key invariants (documented in the module docstring — don't break):
+
+- A hand is fully determined by `(config, seed, button)`; review /
+  repeat / EV-loss all rebuild by replaying the recorded `action_log`
+  through a fresh `env.reset(seed, button)`. Nothing snapshots live
+  engine objects.
+- Trainer terminal state is synthesized from the `done` flag —
+  `study_terminal` / `awaiting_next_street` are study-mode-only engine
+  fields and stay `None` in random-deal mode.
+- Opponents sample the mixed strategy via `eval.model_policy(...,
+  deterministic=False)`, re-seeded per node from `(hand seed, action
+  prefix length)` — behavior is a pure function of the action prefix.
+  trainer.py is the ONLY consumer of torch's global RNG in the UI
+  process (study path is always `deterministic=True`).
+- Scoring (`score_move` + the `SCORING` dict): gate-probability ratio ×
+  Beta-PDF size quality → 0-100 score → best/correct/inaccuracy/wrong/
+  blunder. EV loss = paired Monte-Carlo rollouts (common random
+  numbers) of user action vs the deterministic rec; `mc_rollouts`
+  default 16 keeps a deviating `/trainer/act` under ~1s on CPU with the
+  2048×4 net (matching actions skip MC entirely).
+- What-if card swaps replay through `reset_study` — an unmodified
+  what-if reproduces the original node's observation bit-exactly
+  (pinned by `test_trainer_review.py`).
+- `all_hole_cards()` (engine accessor added for this) reveals opponent
+  cards — projection exposes them only at terminal/review.
+- Lifetime stats + settings persist to `checkpoints/trainer_stats.json`
+  (override with `PLO5BP_TRAINER_STATS`); session stats are in-memory.
+
+Tests: `tests/python/test_trainer_*.py`, `test_all_hole_cards.py`
+(shape parity with the study `_state_dict` is pinned — if you add a key
+to the study projection, mirror it in `_trainer_state_dict`).
+
 ## Rollout paths
 
 Two drivers in `python/plo5bp/rollout.py`:

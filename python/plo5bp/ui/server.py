@@ -39,32 +39,23 @@ from plo5bp.encoding import encode_observation
 from plo5bp.env import BombPotEnv
 from plo5bp.network import ActorCritic
 
+from plo5bp.ui.common import (
+    AWAITING_NAMES,
+    HISTORY_NAMES as _HISTORY_NAMES,
+    POSITION_BY_SEAT_6,
+    POSITION_BY_SEAT_SHORT,
+    STREET_NAMES,
+    position_name as _common_position_name,
+)
+
 logger = logging.getLogger("plo5bp.ui")
 
-POSITION_BY_SEAT_6: dict[int, str] = {
-    0: "BTN", 1: "SB", 2: "BB", 3: "UTG", 4: "HJ", 5: "CO",
-}
-POSITION_BY_SEAT_SHORT = {
-    2: ("SB", "BB"),
-    3: ("BTN", "SB", "BB"),
-    4: ("BTN", "SB", "BB", "CO"),
-    5: ("BTN", "SB", "BB", "UTG", "CO"),
-    6: ("BTN", "SB", "BB", "UTG", "HJ", "CO"),
-}
-
-STREET_NAMES = {0: "preflop", 1: "flop", 2: "turn", 3: "river", 4: "showdown"}
-AWAITING_NAMES = {2: "turn", 3: "river"}
 TERMINAL_NAMES = {0: "fold_out", 1: "run_out", 2: "showdown"}
 TERMINAL_MESSAGES = {
     "fold_out": "All opponents folded — uncontested pot.",
     "run_out": "All remaining players are all-in; turn/river cards were not entered.",
     "showdown": "River action closed with multiple players — opponent cards unknown, no showdown evaluated.",
 }
-
-_HISTORY_NAMES = (
-    "Fold", "CheckCall", "BetPct10", "BetPct25", "BetPct50",
-    "BetPct75", "BetPct100", "AllIn",
-)
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -792,22 +783,12 @@ def _position_name(seat: int) -> str:
     seats). Uses `hand_in_hand_mask` (locked at hand-start) rather than
     `sitting_out_seats` so mid-hand folds don't shift labels.
     """
-    n = session.num_seats
-    names = POSITION_BY_SEAT_SHORT.get(n)
-    if names is None or session.button_seat is None:
-        return f"S{seat}"
-    in_hand = session.hand_in_hand_mask or frozenset(range(n))
-    if seat not in in_hand:
-        return "OUT"
-    position_idx = 0
-    for offset in range(n):
-        candidate = (session.button_seat + offset) % n
-        if candidate not in in_hand:
-            continue
-        if candidate == seat:
-            return names[position_idx] if position_idx < len(names) else f"S{seat}"
-        position_idx += 1
-    return f"S{seat}"
+    return _common_position_name(
+        seat,
+        session.button_seat,
+        session.num_seats,
+        session.hand_in_hand_mask or None,
+    )
 
 
 def _history_entries(obs: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1171,6 +1152,13 @@ def _validate_card_list(xs: list[int | None], length: int, name: str) -> list[in
 # --- FastAPI app ------------------------------------------------------------
 
 app = FastAPI(title="PLO5 Bomb-Pot Study Tool")
+
+# Trainer mode rides on the same app/model under /trainer/*. Import here
+# (not at top) so trainer.py never needs to import server.py back.
+from plo5bp.ui.trainer import create_trainer_router  # noqa: E402
+
+trainer_router = create_trainer_router(MODEL, MODEL_DEVICE)
+app.include_router(trainer_router)
 
 
 @app.get("/state")

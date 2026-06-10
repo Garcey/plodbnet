@@ -287,6 +287,17 @@ impl PyGameState {
 
         Ok(d)
     }
+
+    /// All seats' hole cards as raw indices, 5 per seat. Trainer-only
+    /// accessor for opponent reveal at hand end; never feed into
+    /// observations mid-hand.
+    fn all_hole_cards(&self) -> PyResult<Vec<Vec<u8>>> {
+        let g = self.get()?;
+        Ok(g.hole_cards
+            .iter()
+            .map(|h| h.iter().map(|c| c.index()).collect())
+            .collect())
+    }
 }
 
 /// Mirror of `python/plo5bp/rollout.py:_aggression_bonus_bb`. Pot-fraction

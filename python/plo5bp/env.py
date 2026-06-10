@@ -241,6 +241,11 @@ class BombPotEnv:
     def is_terminal(self) -> bool:
         return bool(self._rs.is_terminal())
 
+    def all_hole_cards(self) -> list[list[int]]:
+        """Every seat's 5 hole cards as raw indices. Trainer-only reveal
+        accessor — never feed into observations mid-hand."""
+        return [[int(c) for c in hole] for hole in self._rs.all_hole_cards()]
+
     def legal_action_mask(self) -> np.ndarray:
         return np.asarray(self._rs.legal_action_mask(), dtype=bool)
 
