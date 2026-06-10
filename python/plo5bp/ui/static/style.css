@@ -564,6 +564,24 @@ main {
 }
 .rec-detail { font-size: 11.5px; color: var(--muted); margin-top: 7px; font-variant-numeric: tabular-nums; }
 
+/* v2 anchor heatmap: x-axis = bet size (min → pot), color = preference */
+.anchor-heat { margin-top: 8px; }
+.anchor-heat-row { display: flex; gap: 2px; }
+.anchor-heat-cell {
+  flex: 1; height: 20px; border-radius: 3px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 10px; color: #fff; cursor: default;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
+}
+.anchor-heat-cell.dead { background: var(--panel-2); opacity: 0.35; }
+.anchor-heat-cell.is-user { box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.65); }
+.anchor-heat-labels { display: flex; gap: 2px; margin-top: 2px; }
+.anchor-heat-labels span {
+  flex: 1; text-align: center;
+  font-size: 9px; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.3px;
+}
+
 /* History */
 #history {
   flex: 1; min-height: 0;

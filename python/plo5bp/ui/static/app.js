@@ -982,28 +982,48 @@ function distRowsHTML(dist, callName) {
     </div>`).join("");
 }
 
-function anchorRowsHTML(anchors, recAnchor, userAnchor) {
-  // v2 sizing-anchor histogram; reuses the rec-dist row markup. ★ marks
-  // the network's pick, "you" the anchor the user's size snapped to.
-  return (anchors || []).map((a) => {
-    const isRec = a.k === recAnchor;
-    const isUser = userAnchor !== null && userAnchor !== undefined && a.k === userAnchor;
-    const marks = `${isRec ? " ★" : ""}${isUser ? " ·you" : ""}`;
-    return `
-    <div class="rec-dist-row">
-      <span class="rec-dist-name">${a.label}${marks}</span>
-      <div class="rec-dist-track">
-        <div class="rec-dist-fill raise" style="width:${(a.prob * 100).toFixed(1)}%"></div>
-      </div>
-      <span class="rec-dist-pct">${(a.prob * 100).toFixed(0)}%</span>
-    </div>`;
-  }).join("");
+const ANCHOR_AXIS_LABELS = ["min", "10", "20", "30", "40", "50", "60", "70", "80", "90", "pot"];
+
+function anchorHeatColor(t) {
+  // t = prob / max-prob in [0,1]: cold slate → hot orange. The x-axis
+  // is bet size (min → pot); color carries the preference.
+  const h = 222 - 200 * t;
+  const s = 30 + 55 * t;
+  const l = 16 + 38 * t;
+  return `hsl(${h.toFixed(0)}, ${s.toFixed(0)}%, ${l.toFixed(0)}%)`;
 }
 
-function recDetailHTML(rec, userAnchor) {
+function anchorHeatmapHTML(anchors, recAnchor, userAnchor, s) {
+  // v2 sizing heatmap: one strip spanning min → pot, one cell per
+  // anchor, color-scaled by the network's preference. ★ = network's
+  // pick; ring + ● = the anchor the user's size snapped to (review).
+  const byK = new Map((anchors || []).map((a) => [a.k, a]));
+  const pmax = Math.max(1e-9, ...(anchors || []).map((a) => a.prob));
+  let cells = "";
+  let labels = "";
+  for (let k = 0; k <= 10; k++) {
+    const a = byK.get(k);
+    if (a) {
+      const isUser = userAnchor !== null && userAnchor !== undefined && k === userAnchor;
+      const marks = `${k === recAnchor ? "★" : ""}${isUser ? "●" : ""}`;
+      const tip = `${a.label} pot — ${(a.prob * 100).toFixed(0)}% — ${formatUnit(a.chips, s)}`;
+      cells += `<div class="anchor-heat-cell${isUser ? " is-user" : ""}" style="background:${anchorHeatColor(a.prob / pmax)}" title="${tip}">${marks}</div>`;
+    } else {
+      cells += `<div class="anchor-heat-cell dead" title="${ANCHOR_AXIS_LABELS[k]} — not a distinct legal size here"></div>`;
+    }
+    labels += `<span>${ANCHOR_AXIS_LABELS[k]}</span>`;
+  }
+  return `
+    <div class="anchor-heat">
+      <div class="anchor-heat-row">${cells}</div>
+      <div class="anchor-heat-labels">${labels}</div>
+    </div>`;
+}
+
+function recDetailHTML(rec, userAnchor, s) {
   // v2 payloads carry `anchors`; v1 carries the single Beta's (α, β).
   if (rec.anchors) {
-    let html = `<div class="rec-dist rec-anchors">${anchorRowsHTML(rec.anchors, rec.rec_anchor, userAnchor)}</div>`;
+    let html = anchorHeatmapHTML(rec.anchors, rec.rec_anchor, userAnchor, s);
     if (rec.refine) {
       html += `<div class="rec-detail">slider β(${rec.refine.alpha.toFixed(1)}, ${rec.refine.beta.toFixed(1)})</div>`;
     }
@@ -1026,12 +1046,12 @@ function renderTrainerReviewRecommendation(s, el) {
     dist = rec.gate_distribution;
     valueBB = rec.value_bb;
     tag = `<span class="whatif-tag">what-if</span> `;
-    detailHTML = recDetailHTML(rec, null);
+    detailHTML = recDetailHTML(rec, null, s);
   } else {
     actionText = cur.rec_label;
     dist = cur.gate_probs;
     valueBB = cur.value_bb;
-    detailHTML = recDetailHTML(cur, cur.user_anchor);
+    detailHTML = recDetailHTML(cur, cur.user_anchor, s);
   }
   const sign = valueBB >= 0 ? "+" : "-";
   const absBB = Math.abs(valueBB);
@@ -1104,7 +1124,7 @@ function renderRecommendation(s) {
       <span class="rec-value">value ${vDisp}</span>
     </div>
     <div class="rec-dist">${distRows}</div>
-    ${recDetailHTML(rec, null)}
+    ${recDetailHTML(rec, null, s)}
   `;
 }
 
