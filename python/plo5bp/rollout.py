@@ -821,9 +821,15 @@ def collect_rollout_batched(
 
     # Array-backed per-(env, seat) trajectory storage. Every per-step
     # append is a vectorized fancy-index write. `MAX_STEPS_PER_SEAT`
-    # caps the per-(env, seat) action count for one hand; PLO5 hands
-    # cap well below this even at deep stacks.
-    MAX_STEPS_PER_SEAT = 32
+    # caps the per-(env, seat) action count for one hand. The worst
+    # case is a 1bb-increment min-raise war (engine floors bets at 1bb
+    # and raise increments at the last raise size): a seat commits
+    # >=2bb per aggressive action, so a 300bb stack (the --stack-range
+    # default cap) tops out near ~150 actions per seat per hand. 32 was
+    # exceeded in practice on a deep-tier rollout (vTwo1 update 94,
+    # 2026-06-10). 192 bounds the theoretical worst case with margin;
+    # RAM cost scales with n_envs via pool_cap / out_cap below.
+    MAX_STEPS_PER_SEAT = 192
     traj_lengths = np.zeros((n_envs, n_seats), dtype=np.int32)
     # Absolute index into `step_obs_pool` / `step_gm_pool` per (env, seat, slot).
     traj_obs_idx = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.int64)
