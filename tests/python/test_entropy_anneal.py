@@ -132,3 +132,77 @@ def test_anneal_convergence_to_floor_over_repeated_holds():
     for _ in range(40):  # more than enough
         ent, base, _action = decide((20.0, 28.0, 35.0), base, ent, STEP, FLOOR, TOL)
     assert ent == 0.0
+
+
+def test_one_point_slip_on_every_street_still_lowers_at_default_tol():
+    """30/30/30 -> 29/29/29 must still lower entropy at the default
+    tolerance (1.0): block-to-block variance from sampled seat counts /
+    stack configs shouldn't let one aggressive block set an unreachable
+    bar."""
+    ent, base, action = decide(
+        (29.0, 29.0, 29.0), (30.0, 30.0, 30.0), 0.09, STEP, FLOOR, 1.0
+    )
+    assert action == "lowered"
+    assert ent == pytest.approx(0.088)
+    assert base == (29.0, 29.0, 29.0)
+
+
+def test_anneal_due_warmup_gating():
+    due = train._anneal_due
+    # Block ends during warmup -> not due (no baseline recording either).
+    assert not due(49, 50, 600)    # update+1 = 50 <= 600
+    assert not due(599, 50, 600)   # update+1 = 600, block of updates 550-599 all pre-threshold
+    # First block fully past the threshold is due.
+    assert due(649, 50, 600)
+    # Non-block-end updates are never due.
+    assert not due(650, 50, 600)
+    # start_update=0 reproduces the old always-on behavior.
+    assert due(49, 50, 0)
+
+
+def test_apply_anneal_control_step_and_tiers():
+    apply = train._apply_anneal_control
+    tier_ent = {"clubgg": 0.09, "deep": 0.15}
+
+    # No file content -> unchanged.
+    step, last = apply(None, None, tier_ent, 0.002)
+    assert step == 0.002 and last is None
+
+    # Step change applies once and is remembered via content tracking.
+    raw1 = '{"step": 0.003}'
+    step, last = apply(raw1, None, tier_ent, 0.002)
+    assert step == 0.003 and last == raw1
+    step, last = apply(raw1, last, tier_ent, step)  # same content -> no-op
+    assert step == 0.003
+
+    # Tier override applies in place; unknown tiers ignored.
+    raw2 = '{"tier_ent": {"deep": 0.08, "bogus": 1.0}}'
+    step, last = apply(raw2, last, tier_ent, step)
+    assert tier_ent["deep"] == 0.08
+    assert tier_ent["clubgg"] == 0.09
+    assert "bogus" not in tier_ent
+
+    # Both at once.
+    raw3 = '{"step": 0.001, "tier_ent": {"clubgg": 0.05}}'
+    step, last = apply(raw3, last, tier_ent, step)
+    assert step == 0.001 and tier_ent["clubgg"] == 0.05
+
+    # Malformed JSON: ignored, not marked applied (so a half-written
+    # save retries next loop).
+    step2, last2 = apply('{"step": 0.0', last, tier_ent, step)
+    assert step2 == step and last2 == last
+
+
+def test_default_tolerance_and_start_update_flags():
+    """The argparse defaults match the documented anneal behavior."""
+    import re
+
+    src = _TRAIN_PATH.read_text(encoding="utf-8")
+    tol = re.search(
+        r'--anneal-tolerance",\s*type=float,\s*default=([0-9.]+)', src
+    )
+    start = re.search(
+        r'--anneal-start-update",\s*type=int,\s*default=([0-9]+)', src
+    )
+    assert tol and float(tol.group(1)) == 1.0
+    assert start and int(start.group(1)) == 600

@@ -65,7 +65,7 @@ size); training at the default silently produces a smaller, weaker
 model — already cost a multi-day run mistaken for a 2048×4 result.
 There is no scenario in this project where 128×2 is the right
 architecture; if a flag is missing, add it. The same rule applies to
-`launch_anchor.sh` (it hardcodes 2048×4).
+`launch_vtwo.sh` (it hardcodes 2048×4).
 
 `scripts/train.py` is **v2-only** (anchor sizing head + centralized
 critic, `head_version: 2` checkpoints; the critic's state rides in the
@@ -79,9 +79,18 @@ v2 specifics:
   (`--critic-hidden-dim 1536 --critic-num-blocks 2` defaults); the
   actor keeps its own observation-only value head for the UI display.
 - Log line: `v` is the critic loss, `vd` the display-head loss, and
-  `Hg/Ha/Hb` decompose entropy into gate/anchor/beta. The anchor head
-  adds up to log(11)≈2.4 nats — v1 entropy-coef intuition does NOT
-  transfer; anchor-family launchers seed coefs at half the v1 values.
+  `Hg/Ha/Hb` decompose entropy into gate/anchor/beta.
+- Entropy coefs seed at v1's COLD-START values
+  (clubgg:0.09/clubgg_deep:0.12/deep:0.15) — NOT the annealed floors
+  v1 later earned. The anneal only walks down, so err high: a 0.02
+  cold start collapsed gate entropy within 10 updates (2026-06-10).
+- Anneal: no decisions (no baselines, no lowering) until
+  `--anneal-start-update` (default 600) updates; tolerance default 1.0
+  (30/30/30→29/29/29 still lowers — absorbs seat/stack block variance).
+  Live-tune WITHOUT pausing training via `runs/anneal_control.json`:
+  `{"step": 0.003}` changes the decrement, `{"tier_ent": {"deep":
+  0.08}}` manually sets a tier's coef (one-shot; anneal continues from
+  there). Applied whenever file content changes.
 - `--kl-anchor-coef` (default 0 = off) enables the KL-to-EMA-reference
   regularizer; the reference is not persisted in checkpoints.
 
@@ -94,8 +103,8 @@ v2 specifics:
 ```
 
 Pod stem families: `optimized<N>` (v1, retired — `launch_auto.sh` /
-`watchdog_auto.sh`) and `anchor<N>` (v2 — `launch_anchor.sh` /
-`watchdog_anchor.sh`; cold-starts anchor1 when no anchor checkpoints
+`watchdog_auto.sh`) and `vTwo<N>` (v2 — `launch_vtwo.sh` /
+`watchdog_vtwo.sh`; cold-starts vTwo1 when no vTwo checkpoints
 exist). Both watchdogs pgrep the same `scripts/train.py` — run ONE
 family per pod; stop the other via its `runs/watchdog_*.stop` file.
 

@@ -21,6 +21,7 @@ Time-based persistence (coexist with update-count flags):
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import signal
 import time
@@ -95,6 +96,53 @@ def _parse_block_rotation(spec: str) -> list[tuple[str, float]]:
 # The TrainingConfig default stays 0 so UI/eval/parity paths keep
 # realized payouts.
 EV_RUNOUT_SAMPLES = 64
+
+
+def _anneal_due(update: int, block_size: int, start_update: int) -> bool:
+    """Whether the block ending at `update` should run an anneal decision.
+
+    Blocks that finish at or before `start_update` are warmup — the
+    strategy gets time to converge before any baseline is recorded or
+    any entropy is lowered."""
+    return (update + 1) % block_size == 0 and (update + 1) > start_update
+
+
+def _apply_anneal_control(
+    raw: str | None,
+    last_raw: str | None,
+    tier_ent: dict[str, float],
+    step: float,
+) -> tuple[float, str | None]:
+    """Apply a live `runs/anneal_control.json` edit without pausing
+    training. Returns (anneal_step, applied_content); mutates `tier_ent`
+    in place. Re-applies only when the file CONTENT changes:
+
+      {"step": 0.003}                     — change the per-block decrement
+      {"tier_ent": {"deep": 0.08}}        — manually set a tier's coef
+      {"step": 0.003, "tier_ent": {...}}  — both at once
+
+    A manual tier_ent set is one-shot: the anneal keeps lowering from
+    the new level afterwards. Malformed JSON is ignored (and retried on
+    the next loop, so a half-written save is harmless)."""
+    if raw is None or raw == last_raw:
+        return step, last_raw
+    try:
+        ctrl = json.loads(raw)
+        new_step = float(ctrl["step"]) if "step" in ctrl else step
+        new_tiers = {
+            tier: float(v)
+            for tier, v in (ctrl.get("tier_ent") or {}).items()
+            if tier in tier_ent
+        }
+    except (ValueError, TypeError):
+        return step, last_raw
+    if new_step != step:
+        print(f"[anneal-control] step {step} -> {new_step}")
+    for tier, v in new_tiers.items():
+        if tier_ent[tier] != v:
+            print(f"[anneal-control] tier_ent[{tier}] {tier_ent[tier]} -> {v}")
+        tier_ent[tier] = v
+    return new_step, raw
 
 
 def _anneal_decision(
@@ -402,7 +450,12 @@ def main() -> None:
         "--anneal-step",
         type=float,
         default=0.002,
-        help="Entropy-coef decrement per successful block (default 0.002).",
+        help="Entropy-coef decrement per successful block (default 0.002). "
+        "Live-tunable without pausing training via runs/anneal_control.json "
+        '— e.g. {"step": 0.003}. The same file can manually set any '
+        'tier\'s coef: {"tier_ent": {"deep": 0.08}} (one-shot; the anneal '
+        "continues from the new level). Applied whenever the file content "
+        "changes.",
     )
     parser.add_argument(
         "--anneal-floor",
@@ -413,9 +466,23 @@ def main() -> None:
     parser.add_argument(
         "--anneal-tolerance",
         type=float,
-        default=0.5,
-        help="F/T/R points a street may slip and still count as 'held' "
-        "(default 0.5; block F/T/R is large-sample and stable).",
+        default=1.0,
+        help="F/T/R points a street may slip vs its baseline and still "
+        "count as 'held' (default 1.0 — e.g. 30/30/30 -> 29/29/29 still "
+        "lowers entropy). Soaks up the block-to-block variance from "
+        "sampled seat counts / stack configs so one unusually aggressive "
+        "block doesn't set an unreachable bar.",
+    )
+    parser.add_argument(
+        "--anneal-start-update",
+        type=int,
+        default=600,
+        help="No anneal decisions (no baseline recording, no lowering) "
+        "until this many updates have completed — gives the strategy "
+        "time to converge to something reasonable before entropy starts "
+        "coming down (default 600). Counted on the persisted update "
+        "counter, so warm-started stems past the threshold anneal "
+        "immediately.",
     )
     parser.add_argument(
         "--seats-dist",
@@ -694,7 +761,8 @@ def main() -> None:
             }
         print(
             f"[anneal] enabled step={args.anneal_step} floor={args.anneal_floor} "
-            f"tol={args.anneal_tolerance} start_update="
+            f"tol={args.anneal_tolerance} anneal_after={args.anneal_start_update} "
+            f"start_update="
             f"{restored_update if restored_update is not None else 0} "
             f"tier_ent={tier_ent} baselines={tier_baseline}"
         )
@@ -702,6 +770,12 @@ def main() -> None:
     trainer = PPOTrainer(model, train_cfg, critic=critic)
     pool = OpponentPool(capacity=train_cfg.opponent_pool_size)
     rng = np.random.default_rng(args.seed)
+
+    # Live anneal control (step changes + manual tier-coef overrides)
+    # without pausing training — see --anneal-step help.
+    anneal_control_file = Path("runs/anneal_control.json")
+    live_anneal_step = float(args.anneal_step)
+    last_anneal_control: str | None = None
 
     collector = collect_rollout_batched if args.batched else collect_rollout
     time_budget = float(args.train_seconds)
@@ -791,6 +865,15 @@ def main() -> None:
         else:
             if update >= train_cfg.num_updates:
                 break
+
+        if blocks and anneal_control_file.exists():
+            try:
+                control_raw = anneal_control_file.read_text()
+            except OSError:
+                control_raw = None
+            live_anneal_step, last_anneal_control = _apply_anneal_control(
+                control_raw, last_anneal_control, tier_ent, live_anneal_step
+            )
 
         if blocks:
             block_idx = (update // args.block_size) % len(blocks)
@@ -904,33 +987,43 @@ def main() -> None:
 
         # End-of-block entropy anneal: this tier's 50-update block just finished.
         if blocks and args.anneal_entropy and (update + 1) % args.block_size == 0:
-            st = block_acc["steps"]
-            bn = block_acc["bonus_steps"]
-            now_ftr = (
-                100.0 * bn[0] / max(1, st[0]),
-                100.0 * bn[1] / max(1, st[1]),
-                100.0 * bn[2] / max(1, st[2]),
-            )
-            base = tier_baseline.get(active_tier)
-            new_ent, new_base, action = _anneal_decision(
-                now_ftr,
-                base,
-                tier_ent[active_tier],
-                args.anneal_step,
-                args.anneal_floor,
-                args.anneal_tolerance,
-            )
-            tier_ent[active_tier] = new_ent
-            tier_baseline[active_tier] = new_base
-            base_str = (
-                "--/--/--" if base is None
-                else f"{base[0]:.1f}/{base[1]:.1f}/{base[2]:.1f}"
-            )
-            print(
-                f"[anneal] tier={active_tier} "
-                f"F/T/R={now_ftr[0]:.1f}/{now_ftr[1]:.1f}/{now_ftr[2]:.1f} "
-                f"base={base_str} -> {action} ent={new_ent:.4f}"
-            )
+            if not _anneal_due(update, args.block_size, args.anneal_start_update):
+                # Warmup: discard the block accumulator without recording a
+                # baseline or touching coefs — the strategy gets
+                # --anneal-start-update updates to converge first.
+                print(
+                    f"[anneal] tier={active_tier} warmup "
+                    f"({update + 1}/{args.anneal_start_update} updates) — "
+                    "no baseline, no change"
+                )
+            else:
+                st = block_acc["steps"]
+                bn = block_acc["bonus_steps"]
+                now_ftr = (
+                    100.0 * bn[0] / max(1, st[0]),
+                    100.0 * bn[1] / max(1, st[1]),
+                    100.0 * bn[2] / max(1, st[2]),
+                )
+                base = tier_baseline.get(active_tier)
+                new_ent, new_base, action = _anneal_decision(
+                    now_ftr,
+                    base,
+                    tier_ent[active_tier],
+                    live_anneal_step,
+                    args.anneal_floor,
+                    args.anneal_tolerance,
+                )
+                tier_ent[active_tier] = new_ent
+                tier_baseline[active_tier] = new_base
+                base_str = (
+                    "--/--/--" if base is None
+                    else f"{base[0]:.1f}/{base[1]:.1f}/{base[2]:.1f}"
+                )
+                print(
+                    f"[anneal] tier={active_tier} "
+                    f"F/T/R={now_ftr[0]:.1f}/{now_ftr[1]:.1f}/{now_ftr[2]:.1f} "
+                    f"base={base_str} -> {action} ent={new_ent:.4f}"
+                )
             block_acc = {"bonus_steps": [0, 0, 0], "steps": [0, 0, 0], "tier": None}
 
         update += 1
