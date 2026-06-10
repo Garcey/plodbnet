@@ -21,7 +21,7 @@ from plo5bp.actions import (
 )
 from plo5bp.config import GameConfig
 from plo5bp.env import BombPotEnv, StepInfo
-from plo5bp.network import ActorCritic
+from plo5bp.network import ActorCritic, obs_adapter
 from plo5bp.sizing import sizing_from_info
 
 
@@ -75,10 +75,11 @@ def always_pot_bet_policy() -> Policy:
 
 def model_policy(model: ActorCritic, deterministic: bool = False) -> Policy:
     device = next(model.parameters()).device
+    adapt = obs_adapter(model)  # v1-era 959-dim checkpoints get downgraded obs
 
     def act(obs: np.ndarray, actor: int, info: StepInfo) -> tuple[int, int]:
         with torch.no_grad():
-            o = torch.from_numpy(obs).unsqueeze(0).to(device)
+            o = torch.from_numpy(adapt(obs)).unsqueeze(0).to(device)
             m = torch.from_numpy(info.gate_mask).unsqueeze(0).to(device)
             b = torch.from_numpy(
                 sizing_from_info(info)[None, :]

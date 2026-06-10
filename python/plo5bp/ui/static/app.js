@@ -982,24 +982,56 @@ function distRowsHTML(dist, callName) {
     </div>`).join("");
 }
 
+function anchorRowsHTML(anchors, recAnchor, userAnchor) {
+  // v2 sizing-anchor histogram; reuses the rec-dist row markup. ★ marks
+  // the network's pick, "you" the anchor the user's size snapped to.
+  return (anchors || []).map((a) => {
+    const isRec = a.k === recAnchor;
+    const isUser = userAnchor !== null && userAnchor !== undefined && a.k === userAnchor;
+    const marks = `${isRec ? " ★" : ""}${isUser ? " ·you" : ""}`;
+    return `
+    <div class="rec-dist-row">
+      <span class="rec-dist-name">${a.label}${marks}</span>
+      <div class="rec-dist-track">
+        <div class="rec-dist-fill raise" style="width:${(a.prob * 100).toFixed(1)}%"></div>
+      </div>
+      <span class="rec-dist-pct">${(a.prob * 100).toFixed(0)}%</span>
+    </div>`;
+  }).join("");
+}
+
+function recDetailHTML(rec, userAnchor) {
+  // v2 payloads carry `anchors`; v1 carries the single Beta's (α, β).
+  if (rec.anchors) {
+    let html = `<div class="rec-dist rec-anchors">${anchorRowsHTML(rec.anchors, rec.rec_anchor, userAnchor)}</div>`;
+    if (rec.refine) {
+      html += `<div class="rec-detail">slider β(${rec.refine.alpha.toFixed(1)}, ${rec.refine.beta.toFixed(1)})</div>`;
+    }
+    return html;
+  }
+  return `<div class="rec-detail">β(${(rec.beta_alpha ?? 0).toFixed(1)}, ${(rec.beta_beta ?? 0).toFixed(1)})</div>`;
+}
+
 function renderTrainerReviewRecommendation(s, el) {
   const rv = s.trainer.review;
   const cur = rv.current;
   const whatif = rv.whatif;
   const callName = cur.to_call_chips > 0 ? "Call" : "Check";
-  let actionText, dist, alpha, beta, valueBB, tag = "";
+  let actionText, dist, valueBB, tag = "", detailHTML;
   if (whatif) {
     const rec = whatif.recommendation;
     actionText = rec.chips !== null && rec.chips !== undefined
       ? `${cur.to_call_chips > 0 ? "Raise" : "Bet"} ${formatUnit(rec.chips, s)}`
       : (rec.gate === "fold" ? "Fold" : callName);
     dist = rec.gate_distribution;
-    alpha = rec.beta_alpha; beta = rec.beta_beta; valueBB = rec.value_bb;
+    valueBB = rec.value_bb;
     tag = `<span class="whatif-tag">what-if</span> `;
+    detailHTML = recDetailHTML(rec, null);
   } else {
     actionText = cur.rec_label;
     dist = cur.gate_probs;
-    alpha = cur.beta_alpha; beta = cur.beta_beta; valueBB = cur.value_bb;
+    valueBB = cur.value_bb;
+    detailHTML = recDetailHTML(cur, cur.user_anchor);
   }
   const sign = valueBB >= 0 ? "+" : "-";
   const absBB = Math.abs(valueBB);
@@ -1012,7 +1044,7 @@ function renderTrainerReviewRecommendation(s, el) {
       <span class="rec-value">value ${vDisp}</span>
     </div>
     <div class="rec-dist">${distRowsHTML(dist, callName)}</div>
-    <div class="rec-detail">β(${(alpha ?? 0).toFixed(1)}, ${(beta ?? 0).toFixed(1)})</div>
+    ${detailHTML}
   `;
 }
 
@@ -1072,7 +1104,7 @@ function renderRecommendation(s) {
       <span class="rec-value">value ${vDisp}</span>
     </div>
     <div class="rec-dist">${distRows}</div>
-    <div class="rec-detail">\u03B2(${rec.beta_alpha.toFixed(1)}, ${rec.beta_beta.toFixed(1)})</div>
+    ${recDetailHTML(rec, null)}
   `;
 }
 

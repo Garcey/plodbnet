@@ -37,7 +37,13 @@ from plo5bp.actions import (
 from plo5bp.config import GameConfig
 from plo5bp.encoding import encode_observation
 from plo5bp.env import BombPotEnv
-from plo5bp.network import ActorCritic
+from plo5bp.network import ActorCritic, build_actor_from_state_dict, obs_adapter
+from plo5bp.sizing import (
+    ANCHOR_COUNT,
+    BRACKET_HALF,
+    anchor_grid_np,
+    sizing_from_info,
+)
 
 from plo5bp.ui.common import (
     AWAITING_NAMES,
@@ -45,6 +51,7 @@ from plo5bp.ui.common import (
     POSITION_BY_SEAT_6,
     POSITION_BY_SEAT_SHORT,
     STREET_NAMES,
+    anchor_label as _anchor_label,
     position_name as _common_position_name,
 )
 
@@ -93,9 +100,12 @@ def _load_model() -> ActorCritic:
         state_dict = ckpt
         hidden_dim = 128
         num_layers = 2
-    model = ActorCritic(hidden_dim=hidden_dim, num_layers=num_layers)
+    # Dual path: v2 anchor-head checkpoints carry 'anchor_head.weight',
+    # v1 Beta-head ones 'raise_head.weight'; the trained obs width (959
+    # v1-era vs 991 current) is sniffed from the first torso layer. The
+    # training-only critic state (ckpt['critic']) is never served.
     try:
-        model.load_state_dict(state_dict)
+        model = build_actor_from_state_dict(state_dict, hidden_dim, num_layers)
     except Exception as e:
         logger.warning(
             "checkpoint %s is incompatible with current network (%s) — "
@@ -107,14 +117,17 @@ def _load_model() -> ActorCritic:
     for p in model.parameters():
         p.requires_grad_(False)
     logger.info(
-        "loaded checkpoint %s (hidden_dim=%d, num_layers=%d, device=%s)",
-        ckpt_path, hidden_dim, num_layers, device,
+        "loaded checkpoint %s (%s, hidden_dim=%d, num_layers=%d, device=%s)",
+        ckpt_path, type(model).__name__, hidden_dim, num_layers, device,
     )
     return model
 
 
 MODEL = _load_model()
 MODEL_DEVICE = next(MODEL.parameters()).device
+# v1-era checkpoints (trained at OBS_DIM 959) get the exact downgrade
+# projection; current-width models get identity.
+OBS_ADAPT = obs_adapter(MODEL)
 
 
 # --- Session state ----------------------------------------------------------
@@ -915,8 +928,10 @@ def _compute_recommendation() -> dict[str, Any] | None:
     obs_np = _network_obs()
     if obs_np is None:
         return None
-    obs_t = torch.from_numpy(obs_np).unsqueeze(0).to(MODEL_DEVICE)
+    obs_t = torch.from_numpy(OBS_ADAPT(obs_np)).unsqueeze(0).to(MODEL_DEVICE)
     gm_t = torch.from_numpy(info.gate_mask).unsqueeze(0).to(MODEL_DEVICE)
+    if getattr(MODEL, "head_version", 1) >= 2:
+        return _recommendation_v2(obs_t, gm_t, info)
     raise_max = int(info.max_raise_chips)
     raise_min = min(int(info.min_raise_chips), raise_max)
     bounds_t = torch.tensor(
@@ -956,6 +971,72 @@ def _compute_recommendation() -> dict[str, Any] | None:
         "gate_distribution": [round(p, 4) for p in gate_probs],
         "beta_alpha": round(alpha, 4),
         "beta_beta": round(beta, 4),
+    }
+
+
+def _recommendation_v2(
+    obs_t: torch.Tensor, gm_t: torch.Tensor, info: Any
+) -> dict[str, Any]:
+    """v2 (anchor head) recommendation: argmax gate + argmax legal anchor
+    with its refinement Beta. The server computes every anchor's chips —
+    the client never recomputes sizing math."""
+    sizing = sizing_from_info(info)
+    sizing_t = torch.from_numpy(sizing[None, :]).to(MODEL_DEVICE)
+    with torch.no_grad():
+        gate_logits, anchor_logits, refine, value = MODEL(obs_t, gm_t)
+        gate_probs = F.softmax(gate_logits, dim=-1).squeeze(0).tolist()
+        _act_out = MODEL.act(obs_t, gm_t, sizing_t, deterministic=True)
+        gate = int(_act_out.gate.item())
+        chips = int(_act_out.chips.item())
+        rec_anchor = int(_act_out.anchor.item())
+        value_bb = float(value.squeeze(0).item())
+        anchor_np = anchor_logits.squeeze(0).float().cpu().numpy()
+        refine_np = refine.squeeze(0).float().cpu().numpy()  # (9, 2)
+
+    grid = anchor_grid_np(sizing[0], sizing[1], sizing[2], sizing[3])
+    masked = np.where(grid.legal, anchor_np, -1e9)
+    exps = np.exp(masked - masked.max())
+    anchor_probs = exps / exps.sum()
+    anchors = [
+        {
+            "k": int(k),
+            "frac": k / 10.0,
+            "label": _anchor_label(int(k)),
+            "prob": round(float(anchor_probs[k]), 4),
+            "chips": int(grid.chips[k]),
+            "chips_bb": round(_chips_to_bb(int(grid.chips[k])), 4),
+        }
+        for k in range(ANCHOR_COUNT)
+        if bool(grid.legal[k])
+    ]
+    refine_block = None
+    if bool(grid.refine_ok[rec_anchor]):
+        alpha, beta = refine_np[rec_anchor - 1]
+        refine_block = {
+            "alpha": round(float(alpha), 4),
+            "beta": round(float(beta), 4),
+            "frac_lo": rec_anchor / 10.0 - BRACKET_HALF,
+            "frac_hi": rec_anchor / 10.0 + BRACKET_HALF,
+        }
+
+    chips_out = chips if gate == GATE_RAISE else None
+    chips_bb = round(_chips_to_bb(chips_out), 4) if chips_out is not None else None
+    gate_slug = (
+        "fold" if gate == GATE_FOLD else
+        "check_call" if gate == GATE_CHECK_CALL else
+        "raise"
+    )
+    return {
+        "head_version": 2,
+        "gate": gate_slug,
+        "gate_name": GATE_NAMES[gate],
+        "chips": chips_out,
+        "chips_bb": chips_bb,
+        "value_bb": round(value_bb, 4),
+        "gate_distribution": [round(p, 4) for p in gate_probs],
+        "anchors": anchors,
+        "rec_anchor": rec_anchor,
+        "refine": refine_block,
     }
 
 

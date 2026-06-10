@@ -49,9 +49,11 @@ from plo5bp.actions import (
 from plo5bp.config import GameConfig
 from plo5bp.env import BombPotEnv, StepInfo
 from plo5bp.eval import model_policy
-from plo5bp.network import ActorCritic
+from plo5bp.network import ActorCritic, obs_adapter
+from plo5bp.sizing import ANCHOR_COUNT, anchor_grid_np, sizing_from_info
 from plo5bp.ui.common import (
     STREET_NAMES,
+    anchor_label,
     chips_to_bb,
     history_entries,
     position_name,
@@ -148,19 +150,140 @@ def score_move(
     }
 
 
+def score_move_v2(
+    dist: dict[str, Any],
+    user_gate: int,
+    user_chips: int,
+) -> dict[str, Any]:
+    """Score one decision against a v2 (anchor head) node distribution.
+
+    `gate_ratio` is unchanged from v1. For raises, the user's chips snap
+    to `user_anchor` — the nearest LEGAL anchor by chip distance (tie →
+    lower anchor) — and
+    `size_q = P(user_anchor)/P(best_anchor) × refinement-pdf-ratio`,
+    where the pdf ratio compares the user anchor's Beta density at the
+    user's in-bracket position vs at its mode. Atoms, short-shove and
+    collapsed brackets have no within-anchor size choice → pdf ratio 1.
+    Categories, the size floor, and the blunder override match v1.
+    """
+    gate_probs = dist["gate_probs"]
+    g_star = max(range(len(gate_probs)), key=lambda i: gate_probs[i])
+    p_user = float(gate_probs[user_gate])
+    p_best = float(gate_probs[g_star])
+    gate_ratio = (p_user / p_best) if p_best > 0 else 0.0
+
+    size_q = 1.0
+    user_anchor: int | None = None
+    if user_gate == GATE_RAISE:
+        legal_ks = [
+            k for k in range(ANCHOR_COUNT) if dist["anchor_legal"][k]
+        ]
+        user_anchor = min(
+            legal_ks,
+            key=lambda k: (abs(user_chips - dist["anchor_chips"][k]), k),
+        )
+        a_probs = dist["anchor_probs"]
+        k_best = max(legal_ks, key=lambda k: a_probs[k])
+        p_ku = float(a_probs[user_anchor])
+        p_kb = float(a_probs[k_best])
+        anchor_ratio = (p_ku / p_kb) if p_kb > 0 else 0.0
+
+        pdf_ratio = 1.0
+        if dist["refine_ok"][user_anchor]:
+            lo = int(dist["anchor_lo"][user_anchor])
+            hi = int(dist["anchor_hi"][user_anchor])
+            if hi > lo:
+                eps = SCORING["u_eps"]
+                u = (user_chips - lo) / (hi - lo)
+                u = min(1.0 - eps, max(eps, u))
+                alpha, beta = dist["refine_params"][user_anchor - 1]
+                if alpha + beta > 2.0 + 1e-9:
+                    mode = (alpha - 1.0) / (alpha + beta - 2.0)
+                    mode = min(1.0 - eps, max(eps, mode))
+
+                    def logpdf(x: float) -> float:
+                        return (alpha - 1.0) * math.log(x) \
+                            + (beta - 1.0) * math.log(1.0 - x)
+
+                    pdf_ratio = math.exp(logpdf(u) - logpdf(mode))
+                # else alpha == beta == 1 -> uniform; every size is the mode.
+        size_q = anchor_ratio * pdf_ratio
+
+    size_factor = SCORING["size_floor"] + (1.0 - SCORING["size_floor"]) * size_q
+    score = 100.0 * gate_ratio * (size_factor if user_gate == GATE_RAISE else 1.0)
+    score = max(0.0, min(100.0, score))
+
+    if p_user < SCORING["blunder_gate_prob"] or score < SCORING["wrong_min"]:
+        category = "blunder"
+    elif score < SCORING["inaccuracy_min"]:
+        category = "wrong"
+    elif score < SCORING["correct_min"]:
+        category = "inaccuracy"
+    elif user_gate == g_star and score >= SCORING["best_min"]:
+        category = "best"
+    else:
+        category = "correct"
+    return {
+        "score": score,
+        "category": category,
+        "gate_ratio": gate_ratio,
+        "size_q": size_q,
+        "user_anchor": user_anchor,
+    }
+
+
 def compute_node_distribution(
     model: ActorCritic,
     device: torch.device,
     obs_np: np.ndarray,
     info: StepInfo,
 ) -> dict[str, Any]:
-    """One forward at a decision node: masked gate distribution, Beta
-    params, value, plus the deterministic recommendation (argmax gate +
-    Beta-mean chips, short-shove redirected to the all-in amount)."""
-    obs_t = torch.from_numpy(obs_np).unsqueeze(0).to(device)
+    """One forward at a decision node, plus the deterministic
+    recommendation (argmax gate; v1: Beta-mean chips with short-shove
+    redirect; v2: argmax legal anchor with refinement-mean chips).
+
+    v1 dicts carry (alpha, beta); v2 dicts carry the masked anchor
+    distribution, per-anchor chips/legality/brackets, and the (9, 2)
+    refinement params. Both carry "head_version" so scorers branch.
+    """
+    obs_t = torch.from_numpy(
+        obs_adapter(model)(obs_np)
+    ).unsqueeze(0).to(device)
     gm_t = torch.from_numpy(info.gate_mask).unsqueeze(0).to(device)
     raise_max = int(info.max_raise_chips)
     raise_min = min(int(info.min_raise_chips), raise_max)
+
+    if getattr(model, "head_version", 1) >= 2:
+        sizing = sizing_from_info(info)
+        sizing_t = torch.from_numpy(sizing[None, :]).to(device)
+        with torch.no_grad():
+            gate_logits, anchor_logits, refine, value = model(obs_t, gm_t)
+            gate_probs = F.softmax(gate_logits, dim=-1).squeeze(0).tolist()
+            _act_out = model.act(obs_t, gm_t, sizing_t, deterministic=True)
+            anchor_np = anchor_logits.squeeze(0).float().cpu().numpy()
+            refine_np = refine.squeeze(0).float().cpu().numpy()  # (9, 2)
+        grid = anchor_grid_np(sizing[0], sizing[1], sizing[2], sizing[3])
+        masked = np.where(grid.legal, anchor_np, -1e9)
+        exps = np.exp(masked - masked.max())
+        anchor_probs = exps / exps.sum()
+        return {
+            "head_version": 2,
+            "gate_probs": [float(p) for p in gate_probs],
+            "anchor_probs": [float(p) for p in anchor_probs],
+            "anchor_chips": [int(c) for c in grid.chips],
+            "anchor_legal": [bool(b) for b in grid.legal],
+            "anchor_lo": [int(c) for c in grid.lo],
+            "anchor_hi": [int(c) for c in grid.hi],
+            "refine_ok": [bool(b) for b in grid.refine_ok],
+            "refine_params": [[float(a), float(b)] for a, b in refine_np],
+            "rec_anchor": int(_act_out.anchor.item()),
+            "min_chips": int(info.min_raise_chips),
+            "max_chips": raise_max,
+            "rec_gate": int(_act_out.gate.item()),
+            "rec_chips": int(_act_out.chips.item()),
+            "value_bb": float(value.squeeze(0).item()),
+        }
+
     bounds_t = torch.tensor(
         [[raise_min, raise_max]], dtype=torch.long, device=device
     )
@@ -175,6 +298,7 @@ def compute_node_distribution(
     if rec_gate == GATE_RAISE and int(info.min_raise_chips) == 0 and raise_max > 0:
         rec_chips = raise_max
     return {
+        "head_version": 1,
         "gate_probs": [float(p) for p in gate_probs],
         "alpha": float(raise_params[0, 0].item()),
         "beta": float(raise_params[0, 1].item()),
@@ -184,6 +308,36 @@ def compute_node_distribution(
         "rec_chips": rec_chips,
         "value_bb": float(value.squeeze(0).item()),
     }
+
+
+def _rec_refine_params(dist: dict[str, Any]) -> tuple[float, float]:
+    """(alpha, beta) of the rec anchor's refinement slider; (1.0, 1.0)
+    when the rec anchor is an atom / has a collapsed bracket."""
+    ra = int(dist["rec_anchor"])
+    if dist["refine_ok"][ra]:
+        a, b = dist["refine_params"][ra - 1]
+        return float(a), float(b)
+    return 1.0, 1.0
+
+
+def _anchors_payload(
+    anchor_probs: list[float],
+    anchor_chips: list[int],
+    anchor_legal: list[bool],
+    bb: int,
+) -> list[dict[str, Any]]:
+    """Legal-only anchor histogram rows for client rendering."""
+    return [
+        {
+            "k": int(k),
+            "label": anchor_label(int(k)),
+            "prob": round(float(anchor_probs[k]), 4),
+            "chips": int(anchor_chips[k]),
+            "chips_bb": round(chips_to_bb(int(anchor_chips[k]), bb), 4),
+        }
+        for k in range(ANCHOR_COUNT)
+        if bool(anchor_legal[k])
+    ]
 
 
 def _stable_seed(*parts: int) -> int:
@@ -283,6 +437,15 @@ class DecisionRecord:
     ev_user_bb: float | None = None
     ev_best_bb: float | None = None
     ev_loss_bb: float | None = None
+    # v2 (anchor head) extras; None/1 on v1 records. For v2, (alpha,
+    # beta) above hold the REC anchor's refinement params (1.0/1.0 when
+    # the rec anchor is an atom).
+    head_version: int = 1
+    anchor_probs: list[float] | None = None
+    anchor_chips: list[int] | None = None
+    anchor_legal: list[bool] | None = None
+    rec_anchor: int | None = None
+    user_anchor: int | None = None
 
 
 @dataclass
@@ -376,6 +539,7 @@ class TrainerSession:
         self.dollars_per_bb = 20.0
         self.rng = np.random.default_rng()
         self._policy = model_policy(model, deterministic=False)
+        self._obs_adapt = obs_adapter(model)
         env_path = os.environ.get("PLO5BP_TRAINER_STATS")
         self.stats_path = (
             stats_path
@@ -585,18 +749,23 @@ class TrainerSession:
                 )
 
         dist = compute_node_distribution(self.model, self.device, h.last_obs, info)
-        sc = score_move(
-            dist["gate_probs"], dist["alpha"], dist["beta"],
-            dist["min_chips"], dist["max_chips"], gate_idx, chips,
-        )
+        if dist["head_version"] >= 2:
+            sc = score_move_v2(dist, gate_idx, chips)
+            rec_alpha, rec_beta = _rec_refine_params(dist)
+        else:
+            sc = score_move(
+                dist["gate_probs"], dist["alpha"], dist["beta"],
+                dist["min_chips"], dist["max_chips"], gate_idx, chips,
+            )
+            rec_alpha, rec_beta = dist["alpha"], dist["beta"]
         raw = info.raw_obs
         decision = DecisionRecord(
             decision_idx=len(h.decisions),
             street=int(raw["street"]),
             action_log_idx=len(h.action_log),
             gate_probs=dist["gate_probs"],
-            alpha=dist["alpha"],
-            beta=dist["beta"],
+            alpha=rec_alpha,
+            beta=rec_beta,
             min_chips=dist["min_chips"],
             max_chips=dist["max_chips"],
             rec_gate=dist["rec_gate"],
@@ -610,6 +779,12 @@ class TrainerSession:
             size_q=sc["size_q"],
             score=sc["score"],
             category=sc["category"],
+            head_version=dist["head_version"],
+            anchor_probs=dist.get("anchor_probs"),
+            anchor_chips=dist.get("anchor_chips"),
+            anchor_legal=dist.get("anchor_legal"),
+            rec_anchor=dist.get("rec_anchor"),
+            user_anchor=sc.get("user_anchor"),
         )
 
         street = int(raw["street"])
@@ -661,6 +836,13 @@ class TrainerSession:
             return False
         if d.user_gate != GATE_RAISE:
             return True
+        if d.head_version >= 2:
+            # Same chosen anchor + chips within tolerance. Short-shove /
+            # single-anchor nodes collapse to the same anchor naturally.
+            if d.user_anchor != d.rec_anchor:
+                return False
+            tol = max(1, (d.max_chips - d.min_chips) // 100)
+            return abs(d.user_chips - d.rec_chips) <= tol
         if d.min_chips == 0 or d.min_chips >= d.max_chips:
             return True  # chips moot (short shove / single point)
         tol = max(1, (d.max_chips - d.min_chips) // 100)
@@ -715,23 +897,19 @@ class TrainerSession:
         # Lockstep: one batched forward per depth across all live rollouts.
         while live:
             obs_b = torch.from_numpy(
-                np.stack([x[1] for x in live])
+                self._obs_adapt(np.stack([x[1] for x in live]))
             ).to(self.device)
             gm_b = torch.from_numpy(
                 np.stack([x[2].gate_mask for x in live])
             ).to(self.device)
-            bounds_b = torch.tensor(
-                [
-                    [min(int(x[2].min_raise_chips), int(x[2].max_raise_chips)),
-                     int(x[2].max_raise_chips)]
-                    for x in live
-                ],
-                dtype=torch.long,
-                device=self.device,
-            )
+            # (B, 4) sizing context — v1 models slice [..., :2], v2 needs
+            # all four columns for the anchor grid.
+            sizing_b = torch.from_numpy(
+                np.stack([sizing_from_info(x[2]) for x in live])
+            ).to(self.device)
             with torch.no_grad():
                 _mc_out = self.model.act(
-                    obs_b, gm_b, bounds_b, deterministic=False
+                    obs_b, gm_b, sizing_b, deterministic=False
                 )
             nxt: list[list[Any]] = []
             for i, x in enumerate(live):
@@ -819,6 +997,13 @@ class TrainerSession:
             "ev_best_bb": d.ev_best_bb,
             "ev_loss_bb": d.ev_loss_bb,
         }
+        if d.head_version >= 2:
+            current["head_version"] = 2
+            current["anchors"] = _anchors_payload(
+                d.anchor_probs, d.anchor_chips, d.anchor_legal, bb
+            )
+            current["rec_anchor"] = d.rec_anchor
+            current["user_anchor"] = d.user_anchor
         return {
             "active": True,
             "decision": current_idx,
@@ -907,12 +1092,39 @@ class TrainerSession:
                 detail="what-if replay did not reach hero's decision node",
             )
         dist = compute_node_distribution(self.model, self.device, obs, info)
-        rescored = score_move(
-            dist["gate_probs"], dist["alpha"], dist["beta"],
-            dist["min_chips"], dist["max_chips"], d.user_gate, d.user_chips,
-        )
+        if dist["head_version"] >= 2:
+            rescored = score_move_v2(dist, d.user_gate, d.user_chips)
+        else:
+            rescored = score_move(
+                dist["gate_probs"], dist["alpha"], dist["beta"],
+                dist["min_chips"], dist["max_chips"], d.user_gate, d.user_chips,
+            )
         bb = BB_CHIPS
         rec_chips_out = dist["rec_chips"] if dist["rec_gate"] == GATE_RAISE else None
+        recommendation: dict[str, Any] = {
+            "gate": GATE_SLUGS[dist["rec_gate"]],
+            "gate_name": GATE_NAMES[dist["rec_gate"]],
+            "chips": rec_chips_out,
+            "chips_bb": round(chips_to_bb(rec_chips_out, bb), 4)
+            if rec_chips_out is not None else None,
+            "value_bb": round(dist["value_bb"], 4),
+            "gate_distribution": [round(p, 4) for p in dist["gate_probs"]],
+        }
+        if dist["head_version"] >= 2:
+            rec_alpha, rec_beta = _rec_refine_params(dist)
+            recommendation["head_version"] = 2
+            recommendation["anchors"] = _anchors_payload(
+                dist["anchor_probs"], dist["anchor_chips"],
+                dist["anchor_legal"], bb,
+            )
+            recommendation["rec_anchor"] = dist["rec_anchor"]
+            recommendation["refine"] = (
+                {"alpha": round(rec_alpha, 4), "beta": round(rec_beta, 4)}
+                if dist["refine_ok"][dist["rec_anchor"]] else None
+            )
+        else:
+            recommendation["beta_alpha"] = round(dist["alpha"], 4)
+            recommendation["beta_beta"] = round(dist["beta"], 4)
         # Display copy keeps the hole-card sort invariant; the replay above
         # used dealt order so an unmodified what-if stays bit-exact.
         display_spec = {k: list(v) for k, v in spec.items()}
@@ -922,17 +1134,7 @@ class TrainerSession:
         )
         whatif_block = {
             "card_spec": display_spec,
-            "recommendation": {
-                "gate": GATE_SLUGS[dist["rec_gate"]],
-                "gate_name": GATE_NAMES[dist["rec_gate"]],
-                "chips": rec_chips_out,
-                "chips_bb": round(chips_to_bb(rec_chips_out, bb), 4)
-                if rec_chips_out is not None else None,
-                "value_bb": round(dist["value_bb"], 4),
-                "gate_distribution": [round(p, 4) for p in dist["gate_probs"]],
-                "beta_alpha": round(dist["alpha"], 4),
-                "beta_beta": round(dist["beta"], 4),
-            },
+            "recommendation": recommendation,
             "rescored": {
                 "score": round(rescored["score"], 1),
                 "category": rescored["category"],

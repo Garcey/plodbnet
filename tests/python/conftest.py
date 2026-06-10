@@ -15,9 +15,10 @@ def trainer_factory(tmp_path):
     from plo5bp.network import ActorCritic
     from plo5bp.ui.trainer import TrainerSession, TrainerSettings
 
-    def make(rng_seed: int = 123, stats_name: str = "stats.json", **settings):
+    def make(rng_seed: int = 123, stats_name: str = "stats.json",
+             model_cls=ActorCritic, **settings):
         torch.manual_seed(0)
-        model = ActorCritic(hidden_dim=32, num_layers=1).eval()
+        model = model_cls(hidden_dim=32, num_layers=1).eval()
         for p in model.parameters():
             p.requires_grad_(False)
         ts = TrainerSession(

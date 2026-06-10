@@ -64,6 +64,12 @@ def chips_to_bb(chips: int | float, bb: int) -> float:
     return float(chips) / float(bb)
 
 
+def anchor_label(k: int) -> str:
+    """Display label for sizing anchor k (pot fraction k/10). Anchor 0
+    clamps to the min-raise floor — "min", never "0%"."""
+    return "min" if k == 0 else f"{k * 10}%"
+
+
 def history_entries(
     obs: dict[str, Any],
     position_of: Callable[[int], str],

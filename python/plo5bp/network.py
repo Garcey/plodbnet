@@ -442,6 +442,24 @@ class ActorCriticV2(nn.Module):
         return log_prob, entropy, value, gate_entropy, anchor_entropy, beta_h_eff
 
 
+def obs_adapter(model: nn.Module):
+    """Return a numpy function mapping freshly-encoded (..., OBS_DIM)
+    observations to the model's expected input width.
+
+    v1-era checkpoints were trained at OBS_DIM_V1=959, before the
+    pot-fraction history dims; the encoder now always emits 991, so
+    those models need the exact `downgrade_obs_to_v1` projection.
+    Models whose first layer already takes the current OBS_DIM (fresh
+    v1 nets included) get identity."""
+    from plo5bp.encoding import OBS_DIM_V1, downgrade_obs_to_v1
+
+    first = model.torso[0]
+    lin = first[0] if isinstance(first, nn.Sequential) else first
+    if int(lin.in_features) == OBS_DIM_V1:
+        return downgrade_obs_to_v1
+    return lambda obs: obs
+
+
 def model_class_for_state_dict(state_dict: dict) -> type:
     """Sniff a checkpoint's actor class from its head parameters:
     'anchor_head.weight' → ActorCriticV2, 'raise_head.weight' → v1.
@@ -455,6 +473,32 @@ def model_class_for_state_dict(state_dict: dict) -> type:
         "state_dict has neither 'anchor_head.weight' (v2) nor "
         "'raise_head.weight' (v1) — not a plo5bp actor checkpoint"
     )
+
+
+def state_dict_obs_dim(state_dict: dict) -> int:
+    """Input width the checkpoint was trained at — 959 for pre-pot-
+    fraction-history (v1-era) checkpoints, 991 current."""
+    w = state_dict.get("torso.0.weight")
+    if w is None:
+        w = state_dict["torso.0.0.weight"]
+    return int(w.shape[1])
+
+
+def build_actor_from_state_dict(
+    state_dict: dict, hidden_dim: int, num_layers: int
+) -> nn.Module:
+    """Build the actor a checkpoint was saved from: sniffs the head
+    class AND the trained obs width (constructing at the current
+    OBS_DIM default would shape-fail on 959-era checkpoints), then
+    loads the weights. Pair with `obs_adapter` at inference time."""
+    cls = model_class_for_state_dict(state_dict)
+    model = cls(
+        hidden_dim=hidden_dim,
+        obs_dim=state_dict_obs_dim(state_dict),
+        num_layers=num_layers,
+    )
+    model.load_state_dict(state_dict)
+    return model
 
 
 def opp_holes_multihot(holes: torch.Tensor) -> torch.Tensor:

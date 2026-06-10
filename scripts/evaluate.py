@@ -16,7 +16,7 @@ from plo5bp.eval import (
     random_legal_policy,
     run_match,
 )
-from plo5bp.network import model_class_for_state_dict
+from plo5bp.network import build_actor_from_state_dict
 
 
 def main() -> None:
@@ -36,9 +36,7 @@ def main() -> None:
     train_cfg_raw = ckpt.get("config", {})
     hidden = int(train_cfg_raw.get("hidden_dim", TrainingConfig.hidden_dim))
     num_layers = int(train_cfg_raw.get("num_layers", TrainingConfig.num_layers))
-    model_cls = model_class_for_state_dict(ckpt["model"])
-    model = model_cls(hidden_dim=hidden, num_layers=num_layers)
-    model.load_state_dict(ckpt["model"])
+    model = build_actor_from_state_dict(ckpt["model"], hidden, num_layers)
     model.to(args.device)
     model.eval()
 
