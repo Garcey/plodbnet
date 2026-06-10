@@ -64,7 +64,26 @@ on every training invocation.** The script defaults to 128×2 (legacy
 size); training at the default silently produces a smaller, weaker
 model — already cost a multi-day run mistaken for a 2048×4 result.
 There is no scenario in this project where 128×2 is the right
-architecture; if a flag is missing, add it.
+architecture; if a flag is missing, add it. The same rule applies to
+`launch_anchor.sh` (it hardcodes 2048×4).
+
+`scripts/train.py` is **v2-only** (anchor sizing head + centralized
+critic, `head_version: 2` checkpoints; the critic's state rides in the
+checkpoint under `"critic"`). It refuses to warm-start v1 checkpoints.
+v2 specifics:
+
+- Sizing head: 11 pot-fraction anchors (0=min,10%,…,100%=pot) with
+  per-anchor Beta refinement sliders; canonical chips/legality math in
+  `python/plo5bp/sizing.py` (shared by network/rollout/UI — don't fork it).
+- `CentralCritic` sees all hole cards during training only
+  (`--critic-hidden-dim 1536 --critic-num-blocks 2` defaults); the
+  actor keeps its own observation-only value head for the UI display.
+- Log line: `v` is the critic loss, `vd` the display-head loss, and
+  `Hg/Ha/Hb` decompose entropy into gate/anchor/beta. The anchor head
+  adds up to log(11)≈2.4 nats — v1 entropy-coef intuition does NOT
+  transfer; anchor-family launchers seed coefs at half the v1 values.
+- `--kl-anchor-coef` (default 0 = off) enables the KL-to-EMA-reference
+  regularizer; the reference is not persisted in checkpoints.
 
 ```bash
 # Serial rollout
@@ -73,6 +92,12 @@ architecture; if a flag is missing, add it.
 # Batched rollout (Phase A-D speedup; 1.3× self-play, 2.06× pool-mix on CPU)
 .venv/Scripts/python scripts/train.py --batched --hidden-dim 2048 --num-layers 4
 ```
+
+Pod stem families: `optimized<N>` (v1, retired — `launch_auto.sh` /
+`watchdog_auto.sh`) and `anchor<N>` (v2 — `launch_anchor.sh` /
+`watchdog_anchor.sh`; cold-starts anchor1 when no anchor checkpoints
+exist). Both watchdogs pgrep the same `scripts/train.py` — run ONE
+family per pod; stop the other via its `runs/watchdog_*.stop` file.
 
 ## Promote good checkpoints to the UI
 
@@ -93,6 +118,15 @@ cp checkpoints/<run_name>.pt checkpoints/stub.pt
 
 The server loads `MODEL` once at import, so a running UI needs a
 restart to pick up the new weights.
+
+The UI serves BOTH checkpoint generations: `_load_model` sniffs the
+head class (`anchor_head.weight` → v2, `raise_head.weight` → v1) and
+the trained obs width (959-era v1 checkpoints get the exact
+`downgrade_obs_to_v1` projection via `network.obs_adapter`; the
+encoder always emits 991). v2 recommendations carry an `anchors`
+histogram + `rec_anchor` + `refine` instead of `beta_alpha/beta_beta`;
+trainer scoring snaps the user's raise size to the nearest legal
+anchor (`score_move_v2`).
 
 ## Restart services yourself
 
