@@ -699,7 +699,11 @@ class TrainerSession:
         total = 0.0
         live: list[list[Any]] = []  # [env, obs, info]
         for _ in range(n):
-            env = BombPotEnv(h.config)
+            # EV runouts: grade all-in continuations by expected value over
+            # board runouts instead of one sampled runout — same rollout
+            # count, much less estimator noise. (The live hand's displayed
+            # result stays realized; only this estimator uses EV.)
+            env = BombPotEnv(h.config, ev_runout_samples=32)
             obs, info = env.reset(h.seed, h.button)
             for a in prefix:
                 obs, _, _, info = env.step_hybrid(a["gate"], a["chips"])

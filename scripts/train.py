@@ -85,6 +85,18 @@ def _parse_block_rotation(spec: str) -> list[tuple[str, float]]:
     return blocks
 
 
+# Training always grades early all-ins by EXPECTED value over board
+# runouts (engine `payouts_ev`) instead of the one sampled runout —
+# unconditional, not a flag: there is no training regime where realized
+# runout luck in the reward is preferable. 64 samples cuts runout
+# variance ~64x; profiled at ~+45% ENGINE time in a 30%-shove stress
+# test (a few percent of real update time, where the network dominates).
+# Fold-outs and river-closes short-circuit to exact payouts in Rust.
+# The TrainingConfig default stays 0 so UI/eval/parity paths keep
+# realized payouts.
+EV_RUNOUT_SAMPLES = 64
+
+
 def _anneal_decision(
     now_ftr: tuple[float, float, float],
     baseline: tuple[float, float, float] | None,
@@ -287,7 +299,6 @@ def main() -> None:
         help="If > 0, push opponent-pool snapshots on this wall-clock cadence "
         "(coexists with --snapshot-every).",
     )
-    parser.add_argument("--ev-runout-samples", type=int, default=0)
     parser.add_argument("--pool-mix-prob", type=float, default=0.5)
     parser.add_argument("--pool-opp-seats", type=int, default=2)
     parser.add_argument(
@@ -539,7 +550,7 @@ def main() -> None:
         ppo_epochs=args.ppo_epochs,
         seed=args.seed,
         snapshot_every=args.snapshot_every,
-        ev_runout_samples=args.ev_runout_samples,
+        ev_runout_samples=EV_RUNOUT_SAMPLES,
         pool_mix_prob=args.pool_mix_prob,
         pool_opp_seats=args.pool_opp_seats,
         entropy_coef=args.entropy_coef,
