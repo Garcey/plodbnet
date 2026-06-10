@@ -875,6 +875,20 @@ impl GameState {
         if min == 0 || chips < min || chips > max {
             return Err(StudyError::InvalidAmount);
         }
+        // Dust guard: continuous (Beta-sampled) sizings frequently land a
+        // few chips shy of all-in, leaving an absurd sub-display "live"
+        // stack that forces extra degenerate streets (cover-short bets of
+        // a few chips) instead of a clean run-out. When the raise would
+        // leave at most bb/100 behind and the full shove is within the
+        // legal max, commit the full stack instead. Deterministic, so
+        // action-log replays re-snap identically.
+        let stack = self.stacks[actor];
+        let dust_eps = (self.config.bb / 100).max(1);
+        let chips = if chips < stack && stack - chips <= dust_eps && stack <= max {
+            stack
+        } else {
+            chips
+        };
         self.commit_chips_as_raise(actor, chips, Action::BetPct100);
 
         // Round-close + next-actor logic identical to `apply`.
@@ -1704,6 +1718,49 @@ mod tests {
         );
         assert_eq!(g.min_raise_chips(), 0);
         assert_eq!(g.max_raise_chips(), 0);
+    }
+
+    #[test]
+    fn dust_raise_snaps_to_all_in_and_runs_out() {
+        // 3 seats, button=2 → order 0,1,2. Ante 300 → pot 900.
+        // Behind after ante: s0=19_700, s1=2_700, s2=19_700.
+        let mut cfg = GameConfig::new_uniform(3, 0, 300, 100);
+        cfg.starting_stacks = vec![20_000u64, 3_000u64, 20_000u64];
+        let mut g = GameState::new_hand(cfg, 42, 2);
+
+        g.apply_raise_chips(900).unwrap(); // seat 0 pots it
+        // Seat 1: PL max delta 3600 > stack 2700 → stack-capped max 2700.
+        // Raising 2699 would leave 1 chip (≤ bb/100 = 1) → snapped to 2700.
+        assert_eq!(g.actor, Some(1));
+        assert_eq!(g.max_raise_chips(), 2_700);
+        g.apply_raise_chips(2_699).unwrap();
+        assert_eq!(g.stacks[1], 0, "dust raise must snap to full stack");
+        assert!(g.all_in[1], "snapped raise must set all_in");
+        assert_eq!(g.bet_to_call, 2_700);
+
+        g.apply(Action::Fold); // seat 2
+        // Seat 0 calls the all-in: only one live-with-chips seat remains →
+        // streets run out and the hand finalizes at showdown.
+        assert_eq!(g.actor, Some(0));
+        g.apply(Action::CheckCall);
+        assert!(g.is_terminal(), "all-in call must run out to showdown");
+        assert_eq!(g.board_a.len(), 5, "board A fully dealt");
+        assert_eq!(g.board_b.len(), 5, "board B fully dealt");
+        let payouts = g.payouts();
+        assert_eq!(payouts.iter().sum::<i64>(), 0);
+    }
+
+    #[test]
+    fn non_dust_short_stack_raise_is_not_snapped() {
+        // Same shape, but the raise leaves 10 chips (> bb/100 = 1): a real
+        // (if tiny) stack stays live — no snap.
+        let mut cfg = GameConfig::new_uniform(3, 0, 300, 100);
+        cfg.starting_stacks = vec![20_000u64, 3_000u64, 20_000u64];
+        let mut g = GameState::new_hand(cfg, 42, 2);
+        g.apply_raise_chips(900).unwrap();
+        g.apply_raise_chips(2_690).unwrap();
+        assert_eq!(g.stacks[1], 10);
+        assert!(!g.all_in[1]);
     }
 
     #[test]
