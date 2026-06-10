@@ -132,10 +132,19 @@ pub struct GameState {
     pub last_raise_size: u64,
     /// True iff the most recent aggression this street was a full (min-raise-
     /// sized or larger) raise. False after a short-all-in that was below the
-    /// PL min-raise floor. When false, seats that already acted this street
-    /// cannot re-raise (Fold/CheckCall only). Reset to true on street
-    /// transitions. See feedback_short_allin_rule memory.
+    /// PL min-raise floor. Informational/diagnostic only — raise-reopen
+    /// legality is per-seat via `street_level_acted`. Reset to true on
+    /// street transitions.
     pub last_aggression_was_full_raise: bool,
+    /// Street bet level (`bet_to_call`) as of each seat's most recent
+    /// action this street; 0 if the seat hasn't acted yet. Drives the
+    /// per-seat short-all-in reopen rule: a seat that has acted may
+    /// re-raise only once `bet_to_call` has grown by at least one full
+    /// raise (`last_raise_size`) since that action. A seat that only
+    /// checked (level 0) is therefore reopened by any subsequent full
+    /// bet even if a later short all-in froze the seats that had
+    /// already responded to that bet. Reset on street transitions.
+    pub street_level_acted: Vec<u64>,
     /// Seat to act next. `None` when the hand is terminal.
     pub actor: Option<usize>,
     /// Seat of the last aggressor this street (for round-close detection).

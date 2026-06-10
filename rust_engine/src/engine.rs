@@ -86,6 +86,7 @@ impl GameState {
         let board_b: Vec<Card> = full_board_b[0..3].to_vec();
         let street_commit = vec![0u64; n];
         let acted_this_street = vec![false; n];
+        let street_level_acted = vec![0u64; n];
 
         let eff_stack_cap_at_hand_start =
             compute_eff_stack_cap(&config.starting_stacks, &folded);
@@ -108,6 +109,7 @@ impl GameState {
             bet_to_call: 0,
             last_raise_size: 0, // set below from bb
             last_aggression_was_full_raise: true,
+            street_level_acted,
             actor: None,
             last_aggressor: None,
             acted_this_street,
@@ -272,6 +274,7 @@ impl GameState {
 
         let street_commit = vec![0u64; n];
         let acted_this_street = vec![false; n];
+        let street_level_acted = vec![0u64; n];
 
         let eff_stack_cap_at_hand_start =
             compute_eff_stack_cap(&config.starting_stacks, &folded);
@@ -294,6 +297,7 @@ impl GameState {
             bet_to_call: 0,
             last_raise_size: 0,
             last_aggression_was_full_raise: true,
+            street_level_acted,
             actor: None,
             last_aggressor: None,
             acted_this_street,
@@ -374,6 +378,7 @@ impl GameState {
         self.bet_to_call = 0;
         self.last_raise_size = self.config.bb;
         self.last_aggression_was_full_raise = true;
+        self.street_level_acted = vec![0u64; n];
         self.last_aggressor = None;
         self.acted_this_street = vec![false; n];
         self.awaiting_next_street = None;
@@ -404,14 +409,10 @@ impl GameState {
             return mask;
         }
 
-        // Short-all-in rule: if the most recent aggression was a sub-min-raise
-        // shove AND this seat has already acted this street, raising is
-        // forbidden — only Fold/CheckCall remain. See state.rs doc + memory
-        // `feedback_short_allin_rule`.
-        if facing_bet
-            && self.acted_this_street[actor]
-            && !self.last_aggression_was_full_raise
-        {
+        // Short-all-in reopen rule (per seat): a seat that already acted may
+        // re-raise only if the bet has grown by at least one full raise
+        // since its last action. See `short_shove_lockout`.
+        if self.short_shove_lockout() {
             return mask;
         }
 
@@ -562,6 +563,7 @@ impl GameState {
         }
 
         self.acted_this_street[actor] = true;
+        self.street_level_acted[actor] = self.bet_to_call;
 
         // Fold-out: single non-folded seat wins.
         let alive: Vec<usize> = (0..self.config.num_seats)
@@ -757,15 +759,24 @@ impl GameState {
     }
 
     /// True when the current actor is locked out of raising by the
-    /// short-shove reopen rule: already acted this street and facing a
-    /// raise that didn't meet the min-raise floor.
+    /// short-all-in reopen rule (per seat, TDA-style): the seat already
+    /// acted this street AND the bet has not grown by at least one full
+    /// raise (`last_raise_size`, which short shoves never lower) since
+    /// that action. A short all-in advances `bet_to_call` without
+    /// reopening seats that already responded to the prior bet, but a
+    /// seat whose last action was at a lower level (e.g. a check at 0)
+    /// is reopened as soon as the cumulative increase since its action
+    /// reaches a full raise — including via multiple short all-ins.
     fn short_shove_lockout(&self) -> bool {
         let actor = match self.actor {
             Some(a) => a,
             None => return false,
         };
         let facing_bet = self.bet_to_call > self.street_commit[actor];
-        facing_bet && self.acted_this_street[actor] && !self.last_aggression_was_full_raise
+        facing_bet
+            && self.acted_this_street[actor]
+            && self.bet_to_call
+                < self.street_level_acted[actor] + self.last_raise_size
     }
 
     /// Smallest chip delta the current actor can add to make a legal
@@ -913,6 +924,7 @@ impl GameState {
             street: self.street,
         });
         self.acted_this_street[actor] = true;
+        self.street_level_acted[actor] = self.bet_to_call;
     }
 
     /// Hand category index (0..=8 per `CAT_*` constants) of seat's current
@@ -1241,6 +1253,7 @@ impl GameState {
             self.bet_to_call = 0;
             self.last_raise_size = self.config.bb;
             self.last_aggression_was_full_raise = true;
+            self.street_level_acted = vec![0u64; n];
             self.last_aggressor = None;
             self.acted_this_street = vec![false; n];
 
@@ -1634,6 +1647,95 @@ mod tests {
             Err(StudyError::InvalidAmount),
             "lockout must reject apply_raise_chips"
         );
+    }
+
+    #[test]
+    fn checker_is_reopened_after_full_bet_plus_short_shove() {
+        // Per-seat reopen rule: seat 0 CHECKS (acted at level 0), seat 1
+        // makes a full bet, seat 2 short-shoves (sub-min-raise), seat 3
+        // calls. Action returns to seat 0, whose level has grown by a
+        // full raise since its check — seat 0 MAY raise. Seat 1 (who bet)
+        // saw only the sub-min increase and stays locked.
+        // 4 seats, button=3 → flop order 0,1,2,3. Ante 300 → pot 1200.
+        // Stacks after ante: s0=19_700, s1=19_700, s2=700, s3=19_700.
+        let mut cfg = GameConfig::new_uniform(4, 0, 300, 100);
+        cfg.starting_stacks = vec![20_000u64, 20_000u64, 1_000u64, 20_000u64];
+        let mut g = GameState::new_hand(cfg, 7, 3);
+
+        assert_eq!(g.actor, Some(0));
+        g.apply(Action::CheckCall); // seat 0 checks at level 0
+
+        assert_eq!(g.actor, Some(1));
+        g.apply(Action::BetPct50); // 0.5 * 1200 = 600 — full bet
+        assert_eq!(g.bet_to_call, 600);
+        assert_eq!(g.last_raise_size, 600);
+
+        assert_eq!(g.actor, Some(2));
+        g.apply(Action::AllIn); // 700 total: > 600 call, < 1200 min — short
+        assert_eq!(g.bet_to_call, 700);
+        assert_eq!(g.last_raise_size, 600, "floor preserved");
+        assert!(!g.last_aggression_was_full_raise);
+
+        assert_eq!(g.actor, Some(3));
+        g.apply(Action::CheckCall); // flat-call 700
+
+        // Seat 0 checked at level 0 and now faces 700 ≥ 0 + 600: reopened.
+        assert_eq!(g.actor, Some(0));
+        let mask0 = g.legal_action_mask();
+        assert!(
+            mask0.iter().skip(2).any(|&b| b),
+            "checker must be reopened by full bet + short shove"
+        );
+        // Min raise = call 700 + full 600 increment (short shove doesn't
+        // lower the floor).
+        assert_eq!(g.min_raise_chips(), 1300);
+        assert!(g.max_raise_chips() >= g.min_raise_chips());
+
+        // Seat 0 just calls; seat 1 (bet at level 600, faces +100 < 600)
+        // must stay locked to Fold/CheckCall.
+        g.apply(Action::CheckCall);
+        assert_eq!(g.actor, Some(1));
+        let mask1 = g.legal_action_mask();
+        assert!(mask1[Action::Fold as usize]);
+        assert!(mask1[Action::CheckCall as usize]);
+        assert!(
+            mask1.iter().skip(2).all(|&b| !b),
+            "original bettor must stay locked after sub-min increase"
+        );
+        assert_eq!(g.min_raise_chips(), 0);
+        assert_eq!(g.max_raise_chips(), 0);
+    }
+
+    #[test]
+    fn cumulative_short_shoves_reopen_when_full_raise_reached() {
+        // Multiple short all-ins that cumulatively amount to a full raise
+        // reopen seats that acted before them (TDA rule).
+        // 4 seats, button=3 → order 0,1,2,3. Ante 300 → pot 1200.
+        // Behind after ante: s0=19_700, s1=1_000, s2=1_450, s3=19_700.
+        let mut cfg = GameConfig::new_uniform(4, 0, 300, 100);
+        cfg.starting_stacks = vec![20_000u64, 1_300u64, 1_750u64, 20_000u64];
+        let mut g = GameState::new_hand(cfg, 7, 3);
+
+        assert_eq!(g.actor, Some(0));
+        g.apply(Action::BetPct50); // 600 — full bet, level 600
+        assert_eq!(g.actor, Some(1));
+        g.apply(Action::AllIn); // 1000: short (+400 < 600)
+        assert_eq!(g.bet_to_call, 1000);
+        assert_eq!(g.actor, Some(2));
+        g.apply(Action::AllIn); // 1450: short again (+450 < 600)
+        assert_eq!(g.bet_to_call, 1450);
+        assert_eq!(g.last_raise_size, 600, "floor never lowered by shorts");
+        assert_eq!(g.actor, Some(3));
+        g.apply(Action::CheckCall); // deep seat flat-calls 1450
+
+        // Seat 0 bet at level 600; cumulative increase 850 ≥ 600 — reopened.
+        assert_eq!(g.actor, Some(0));
+        let mask0 = g.legal_action_mask();
+        assert!(
+            mask0.iter().skip(2).any(|&b| b),
+            "cumulative short shoves reaching a full raise must reopen"
+        );
+        assert_eq!(g.min_raise_chips(), 1450); // to 2050 total from 600 commit
     }
 
     #[test]
