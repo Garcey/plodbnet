@@ -2,7 +2,7 @@
 dict emitted by `PyGameState.observation_dict()` (augmented in `env._pack_obs`
 with Rust-computed hand categories).
 
-Layout (946 dims total):
+Layout (991 dims total):
   0..52     hero hole multi-hot (52)
   52..104   board A multi-hot (52)
   104..156  board B multi-hot (52)
@@ -12,58 +12,66 @@ Layout (946 dims total):
   176..184  stacks / bb (stack-depth in bb), hero-rotated, padded to 8
   184..188  scalars: pot, bet_to_call, min_bet, max_bet — all / bb (bb units)
   188..196  relative-position one-hot of actor (actor - hero) mod num_seats
-  196..740  history: last 32 actions oldest-first, each slot 17 dims
-            (seat-one-hot hero-rel 8 + gate one-hot 4 + street one-hot 4 + chips/bb 1).
+  196..772  history: last 32 actions oldest-first, each slot 18 dims
+            (seat-one-hot hero-rel 8 + gate one-hot 4 + street one-hot 4
+            + chips/bb 1 + chips/pot-before 1).
             Gate is {Fold=0, Check=1, Call=2, Raise=3} derived at encode time
             from (action, chips): CheckCall with chips==0 is Check, with chips>0
-            is Call; any Bet*/AllIn is Raise. chips is the seat's street-total
-            commit at the moment of the action, divided by cfg.bb.
-  740..748  SPR per seat, hero-rotated, padded to 8 (stack/max(pot,1), clip[0,4])
-  748..749  pot odds (to_call / (pot + to_call), 0 if no bet to face)
-  749..758  hero hand category one-hot on board A (9 categories)
-  758..767  hero hand category one-hot on board B (9 categories)
-  767..769  hero draw flags on board A (flush, straight)
-  769..771  hero draw flags on board B (flush, straight)
-  771..776  pair-with-board count on A: count of hero hole cards matching
+            is Call; any Bet*/AllIn is Raise. chips is the per-action chip
+            DELTA the action added to the pot (engine ActionRecord.chips;
+            antes are never recorded). Slot dim 16 is chips / cfg.bb; slot
+            dim 17 is chips / pot-before-the-action, clipped [0, 2], where
+            pot_before(slot j) = current_pot − Σ chips of slots ≥ j (valid
+            under 32-slot truncation: truncated actions all precede the
+            visible window, so their chips stay inside the subtracted-from
+            pot). Speaks the same pot-fraction language as the v2 anchor
+            sizing head.
+  772..780  SPR per seat, hero-rotated, padded to 8 (stack/max(pot,1), clip[0,4])
+  780..781  pot odds (to_call / (pot + to_call), 0 if no bet to face)
+  781..790  hero hand category one-hot on board A (9 categories)
+  790..799  hero hand category one-hot on board B (9 categories)
+  799..801  hero draw flags on board A (flush, straight)
+  801..803  hero draw flags on board B (flush, straight)
+  803..808  pair-with-board count on A: count of hero hole cards matching
             the rank of the i-th board card (sorted by rank descending),
             5 slots, trailing zeros for streets < river
-  776..781  pair-with-board count on B (same semantics)
-  781..785  board A pair structure (paired, double_paired, tripled, quadded)
-  785..789  board B pair structure (same semantics)
-  789..802  hero rank histogram: slot r = count of hero hole cards at rank r
+  808..813  pair-with-board count on B (same semantics)
+  813..817  board A pair structure (paired, double_paired, tripled, quadded)
+  817..821  board B pair structure (same semantics)
+  821..834  hero rank histogram: slot r = count of hero hole cards at rank r
             (rank 0=2, 12=A). Board-agnostic; closes the pocket-pair-
             not-on-board blind spot left by the pair-with-board feature.
-  802..840  straight/flush/SF block on board A (38 dims):
-              802       flush_nut_distance       (0 if hero has no flush; uncapped)
-              803       straight_nut_distance    (0 if hero has no straight; uncapped)
-              804..814  straight_outs_per_window (10 dims, slot 0=wheel, 9=broadway)
-              814..824  straight_possible_per_window (10 dims, board-only binary)
-              824..828  flush_possible_per_suit  (4 dims, board-only binary)
-              828..832  flush_draw_outs[s]       (4 dims, per suit; needs 2-2 split)
-              832..836  nut_flush_draw_outs[s]   (4 dims; produces nut after hit)
-              836..840  straight_flush_draw_outs[s] (4 dims; intersects flush + straight)
-  840..878  straight/flush/SF block on board B (38 dims, same layout)
-  878..886  hero-rotated seat-exists mask: slot k = 1 iff (hero + k) % num_seats
+  834..872  straight/flush/SF block on board A (38 dims):
+              834       flush_nut_distance       (0 if hero has no flush; uncapped)
+              835       straight_nut_distance    (0 if hero has no straight; uncapped)
+              836..846  straight_outs_per_window (10 dims, slot 0=wheel, 9=broadway)
+              846..856  straight_possible_per_window (10 dims, board-only binary)
+              856..860  flush_possible_per_suit  (4 dims, board-only binary)
+              860..864  flush_draw_outs[s]       (4 dims, per suit; needs 2-2 split)
+              864..868  nut_flush_draw_outs[s]   (4 dims; produces nut after hit)
+              868..872  straight_flush_draw_outs[s] (4 dims; intersects flush + straight)
+  872..910  straight/flush/SF block on board B (38 dims, same layout)
+  910..918  hero-rotated seat-exists mask: slot k = 1 iff (hero + k) % num_seats
             is a real seat, else 0. Structural; doesn't depend on stack state,
             so a 0-chip seat is still distinguishable from a padded slot.
-  886..894  per-seat hand-total commit, hero-rotated, /cfg.bb (raw, no clamp).
-  894..902  per-seat street commit, hero-rotated, /cfg.bb (raw, no clamp).
-  902..910  last-aggressor one-hot, hero-relative; all-zero when no raise yet.
-  910..918  hero distance to button: one-hot of (button - hero) % num_seats.
-  918..931  shared-rank mask: slot r = 1 iff rank r appears on BOTH boards.
-  931..935  per-suit cross-board flush MADE on both boards: hero ≥2-of-s
+  918..926  per-seat hand-total commit, hero-rotated, /cfg.bb (raw, no clamp).
+  926..934  per-seat street commit, hero-rotated, /cfg.bb (raw, no clamp).
+  934..942  last-aggressor one-hot, hero-relative; all-zero when no raise yet.
+  942..950  hero distance to button: one-hot of (button - hero) % num_seats.
+  950..963  shared-rank mask: slot r = 1 iff rank r appears on BOTH boards.
+  963..967  per-suit cross-board flush MADE on both boards: hero ≥2-of-s
             AND board_a ≥3-of-s AND board_b ≥3-of-s.
-  935..939  per-suit cross-board flush DRAW on both boards: hero ≥2-of-s
+  967..971  per-suit cross-board flush DRAW on both boards: hero ≥2-of-s
             AND board_a 2-of-s AND board_b 2-of-s.
-  939..943  per-suit cross-board flush MIXED: hero ≥2-of-s AND
+  971..975  per-suit cross-board flush MIXED: hero ≥2-of-s AND
             (one board ≥3-of-s, the other 2-of-s).
-  943       cross-board straight MADE on both: ∃ pair {r1,r2} ⊆ hero ranks
+  975       cross-board straight MADE on both: ∃ pair {r1,r2} ⊆ hero ranks
             making a straight on A and on B (windows may differ).
-  944       cross-board straight DRAW on both: ∃ pair drawing (4-rank
+  976       cross-board straight DRAW on both: ∃ pair drawing (4-rank
             coverage) on A and on B (and not made on either).
-  945       cross-board straight MIXED: ∃ pair made on one, drawing on
+  977       cross-board straight MIXED: ∃ pair made on one, drawing on
             the other.
-  946..958  opp-outcome fractions: 12 dims (3 hand sizes × 4 outcomes),
+  978..990  opp-outcome fractions: 12 dims (3 hand sizes × 4 outcomes),
             row-major [k][outcome] for k ∈ {2, 3, 4}. Per k, the four
             outcomes are: opp scoops hero, opp quarters hero, hero
             scoops opp, hero quarters opp. Each entry is a fraction in
@@ -73,7 +81,7 @@ Layout (946 dims total):
             Computed in Rust (`GameState::opp_outcome_fractions`); k=2,3
             exhaustive, k=4 MC-sampled (1024) with a deterministic seed
             from observation-visible state. All-zero pre-flop / terminal.
-  958..959  bet-faced as fraction of pot-bet-into: to_call /
+  990..991  bet-faced as fraction of pot-bet-into: to_call /
             max(pot - to_call, 1), clipped [0, 4]. 0 when no bet to
             face. The pot the bet was made into (i.e., pot before the
             facing bet); a "half-pot bet" reads as ~0.5, "pot bet" as
@@ -98,7 +106,13 @@ from plo5bp._engine import (  # type: ignore[attr-defined]
 from plo5bp.actions import CHECK_CALL, FOLD
 from plo5bp.config import GameConfig
 
-OBS_DIM: int = 959
+OBS_DIM: int = 991
+
+# v1 (pre-anchor-head era) observation layout: 17-dim history slots, no
+# pot-fraction dim, tail blocks 32 lower. v1 checkpoints can keep
+# serving in the UI via `downgrade_obs_to_v1`, which is an EXACT
+# projection — the v2 layout is purely additive.
+OBS_DIM_V1: int = 959
 
 _HOLE_OFF = 0
 _BOARD_A_OFF = 52
@@ -111,7 +125,7 @@ _SCALARS_OFF = 184
 _REL_POS_OFF = 188
 _HISTORY_OFF = 196
 _HISTORY_DEPTH = 32
-_HISTORY_SLOT_DIM = 17
+_HISTORY_SLOT_DIM = 18
 _MAX_SEATS = 8
 _NUM_STREET_ONEHOT = 4
 _NUM_CATEGORIES = 9  # high-card..straight-flush
@@ -121,6 +135,7 @@ _HISTORY_SEAT_OFF_REL = 0  # 8 dims (hero-relative seat one-hot)
 _HISTORY_GATE_OFF_REL = 8  # 4 dims {Fold, Check, Call, Raise}
 _HISTORY_STREET_OFF_REL = 12  # 4 dims (preflop, flop, turn, river)
 _HISTORY_CHIPS_OFF_REL = 16  # 1 dim (chips / cfg.bb)
+_HISTORY_FRAC_OFF_REL = 17  # 1 dim (chips / pot-before-action, clip [0, 2])
 
 # Encoder-side gate enum (distinct from the policy gate which is 3-way:
 # Fold/CheckCall/Raise). The encoder breaks CheckCall apart so the
@@ -130,53 +145,78 @@ _GATE_CHECK = 1
 _GATE_CALL = 2
 _GATE_RAISE = 3
 
-_SPR_OFF = 740
-_POT_ODDS_OFF = 748
-_CAT_A_OFF = 749
-_CAT_B_OFF = 758
-_DRAW_A_OFF = 767
-_DRAW_B_OFF = 769
-_PAIR_COUNT_A_OFF = 771
-_PAIR_COUNT_B_OFF = 776
-_BOARD_STRUCT_A_OFF = 781
-_BOARD_STRUCT_B_OFF = 785
-_HERO_RANK_HIST_OFF = 789
+_SPR_OFF = 772
+_POT_ODDS_OFF = 780
+_CAT_A_OFF = 781
+_CAT_B_OFF = 790
+_DRAW_A_OFF = 799
+_DRAW_B_OFF = 801
+_PAIR_COUNT_A_OFF = 803
+_PAIR_COUNT_B_OFF = 808
+_BOARD_STRUCT_A_OFF = 813
+_BOARD_STRUCT_B_OFF = 817
+_HERO_RANK_HIST_OFF = 821
 
-_FLUSH_NUT_DIST_A_OFF = 802
-_STRAIGHT_NUT_DIST_A_OFF = 803
-_STRAIGHT_OUTS_A_OFF = 804
-_STRAIGHT_POSSIBLE_A_OFF = 814
-_FLUSH_POSSIBLE_A_OFF = 824
-_FLUSH_DRAW_OUTS_A_OFF = 828
-_NUT_FLUSH_DRAW_OUTS_A_OFF = 832
-_SF_DRAW_OUTS_A_OFF = 836
+_FLUSH_NUT_DIST_A_OFF = 834
+_STRAIGHT_NUT_DIST_A_OFF = 835
+_STRAIGHT_OUTS_A_OFF = 836
+_STRAIGHT_POSSIBLE_A_OFF = 846
+_FLUSH_POSSIBLE_A_OFF = 856
+_FLUSH_DRAW_OUTS_A_OFF = 860
+_NUT_FLUSH_DRAW_OUTS_A_OFF = 864
+_SF_DRAW_OUTS_A_OFF = 868
 
-_FLUSH_NUT_DIST_B_OFF = 840
-_STRAIGHT_NUT_DIST_B_OFF = 841
-_STRAIGHT_OUTS_B_OFF = 842
-_STRAIGHT_POSSIBLE_B_OFF = 852
-_FLUSH_POSSIBLE_B_OFF = 862
-_FLUSH_DRAW_OUTS_B_OFF = 866
-_NUT_FLUSH_DRAW_OUTS_B_OFF = 870
-_SF_DRAW_OUTS_B_OFF = 874
+_FLUSH_NUT_DIST_B_OFF = 872
+_STRAIGHT_NUT_DIST_B_OFF = 873
+_STRAIGHT_OUTS_B_OFF = 874
+_STRAIGHT_POSSIBLE_B_OFF = 884
+_FLUSH_POSSIBLE_B_OFF = 894
+_FLUSH_DRAW_OUTS_B_OFF = 898
+_NUT_FLUSH_DRAW_OUTS_B_OFF = 902
+_SF_DRAW_OUTS_B_OFF = 906
 
-_SEAT_EXISTS_OFF = 878  # 8 dims; structural seat-presence, hero-rotated
-_TOTAL_COMMIT_OFF = 886  # 8 dims; per-seat hand-total commit, hero-rotated, /bb
-_STREET_COMMIT_OFF = 894  # 8 dims; per-seat street commit, hero-rotated, /bb
-_LAST_AGGRESSOR_OFF = 902  # 8 dims; hero-rel one-hot of last aggressor (or all-zero)
-_HERO_BTN_DIST_OFF = 910  # 8 dims; one-hot of (button - hero) % num_seats
+_SEAT_EXISTS_OFF = 910  # 8 dims; structural seat-presence, hero-rotated
+_TOTAL_COMMIT_OFF = 918  # 8 dims; per-seat hand-total commit, hero-rotated, /bb
+_STREET_COMMIT_OFF = 926  # 8 dims; per-seat street commit, hero-rotated, /bb
+_LAST_AGGRESSOR_OFF = 934  # 8 dims; hero-rel one-hot of last aggressor (or all-zero)
+_HERO_BTN_DIST_OFF = 942  # 8 dims; one-hot of (button - hero) % num_seats
 
-_SHARED_RANKS_OFF = 918  # 13 dims; rank present on both A and B
-_FLUSH_MADE_BOTH_OFF = 931  # 4 dims; per-suit hero-involved made on both
-_FLUSH_DRAW_BOTH_OFF = 935  # 4 dims; per-suit hero-involved draw on both
-_FLUSH_MIXED_OFF = 939  # 4 dims; per-suit hero-involved made on one + draw on other
-_STRAIGHT_MADE_BOTH_OFF = 943  # 1 dim; same hero rank-pair makes straight on both
-_STRAIGHT_DRAW_BOTH_OFF = 944  # 1 dim; same hero pair draws (4-rank cov) on both
-_STRAIGHT_MIXED_OFF = 945  # 1 dim; same hero pair made on one, drawing on other
+_SHARED_RANKS_OFF = 950  # 13 dims; rank present on both A and B
+_FLUSH_MADE_BOTH_OFF = 963  # 4 dims; per-suit hero-involved made on both
+_FLUSH_DRAW_BOTH_OFF = 967  # 4 dims; per-suit hero-involved draw on both
+_FLUSH_MIXED_OFF = 971  # 4 dims; per-suit hero-involved made on one + draw on other
+_STRAIGHT_MADE_BOTH_OFF = 975  # 1 dim; same hero rank-pair makes straight on both
+_STRAIGHT_DRAW_BOTH_OFF = 976  # 1 dim; same hero pair draws (4-rank cov) on both
+_STRAIGHT_MIXED_OFF = 977  # 1 dim; same hero pair made on one, drawing on other
 
-_OPP_OUTCOME_OFF = 946  # 12 dims; [k=2,3,4][outcome] fractions in [0,1]
+_OPP_OUTCOME_OFF = 978  # 12 dims; [k=2,3,4][outcome] fractions in [0,1]
 _OPP_OUTCOME_DIM = 12
-_BET_PCT_POT_OFF = 958  # 1 dim; to_call / max(pot, 1), clipped [0, 4]
+_BET_PCT_POT_OFF = 990  # 1 dim; to_call / max(pot, 1), clipped [0, 4]
+
+# Index map projecting the v2 (991) layout onto the exact v1 (959)
+# layout: pre-history block verbatim, first 17 of each 18-dim history
+# slot, then the tail (identical content, shifted by +32 in v2).
+_V1_SLOT_DIM = 17
+_V1_INDEX: np.ndarray = np.concatenate([
+    np.arange(_HISTORY_OFF),
+    np.concatenate([
+        _HISTORY_OFF + s * _HISTORY_SLOT_DIM + np.arange(_V1_SLOT_DIM)
+        for s in range(_HISTORY_DEPTH)
+    ]),
+    np.arange(_SPR_OFF, OBS_DIM),
+]).astype(np.int64)
+assert _V1_INDEX.shape[0] == OBS_DIM_V1
+
+
+def downgrade_obs_to_v1(vec: np.ndarray) -> np.ndarray:
+    """Project a v2 (..., 991) observation onto the v1 (..., 959) layout.
+
+    Exact: drops each history slot's pot-fraction dim and un-shifts the
+    post-history tail. Used by the UI to keep serving v1-era checkpoints
+    (trained at OBS_DIM 959) after the encoder upgrade.
+    """
+    return np.ascontiguousarray(vec[..., _V1_INDEX])
+
 
 # 10 straight windows: slot 0 = wheel (A,2,3,4,5); slots 1..9 = consecutive
 # 5-rank windows starting at rank 0..8. Slot 9 = broadway (T,J,Q,K,A).
@@ -708,6 +748,16 @@ def encode_observation(obs: Mapping[str, Any], config: GameConfig) -> np.ndarray
     history = obs["history"]
     if len(history) > _HISTORY_DEPTH:
         history = history[-_HISTORY_DEPTH:]
+    # Pot before each visible action, reconstructed backwards: history
+    # chips are per-action DELTAS (antes never recorded), so
+    # pot_before(slot j) = current_pot − Σ chips of visible slots ≥ j.
+    # Valid under truncation — truncated actions all precede the window.
+    pot_now_chips = int(obs["pot"])
+    pot_before = [0] * len(history)
+    suffix = 0
+    for j in range(len(history) - 1, -1, -1):
+        suffix += int(history[j][2])
+        pot_before[j] = pot_now_chips - suffix
     for slot, (seat, action, chips, street_idx) in enumerate(history):
         base = _HISTORY_OFF + slot * _HISTORY_SLOT_DIM
         rel_seat = (seat - hero) % num_seats
@@ -718,6 +768,8 @@ def encode_observation(obs: Mapping[str, Any], config: GameConfig) -> np.ndarray
         if 0 <= s_idx < _NUM_STREET_ONEHOT:
             out[base + _HISTORY_STREET_OFF_REL + s_idx] = 1.0
         out[base + _HISTORY_CHIPS_OFF_REL] = float(chips) * inv_bb
+        frac = float(chips) / float(max(pot_before[slot], 1))
+        out[base + _HISTORY_FRAC_OFF_REL] = min(max(frac, 0.0), 2.0)
 
     # SPR uses the same effective remaining as _STACKS_OFF.
     pot_safe = max(pot, 1.0)
@@ -1241,9 +1293,9 @@ def encode_observation_batch(
 
     # History: last 32 entries oldest-first. history_len encodes kept count.
     # Per-slot layout: 8 hero-rel seat one-hot + 4 gate one-hot + 4 street
-    # one-hot + 1 chips/bb scalar. Gate derived from (action, chips) per
-    # `_gate_from_action`: Fold→0, CheckCall&chips==0→Check, CheckCall&chips>0
-    # →Call, anything else→Raise.
+    # one-hot + 1 chips/bb scalar + 1 chips/pot-before scalar. Gate derived
+    # from (action, chips) per `_gate_from_action`: Fold→0,
+    # CheckCall&chips==0→Check, CheckCall&chips>0→Call, anything else→Raise.
     history_seat = obs_arrays["history_seat"].astype(np.int64)
     history_action = obs_arrays["history_action"].astype(np.int64)
     history_chips = obs_arrays["history_chips"].astype(np.int64)
@@ -1283,6 +1335,18 @@ def encode_observation_batch(
             ] = 1.0
 
         out[rows, base + _HISTORY_CHIPS_OFF_REL] = chips_flat.astype(np.float64) * inv_bb
+
+        # Pot before each visible action (per-action deltas; padded slots
+        # are zero chips so the reversed cumsum is unaffected). Mirrors
+        # the scalar path's suffix-sum reconstruction exactly.
+        pot_chips_i64 = obs_arrays["pot"].astype(np.int64)
+        suffix = np.cumsum(history_chips[:, ::-1], axis=1)[:, ::-1]
+        pot_before = pot_chips_i64[:, None] - suffix
+        pot_before_flat = pot_before[valid_slots]
+        frac = chips_flat.astype(np.float64) / np.maximum(
+            pot_before_flat, 1
+        ).astype(np.float64)
+        out[rows, base + _HISTORY_FRAC_OFF_REL] = np.clip(frac, 0.0, 2.0)
 
     # SPR mirrors the scalar path: uses effective stack so chips above
     # max-other-reachable don't enter the network input.

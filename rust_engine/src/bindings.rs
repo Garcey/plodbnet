@@ -1799,6 +1799,7 @@ impl PyBatchedEngine {
         d.set_item("bet_to_call", packed.bet_to_call.into_pyarray(py))?;
         d.set_item("street_commit", packed.street_commit.into_pyarray(py))?;
         d.set_item("street", packed.street.into_pyarray(py))?;
+        d.set_item("pot", packed.pot.into_pyarray(py))?;
         Ok(d)
     }
 }
@@ -1809,7 +1810,7 @@ impl PyBatchedEngine {
 // misplaces a whole feature block, so keep in lockstep with the Python side.
 // =============================================================================
 mod obs_layout {
-    pub const OBS_DIM: usize = 959;
+    pub const OBS_DIM: usize = 991;
     pub const HOLE_OFF: usize = 0;
     pub const BOARD_A_OFF: usize = 52;
     pub const BOARD_B_OFF: usize = 104;
@@ -1821,41 +1822,42 @@ mod obs_layout {
     pub const REL_POS_OFF: usize = 188;
     pub const HISTORY_OFF: usize = 196;
     pub const HISTORY_DEPTH: usize = 32;
-    pub const HISTORY_SLOT_DIM: usize = 17;
+    pub const HISTORY_SLOT_DIM: usize = 18;
     pub const HISTORY_SEAT_OFF_REL: usize = 0;
     pub const HISTORY_GATE_OFF_REL: usize = 8;
     pub const HISTORY_STREET_OFF_REL: usize = 12;
     pub const HISTORY_CHIPS_OFF_REL: usize = 16;
+    pub const HISTORY_FRAC_OFF_REL: usize = 17;
     pub const NUM_STREET_ONEHOT: usize = 4;
     pub const NUM_CATEGORIES: usize = 9;
-    pub const SPR_OFF: usize = 740;
-    pub const POT_ODDS_OFF: usize = 748;
-    pub const CAT_A_OFF: usize = 749;
-    pub const CAT_B_OFF: usize = 758;
-    pub const DRAW_A_OFF: usize = 767;
-    pub const DRAW_B_OFF: usize = 769;
-    pub const PAIR_COUNT_A_OFF: usize = 771;
-    pub const PAIR_COUNT_B_OFF: usize = 776;
-    pub const BOARD_STRUCT_A_OFF: usize = 781;
-    pub const BOARD_STRUCT_B_OFF: usize = 785;
-    pub const HERO_RANK_HIST_OFF: usize = 789;
-    pub const FLUSH_NUT_DIST_A_OFF: usize = 802;
-    pub const FLUSH_NUT_DIST_B_OFF: usize = 840;
-    pub const SEAT_EXISTS_OFF: usize = 878;
-    pub const TOTAL_COMMIT_OFF: usize = 886;
-    pub const STREET_COMMIT_OFF: usize = 894;
-    pub const LAST_AGGRESSOR_OFF: usize = 902;
-    pub const HERO_BTN_DIST_OFF: usize = 910;
-    pub const SHARED_RANKS_OFF: usize = 918;
-    pub const FLUSH_MADE_BOTH_OFF: usize = 931;
-    pub const FLUSH_DRAW_BOTH_OFF: usize = 935;
-    pub const FLUSH_MIXED_OFF: usize = 939;
-    pub const STRAIGHT_MADE_BOTH_OFF: usize = 943;
-    pub const STRAIGHT_DRAW_BOTH_OFF: usize = 944;
-    pub const STRAIGHT_MIXED_OFF: usize = 945;
-    pub const OPP_OUTCOME_OFF: usize = 946;
+    pub const SPR_OFF: usize = 772;
+    pub const POT_ODDS_OFF: usize = 780;
+    pub const CAT_A_OFF: usize = 781;
+    pub const CAT_B_OFF: usize = 790;
+    pub const DRAW_A_OFF: usize = 799;
+    pub const DRAW_B_OFF: usize = 801;
+    pub const PAIR_COUNT_A_OFF: usize = 803;
+    pub const PAIR_COUNT_B_OFF: usize = 808;
+    pub const BOARD_STRUCT_A_OFF: usize = 813;
+    pub const BOARD_STRUCT_B_OFF: usize = 817;
+    pub const HERO_RANK_HIST_OFF: usize = 821;
+    pub const FLUSH_NUT_DIST_A_OFF: usize = 834;
+    pub const FLUSH_NUT_DIST_B_OFF: usize = 872;
+    pub const SEAT_EXISTS_OFF: usize = 910;
+    pub const TOTAL_COMMIT_OFF: usize = 918;
+    pub const STREET_COMMIT_OFF: usize = 926;
+    pub const LAST_AGGRESSOR_OFF: usize = 934;
+    pub const HERO_BTN_DIST_OFF: usize = 942;
+    pub const SHARED_RANKS_OFF: usize = 950;
+    pub const FLUSH_MADE_BOTH_OFF: usize = 963;
+    pub const FLUSH_DRAW_BOTH_OFF: usize = 967;
+    pub const FLUSH_MIXED_OFF: usize = 971;
+    pub const STRAIGHT_MADE_BOTH_OFF: usize = 975;
+    pub const STRAIGHT_DRAW_BOTH_OFF: usize = 976;
+    pub const STRAIGHT_MIXED_OFF: usize = 977;
+    pub const OPP_OUTCOME_OFF: usize = 978;
     pub const OPP_OUTCOME_DIM: usize = 12;
-    pub const BET_PCT_POT_OFF: usize = 958;
+    pub const BET_PCT_POT_OFF: usize = 990;
 }
 
 /// Encode one env's observation into `out` (length OBS_DIM, pre-zeroed). A
@@ -1957,6 +1959,17 @@ fn encode_obs_row(
 
     // --- History (oldest-first, already truncated to last HISTORY_DEPTH). ---
     let hlen = (packed.history_len[j] as usize).min(HISTORY_DEPTH);
+    // Pot before each visible action: history chips are per-action
+    // DELTAS (antes never recorded), so pot_before(slot) = current_pot −
+    // Σ chips of visible slots ≥ slot. Valid under truncation — dropped
+    // actions all precede the window. Integer math mirrors numpy/scalar.
+    let pot_now_chips = packed.pot[j] as i64;
+    let mut pot_before = [0i64; HISTORY_DEPTH];
+    let mut chips_suffix: i64 = 0;
+    for slot in (0..hlen).rev() {
+        chips_suffix += packed.history_chips[[j, slot]] as i64;
+        pot_before[slot] = pot_now_chips - chips_suffix;
+    }
     for slot in 0..hlen {
         let base = HISTORY_OFF + slot * HISTORY_SLOT_DIM;
         let hseat = packed.history_seat[[j, slot]] as i64;
@@ -1982,6 +1995,8 @@ fn encode_obs_row(
             out[base + HISTORY_STREET_OFF_REL + s_idx as usize] = 1.0;
         }
         out[base + HISTORY_CHIPS_OFF_REL] = (chips as f64 * inv_bb) as f32;
+        let frac = chips as f64 / pot_before[slot].max(1) as f64;
+        out[base + HISTORY_FRAC_OFF_REL] = frac.clamp(0.0, 2.0) as f32;
     }
 
     // --- SPR per seat (hero-rotated), clip [0, 4]. ---
