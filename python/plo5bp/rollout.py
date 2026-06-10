@@ -462,7 +462,10 @@ def collect_rollout(
             m_t = torch.from_numpy(batch_gm).to(device)
             b_t = torch.from_numpy(batch_bounds).to(device)
             with torch.no_grad():
-                gates_t, chips_t, log_probs_t, values_t = learner.act(o_t, m_t, b_t)
+                _act_out = learner.act(o_t, m_t, b_t)
+                gates_t, chips_t, log_probs_t, values_t = (
+                    _act_out.gate, _act_out.chips, _act_out.log_prob, _act_out.value
+                )
             g_np = gates_t.cpu().numpy()
             c_np = chips_t.cpu().numpy()
             lp_np = log_probs_t.cpu().numpy()
@@ -484,7 +487,8 @@ def collect_rollout(
                     dtype=torch.long,
                 ).to(device)
                 with torch.no_grad():
-                    g_t, c_t, _, _ = opp.act(o_t, m_t, b_t)
+                    _opp_out = opp.act(o_t, m_t, b_t)
+                    g_t, c_t = _opp_out.gate, _opp_out.chips
                 gates_per_env[i] = int(g_t.cpu().numpy()[0])
                 chips_per_env[i] = np.uint64(max(0, int(c_t.cpu().numpy()[0])))
 
@@ -801,7 +805,10 @@ def collect_rollout_batched(
             b_t = torch.from_numpy(b_bounds).to(device)
         with record_function("step3/learner_forward"):
             with torch.inference_mode():
-                g_t, c_t, lp_t, v_t = model.act(o_t, m_t, b_t)
+                _fw_out = model.act(o_t, m_t, b_t)
+                g_t, c_t, lp_t, v_t = (
+                    _fw_out.gate, _fw_out.chips, _fw_out.log_prob, _fw_out.value
+                )
         with record_function("step5/action_d2h"):
             # Coalesce four separate device->host copies (each forces a full
             # CUDA sync) into two by stacking same-dtype outputs: one int64

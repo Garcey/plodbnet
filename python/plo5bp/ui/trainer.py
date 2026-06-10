@@ -167,11 +167,11 @@ def compute_node_distribution(
     with torch.no_grad():
         gate_logits, raise_params, value = model(obs_t, gm_t)
         gate_probs = F.softmax(gate_logits, dim=-1).squeeze(0).tolist()
-        gate_argmax, chips_t, _, _ = model.act(
+        _act_out = model.act(
             obs_t, gm_t, bounds_t, deterministic=True
         )
-    rec_gate = int(gate_argmax.item())
-    rec_chips = int(chips_t.item())
+    rec_gate = int(_act_out.gate.item())
+    rec_chips = int(_act_out.chips.item())
     if rec_gate == GATE_RAISE and int(info.min_raise_chips) == 0 and raise_max > 0:
         rec_chips = raise_max
     return {
@@ -730,13 +730,13 @@ class TrainerSession:
                 device=self.device,
             )
             with torch.no_grad():
-                g_b, c_b, _, _ = self.model.act(
+                _mc_out = self.model.act(
                     obs_b, gm_b, bounds_b, deterministic=False
                 )
             nxt: list[list[Any]] = []
             for i, x in enumerate(live):
                 obs2, rewards, done, info2 = x[0].step_hybrid(
-                    int(g_b[i].item()), int(c_b[i].item())
+                    int(_mc_out.gate[i].item()), int(_mc_out.chips[i].item())
                 )
                 if done:
                     total += float(rewards[h.hero_seat])

@@ -925,11 +925,11 @@ def _compute_recommendation() -> dict[str, Any] | None:
     with torch.no_grad():
         gate_logits, raise_params, value = MODEL(obs_t, gm_t)
         gate_probs = F.softmax(gate_logits, dim=-1).squeeze(0).tolist()
-        gate_argmax, chips_tensor, _, _ = MODEL.act(
+        _act_out = MODEL.act(
             obs_t, gm_t, bounds_t, deterministic=True
         )
-        gate = int(gate_argmax.item())
-        chips = int(chips_tensor.item())
+        gate = int(_act_out.gate.item())
+        chips = int(_act_out.chips.item())
         alpha = float(raise_params[0, 0].item())
         beta = float(raise_params[0, 1].item())
         value_bb = float(value.squeeze(0).item())

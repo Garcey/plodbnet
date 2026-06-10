@@ -84,8 +84,8 @@ def model_policy(model: ActorCritic, deterministic: bool = False) -> Policy:
                 dtype=torch.long,
                 device=device,
             )
-            gate, chips, _, _ = model.act(o, m, b, deterministic=deterministic)
-        return int(gate.item()), int(chips.item())
+            out = model.act(o, m, b, deterministic=deterministic)
+        return int(out.gate.item()), int(out.chips.item())
 
     return act
 
