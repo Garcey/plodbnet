@@ -389,12 +389,18 @@ class ActorCriticV2(nn.Module):
         gate_actions: torch.Tensor,
         anchor_actions: torch.Tensor,
         refine_u: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return (log_prob, entropy, display_value) for stored actions.
+    ) -> tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor,
+        torch.Tensor, torch.Tensor, torch.Tensor,
+    ]:
+        """Return (log_prob, entropy, display_value, gate_H, anchor_H,
+        beta_H_eff) for stored actions.
 
         Entropy follows the generative process:
         H(gate) + P(Raise) · (H(anchor) + Σ_k p_k · H(Beta_k) · refine_ok_k).
-        Masked anchors contribute exactly zero.
+        Masked anchors contribute exactly zero. The decomposition terms
+        are returned so training can log Hg/Ha/Hb separately (the anchor
+        head adds up to log(11) ≈ 2.4 nats vs the v1 entropy scale).
         """
         gate_logits, anchor_logits, refine, value = self.forward(obs, gate_mask)
         grid = anchor_grid_torch(sizing)
@@ -431,8 +437,9 @@ class ActorCriticV2(nn.Module):
         beta_h_eff = (
             anchor_probs[..., 1:ANCHOR_COUNT - 1] * beta_h * interior_ok
         ).sum(-1)
-        entropy = gate_entropy + p_raise * (anchor_dist.entropy() + beta_h_eff)
-        return log_prob, entropy, value
+        anchor_entropy = anchor_dist.entropy()
+        entropy = gate_entropy + p_raise * (anchor_entropy + beta_h_eff)
+        return log_prob, entropy, value, gate_entropy, anchor_entropy, beta_h_eff
 
 
 def opp_holes_multihot(holes: torch.Tensor) -> torch.Tensor:

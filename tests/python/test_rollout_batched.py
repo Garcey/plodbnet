@@ -45,7 +45,7 @@ def test_batched_rollout_smoke_self_play_only() -> None:
     gm = batch.gate_masks.numpy()
     ga = batch.gate_actions.numpy()
     rc = batch.raise_chips.numpy()
-    rb = batch.raise_bounds.numpy()
+    rb = batch.sizing.numpy()
     for i in range(ga.shape[0]):
         assert bool(gm[i, int(ga[i])]), (
             f"illegal gate {int(ga[i])} at row {i}"
@@ -96,7 +96,7 @@ def test_batched_rollout_exercises_snapshot_group_path() -> None:
     gm = batch.gate_masks.numpy()
     ga = batch.gate_actions.numpy()
     rc = batch.raise_chips.numpy()
-    rb = batch.raise_bounds.numpy()
+    rb = batch.sizing.numpy()
     for i in range(ga.shape[0]):
         assert bool(gm[i, int(ga[i])])
         if int(ga[i]) == 2:

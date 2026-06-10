@@ -47,7 +47,7 @@ def test_rollout_and_update_finite_and_in_bounds() -> None:
     gm = batch.gate_masks.numpy()
     ga = batch.gate_actions.numpy()
     rc = batch.raise_chips.numpy()
-    rb = batch.raise_bounds.numpy()
+    rb = batch.sizing.numpy()
     for i in range(ga.shape[0]):
         assert bool(gm[i, int(ga[i])]), f"illegal gate at row {i}"
         if int(ga[i]) == GATE_RAISE:

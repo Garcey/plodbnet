@@ -75,4 +75,18 @@ class TrainingConfig:
     # the other.
     retroactive_bonus_c: float = 0.0
 
+    # v2 (anchor head + centralized critic) hyperparameters. Ignored on
+    # v1 runs — the critic is only built when train.py constructs one.
+    critic_hidden_dim: int = 1536
+    critic_num_blocks: int = 2
+    # Weight on the actor's own value head ("display head" for the UI)
+    # when a CentralCritic owns the GAE values. Plain regression, no
+    # clipping; small so it stays subordinate to the policy loss.
+    display_value_coef: float = 0.125
+    # KL-to-EMA-reference regularizer. 0.0 = off (no EMA model built).
+    # The reference re-initializes to current weights on every (re)start
+    # — it is NOT persisted in checkpoints.
+    kl_anchor_coef: float = 0.0
+    kl_anchor_ema: float = 0.999
+
     device: str = "cpu"

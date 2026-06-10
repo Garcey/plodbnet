@@ -22,6 +22,7 @@ from plo5bp.actions import (
 from plo5bp.config import GameConfig
 from plo5bp.env import BombPotEnv, StepInfo
 from plo5bp.network import ActorCritic
+from plo5bp.sizing import sizing_from_info
 
 
 Policy = Callable[[np.ndarray, int, StepInfo], tuple[int, int]]
@@ -79,11 +80,9 @@ def model_policy(model: ActorCritic, deterministic: bool = False) -> Policy:
         with torch.no_grad():
             o = torch.from_numpy(obs).unsqueeze(0).to(device)
             m = torch.from_numpy(info.gate_mask).unsqueeze(0).to(device)
-            b = torch.tensor(
-                [[info.min_raise_chips, info.max_raise_chips]],
-                dtype=torch.long,
-                device=device,
-            )
+            b = torch.from_numpy(
+                sizing_from_info(info)[None, :]
+            ).to(device)
             out = model.act(o, m, b, deterministic=deterministic)
         return int(out.gate.item()), int(out.chips.item())
 

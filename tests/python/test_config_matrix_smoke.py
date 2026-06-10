@@ -62,7 +62,7 @@ def test_batched_ppo_smoke_across_configs(
         gm = batch.gate_masks.numpy()
         ga = batch.gate_actions.numpy()
         rc = batch.raise_chips.numpy()
-        rb = batch.raise_bounds.numpy()
+        rb = batch.sizing.numpy()
         for i in range(ga.shape[0]):
             assert bool(gm[i, int(ga[i])])
             if int(ga[i]) == 2:  # GATE_RAISE

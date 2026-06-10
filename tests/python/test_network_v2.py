@@ -69,7 +69,7 @@ def test_act_evaluate_log_prob_parity():
         obs, gm, sizing = _random_batch(rng, 512)
         torch.manual_seed(100 + trial)
         out = m.act(obs, gm, sizing, deterministic=False)
-        log_prob_eval, entropy, value = m.evaluate(
+        log_prob_eval, entropy, value, gate_h, anchor_h, beta_h = m.evaluate(
             obs, gm, sizing, out.gate, out.anchor, out.refine_u
         )
         diff = (out.log_prob - log_prob_eval).abs().max().item()
@@ -131,12 +131,16 @@ def test_masked_anchor_entropy_zero_contribution():
     gm = torch.ones(4, 3, dtype=torch.bool)
     sizing = torch.tensor([[500, 500, 900, 0]] * 4, dtype=torch.int64)
     out = m.act(obs, gm, sizing, deterministic=False)
-    lp, entropy, _ = m.evaluate(obs, gm, sizing, out.gate, out.anchor, out.refine_u)
+    lp, entropy, _v, gate_h, anchor_h, beta_h = m.evaluate(
+        obs, gm, sizing, out.gate, out.anchor, out.refine_u
+    )
     gate_logits, _, _, _ = m(obs, gm)
     gate_dist = torch.distributions.Categorical(logits=gate_logits)
     assert torch.allclose(entropy, gate_dist.entropy(), atol=1e-6), (
         "degenerate sizing must contribute zero entropy beyond the gate"
     )
+    assert torch.allclose(anchor_h, torch.zeros_like(anchor_h), atol=1e-6)
+    assert torch.allclose(beta_h, torch.zeros_like(beta_h), atol=1e-6)
 
 
 def test_v1_act_returns_actout_with_sentinel_anchor():

@@ -78,7 +78,7 @@ def test_rollout_parity_self_play_only() -> None:
         gm = b.gate_masks.numpy()
         ga = b.gate_actions.numpy()
         rc = b.raise_chips.numpy()
-        rb = b.raise_bounds.numpy()
+        rb = b.sizing.numpy()
         for i in range(ga.shape[0]):
             assert bool(gm[i, int(ga[i])])
             if int(ga[i]) == 2:  # GATE_RAISE
@@ -126,7 +126,7 @@ def test_rollout_parity_pool_mix_learner_row_fraction() -> None:
         gm = b.gate_masks.numpy()
         ga = b.gate_actions.numpy()
         rc = b.raise_chips.numpy()
-        rb = b.raise_bounds.numpy()
+        rb = b.sizing.numpy()
         for i in range(ga.shape[0]):
             assert bool(gm[i, int(ga[i])])
             if int(ga[i]) == 2:  # GATE_RAISE

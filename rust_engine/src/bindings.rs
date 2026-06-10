@@ -3,7 +3,8 @@
 
 use numpy::ndarray::{Array1, Array2};
 use numpy::{
-    IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3,
+    IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2,
+    PyReadonlyArray3,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -699,6 +700,29 @@ impl PyBatchedEngine {
 
     fn num_seats(&self) -> usize {
         self.config.num_seats
+    }
+
+    /// (N, num_seats, 5) u8 hole-card indices for every seat in every
+    /// env; rows for dead (never-reset) envs are 255-filled. Holes are
+    /// static per hand, so callers cache this once per reset wave —
+    /// it feeds the centralized critic's opponent-hole inputs.
+    fn all_hole_cards_batch<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyArray3<u8>>> {
+        let n = self.states.len();
+        let s = self.config.num_seats;
+        let mut arr = numpy::ndarray::Array3::<u8>::from_elem((n, s, 5), 255u8);
+        for (i, st) in self.states.iter().enumerate() {
+            if let Some(g) = st {
+                for seat in 0..s {
+                    for c in 0..5 {
+                        arr[[i, seat, c]] = g.hole_cards[seat][c].index();
+                    }
+                }
+            }
+        }
+        Ok(arr.into_pyarray(py))
     }
 
     fn num_actions(&self) -> usize {

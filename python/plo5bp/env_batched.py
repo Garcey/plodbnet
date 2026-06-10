@@ -291,6 +291,7 @@ class BatchedBombPotEnv:
             self._bet_to_call = np.asarray(bundle["bet_to_call"], dtype=np.uint64)
             self._street_commit = np.asarray(bundle["street_commit"], dtype=np.uint64)
             self._street = np.asarray(bundle["street"], dtype=np.uint8)
+            self._pot = np.asarray(bundle["pot"], dtype=np.uint64)
 
     def _refresh_subset(self, mask: np.ndarray) -> None:
         """Partial `_refresh`: re-pack + re-encode ONLY the envs selected by
@@ -354,6 +355,7 @@ class BatchedBombPotEnv:
                 bundle["street_commit"], dtype=np.uint64
             )
             self._street[idx] = np.asarray(bundle["street"], dtype=np.uint8)
+            self._pot[idx] = np.asarray(bundle["pot"], dtype=np.uint64)
 
     # ------------------------------------------------------------------
     # Read-only accessors mirroring the scalar env's helpers.
