@@ -32,7 +32,7 @@ from train import _sample_game_config  # noqa: E402
 
 from plo5bp.env import BombPotEnv  # noqa: E402
 from plo5bp.eval import model_policy  # noqa: E402
-from plo5bp.network import ActorCritic  # noqa: E402
+from plo5bp.network import ActorCritic, model_class_for_state_dict  # noqa: E402
 
 
 def _resolve_device(name: str) -> torch.device:
@@ -55,7 +55,8 @@ def load_checkpoint(path: Path, device: torch.device) -> ActorCritic:
         state_dict = ckpt
         hidden_dim = 128
         num_layers = 2
-    model = ActorCritic(hidden_dim=hidden_dim, num_layers=num_layers)
+    model_cls = model_class_for_state_dict(state_dict)
+    model = model_cls(hidden_dim=hidden_dim, num_layers=num_layers)
     model.load_state_dict(state_dict)
     model.to(device).eval()
     for p in model.parameters():

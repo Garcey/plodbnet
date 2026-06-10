@@ -442,6 +442,21 @@ class ActorCriticV2(nn.Module):
         return log_prob, entropy, value, gate_entropy, anchor_entropy, beta_h_eff
 
 
+def model_class_for_state_dict(state_dict: dict) -> type:
+    """Sniff a checkpoint's actor class from its head parameters:
+    'anchor_head.weight' → ActorCriticV2, 'raise_head.weight' → v1.
+    Shared by the UI server and the eval/exploit/bankroll loaders so
+    every consumer serves both checkpoint generations."""
+    if "anchor_head.weight" in state_dict:
+        return ActorCriticV2
+    if "raise_head.weight" in state_dict:
+        return ActorCritic
+    raise ValueError(
+        "state_dict has neither 'anchor_head.weight' (v2) nor "
+        "'raise_head.weight' (v1) — not a plo5bp actor checkpoint"
+    )
+
+
 def opp_holes_multihot(holes: torch.Tensor) -> torch.Tensor:
     """Expand compact (B, 5, 5) uint8/int hole-card indices (255 =
     empty slot) into the (B, 260) multi-hot the CentralCritic consumes."""

@@ -31,7 +31,7 @@ import torch
 
 from plo5bp.actions import GATE_ACTIONS
 from plo5bp.config import GameConfig, TrainingConfig
-from plo5bp.network import ActorCritic
+from plo5bp.network import ActorCriticV2, CentralCritic
 from plo5bp.ppo import PPOTrainer
 from plo5bp.rollout import collect_rollout, collect_rollout_batched
 from plo5bp.selfplay import OpponentPool
@@ -445,6 +445,34 @@ def main() -> None:
         help="Optional warm-start: load model weights from this .pt before training.",
     )
     parser.add_argument(
+        "--critic-hidden-dim",
+        type=int,
+        default=1536,
+        help="Hidden width of the centralized critic (training-only value "
+        "net that sees all hole cards).",
+    )
+    parser.add_argument(
+        "--critic-num-blocks",
+        type=int,
+        default=2,
+        help="Residual blocks in the centralized critic torso.",
+    )
+    parser.add_argument(
+        "--kl-anchor-coef",
+        type=float,
+        default=0.0,
+        help="KL-to-EMA-reference regularizer coefficient. 0 disables "
+        "(no EMA model is built). The reference is NOT persisted in "
+        "checkpoints — on (re)start it re-initializes to the current "
+        "weights and ramps in over ~1/(1-ema) updates.",
+    )
+    parser.add_argument(
+        "--kl-anchor-ema",
+        type=float,
+        default=0.999,
+        help="EMA decay of the KL reference model.",
+    )
+    parser.add_argument(
         "--checkpoint-every",
         type=int,
         default=5,
@@ -556,13 +584,22 @@ def main() -> None:
         entropy_coef=args.entropy_coef,
         aggression_bonus_c=args.aggression_bonus_c,
         retroactive_bonus_c=args.retroactive_bonus_c,
+        critic_hidden_dim=args.critic_hidden_dim,
+        critic_num_blocks=args.critic_num_blocks,
+        kl_anchor_coef=args.kl_anchor_coef,
+        kl_anchor_ema=args.kl_anchor_ema,
         device=args.device,
     )
 
-    model = ActorCritic(
+    model = ActorCriticV2(
         hidden_dim=train_cfg.hidden_dim, num_layers=train_cfg.num_layers
     )
     model.to(train_cfg.device)
+    critic = CentralCritic(
+        hidden_dim=train_cfg.critic_hidden_dim,
+        num_blocks=train_cfg.critic_num_blocks,
+    )
+    critic.to(train_cfg.device)
     print(f"[device] learner on {train_cfg.device}")
     # Annealing state restored from the checkpoint (None when absent / cold).
     restored_update: int | None = None
@@ -571,10 +608,39 @@ def main() -> None:
     restored_block_acc: dict | None = None
     if args.load_checkpoint is not None:
         ckpt = torch.load(args.load_checkpoint, map_location="cpu", weights_only=False)
+        ckpt_head = int(ckpt.get("head_version", 1))
+        if ckpt_head != 2:
+            raise SystemExit(
+                f"head_version mismatch: checkpoint={ckpt_head} (v1 Beta "
+                "sizing head) cannot warm-start the v2 anchor-head trainer. "
+                "Start cold or point --load-checkpoint at an anchor-family "
+                "checkpoint."
+            )
+        if "critic" not in ckpt:
+            raise SystemExit(
+                "v2 checkpoint is missing the 'critic' state dict — cannot "
+                "warm-start the centralized critic."
+            )
         ckpt_cfg = ckpt.get("config") or {}
         ckpt_hidden = int(ckpt_cfg.get("hidden_dim", train_cfg.hidden_dim))
         ckpt_layers = int(ckpt_cfg.get("num_layers", train_cfg.num_layers))
+        ckpt_critic_hidden = int(
+            ckpt_cfg.get("critic_hidden_dim", train_cfg.critic_hidden_dim)
+        )
+        ckpt_critic_blocks = int(
+            ckpt_cfg.get("critic_num_blocks", train_cfg.critic_num_blocks)
+        )
         ckpt_gate_count = ckpt.get("gate_count")
+        if ckpt_critic_hidden != train_cfg.critic_hidden_dim:
+            raise SystemExit(
+                f"critic_hidden_dim mismatch: checkpoint={ckpt_critic_hidden} "
+                f"vs --critic-hidden-dim={train_cfg.critic_hidden_dim}"
+            )
+        if ckpt_critic_blocks != train_cfg.critic_num_blocks:
+            raise SystemExit(
+                f"critic_num_blocks mismatch: checkpoint={ckpt_critic_blocks} "
+                f"vs --critic-num-blocks={train_cfg.critic_num_blocks}"
+            )
         if ckpt_hidden != train_cfg.hidden_dim:
             raise SystemExit(
                 f"hidden_dim mismatch: checkpoint={ckpt_hidden} vs --hidden-dim={train_cfg.hidden_dim}"
@@ -589,6 +655,7 @@ def main() -> None:
                 "This checkpoint was trained with a different gate-head width and cannot be warm-started."
             )
         model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt)
+        critic.load_state_dict(ckpt["critic"])
         prior_game = ckpt.get("game_config")
         print(f"warm-started from {args.load_checkpoint} (prior game_config: {prior_game})")
         restored_update = ckpt.get("update_counter")
@@ -632,7 +699,7 @@ def main() -> None:
             f"tier_ent={tier_ent} baselines={tier_baseline}"
         )
 
-    trainer = PPOTrainer(model, train_cfg)
+    trainer = PPOTrainer(model, train_cfg, critic=critic)
     pool = OpponentPool(capacity=train_cfg.opponent_pool_size)
     rng = np.random.default_rng(args.seed)
 
@@ -650,6 +717,8 @@ def main() -> None:
         torch.save(
             {
                 "model": model.state_dict(),
+                "critic": critic.state_dict(),
+                "head_version": 2,
                 "config": train_cfg.__dict__,
                 "game_config": game_cfg_snap,
                 "gate_count": GATE_ACTIONS,
@@ -753,7 +822,7 @@ def main() -> None:
             )
             _prof.__enter__()
 
-        batch = collector(model, pool, sampled_game_cfg, train_cfg, rng)
+        batch = collector(model, pool, sampled_game_cfg, train_cfg, rng, critic=critic)
         if blocks:
             # tier_ent[tier] == the static block value when --anneal-entropy is
             # off (it is never mutated then), so this is identical to today.
@@ -816,8 +885,13 @@ def main() -> None:
                 f"[{elapsed:7.1f}s] update {update:5d}  "
                 f"pi={stats.policy_loss:+.4f}  "
                 f"v={stats.value_loss:.4f}  "
+                f"vd={stats.display_loss:.4f}  "
                 f"H={stats.entropy:.3f}  "
+                f"Hg/Ha/Hb={stats.gate_entropy:.2f}/{stats.anchor_entropy:.2f}/"
+                f"{stats.beta_entropy:.2f}  "
                 f"kl={stats.approx_kl:+.4f}  "
+                + (f"klA={stats.kl_anchor:.4f}  " if args.kl_anchor_coef > 0 else "")
+                +
                 f"bonus={bonus_mean:+.4f}  "
                 f"bonus%(F/T/R)={bonus_pct_flop:4.1f}/{bonus_pct_turn:4.1f}/"
                 f"{bonus_pct_river:4.1f}  "
@@ -865,6 +939,8 @@ def main() -> None:
     torch.save(
         {
             "model": model.state_dict(),
+            "critic": critic.state_dict(),
+            "head_version": 2,
             "config": train_cfg.__dict__,
             "game_config": sampled_game_cfg.__dict__,
             "gate_count": GATE_ACTIONS,
