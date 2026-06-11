@@ -828,7 +828,10 @@ def collect_rollout_batched(
     # default cap) tops out near ~150 actions per seat per hand. 32 was
     # exceeded in practice on a deep-tier rollout (vTwo1 update 94,
     # 2026-06-10). 192 bounds the theoretical worst case with margin;
-    # RAM cost scales with n_envs via pool_cap / out_cap below.
+    # cost is only the per-(env, seat) trajectory arrays (~4GB at 49k
+    # envs) — the obs pool / output slabs use POOL_SLACK_PER_ENV below,
+    # NOT this capacity, and flush temporaries are bounded by the
+    # actual max trajectory length per flush.
     MAX_STEPS_PER_SEAT = 192
     traj_lengths = np.zeros((n_envs, n_seats), dtype=np.int32)
     # Absolute index into `step_obs_pool` / `step_gm_pool` per (env, seat, slot).
@@ -851,7 +854,19 @@ def collect_rollout_batched(
     # terminal-flush gather a single `np.take` rather than a Python
     # walk over chunked storage.
     rollout_target = int(train_config.rollout_length)
-    pool_cap = rollout_target + n_envs * MAX_STEPS_PER_SEAT
+    # Slack for learner steps written after `wcursor` last crossed the
+    # rollout target (in-flight, unflushed hands). This is a per-env
+    # STATISTICAL bound (~avg hand length, a handful of steps), NOT the
+    # per-seat capacity above — scaling it with MAX_STEPS_PER_SEAT=192
+    # ballooned the obs pool + output slabs from ~75GB to ~160GB at 49k
+    # envs and blew the pod's 146GB cgroup memory.max (reclaim thrash,
+    # ~7x wall-clock, 2026-06-11; `free` shows HOST memory inside a
+    # container — check /sys/fs/cgroup/memory.max). 32 steps/env of
+    # slack is ~50x the observed need; the explicit guards below turn
+    # the impossible overflow into a clean error instead of a silent
+    # shape mismatch.
+    POOL_SLACK_PER_ENV = 32
+    pool_cap = rollout_target + n_envs * POOL_SLACK_PER_ENV
     step_obs_pool = np.empty((pool_cap, OBS_DIM), dtype=np.float32)
     step_gm_pool = np.empty((pool_cap, GATE_ACTIONS), dtype=bool)
     pool_cursor = 0
@@ -861,7 +876,7 @@ def collect_rollout_batched(
     # transitions written so far across all terminal flushes. On CUDA,
     # back the slabs with pinned host memory so the finalize transfer
     # can run with `non_blocking=True` and overlap the first PPO forward.
-    out_cap = rollout_target + n_envs * MAX_STEPS_PER_SEAT
+    out_cap = rollout_target + n_envs * POOL_SLACK_PER_ENV
     # Pinned host memory makes the finalize H2D copy overlap downstream compute
     # (via non_blocking=True), but PINNING THE ~36GB obs slab can cost 60+ SECONDS
     # PER UPDATE on some hosts (measured: torch 2.11 / AMD EPYC pins 36GB in ~64s,
@@ -1034,6 +1049,12 @@ def collect_rollout_batched(
         if learner_idx_np.size:
             k_step = learner_idx_np.size
             pool_end = pool_cursor + k_step
+            if pool_end > pool_cap:
+                raise RuntimeError(
+                    f"obs pool overflow: {pool_end} > pool_cap={pool_cap} "
+                    f"(rollout_target={rollout_target} + "
+                    f"{n_envs}x{POOL_SLACK_PER_ENV} slack)"
+                )
             step_obs_pool[pool_cursor:pool_end] = obs[learner_idx_np]
             step_gm_pool[pool_cursor:pool_end] = gate_masks[learner_idx_np]
             pool_indices = np.arange(pool_cursor, pool_end, dtype=np.int64)
@@ -1254,6 +1275,13 @@ def collect_rollout_batched(
                     flat = active_step.ravel()
                     n_new = int(flat.sum())
                     if n_new:
+                        if wcursor + n_new > out_cap:
+                            raise RuntimeError(
+                                f"output slab overflow: {wcursor + n_new} > "
+                                f"out_cap={out_cap} (rollout_target="
+                                f"{rollout_target} + {n_envs}x"
+                                f"{POOL_SLACK_PER_ENV} slack)"
+                            )
                         sel = np.nonzero(flat)[0]
                         obs_idx = traj_obs_idx[term_envs, :, :L].ravel()[sel]
                         end = wcursor + n_new
