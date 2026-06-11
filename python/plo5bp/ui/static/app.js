@@ -985,12 +985,15 @@ function distRowsHTML(dist, callName) {
 const ANCHOR_AXIS_LABELS = ["min", "10", "20", "30", "40", "50", "60", "70", "80", "90", "pot"];
 
 function anchorHeatColor(t) {
-  // t = prob / max-prob in [0,1]: cold slate → hot orange. The x-axis
-  // is bet size (min → pot); color carries the preference.
-  const h = 222 - 200 * t;
-  const s = 30 + 55 * t;
-  const l = 16 + 38 * t;
-  return `hsl(${h.toFixed(0)}, ${s.toFixed(0)}%, ${l.toFixed(0)}%)`;
+  // t = prob / max-prob in [0,1]. Single-hue intensity ramp: every
+  // cell is the same amber and only brightness carries the
+  // preference — dim = rarely bet, bright = favorite size. (A
+  // blue→orange hue sweep passes through green midway, which reads
+  // as a third category instead of "medium".)
+  const c0 = [38, 42, 54];   // near-background slate
+  const c1 = [255, 158, 42]; // hot amber
+  const ch = c0.map((v, i) => Math.round(v + (c1[i] - v) * t));
+  return `rgb(${ch[0]}, ${ch[1]}, ${ch[2]})`;
 }
 
 function anchorHeatmapHTML(anchors, recAnchor, userAnchor, s) {
