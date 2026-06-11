@@ -21,6 +21,11 @@ State/replay invariants:
   reproduces opponent lines until the user deviates.
 - `study_terminal` / `awaiting_next_street` are study-mode-only engine
   fields; trainer terminal state is synthesized from the `done` flag.
+- Moot nodes (nothing to call, every other live seat all-in) are
+  auto-checked by `_advance` for hero and opponents alike — an all-in
+  hand runs out to showdown without drilling the user on meaningless
+  check nodes. Auto-checks consume no model RNG and are recorded in
+  `action_log` like any action, so replay determinism is unchanged.
 """
 
 from __future__ import annotations
@@ -679,15 +684,24 @@ class TrainerSession:
                         np.asarray(h.env._rs.payouts(), dtype=np.float32)
                     )
                 break
-            if info.actor == h.hero_seat:
-                break
-            # Re-seed per node: opponent behavior is a pure function of
-            # the action prefix (see module docstring).
-            torch.manual_seed(self._opp_seed(h))
-            gate, chips = self._policy(h.last_obs, info.actor, info)
-            street = int(info.raw_obs["street"])
             actor = int(info.actor)
+            moot = _betting_moot(info.raw_obs, actor)
+            if actor == h.hero_seat and not moot:
+                break
+            street = int(info.raw_obs["street"])
             to_call_pre = _to_call_chips(info.raw_obs, actor)
+            if moot:
+                # All-in runout: no live opponent can respond, so check
+                # is the only meaningful action. Auto-check (hero
+                # included) rather than asking/sampling; no model RNG
+                # is consumed, so behavior stays a pure function of the
+                # action prefix.
+                gate, chips = GATE_CHECK_CALL, 0
+            else:
+                # Re-seed per node: opponent behavior is a pure function
+                # of the action prefix (see module docstring).
+                torch.manual_seed(self._opp_seed(h))
+                gate, chips = self._policy(h.last_obs, info.actor, info)
             obs, rewards, done, info2 = h.env.step_hybrid(gate, chips)
             entry = {"seat": actor, "gate": int(gate), "chips": int(chips),
                      "street": street}
@@ -1391,6 +1405,34 @@ def _to_call_chips(obs: dict[str, Any], actor: int) -> int:
     stack = int(obs["stacks"][actor])
     bet_to_call = int(obs["bet_to_call"])
     return min(max(0, bet_to_call - current_commit), stack)
+
+
+# A stack at or below this is "dust": chips that can neither make nor
+# meaningfully call a bet (0.001bb — fractions of a cent at any real
+# chip scale). A seat that called off all but a few chips is treated
+# like an all-in seat; without this, an exact-ish all-in call leaves
+# the engine walking betting rounds where the only available bet is
+# the opponent's sub-cent remainder ("Bet $0.00" in the UI).
+_DUST_CHIPS = max(1, BB_CHIPS // 1000)
+
+
+def _betting_moot(obs: dict[str, Any], actor: int) -> bool:
+    """True when the actor has no real betting decision: at most dust
+    to call, and every other live seat is all-in or down to dust, so
+    no meaningful bet could ever be made or called. The engine still
+    asks for an action on each remaining street; `_advance` auto
+    check/calls through these nodes so an all-in hand runs out to
+    showdown instead of stopping on hero."""
+    if _to_call_chips(obs, actor) > _DUST_CHIPS:
+        return False
+    folded = obs["folded"]
+    all_in = obs["all_in"]
+    stacks = obs["stacks"]
+    return all(
+        bool(folded[s]) or bool(all_in[s]) or int(stacks[s]) <= _DUST_CHIPS
+        for s in range(len(folded))
+        if s != actor
+    )
 
 
 def _action_label(gate: int, chips: int, to_call: int) -> str:

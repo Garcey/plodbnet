@@ -301,3 +301,149 @@ def test_router_endpoints(trainer_factory, tmp_path, monkeypatch):
     assert client.post(
         "/trainer/stats/reset", json={"scope": "lifetime"}
     ).status_code == 200
+
+
+# --- moot-node auto-check (all-in runout) ----------------------------------------
+
+
+def test_betting_moot_helper():
+    from plo5bp.ui.trainer import _betting_moot
+
+    base = {
+        "bet_to_call": 0,
+        "street_commit": [0, 0, 0],
+        "stacks": [50_000, 0, 0],
+        "folded": [False, True, False],
+        "all_in": [False, False, True],
+    }
+    # Hero covered, sole live opponent all-in, nothing to call -> moot.
+    assert _betting_moot(base, 0)
+    # Facing a bet -> a real call/fold decision, never moot.
+    facing = {**base, "bet_to_call": 5_000}
+    assert not _betting_moot(facing, 0)
+    # A live opponent with chips behind -> betting is real.
+    live_opp = {**base, "folded": [False, False, False],
+                "all_in": [False, False, True],
+                "stacks": [50_000, 30_000, 0]}
+    assert not _betting_moot(live_opp, 0)
+    # A live opponent reduced to dust (sub-cent call remainder) is
+    # effectively all-in even though the engine flag is unset.
+    dust_opp = {**base, "folded": [False, True, False],
+                "all_in": [False, False, False],
+                "stacks": [50_000, 0, 7]}
+    assert _betting_moot(dust_opp, 0)
+    # Dust to call is likewise not a real decision.
+    dust_call = {**dust_opp, "bet_to_call": 5}
+    assert _betting_moot(dust_call, 0)
+
+
+def test_allin_hand_runs_out_without_hero_moot_nodes(trainer_factory):
+    """Once every non-hero live seat is all-in and there is nothing to
+    call, the hand must auto-run to showdown — hero is never asked to
+    act at a moot node (the pre-fix symptom: check/bet-0 on the river
+    of a turn all-in). Opponent policy is scripted to always shove so
+    the covered-call runout occurs deterministically."""
+    from plo5bp.actions import GATE_CHECK_CALL, GATE_RAISE
+    from plo5bp.ui.trainer import _betting_moot
+
+    saw_covered_allin = False
+    for seed in range(20):
+        # Random unequal stacks: with fixed (equal) stacks a called
+        # shove puts hero all-in too and the covered case can't occur.
+        ts = trainer_factory(rng_seed=seed, stats_name=f"s{seed}.json",
+                             seats_mode="fixed", seats_fixed=2, mc_rollouts=0,
+                             stacks_mode="random", stack_min_bb=10.0,
+                             stack_max_bb=100.0)
+
+        def shover(obs, actor, info):
+            if bool(info.gate_mask[GATE_RAISE]):
+                return GATE_RAISE, int(info.max_raise_chips)
+            return GATE_CHECK_CALL, 0
+
+        ts._policy = shover
+        ts.new_hand()
+        steps = 0
+        while ts.hand is not None and not ts.hand.terminal and steps < 40:
+            info = ts.hand.last_info
+            assert info is not None and info.actor == ts.hand.hero_seat
+            # Whenever the trainer stops on hero, the node must be real.
+            assert not _betting_moot(info.raw_obs, ts.hand.hero_seat), (
+                f"seed {seed}: trainer stopped on hero at a moot node"
+            )
+            s = ts.project_state()
+            if s["legal"]["check_call"]:
+                ts.act("check_call", None)  # call the shove, covered or not
+            else:
+                ts.act("raise", s["raise_bounds"]["min_chips"])
+            steps += 1
+        assert ts.hand is not None and ts.hand.terminal
+        # Track whether the scenario under test actually occurred:
+        # an opponent all-in with hero finishing with chips behind.
+        raw = ts.hand.last_info.raw_obs if ts.hand.last_info else None
+        if raw is not None:
+            hero = ts.hand.hero_seat
+            others_allin = any(
+                bool(raw["all_in"][s_]) and not bool(raw["folded"][s_])
+                for s_ in range(len(raw["all_in"])) if s_ != hero
+            )
+            if others_allin and int(raw["stacks"][hero]) > 0:
+                saw_covered_allin = True
+    assert saw_covered_allin, (
+        "no covered-all-in runout occurred in 20 seeds; scripted shover "
+        "should make this deterministic — investigate"
+    )
+
+
+def test_dust_caller_runs_out_without_hero_nodes(trainer_factory):
+    """The reported bug shape: an opponent calls a covering bet but is
+    left with dust (sub-cent remainder), so the engine's all_in flag
+    stays False and it keeps walking betting rounds where hero's only
+    option is check / bet-the-dust. The trainer must auto-run these
+    streets instead of stopping on hero."""
+    from plo5bp.actions import GATE_CHECK_CALL
+    from plo5bp.ui.trainer import _DUST_CHIPS, _betting_moot
+
+    per_seat = [(100.0, 100.0), (5.0004, 5.0004)] + [(20.0, 20.0)] * 4
+    for seed in range(30):
+        ts = trainer_factory(rng_seed=seed, stats_name=f"d{seed}.json",
+                             seats_mode="fixed", seats_fixed=2, mc_rollouts=0,
+                             stacks_mode="per_seat",
+                             stacks_per_seat_bb=per_seat)
+        ts._policy = lambda obs, actor, info: (GATE_CHECK_CALL, 0)
+        ts.new_hand()
+        h = ts.hand
+        if h.hero_seat != 0:
+            continue  # need hero on the deep stack; opponent is seat 1
+        opp = 1
+        steps = 0
+        while not h.terminal and steps < 12:
+            info = h.last_info
+            assert info is not None and info.actor == h.hero_seat
+            assert not _betting_moot(info.raw_obs, h.hero_seat), (
+                f"seed {seed}: stopped on hero at a moot (dust) node"
+            )
+            raw = info.raw_obs
+            opp_stack = int(raw["stacks"][opp])
+            s = ts.project_state()
+            lo = s["raise_bounds"]["min_chips"]
+            hi = s["raise_bounds"]["max_chips"]
+            target = opp_stack - 4  # leave the caller 4 chips of dust
+            if s["legal"]["raise"] and lo <= target <= hi and opp_stack > _DUST_CHIPS:
+                ts.act("raise", target)
+            else:
+                ts.act("check_call", None)
+            steps += 1
+        assert h.terminal, f"seed {seed}: hand did not finish"
+        raw = h.last_info.raw_obs
+        # The scenario must have actually occurred: opponent live, not
+        # engine-flagged all-in, holding only dust.
+        assert not bool(raw["folded"][opp])
+        assert 0 < int(raw["stacks"][opp]) <= _DUST_CHIPS
+        assert not bool(raw["all_in"][opp])
+        # Hero made exactly one real decision (the covering bet); the
+        # turn/river check nodes were auto-run.
+        assert len(h.decisions) == 1, (
+            f"seed {seed}: hero was drilled on {len(h.decisions)} decisions"
+        )
+        return
+    raise AssertionError("hero never landed on the deep seat in 30 seeds")
