@@ -89,3 +89,34 @@ def test_kl_anchor_flag_on() -> None:
         for b, p in zip(ref_before, trainer._ref.parameters())
     )
     assert moved
+
+def test_kl_guard_trips_and_skips_step() -> None:
+    # Corrupt the stored log-probs so the very first minibatch shows a
+    # huge approx_kl: the guard must abort before any optimizer step,
+    # leaving the model untouched.
+    trainer, batch, rng = _setup(critic_hidden_dim=64, critic_num_blocks=1)
+    batch.log_probs.add_(10.0)  # kl = mean(stored - current) ≈ +10
+    params_before = [p.clone() for p in trainer.model.parameters()]
+    stats = trainer.update(batch, rng)
+    assert stats.kl_stopped_at == 0, stats
+    assert stats.kl_stop > 0.5, stats
+    unchanged = all(
+        torch.equal(b, p)
+        for b, p in zip(params_before, trainer.model.parameters())
+    )
+    assert unchanged, "guard tripped but an optimizer step was applied"
+
+
+def test_kl_guard_disabled_lets_update_through() -> None:
+    trainer, batch, rng = _setup(
+        critic_hidden_dim=64, critic_num_blocks=1, target_kl=0.0
+    )
+    batch.log_probs.add_(10.0)
+    params_before = [p.clone() for p in trainer.model.parameters()]
+    stats = trainer.update(batch, rng)
+    assert stats.kl_stopped_at == -1, stats
+    moved = any(
+        not torch.equal(b, p)
+        for b, p in zip(params_before, trainer.model.parameters())
+    )
+    assert moved, "update should proceed when the guard is off"

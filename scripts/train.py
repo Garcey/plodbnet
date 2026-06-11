@@ -534,6 +534,17 @@ def main() -> None:
         "weights and ramps in over ~1/(1-ema) updates.",
     )
     parser.add_argument(
+        "--target-kl",
+        type=float,
+        default=0.5,
+        help="KL guard: abort the PPO inner loop (skip the pending "
+        "optimizer step and all remaining minibatches/epochs) when a "
+        "minibatch's |approx_kl| exceeds this. 0 disables. Insurance "
+        "against runaway updates (vTwo2 collapsed at update 173 with "
+        "approx_kl ~ +2417); normal updates sit well under 0.1, so 0.5 "
+        "only trips on genuine blow-ups.",
+    )
+    parser.add_argument(
         "--kl-anchor-ema",
         type=float,
         default=0.999,
@@ -655,6 +666,7 @@ def main() -> None:
         critic_num_blocks=args.critic_num_blocks,
         kl_anchor_coef=args.kl_anchor_coef,
         kl_anchor_ema=args.kl_anchor_ema,
+        target_kl=args.target_kl,
         device=args.device,
     )
 
@@ -974,6 +986,10 @@ def main() -> None:
                 f"{stats.beta_entropy:.2f}  "
                 f"kl={stats.approx_kl:+.4f}  "
                 + (f"klA={stats.kl_anchor:.4f}  " if args.kl_anchor_coef > 0 else "")
+                + (
+                    f"KLSTOP@mb{stats.kl_stopped_at}(kl={stats.kl_stop:+.2f})  "
+                    if stats.kl_stopped_at >= 0 else ""
+                )
                 +
                 f"bonus={bonus_mean:+.4f}  "
                 f"bonus%(F/T/R)={bonus_pct_flop:4.1f}/{bonus_pct_turn:4.1f}/"

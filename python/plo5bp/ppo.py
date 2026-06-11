@@ -44,6 +44,12 @@ class PPOStats:
     gate_entropy: float = 0.0
     anchor_entropy: float = 0.0
     beta_entropy: float = 0.0
+    # KL guard: minibatch index (0-based, across epochs) whose
+    # |approx_kl| exceeded target_kl, aborting the inner loop before
+    # its optimizer step. -1 = guard never tripped. `kl_stop` is the
+    # offending value (excluded from the approx_kl average).
+    kl_stopped_at: int = -1
+    kl_stop: float = 0.0
 
 
 def _kl_to_reference(
@@ -124,6 +130,8 @@ class PPOTrainer:
         # KL-to-EMA reference: zero overhead unless the flag is on.
         self.kl_anchor_coef = float(getattr(config, "kl_anchor_coef", 0.0))
         self.kl_anchor_ema = float(getattr(config, "kl_anchor_ema", 0.999))
+        # KL guard threshold (0 = off); see TrainingConfig.target_kl.
+        self.target_kl = float(getattr(config, "target_kl", 0.0))
         self._ref: ActorCritic | None = None
         if self.kl_anchor_coef > 0.0:
             self._ref = copy.deepcopy(model).eval()
@@ -175,8 +183,12 @@ class PPOTrainer:
         total_anchor_h = torch.zeros((), device=device)
         total_beta_h = torch.zeros((), device=device)
         count = 0
+        kl_stopped_at = -1
+        kl_stop_val = 0.0
         with record_function("step12/inner_loop"):
             for _ in range(cfg.ppo_epochs):
+                if kl_stopped_at >= 0:
+                    break
                 for mb in iter_minibatches(batch, cfg.batch_size, rng):
                     with torch.autocast(
                         device_type="cuda",
@@ -257,16 +269,29 @@ class PPOTrainer:
                             )
                             loss = loss + self.kl_anchor_coef * kl_anchor_term
 
+                    with record_function("step12e/kl"):
+                        with torch.no_grad():
+                            kl = (mb.log_probs - log_prob).mean()
+
+                    # KL guard: checked BEFORE the optimizer step so a
+                    # runaway minibatch is skipped, not applied. The
+                    # .item() forces a per-minibatch device sync, which
+                    # the accumulators below deliberately avoid — but it
+                    # is the price of being able to abort in time, and
+                    # is negligible against multi-minute updates.
+                    if self.target_kl > 0.0:
+                        kl_now = float(kl.item())
+                        if abs(kl_now) > self.target_kl:
+                            kl_stopped_at = count
+                            kl_stop_val = kl_now
+                            break
+
                     with record_function("step12c/backward"):
                         self.optimizer.zero_grad()
                         loss.backward()
                     with record_function("step12d/optimizer_step"):
                         nn.utils.clip_grad_norm_(self._all_params, 0.5)
                         self.optimizer.step()
-
-                    with record_function("step12e/kl"):
-                        with torch.no_grad():
-                            kl = (mb.log_probs - log_prob).mean()
                     total_policy += policy_loss.detach().float()
                     total_value += value_loss.detach().float()
                     total_display += display_loss.detach().float()
@@ -290,4 +315,6 @@ class PPOTrainer:
                 gate_entropy=float(total_gate_h.item()) / denom,
                 anchor_entropy=float(total_anchor_h.item()) / denom,
                 beta_entropy=float(total_beta_h.item()) / denom,
+                kl_stopped_at=kl_stopped_at,
+                kl_stop=kl_stop_val,
             )

@@ -15,12 +15,17 @@
 # 'scripts/train.py' in pgrep — run ONE watchdog family per pod.
 # Stop the v1 family first:  touch runs/watchdog_auto.stop
 #
-# Entropy coefs seed at v1's COLD-START values (0.09/0.12/0.15) — not
-# the annealed floors v1 later earned. The anneal only walks down, so
-# err high: a 0.02 cold start collapsed gate entropy within 10 updates
-# (2026-06-10 bake-off). Anneal decisions begin after
-# --anneal-start-update updates; live-tune step / tier coefs via
+# Entropy coefs seed at 0.10/0.12/0.18 (raised from v1's cold-start
+# 0.09/0.12/0.15 on 2026-06-11: the v2 anchor head over deep-stack
+# double-board PLO5 is a harder exploration problem; the anneal only
+# walks down, so err high — a 0.02 cold start collapsed gate entropy
+# within 10 updates, 2026-06-10 bake-off). Anneal decisions begin
+# after --anneal-start-update updates; live-tune step / tier coefs via
 # runs/anneal_control.json without pausing training.
+#
+# --target-kl 0.5 is the KL guard: vTwo2 died at update 173 when one
+# update hit approx_kl ≈ +2417 and collapsed entropy to 0. The guard
+# aborts the PPO inner loop before the runaway step is applied.
 set -uo pipefail
 cd /workspace/plodbnet
 
@@ -79,8 +84,9 @@ setsid nohup .venv/bin/python -u scripts/train.py \
   --num-envs 49134 \
   --rollout-length 7833600 \
   --num-minibatches 48 \
-  --block-rotation 'clubgg:0.09,clubgg_deep:0.12,deep:0.15' \
+  --block-rotation 'clubgg:0.1,clubgg_deep:0.12,deep:0.18' \
   --block-size 50 \
+  --target-kl 0.5 \
   --anneal-entropy \
   --anneal-step 0.002 \
   --anneal-floor 0.0 \

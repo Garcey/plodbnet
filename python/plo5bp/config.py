@@ -89,4 +89,13 @@ class TrainingConfig:
     kl_anchor_coef: float = 0.0
     kl_anchor_ema: float = 0.999
 
+    # KL guard: stop the PPO inner loop (skip the pending optimizer step
+    # and all remaining minibatches/epochs) when |approx_kl| on a
+    # minibatch exceeds this. 0.0 = off. Insurance against runaway
+    # updates: vTwo2 died at update 173 when a single update reached
+    # approx_kl ≈ +2417 and collapsed entropy to 0 (2026-06-11). The v2
+    # discrete anchor head has much heavier-tailed importance ratios
+    # than v1's continuous Beta, so v1 never needed this.
+    target_kl: float = 0.5
+
     device: str = "cpu"

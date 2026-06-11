@@ -80,10 +80,17 @@ v2 specifics:
   actor keeps its own observation-only value head for the UI display.
 - Log line: `v` is the critic loss, `vd` the display-head loss, and
   `Hg/Ha/Hb` decompose entropy into gate/anchor/beta.
-- Entropy coefs seed at v1's COLD-START values
-  (clubgg:0.09/clubgg_deep:0.12/deep:0.15) — NOT the annealed floors
-  v1 later earned. The anneal only walks down, so err high: a 0.02
-  cold start collapsed gate entropy within 10 updates (2026-06-10).
+- Entropy coefs seed at clubgg:0.10/clubgg_deep:0.12/deep:0.18
+  (raised 2026-06-11 from v1's cold-start values; the v2 anchor head
+  is a harder exploration problem) — NOT the annealed floors v1 later
+  earned. The anneal only walks down, so err high: a 0.02 cold start
+  collapsed gate entropy within 10 updates (2026-06-10).
+- `--target-kl` (default 0.5) is the KL guard: aborts the PPO inner
+  loop before the optimizer step when a minibatch's |approx_kl|
+  exceeds it (logged as `KLSTOP@mbN`). vTwo2 collapsed at update 173
+  (approx_kl ≈ +2417 → entropy pinned at 0) without it; the v2
+  discrete anchor head has heavier-tailed importance ratios than v1's
+  continuous Beta, which is why v1 never needed this. 0 disables.
 - Anneal: no decisions (no baselines, no lowering) until
   `--anneal-start-update` (default 600) updates; tolerance default 1.0
   (30/30/30→29/29/29 still lowers — absorbs seat/stack block variance).
