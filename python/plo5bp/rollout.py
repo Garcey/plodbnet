@@ -857,14 +857,13 @@ def collect_rollout_batched(
     # Slack for learner steps written after `wcursor` last crossed the
     # rollout target (in-flight, unflushed hands). This is a per-env
     # STATISTICAL bound (~avg hand length, a handful of steps), NOT the
-    # per-seat capacity above — scaling it with MAX_STEPS_PER_SEAT=192
-    # ballooned the obs pool + output slabs from ~75GB to ~160GB at 49k
-    # envs and blew the pod's 146GB cgroup memory.max (reclaim thrash,
-    # ~7x wall-clock, 2026-06-11; `free` shows HOST memory inside a
-    # container — check /sys/fs/cgroup/memory.max). 32 steps/env of
-    # slack is ~50x the observed need; the explicit guards below turn
-    # the impossible overflow into a clean error instead of a silent
-    # shape mismatch.
+    # per-seat capacity above — there is no reason for it to scale with
+    # MAX_STEPS_PER_SEAT. Note the cost of oversizing is only VIRTUAL
+    # address space (np.empty pages materialize on first write and the
+    # slack tail is mostly never written), but keeping the bound honest
+    # documents the actual requirement, and the explicit guards below
+    # turn a (near-impossible) overflow into a clean error instead of a
+    # silent numpy shape mismatch. 32 steps/env is ~50x observed need.
     POOL_SLACK_PER_ENV = 32
     pool_cap = rollout_target + n_envs * POOL_SLACK_PER_ENV
     step_obs_pool = np.empty((pool_cap, OBS_DIM), dtype=np.float32)
@@ -1184,12 +1183,11 @@ def collect_rollout_batched(
             #
             # L bounds every flush temporary by the longest trajectory
             # actually present in this flush (typically 8-16 actions),
-            # NOT the MAX_STEPS_PER_SEAT capacity. With MAX=192 and
+            # NOT the MAX_STEPS_PER_SEAT capacity — with MAX=192 and
             # thousands of terminals per step, (T, S, MAX) temporaries
-            # cost ~GBs of traffic per step and dominated the rollout
-            # (~7x wall-clock, observed on vTwo2 2026-06-11). Slots in
-            # [L, MAX) are inactive by construction, so the output is
-            # bit-identical.
+            # would cost ~GBs of allocation/zeroing traffic per flush
+            # for slots that are empty by construction. Slots in
+            # [L, MAX) are inactive, so the output is bit-identical.
             term_envs = np.nonzero(newly_terminal)[0]
             T = int(term_envs.size)
             if T:
