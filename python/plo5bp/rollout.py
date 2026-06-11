@@ -1157,23 +1157,32 @@ def collect_rollout_batched(
             # Vectorized terminal flush: process every newly-terminal env
             # in one numpy block. Replaces the per-(env, seat, t) Python
             # walk that built tuple lists for `_apply_retroactive_bonus`
-            # and `_flush_trajectory`. Net work: one (T, S, MAX) bonus
-            # mask + a 32-step backward GAE scan vectorized over T*S +
+            # and `_flush_trajectory`. Net work: one (T, S, L) bonus
+            # mask + an L-step backward GAE scan vectorized over T*S +
             # one np.take per output slab.
+            #
+            # L bounds every flush temporary by the longest trajectory
+            # actually present in this flush (typically 8-16 actions),
+            # NOT the MAX_STEPS_PER_SEAT capacity. With MAX=192 and
+            # thousands of terminals per step, (T, S, MAX) temporaries
+            # cost ~GBs of traffic per step and dominated the rollout
+            # (~7x wall-clock, observed on vTwo2 2026-06-11). Slots in
+            # [L, MAX) are inactive by construction, so the output is
+            # bit-identical.
             term_envs = np.nonzero(newly_terminal)[0]
             T = int(term_envs.size)
             if T:
-                MAX = MAX_STEPS_PER_SEAT
                 S = n_seats
                 lengths = traj_lengths[term_envs]                       # (T, S)
                 flush_mask = learner_seats_mask[term_envs] & (lengths > 0)  # (T, S)
-                t_idx = np.arange(MAX, dtype=np.int32)
+                L = int(lengths.max())
+                t_idx = np.arange(L, dtype=np.int32)
                 active_step = (
                     (t_idx[None, None, :] < lengths[..., None])
                     & flush_mask[..., None]
-                )  # (T, S, MAX)
+                )  # (T, S, L)
 
-                # Retroactive bonus (vectorized over (T, S, MAX)).
+                # Retroactive bonus (vectorized over (T, S, L)).
                 with record_function("step9b/retroactive_bonus"):
                     payout_chips = np.rint(won_f32[term_envs]).astype(np.int64)  # (T, S)
                     total_pot_chips = post_total_commit[term_envs].astype(np.int64).sum(axis=1)  # (T,)
@@ -1183,10 +1192,12 @@ def collect_rollout_batched(
                     )  # (T, S)
                     share_gt = two_pay > total_pot_chips[:, None]            # (T, S)
 
-                    gates_t = traj_gate[term_envs]                           # (T, S, MAX)
-                    costs_t = costs_arr[term_envs].copy()                    # (T, S, MAX)
-                    pots_t = pots_arr[term_envs]                             # (T, S, MAX)
-                    streets_t = streets_arr[term_envs]                       # (T, S, MAX)
+                    # Mixed fancy+basic indexing copies only the [:L]
+                    # region — never materialize (T, S, MAX).
+                    gates_t = traj_gate[term_envs, :, :L]                    # (T, S, L)
+                    costs_t = costs_arr[term_envs, :, :L]                    # (T, S, L) copy
+                    pots_t = pots_arr[term_envs, :, :L]                      # (T, S, L)
+                    streets_t = streets_arr[term_envs, :, :L]                # (T, S, L)
 
                     is_raise = (gates_t == GATE_RAISE)
                     is_call_with_chips = (gates_t == GATE_CHECK_CALL) & (costs_t < 0.0)
@@ -1212,25 +1223,22 @@ def collect_rollout_batched(
 
                 # GAE backward scan vectorized over (T, S).
                 with record_function("step9c/gae_scan"):
-                    vals_t = traj_value[term_envs]                           # (T, S, MAX)
+                    vals_t = traj_value[term_envs, :, :L]                    # (T, S, L)
                     won_bb = won_f32[term_envs].astype(np.float32) * np.float32(reward_norm)
                     last_gae = np.zeros((T, S), dtype=np.float32)
-                    advs_t = np.zeros((T, S, MAX), dtype=np.float32)
+                    advs_t = np.zeros((T, S, L), dtype=np.float32)
                     last_t_arr = (lengths.astype(np.int32) - 1)              # (T, S)
                     gamma_f = np.float32(gamma)
                     lam_f = np.float32(lam)
-                    # Slots beyond the longest trajectory stay zero: advs_t is
-                    # zero-initialized and `is_last`/`active_tm` are all-False
-                    # there, so those iterations are no-ops for both last_gae
-                    # and advs_t. Bounding the scan to the max trajectory
-                    # length is bit-identical to scanning all MAX slots, but
-                    # skips the empty tail on every flush.
-                    max_len = int(lengths.max()) if lengths.size else 0
-                    for t in range(max_len - 1, -1, -1):
+                    # L is the longest trajectory in this flush; slots in
+                    # [length, L) are inactive (`is_last`/`active_tm`
+                    # all-False), so the scan is bit-identical to one
+                    # over the full MAX capacity.
+                    for t in range(L - 1, -1, -1):
                         is_last = (t == last_t_arr) & flush_mask
                         active_tm = (t <= last_t_arr) & flush_mask
                         reward_t = costs_t[..., t] + np.where(is_last, won_bb, np.float32(0.0))
-                        if t + 1 < MAX:
+                        if t + 1 < L:
                             next_v = np.where(is_last, np.float32(0.0), vals_t[..., t + 1])
                         else:
                             next_v = np.zeros((T, S), dtype=np.float32)
@@ -1240,29 +1248,29 @@ def collect_rollout_batched(
                         advs_t[..., t] = np.where(active_tm, last_gae, np.float32(0.0))
                     rets_t = advs_t + vals_t
 
-                # Gather the (T, S, MAX) → (n_new,) flat slab and copy
+                # Gather the (T, S, L) → (n_new,) flat slab and copy
                 # into the preallocated output arrays at `wcursor`.
                 with record_function("step9d/slab_copies"):
                     flat = active_step.ravel()
                     n_new = int(flat.sum())
                     if n_new:
                         sel = np.nonzero(flat)[0]
-                        obs_idx = traj_obs_idx[term_envs].ravel()[sel]
+                        obs_idx = traj_obs_idx[term_envs, :, :L].ravel()[sel]
                         end = wcursor + n_new
                         np.take(step_obs_pool, obs_idx, axis=0, out=all_obs_arr[wcursor:end])
                         np.take(step_gm_pool, obs_idx, axis=0, out=all_gm_arr[wcursor:end])
-                        all_ga_arr[wcursor:end] = traj_gate[term_envs].ravel()[sel].astype(np.int64)
-                        all_rc_arr[wcursor:end] = traj_chips[term_envs].ravel()[sel]
+                        all_ga_arr[wcursor:end] = traj_gate[term_envs, :, :L].ravel()[sel].astype(np.int64)
+                        all_rc_arr[wcursor:end] = traj_chips[term_envs, :, :L].ravel()[sel]
                         all_sz_arr[wcursor:end] = (
-                            traj_sizing[term_envs].reshape(-1, 4)[sel]
+                            traj_sizing[term_envs, :, :L].reshape(-1, 4)[sel]
                         )
                         all_an_arr[wcursor:end] = (
-                            traj_anchor[term_envs].ravel()[sel].astype(np.int64)
+                            traj_anchor[term_envs, :, :L].ravel()[sel].astype(np.int64)
                         )
-                        all_ru_arr[wcursor:end] = traj_u[term_envs].ravel()[sel]
+                        all_ru_arr[wcursor:end] = traj_u[term_envs, :, :L].ravel()[sel]
                         # Rotated opp holes are constant per (env, seat) per
                         # hand: build one (T, S, 5, 5) block from the hand's
-                        # hole cache and index it by sel // MAX.
+                        # hole cache and index it by sel // L.
                         seat_ids = np.arange(S)
                         j5 = np.arange(5)
                         rot_seats = (seat_ids[:, None] + 1 + j5[None, :]) % S
@@ -1272,11 +1280,11 @@ def collect_rollout_batched(
                             rot_block = np.where(
                                 invalid[None, None, :, None], np.uint8(255), rot_block
                             )
-                        ts_idx = sel // MAX
+                        ts_idx = sel // L
                         all_oh_arr[wcursor:end] = (
                             rot_block.reshape(T * S, 5, 5)[ts_idx]
                         )
-                        all_lp_arr[wcursor:end] = traj_log_p[term_envs].ravel()[sel]
+                        all_lp_arr[wcursor:end] = traj_log_p[term_envs, :, :L].ravel()[sel]
                         all_v_arr[wcursor:end] = vals_t.ravel()[sel]
                         all_ret_arr[wcursor:end] = rets_t.ravel()[sel]
                         all_adv_arr[wcursor:end] = advs_t.ravel()[sel]
