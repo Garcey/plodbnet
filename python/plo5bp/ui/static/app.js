@@ -984,22 +984,11 @@ function distRowsHTML(dist, callName) {
 
 const ANCHOR_AXIS_LABELS = ["min", "10", "20", "30", "40", "50", "60", "70", "80", "90", "pot"];
 
-function anchorHeatColor(t) {
-  // t = prob / max-prob in [0,1]. Single-hue intensity ramp: every
-  // cell is the same amber and only brightness carries the
-  // preference — dim = rarely bet, bright = favorite size. (A
-  // blue→orange hue sweep passes through green midway, which reads
-  // as a third category instead of "medium".)
-  const c0 = [38, 42, 54];   // near-background slate
-  const c1 = [255, 158, 42]; // hot amber
-  const ch = c0.map((v, i) => Math.round(v + (c1[i] - v) * t));
-  return `rgb(${ch[0]}, ${ch[1]}, ${ch[2]})`;
-}
-
 function anchorHeatmapHTML(anchors, recAnchor, userAnchor, s) {
-  // v2 sizing heatmap: one strip spanning min → pot, one cell per
-  // anchor, color-scaled by the network's preference. ★ = network's
-  // pick; ring + ● = the anchor the user's size snapped to (review).
+  // v2 sizing EQ: one column per anchor spanning min → pot, like a
+  // stereo equalizer — bar height carries the network's preference
+  // (more bulk = more bet at that size). ★ = network's pick; ring +
+  // ● = the anchor the user's size snapped to (review).
   const byK = new Map((anchors || []).map((a) => [a.k, a]));
   const pmax = Math.max(1e-9, ...(anchors || []).map((a) => a.prob));
   let cells = "";
@@ -1008,17 +997,25 @@ function anchorHeatmapHTML(anchors, recAnchor, userAnchor, s) {
     const a = byK.get(k);
     if (a) {
       const isUser = userAnchor !== null && userAnchor !== undefined && k === userAnchor;
-      const marks = `${k === recAnchor ? "★" : ""}${isUser ? "●" : ""}`;
+      const isRec = k === recAnchor;
+      const marks = `${isRec ? "★" : ""}${isUser ? "●" : ""}`;
       const tip = `${a.label} pot — ${(a.prob * 100).toFixed(0)}% — ${formatUnit(a.chips, s)}`;
-      cells += `<div class="anchor-heat-cell${isUser ? " is-user" : ""}" style="background:${anchorHeatColor(a.prob / pmax)}" title="${tip}">${marks}</div>`;
+      // Floor nonzero bars at 6% so a rarely-used size still shows a
+      // sliver instead of reading as illegal.
+      const hpct = Math.max(6, 100 * a.prob / pmax);
+      cells += `
+        <div class="anchor-eq-cell${isUser ? " is-user" : ""}${isRec ? " is-rec" : ""}" title="${tip}">
+          <div class="anchor-eq-bar" style="height:${hpct.toFixed(1)}%"></div>
+          <span class="anchor-eq-marks">${marks}</span>
+        </div>`;
     } else {
-      cells += `<div class="anchor-heat-cell dead" title="${ANCHOR_AXIS_LABELS[k]} — not a distinct legal size here"></div>`;
+      cells += `<div class="anchor-eq-cell dead" title="${ANCHOR_AXIS_LABELS[k]} — not a distinct legal size here"></div>`;
     }
     labels += `<span>${ANCHOR_AXIS_LABELS[k]}</span>`;
   }
   return `
     <div class="anchor-heat">
-      <div class="anchor-heat-row">${cells}</div>
+      <div class="anchor-eq-row">${cells}</div>
       <div class="anchor-heat-labels">${labels}</div>
     </div>`;
 }
