@@ -120,3 +120,54 @@ def test_kl_guard_disabled_lets_update_through() -> None:
         for b, p in zip(params_before, trainer.model.parameters())
     )
     assert moved, "update should proceed when the guard is off"
+
+
+def test_entropy_bonus_gate_gradient_is_pure_gate_entropy() -> None:
+    # The entropy bonus must not pay the gate head for shifting mass
+    # onto Raise: the anchor head's ~2.4 nats made the joint-entropy
+    # gradient anti-fold and drove fold to ~5e-5 everywhere within 5
+    # updates (vTwo1 2026-06-11). With p_raise detached, the entropy's
+    # gradient w.r.t. the gate head must equal the gradient of pure
+    # gate entropy — the conditional sizing term contributes nothing
+    # through the gate.
+    trainer, batch, rng = _setup(critic_hidden_dim=64, critic_num_blocks=1)
+    model = trainer.model
+    n = min(256, batch.obs.shape[0])
+    args = (
+        batch.obs[:n], batch.gate_masks[:n], batch.sizing[:n],
+        batch.gate_actions[:n], batch.anchor_actions[:n],
+        batch.refine_u[:n],
+    )
+    _, entropy, _, gate_h, _, _ = model.evaluate(*args)
+    g_total = torch.autograd.grad(
+        entropy.sum(), model.gate_head.weight, retain_graph=True
+    )[0]
+    g_gate = torch.autograd.grad(gate_h.sum(), model.gate_head.weight)[0]
+    assert torch.allclose(g_total, g_gate, atol=1e-6), (
+        "entropy bonus leaks non-gate-entropy gradient into the gate head "
+        f"(max delta {(g_total - g_gate).abs().max().item():.3e})"
+    )
+
+
+def test_display_value_head_detached_from_torso() -> None:
+    # v2's display value head regresses raw-bb returns (hundreds of bb);
+    # trained through the shared torso its gradients dwarf the policy
+    # gradient. It must read a detached torso: gradient flows to the
+    # head itself, never to torso parameters.
+    trainer, batch, rng = _setup(critic_hidden_dim=64, critic_num_blocks=1)
+    model = trainer.model
+    n = min(64, batch.obs.shape[0])
+    _, _, value, _, _, _ = model.evaluate(
+        batch.obs[:n], batch.gate_masks[:n], batch.sizing[:n],
+        batch.gate_actions[:n], batch.anchor_actions[:n],
+        batch.refine_u[:n],
+    )
+    loss = value.pow(2).sum()
+    torso_params = list(model.torso.parameters())
+    grads = torch.autograd.grad(
+        loss, torso_params + [model.value_head.weight], allow_unused=True
+    )
+    assert grads[-1] is not None and grads[-1].abs().sum() > 0
+    assert all(g is None for g in grads[:-1]), (
+        "display value loss reaches torso parameters"
+    )

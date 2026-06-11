@@ -299,14 +299,25 @@ class ActorCriticV2(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return (masked gate logits, raw anchor logits, refine params
         (B, 9, 2), display value). Anchor legality masking happens in
-        act/evaluate where the sizing context is available."""
+        act/evaluate where the sizing context is available.
+
+        The display value head reads a DETACHED torso. In v2 the GAE
+        values come from the CentralCritic; this head exists for the UI
+        display only, but its regression target is raw-bb returns
+        (±100s of bb), so trained through the torso its gradients dwarf
+        the unit-scale policy gradient by orders of magnitude and the
+        torso becomes a value-fitting network with policy heads as
+        passengers (2026-06-11 review). Detaching keeps the head
+        readable without letting it steer the torso. v1's ActorCritic
+        is untouched — there the value head feeds GAE and is
+        load-bearing."""
         z = self.torso(obs)
         gate_logits = self.gate_head(z).masked_fill(~gate_mask, -1e9)
         anchor_logits = self.anchor_head(z)
         refine = F.softplus(self.refine_head(z)).view(
             *z.shape[:-1], _INTERIOR, 2
         ) + 1.0
-        value = self.value_head(z).squeeze(-1)
+        value = self.value_head(z.detach()).squeeze(-1)
         return gate_logits, anchor_logits, refine, value
 
     @staticmethod
@@ -401,6 +412,19 @@ class ActorCriticV2(nn.Module):
         Masked anchors contribute exactly zero. The decomposition terms
         are returned so training can log Hg/Ha/Hb separately (the anchor
         head adds up to log(11) ≈ 2.4 nats vs the v1 entropy scale).
+
+        The P(Raise) weighting is DETACHED from the graph. The joint
+        entropy is mathematically correct with the gradient flowing
+        through p_raise, but as a maximized bonus that gradient pays the
+        GATE head to shift mass onto Raise (the branch holding ~2.4 nats
+        of anchor entropy) — the bonus's own optimum is p_fold ≈ 8%, and
+        combined with early advantage pressure it drove fold to ~5e-5
+        at every node within 5 updates (vTwo1 2026-06-11; four-way code
+        review converged on this line). Detaching makes the gate head
+        feel pure H(gate) pressure while the sizing heads still receive
+        their entropy bonus at the (stop-grad) p_raise weight. v1 had
+        the same form but its conditional Beta entropy is ~0, which is
+        why this never bit before the anchor head existed.
         """
         gate_logits, anchor_logits, refine, value = self.forward(obs, gate_mask)
         grid = anchor_grid_torch(sizing)
@@ -438,7 +462,7 @@ class ActorCriticV2(nn.Module):
             anchor_probs[..., 1:ANCHOR_COUNT - 1] * beta_h * interior_ok
         ).sum(-1)
         anchor_entropy = anchor_dist.entropy()
-        entropy = gate_entropy + p_raise * (anchor_entropy + beta_h_eff)
+        entropy = gate_entropy + p_raise.detach() * (anchor_entropy + beta_h_eff)
         return log_prob, entropy, value, gate_entropy, anchor_entropy, beta_h_eff
 
 
