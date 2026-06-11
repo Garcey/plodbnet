@@ -555,6 +555,25 @@ def main() -> None:
         "the full inner loop run.",
     )
     parser.add_argument(
+        "--kl-rollback",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="On a KL-guard trip, restore params + optimizer state from "
+        "the top of the update — discard the whole update instead of "
+        "keeping the pre-trip minibatches. Near-threshold partial "
+        "updates compounded into the vTwo1 u52-80 collapse (2026-06-11). "
+        "--no-kl-rollback keeps the old truncate-only behavior.",
+    )
+    parser.add_argument(
+        "--adv-clip",
+        type=float,
+        default=8.0,
+        help="Clamp normalized advantages to ±N σ before the PPO loss "
+        "(0 disables). PPO clips the ratio, not the advantage weight; "
+        "deep-stack all-in pots produce 30σ+ samples that carry 30x "
+        "gradient weight and drove the post-block-transition violence.",
+    )
+    parser.add_argument(
         "--target-kl",
         type=float,
         default=0.5,
@@ -688,6 +707,8 @@ def main() -> None:
         kl_anchor_coef=args.kl_anchor_coef,
         kl_anchor_ema=args.kl_anchor_ema,
         target_kl=args.target_kl,
+        kl_rollback=args.kl_rollback,
+        adv_clip=args.adv_clip,
         device=args.device,
     )
 
@@ -1017,7 +1038,8 @@ def main() -> None:
                 f"kl={stats.approx_kl:+.4f}  "
                 + (f"klA={stats.kl_anchor:.4f}  " if args.kl_anchor_coef > 0 else "")
                 + (
-                    f"KLSTOP@mb{stats.kl_stopped_at}(kl={stats.kl_stop:+.2f})  "
+                    f"KLSTOP@mb{stats.kl_stopped_at}(kl={stats.kl_stop:+.2f}"
+                    f"{',RB' if stats.rolled_back else ''})  "
                     if stats.kl_stopped_at >= 0 else ""
                 )
                 +

@@ -94,6 +94,8 @@ setsid nohup .venv/bin/python -u scripts/train.py \
   --block-rotation 'clubgg:0.5,clubgg_deep:0.5,deep:0.5' \
   --block-size 50 \
   --target-kl 0.5 \
+  --kl-rollback \
+  --adv-clip 8 \
   --lr-warmup-updates 75 \
   --anneal-entropy \
   --anneal-step 0.002 \

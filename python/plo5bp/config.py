@@ -98,4 +98,21 @@ class TrainingConfig:
     # than v1's continuous Beta, so v1 never needed this.
     target_kl: float = 0.5
 
+    # On a KL-guard trip, restore the model/critic parameters AND
+    # optimizer state captured at the top of update() — the entire
+    # update is discarded instead of keeping the pre-trip minibatches.
+    # Near-threshold partial updates compound: vTwo1 collapsed over
+    # updates 52-80 (2026-06-11) through repeated trips that each kept
+    # their poisoned prefix. Ignored when target_kl == 0.
+    kl_rollback: bool = True
+
+    # Clamp normalized advantages to ±this many σ before the PPO loss.
+    # 0.0 = off. PPO's clip bounds the importance RATIO, not the
+    # advantage weight, so one fat-tail sample (a 1500bb six-way
+    # all-in pot lands at 30σ+ after unit normalization) carries 30x
+    # gradient weight — deep-stack blocks generate exactly these and
+    # they drove the update-52+ violence. Applied identically in the
+    # serial and batched collectors.
+    adv_clip: float = 8.0
+
     device: str = "cpu"

@@ -308,6 +308,7 @@ def _finalize_batch(
     aggr_bonus_steps: int = 0,
     aggr_steps_total_by_street: tuple[int, int, int] = (0, 0, 0),
     aggr_bonus_steps_by_street: tuple[int, int, int] = (0, 0, 0),
+    adv_clip: float = 0.0,
 ) -> Batch:
     obs_t = torch.from_numpy(np.stack(all_obs, axis=0)).to(device)
     gm_t = torch.from_numpy(np.stack(all_gate_masks, axis=0)).to(device)
@@ -327,6 +328,11 @@ def _finalize_batch(
     adv_mean = adv_t.mean()
     adv_std = adv_t.std().clamp(min=1e-8)
     adv_t = (adv_t - adv_mean) / adv_std
+    if adv_clip > 0.0:
+        # Tame fat tails: PPO's clip bounds the ratio, not the advantage
+        # weight, so a 30σ outlier sample (deep-stack all-in pots) gets
+        # 30x gradient weight. See TrainingConfig.adv_clip.
+        adv_t = adv_t.clamp(-adv_clip, adv_clip)
 
     return Batch(
         obs=obs_t,
@@ -369,6 +375,7 @@ def _finalize_batch_arr(
     aggr_bonus_steps: int = 0,
     aggr_steps_total_by_street: tuple[int, int, int] = (0, 0, 0),
     aggr_bonus_steps_by_street: tuple[int, int, int] = (0, 0, 0),
+    adv_clip: float = 0.0,
 ) -> Batch:
     """Slab-based finalize: each `all_*_arr` is preallocated and written
     contiguously. Slice to `[:wcursor]` and copy once to `device` per
@@ -394,6 +401,9 @@ def _finalize_batch_arr(
         adv_mean = adv_t.mean()
         adv_std = adv_t.std().clamp(min=1e-8)
         adv_t = (adv_t - adv_mean) / adv_std
+        if adv_clip > 0.0:
+            # Same fat-tail clamp as _finalize_batch (serial parity).
+            adv_t = adv_t.clamp(-adv_clip, adv_clip)
 
     return Batch(
         obs=obs_t,
@@ -737,6 +747,7 @@ def collect_rollout(
         aggr_bonus_steps=aggr_bonus_steps,
         aggr_steps_total_by_street=tuple(aggr_steps_total_by_street),
         aggr_bonus_steps_by_street=tuple(aggr_bonus_steps_by_street),
+        adv_clip=float(getattr(train_config, "adv_clip", 0.0)),
     )
 
 
@@ -1358,6 +1369,7 @@ def collect_rollout_batched(
         aggr_bonus_steps=aggr_bonus_steps,
         aggr_steps_total_by_street=tuple(aggr_steps_total_by_street),
         aggr_bonus_steps_by_street=tuple(aggr_bonus_steps_by_street),
+        adv_clip=float(getattr(train_config, "adv_clip", 0.0)),
     )
 
 

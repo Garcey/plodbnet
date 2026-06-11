@@ -50,6 +50,9 @@ class PPOStats:
     # offending value (excluded from the approx_kl average).
     kl_stopped_at: int = -1
     kl_stop: float = 0.0
+    # True when the trip also rolled the update back entirely
+    # (params + optimizer moments restored; see config.kl_rollback).
+    rolled_back: bool = False
 
 
 def _kl_to_reference(
@@ -132,6 +135,10 @@ class PPOTrainer:
         self.kl_anchor_ema = float(getattr(config, "kl_anchor_ema", 0.999))
         # KL guard threshold (0 = off); see TrainingConfig.target_kl.
         self.target_kl = float(getattr(config, "target_kl", 0.0))
+        # On a guard trip, restore params + optimizer state from the
+        # top of update() — discard the whole update, not just the
+        # remainder. See TrainingConfig.kl_rollback.
+        self.kl_rollback = bool(getattr(config, "kl_rollback", False))
         self._ref: ActorCritic | None = None
         if self.kl_anchor_coef > 0.0:
             self._ref = copy.deepcopy(model).eval()
@@ -185,6 +192,20 @@ class PPOTrainer:
         count = 0
         kl_stopped_at = -1
         kl_stop_val = 0.0
+        # Rollback snapshot: param data + Adam moments, cloned on-device
+        # (~3x param memory, copied once per update). Restored verbatim
+        # on a guard trip so near-threshold partial updates can't
+        # compound across updates (the vTwo1 u52-80 collapse mode).
+        snapshot: list[tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]] | None = None
+        if self.target_kl > 0.0 and self.kl_rollback:
+            snapshot = []
+            for p in self._all_params:
+                st = self.optimizer.state.get(p, {})
+                snapshot.append((
+                    p.detach().clone(),
+                    st["exp_avg"].clone() if "exp_avg" in st else None,
+                    st["exp_avg_sq"].clone() if "exp_avg_sq" in st else None,
+                ))
         with record_function("step12/inner_loop"):
             for _ in range(cfg.ppo_epochs):
                 if kl_stopped_at >= 0:
@@ -284,6 +305,29 @@ class PPOTrainer:
                         if abs(kl_now) > self.target_kl:
                             kl_stopped_at = count
                             kl_stop_val = kl_now
+                            if snapshot is not None:
+                                with torch.no_grad():
+                                    for p, (pd, m1, m2) in zip(
+                                        self._all_params, snapshot
+                                    ):
+                                        p.data.copy_(pd)
+                                        st = self.optimizer.state.get(p)
+                                        if st is None or not st:
+                                            continue
+                                        if m1 is None:
+                                            # No pre-update state existed
+                                            # (first-ever steps): drop the
+                                            # polluted moments entirely.
+                                            self.optimizer.state[p] = {}
+                                            continue
+                                        st["exp_avg"].copy_(m1)
+                                        if m2 is not None:
+                                            st["exp_avg_sq"].copy_(m2)
+                                        if "step" in st:
+                                            # Rewind Adam's bias-correction
+                                            # counter by the steps applied
+                                            # this update (tensor or int).
+                                            st["step"] -= count
                             break
 
                     with record_function("step12c/backward"):
@@ -317,4 +361,5 @@ class PPOTrainer:
                 beta_entropy=float(total_beta_h.item()) / denom,
                 kl_stopped_at=kl_stopped_at,
                 kl_stop=kl_stop_val,
+                rolled_back=(kl_stopped_at >= 0 and snapshot is not None),
             )

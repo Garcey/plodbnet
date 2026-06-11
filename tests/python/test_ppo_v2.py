@@ -171,3 +171,50 @@ def test_display_value_head_detached_from_torso() -> None:
     assert all(g is None for g in grads[:-1]), (
         "display value loss reaches torso parameters"
     )
+
+
+def test_kl_rollback_restores_params_exactly() -> None:
+    # target_kl tiny -> the guard trips on the first KL reading; with
+    # kl_rollback the entire update must be discarded: every model and
+    # critic parameter bit-identical to before update().
+    trainer, batch, rng = _setup(
+        critic_hidden_dim=64, critic_num_blocks=1,
+        target_kl=1e-12, kl_rollback=True,
+    )
+    before = [p.detach().clone() for p in trainer._all_params]
+    stats = trainer.update(batch, rng)
+    assert stats.kl_stopped_at >= 0 and stats.rolled_back
+    after = list(trainer._all_params)
+    assert all(torch.equal(b, a.detach()) for b, a in zip(before, after)), (
+        "rollback left parameters modified"
+    )
+
+
+def test_adv_clip_bounds_batch_advantages() -> None:
+    # A tight adv_clip must bound the normalized advantages in the
+    # collected batch (both collectors share the finalize clamp).
+    import numpy as np
+    from plo5bp.config import GameConfig, TrainingConfig
+    from plo5bp.network import ActorCriticV2, CentralCritic
+    from plo5bp.rollout import collect_rollout, collect_rollout_batched
+    from plo5bp.selfplay import OpponentPool
+
+    torch.manual_seed(0)
+    np.random.seed(0)
+    game_cfg = GameConfig(num_seats=4)
+    train_cfg = TrainingConfig(
+        num_envs=4, rollout_length=128, hidden_dim=32, adv_clip=0.5,
+    )
+    model = ActorCriticV2(hidden_dim=32).eval()
+    critic = CentralCritic(hidden_dim=64, num_blocks=1)
+    pool = OpponentPool(capacity=1)
+    b1 = collect_rollout_batched(
+        model, pool, game_cfg, train_cfg, np.random.default_rng(0),
+        critic=critic,
+    )
+    assert float(b1.advantages.abs().max()) <= 0.5 + 1e-6
+    b2 = collect_rollout(
+        model, pool, game_cfg, train_cfg, np.random.default_rng(0),
+        critic=critic,
+    )
+    assert float(b2.advantages.abs().max()) <= 0.5 + 1e-6
