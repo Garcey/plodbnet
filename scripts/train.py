@@ -46,6 +46,16 @@ def _parse_seats_range(spec: str) -> tuple[int, ...]:
     return out
 
 
+def _lr_warmup_scale(update: int, warmup_updates: int) -> float:
+    """Linear LR ramp over the first `warmup_updates` updates: scale
+    runs from 1/warmup_updates up to 1.0, then stays at 1.0. 0 disables
+    (always 1.0). Pure function of the global update index, so resumes
+    are deterministic."""
+    if warmup_updates <= 0 or update >= warmup_updates:
+        return 1.0
+    return (update + 1) / warmup_updates
+
+
 def _parse_stack_range(spec: str) -> tuple[float, float]:
     if ":" not in spec:
         raise SystemExit(f"--stack-range must be 'min:max' in bb, got {spec!r}")
@@ -534,6 +544,17 @@ def main() -> None:
         "weights and ramps in over ~1/(1-ema) updates.",
     )
     parser.add_argument(
+        "--lr-warmup-updates",
+        type=int,
+        default=0,
+        help="Linear LR warmup over the first N GLOBAL updates (cold "
+        "starts only in practice — warm restarts past N run at full LR). "
+        "0 disables. Cold-start Adam steps at full LR moved the policy "
+        "by KL 1-20 per minibatch, tripping the KL guard at mb1-2 and "
+        "starving the critic (vTwo1 2026-06-11); small early steps let "
+        "the full inner loop run.",
+    )
+    parser.add_argument(
         "--target-kl",
         type=float,
         default=0.5,
@@ -926,6 +947,15 @@ def main() -> None:
             update_entropy_coef = (
                 entropy_coef_deep if sampled_eff_dist == "deep" else args.entropy_coef
             )
+        # Cold-start LR warmup: small early steps keep per-minibatch KL
+        # inside the guard's trust region, so all minibatches apply and
+        # the critic actually trains (a tripped update aborts the critic
+        # too — huge advantages then keep the next step violent). Uses
+        # the GLOBAL update index, so warm restarts past the window run
+        # at full LR from the first update.
+        lr_scale = _lr_warmup_scale(update, args.lr_warmup_updates)
+        for _pg in trainer.optimizer.param_groups:
+            _pg["lr"] = train_cfg.lr * lr_scale
         stats = trainer.update(batch, rng, entropy_coef=update_entropy_coef)
 
         # Accumulate this update's per-street aggression counts into the current
@@ -998,6 +1028,7 @@ def main() -> None:
                 f"seats={sampled_game_cfg.num_seats}  "
                 f"stacks_bb={stacks_bb}  "
                 f"ent={update_entropy_coef:.3f}"
+                + (f"  lr×{lr_scale:.2f}" if lr_scale < 1.0 else "")
                 + (f"  block={block_idx + 1}/{len(blocks)}({active_tier})" if blocks else "")
             )
 
