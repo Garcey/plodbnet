@@ -30,7 +30,7 @@
 # also starved the critic (it trains in the same inner loop), keeping
 # advantages huge and the violence self-sustaining.
 #
-# --target-kl 0.5 is the KL guard: vTwo2 died at update 173 when one
+# --target-kl 1.0 is the KL guard: vTwo2 died at update 173 when one
 # update hit approx_kl ≈ +2417 and collapsed entropy to 0. The guard
 # aborts the PPO inner loop before the runaway step is applied.
 set -uo pipefail
@@ -93,7 +93,7 @@ setsid nohup .venv/bin/python -u scripts/train.py \
   --num-minibatches 48 \
   --block-rotation 'clubgg:0.5,clubgg_deep:0.5,deep:0.5' \
   --block-size 50 \
-  --target-kl 0.5 \
+  --target-kl 1.0 \
   --kl-rollback \
   --adv-clip 8 \
   --lr-warmup-updates 75 \
