@@ -122,14 +122,17 @@ def _apply_anneal_control(
     last_raw: str | None,
     tier_ent: dict[str, float],
     step: float,
+    trainer=None,
 ) -> tuple[float, str | None]:
     """Apply a live `runs/anneal_control.json` edit without pausing
     training. Returns (anneal_step, applied_content); mutates `tier_ent`
-    in place. Re-applies only when the file CONTENT changes:
+    in place (and `trainer.target_kl` when given). Re-applies only when
+    the file CONTENT changes:
 
       {"step": 0.003}                     — change the per-block decrement
       {"tier_ent": {"deep": 0.08}}        — manually set a tier's coef
-      {"step": 0.003, "tier_ent": {...}}  — both at once
+      {"target_kl": 2.0}                  — retune the KL guard threshold
+      {"step": 0.003, "tier_ent": {...}}  — any combination
 
     A manual tier_ent set is one-shot: the anneal keeps lowering from
     the new level afterwards. Malformed JSON is ignored (and retried on
@@ -144,6 +147,9 @@ def _apply_anneal_control(
             for tier, v in (ctrl.get("tier_ent") or {}).items()
             if tier in tier_ent
         }
+        new_target_kl = (
+            float(ctrl["target_kl"]) if "target_kl" in ctrl else None
+        )
     except (ValueError, TypeError):
         return step, last_raw
     if new_step != step:
@@ -152,6 +158,12 @@ def _apply_anneal_control(
         if tier_ent[tier] != v:
             print(f"[anneal-control] tier_ent[{tier}] {tier_ent[tier]} -> {v}")
         tier_ent[tier] = v
+    if new_target_kl is not None and trainer is not None:
+        if trainer.target_kl != new_target_kl:
+            print(
+                f"[anneal-control] target_kl {trainer.target_kl} -> {new_target_kl}"
+            )
+        trainer.target_kl = new_target_kl
     return new_step, raw
 
 
@@ -926,7 +938,8 @@ def main() -> None:
             except OSError:
                 control_raw = None
             live_anneal_step, last_anneal_control = _apply_anneal_control(
-                control_raw, last_anneal_control, tier_ent, live_anneal_step
+                control_raw, last_anneal_control, tier_ent, live_anneal_step,
+                trainer=trainer,
             )
 
         if blocks:
