@@ -380,6 +380,8 @@ class TrainerSettings(BaseModel):
     # Monte-Carlo rollouts per EV-loss candidate; 0 disables EV loss.
     # 16 keeps a deviating /trainer/act under ~1s with the 2048x4 net on CPU.
     mc_rollouts: int = Field(16, ge=0, le=256)
+    # Display conversion: dollars per 1bb when the UI is in $ mode.
+    dollars_per_bb: float = Field(20.0, gt=0.0, le=100000.0)
 
     @model_validator(mode="after")
     def _check_ranges(self) -> "TrainerSettings":
@@ -541,7 +543,6 @@ class TrainerSession:
         self.hand_no = 0
         self.session_stats = StatsBlock()
         self.lifetime_stats = StatsBlock()
-        self.dollars_per_bb = 20.0
         self.rng = np.random.default_rng()
         self._policy = model_policy(model, deterministic=False)
         self._obs_adapt = obs_adapter(model)
@@ -840,6 +841,14 @@ class TrainerSession:
             "rec_label": _action_label(d.rec_gate, d.rec_chips, d.to_call_chips),
             "rec_chips_bb": round(chips_to_bb(d.rec_chips, bb), 2)
             if d.rec_gate == GATE_RAISE else None,
+            # Raw gate slugs + chip amounts so the client can format the
+            # labels in the active display unit ($ vs bb); the *_label
+            # strings above are bb-only fallbacks.
+            "user_gate": GATE_SLUGS[d.user_gate],
+            "user_chips": int(d.user_chips) if d.user_gate == GATE_RAISE else None,
+            "rec_gate": GATE_SLUGS[d.rec_gate],
+            "rec_chips": int(d.rec_chips) if d.rec_gate == GATE_RAISE else None,
+            "to_call_chips": int(d.to_call_chips),
             "ev_loss_bb": round(d.ev_loss_bb, 3) if d.ev_loss_bb is not None else None,
         }
 
@@ -1321,7 +1330,7 @@ class TrainerSession:
             "chip_scale": {
                 "bb_chips": int(bb),
                 "ante_chips": int(cfg.ante),
-                "dollars_per_bb": float(self.dollars_per_bb),
+                "dollars_per_bb": float(self.settings.dollars_per_bb),
             },
             "starting_stacks_chips": [int(s) for s in cfg.resolved_stacks],
             "starting_stacks_bb": [

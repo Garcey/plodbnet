@@ -61,6 +61,14 @@ function formatUnit(chips, state) {
   const str = val.toFixed(2);
   return UI.unit === "bb" ? `${str}bb` : `$${str}`;
 }
+// Action label in the ACTIVE display unit. Server-built *_label strings
+// are bb-only; prefer this whenever raw gate/chips are in the payload.
+function gateActionLabel(gateSlug, chips, toCall, state) {
+  if (gateSlug === "fold") return "Fold";
+  if (gateSlug === "check_call") return toCall > 0 ? "Call" : "Check";
+  const verb = toCall > 0 ? "Raise" : "Bet";
+  return `${verb} ${formatUnit(chips || 0, state)}`;
+}
 // Chips the current actor has already committed THIS street. Engine raise
 // bounds / recommendation are DELTAS on top of this; the UI displays totals,
 // where total = delta + actorCommitChips. Returns 0 (-> total == delta, a safe
@@ -1048,7 +1056,9 @@ function renderTrainerReviewRecommendation(s, el) {
     tag = `<span class="whatif-tag">what-if</span> `;
     detailHTML = recDetailHTML(rec, null, s);
   } else {
-    actionText = cur.rec_label;
+    actionText = cur.rec_gate
+      ? gateActionLabel(cur.rec_gate, cur.rec_chips, cur.to_call_chips, s)
+      : cur.rec_label;
     dist = cur.gate_probs;
     valueBB = cur.value_bb;
     detailHTML = recDetailHTML(cur, cur.user_anchor, s);
@@ -1746,10 +1756,16 @@ function renderFeedbackFlash(s, force = false) {
   UI.feedbackShownIdx = key;
   const el = document.getElementById("feedback-flash");
   document.getElementById("feedback-marks").textContent = fb.marks;
+  const userLabel = fb.user_gate
+    ? gateActionLabel(fb.user_gate, fb.user_chips, fb.to_call_chips, s)
+    : fb.label;
   document.getElementById("feedback-text").textContent =
-    `${fb.label} · ${Math.round(fb.score)}%`;
+    `${userLabel} · ${Math.round(fb.score)}%`;
   const bits = [];
-  if (fb.category !== "best" && fb.rec_label) bits.push(`best: ${fb.rec_label}`);
+  const recLabel = fb.rec_gate
+    ? gateActionLabel(fb.rec_gate, fb.rec_chips, fb.to_call_chips, s)
+    : fb.rec_label;
+  if (fb.category !== "best" && recLabel) bits.push(`best: ${recLabel}`);
   if (fb.ev_loss_bb !== null && fb.ev_loss_bb !== undefined && fb.ev_loss_bb > 0) {
     bits.push(`EV −${fb.ev_loss_bb.toFixed(2)}bb`);
   }
@@ -1915,6 +1931,7 @@ function openTrainerSettings() {
   document.getElementById("ts-hero-kth").value = String(t.hero_kth);
   document.getElementById("ts-ante-bb").value = t.ante_bb;
   document.getElementById("ts-mc-rollouts").value = t.mc_rollouts;
+  document.getElementById("ts-dollars-bb").value = t.dollars_per_bb;
   const wrap = document.getElementById("ts-per-seat");
   wrap.innerHTML = "";
   for (let i = 0; i < 6; i++) {
@@ -1957,6 +1974,7 @@ async function saveTrainerSettings() {
     hero_kth: _tsInt("ts-hero-kth"),
     ante_bb: _tsNum("ts-ante-bb"),
     mc_rollouts: _tsInt("ts-mc-rollouts"),
+    dollars_per_bb: _tsNum("ts-dollars-bb"),
   };
   const ok = await postTrainer("settings", body);
   if (ok) closeTrainerSettings();
