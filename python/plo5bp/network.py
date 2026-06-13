@@ -49,10 +49,15 @@ class ActOut(NamedTuple):
 
     gate: torch.Tensor      # (B,) int64
     chips: torch.Tensor     # (B,) int64 chip delta; 0 for non-Raise
-    log_prob: torch.Tensor  # (B,) float
+    log_prob: torch.Tensor  # (B,) float — JOINT log-prob
     value: torch.Tensor     # (B,) float (v2: the display value head)
     anchor: torch.Tensor    # (B,) int64
     refine_u: torch.Tensor  # (B,) float — clamped sampled u
+    # Per-head log-prob components stored for per-head KL diagnostics.
+    # gate is always present; anchor is the raise-row anchor log-prob
+    # (v1 fills zeros — no anchor head).
+    gate_log_prob: torch.Tensor    # (B,) float
+    anchor_log_prob: torch.Tensor  # (B,) float
 
 
 class _ResidualBlock(nn.Module):
@@ -193,6 +198,8 @@ class ActorCritic(nn.Module):
             value=value,
             anchor=torch.full_like(gate, -1),
             refine_u=u,
+            gate_log_prob=gate_log_prob,
+            anchor_log_prob=torch.zeros_like(log_prob),  # v1: no anchor head
         )
 
     def evaluate(
@@ -390,6 +397,8 @@ class ActorCriticV2(nn.Module):
             value=value,
             anchor=anchor,
             refine_u=u,
+            gate_log_prob=gate_log_prob,
+            anchor_log_prob=anchor_log_prob,
         )
 
     def evaluate(
@@ -403,9 +412,12 @@ class ActorCriticV2(nn.Module):
     ) -> tuple[
         torch.Tensor, torch.Tensor, torch.Tensor,
         torch.Tensor, torch.Tensor, torch.Tensor,
+        torch.Tensor, torch.Tensor,
     ]:
         """Return (log_prob, entropy, display_value, gate_H, anchor_H,
-        beta_H_eff) for stored actions.
+        beta_H_eff, gate_log_prob, anchor_log_prob) for stored actions.
+        The last two are the per-head log-prob components (for per-head
+        KL diagnostics in the trainer).
 
         Entropy follows the generative process:
         H(gate) + P(Raise) · (H(anchor) + Σ_k p_k · H(Beta_k) · refine_ok_k).
@@ -463,7 +475,10 @@ class ActorCriticV2(nn.Module):
         ).sum(-1)
         anchor_entropy = anchor_dist.entropy()
         entropy = gate_entropy + p_raise.detach() * (anchor_entropy + beta_h_eff)
-        return log_prob, entropy, value, gate_entropy, anchor_entropy, beta_h_eff
+        return (
+            log_prob, entropy, value, gate_entropy, anchor_entropy,
+            beta_h_eff, gate_log_prob, anchor_log_prob,
+        )
 
 
 def obs_adapter(model: nn.Module):

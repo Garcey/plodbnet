@@ -50,10 +50,15 @@ class Batch:
     anchor_actions: torch.Tensor  # (T,) long — sampled anchor (-1 for v1)
     refine_u: torch.Tensor      # (T,) f32 — sampled refinement u
     opp_holes: torch.Tensor     # (T, 5, 5) u8 — rotated opp hole cards
-    log_probs: torch.Tensor     # (T,) f32 — sampling log-prob
+    log_probs: torch.Tensor     # (T,) f32 — sampling JOINT log-prob
     values: torch.Tensor        # (T,) f32 — critic at sampling time
     returns: torch.Tensor       # (T,) f32
     advantages: torch.Tensor    # (T,) f32 — normalized
+    # Per-head sampling log-probs for per-head KL diagnostics. gate is
+    # always meaningful; anchor is the raise-row anchor log-prob (0 for
+    # v1). beta_kl is derived as total_kl - gate_kl - anchor_kl.
+    old_gate_logp: torch.Tensor    # (T,) f32
+    old_anchor_logp: torch.Tensor  # (T,) f32
     # Aggression-bonus diagnostics (set by the rollout collector).
     # `aggr_bonus_total_bb` is the sum of pot-fraction bonus added to
     # learner-step rewards; `aggr_steps_total` is the count of learner
@@ -243,6 +248,8 @@ def _flush_trajectory(
     all_values: list,
     all_returns: list,
     all_advantages: list,
+    all_gate_logp: list,
+    all_anchor_logp: list,
 ) -> None:
     """GAE-λ flush for a single seat's trajectory under the forward-EV
     reward signal.
@@ -287,6 +294,8 @@ def _flush_trajectory(
     all_anchors.extend(t[7] for t in traj)
     all_refine_u.extend(t[8] for t in traj)
     all_opp_holes.extend(t[9] for t in traj)
+    all_gate_logp.extend(t[10] for t in traj)
+    all_anchor_logp.extend(t[11] for t in traj)
 
 
 def _finalize_batch(
@@ -302,6 +311,8 @@ def _finalize_batch(
     all_values: list,
     all_returns: list,
     all_advantages: list,
+    all_gate_logp: list,
+    all_anchor_logp: list,
     device: torch.device | str = "cpu",
     aggr_bonus_total_bb: float = 0.0,
     aggr_steps_total: int = 0,
@@ -321,6 +332,8 @@ def _finalize_batch(
     ru_t = torch.tensor(all_refine_u, dtype=torch.float32, device=device)
     oh_t = torch.from_numpy(np.stack(all_opp_holes, axis=0)).to(device)
     lp_t = torch.tensor(all_log_probs, dtype=torch.float32, device=device)
+    glp_t = torch.tensor(all_gate_logp, dtype=torch.float32, device=device)
+    alp_t = torch.tensor(all_anchor_logp, dtype=torch.float32, device=device)
     v_t = torch.tensor(all_values, dtype=torch.float32, device=device)
     ret_t = torch.tensor(all_returns, dtype=torch.float32, device=device)
     adv_t = torch.tensor(all_advantages, dtype=torch.float32, device=device)
@@ -347,6 +360,8 @@ def _finalize_batch(
         values=v_t,
         returns=ret_t,
         advantages=adv_t,
+        old_gate_logp=glp_t,
+        old_anchor_logp=alp_t,
         aggr_bonus_total_bb=float(aggr_bonus_total_bb),
         aggr_steps_total=int(aggr_steps_total),
         aggr_bonus_steps=int(aggr_bonus_steps),
@@ -368,6 +383,8 @@ def _finalize_batch_arr(
     all_v_arr: np.ndarray,
     all_ret_arr: np.ndarray,
     all_adv_arr: np.ndarray,
+    all_glp_arr: np.ndarray,
+    all_alp_arr: np.ndarray,
     wcursor: int,
     device: torch.device | str = "cpu",
     aggr_bonus_total_bb: float = 0.0,
@@ -394,6 +411,8 @@ def _finalize_batch_arr(
         ru_t = torch.from_numpy(all_ru_arr[:wcursor]).to(device, non_blocking=True)
         oh_t = torch.from_numpy(all_oh_arr[:wcursor]).to(device, non_blocking=True)
         lp_t = torch.from_numpy(all_lp_arr[:wcursor]).to(device, non_blocking=True)
+        glp_t = torch.from_numpy(all_glp_arr[:wcursor]).to(device, non_blocking=True)
+        alp_t = torch.from_numpy(all_alp_arr[:wcursor]).to(device, non_blocking=True)
         v_t = torch.from_numpy(all_v_arr[:wcursor]).to(device, non_blocking=True)
         ret_t = torch.from_numpy(all_ret_arr[:wcursor]).to(device, non_blocking=True)
         adv_t = torch.from_numpy(all_adv_arr[:wcursor]).to(device, non_blocking=True)
@@ -418,6 +437,8 @@ def _finalize_batch_arr(
         values=v_t,
         returns=ret_t,
         advantages=adv_t,
+        old_gate_logp=glp_t,
+        old_anchor_logp=alp_t,
         aggr_bonus_total_bb=float(aggr_bonus_total_bb),
         aggr_steps_total=int(aggr_steps_total),
         aggr_bonus_steps=int(aggr_bonus_steps),
@@ -521,6 +542,8 @@ def collect_rollout(
     all_values: list[float] = []
     all_returns: list[float] = []
     all_advantages: list[float] = []
+    all_gate_logp: list[float] = []
+    all_anchor_logp: list[float] = []
 
     aggression_bonus_c = float(train_config.aggression_bonus_c)
     retroactive_bonus_c = float(train_config.retroactive_bonus_c)
@@ -547,6 +570,8 @@ def collect_rollout(
         anchors_per_env = np.full(n_envs, -1, dtype=np.int64)
         refine_u_per_env = np.zeros(n_envs, dtype=np.float32)
         log_probs_per_env = np.zeros(n_envs, dtype=np.float32)
+        gate_logp_per_env = np.zeros(n_envs, dtype=np.float32)
+        anchor_logp_per_env = np.zeros(n_envs, dtype=np.float32)
         values_per_env = np.zeros(n_envs, dtype=np.float32)
         # The sizing context per env, built ONCE per step — the exact
         # tensor fed to act() is also what gets stored (no recompute drift).
@@ -568,6 +593,8 @@ def collect_rollout(
             an_np = _act_out.anchor.cpu().numpy()
             ru_np = _act_out.refine_u.cpu().numpy()
             lp_np = _act_out.log_prob.cpu().numpy()
+            glp_np = _act_out.gate_log_prob.cpu().numpy()
+            alp_np = _act_out.anchor_log_prob.cpu().numpy()
             if critic is not None:
                 batch_opp = np.stack(
                     [
@@ -585,6 +612,8 @@ def collect_rollout(
                 anchors_per_env[i] = int(an_np[k])
                 refine_u_per_env[i] = float(ru_np[k])
                 log_probs_per_env[i] = float(lp_np[k])
+                gate_logp_per_env[i] = float(glp_np[k])
+                anchor_logp_per_env[i] = float(alp_np[k])
                 values_per_env[i] = float(v_np[k])
 
         if opp_idx:
@@ -619,6 +648,8 @@ def collect_rollout(
                     int(anchors_per_env[i]),
                     float(refine_u_per_env[i]),
                     _rotate_opp_holes(hole_caches[i], actor),
+                    float(gate_logp_per_env[i]),
+                    float(anchor_logp_per_env[i]),
                 ))
 
             # Pre-step pot / call signals for the aggression bonus —
@@ -714,6 +745,8 @@ def collect_rollout(
                         all_values=all_values,
                         all_returns=all_returns,
                         all_advantages=all_advantages,
+                        all_gate_logp=all_gate_logp,
+                        all_anchor_logp=all_anchor_logp,
                     )
                 trajectories[i] = [[] for _ in range(n_seats)]
                 cost_trajs[i] = [[] for _ in range(n_seats)]
@@ -741,6 +774,8 @@ def collect_rollout(
         all_values,
         all_returns,
         all_advantages,
+        all_gate_logp,
+        all_anchor_logp,
         device=device,
         aggr_bonus_total_bb=aggr_bonus_total_bb,
         aggr_steps_total=aggr_steps_total,
@@ -853,6 +888,8 @@ def collect_rollout_batched(
     traj_anchor = np.full((n_envs, n_seats, MAX_STEPS_PER_SEAT), -1, dtype=np.int8)
     traj_u = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.float32)
     traj_log_p = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.float32)
+    traj_gate_lp = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.float32)
+    traj_anchor_lp = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.float32)
     traj_value = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.float32)
     # Per-step cost / pot / street parallel arrays, mirrored shape.
     costs_arr = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.float32)
@@ -919,6 +956,8 @@ def collect_rollout_batched(
     all_ru_arr = _alloc_slab(out_cap, np.float32, torch.float32)
     all_oh_arr = _alloc_slab((out_cap, 5, 5), np.uint8, torch.uint8)
     all_lp_arr = _alloc_slab(out_cap, np.float32, torch.float32)
+    all_glp_arr = _alloc_slab(out_cap, np.float32, torch.float32)
+    all_alp_arr = _alloc_slab(out_cap, np.float32, torch.float32)
     all_v_arr = _alloc_slab(out_cap, np.float32, torch.float32)
     all_ret_arr = _alloc_slab(out_cap, np.float32, torch.float32)
     all_adv_arr = _alloc_slab(out_cap, np.float32, torch.float32)
@@ -936,7 +975,8 @@ def collect_rollout_batched(
 
     def _forward(model: ActorCritic, group: np.ndarray, obs_arr: np.ndarray,
                  gate_mask_arr: np.ndarray, sizing_arr: np.ndarray) -> tuple[
-        np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray
+        np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+        np.ndarray, np.ndarray,
     ]:
         b_obs = obs_arr[group]
         b_gm = gate_mask_arr[group]
@@ -952,13 +992,14 @@ def collect_rollout_batched(
             # Coalesce device->host copies (each forces a full CUDA sync)
             # into two by stacking same-dtype outputs: one int64 transfer
             # for (gate, chips, anchor) and one float32 transfer for
-            # (log_prob, refine_u, value). Bit-identical to per-tensor
-            # copies — only the number of syncs changes.
+            # (log_prob, refine_u, value, gate_log_prob, anchor_log_prob).
+            # Bit-identical to per-tensor copies — only the sync count changes.
             ints = torch.stack(
                 (_fw_out.gate, _fw_out.chips, _fw_out.anchor), dim=0
             ).cpu().numpy()
             floats = torch.stack(
-                (_fw_out.log_prob, _fw_out.refine_u, _fw_out.value), dim=0
+                (_fw_out.log_prob, _fw_out.refine_u, _fw_out.value,
+                 _fw_out.gate_log_prob, _fw_out.anchor_log_prob), dim=0
             ).cpu().numpy()
             return (
                 ints[0].astype(np.uint8),
@@ -967,6 +1008,8 @@ def collect_rollout_batched(
                 floats[0],
                 floats[1],
                 floats[2],
+                floats[3],
+                floats[4],
             )
 
     env_idx_range = np.arange(n_envs)
@@ -999,6 +1042,8 @@ def collect_rollout_batched(
         anchors_per_env = np.full(n_envs, -1, dtype=np.int64)
         refine_u_per_env = np.zeros(n_envs, dtype=np.float32)
         log_probs_per_env = np.zeros(n_envs, dtype=np.float32)
+        gate_logp_per_env = np.zeros(n_envs, dtype=np.float32)
+        anchor_logp_per_env = np.zeros(n_envs, dtype=np.float32)
         values_per_env = np.zeros(n_envs, dtype=np.float32)
 
         # Per-step sizing context (min, max, pot, to_call) — built once;
@@ -1019,7 +1064,7 @@ def collect_rollout_batched(
         )
 
         if learner_idx_np.size:
-            g_np, c_np, an_np, lp_np, ru_np, v_np = _forward(
+            g_np, c_np, an_np, lp_np, ru_np, v_np, glp_np, alp_np = _forward(
                 learner, learner_idx_np, obs, gate_masks, sizing_step
             )
             gates_per_env[learner_idx_np] = g_np
@@ -1027,6 +1072,8 @@ def collect_rollout_batched(
             anchors_per_env[learner_idx_np] = an_np
             refine_u_per_env[learner_idx_np] = ru_np
             log_probs_per_env[learner_idx_np] = lp_np
+            gate_logp_per_env[learner_idx_np] = glp_np
+            anchor_logp_per_env[learner_idx_np] = alp_np
             if critic is not None:
                 with record_function("step3b/critic_forward"):
                     opp_block = _rotate_opp_holes_batch(
@@ -1047,7 +1094,7 @@ def collect_rollout_batched(
                     sd_idx_int = int(sd_idx)
                     group = np.nonzero(opp_snap_col == sd_idx)[0]
                     m = _get_snapshot_model(sd_idx_int)
-                    g_np, c_np, _, _, _, _ = _forward(
+                    g_np, c_np, _, _, _, _, _, _ = _forward(
                         m, group, obs, gate_masks, sizing_step
                     )
                     gates_per_env[group] = g_np
@@ -1096,6 +1143,12 @@ def collect_rollout_batched(
             )
             traj_log_p[learner_idx_np, learner_actors, slots] = (
                 log_probs_per_env[learner_idx_np]
+            )
+            traj_gate_lp[learner_idx_np, learner_actors, slots] = (
+                gate_logp_per_env[learner_idx_np]
+            )
+            traj_anchor_lp[learner_idx_np, learner_actors, slots] = (
+                anchor_logp_per_env[learner_idx_np]
             )
             traj_value[learner_idx_np, learner_actors, slots] = (
                 values_per_env[learner_idx_np]
@@ -1322,6 +1375,8 @@ def collect_rollout_batched(
                             rot_block.reshape(T * S, 5, 5)[ts_idx]
                         )
                         all_lp_arr[wcursor:end] = traj_log_p[term_envs, :, :L].ravel()[sel]
+                        all_glp_arr[wcursor:end] = traj_gate_lp[term_envs, :, :L].ravel()[sel]
+                        all_alp_arr[wcursor:end] = traj_anchor_lp[term_envs, :, :L].ravel()[sel]
                         all_v_arr[wcursor:end] = vals_t.ravel()[sel]
                         all_ret_arr[wcursor:end] = rets_t.ravel()[sel]
                         all_adv_arr[wcursor:end] = advs_t.ravel()[sel]
@@ -1362,6 +1417,8 @@ def collect_rollout_batched(
         all_v_arr,
         all_ret_arr,
         all_adv_arr,
+        all_glp_arr,
+        all_alp_arr,
         wcursor,
         device=device,
         aggr_bonus_total_bb=aggr_bonus_total_bb,
@@ -1395,4 +1452,6 @@ def iter_minibatches(
             values=batch.values[sel],
             returns=batch.returns[sel],
             advantages=batch.advantages[sel],
+            old_gate_logp=batch.old_gate_logp[sel],
+            old_anchor_logp=batch.old_anchor_logp[sel],
         )

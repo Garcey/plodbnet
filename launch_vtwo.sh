@@ -26,13 +26,24 @@
 # decisions begin after --anneal-start-update updates.
 #
 # --lr-warmup-updates 75: full-LR cold-start Adam steps moved the
-# policy KL 1-20 per minibatch, tripping the guard at mb1-2 — which
-# also starved the critic (it trains in the same inner loop), keeping
-# advantages huge and the violence self-sustaining.
+# policy KL 1-20 per minibatch; the warmup eases them in.
 #
-# --target-kl 2.0 is the KL guard: vTwo2 died at update 173 when one
-# update hit approx_kl ≈ +2417 and collapsed entropy to 0. The guard
-# aborts the PPO inner loop before the runaway step is applied.
+# KL guard is now SPLIT (the single-threshold full-rollback froze a
+# run — 317/318 updates rolled back to no-ops once the policy
+# sharpened, 2026-06-12):
+#   --target-kl 2.0  SOFT early-stop: stop the inner loop but KEEP the
+#                    minibatches already applied (standard PPO).
+#   --kl-hard 10.0   HARD rollback: revert the WHOLE update; reserved
+#                    for catastrophe (vTwo2 hit approx_kl ≈ +2417 at
+#                    update 173). Both live-tunable via anneal_control.
+#
+# Base LR is the train.py default (3e-4) — live-tunable down/up via
+# runs/anneal_control.json {"lr": X} (decay it as the policy sharpens
+# and KLSTOP frequency climbs, no restart, opponent pool preserved).
+#
+# 16 minibatches x 2 epochs (was 48 x 4): bigger minibatches = better
+# game-tree coverage per gradient step; the 7.83M batch doesn't need
+# 4x reuse.
 set -uo pipefail
 cd /workspace/plodbnet
 
@@ -90,18 +101,19 @@ setsid nohup .venv/bin/python -u scripts/train.py \
   --critic-hidden-dim 1536 --critic-num-blocks 2 \
   --num-envs 49134 \
   --rollout-length 7833600 \
-  --num-minibatches 48 \
+  --num-minibatches 16 \
+  --ppo-epochs 2 \
   --block-rotation 'clubgg:0.5,clubgg_deep:0.5,deep:0.5' \
   --block-size 50 \
   --target-kl 2.0 \
-  --kl-rollback \
+  --kl-hard 10.0 \
   --adv-clip 8 \
   --lr-warmup-updates 75 \
   --anneal-entropy \
   --anneal-step 0.002 \
   --anneal-floor 0.0 \
   --anneal-tolerance 1.0 \
-  --anneal-start-update 600 \
+  --anneal-start-update 900 \
   --num-updates 100000000 \
   "${WARM_ARGS[@]}" \
   --checkpoint "checkpoints/vTwo${NEXT}.pt" \

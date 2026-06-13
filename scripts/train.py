@@ -122,23 +122,27 @@ def _apply_anneal_control(
     last_raw: str | None,
     tier_ent: dict[str, float],
     step: float,
+    live_lr: float,
     trainer=None,
-) -> tuple[float, str | None]:
+) -> tuple[float, str | None, float]:
     """Apply a live `runs/anneal_control.json` edit without pausing
-    training. Returns (anneal_step, applied_content); mutates `tier_ent`
-    in place (and `trainer.target_kl` when given). Re-applies only when
-    the file CONTENT changes:
+    training. Returns (anneal_step, applied_content, live_lr); mutates
+    `tier_ent` in place (and `trainer.target_kl` / `trainer.kl_hard`
+    when given). Re-applies only when the file CONTENT changes:
 
       {"step": 0.003}                     — change the per-block decrement
       {"tier_ent": {"deep": 0.08}}        — manually set a tier's coef
-      {"target_kl": 2.0}                  — retune the KL guard threshold
+      {"target_kl": 2.0}                  — retune the soft KL early-stop
+      {"kl_hard": 12.0}                   — retune the hard rollback level
+      {"lr": 1e-4}                        — retune the base learning rate
       {"step": 0.003, "tier_ent": {...}}  — any combination
 
     A manual tier_ent set is one-shot: the anneal keeps lowering from
-    the new level afterwards. Malformed JSON is ignored (and retried on
-    the next loop, so a half-written save is harmless)."""
+    the new level afterwards. The lr set is the BASE lr — the per-update
+    warmup scale still multiplies it. Malformed JSON is ignored (and
+    retried on the next loop, so a half-written save is harmless)."""
     if raw is None or raw == last_raw:
-        return step, last_raw
+        return step, last_raw, live_lr
     try:
         ctrl = json.loads(raw)
         new_step = float(ctrl["step"]) if "step" in ctrl else step
@@ -150,8 +154,10 @@ def _apply_anneal_control(
         new_target_kl = (
             float(ctrl["target_kl"]) if "target_kl" in ctrl else None
         )
+        new_kl_hard = float(ctrl["kl_hard"]) if "kl_hard" in ctrl else None
+        new_lr = float(ctrl["lr"]) if "lr" in ctrl else None
     except (ValueError, TypeError):
-        return step, last_raw
+        return step, last_raw, live_lr
     if new_step != step:
         print(f"[anneal-control] step {step} -> {new_step}")
     for tier, v in new_tiers.items():
@@ -164,7 +170,16 @@ def _apply_anneal_control(
                 f"[anneal-control] target_kl {trainer.target_kl} -> {new_target_kl}"
             )
         trainer.target_kl = new_target_kl
-    return new_step, raw
+    if new_kl_hard is not None and trainer is not None:
+        if trainer.kl_hard != new_kl_hard:
+            print(f"[anneal-control] kl_hard {trainer.kl_hard} -> {new_kl_hard}")
+        trainer.kl_hard = new_kl_hard
+    out_lr = live_lr
+    if new_lr is not None:
+        if live_lr != new_lr:
+            print(f"[anneal-control] lr {live_lr} -> {new_lr}")
+        out_lr = new_lr
+    return new_step, raw, out_lr
 
 
 def _anneal_decision(
@@ -567,16 +582,6 @@ def main() -> None:
         "the full inner loop run.",
     )
     parser.add_argument(
-        "--kl-rollback",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="On a KL-guard trip, restore params + optimizer state from "
-        "the top of the update — discard the whole update instead of "
-        "keeping the pre-trip minibatches. Near-threshold partial "
-        "updates compounded into the vTwo1 u52-80 collapse (2026-06-11). "
-        "--no-kl-rollback keeps the old truncate-only behavior.",
-    )
-    parser.add_argument(
         "--adv-clip",
         type=float,
         default=8.0,
@@ -588,13 +593,21 @@ def main() -> None:
     parser.add_argument(
         "--target-kl",
         type=float,
-        default=0.5,
-        help="KL guard: abort the PPO inner loop (skip the pending "
-        "optimizer step and all remaining minibatches/epochs) when a "
-        "minibatch's |approx_kl| exceeds this. 0 disables. Insurance "
-        "against runaway updates (vTwo2 collapsed at update 173 with "
-        "approx_kl ~ +2417); normal updates sit well under 0.1, so 0.5 "
-        "only trips on genuine blow-ups.",
+        default=2.0,
+        help="SOFT KL guard (early-stop): when a minibatch's |approx_kl| "
+        "exceeds this, stop the PPO inner loop but KEEP the minibatches "
+        "already applied this update. Standard PPO early-stopping. 0 "
+        "disables. Live-tunable via runs/anneal_control.json {\"target_kl\"}.",
+    )
+    parser.add_argument(
+        "--kl-hard",
+        type=float,
+        default=10.0,
+        help="HARD KL guard (full rollback): when a minibatch's "
+        "|approx_kl| exceeds this, restore params + optimizer state and "
+        "discard the WHOLE update. Reserved for catastrophe (vTwo2 hit "
+        "approx_kl ~ +2417 at update 173). Should be >= --target-kl. 0 "
+        "disables hard rollback. Live-tunable via anneal_control.json.",
     )
     parser.add_argument(
         "--kl-anchor-ema",
@@ -719,7 +732,7 @@ def main() -> None:
         kl_anchor_coef=args.kl_anchor_coef,
         kl_anchor_ema=args.kl_anchor_ema,
         target_kl=args.target_kl,
-        kl_rollback=args.kl_rollback,
+        kl_hard=args.kl_hard,
         adv_clip=args.adv_clip,
         device=args.device,
     )
@@ -841,6 +854,7 @@ def main() -> None:
     # without pausing training — see --anneal-step help.
     anneal_control_file = Path("runs/anneal_control.json")
     live_anneal_step = float(args.anneal_step)
+    live_lr = float(train_cfg.lr)
     last_anneal_control: str | None = None
 
     collector = collect_rollout_batched if args.batched else collect_rollout
@@ -937,9 +951,9 @@ def main() -> None:
                 control_raw = anneal_control_file.read_text()
             except OSError:
                 control_raw = None
-            live_anneal_step, last_anneal_control = _apply_anneal_control(
+            live_anneal_step, last_anneal_control, live_lr = _apply_anneal_control(
                 control_raw, last_anneal_control, tier_ent, live_anneal_step,
-                trainer=trainer,
+                live_lr, trainer=trainer,
             )
 
         if blocks:
@@ -989,7 +1003,7 @@ def main() -> None:
         # at full LR from the first update.
         lr_scale = _lr_warmup_scale(update, args.lr_warmup_updates)
         for _pg in trainer.optimizer.param_groups:
-            _pg["lr"] = train_cfg.lr * lr_scale
+            _pg["lr"] = live_lr * lr_scale
         stats = trainer.update(batch, rng, entropy_coef=update_entropy_coef)
 
         # Accumulate this update's per-street aggression counts into the current
@@ -1049,10 +1063,16 @@ def main() -> None:
                 f"Hg/Ha/Hb={stats.gate_entropy:.2f}/{stats.anchor_entropy:.2f}/"
                 f"{stats.beta_entropy:.2f}  "
                 f"kl={stats.approx_kl:+.4f}  "
-                + (f"klA={stats.kl_anchor:.4f}  " if args.kl_anchor_coef > 0 else "")
+                f"klG/klA/klB={stats.gate_kl:+.3f}/{stats.anchor_kl:+.3f}/"
+                f"{stats.beta_kl:+.3f}  "
+                + (f"klanc={stats.kl_anchor:.4f}  " if args.kl_anchor_coef > 0 else "")
                 + (
-                    f"KLSTOP@mb{stats.kl_stopped_at}(kl={stats.kl_stop:+.2f}"
-                    f"{',RB' if stats.rolled_back else ''})  "
+                    (
+                        f"KLROLLBACK@mb{stats.kl_stopped_at}"
+                        if stats.rolled_back
+                        else f"KLSTOP@mb{stats.kl_stopped_at}"
+                    )
+                    + f"(kl={stats.kl_stop:+.2f})  "
                     if stats.kl_stopped_at >= 0 else ""
                 )
                 +

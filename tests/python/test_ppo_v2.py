@@ -56,6 +56,7 @@ def test_v2_update_finite_stats() -> None:
     for name in (
         "policy_loss", "value_loss", "entropy", "approx_kl",
         "display_loss", "gate_entropy", "anchor_entropy", "beta_entropy",
+        "gate_kl", "anchor_kl", "beta_kl",
     ):
         assert np.isfinite(getattr(stats, name)), f"non-finite {name}: {stats}"
     assert stats.kl_anchor == 0.0
@@ -90,26 +91,29 @@ def test_kl_anchor_flag_on() -> None:
     )
     assert moved
 
-def test_kl_guard_trips_and_skips_step() -> None:
-    # Corrupt the stored log-probs so the very first minibatch shows a
-    # huge approx_kl: the guard must abort before any optimizer step,
-    # leaving the model untouched.
+def test_kl_soft_guard_trips_keeps_no_rollback() -> None:
+    # Corrupt the stored log-probs so the first minibatch shows kl ≈ +5,
+    # cleanly inside the soft band (2 < kl < hard 10): a SOFT early-stop.
+    # mb0 trip applies nothing before it (params unchanged) and does NOT
+    # roll back.
     trainer, batch, rng = _setup(critic_hidden_dim=64, critic_num_blocks=1)
-    batch.log_probs.add_(10.0)  # kl = mean(stored - current) ≈ +10
+    batch.log_probs.add_(5.0)  # kl = mean(stored - current) ≈ +5
     params_before = [p.clone() for p in trainer.model.parameters()]
     stats = trainer.update(batch, rng)
     assert stats.kl_stopped_at == 0, stats
-    assert stats.kl_stop > 0.5, stats
+    assert stats.kl_stop > 2.0, stats
+    assert not stats.rolled_back, "soft early-stop must not roll back"
     unchanged = all(
         torch.equal(b, p)
         for b, p in zip(params_before, trainer.model.parameters())
     )
-    assert unchanged, "guard tripped but an optimizer step was applied"
+    assert unchanged, "soft stop at mb0 applied a step"
 
 
 def test_kl_guard_disabled_lets_update_through() -> None:
     trainer, batch, rng = _setup(
-        critic_hidden_dim=64, critic_num_blocks=1, target_kl=0.0
+        critic_hidden_dim=64, critic_num_blocks=1,
+        target_kl=0.0, kl_hard=0.0,
     )
     batch.log_probs.add_(10.0)
     params_before = [p.clone() for p in trainer.model.parameters()]
@@ -138,7 +142,7 @@ def test_entropy_bonus_gate_gradient_is_pure_gate_entropy() -> None:
         batch.gate_actions[:n], batch.anchor_actions[:n],
         batch.refine_u[:n],
     )
-    _, entropy, _, gate_h, _, _ = model.evaluate(*args)
+    _, entropy, _, gate_h, _, _, _, _ = model.evaluate(*args)
     g_total = torch.autograd.grad(
         entropy.sum(), model.gate_head.weight, retain_graph=True
     )[0]
@@ -157,7 +161,7 @@ def test_display_value_head_detached_from_torso() -> None:
     trainer, batch, rng = _setup(critic_hidden_dim=64, critic_num_blocks=1)
     model = trainer.model
     n = min(64, batch.obs.shape[0])
-    _, _, value, _, _, _ = model.evaluate(
+    _, _, value, _, _, _, _, _ = model.evaluate(
         batch.obs[:n], batch.gate_masks[:n], batch.sizing[:n],
         batch.gate_actions[:n], batch.anchor_actions[:n],
         batch.refine_u[:n],
@@ -173,13 +177,13 @@ def test_display_value_head_detached_from_torso() -> None:
     )
 
 
-def test_kl_rollback_restores_params_exactly() -> None:
-    # target_kl tiny -> the guard trips on the first KL reading; with
-    # kl_rollback the entire update must be discarded: every model and
-    # critic parameter bit-identical to before update().
+def test_kl_hard_rollback_restores_params_exactly() -> None:
+    # kl_hard tiny -> the hard guard trips on the first nonzero KL
+    # reading and discards the WHOLE update: every model and critic
+    # parameter bit-identical to before update().
     trainer, batch, rng = _setup(
         critic_hidden_dim=64, critic_num_blocks=1,
-        target_kl=1e-12, kl_rollback=True,
+        target_kl=2.0, kl_hard=1e-12,
     )
     before = [p.detach().clone() for p in trainer._all_params]
     stats = trainer.update(batch, rng)
@@ -188,6 +192,52 @@ def test_kl_rollback_restores_params_exactly() -> None:
     assert all(torch.equal(b, a.detach()) for b, a in zip(before, after)), (
         "rollback left parameters modified"
     )
+
+
+def test_kl_soft_stop_keeps_applied_minibatches() -> None:
+    # A soft early-stop on a LATER minibatch must KEEP the minibatches
+    # already applied — params move, no rollback. Use many small
+    # minibatches and a low soft threshold so the trip lands after some
+    # steps have applied.
+    trainer, batch, rng = _setup(
+        critic_hidden_dim=64, critic_num_blocks=1,
+        ppo_epochs=4, batch_size=16, target_kl=0.02, kl_hard=0.0,
+    )
+    before = [p.detach().clone() for p in trainer.model.parameters()]
+    stats = trainer.update(batch, rng)
+    assert stats.kl_stopped_at >= 0, stats
+    assert not stats.rolled_back
+    moved = any(
+        not torch.equal(b, p)
+        for b, p in zip(before, trainer.model.parameters())
+    )
+    assert moved, "soft stop discarded the applied prefix"
+
+
+def test_per_head_kl_decomposition_sums_to_total() -> None:
+    # gate_kl + anchor_kl + beta_kl must equal approx_kl (the averaged
+    # identity), and all be finite, over a real update.
+    trainer, batch, rng = _setup(critic_hidden_dim=64, critic_num_blocks=1)
+    stats = trainer.update(batch, rng)
+    parts = stats.gate_kl + stats.anchor_kl + stats.beta_kl
+    assert np.isfinite(parts)
+    assert abs(parts - stats.approx_kl) < 1e-4, (
+        f"per-head KL {parts} != approx_kl {stats.approx_kl}"
+    )
+
+
+def test_batch_carries_per_head_logp() -> None:
+    # Both per-head old log-prob arrays exist, match the joint shape,
+    # and are finite; on the first-minibatch replay gate/anchor KL ≈ 0.
+    trainer, batch, rng = _setup(
+        critic_hidden_dim=64, critic_num_blocks=1,
+        ppo_epochs=1, batch_size=1_000_000,
+    )
+    assert batch.old_gate_logp.shape == batch.log_probs.shape
+    assert batch.old_anchor_logp.shape == batch.log_probs.shape
+    assert torch.isfinite(batch.old_gate_logp).all()
+    stats = trainer.update(batch, rng)
+    assert abs(stats.gate_kl) < 1e-3 and abs(stats.anchor_kl) < 1e-3, stats
 
 
 def test_adv_clip_bounds_batch_advantages() -> None:

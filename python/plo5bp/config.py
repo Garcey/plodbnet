@@ -89,22 +89,23 @@ class TrainingConfig:
     kl_anchor_coef: float = 0.0
     kl_anchor_ema: float = 0.999
 
-    # KL guard: stop the PPO inner loop (skip the pending optimizer step
-    # and all remaining minibatches/epochs) when |approx_kl| on a
-    # minibatch exceeds this. 0.0 = off. Insurance against runaway
-    # updates: vTwo2 died at update 173 when a single update reached
-    # approx_kl ≈ +2417 and collapsed entropy to 0 (2026-06-11). The v2
-    # discrete anchor head has much heavier-tailed importance ratios
-    # than v1's continuous Beta, so v1 never needed this.
-    target_kl: float = 0.5
+    # SOFT KL guard (early-stop): when a minibatch's |approx_kl| exceeds
+    # this, break the PPO inner loop but KEEP the minibatches already
+    # applied this update (the tripping minibatch's step is not applied).
+    # Standard PPO early-stopping — bounds per-update drift without
+    # discarding progress. 0.0 = off. NOTE: this used to do a full
+    # rollback at this threshold, which froze a run (317/318 updates
+    # rolled back to no-ops, 2026-06-12) once the policy sharpened enough
+    # to cross it every update. Rollback now lives at kl_hard below.
+    target_kl: float = 2.0
 
-    # On a KL-guard trip, restore the model/critic parameters AND
-    # optimizer state captured at the top of update() — the entire
-    # update is discarded instead of keeping the pre-trip minibatches.
-    # Near-threshold partial updates compound: vTwo1 collapsed over
-    # updates 52-80 (2026-06-11) through repeated trips that each kept
-    # their poisoned prefix. Ignored when target_kl == 0.
-    kl_rollback: bool = True
+    # HARD KL guard (full rollback): when a minibatch's |approx_kl|
+    # exceeds this, restore params + optimizer moments captured at the
+    # top of update() — the ENTIRE update is discarded. Reserved for
+    # genuine catastrophe (vTwo2 hit approx_kl ≈ +2417 at update 173 and
+    # collapsed entropy to 0). Should be >= target_kl. 0.0 = no hard
+    # rollback (soft early-stop still applies).
+    kl_hard: float = 10.0
 
     # Clamp normalized advantages to ±this many σ before the PPO loss.
     # 0.0 = off. PPO's clip bounds the importance RATIO, not the

@@ -44,14 +44,20 @@ class PPOStats:
     gate_entropy: float = 0.0
     anchor_entropy: float = 0.0
     beta_entropy: float = 0.0
-    # KL guard: minibatch index (0-based, across epochs) whose
-    # |approx_kl| exceeded target_kl, aborting the inner loop before
-    # its optimizer step. -1 = guard never tripped. `kl_stop` is the
-    # offending value (excluded from the approx_kl average).
+    # Per-head KL decomposition (v2 only): gate_kl + anchor_kl + beta_kl
+    # == approx_kl by construction. Diagnostics for which head drives
+    # drift. Zero on v1.
+    gate_kl: float = 0.0
+    anchor_kl: float = 0.0
+    beta_kl: float = 0.0
+    # KL guard: minibatch index (0-based, across epochs) of the trip
+    # (soft early-stop OR hard rollback), -1 = never tripped. `kl_stop`
+    # is the offending value (excluded from the approx_kl average).
     kl_stopped_at: int = -1
     kl_stop: float = 0.0
-    # True when the trip also rolled the update back entirely
-    # (params + optimizer moments restored; see config.kl_rollback).
+    # True ONLY on a hard-threshold (kl_hard) trip — the whole update
+    # was rolled back. A soft early-stop leaves this False (it keeps
+    # the minibatches already applied).
     rolled_back: bool = False
 
 
@@ -133,12 +139,13 @@ class PPOTrainer:
         # KL-to-EMA reference: zero overhead unless the flag is on.
         self.kl_anchor_coef = float(getattr(config, "kl_anchor_coef", 0.0))
         self.kl_anchor_ema = float(getattr(config, "kl_anchor_ema", 0.999))
-        # KL guard threshold (0 = off); see TrainingConfig.target_kl.
+        # Soft KL guard (early-stop, KEEP applied minibatches); 0 = off.
+        # See TrainingConfig.target_kl.
         self.target_kl = float(getattr(config, "target_kl", 0.0))
-        # On a guard trip, restore params + optimizer state from the
-        # top of update() — discard the whole update, not just the
-        # remainder. See TrainingConfig.kl_rollback.
-        self.kl_rollback = bool(getattr(config, "kl_rollback", False))
+        # Hard KL guard (full rollback): restore params + optimizer state
+        # from the top of update(), discarding the whole update. 0 = off.
+        # See TrainingConfig.kl_hard.
+        self.kl_hard = float(getattr(config, "kl_hard", 0.0))
         self._ref: ActorCritic | None = None
         if self.kl_anchor_coef > 0.0:
             self._ref = copy.deepcopy(model).eval()
@@ -189,15 +196,19 @@ class PPOTrainer:
         total_gate_h = torch.zeros((), device=device)
         total_anchor_h = torch.zeros((), device=device)
         total_beta_h = torch.zeros((), device=device)
+        total_gate_kl = torch.zeros((), device=device)
+        total_anchor_kl = torch.zeros((), device=device)
+        total_beta_kl = torch.zeros((), device=device)
         count = 0
         kl_stopped_at = -1
         kl_stop_val = 0.0
-        # Rollback snapshot: param data + Adam moments, cloned on-device
-        # (~3x param memory, copied once per update). Restored verbatim
-        # on a guard trip so near-threshold partial updates can't
-        # compound across updates (the vTwo1 u52-80 collapse mode).
+        rolled_back_flag = False
+        # Hard-rollback snapshot: param data + Adam moments, cloned
+        # on-device (~3x param memory, copied once per update). Restored
+        # verbatim only on a HARD (kl_hard) trip — a soft early-stop
+        # keeps its applied minibatches and never touches this.
         snapshot: list[tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]] | None = None
-        if self.target_kl > 0.0 and self.kl_rollback:
+        if self.kl_hard > 0.0:
             snapshot = []
             for p in self._all_params:
                 st = self.optimizer.state.get(p, {})
@@ -221,6 +232,7 @@ class PPOTrainer:
                                 (
                                     log_prob, entropy, display_value,
                                     gate_h, anchor_h, beta_h,
+                                    gate_lp_new, anchor_lp_new,
                                 ) = self._evaluate(
                                     mb.obs,
                                     mb.gate_masks,
@@ -293,18 +305,35 @@ class PPOTrainer:
                     with record_function("step12e/kl"):
                         with torch.no_grad():
                             kl = (mb.log_probs - log_prob).mean()
+                            # Per-head KL decomposition (v2 only): gate
+                            # and anchor (raise rows) computed directly,
+                            # beta derived by the joint identity. Pure
+                            # diagnostics — never feeds the loss or guard.
+                            if self.head_version >= 2:
+                                gate_kl = (mb.old_gate_logp - gate_lp_new).mean()
+                                raise_m = (mb.gate_actions == GATE_RAISE)
+                                denom_r = raise_m.sum().clamp(min=1)
+                                anchor_kl = (
+                                    (mb.old_anchor_logp - anchor_lp_new) * raise_m
+                                ).sum() / denom_r
+                                beta_kl = kl - gate_kl - anchor_kl
 
-                    # KL guard: checked BEFORE the optimizer step so a
-                    # runaway minibatch is skipped, not applied. The
-                    # .item() forces a per-minibatch device sync, which
-                    # the accumulators below deliberately avoid — but it
-                    # is the price of being able to abort in time, and
-                    # is negligible against multi-minute updates.
-                    if self.target_kl > 0.0:
+                    # KL guard: checked BEFORE the optimizer step so the
+                    # offending minibatch is never applied. Two thresholds:
+                    #   |kl| > kl_hard  -> HARD: full rollback (revert the
+                    #                      whole update) — catastrophe only.
+                    #   |kl| > target_kl -> SOFT: early-stop, KEEP the
+                    #                      minibatches already applied.
+                    # The .item() forces a per-minibatch sync; negligible
+                    # against multi-minute updates, and load-bearing for
+                    # aborting in time.
+                    if self.kl_hard > 0.0 or self.target_kl > 0.0:
                         kl_now = float(kl.item())
-                        if abs(kl_now) > self.target_kl:
+                        abs_kl = abs(kl_now)
+                        if self.kl_hard > 0.0 and abs_kl > self.kl_hard:
                             kl_stopped_at = count
                             kl_stop_val = kl_now
+                            rolled_back_flag = True
                             if snapshot is not None:
                                 with torch.no_grad():
                                     for p, (pd, m1, m2) in zip(
@@ -329,6 +358,12 @@ class PPOTrainer:
                                             # this update (tensor or int).
                                             st["step"] -= count
                             break
+                        if self.target_kl > 0.0 and abs_kl > self.target_kl:
+                            # SOFT early-stop: keep applied minibatches,
+                            # do NOT touch the snapshot.
+                            kl_stopped_at = count
+                            kl_stop_val = kl_now
+                            break
 
                     with record_function("step12c/backward"):
                         self.optimizer.zero_grad()
@@ -345,6 +380,10 @@ class PPOTrainer:
                     total_gate_h += gate_h.detach().float().mean()
                     total_anchor_h += anchor_h.detach().float().mean()
                     total_beta_h += beta_h.detach().float().mean()
+                    if self.head_version >= 2:
+                        total_gate_kl += gate_kl.float()
+                        total_anchor_kl += anchor_kl.float()
+                        total_beta_kl += beta_kl.float()
                     count += 1
         self._ema_update_ref()
         denom = max(count, 1)
@@ -359,7 +398,10 @@ class PPOTrainer:
                 gate_entropy=float(total_gate_h.item()) / denom,
                 anchor_entropy=float(total_anchor_h.item()) / denom,
                 beta_entropy=float(total_beta_h.item()) / denom,
+                gate_kl=float(total_gate_kl.item()) / denom,
+                anchor_kl=float(total_anchor_kl.item()) / denom,
+                beta_kl=float(total_beta_kl.item()) / denom,
                 kl_stopped_at=kl_stopped_at,
                 kl_stop=kl_stop_val,
-                rolled_back=(kl_stopped_at >= 0 and snapshot is not None),
+                rolled_back=rolled_back_flag,
             )

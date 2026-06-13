@@ -160,37 +160,54 @@ def test_anneal_due_warmup_gating():
     assert due(49, 50, 0)
 
 
+class _StubTrainer:
+    target_kl = 2.0
+    kl_hard = 10.0
+
+
 def test_apply_anneal_control_step_and_tiers():
     apply = train._apply_anneal_control
     tier_ent = {"clubgg": 0.09, "deep": 0.15}
+    lr0 = 3e-4
 
-    # No file content -> unchanged.
-    step, last = apply(None, None, tier_ent, 0.002)
-    assert step == 0.002 and last is None
+    # No file content -> unchanged (now a 3-tuple incl. live_lr).
+    step, last, lr = apply(None, None, tier_ent, 0.002, lr0)
+    assert step == 0.002 and last is None and lr == lr0
 
     # Step change applies once and is remembered via content tracking.
     raw1 = '{"step": 0.003}'
-    step, last = apply(raw1, None, tier_ent, 0.002)
+    step, last, lr = apply(raw1, None, tier_ent, 0.002, lr)
     assert step == 0.003 and last == raw1
-    step, last = apply(raw1, last, tier_ent, step)  # same content -> no-op
+    step, last, lr = apply(raw1, last, tier_ent, step, lr)  # same -> no-op
     assert step == 0.003
 
     # Tier override applies in place; unknown tiers ignored.
     raw2 = '{"tier_ent": {"deep": 0.08, "bogus": 1.0}}'
-    step, last = apply(raw2, last, tier_ent, step)
+    step, last, lr = apply(raw2, last, tier_ent, step, lr)
     assert tier_ent["deep"] == 0.08
     assert tier_ent["clubgg"] == 0.09
     assert "bogus" not in tier_ent
 
     # Both at once.
     raw3 = '{"step": 0.001, "tier_ent": {"clubgg": 0.05}}'
-    step, last = apply(raw3, last, tier_ent, step)
+    step, last, lr = apply(raw3, last, tier_ent, step, lr)
     assert step == 0.001 and tier_ent["clubgg"] == 0.05
+
+    # Live LR override returns the new base lr.
+    raw4 = '{"lr": 0.0001}'
+    step, last, lr = apply(raw4, last, tier_ent, step, lr)
+    assert lr == 0.0001
+
+    # target_kl / kl_hard mutate the trainer in place.
+    trn = _StubTrainer()
+    raw5 = '{"target_kl": 1.5, "kl_hard": 12.0}'
+    step, last, lr = apply(raw5, last, tier_ent, step, lr, trainer=trn)
+    assert trn.target_kl == 1.5 and trn.kl_hard == 12.0
 
     # Malformed JSON: ignored, not marked applied (so a half-written
     # save retries next loop).
-    step2, last2 = apply('{"step": 0.0', last, tier_ent, step)
-    assert step2 == step and last2 == last
+    step2, last2, lr2 = apply('{"step": 0.0', last, tier_ent, step, lr)
+    assert step2 == step and last2 == last and lr2 == lr
 
 
 def test_default_tolerance_and_start_update_flags():
