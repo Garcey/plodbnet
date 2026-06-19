@@ -49,7 +49,7 @@ class TrainingConfig:
     hidden_dim: int = 128
     num_layers: int = 2
     num_updates: int = 1000
-    opponent_pool_size: int = 16
+    opponent_pool_size: int = 8
     snapshot_every: int = 50
     seed: int = 0
 
