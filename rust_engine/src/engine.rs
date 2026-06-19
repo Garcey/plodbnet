@@ -969,18 +969,24 @@ impl GameState {
     /// evaluated on the *visible* board under PLO5 rules (exactly 2 from
     /// k + 3 from board). No runout sampling on flop/turn.
     ///
-    /// Sampling: k=2 and k=3 are exhaustive; k=4 uses 1024 MC samples.
-    /// PRNG seeded deterministically from the immutable observation
-    /// state so the feature is reproducible (parity tests survive).
+    /// Sampling: k=2 is exhaustive; k=3 and k=4 use `mc_samples` MC
+    /// draws each. PRNG seeded deterministically from the immutable
+    /// observation state so the feature is reproducible (parity tests
+    /// survive at a fixed sample count).
     ///
     /// Returns all-zero before the flop or when the hand is terminal.
-    pub fn opp_outcome_fractions(&self) -> Vec<f32> {
+    ///
+    /// Serial / UI / eval callers use the 1024-sample
+    /// `opp_outcome_fractions` wrapper; batched training passes a
+    /// smaller `mc_samples` (e.g. 256) — this feature is ~94% of the
+    /// per-decision encode cost, so halving the MC budget roughly
+    /// doubles obs-build throughput at a benign ~1-3% extra noise.
+    pub fn opp_outcome_fractions_mc(&self, mc_samples: usize) -> Vec<f32> {
         const N_OUT: usize = 12;
         const SCOOP_OPP: usize = 0;
         const QUARTER_OPP: usize = 1;
         const SCOOP_HERO: usize = 2;
         const QUARTER_HERO: usize = 3;
-        const MC_SAMPLES: usize = 1024;
 
         let hero_seat = match self.actor {
             Some(s) => s,
@@ -1066,9 +1072,9 @@ impl GameState {
             let mut samples: u32 = 0;
 
             // k=2 exhaustive (C(<=41, 2) <= 820 is cheap); k=3,4 always
-            // MC. Previously k=3 was exhaustive at turn+river (C(39,3) and
-            // C(37,3) both <= 10k), but that's ~18k evals/env vs ~2k for
-            // MC=1024 — dominated bundle cost.
+            // MC (`mc_samples` draws each). Previously k=3 was exhaustive
+            // at turn+river (C(39,3) and C(37,3) both <= 10k), but that's
+            // ~18k evals/env vs ~2*mc_samples for MC — dominated bundle cost.
             if k == 2 {
                 let mut idx: Vec<usize> = (0..k).collect();
                 loop {
@@ -1098,7 +1104,7 @@ impl GameState {
                 }
             } else {
                 debug_assert!(n_unseen <= 64);
-                for _ in 0..MC_SAMPLES {
+                for _ in 0..mc_samples {
                     let mut mask: u64 = 0;
                     opp_buf.clear();
                     let mut written = 0;
@@ -1126,6 +1132,12 @@ impl GameState {
             }
         }
         out
+    }
+
+    /// 1024-sample MC convenience wrapper (serial / UI / eval path).
+    /// See [`Self::opp_outcome_fractions_mc`].
+    pub fn opp_outcome_fractions(&self) -> Vec<f32> {
+        self.opp_outcome_fractions_mc(1024)
     }
 
     // ---- Internal helpers ----

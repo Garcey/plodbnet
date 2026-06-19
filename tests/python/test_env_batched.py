@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 
 from plo5bp.config import GameConfig
+from plo5bp.encoding import _OPP_OUTCOME_DIM, _OPP_OUTCOME_OFF
 from plo5bp.env import BombPotEnv
 from plo5bp.env_batched import BatchedBombPotEnv
 
@@ -167,3 +168,42 @@ def test_reset_terminal_batch_refreshes_masked_envs_only() -> None:
     for i in range(1, n):
         assert bstep.actors[i] == actors_before[i]
         assert np.array_equal(bstep.obs[i], obs_before[i])
+
+
+def test_opp_outcome_mc_budget_plumbs_through() -> None:
+    """The `opp_outcome_mc` kwarg reaches the Rust MC sampler.
+
+    A batched build at mc=256 must equal the serial engine's explicit
+    256-sample call bit-for-bit (same deterministic per-state seed +
+    budget), and must differ from the 1024-sample default (proving the
+    kwarg is honored, not ignored) while staying numerically close.
+    """
+    cfg = GameConfig(num_seats=6, starting_stack=200000, ante=30000, bb=10000)
+    seeds = np.array([12345, 999, 42, 7, 100003], dtype=np.uint64)
+    buttons = np.zeros(len(seeds), dtype=np.uint8)
+    off, dim = _OPP_OUTCOME_OFF, _OPP_OUTCOME_OFF + _OPP_OUTCOME_DIM
+
+    be256 = BatchedBombPotEnv(len(seeds), cfg, opp_outcome_mc=256)
+    s256 = be256.reset_batch(seeds, buttons)
+    be1024 = BatchedBombPotEnv(len(seeds), cfg)  # default 1024
+    s1024 = be1024.reset_batch(seeds, buttons)
+
+    differs_somewhere = False
+    for i, seed in enumerate(seeds):
+        # Serial engine, explicit 256-sample call: same (seed, button) →
+        # same deal → same per-state seed → bit-identical fractions.
+        env = BombPotEnv(cfg)
+        env.reset(int(seed), int(buttons[i]))
+        serial256 = np.asarray(
+            env._rs.opp_outcome_fractions_mc(256), dtype=np.float32
+        )
+        np.testing.assert_array_equal(s256.obs[i, off:dim], serial256)
+        # 256 vs 1024: same statistic, lower fidelity → close, not equal.
+        np.testing.assert_allclose(
+            s256.obs[i, off:dim], s1024.obs[i, off:dim], atol=0.2
+        )
+        if not np.array_equal(s256.obs[i, off:dim], s1024.obs[i, off:dim]):
+            differs_somewhere = True
+    # At least one non-degenerate spot must actually change with the
+    # sample count, else the kwarg could be silently ignored.
+    assert differs_somewhere

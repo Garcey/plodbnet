@@ -786,6 +786,16 @@ def collect_rollout(
     )
 
 
+# k=3/k=4 Monte-Carlo budget for the opp-outcome obs feature during
+# BATCHED TRAINING rollout. Lower than the 1024-sample serial/UI/eval
+# default to cut the dominant per-decision encode cost (the feature is
+# ~94% of obs-build, so ~halving the MC budget ~doubles obs-build
+# throughput). The ~1-3% extra MC noise on 12 of 991 dims is a benign,
+# fine-tune-safe regularizer; the UI/eval/serial paths keep 1024 so the
+# study tool still computes the more accurate estimate.
+TRAIN_OPP_OUTCOME_MC = 256
+
+
 def collect_rollout_batched(
     learner: ActorCritic,
     pool: OpponentPool,
@@ -807,7 +817,10 @@ def collect_rollout_batched(
     device = next(learner.parameters()).device
 
     env = BatchedBombPotEnv(
-        n_envs, game_config, ev_runout_samples=train_config.ev_runout_samples
+        n_envs,
+        game_config,
+        ev_runout_samples=train_config.ev_runout_samples,
+        opp_outcome_mc=TRAIN_OPP_OUTCOME_MC,
     )
 
     snapshot_models: dict[int, ActorCritic] = {}

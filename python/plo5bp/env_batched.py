@@ -57,9 +57,14 @@ class BatchedBombPotEnv:
         num_envs: int,
         config: GameConfig | None = None,
         ev_runout_samples: int = 0,
+        opp_outcome_mc: int = 1024,
     ):
         self.n = int(num_envs)
         self.config = config or GameConfig()
+        # k=3/k=4 Monte-Carlo budget for the opp-outcome obs feature.
+        # 1024 (serial/UI/eval fidelity) by default; training rollout
+        # passes a lower count for speed. See rollout.TRAIN_OPP_OUTCOME_MC.
+        self._opp_outcome_mc = int(opp_outcome_mc)
         # Default-off switch for the Rust observation encoder. When set, the
         # finished obs comes straight from the engine (one FFI call, no numpy
         # assembly); otherwise the numpy `encode_observation_batch` reference
@@ -78,6 +83,7 @@ class BatchedBombPotEnv:
             ante=self.config.ante,
             bb=self.config.bb,
             starting_stacks=stacks,
+            opp_outcome_mc=self._opp_outcome_mc,
         )
         self._ev_runout_samples = int(ev_runout_samples)
         self._reset_seeds = np.zeros(self.n, dtype=np.uint64)

@@ -232,6 +232,13 @@ impl PyGameState {
         Ok(self.get()?.opp_outcome_fractions())
     }
 
+    /// Like `opp_outcome_fractions` but with an explicit k=3/k=4 MC
+    /// sample budget (the no-arg form uses 1024). For tests / benchmarks
+    /// of the training-vs-UI fidelity split.
+    fn opp_outcome_fractions_mc(&self, mc_samples: usize) -> PyResult<Vec<f32>> {
+        Ok(self.get()?.opp_outcome_fractions_mc(mc_samples))
+    }
+
     /// Dict-shaped observation. See module doc for keys.
     fn observation_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let g = self.get()?;
@@ -662,12 +669,16 @@ const HISTORY_CAP: usize = 32;
 pub struct PyBatchedEngine {
     states: Vec<Option<GameState>>,
     config: GameConfig,
+    /// k=3/k=4 Monte-Carlo budget for `opp_outcome_fractions` on this
+    /// engine. Serial/UI/eval use 1024; batched TRAINING sets it lower
+    /// (256) to cut the dominant per-decision encode cost.
+    opp_outcome_mc: usize,
 }
 
 #[pymethods]
 impl PyBatchedEngine {
     #[new]
-    #[pyo3(signature = (num_envs, num_seats=6, starting_stack=200000, ante=30000, bb=10000, starting_stacks=None))]
+    #[pyo3(signature = (num_envs, num_seats=6, starting_stack=200000, ante=30000, bb=10000, starting_stacks=None, opp_outcome_mc=1024))]
     fn new(
         num_envs: usize,
         num_seats: usize,
@@ -675,12 +686,16 @@ impl PyBatchedEngine {
         ante: u64,
         bb: u64,
         starting_stacks: Option<PyReadonlyArray1<'_, u64>>,
+        opp_outcome_mc: usize,
     ) -> PyResult<Self> {
         if num_envs == 0 {
             return Err(PyValueError::new_err("num_envs must be >= 1"));
         }
         if num_seats < 2 {
             return Err(PyValueError::new_err("num_seats must be >= 2"));
+        }
+        if opp_outcome_mc == 0 {
+            return Err(PyValueError::new_err("opp_outcome_mc must be >= 1"));
         }
         let stacks = resolve_starting_stacks(num_seats, starting_stack, starting_stacks)?;
         Ok(PyBatchedEngine {
@@ -691,6 +706,7 @@ impl PyBatchedEngine {
                 ante,
                 bb,
             },
+            opp_outcome_mc,
         })
     }
 
@@ -1561,15 +1577,16 @@ impl PyBatchedEngine {
         let mut opp_outcome_fractions = Array2::<f32>::zeros((n, 12));
 
         // Compute opp_outcome_fractions in parallel — this is the
-        // expensive per-env work (k=2/3 exhaustive + k=4 MC=1024 hand
-        // evaluations). The remaining per-env writes below are cheap
-        // memcpy and stay serial.
+        // expensive per-env work (k=2 exhaustive + k=3/k=4 MC at
+        // `self.opp_outcome_mc` draws). The remaining per-env writes
+        // below are cheap memcpy and stay serial.
+        let opp_outcome_mc = self.opp_outcome_mc;
         let opp_fr_per_env: Vec<[f32; 12]> = (0..n)
             .into_par_iter()
             .map(|i| {
                 let mut out = [0.0f32; 12];
                 if let Some(state) = self.states[idx[i]].as_ref() {
-                    let fr = state.opp_outcome_fractions();
+                    let fr = state.opp_outcome_fractions_mc(opp_outcome_mc);
                     for j in 0..12 {
                         out[j] = fr[j];
                     }
