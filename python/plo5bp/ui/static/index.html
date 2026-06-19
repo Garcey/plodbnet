@@ -117,8 +117,12 @@
             <g id="board-b" transform="translate(280 285)"></g>
 
             <g id="pot-badge">
-              <rect x="338" y="154" width="124" height="32" rx="16" class="pot-badge-rect" />
-              <text id="pot-label" x="400" y="175" text-anchor="middle" class="pot-label">Pot 0bb</text>
+              <rect x="320" y="154" width="160" height="32" rx="16" class="pot-badge-rect" />
+              <text id="pot-label" x="400" y="175" text-anchor="middle" class="pot-label">Total Pot 0bb</text>
+            </g>
+            <g id="pot-settled-badge">
+              <rect x="345" y="360" width="110" height="22" rx="11" class="pot-settled-rect" />
+              <text id="pot-settled-label" x="400" y="375" text-anchor="middle" class="pot-settled-label">Pot 0bb</text>
             </g>
 
             <g id="seats"></g>
@@ -161,9 +165,11 @@
           </div>
           <div class="review-mid">
             <div class="review-step-row">
-              <button id="review-prev" type="button" aria-label="Previous decision">‹</button>
+              <button id="review-first" type="button" aria-label="First node" title="Jump to first decision">«</button>
+              <button id="review-prev" type="button" aria-label="Previous node">‹</button>
               <span id="review-step-label"></span>
-              <button id="review-next" type="button" aria-label="Next decision">›</button>
+              <button id="review-next" type="button" aria-label="Next node">›</button>
+              <button id="review-last" type="button" aria-label="Last node" title="Jump to last decision">»</button>
             </div>
             <div id="review-chips"></div>
             <div id="review-whatif-bar" hidden>

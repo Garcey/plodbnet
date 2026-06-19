@@ -137,3 +137,179 @@ def test_repeat_redeal_is_identical(trainer_factory, play_to_terminal):
     assert ts.hand.is_repeat
     assert ts.hand.seed == seed and ts.hand.button == button
     assert ts.hand.all_holes == holes
+
+
+# --- All-decisions node stepper (hero + villain) --------------------------
+
+
+def _review(ts, node):
+    """The review block projected at a given action_log node index."""
+    return ts.review_at_node(node)["trainer"]["review"]
+
+
+def test_node_index_matches_action_log(trainer_factory, play_to_terminal):
+    ts = trainer_factory(seats_mode="fixed", seats_fixed=4, mc_rollouts=0)
+    ts.new_hand()
+    play_to_terminal(ts)
+    rv = _review(ts, 0)
+    log = ts.hand.action_log
+    assert rv["num_nodes"] == len(log)
+    assert len(rv["nodes"]) == len(log)
+    for i, (row, a) in enumerate(zip(rv["nodes"], log)):
+        assert row["node_idx"] == i
+        assert row["seat"] == a["seat"]
+        assert row["is_hero"] == (a["seat"] == ts.hand.hero_seat)
+
+
+def test_pills_map_to_hero_nodes(trainer_factory, play_to_terminal):
+    ts = trainer_factory(seats_mode="fixed", seats_fixed=4, mc_rollouts=0)
+    ts.new_hand()
+    play_to_terminal(ts)
+    if not ts.hand.decisions:
+        pytest.skip("hero never acted")
+    rv = _review(ts, 0)
+    nodes = rv["nodes"]
+    assert rv["decisions"]  # one pill per hero decision
+    for pill in rv["decisions"]:
+        ni = pill["node_idx"]
+        assert nodes[ni]["is_hero"] is True
+        assert nodes[ni]["decision_idx"] == pill["decision_idx"]
+
+
+def test_villain_node_view(trainer_factory, play_to_terminal):
+    ts = trainer_factory(seats_mode="fixed", seats_fixed=4, mc_rollouts=0)
+    ts.new_hand()
+    play_to_terminal(ts)
+    villain = next(
+        (n for n in _review(ts, 0)["nodes"] if not n["is_hero"]), None
+    )
+    if villain is None:
+        pytest.skip("no villain decision in this hand")
+    nc = _review(ts, villain["node_idx"])["node_current"]
+    assert nc["is_hero"] is False
+    assert nc["node_idx"] == villain["node_idx"]
+    assert len(nc["gate_probs"]) == 3
+    assert abs(sum(nc["gate_probs"]) - 1.0) < 1e-2
+    assert isinstance(nc["value_bb"], float)
+    assert nc["actual_label"]
+    assert "score" not in nc  # no graded user action at a villain node
+
+
+def test_hero_node_overlays_stored_record(trainer_factory, play_to_terminal):
+    ts = trainer_factory(seats_mode="fixed", seats_fixed=4, mc_rollouts=4)
+    ts.new_hand()
+    play_to_terminal(ts)
+    if not ts.hand.decisions:
+        pytest.skip("hero never acted")
+    d = ts.hand.decisions[0]
+    nc = _review(ts, d.action_log_idx)["node_current"]
+    assert nc["is_hero"] is True
+    assert nc["decision_idx"] == d.decision_idx
+    assert nc["score"] == round(d.score, 1)
+    assert nc["category"] == d.category
+    assert nc["ev_loss_bb"] == d.ev_loss_bb  # MC value a fresh forward can't reproduce
+
+
+def test_review_at_node_clamps(trainer_factory, play_to_terminal):
+    ts = trainer_factory(seats_mode="fixed", seats_fixed=4, mc_rollouts=0)
+    ts.new_hand()
+    play_to_terminal(ts)
+    n = len(ts.hand.action_log)
+    assert _review(ts, -5)["node"] == 0
+    assert _review(ts, 10**9)["node"] == n - 1
+
+
+def test_early_node_hides_turn_river(trainer_factory, play_to_terminal):
+    ts = trainer_factory(seats_mode="fixed", seats_fixed=4, mc_rollouts=0)
+    ts.new_hand()
+    play_to_terminal(ts)
+    spec = ts.review_at_node(0)["card_spec"]
+    assert spec["turn"] == [None, None]
+    assert spec["river"] == [None, None]
+
+
+def test_review_block_backcompat(trainer_factory, play_to_terminal):
+    ts = trainer_factory(seats_mode="fixed", seats_fixed=4, mc_rollouts=0)
+    ts.new_hand()
+    play_to_terminal(ts)
+    if not ts.hand.decisions:
+        pytest.skip("hero never acted")
+    rb = ts.review_block(0)
+    assert rb["current"] is not None
+    assert rb["current"]["decision_idx"] == 0
+    assert rb["node"] == ts.hand.decisions[0].action_log_idx
+    assert rb["node_current"] is None
+
+
+def test_node_view_true_ev_matches_critic(trainer_factory, play_to_terminal):
+    """The review's true-EV must equal an independent critic call built
+    from the canonical rotation helper — pins the opp-multihot convention
+    (rotation / dealt order / dtype) to the training path."""
+    import numpy as np
+    import torch
+
+    from plo5bp.network import ActorCriticV2, CentralCritic
+    from plo5bp.rollout import _critic_values, _rotate_opp_holes
+
+    ts = trainer_factory(
+        model_cls=ActorCriticV2, seats_mode="fixed", seats_fixed=4, mc_rollouts=0
+    )
+    torch.manual_seed(1)
+    critic = CentralCritic(hidden_dim=32, num_blocks=1).eval()
+    for p in critic.parameters():
+        p.requires_grad_(False)
+    ts.critic = critic
+    ts.new_hand()
+    play_to_terminal(ts)
+    node_idx = len(ts.hand.action_log) // 2
+    env, obs, info = ts._replay_to_node(node_idx)
+    nc = ts._node_view(node_idx, obs, info)
+    assert nc["value_true_bb"] is not None
+    actor = int(info.actor)
+    holes = np.asarray(ts.hand.all_holes_dealt, dtype=np.uint8)
+    opp = _rotate_opp_holes(holes, actor)[None]
+    expected = round(float(_critic_values(
+        critic, ts.device, obs[None].astype(np.float32), opp,
+    )[0]), 4)
+    assert nc["value_true_bb"] == expected
+
+
+def test_review_endpoint_node_param(tmp_path, monkeypatch):
+    import torch
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from plo5bp.network import ActorCritic
+    from plo5bp.ui.trainer import TrainerSettings, create_trainer_router
+
+    monkeypatch.setenv("PLO5BP_TRAINER_STATS", str(tmp_path / "stats.json"))
+    torch.manual_seed(0)
+    model = ActorCritic(hidden_dim=32, num_layers=1).eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    router = create_trainer_router(model, torch.device("cpu"))
+    ts = router.trainer_session
+    ts.settings = TrainerSettings(**{
+        **ts.settings.model_dump(),
+        "seats_mode": "fixed", "seats_fixed": 4, "mc_rollouts": 0,
+    })
+    ts.new_hand()
+    steps = 0
+    while ts.hand is not None and not ts.hand.terminal and steps < 80:
+        s = ts.project_state()
+        legal = s["legal"]
+        if legal["check_call"]:
+            ts.act("check_call", None)
+        elif legal["fold"]:
+            ts.act("fold", None)
+        else:
+            ts.act("raise", s["raise_bounds"]["min_chips"])
+        steps += 1
+    app = FastAPI()
+    app.include_router(router)
+    client = TestClient(app)
+    r = client.get("/trainer/review", params={"node": 0})
+    assert r.status_code == 200
+    rv = r.json()["state"]["trainer"]["review"]
+    assert rv["node_current"]["node_idx"] == 0
+    assert rv["num_nodes"] == len(ts.hand.action_log)

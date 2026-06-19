@@ -64,6 +64,32 @@ def test_exact_rec_pick_scores_100_best():
     assert sc["user_anchor"] == 5
 
 
+def test_recommended_mean_size_scores_full_v2():
+    # Skewed Beta (mean != mode): betting the MEAN — what the deterministic
+    # rec bets — must earn full size credit. Regression for the mean/mode
+    # scoring mismatch (a matched bet previously scored well under 100%).
+    refine_ok = [False] * 11
+    refine_ok[5] = True
+    alpha, beta = 2.0, 6.0
+    refine_params = [[1.0, 1.0]] * 9
+    refine_params[4] = [alpha, beta]
+    chips = [100 * k + 100 for k in range(11)]
+    lo = [chips[k] - 50 for k in range(11)]
+    hi = [chips[k] + 50 for k in range(11)]
+    probs = [0.0] * 11
+    probs[5] = 1.0
+    d = _dist(
+        anchor_probs=probs, anchor_chips=chips, refine_ok=refine_ok,
+        refine_params=refine_params, anchor_lo=lo, anchor_hi=hi,
+    )
+    mean = alpha / (alpha + beta)
+    user_chips = round(lo[5] + mean * (hi[5] - lo[5]))
+    sc = score_move_v2(d, GATE_RAISE, user_chips)
+    assert sc["user_anchor"] == 5
+    assert sc["size_q"] == pytest.approx(1.0, abs=1e-3)
+    assert sc["score"] == pytest.approx(100.0, abs=0.5)
+
+
 def test_nearest_anchor_snapping_tie_goes_lower():
     d = _dist()
     # chips exactly between anchors 3 (400) and 4 (500) → snaps to 3.

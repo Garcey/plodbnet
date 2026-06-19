@@ -54,7 +54,8 @@ from plo5bp.actions import (
 from plo5bp.config import GameConfig
 from plo5bp.env import BombPotEnv, StepInfo
 from plo5bp.eval import model_policy
-from plo5bp.network import ActorCritic, obs_adapter
+from plo5bp.network import ActorCritic, CentralCritic, obs_adapter
+from plo5bp.rollout import _critic_values, _rotate_opp_holes
 from plo5bp.sizing import ANCHOR_COUNT, anchor_grid_np, sizing_from_info
 from plo5bp.ui.common import (
     STREET_NAMES,
@@ -123,15 +124,19 @@ def score_move(
         eps = SCORING["u_eps"]
         u = (user_chips - min_chips) / (max_chips - min_chips)
         u = min(1.0 - eps, max(eps, u))
-        if alpha + beta > 2.0 + 1e-9:
-            mode = (alpha - 1.0) / (alpha + beta - 2.0)
-            mode = min(1.0 - eps, max(eps, mode))
+        # Reference the Beta MEAN (= the size the deterministic policy bets
+        # and the UI shows as "the network's choice"), clamped to <=1, so
+        # playing the recommended size earns full size credit. Density peaks
+        # at the mode, not the mean, so a size between mean and mode also
+        # reads as full quality; only the tails are penalized. (The earlier
+        # mode reference scored the recommended mean < 100% on skewed Betas.)
+        ref = alpha / (alpha + beta)
+        ref = min(1.0 - eps, max(eps, ref))
 
-            def logpdf(x: float) -> float:
-                return (alpha - 1.0) * math.log(x) + (beta - 1.0) * math.log(1.0 - x)
+        def logpdf(x: float) -> float:
+            return (alpha - 1.0) * math.log(x) + (beta - 1.0) * math.log(1.0 - x)
 
-            size_q = math.exp(logpdf(u) - logpdf(mode))
-        # else alpha == beta == 1 -> uniform; every size is the mode.
+        size_q = min(1.0, math.exp(logpdf(u) - logpdf(ref)))
 
     size_factor = SCORING["size_floor"] + (1.0 - SCORING["size_floor"]) * size_q
     score = 100.0 * gate_ratio * (size_factor if user_gate == GATE_RAISE else 1.0)
@@ -202,16 +207,19 @@ def score_move_v2(
                 u = (user_chips - lo) / (hi - lo)
                 u = min(1.0 - eps, max(eps, u))
                 alpha, beta = dist["refine_params"][user_anchor - 1]
-                if alpha + beta > 2.0 + 1e-9:
-                    mode = (alpha - 1.0) / (alpha + beta - 2.0)
-                    mode = min(1.0 - eps, max(eps, mode))
+                # Reference the Beta MEAN (= the size the deterministic policy
+                # bets and the UI shows as the recommendation), clamped to <=1,
+                # so betting the recommended size earns full size credit. The
+                # earlier mode reference penalized the recommended mean on any
+                # skewed Beta (a matched bet could score well under 100%).
+                ref = alpha / (alpha + beta)
+                ref = min(1.0 - eps, max(eps, ref))
 
-                    def logpdf(x: float) -> float:
-                        return (alpha - 1.0) * math.log(x) \
-                            + (beta - 1.0) * math.log(1.0 - x)
+                def logpdf(x: float) -> float:
+                    return (alpha - 1.0) * math.log(x) \
+                        + (beta - 1.0) * math.log(1.0 - x)
 
-                    pdf_ratio = math.exp(logpdf(u) - logpdf(mode))
-                # else alpha == beta == 1 -> uniform; every size is the mode.
+                pdf_ratio = min(1.0, math.exp(logpdf(u) - logpdf(ref)))
         size_q = anchor_ratio * pdf_ratio
 
     size_factor = SCORING["size_floor"] + (1.0 - SCORING["size_floor"]) * size_q
@@ -444,6 +452,9 @@ class DecisionRecord:
     ev_user_bb: float | None = None
     ev_best_bb: float | None = None
     ev_loss_bb: float | None = None
+    # Hero's total committed chips AT the decision node (= chips forfeited
+    # on a fold). Rebases the EV components to forward-facing (fold = 0).
+    hero_committed_chips: int = 0
     # v2 (anchor head) extras; None/1 on v1 records. For v2, (alpha,
     # beta) above hold the REC anchor's refinement params (1.0/1.0 when
     # the rec anchor is an atom).
@@ -534,9 +545,14 @@ class TrainerSession:
         model: ActorCritic,
         device: torch.device,
         stats_path: Path | None = None,
+        critic: CentralCritic | None = None,
     ):
         self.model = model
         self.device = device
+        # Centralized critic (sees all hole cards) for the review's
+        # "true EV" readout. None on v1 / when the checkpoint lacks one
+        # → review shows only the actor's own (blind) value estimate.
+        self.critic = critic
         self.lock = threading.Lock()
         self.settings = TrainerSettings()
         self.hand: HandRecord | None = None
@@ -788,6 +804,7 @@ class TrainerSession:
             value_bb=dist["value_bb"],
             pot_chips=int(raw["pot"]),
             to_call_chips=_to_call_chips(raw, h.hero_seat),
+            hero_committed_chips=int(raw["total_commit"][h.hero_seat]),
             user_gate=gate_idx,
             user_chips=chips,
             gate_ratio=sc["gate_ratio"],
@@ -884,8 +901,12 @@ class TrainerSession:
         prefix = h.action_log[: d.action_log_idx]
         ev_user = self._rollout_ev(h, prefix, d.user_gate, d.user_chips, n, node_seed)
         ev_best = self._rollout_ev(h, prefix, d.rec_gate, d.rec_chips, n, node_seed)
-        d.ev_user_bb = round(ev_user, 4)
-        d.ev_best_bb = round(ev_best, 4)
+        # Forward-facing EV: rebase by the chips already committed at this
+        # node (sunk), so a fold reads as 0 EV instead of -(committed). The
+        # offset is identical for both candidates, so the loss is unchanged.
+        committed_bb = chips_to_bb(d.hero_committed_chips, h.config.bb)
+        d.ev_user_bb = round(ev_user + committed_bb, 4)
+        d.ev_best_bb = round(ev_best + committed_bb, 4)
         d.ev_loss_bb = round(max(0.0, ev_best - ev_user), 4)
 
     def _rollout_ev(
@@ -948,14 +969,25 @@ class TrainerSession:
 
     # -- review / what-if ------------------------------------------------------------
 
-    def _replay_to_decision(self, d: DecisionRecord) -> tuple[BombPotEnv, np.ndarray, StepInfo]:
+    def _replay_to_node(
+        self, node_idx: int
+    ) -> tuple[BombPotEnv, np.ndarray, StepInfo]:
+        """Replay the recorded action_log up to (not including) `node_idx`
+        — leaving the engine at the node whose actor is
+        `action_log[node_idx]["seat"]`. The encoder is actor-rotated, so
+        the returned obs is that actor's observation."""
         h = self.hand
         assert h is not None
         env = BombPotEnv(h.config)
         obs, info = env.reset(h.seed, h.button)
-        for a in h.action_log[: d.action_log_idx]:
+        for a in h.action_log[:node_idx]:
             obs, _, _, info = env.step_hybrid(a["gate"], a["chips"])
         return env, obs, info
+
+    def _replay_to_decision(
+        self, d: DecisionRecord
+    ) -> tuple[BombPotEnv, np.ndarray, StepInfo]:
+        return self._replay_to_node(d.action_log_idx)
 
     def _decision_for(self, idx: int) -> DecisionRecord:
         h = self.hand
@@ -968,27 +1000,141 @@ class TrainerSession:
             idx = max(0, min(len(h.decisions) - 1, idx))
         return h.decisions[idx]
 
-    def review_block(
-        self, current_idx: int, whatif: dict[str, Any] | None = None
+    def _hero_by_node(self) -> dict[int, DecisionRecord]:
+        """Map action_log index -> hero DecisionRecord. Keys are unique:
+        `action_log_idx` is captured as len(action_log) right before each
+        hero action is appended."""
+        h = self.hand
+        assert h is not None
+        return {d.action_log_idx: d for d in h.decisions}
+
+    def _node_index(self) -> list[dict[str, Any]]:
+        """One lightweight row per action_log entry (every seat's
+        decision, in order) — drives the review stepper and the pill ->
+        node mapping."""
+        h = self.hand
+        assert h is not None
+        hero_by_node = self._hero_by_node()
+        rows: list[dict[str, Any]] = []
+        for i, a in enumerate(h.action_log):
+            seat = int(a["seat"])
+            d = hero_by_node.get(i)
+            rows.append({
+                "node_idx": i,
+                "seat": seat,
+                "position": self._position_of(seat),
+                "is_hero": seat == h.hero_seat,
+                "street": STREET_NAMES.get(int(a["street"]), str(a["street"])),
+                "actual_gate": GATE_SLUGS[int(a["gate"])],
+                "actual_chips": int(a["chips"]),
+                "decision_idx": d.decision_idx if d is not None else None,
+            })
+        return rows
+
+    def _node_view(
+        self, node_idx: int, obs_np: np.ndarray, info: StepInfo
     ) -> dict[str, Any]:
+        """Detailed view of one decision node (hero OR villain): the
+        model's policy + both EV estimates + the actor's actual action.
+        Same key shape as `_hero_current` so the frontend renders both
+        uniformly. Hero nodes additionally overlay the stored record's
+        scoring / MC EV-loss (a fresh forward can't reproduce the MC)."""
         h = self.hand
         assert h is not None
         bb = BB_CHIPS
-        decisions = [
-            {
+        a = h.action_log[node_idx]
+        actor = int(info.actor) if info.actor is not None else int(a["seat"])
+        raw = info.raw_obs
+        to_call = _to_call_chips(raw, actor)
+        dist = compute_node_distribution(self.model, self.device, obs_np, info)
+
+        # own EV = the actor's observation-only value head (blind to
+        # opponents' cards); true EV = the centralized critic (sees all
+        # hole cards), built with the EXACT training convention via the
+        # canonical rollout helpers so the number is meaningful.
+        value_true_bb: float | None = None
+        if self.critic is not None and dist["head_version"] >= 2:
+            holes = np.asarray(h.all_holes_dealt, dtype=np.uint8)  # (S, 5)
+            opp = _rotate_opp_holes(holes, actor)[None]            # (1, 5, 5)
+            value_true_bb = round(float(_critic_values(
+                self.critic, self.device,
+                obs_np[None].astype(np.float32), opp,
+            )[0]), 4)
+
+        actual_gate = int(a["gate"])
+        actual_chips = int(a["chips"])
+        nc: dict[str, Any] = {
+            "node_idx": node_idx,
+            "seat": actor,
+            "position": self._position_of(actor),
+            "is_hero": actor == h.hero_seat,
+            "street": STREET_NAMES.get(int(raw["street"]), str(raw["street"])),
+            "gate_probs": [round(p, 4) for p in dist["gate_probs"]],
+            "rec_gate": GATE_SLUGS[dist["rec_gate"]],
+            "rec_chips": dist["rec_chips"] if dist["rec_gate"] == GATE_RAISE else None,
+            "rec_chips_bb": round(chips_to_bb(dist["rec_chips"], bb), 4)
+            if dist["rec_gate"] == GATE_RAISE else None,
+            "rec_label": _action_label(dist["rec_gate"], dist["rec_chips"], to_call),
+            "value_bb": round(dist["value_bb"], 4),
+            "value_true_bb": value_true_bb,
+            "to_call_chips": to_call,
+            "pot_chips": int(raw["pot"]),
+            "actual_gate": GATE_SLUGS[actual_gate],
+            "actual_chips": actual_chips if actual_gate == GATE_RAISE else None,
+            "actual_label": _action_label(actual_gate, actual_chips, to_call),
+        }
+        if dist["head_version"] >= 2:
+            nc["head_version"] = 2
+            nc["anchors"] = _anchors_payload(
+                dist["anchor_probs"], dist["anchor_chips"],
+                dist["anchor_legal"], bb,
+            )
+            nc["rec_anchor"] = dist["rec_anchor"]
+            # Mark where the actor's ACTUAL raise landed (the ● on the EQ
+            # bars): nearest legal anchor by chip distance, tie -> lower.
+            if actual_gate == GATE_RAISE:
+                legal_ks = [
+                    k for k in range(ANCHOR_COUNT) if dist["anchor_legal"][k]
+                ]
+                nc["user_anchor"] = min(
+                    legal_ks,
+                    key=lambda k: (abs(actual_chips - dist["anchor_chips"][k]), k),
+                ) if legal_ks else None
+            else:
+                nc["user_anchor"] = None
+
+        d = self._hero_by_node().get(node_idx)
+        if d is not None:
+            nc.update({
                 "decision_idx": d.decision_idx,
-                "street": STREET_NAMES.get(d.street, str(d.street)),
-                "category": d.category,
+                "user_gate": GATE_SLUGS[d.user_gate],
+                "user_chips": d.user_chips if d.user_gate == GATE_RAISE else None,
+                "user_chips_bb": round(chips_to_bb(d.user_chips, bb), 4)
+                if d.user_gate == GATE_RAISE else None,
+                "user_label": _action_label(
+                    d.user_gate, d.user_chips, d.to_call_chips
+                ),
                 "score": round(d.score, 1),
-                "user_label": _action_label(d.user_gate, d.user_chips,
-                                            d.to_call_chips),
-                "ev_loss_bb": round(d.ev_loss_bb, 3)
-                if d.ev_loss_bb is not None else None,
-            }
-            for d in h.decisions
-        ]
-        scores = [d.score for d in h.decisions]
-        hand_score = round(sum(scores) / len(scores), 1) if scores else None
+                "category": d.category,
+                "marks": CATEGORY_MARKS[d.category],
+                "gate_ratio": round(d.gate_ratio, 4),
+                "size_q": round(d.size_q, 4),
+                "ev_user_bb": d.ev_user_bb,
+                "ev_best_bb": d.ev_best_bb,
+                "ev_loss_bb": d.ev_loss_bb,
+            })
+            if d.head_version >= 2:
+                nc["user_anchor"] = d.user_anchor
+        return nc
+
+    def _hero_current(self, current_idx: int) -> dict[str, Any] | None:
+        """The detailed view of hero decision `current_idx` (the pill
+        detail panel). None when the hand had no hero decisions."""
+        h = self.hand
+        assert h is not None
+        if not h.decisions:
+            return None
+        bb = BB_CHIPS
         d = h.decisions[current_idx]
         current = {
             "decision_idx": d.decision_idx,
@@ -1027,6 +1173,41 @@ class TrainerSession:
             )
             current["rec_anchor"] = d.rec_anchor
             current["user_anchor"] = d.user_anchor
+        return current
+
+    def review_block(
+        self, current_idx: int, whatif: dict[str, Any] | None = None,
+        *, node_idx: int | None = None,
+        node_current: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        h = self.hand
+        assert h is not None
+        decisions = [
+            {
+                "decision_idx": d.decision_idx,
+                "node_idx": d.action_log_idx,
+                "street": STREET_NAMES.get(d.street, str(d.street)),
+                "category": d.category,
+                "score": round(d.score, 1),
+                "user_label": _action_label(d.user_gate, d.user_chips,
+                                            d.to_call_chips),
+                "ev_loss_bb": round(d.ev_loss_bb, 3)
+                if d.ev_loss_bb is not None else None,
+            }
+            for d in h.decisions
+        ]
+        scores = [d.score for d in h.decisions]
+        hand_score = round(sum(scores) / len(scores), 1) if scores else None
+        current = self._hero_current(current_idx)
+        nodes = self._node_index()
+        # `node` is the shared cursor (action_log index). Pills and arrows
+        # both drive it; the hero path syncs it to the current decision.
+        if node_idx is not None:
+            node_val = node_idx
+        elif h.decisions:
+            node_val = h.decisions[current_idx].action_log_idx
+        else:
+            node_val = 0
         return {
             "active": True,
             "decision": current_idx,
@@ -1035,7 +1216,36 @@ class TrainerSession:
             "decisions": decisions,
             "current": current,
             "whatif": whatif,
+            "nodes": nodes,
+            "num_nodes": len(nodes),
+            "node": node_val,
+            "node_current": node_current,
         }
+
+    def review_at_node(self, node_idx: int) -> dict[str, Any]:
+        """Project the hand at decision node `node_idx` (any seat). The
+        review carries `node_current` (the node detail) and keeps the
+        hero pill list in sync via the shared `node` cursor."""
+        h = self.hand
+        if h is None or not h.terminal:
+            raise HTTPException(status_code=400,
+                                detail="review available after the hand ends")
+        if not h.action_log:
+            raise HTTPException(status_code=400, detail="no decisions this hand")
+        node_idx = max(0, min(len(h.action_log) - 1, int(node_idx)))
+        env, obs, info = self._replay_to_node(node_idx)
+        nc = self._node_view(node_idx, obs, info)
+        cur_dec = self._hero_by_node().get(node_idx)
+        if cur_dec is not None:
+            current_idx = cur_dec.decision_idx
+        else:
+            current_idx = len(h.decisions) - 1 if h.decisions else 0
+        review = self.review_block(
+            current_idx, node_idx=node_idx, node_current=nc,
+        )
+        return self.project_state(
+            env=env, info=info, reveal=True, review=review,
+        )
 
     def _original_card_spec(self, d: DecisionRecord) -> dict[str, list[int | None]]:
         """Cards as visible at decision `d`'s node (turn/river None until
@@ -1300,7 +1510,16 @@ class TrainerSession:
         # Live terminal state carries the review block (last decision) so
         # the frontend can open the review pane immediately.
         if review is None and live and h.terminal and h.decisions:
-            review = self.review_block(len(h.decisions) - 1)
+            # Open review on the last hero decision, but attach its
+            # node_current so the dual-EV node view is populated from the
+            # first frame (one extra replay+forward+critic at hand-end).
+            last = h.decisions[-1]
+            _e, _o, _i = self._replay_to_node(last.action_log_idx)
+            review = self.review_block(
+                len(h.decisions) - 1,
+                node_idx=last.action_log_idx,
+                node_current=self._node_view(last.action_log_idx, _o, _i),
+            )
 
         state = {
             "num_seats": cfg.num_seats,
@@ -1314,6 +1533,14 @@ class TrainerSession:
             "modified_cards": [],
             "pot_chips": int(raw["pot"]),
             "pot_bb": round(chips_to_bb(int(raw["pot"]), bb), 4),
+            # Settled pot ("Pot") = pot minus this street's live commits;
+            # pot_chips is the grand "Total Pot".
+            "settled_pot_chips": int(raw["pot"]) - sum(int(x) for x in raw["street_commit"]),
+            "settled_pot_bb": round(
+                chips_to_bb(
+                    int(raw["pot"]) - sum(int(x) for x in raw["street_commit"]), bb
+                ), 4
+            ),
             "bet_to_call_chips": int(raw["bet_to_call"]),
             "bet_to_call_bb": round(chips_to_bb(int(raw["bet_to_call"]), bb), 4),
             "to_call_chips": int(to_call),
@@ -1456,8 +1683,12 @@ def _action_label(gate: int, chips: int, to_call: int) -> str:
 # --- Router ---------------------------------------------------------------------
 
 
-def create_trainer_router(model: ActorCritic, device: torch.device) -> APIRouter:
-    ts = TrainerSession(model, device)
+def create_trainer_router(
+    model: ActorCritic,
+    device: torch.device,
+    critic: CentralCritic | None = None,
+) -> APIRouter:
+    ts = TrainerSession(model, device, critic=critic)
     router = APIRouter(prefix="/trainer")
     router.trainer_session = ts  # type: ignore[attr-defined]  # test hook
 
@@ -1501,8 +1732,12 @@ def create_trainer_router(model: ActorCritic, device: torch.device) -> APIRouter
             return {"state": ts.project_state(), "frames": frames}
 
     @router.get("/review")
-    def trainer_review(decision: int = 0) -> dict[str, Any]:
+    def trainer_review(
+        decision: int = 0, node: int | None = None
+    ) -> dict[str, Any]:
         with ts.lock:
+            if node is not None:
+                return {"state": ts.review_at_node(node)}
             d = ts._decision_for(decision)
             env, _obs, info = ts._replay_to_decision(d)
             review = ts.review_block(d.decision_idx)

@@ -75,7 +75,8 @@ v2 specifics:
 - Sizing head: 11 pot-fraction anchors (0=min,10%,…,100%=pot) with
   per-anchor Beta refinement sliders; canonical chips/legality math in
   `python/plo5bp/sizing.py` (shared by network/rollout/UI — don't fork it).
-- `CentralCritic` sees all hole cards during training only
+- `CentralCritic` sees all hole cards: training advantages, and (read-
+  only) the trainer review's all-cards "true EV"
   (`--critic-hidden-dim 1536 --critic-num-blocks 2` defaults); the
   actor keeps its own observation-only value head for the UI display.
 - Log line: `v` is the critic loss, `vd` the display-head loss, and
@@ -193,7 +194,15 @@ Key invariants (documented in the module docstring — don't break):
   2048×4 net (matching actions skip MC entirely).
 - What-if card swaps replay through `reset_study` — an unmodified
   what-if reproduces the original node's observation bit-exactly
-  (pinned by `test_trainer_review.py`).
+  (pinned by `test_trainer_review.py`). What-if stays hero-only.
+- Review steps EVERY decision node (hero + villain): the arrows drive a
+  shared node cursor (`review_at_node` / `?node=` → `review.node_current`,
+  one `_node_view` per click); pills still jump to hero decisions. Each
+  node shows the acting seat's policy + DUAL EV — the actor's own (blind)
+  value head AND the critic's all-cards "true EV" (UI loads `ckpt['critic']`
+  via `server._load_critic`; opp multi-hot built with the canonical
+  `rollout._rotate_opp_holes` so it matches training). Villain nodes have
+  no graded score; hero nodes overlay the stored `DecisionRecord`.
 - `all_hole_cards()` (engine accessor added for this) reveals opponent
   cards — projection exposes them only at terminal/review.
 - Lifetime stats + settings persist to `checkpoints/trainer_stats.json`

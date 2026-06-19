@@ -256,6 +256,14 @@ main {
   fill: var(--text-bright); font-size: 13.5px; font-weight: 700;
   letter-spacing: 0.4px;
 }
+.pot-settled-rect {
+  fill: rgba(7, 13, 20, 0.55);
+  stroke: rgba(255, 255, 255, 0.08); stroke-width: 1;
+}
+.pot-settled-label {
+  fill: var(--muted); font-size: 11.5px; font-weight: 700;
+  letter-spacing: 0.3px;
+}
 
 /* Board card slots inside SVG */
 .slot-rect {
@@ -531,6 +539,7 @@ main {
   font-size: 14px; padding: 2px 0 7px;
 }
 .rec-action { font-weight: 800; font-size: 16px; color: var(--accent-2); }
+.rec-value-true { color: var(--text-bright); font-weight: 700; }
 .rec-value {
   margin-left: auto;
   font-size: 11.5px; font-weight: 600; color: var(--muted);
@@ -866,7 +875,13 @@ body.trainer-mode.trainer-pick #card-grid-panel {
 }
 .review-step-row button:hover:not(:disabled) { background: var(--panel-3); }
 .review-step-row button:disabled { opacity: 0.3; cursor: not-allowed; }
-#review-step-label { font-size: 12.5px; font-weight: 700; }
+#review-step-label {
+  font-size: 12.5px; font-weight: 700;
+  /* Fixed-width centered slot so the prev/next arrows don't shift as the
+     node string ("Node x / y — SEAT") changes length between nodes. */
+  flex: 0 0 210px; text-align: center;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 #review-chips { display: flex; gap: 5px; flex-wrap: wrap; max-width: 380px; }
 .review-chip {
   display: inline-flex; align-items: center; gap: 5px;
@@ -911,6 +926,7 @@ body.trainer-mode.trainer-pick #card-grid-panel {
 .review-moves b { color: var(--text-bright); }
 .review-ev { font-variant-numeric: tabular-nums; }
 .review-hint { font-size: 11px; }
+.review-villain { color: var(--muted); font-weight: 700; font-size: 12.5px; }
 .review-actions {
   display: flex; flex-direction: column; gap: 7px; flex: none;
   align-self: center;

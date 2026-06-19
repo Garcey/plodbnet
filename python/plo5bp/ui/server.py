@@ -37,7 +37,12 @@ from plo5bp.actions import (
 from plo5bp.config import GameConfig
 from plo5bp.encoding import encode_observation
 from plo5bp.env import BombPotEnv
-from plo5bp.network import ActorCritic, build_actor_from_state_dict, obs_adapter
+from plo5bp.network import (
+    ActorCritic,
+    CentralCritic,
+    build_actor_from_state_dict,
+    obs_adapter,
+)
 from plo5bp.sizing import (
     ANCHOR_COUNT,
     BRACKET_HALF,
@@ -103,7 +108,8 @@ def _load_model() -> ActorCritic:
     # Dual path: v2 anchor-head checkpoints carry 'anchor_head.weight',
     # v1 Beta-head ones 'raise_head.weight'; the trained obs width (959
     # v1-era vs 991 current) is sniffed from the first torso layer. The
-    # training-only critic state (ckpt['critic']) is never served.
+    # bundled critic state (ckpt['critic']) is loaded separately by
+    # _load_critic() for the trainer review's all-cards "true EV".
     try:
         model = build_actor_from_state_dict(state_dict, hidden_dim, num_layers)
     except Exception as e:
@@ -123,8 +129,50 @@ def _load_model() -> ActorCritic:
     return model
 
 
+def _load_critic(device: torch.device) -> CentralCritic | None:
+    """Load the centralized critic bundled in the checkpoint (v2 only;
+    ckpt['critic'] + head_version>=2). Returns None for v1 / random-init
+    / missing critic, in which case the trainer review shows only the
+    actor's own (blind) value estimate. One extra torch.load at startup."""
+    ckpt_path = Path(os.environ.get("PLO5BP_CHECKPOINT", "checkpoints/stub.pt"))
+    if not ckpt_path.exists():
+        return None
+    try:
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    except Exception as e:
+        logger.warning("failed to load critic from %s (%s)", ckpt_path, e)
+        return None
+    if not (
+        isinstance(ckpt, dict)
+        and int(ckpt.get("head_version", 1)) >= 2
+        and "critic" in ckpt
+    ):
+        return None
+    cfg_block = ckpt.get("config", {}) or {}
+    hidden_dim = int(cfg_block.get("critic_hidden_dim", 1536))
+    num_blocks = int(cfg_block.get("critic_num_blocks", 2))
+    try:
+        critic = CentralCritic(hidden_dim=hidden_dim, num_blocks=num_blocks)
+        critic.load_state_dict(ckpt["critic"])
+    except Exception as e:
+        logger.warning(
+            "checkpoint %s critic incompatible (%s) — true-EV disabled",
+            ckpt_path, e,
+        )
+        return None
+    critic.to(device).eval()
+    for p in critic.parameters():
+        p.requires_grad_(False)
+    logger.info(
+        "loaded centralized critic (hidden_dim=%d, num_blocks=%d, device=%s)",
+        hidden_dim, num_blocks, device,
+    )
+    return critic
+
+
 MODEL = _load_model()
 MODEL_DEVICE = next(MODEL.parameters()).device
+MODEL_CRITIC = _load_critic(MODEL_DEVICE)
 # v1-era checkpoints (trained at OBS_DIM 959) get the exact downgrade
 # projection; current-width models get identity.
 OBS_ADAPT = obs_adapter(MODEL)
@@ -1181,6 +1229,13 @@ def _state_dict() -> dict[str, Any]:
         "modified_cards": _modified_cards(),
         "pot_chips": int(raw["pot"]),
         "pot_bb": round(_chips_to_bb(int(raw["pot"])), 4),
+        # Settled pot = the pot gathered from completed streets (pot minus
+        # this street's live commits, which still sit in front of seats).
+        # "Total Pot" = pot_chips; "Pot" = settled_pot_chips.
+        "settled_pot_chips": int(raw["pot"]) - sum(int(x) for x in raw["street_commit"]),
+        "settled_pot_bb": round(
+            _chips_to_bb(int(raw["pot"]) - sum(int(x) for x in raw["street_commit"])), 4
+        ),
         "bet_to_call_chips": int(raw["bet_to_call"]),
         "bet_to_call_bb": round(_chips_to_bb(int(raw["bet_to_call"])), 4),
         "to_call_chips": int(to_call),
@@ -1238,7 +1293,7 @@ app = FastAPI(title="PLO5 Bomb-Pot Study Tool")
 # (not at top) so trainer.py never needs to import server.py back.
 from plo5bp.ui.trainer import create_trainer_router  # noqa: E402
 
-trainer_router = create_trainer_router(MODEL, MODEL_DEVICE)
+trainer_router = create_trainer_router(MODEL, MODEL_DEVICE, critic=MODEL_CRITIC)
 app.include_router(trainer_router)
 
 

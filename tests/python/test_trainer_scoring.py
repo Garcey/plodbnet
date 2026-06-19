@@ -50,6 +50,19 @@ def test_right_gate_wrong_size_drags_score():
     assert r_mode["category"] == "best"
 
 
+def test_recommended_mean_size_scores_full():
+    # The deterministic recommendation bets the Beta MEAN; betting exactly
+    # that must earn full size credit. Regression: the old mode reference
+    # scored the recommended (mean) size below 100% on skewed Betas.
+    alpha, beta = 2.0, 8.0
+    mean = alpha / (alpha + beta)
+    lo, hi = 10_000, 100_000
+    chips = round(lo + mean * (hi - lo))
+    r = score_move([0.0, 0.3, 0.7], alpha, beta, lo, hi, GATE_RAISE, chips)
+    assert r["size_q"] == pytest.approx(1.0, abs=1e-3)
+    assert r["category"] == "best"
+
+
 def test_degenerate_ranges_have_no_size_penalty():
     # Short shove (min == 0): chips are moot.
     r = score_move([0.1, 0.1, 0.8], 2.0, 8.0, 0, 50_000, GATE_RAISE, 50_000)

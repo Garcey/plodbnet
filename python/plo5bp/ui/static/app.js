@@ -113,7 +113,8 @@ const UI = {
   // Trainer
   feedbackShownIdx: -1,
   feedbackTimer: null,
-  reviewDecision: null,   // decision index currently shown in review, or null
+  reviewDecision: null,   // hero decision index currently shown, or null
+  reviewNode: null,       // node (action_log) index currently shown, or null
   trainerPick: false,     // card grid open for a what-if swap
   settingsOpen: false,
   animSeq: 0,             // bumped to cancel an in-flight frame animation
@@ -232,6 +233,14 @@ async function trainerReviewGoto(decision) {
   try {
     const data = await getJSON(`/trainer/review?decision=${decision}`);
     UI.reviewDecision = decision;
+    applyState(data.state);
+  } catch (e) { showToast(e.message); }
+}
+// Step the unified review cursor to any decision NODE (hero or villain).
+async function trainerReviewGotoNode(node) {
+  try {
+    const data = await getJSON(`/trainer/review?node=${node}`);
+    UI.reviewNode = node;
     applyState(data.state);
   } catch (e) { showToast(e.message); }
 }
@@ -744,7 +753,11 @@ function renderDealerButton(s) {
 }
 
 function renderPotLabel(s) {
-  document.getElementById("pot-label").textContent = `Pot ${formatUnit(s.pot_chips, s)}`;
+  // Top badge = grand Total Pot (incl. this street's live bets); the
+  // badge below the boards = settled Pot (gathered from prior streets).
+  document.getElementById("pot-label").textContent = `Total Pot ${formatUnit(s.pot_chips, s)}`;
+  const settled = s.settled_pot_chips ?? s.pot_chips;
+  document.getElementById("pot-settled-label").textContent = `Pot ${formatUnit(settled, s)}`;
 }
 
 function animActionText(s) {
@@ -773,12 +786,21 @@ function renderActorBanner(s) {
   // Trainer review: the state is a mid-hand reconstruction, not a live turn.
   if (s.trainer && !s.trainer.hand_active && s.trainer.review) {
     const rv = s.trainer.review;
-    const cur = rv.current;
+    const nc = rv.node_current;
     banner.hidden = false;
-    banner.classList.toggle("hero", true);
-    banner.textContent =
-      `Reviewing decision ${rv.decision + 1} / ${rv.num_decisions} — ${cur.street}` +
-      ` · you chose ${cur.user_label}`;
+    banner.classList.toggle("hero", nc ? nc.is_hero : true);
+    if (nc) {
+      const who = `${nc.position}${nc.is_hero ? " (hero)" : ""}`;
+      const verb = nc.is_hero ? "you chose" : "acted";
+      banner.textContent =
+        `Node ${rv.node + 1} / ${rv.num_nodes} — ${nc.street} · ${who} ${verb} ${nc.actual_label}`;
+    } else if (rv.current) {
+      banner.textContent =
+        `Reviewing decision ${rv.decision + 1} / ${rv.num_decisions} — ${rv.current.street}` +
+        ` · you chose ${rv.current.user_label}`;
+    } else {
+      banner.textContent = "Reviewing hand";
+    }
     return;
   }
   if (s.actor === null || s.actor === undefined) {
@@ -992,17 +1014,19 @@ function distRowsHTML(dist, callName) {
 
 const ANCHOR_AXIS_LABELS = ["min", "10", "20", "30", "40", "50", "60", "70", "80", "90", "pot"];
 
-function anchorHeatmapHTML(anchors, recAnchor, userAnchor, s) {
+function anchorHeatmapHTML(anchors, recAnchor, userAnchor, s, raiseActive = true) {
   // v2 sizing EQ: one column per anchor spanning min → pot, like a
   // stereo equalizer — bar height carries the network's preference
   // (more bulk = more bet at that size). ★ = network's pick; ring +
-  // ● = the anchor the user's size snapped to (review).
+  // ● = the anchor the user's size snapped to (review). When the network
+  // never raises here (raise freq rounds to 0%), the conditional sizing
+  // is moot — render an empty row: no bars, no ★/●.
   const byK = new Map((anchors || []).map((a) => [a.k, a]));
   const pmax = Math.max(1e-9, ...(anchors || []).map((a) => a.prob));
   let cells = "";
   let labels = "";
   for (let k = 0; k <= 10; k++) {
-    const a = byK.get(k);
+    const a = raiseActive ? byK.get(k) : undefined;
     if (a) {
       const isUser = userAnchor !== null && userAnchor !== undefined && k === userAnchor;
       const isRec = k === recAnchor;
@@ -1017,7 +1041,10 @@ function anchorHeatmapHTML(anchors, recAnchor, userAnchor, s) {
           <span class="anchor-eq-marks">${marks}</span>
         </div>`;
     } else {
-      cells += `<div class="anchor-eq-cell dead" title="${ANCHOR_AXIS_LABELS[k]} — not a distinct legal size here"></div>`;
+      const deadTip = raiseActive
+        ? `${ANCHOR_AXIS_LABELS[k]} — not a distinct legal size here`
+        : `${ANCHOR_AXIS_LABELS[k]} — network does not raise here`;
+      cells += `<div class="anchor-eq-cell dead" title="${deadTip}"></div>`;
     }
     labels += `<span>${ANCHOR_AXIS_LABELS[k]}</span>`;
   }
@@ -1030,22 +1057,36 @@ function anchorHeatmapHTML(anchors, recAnchor, userAnchor, s) {
 
 function recDetailHTML(rec, userAnchor, s) {
   // v2 payloads carry `anchors`; v1 carries the single Beta's (α, β).
+  // raiseActive mirrors the displayed RAISE % — when it rounds to 0 the
+  // network never raises here, so the whole sizing detail is blanked.
+  const gateDist = rec.gate_distribution || rec.gate_probs || [];
+  const raiseActive = Math.round((gateDist[2] || 0) * 100) > 0;
   if (rec.anchors) {
-    let html = anchorHeatmapHTML(rec.anchors, rec.rec_anchor, userAnchor, s);
-    if (rec.refine) {
+    let html = anchorHeatmapHTML(rec.anchors, rec.rec_anchor, userAnchor, s, raiseActive);
+    if (raiseActive && rec.refine) {
       html += `<div class="rec-detail">slider β(${rec.refine.alpha.toFixed(1)}, ${rec.refine.beta.toFixed(1)})</div>`;
     }
     return html;
   }
+  if (!raiseActive) return "";
   return `<div class="rec-detail">β(${(rec.beta_alpha ?? 0).toFixed(1)}, ${(rec.beta_beta ?? 0).toFixed(1)})</div>`;
+}
+
+function fmtSignedValue(bb, s) {
+  if (bb === null || bb === undefined) return null;
+  const sign = bb >= 0 ? "+" : "-";
+  const abs = Math.abs(bb);
+  return UI.unit === "bb"
+    ? `${sign}${abs.toFixed(2)}bb`
+    : `${sign}$${(abs * (s?.chip_scale?.dollars_per_bb ?? 2)).toFixed(2)}`;
 }
 
 function renderTrainerReviewRecommendation(s, el) {
   const rv = s.trainer.review;
-  const cur = rv.current;
+  const cur = rv.node_current || rv.current;
   const whatif = rv.whatif;
   const callName = cur.to_call_chips > 0 ? "Call" : "Check";
-  let actionText, dist, valueBB, tag = "", detailHTML;
+  let actionText, dist, valueBB, valueTrueBB = null, tag = "", detailHTML;
   if (whatif) {
     const rec = whatif.recommendation;
     actionText = rec.chips !== null && rec.chips !== undefined
@@ -1061,17 +1102,21 @@ function renderTrainerReviewRecommendation(s, el) {
       : cur.rec_label;
     dist = cur.gate_probs;
     valueBB = cur.value_bb;
+    valueTrueBB = cur.value_true_bb;       // null on v1 / when no critic
     detailHTML = recDetailHTML(cur, cur.user_anchor, s);
   }
-  const sign = valueBB >= 0 ? "+" : "-";
-  const absBB = Math.abs(valueBB);
-  const vDisp = UI.unit === "bb"
-    ? `${sign}${absBB.toFixed(2)}bb`
-    : `${sign}$${(absBB * (s?.chip_scale?.dollars_per_bb ?? 2)).toFixed(2)}`;
+  const ownV = fmtSignedValue(valueBB, s);
+  const trueV = fmtSignedValue(valueTrueBB, s);
+  // "own" = the acting seat's blind value head; "true" = the all-cards
+  // critic's EV for that seat. Show both side by side when available.
+  const valueHTML = trueV
+    ? `<span class="rec-value">value (own) ${ownV} · ` +
+      `<span class="rec-value-true">true ${trueV}</span></span>`
+    : `<span class="rec-value">value ${ownV}</span>`;
   el.innerHTML = `
     <div class="rec-line">
       ${tag}<span class="rec-action">${actionText}</span>
-      <span class="rec-value">value ${vDisp}</span>
+      ${valueHTML}
     </div>
     <div class="rec-dist">${distRowsHTML(dist, callName)}</div>
     ${detailHTML}
@@ -1081,7 +1126,7 @@ function renderTrainerReviewRecommendation(s, el) {
 function renderRecommendation(s) {
   const el = document.getElementById("recommendation");
   if (s.trainer) {
-    if (s.trainer.review && s.trainer.review.current) {
+    if (s.trainer.review && (s.trainer.review.node_current || s.trainer.review.current)) {
       renderTrainerReviewRecommendation(s, el);
       return;
     }
@@ -1224,6 +1269,9 @@ function onSlotClick(key, index) {
     // selects the card for a what-if swap.
     const rv = s.trainer.review;
     if (!rv) return;
+    // What-if is hero-only (the /whatif replay must reach hero's node) —
+    // villain-node card clicks are inert.
+    if (rv.node_current && !rv.node_current.is_hero) return;
     const spec = s.card_spec[key];
     if (!spec || spec[index] === null || spec[index] === undefined) return;
     if (UI.selectedSlot && UI.selectedSlot.key === key && UI.selectedSlot.index === index) {
@@ -1262,6 +1310,7 @@ function onGridCardClick(cardInt) {
     const rv = s.trainer.review;
     const sel = UI.selectedSlot;
     if (!rv || !sel || !UI.trainerPick) return;
+    if (rv.node_current && !rv.node_current.is_hero) return;  // hero-only
     const used = collectUsedCards(s);
     if (used.has(cardInt)) return;
     // Send the full current spec as absolute overrides so earlier
@@ -1730,6 +1779,7 @@ function setMode(mode) {
   UI.lastStateKey = null;
   UI.selectedSlot = null;
   UI.reviewDecision = null;
+  UI.reviewNode = null;
   cancelTrainerPick();
   applyModeUI();
   fetchState();
@@ -1847,6 +1897,7 @@ function renderReviewPanel(s) {
   }
   panel.hidden = false;
   UI.reviewDecision = rv.decision;
+  UI.reviewNode = rv.node;
 
   const C = 2 * Math.PI * 26;
   const pct = rv.hand_score ?? 0;
@@ -1857,27 +1908,48 @@ function renderReviewPanel(s) {
     (rv.hand_score !== null && rv.hand_score !== undefined)
       ? `${Math.round(rv.hand_score)}%` : "—";
 
-  document.getElementById("review-step-label").textContent =
-    `Decision ${rv.decision + 1} / ${rv.num_decisions}`;
-  document.getElementById("review-prev").disabled = rv.decision <= 0;
-  document.getElementById("review-next").disabled = rv.decision >= rv.num_decisions - 1;
+  // Arrows + label step the unified NODE cursor (every seat's decision).
+  const nc = rv.node_current;
+  document.getElementById("review-step-label").textContent = nc
+    ? `Node ${rv.node + 1} / ${rv.num_nodes} — ${nc.position}${nc.is_hero ? " (hero)" : ""}`
+    : `Node ${rv.node + 1} / ${rv.num_nodes}`;
+  const atStart = rv.node <= 0;
+  const atEnd = rv.node >= rv.num_nodes - 1;
+  document.getElementById("review-first").disabled = atStart;
+  document.getElementById("review-prev").disabled = atStart;
+  document.getElementById("review-next").disabled = atEnd;
+  document.getElementById("review-last").disabled = atEnd;
 
+  // Pills stay one-per-hero-decision; clicking one drives the shared node
+  // cursor. Highlight the pill whose node is the current cursor.
   const chips = document.getElementById("review-chips");
   chips.innerHTML = "";
-  rv.decisions.forEach((d, i) => {
+  rv.decisions.forEach((d) => {
     const b = document.createElement("button");
     b.type = "button";
-    b.className = `review-chip cat-border-${d.category}` + (i === rv.decision ? " current" : "");
+    const isCurrent = d.node_idx === rv.node;
+    b.className = `review-chip cat-border-${d.category}` + (isCurrent ? " current" : "");
     b.innerHTML = `<span class="rc-street">${d.street}</span>${d.user_label}` +
       ` <span class="rc-score">${Math.round(d.score)}%</span>`;
-    b.addEventListener("click", () => trainerReviewGoto(i));
+    b.addEventListener("click", () => trainerReviewGotoNode(d.node_idx));
     chips.appendChild(b);
   });
 
   document.getElementById("review-whatif-bar").hidden = !rv.whatif;
 
-  const cur = rv.current;
+  const cur = rv.node_current || rv.current;
   const detail = document.getElementById("review-detail");
+  if (!cur) { detail.innerHTML = ""; return; }
+  if (rv.node_current && !rv.node_current.is_hero) {
+    // Opponent node: no graded user action — show what they actually did
+    // vs the network's deterministic pick (policy + EVs ride in the
+    // recommendation panel). No EV-loss, no what-if hint.
+    detail.innerHTML = `
+      <div class="review-villain">${cur.position} · ${cur.street} decision</div>
+      <div class="review-moves">Actual: <b>${cur.actual_label}</b> · Network: <b>${cur.rec_label}</b></div>
+    `;
+    return;
+  }
   let evRow = "";
   if (cur.ev_loss_bb !== null && cur.ev_loss_bb !== undefined) {
     const detailBit = (cur.ev_user_bb !== null && cur.ev_user_bb !== undefined)
@@ -1986,12 +2058,14 @@ function setupTrainerControls() {
   const newHand = () => {
     cancelTrainerPick();
     UI.reviewDecision = null;
+    UI.reviewNode = null;
     UI.selectedSlot = null;
     postTrainer("new_hand");
   };
   const repeatHand = () => {
     cancelTrainerPick();
     UI.reviewDecision = null;
+    UI.reviewNode = null;
     UI.selectedSlot = null;
     postTrainer("repeat");
   };
@@ -1999,17 +2073,25 @@ function setupTrainerControls() {
   document.getElementById("trainer-repeat-btn").addEventListener("click", repeatHand);
   document.getElementById("review-next-hand").addEventListener("click", newHand);
   document.getElementById("review-repeat-hand").addEventListener("click", repeatHand);
+  document.getElementById("review-first").addEventListener("click", () => {
+    const rv = UI.lastState?.trainer?.review;
+    if (rv && rv.node > 0) trainerReviewGotoNode(0);
+  });
   document.getElementById("review-prev").addEventListener("click", () => {
     const rv = UI.lastState?.trainer?.review;
-    if (rv && rv.decision > 0) trainerReviewGoto(rv.decision - 1);
+    if (rv && rv.node > 0) trainerReviewGotoNode(rv.node - 1);
   });
   document.getElementById("review-next").addEventListener("click", () => {
     const rv = UI.lastState?.trainer?.review;
-    if (rv && rv.decision < rv.num_decisions - 1) trainerReviewGoto(rv.decision + 1);
+    if (rv && rv.node < rv.num_nodes - 1) trainerReviewGotoNode(rv.node + 1);
+  });
+  document.getElementById("review-last").addEventListener("click", () => {
+    const rv = UI.lastState?.trainer?.review;
+    if (rv && rv.node < rv.num_nodes - 1) trainerReviewGotoNode(rv.num_nodes - 1);
   });
   document.getElementById("review-whatif-reset").addEventListener("click", () => {
     const rv = UI.lastState?.trainer?.review;
-    if (rv) trainerReviewGoto(rv.decision);
+    if (rv) trainerReviewGotoNode(rv.node);
   });
   document.getElementById("trainer-settings-btn").addEventListener("click", openTrainerSettings);
   document.getElementById("ts-cancel").addEventListener("click", closeTrainerSettings);
