@@ -793,7 +793,11 @@ def collect_rollout(
 # throughput). The ~1-3% extra MC noise on 12 of 991 dims is a benign,
 # fine-tune-safe regularizer; the UI/eval/serial paths keep 1024 so the
 # study tool still computes the more accurate estimate.
-TRAIN_OPP_OUTCOME_MC = 256
+# 2026-06-20: MC=256 destabilized the gate in the shallow clubgg block
+# (vTwo10 saturated-collapsed at u490, in clubgg, even after an LR cut to
+# 1.5e-4). Raised to 384 as a less-noisy compromise — still cheaper than
+# the 1024 UI/eval path, but with ~1/3 less MC variance on the 12 dims.
+TRAIN_OPP_OUTCOME_MC = 384
 
 
 def collect_rollout_batched(
