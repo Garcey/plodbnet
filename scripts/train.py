@@ -34,7 +34,11 @@ from plo5bp.actions import GATE_ACTIONS
 from plo5bp.config import GameConfig, TrainingConfig
 from plo5bp.network import ActorCriticV2, CentralCritic
 from plo5bp.ppo import PPOTrainer
-from plo5bp.rollout import collect_rollout, collect_rollout_batched
+from plo5bp.rollout import (
+    collect_rollout,
+    collect_rollout_batched,
+    collect_rollout_multiconfig,
+)
 from plo5bp.selfplay import OpponentPool
 
 
@@ -473,6 +477,27 @@ def main() -> None:
         help="Updates per block when --block-rotation is set.",
     )
     parser.add_argument(
+        "--mix-configs",
+        action="store_true",
+        help="vThree mode: each update mixes --configs-per-tier (seats,stacks) "
+        "draws from EACH of --mix-tiers (default all three stack tiers), instead "
+        "of one config per update + a 50-update block. The gradient averages "
+        "over all N configs, removing the consecutive-shallow exposure that "
+        "saturates the gate. Forces blocks off; requires --batched.",
+    )
+    parser.add_argument(
+        "--configs-per-tier",
+        type=int,
+        default=10,
+        help="With --mix-configs: distinct (seats,stacks) draws per tier per update.",
+    )
+    parser.add_argument(
+        "--mix-tiers",
+        type=str,
+        default="clubgg,clubgg_deep,deep",
+        help="With --mix-configs: comma-separated stack tiers mixed per update.",
+    )
+    parser.add_argument(
         "--anneal-entropy",
         action="store_true",
         help="Automatically lower each tier's block-rotation entropy coef by "
@@ -676,6 +701,8 @@ def main() -> None:
         )
 
     blocks = _parse_block_rotation(args.block_rotation)
+    if args.mix_configs:
+        blocks = []  # mix mode replaces block-rotation (summary printed below)
     if blocks and args.block_size <= 0:
         raise SystemExit("--block-size must be > 0 when --block-rotation is set")
     if blocks:
@@ -685,6 +712,20 @@ def main() -> None:
         print(
             f"[block-rotation] N={args.block_size} per block, "
             f"cycle: {rotation_summary}"
+        )
+
+    mix_tiers = [t.strip() for t in args.mix_tiers.split(",") if t.strip()]
+    if args.mix_configs:
+        if not args.batched:
+            raise SystemExit("--mix-configs requires --batched")
+        if not mix_tiers:
+            raise SystemExit("--mix-tiers parsed to empty")
+        if args.configs_per_tier <= 0:
+            raise SystemExit("--configs-per-tier must be > 0")
+        print(
+            f"[mix-configs] {args.configs_per_tier} configs/tier x "
+            f"{len(mix_tiers)} tiers ({','.join(mix_tiers)}) = "
+            f"{args.configs_per_tier * len(mix_tiers)} configs/update"
         )
 
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -819,6 +860,13 @@ def main() -> None:
         tier: None for tier, _ in blocks
     }
     block_acc: dict = {"bonus_steps": [0, 0, 0], "steps": [0, 0, 0], "tier": None}
+    if args.mix_configs:
+        # Mix mode has no per-tier blocks; use one live-tunable entropy coef
+        # (all tiers equal). anneal_control's {"tier_ent": {...}} still tunes
+        # it live; {"lr": X} still tunes LR. Auto-anneal (F/T/R-driven) stays
+        # off since `blocks` is empty.
+        tier_ent = {t: args.entropy_coef for t in mix_tiers}
+        tier_baseline = {t: None for t in mix_tiers}
     if args.anneal_entropy:
         if restored_tier_ent:
             tier_ent.update(
@@ -946,7 +994,7 @@ def main() -> None:
             if update >= train_cfg.num_updates:
                 break
 
-        if blocks and anneal_control_file.exists():
+        if (blocks or args.mix_configs) and anneal_control_file.exists():
             try:
                 control_raw = anneal_control_file.read_text()
             except OSError:
@@ -956,23 +1004,35 @@ def main() -> None:
                 live_lr, trainer=trainer,
             )
 
-        if blocks:
+        if args.mix_configs:
+            # vThree: every update mixes `configs_per_tier` (seats,stacks) draws
+            # from each mix tier (no block-rotation), so the gradient averages
+            # over all N configs — no consecutive-tier saturation.
+            mix_cfgs = [
+                _sample_game_config(
+                    seats_choices, stack_lo, stack_hi, args.bb, args.ante, rng,
+                    stack_dist=tier, seats_dist=args.seats_dist,
+                )[0]
+                for tier in mix_tiers
+                for _ in range(args.configs_per_tier)
+            ]
+            block_idx = -1
+            active_tier = "mix"
+            sampled_game_cfg, sampled_eff_dist = mix_cfgs[0], "mix"
+        elif blocks:
             block_idx = (update // args.block_size) % len(blocks)
             active_tier = blocks[block_idx][0]
+            sampled_game_cfg, sampled_eff_dist = _sample_game_config(
+                seats_choices, stack_lo, stack_hi, args.bb, args.ante, rng,
+                stack_dist=active_tier, seats_dist=args.seats_dist,
+            )
         else:
             block_idx = -1
             active_tier = args.stack_dist
-
-        sampled_game_cfg, sampled_eff_dist = _sample_game_config(
-            seats_choices,
-            stack_lo,
-            stack_hi,
-            args.bb,
-            args.ante,
-            rng,
-            stack_dist=active_tier,
-            seats_dist=args.seats_dist,
-        )
+            sampled_game_cfg, sampled_eff_dist = _sample_game_config(
+                seats_choices, stack_lo, stack_hi, args.bb, args.ante, rng,
+                stack_dist=active_tier, seats_dist=args.seats_dist,
+            )
         _profile_this = args.profile_one_update and update == 0
         _prof = None
         if _profile_this:
@@ -986,12 +1046,20 @@ def main() -> None:
             )
             _prof.__enter__()
 
-        batch = collector(model, pool, sampled_game_cfg, train_cfg, rng, critic=critic)
-        if blocks:
+        if args.mix_configs:
+            batch = collect_rollout_multiconfig(
+                model, pool, mix_cfgs, train_cfg, rng, critic=critic
+            )
+            # One coef for the mixed update (all mix tiers seeded equal);
+            # live-tunable via anneal_control {"tier_ent": {...}}.
+            update_entropy_coef = tier_ent.get(mix_tiers[0], args.entropy_coef)
+        elif blocks:
+            batch = collector(model, pool, sampled_game_cfg, train_cfg, rng, critic=critic)
             # tier_ent[tier] == the static block value when --anneal-entropy is
             # off (it is never mutated then), so this is identical to today.
             update_entropy_coef = tier_ent[active_tier]
         else:
+            batch = collector(model, pool, sampled_game_cfg, train_cfg, rng, critic=critic)
             update_entropy_coef = (
                 entropy_coef_deep if sampled_eff_dist == "deep" else args.entropy_coef
             )

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import copy
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable
 
 import numpy as np
@@ -1445,6 +1445,98 @@ def collect_rollout_batched(
         aggr_bonus_steps_by_street=tuple(aggr_bonus_steps_by_street),
         adv_clip=float(getattr(train_config, "adv_clip", 0.0)),
     )
+
+
+# ---- vThree: mix many (seats,stacks) configs within ONE update ------------
+# Each update's gradient averages over N configs spanning all stack tiers,
+# instead of one config + a 50-update block. This removes the consecutive-
+# shallow exposure that saturated the gate (vTwo10-13 all died ~38 clubgg
+# updates in). Implemented as a thin wrapper over the bit-exact single-config
+# collector: split → host-concat → global advantage re-normalization.
+
+_BATCH_TENSOR_FIELDS = (
+    "obs", "gate_masks", "gate_actions", "raise_chips", "sizing",
+    "anchor_actions", "refine_u", "opp_holes", "log_probs", "values",
+    "returns", "advantages", "old_gate_logp", "old_anchor_logp",
+)
+
+
+def _batch_to_device(batch: Batch, device: torch.device) -> Batch:
+    """Move every tensor field of a Batch to `device`; scalar diagnostics ride
+    along unchanged. Used to evacuate each sub-rollout to host RAM before the
+    next starts, so GPU peak stays at a single sub-rollout (not all N)."""
+    return replace(
+        batch, **{f: getattr(batch, f).to(device) for f in _BATCH_TENSOR_FIELDS}
+    )
+
+
+def _concat_batches(batches: list[Batch], adv_clip: float) -> Batch:
+    """Concatenate sub-rollout Batches along the transition axis. Each arrives
+    already per-rollout advantage-normalized, so we RE-normalize the combined
+    advantages GLOBALLY (mean 0 / std 1, then the same fat-tail clamp) so no
+    single config's value scale dominates. Scalar aggression diagnostics sum."""
+    if len(batches) == 1:
+        return batches[0]
+
+    def _cat(field: str) -> torch.Tensor:
+        return torch.cat([getattr(b, field) for b in batches], dim=0)
+
+    adv = _cat("advantages")
+    adv = (adv - adv.mean()) / adv.std().clamp(min=1e-8)
+    if adv_clip > 0.0:
+        adv = adv.clamp(-adv_clip, adv_clip)
+
+    def _sum3(field: str) -> tuple[int, int, int]:
+        vals = [int(sum(getattr(b, field)[i] for b in batches)) for i in range(3)]
+        return (vals[0], vals[1], vals[2])
+
+    merged = {f: _cat(f) for f in _BATCH_TENSOR_FIELDS}
+    merged["advantages"] = adv
+    return Batch(
+        **merged,
+        aggr_bonus_total_bb=float(sum(b.aggr_bonus_total_bb for b in batches)),
+        aggr_steps_total=int(sum(b.aggr_steps_total for b in batches)),
+        aggr_bonus_steps=int(sum(b.aggr_bonus_steps for b in batches)),
+        aggr_steps_total_by_street=_sum3("aggr_steps_total_by_street"),
+        aggr_bonus_steps_by_street=_sum3("aggr_bonus_steps_by_street"),
+    )
+
+
+def collect_rollout_multiconfig(
+    learner: ActorCritic,
+    pool: OpponentPool,
+    configs: list[GameConfig],
+    train_config: TrainingConfig,
+    rng: np.random.Generator,
+    critic: CentralCritic | None = None,
+) -> Batch:
+    """One update's rollout MIXED across `configs` distinct (seats,stacks) setups.
+
+    Runs `collect_rollout_batched` once per config — each sub-rollout sized
+    `num_envs // N` envs and `rollout_length // N` learner steps — evacuates the
+    sub-batch to host RAM as it finishes (GPU peak = one sub-rollout, not N),
+    concatenates on the host, then transfers the combined batch to the learner's
+    device once with a global advantage re-normalization. Reuses the single-
+    config collector verbatim; the only new logic is split / host-concat /
+    re-norm. Pool snapshots are taken by the caller per-update, so calling the
+    collector N times here does not over-snapshot."""
+    n = len(configs)
+    if n == 0:
+        raise ValueError("collect_rollout_multiconfig requires >= 1 config")
+    device = next(learner.parameters()).device
+    host = torch.device("cpu")
+    sub_config = replace(
+        train_config,
+        num_envs=max(1, train_config.num_envs // n),
+        rollout_length=max(1, train_config.rollout_length // n),
+    )
+    host_batches: list[Batch] = []
+    for cfg in configs:
+        sub = collect_rollout_batched(learner, pool, cfg, sub_config, rng, critic=critic)
+        host_batches.append(_batch_to_device(sub, host))
+        del sub
+    combined = _concat_batches(host_batches, float(getattr(train_config, "adv_clip", 0.0)))
+    return _batch_to_device(combined, device)
 
 
 def iter_minibatches(
