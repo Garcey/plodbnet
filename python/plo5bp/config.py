@@ -107,6 +107,14 @@ class TrainingConfig:
     # rollback (soft early-stop still applies).
     kl_hard: float = 10.0
 
+    # Sizing-entropy scale (v2 only): multiplies the anchor+beta
+    # (sizing-head) entropy bonus relative to the gate. 1.0 = off (gate and
+    # sizing heads share entropy_coef). >1 gives the sizing heads a stronger
+    # entropy bonus to resist the anchor/beta over-sharpening that drives v2
+    # saturation collapse, WITHOUT loosening the gate. Live-tunable via
+    # runs/anneal_control.json {"sizing_entropy_scale": X}.
+    sizing_entropy_scale: float = 1.0
+
     # Clamp normalized advantages to ±this many σ before the PPO loss.
     # 0.0 = off. PPO's clip bounds the importance RATIO, not the
     # advantage weight, so one fat-tail sample (a 1500bb six-way

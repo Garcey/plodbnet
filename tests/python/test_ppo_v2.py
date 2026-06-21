@@ -268,3 +268,47 @@ def test_adv_clip_bounds_batch_advantages() -> None:
         critic=critic,
     )
     assert float(b2.advantages.abs().max()) <= 0.5 + 1e-6
+
+
+def test_sizing_entropy_scale_plumbs_and_runs() -> None:
+    # The config field reaches the trainer attribute, and the scaled-entropy
+    # code path runs end-to-end producing finite stats.
+    trainer, batch, rng = _setup(
+        critic_hidden_dim=64, critic_num_blocks=1, sizing_entropy_scale=3.0
+    )
+    assert trainer.sizing_entropy_scale == 3.0
+    stats = trainer.update(batch, rng)
+    for name in ("entropy", "policy_loss", "gate_entropy", "anchor_entropy"):
+        assert np.isfinite(getattr(stats, name)), f"non-finite {name}: {stats}"
+
+
+def test_sizing_entropy_scale_gradient_behavior() -> None:
+    # The rescaling is exactly ppo.py's entropy_for_loss = gate_h +
+    # scale*(entropy - gate_h): the sizing-head (anchor) entropy gradient
+    # scales with `scale`, while the gate-head gradient is untouched because
+    # the gate_h term cancels in (entropy - gate_h).
+    trainer, batch, _ = _setup(critic_hidden_dim=64, critic_num_blocks=1)
+    model = trainer.model
+
+    def head_grads(scale):
+        model.zero_grad(set_to_none=True)
+        out = model.evaluate(
+            batch.obs, batch.gate_masks, batch.sizing,
+            batch.gate_actions, batch.anchor_actions, batch.refine_u,
+        )
+        entropy, gate_h = out[1], out[3]
+        entropy_for_loss = gate_h + scale * (entropy - gate_h)
+        (-entropy_for_loss.mean()).backward()
+        return (
+            model.anchor_head.weight.grad.clone(),
+            model.gate_head.weight.grad.clone(),
+        )
+
+    a1, g1 = head_grads(1.0)
+    a3, g3 = head_grads(3.0)
+    # Sizing-head entropy gradient scales ~3x with the knob...
+    assert torch.allclose(a3, 3.0 * a1, rtol=1e-4, atol=1e-7)
+    # ...gate-head gradient is unchanged by it.
+    assert torch.allclose(g3, g1, rtol=1e-4, atol=1e-5)
+    # The sizing gradient is a real, nonzero signal (not a degenerate pass).
+    assert float(a1.abs().sum()) > 0.0

@@ -146,6 +146,13 @@ class PPOTrainer:
         # from the top of update(), discarding the whole update. 0 = off.
         # See TrainingConfig.kl_hard.
         self.kl_hard = float(getattr(config, "kl_hard", 0.0))
+        # Sizing-entropy scale (v2): multiplies the anchor+beta (sizing-head)
+        # entropy bonus relative to the gate. 1.0 = unchanged. >1 resists the
+        # anchor/beta over-sharpening that drives the v2 saturation collapse,
+        # without loosening the gate. Live-tunable via anneal_control.
+        self.sizing_entropy_scale = float(
+            getattr(config, "sizing_entropy_scale", 1.0)
+        )
         self._ref: ActorCritic | None = None
         if self.kl_anchor_coef > 0.0:
             self._ref = copy.deepcopy(model).eval()
@@ -285,7 +292,23 @@ class PPOTrainer:
                             else:
                                 display_loss = torch.zeros_like(value_loss)
 
-                            entropy_loss = -entropy.mean()
+                            # Sizing-entropy scale (v2): `entropy` is
+                            # gate_h + p_raise.detach()*(anchor_h+beta_h), so
+                            # (entropy - gate_h) is exactly the p_raise-weighted
+                            # sizing-head entropy. Rescaling it boosts the
+                            # anchor/beta entropy bonus while the gate-head
+                            # gradient cancels between the two gate_h terms
+                            # (gate weight stays 1, sizing weight = scale).
+                            if (
+                                self.head_version >= 2
+                                and self.sizing_entropy_scale != 1.0
+                            ):
+                                entropy_for_loss = gate_h + (
+                                    self.sizing_entropy_scale * (entropy - gate_h)
+                                )
+                            else:
+                                entropy_for_loss = entropy
+                            entropy_loss = -entropy_for_loss.mean()
                             loss = (
                                 policy_loss
                                 + 0.5 * value_loss

@@ -163,6 +163,7 @@ def test_anneal_due_warmup_gating():
 class _StubTrainer:
     target_kl = 2.0
     kl_hard = 10.0
+    sizing_entropy_scale = 1.0
 
 
 def test_apply_anneal_control_step_and_tiers():
@@ -198,11 +199,12 @@ def test_apply_anneal_control_step_and_tiers():
     step, last, lr = apply(raw4, last, tier_ent, step, lr)
     assert lr == 0.0001
 
-    # target_kl / kl_hard mutate the trainer in place.
+    # target_kl / kl_hard / sizing_entropy_scale mutate the trainer in place.
     trn = _StubTrainer()
-    raw5 = '{"target_kl": 1.5, "kl_hard": 12.0}'
+    raw5 = '{"target_kl": 1.5, "kl_hard": 12.0, "sizing_entropy_scale": 2.5}'
     step, last, lr = apply(raw5, last, tier_ent, step, lr, trainer=trn)
     assert trn.target_kl == 1.5 and trn.kl_hard == 12.0
+    assert trn.sizing_entropy_scale == 2.5
 
     # Malformed JSON: ignored, not marked applied (so a half-written
     # save retries next loop).

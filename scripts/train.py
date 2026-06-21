@@ -139,6 +139,7 @@ def _apply_anneal_control(
       {"target_kl": 2.0}                  — retune the soft KL early-stop
       {"kl_hard": 12.0}                   — retune the hard rollback level
       {"lr": 1e-4}                        — retune the base learning rate
+      {"sizing_entropy_scale": 2.5}       — scale the sizing-head entropy
       {"step": 0.003, "tier_ent": {...}}  — any combination
 
     A manual tier_ent set is one-shot: the anneal keeps lowering from
@@ -160,6 +161,11 @@ def _apply_anneal_control(
         )
         new_kl_hard = float(ctrl["kl_hard"]) if "kl_hard" in ctrl else None
         new_lr = float(ctrl["lr"]) if "lr" in ctrl else None
+        new_sizing_scale = (
+            float(ctrl["sizing_entropy_scale"])
+            if "sizing_entropy_scale" in ctrl
+            else None
+        )
     except (ValueError, TypeError):
         return step, last_raw, live_lr
     if new_step != step:
@@ -178,6 +184,13 @@ def _apply_anneal_control(
         if trainer.kl_hard != new_kl_hard:
             print(f"[anneal-control] kl_hard {trainer.kl_hard} -> {new_kl_hard}")
         trainer.kl_hard = new_kl_hard
+    if new_sizing_scale is not None and trainer is not None:
+        if trainer.sizing_entropy_scale != new_sizing_scale:
+            print(
+                "[anneal-control] sizing_entropy_scale "
+                f"{trainer.sizing_entropy_scale} -> {new_sizing_scale}"
+            )
+        trainer.sizing_entropy_scale = new_sizing_scale
     out_lr = live_lr
     if new_lr is not None:
         if live_lr != new_lr:
@@ -635,6 +648,16 @@ def main() -> None:
         "disables hard rollback. Live-tunable via anneal_control.json.",
     )
     parser.add_argument(
+        "--sizing-entropy-scale",
+        type=float,
+        default=1.0,
+        help="v2 sizing-entropy scale: multiplies the anchor+beta "
+        "(sizing-head) entropy bonus relative to the gate. 1.0 = off. >1 "
+        "resists the anchor/beta over-sharpening that drives v2 saturation "
+        "collapse without loosening the gate. Live-tunable via "
+        'runs/anneal_control.json {"sizing_entropy_scale": X}.',
+    )
+    parser.add_argument(
         "--kl-anchor-ema",
         type=float,
         default=0.999,
@@ -774,6 +797,7 @@ def main() -> None:
         kl_anchor_ema=args.kl_anchor_ema,
         target_kl=args.target_kl,
         kl_hard=args.kl_hard,
+        sizing_entropy_scale=args.sizing_entropy_scale,
         adv_clip=args.adv_clip,
         device=args.device,
     )
