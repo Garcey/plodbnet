@@ -47,7 +47,7 @@ def _fake_batch(t: int, seed: int) -> Batch:
     )
 
 
-def test_concat_batches_shapes_fields_and_global_renorm() -> None:
+def test_concat_batches_shapes_fields_and_per_config_norm() -> None:
     b1, b2 = _fake_batch(4, 0), _fake_batch(6, 1)
     out = _concat_batches([b1, b2], adv_clip=8.0)
 
@@ -56,10 +56,13 @@ def test_concat_batches_shapes_fields_and_global_renorm() -> None:
     assert torch.equal(out.gate_actions, torch.cat([b1.gate_actions, b2.gate_actions], 0))
     assert torch.equal(out.opp_holes, torch.cat([b1.opp_holes, b2.opp_holes], 0))
 
-    # Advantages re-normalized over the COMBINED set (mean 0, unbiased std 1) —
-    # not the per-sub-rollout scales.
-    assert abs(out.advantages.mean().item()) < 1e-5
-    assert abs(out.advantages.std().item() - 1.0) < 1e-4
+    # Advantages PRESERVE each sub-rollout's own (per-config) scale — NO global
+    # re-normalization (which mixed incomparable stack-depth scales and drove the
+    # full-LR collapse). The combined is exactly the concatenation, here all
+    # within the fat-tail clamp.
+    assert torch.equal(
+        out.advantages, torch.cat([b1.advantages, b2.advantages], 0)
+    )
 
     # Scalar diagnostics sum.
     assert out.aggr_steps_total == b1.aggr_steps_total + b2.aggr_steps_total
@@ -76,7 +79,7 @@ def test_concat_single_batch_is_passthrough() -> None:
 
 def test_concat_advantages_fat_tail_clamped() -> None:
     b1, b2 = _fake_batch(50, 2), _fake_batch(50, 3)
-    b1.advantages[0] = 1000.0  # outlier -> large after renorm -> clamped
+    b1.advantages[0] = 1000.0  # outlier -> clamped by the fat-tail safety
     out = _concat_batches([b1, b2], adv_clip=8.0)
     assert out.advantages.max().item() <= 8.0 + 1e-5
     assert out.advantages.min().item() >= -8.0 - 1e-5
@@ -102,5 +105,6 @@ def test_collect_rollout_multiconfig_smoke() -> None:
     assert batch.obs.device.type == "cpu"
     for f in ("obs", "advantages", "returns", "values", "log_probs"):
         assert torch.isfinite(getattr(batch, f)).all(), f
-    # Globally normalized advantages.
+    # Per-config normalized: each sub-rollout is mean-0 from its own finalize,
+    # so the concatenation is ~mean-0 without any global re-normalization.
     assert abs(batch.advantages.mean().item()) < 1e-3

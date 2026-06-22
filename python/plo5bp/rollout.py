@@ -1452,7 +1452,7 @@ def collect_rollout_batched(
 # instead of one config + a 50-update block. This removes the consecutive-
 # shallow exposure that saturated the gate (vTwo10-13 all died ~38 clubgg
 # updates in). Implemented as a thin wrapper over the bit-exact single-config
-# collector: split → host-concat → global advantage re-normalization.
+# collector: split → host-concat, preserving each config's own advantage norm.
 
 _BATCH_TENSOR_FIELDS = (
     "obs", "gate_masks", "gate_actions", "raise_chips", "sizing",
@@ -1472,9 +1472,16 @@ def _batch_to_device(batch: Batch, device: torch.device) -> Batch:
 
 def _concat_batches(batches: list[Batch], adv_clip: float) -> Batch:
     """Concatenate sub-rollout Batches along the transition axis. Each arrives
-    already per-rollout advantage-normalized, so we RE-normalize the combined
-    advantages GLOBALLY (mean 0 / std 1, then the same fat-tail clamp) so no
-    single config's value scale dominates. Scalar aggression diagnostics sum."""
+    already per-rollout (per-config) advantage-normalized to unit std, and we
+    PRESERVE that scale — we do NOT re-pool the configs into one global std.
+
+    Global re-normalization was the full-LR collapse driver (vThree, 2026-06-22):
+    it mixed incomparable advantage scales across stack depths (20bb clubgg vs
+    250bb deep) into a single std, distorting the gradient. Block-rotation —
+    rock-stable at full LR 2e-4 — normalized per-update/per-config; keeping each
+    sub-rollout's own normalization restores exactly that structure. Only the
+    fat-tail clamp is re-applied (idempotent; already done upstream). Scalar
+    aggression diagnostics sum."""
     if len(batches) == 1:
         return batches[0]
 
@@ -1482,7 +1489,6 @@ def _concat_batches(batches: list[Batch], adv_clip: float) -> Batch:
         return torch.cat([getattr(b, field) for b in batches], dim=0)
 
     adv = _cat("advantages")
-    adv = (adv - adv.mean()) / adv.std().clamp(min=1e-8)
     if adv_clip > 0.0:
         adv = adv.clamp(-adv_clip, adv_clip)
 
