@@ -287,7 +287,9 @@ class BatchedBombPotEnv:
             self._legal = np.asarray(bundle["legal_mask"], dtype=bool)
             self._min_raise = np.asarray(bundle["min_raise"], dtype=np.uint64)
             self._max_raise = np.asarray(bundle["max_raise"], dtype=np.uint64)
-            self._gate_mask = gate_mask_from_bounds(self._legal, self._max_raise)
+            self._gate_mask = gate_mask_from_bounds(
+                self._legal, self._max_raise, self.config.bb
+            )
             # Terminal envs: zero everything so downstream code can rely on
             # "dones → no legal action".
             self._gate_mask[dones] = False
@@ -341,7 +343,9 @@ class BatchedBombPotEnv:
             legal_sub = np.asarray(bundle["legal_mask"], dtype=bool)
             min_raise_sub = np.asarray(bundle["min_raise"], dtype=np.uint64)
             max_raise_sub = np.asarray(bundle["max_raise"], dtype=np.uint64)
-            gate_sub = gate_mask_from_bounds(legal_sub, max_raise_sub)
+            gate_sub = gate_mask_from_bounds(
+                legal_sub, max_raise_sub, self.config.bb
+            )
             # Mirror the full-refresh terminal rule on the subset rows.
             gate_sub[dones_sub] = False
 

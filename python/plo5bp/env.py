@@ -254,7 +254,7 @@ class BombPotEnv:
         mask = np.asarray(self._rs.legal_action_mask(), dtype=bool)
         min_raise = int(raw.get("min_raise", 0))
         max_raise = int(raw.get("max_raise", 0))
-        gate_mask = gate_mask_from_bounds(mask, max_raise)
+        gate_mask = gate_mask_from_bounds(mask, max_raise, self.config.bb)
         actor = raw["actor"]
         if actor is not None:
             raw["hero_category_a"] = int(self._rs.hero_category(actor, 0))
