@@ -56,7 +56,12 @@ from plo5bp.env import BombPotEnv, StepInfo
 from plo5bp.eval import model_policy
 from plo5bp.network import ActorCritic, CentralCritic, obs_adapter
 from plo5bp.rollout import _critic_values, _rotate_opp_holes
-from plo5bp.sizing import ANCHOR_COUNT, anchor_grid_np, sizing_from_info
+from plo5bp.sizing import (
+    ANCHOR_COUNT,
+    anchor_grid_np,
+    anchor_grid_torch,
+    sizing_from_info,
+)
 from plo5bp.ui.common import (
     STREET_NAMES,
     anchor_label,
@@ -270,17 +275,19 @@ def compute_node_distribution(
         sizing = sizing_from_info(info)
         sizing_t = torch.from_numpy(sizing[None, :]).to(device)
         with torch.no_grad():
-            gate_logits, anchor_logits, refine, value = model(obs_t, gm_t)
+            gate_logits, anchor_head_out, refine, value = model(obs_t, gm_t)
             gate_probs = F.softmax(gate_logits, dim=-1).squeeze(0).tolist()
             _act_out = model.act(obs_t, gm_t, sizing_t, deterministic=True)
-            anchor_np = anchor_logits.squeeze(0).float().cpu().numpy()
+            # Anchor histogram via the model's own (head-agnostic) anchor
+            # distribution: flat softmax for v2, discretized-logistic for v4.
+            anchor_probs = (
+                model._anchor_dist(anchor_head_out, anchor_grid_torch(sizing_t))
+                .probs.squeeze(0).float().cpu().numpy()
+            )
             refine_np = refine.squeeze(0).float().cpu().numpy()  # (9, 2)
         grid = anchor_grid_np(sizing[0], sizing[1], sizing[2], sizing[3])
-        masked = np.where(grid.legal, anchor_np, -1e9)
-        exps = np.exp(masked - masked.max())
-        anchor_probs = exps / exps.sum()
         return {
-            "head_version": 2,
+            "head_version": model.head_version,
             "gate_probs": [float(p) for p in gate_probs],
             "anchor_probs": [float(p) for p in anchor_probs],
             "anchor_chips": [int(c) for c in grid.chips],
