@@ -47,6 +47,7 @@ from plo5bp.sizing import (
     ANCHOR_COUNT,
     BRACKET_HALF,
     anchor_grid_np,
+    anchor_grid_torch,
     sizing_from_info,
 )
 
@@ -1031,20 +1032,24 @@ def _recommendation_v2(
     sizing = sizing_from_info(info)
     sizing_t = torch.from_numpy(sizing[None, :]).to(MODEL_DEVICE)
     with torch.no_grad():
-        gate_logits, anchor_logits, refine, value = MODEL(obs_t, gm_t)
+        gate_logits, anchor_head_out, refine, value = MODEL(obs_t, gm_t)
         gate_probs = F.softmax(gate_logits, dim=-1).squeeze(0).tolist()
         _act_out = MODEL.act(obs_t, gm_t, sizing_t, deterministic=True)
         gate = int(_act_out.gate.item())
         chips = int(_act_out.chips.item())
         rec_anchor = int(_act_out.anchor.item())
         value_bb = float(value.squeeze(0).item())
-        anchor_np = anchor_logits.squeeze(0).float().cpu().numpy()
+        # Anchor histogram via the model's own (head-agnostic) anchor
+        # distribution: flat masked softmax for v2, discretized-logistic for
+        # v4. Avoids assuming the 2nd forward output is 11 raw anchor logits.
+        grid_t = anchor_grid_torch(sizing_t)
+        anchor_probs = (
+            MODEL._anchor_dist(anchor_head_out, grid_t)
+            .probs.squeeze(0).float().cpu().numpy()
+        )
         refine_np = refine.squeeze(0).float().cpu().numpy()  # (9, 2)
 
     grid = anchor_grid_np(sizing[0], sizing[1], sizing[2], sizing[3])
-    masked = np.where(grid.legal, anchor_np, -1e9)
-    exps = np.exp(masked - masked.max())
-    anchor_probs = exps / exps.sum()
     anchors = [
         {
             "k": int(k),
@@ -1075,7 +1080,7 @@ def _recommendation_v2(
         "raise"
     )
     return {
-        "head_version": 2,
+        "head_version": MODEL.head_version,
         "gate": gate_slug,
         "gate_name": GATE_NAMES[gate],
         "chips": chips_out,
