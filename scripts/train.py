@@ -618,6 +618,14 @@ def main() -> None:
         "weights and ramps in over ~1/(1-ema) updates.",
     )
     parser.add_argument(
+        "--lr",
+        type=float,
+        default=TrainingConfig.lr,
+        help="Base Adam learning rate before the --lr-warmup-updates ramp "
+        "and any live anneal_control.json {\"lr\": ...} retune. Lower it for "
+        "warm restarts whose gate is fragile under the full default rate.",
+    )
+    parser.add_argument(
         "--lr-warmup-updates",
         type=int,
         default=0,
@@ -785,6 +793,7 @@ def main() -> None:
     stack_lo, stack_hi = _parse_stack_range(args.stack_range)
 
     train_cfg = TrainingConfig(
+        lr=args.lr,
         num_updates=args.num_updates,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
@@ -834,12 +843,12 @@ def main() -> None:
     if args.load_checkpoint is not None:
         ckpt = torch.load(args.load_checkpoint, map_location="cpu", weights_only=False)
         ckpt_head = int(ckpt.get("head_version", 1))
-        if ckpt_head != 2:
+        if ckpt_head != model.head_version:
             raise SystemExit(
-                f"head_version mismatch: checkpoint={ckpt_head} (v1 Beta "
-                "sizing head) cannot warm-start the v2 anchor-head trainer. "
-                "Start cold or point --load-checkpoint at an anchor-family "
-                "checkpoint."
+                f"head_version mismatch: checkpoint={ckpt_head} vs model="
+                f"{model.head_version} (selected by --sizing-head). Warm-start "
+                "requires a checkpoint of the same sizing-head version; start "
+                "cold or point --load-checkpoint at a matching-family checkpoint."
             )
         if "critic" not in ckpt:
             raise SystemExit(
