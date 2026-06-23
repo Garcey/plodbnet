@@ -339,6 +339,17 @@ class ActorCriticV2(nn.Module):
         ).squeeze(-2)
         return ab[..., 0], ab[..., 1]
 
+    def _anchor_dist(self, anchor_head_out: torch.Tensor, grid):
+        """Categorical over the LEGAL anchors from this head's raw output.
+
+        v2: a flat softmax over the 11 anchor logits with illegal anchors
+        masked to -inf. `act`/`evaluate` are head-agnostic — they only touch
+        the returned Categorical (`.sample()`, `.log_prob()`, `.probs`,
+        `.entropy()`) — so a subclass overrides only this method to change the
+        size parameterization (see ActorCriticV4)."""
+        logits = anchor_head_out.masked_fill(~grid.legal, -1e9)
+        return torch.distributions.Categorical(logits=logits)
+
     def act(
         self,
         obs: torch.Tensor,
@@ -358,10 +369,9 @@ class ActorCriticV2(nn.Module):
             gate = gate_dist.sample()
         gate_log_prob = gate_dist.log_prob(gate)
 
-        anchor_logits_m = anchor_logits.masked_fill(~grid.legal, -1e9)
-        anchor_dist = torch.distributions.Categorical(logits=anchor_logits_m)
+        anchor_dist = self._anchor_dist(anchor_logits, grid)
         if deterministic:
-            anchor = anchor_logits_m.argmax(dim=-1)
+            anchor = anchor_dist.probs.argmax(dim=-1)
         else:
             anchor = anchor_dist.sample()
         anchor_log_prob = anchor_dist.log_prob(anchor)
@@ -445,8 +455,7 @@ class ActorCriticV2(nn.Module):
         gate_log_prob = gate_dist.log_prob(gate_actions)
         gate_entropy = gate_dist.entropy()
 
-        anchor_logits_m = anchor_logits.masked_fill(~grid.legal, -1e9)
-        anchor_dist = torch.distributions.Categorical(logits=anchor_logits_m)
+        anchor_dist = self._anchor_dist(anchor_logits, grid)
         anchor_log_prob = anchor_dist.log_prob(anchor_actions)
 
         alpha, beta = self._gather_refine(refine, anchor_actions)
@@ -466,7 +475,7 @@ class ActorCriticV2(nn.Module):
 
         gate_probs = F.softmax(gate_logits, dim=-1)
         p_raise = gate_probs[..., GATE_RAISE]
-        anchor_probs = F.softmax(anchor_logits_m, dim=-1)
+        anchor_probs = anchor_dist.probs
         all_beta = torch.distributions.Beta(refine[..., 0], refine[..., 1])
         beta_h = all_beta.entropy()                       # (B, 9)
         interior_ok = grid.refine_ok[..., 1:ANCHOR_COUNT - 1]
@@ -479,6 +488,98 @@ class ActorCriticV2(nn.Module):
             log_prob, entropy, value, gate_entropy, anchor_entropy,
             beta_h_eff, gate_log_prob, anchor_log_prob,
         )
+
+
+def _discretized_logistic_probs(
+    mu: torch.Tensor,
+    s: torch.Tensor,
+    legal: torch.Tensor,
+    count: int = ANCHOR_COUNT,
+) -> torch.Tensor:
+    """P(anchor k) from a Logistic(mu, s) latent discretized over the ordered
+    anchor-index axis: anchor k owns the unit interval [k-0.5, k+0.5], and the
+    two END anchors absorb the outer tails so exact-min (k=0) and exact-pot
+    (k=count-1) stay first-class, concentratable actions. Illegal anchors are
+    masked out and the result renormalized over the legal set.
+
+    `mu`, `s` are (...,) on the index axis (s > 0); `legal` is (..., count) bool.
+    The standardized bin edges are clamped for tail stability. The end-bin tail
+    absorption is what avoids v1's failure (a plain continuous density gives the
+    exact endpoints ~0 mass); the low-dimensional ordered (mu, s) parameterization
+    is what avoids the v2/v3 flat-categorical instability."""
+    idx = torch.arange(count, device=mu.device, dtype=mu.dtype)
+    mu_e = mu[..., None]
+    s_e = s[..., None].clamp_min(1e-3)
+    cdf_hi = torch.sigmoid(((idx + 0.5 - mu_e) / s_e).clamp(-12.0, 12.0))
+    cdf_lo = torch.sigmoid(((idx - 0.5 - mu_e) / s_e).clamp(-12.0, 12.0))
+    p = torch.cat(
+        [
+            cdf_hi[..., :1],               # anchor 0 absorbs (-inf, 0.5]
+            (cdf_hi - cdf_lo)[..., 1:-1],  # interior bins
+            1.0 - cdf_lo[..., -1:],        # last anchor absorbs [count-1.5, +inf)
+        ],
+        dim=-1,
+    )
+    p = p.clamp_min(1e-9) * legal.to(p.dtype)
+    return p / p.sum(-1, keepdim=True).clamp_min(1e-12)
+
+
+class ActorCriticV4(ActorCriticV2):
+    """v4 sizing head: an ordinal *discretized-logistic* over the 11 anchors.
+
+    Identical to ActorCriticV2 in every respect EXCEPT how the anchor is chosen.
+    Instead of 11 free, unordered logits (a flat softmax), the size head emits a
+    single location `mu` and scale `s`, and each anchor's probability is the
+    slice of a Logistic(mu, s) sitting over it (`_discretized_logistic_probs`).
+    The per-anchor Beta refine, gate head, value head, torso, `act`/`evaluate`
+    and the rollout/PPO interfaces are all inherited unchanged.
+
+    Why: the flat categorical gave heavy-tailed, conflicting gradients across
+    stack depths (a 20bb spot wants small bets, a 250bb spot wants large) that
+    spiked the size-head KL and collapsed every full-LR run. With a single
+    ordered location, that conflict resolves by `mu` becoming a smooth function
+    of stack depth (a regression the torso handles) instead of a tug-of-war over
+    distant independent logits; a scale FLOOR makes a one-hot spike impossible,
+    so the size KL stays small. The end anchors absorb the logistic tails, so
+    exact-min and exact-pot stay reliably hittable (v2's win) — the property a
+    plain continuous head would lose. Checkpoints sniff on `size_head.weight`."""
+
+    head_version = 3
+
+    def __init__(
+        self,
+        hidden_dim: int = 512,
+        obs_dim: int = OBS_DIM,
+        num_layers: int = 2,
+        size_scale_floor: float = 0.3,
+        size_scale_cap: float = 5.0,
+    ):
+        super().__init__(hidden_dim=hidden_dim, obs_dim=obs_dim, num_layers=num_layers)
+        # Swap the flat 11-way anchor head for a 2-output (mu_raw, s_raw) head.
+        del self.anchor_head
+        self.size_head = nn.Linear(hidden_dim, 2)
+        self._size_floor = float(size_scale_floor)
+        self._size_span = float(size_scale_cap) - float(size_scale_floor)
+
+    def forward(self, obs, gate_mask):
+        z = self.torso(obs)
+        gate_logits = self.gate_head(z).masked_fill(~gate_mask, -1e9)
+        size_params = self.size_head(z)  # (..., 2): mu_raw, s_raw
+        refine = F.softplus(self.refine_head(z)).view(
+            *z.shape[:-1], _INTERIOR, 2
+        ) + 1.0
+        value = self.value_head(z.detach()).squeeze(-1)
+        return gate_logits, size_params, refine, value
+
+    def _anchor_dist(self, size_params: torch.Tensor, grid):
+        # mu on the index axis: center (count-1)/2, ranging +/-((count-1)/2 + 2)
+        # so it reaches BEYOND [0, count-1] and an end anchor can carry the
+        # majority of the mass. s floored (no spike) and soft-capped (not flat).
+        c = (ANCHOR_COUNT - 1) / 2.0
+        mu = c + (c + 2.0) * torch.tanh(size_params[..., 0])
+        s = self._size_floor + self._size_span * torch.sigmoid(size_params[..., 1])
+        probs = _discretized_logistic_probs(mu, s, grid.legal)
+        return torch.distributions.Categorical(probs=probs)
 
 
 def obs_adapter(model: nn.Module):
@@ -501,16 +602,18 @@ def obs_adapter(model: nn.Module):
 
 def model_class_for_state_dict(state_dict: dict) -> type:
     """Sniff a checkpoint's actor class from its head parameters:
-    'anchor_head.weight' → ActorCriticV2, 'raise_head.weight' → v1.
-    Shared by the UI server and the eval/exploit/bankroll loaders so
-    every consumer serves both checkpoint generations."""
+    'size_head.weight' → ActorCriticV4 (ordinal logistic), 'anchor_head.weight'
+    → ActorCriticV2, 'raise_head.weight' → v1. Shared by the UI server and the
+    eval/exploit/bankroll loaders so every consumer serves all generations."""
+    if "size_head.weight" in state_dict:
+        return ActorCriticV4
     if "anchor_head.weight" in state_dict:
         return ActorCriticV2
     if "raise_head.weight" in state_dict:
         return ActorCritic
     raise ValueError(
-        "state_dict has neither 'anchor_head.weight' (v2) nor "
-        "'raise_head.weight' (v1) — not a plo5bp actor checkpoint"
+        "state_dict has none of 'size_head.weight' (v4), 'anchor_head.weight' "
+        "(v2), or 'raise_head.weight' (v1) — not a plo5bp actor checkpoint"
     )
 
 

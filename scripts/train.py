@@ -32,7 +32,7 @@ import torch
 
 from plo5bp.actions import GATE_ACTIONS
 from plo5bp.config import GameConfig, TrainingConfig
-from plo5bp.network import ActorCriticV2, CentralCritic
+from plo5bp.network import ActorCriticV2, ActorCriticV4, CentralCritic
 from plo5bp.ppo import PPOTrainer
 from plo5bp.rollout import (
     collect_rollout,
@@ -374,6 +374,15 @@ def main() -> None:
     )
     parser.add_argument("--hidden-dim", type=int, default=2048)
     parser.add_argument("--num-layers", type=int, default=4)
+    parser.add_argument(
+        "--sizing-head",
+        choices=["anchor", "logistic"],
+        default="anchor",
+        help="Sizing-head architecture. 'anchor' = v2 flat 11-way categorical "
+        "(head_version 2). 'logistic' = v4 ordinal discretized-logistic over the "
+        "same 11 anchors (head_version 3): location+scale, stable under PPO, with "
+        "the min/pot end anchors tail-absorbed so they stay hittable.",
+    )
     parser.add_argument("--num-envs", type=int, default=1536)
     parser.add_argument("--rollout-length", type=int, default=262_144)
     parser.add_argument(
@@ -802,8 +811,13 @@ def main() -> None:
         device=args.device,
     )
 
-    model = ActorCriticV2(
+    model_cls = ActorCriticV4 if args.sizing_head == "logistic" else ActorCriticV2
+    model = model_cls(
         hidden_dim=train_cfg.hidden_dim, num_layers=train_cfg.num_layers
+    )
+    print(
+        f"[head] sizing-head={args.sizing_head} "
+        f"(head_version={model.head_version})"
     )
     model.to(train_cfg.device)
     critic = CentralCritic(
@@ -944,7 +958,7 @@ def main() -> None:
             {
                 "model": model.state_dict(),
                 "critic": critic.state_dict(),
-                "head_version": 2,
+                "head_version": model.head_version,
                 "config": train_cfg.__dict__,
                 "game_config": game_cfg_snap,
                 "gate_count": GATE_ACTIONS,
@@ -1227,7 +1241,7 @@ def main() -> None:
         {
             "model": model.state_dict(),
             "critic": critic.state_dict(),
-            "head_version": 2,
+            "head_version": model.head_version,
             "config": train_cfg.__dict__,
             "game_config": sampled_game_cfg.__dict__,
             "gate_count": GATE_ACTIONS,
