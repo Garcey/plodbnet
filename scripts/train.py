@@ -950,7 +950,18 @@ def main() -> None:
     anneal_control_file = Path("runs/anneal_control.json")
     live_anneal_step = float(args.anneal_step)
     live_lr = float(train_cfg.lr)
+    # Seed the baseline with any PRE-EXISTING anneal_control.json so a stale
+    # file left from a prior run/session is treated as ALREADY-APPLIED — not as
+    # a fresh edit that silently overrides THIS run's launch args (--lr,
+    # --entropy-coef via tier_ent, --target-kl, ...). Only edits made AFTER
+    # startup take effect. A stale {"lr": 3e-4} once forced 3e-4 onto three runs
+    # that launched with a lower --lr before this guard (2026-06-24).
     last_anneal_control: str | None = None
+    if anneal_control_file.exists():
+        try:
+            last_anneal_control = anneal_control_file.read_text()
+        except OSError:
+            last_anneal_control = None
 
     collector = collect_rollout_batched if args.batched else collect_rollout
     time_budget = float(args.train_seconds)
