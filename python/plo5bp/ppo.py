@@ -130,9 +130,16 @@ class PPOTrainer:
         self.config = config
         self.head_version = getattr(model, "head_version", 1)
         self._cuda = config.device == "cuda" and torch.cuda.is_available()
-        params = list(model.parameters())
-        if critic is not None:
-            params += list(critic.parameters())
+        # Actor and critic params kept separate so their gradients can be
+        # clipped independently (see the grad-clip in update()): they share one
+        # optimizer but the critic's grads are chip-scale and the actor's are
+        # unit-scale, so a single global clip lets a critic-loss spike throttle
+        # the actor's (gate) gradient.
+        self._actor_params = list(model.parameters())
+        self._critic_params = (
+            list(critic.parameters()) if critic is not None else []
+        )
+        params = self._actor_params + self._critic_params
         self.optimizer = optim.AdamW(params, lr=config.lr, fused=self._cuda)
         self._all_params = params
 
@@ -392,7 +399,13 @@ class PPOTrainer:
                         self.optimizer.zero_grad()
                         loss.backward()
                     with record_function("step12d/optimizer_step"):
-                        nn.utils.clip_grad_norm_(self._all_params, 0.5)
+                        # Clip actor and critic grads SEPARATELY — a single
+                        # global clip over both lets a chip-scale critic-loss
+                        # spike inflate the shared grad-norm and throttle the
+                        # actor's (gate) gradient on that same update.
+                        nn.utils.clip_grad_norm_(self._actor_params, 0.5)
+                        if self._critic_params:
+                            nn.utils.clip_grad_norm_(self._critic_params, 0.5)
                         self.optimizer.step()
                     total_policy += policy_loss.detach().float()
                     total_value += value_loss.detach().float()

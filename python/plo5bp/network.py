@@ -498,9 +498,10 @@ def _discretized_logistic_probs(
 ) -> torch.Tensor:
     """P(anchor k) from a Logistic(mu, s) latent discretized over the ordered
     anchor-index axis: anchor k owns the unit interval [k-0.5, k+0.5], and the
-    two END anchors absorb the outer tails so exact-min (k=0) and exact-pot
-    (k=count-1) stay first-class, concentratable actions. Illegal anchors are
-    masked out and the result renormalized over the legal set.
+    lowest/highest LEGAL anchors absorb the outer tails so exact-min and
+    exact-pot stay first-class concentratable actions when legal, and a
+    beyond-range mu lands on the nearest legal anchor (not spuriously on min).
+    Illegal anchors are masked out and the result renormalized over the legal set.
 
     `mu`, `s` are (...,) on the index axis (s > 0); `legal` is (..., count) bool.
     The standardized bin edges are clamped for tail stability. The end-bin tail
@@ -512,15 +513,22 @@ def _discretized_logistic_probs(
     s_e = s[..., None].clamp_min(1e-3)
     cdf_hi = torch.sigmoid(((idx + 0.5 - mu_e) / s_e).clamp(-12.0, 12.0))
     cdf_lo = torch.sigmoid(((idx - 0.5 - mu_e) / s_e).clamp(-12.0, 12.0))
-    p = torch.cat(
-        [
-            cdf_hi[..., :1],               # anchor 0 absorbs (-inf, 0.5]
-            (cdf_hi - cdf_lo)[..., 1:-1],  # interior bins
-            1.0 - cdf_lo[..., -1:],        # last anchor absorbs [count-1.5, +inf)
-        ],
-        dim=-1,
-    )
-    p = p.clamp_min(1e-9) * legal.to(p.dtype)
+    # Tail absorption at the LEGAL edges, not the fixed first/last anchor: the
+    # lowest legal anchor absorbs all mass below it, the highest legal anchor all
+    # mass above it. Reduces EXACTLY to fixed-edge absorption when anchors 0 and
+    # count-1 are themselves legal (the common case). Without this, a narrow s
+    # with mu pinned past a capped legal range dumped ~all mass on the min anchor
+    # — the only legal anchor whose raw-CDF formula doesn't cancel to ~0 under the
+    # [-12,12] clamp — instead of the highest legal anchor nearest mu.
+    legal_b = legal.bool()
+    legal_l = legal_b.to(torch.long)
+    n_before = legal_l.cumsum(-1) - legal_l                   # legal strictly before k
+    n_after = legal_l.flip(-1).cumsum(-1).flip(-1) - legal_l  # legal strictly after k
+    is_lowest = legal_b & (n_before == 0)
+    is_highest = legal_b & (n_after == 0)
+    lo_edge = torch.where(is_lowest, torch.zeros_like(cdf_lo), cdf_lo)
+    hi_edge = torch.where(is_highest, torch.ones_like(cdf_hi), cdf_hi)
+    p = (hi_edge - lo_edge).clamp_min(1e-9) * legal_b.to(cdf_hi.dtype)
     return p / p.sum(-1, keepdim=True).clamp_min(1e-12)
 
 

@@ -73,6 +73,39 @@ def test_legality_masking_renormalizes() -> None:
     assert abs(p.sum().item() - 1.0) < 1e-5
 
 
+def test_capped_high_mu_lands_on_highest_legal() -> None:
+    # Legal-edge tail absorption: mu pinned past the top of a CAPPED legal range
+    # with a tight spread must pile mass on the highest LEGAL anchor (nearest mu),
+    # NOT on min. Pre-fix this gave ~100% on anchor 0 — the only legal anchor
+    # whose raw-CDF formula didn't cancel to ~0 under the [-12,12] clamp.
+    legal = torch.zeros(1, ANCHOR_COUNT, dtype=torch.bool)
+    legal[0, :7] = True                              # anchors 0..6 (min..60%) legal
+    p = _discretized_logistic_probs(torch.tensor([12.0]), torch.tensor([0.35]), legal)
+    assert int(p.argmax()) == 6, p
+    assert p[0, 6] > 0.9 and p[0, 0] < 0.05
+    assert (p[0, 7:] == 0).all()                     # illegal anchors stay zero
+    assert abs(p.sum().item() - 1.0) < 1e-5
+
+
+def test_capped_low_mu_lands_on_lowest_legal() -> None:
+    # Symmetric: mu past the bottom of a range floored above min -> lowest legal.
+    legal = torch.zeros(1, ANCHOR_COUNT, dtype=torch.bool)
+    legal[0, 4:] = True                              # anchors 4..10 legal
+    p = _discretized_logistic_probs(torch.tensor([-2.0]), torch.tensor([0.35]), legal)
+    assert int(p.argmax()) == 4, p
+    assert p[0, 4] > 0.9
+    assert (p[0, :4] == 0).all()
+
+
+def test_single_legal_anchor_gets_all_mass() -> None:
+    # Degenerate 1-anchor legal set: that anchor takes ~all the mass for any mu.
+    for k in (0, 5, ANCHOR_COUNT - 1):
+        legal = torch.zeros(1, ANCHOR_COUNT, dtype=torch.bool)
+        legal[0, k] = True
+        p = _discretized_logistic_probs(torch.tensor([12.0]), torch.tensor([0.5]), legal)
+        assert p[0, k] > 0.999, (k, p)
+
+
 # ---- the ActorCriticV4 head ----------------------------------------------
 
 def test_v4_head_wiring_and_sniff() -> None:

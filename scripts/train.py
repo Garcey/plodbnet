@@ -648,7 +648,7 @@ def main() -> None:
     parser.add_argument(
         "--target-kl",
         type=float,
-        default=2.0,
+        default=0.5,
         help="SOFT KL guard (early-stop): when a minibatch's |approx_kl| "
         "exceeds this, stop the PPO inner loop but KEEP the minibatches "
         "already applied this update. Standard PPO early-stopping. 0 "

@@ -97,7 +97,10 @@ class TrainingConfig:
     # rollback at this threshold, which froze a run (317/318 updates
     # rolled back to no-ops, 2026-06-12) once the policy sharpened enough
     # to cross it every update. Rollback now lives at kl_hard below.
-    target_kl: float = 2.0
+    # 0.5 (not 2.0): the v2/v4 discrete heads have heavier-tailed importance
+    # ratios than v1's Beta; vFour ran 2.0 and the gate over-moved → collapsed
+    # at u36, vFour3 held at 0.5.
+    target_kl: float = 0.5
 
     # HARD KL guard (full rollback): when a minibatch's |approx_kl|
     # exceeds this, restore params + optimizer moments captured at the
