@@ -283,6 +283,39 @@ _CLUBGG_SEAT_WEIGHTS: dict[int, float] = {
     2: 0.10,
 }
 
+# NLH ring-game seat weights (user-described 2026-07-04): "slightly more
+# emphasis on 5-6 handed, the rest split evenly" — 5/6 get 1.25x the
+# 2/3/4 weight (≈22.7% each vs ≈18.2% each after normalization).
+_NLH_RING_SEAT_WEIGHTS: dict[int, float] = {
+    6: 1.25,
+    5: 1.25,
+    4: 1.0,
+    3: 1.0,
+    2: 1.0,
+}
+
+
+def _sample_nlh_topoff_stack_bb(rng: np.random.Generator) -> float:
+    """Per-seat stack depth for the live 5/10($5) NLH table's top-off
+    culture (user-described 2026-07-04): most players auto top off to
+    100bb, so hand-start stacks cluster there; 1-2 (occasionally 3) of
+    ~6 seats sit below 100bb (non-topped, stuck); the rest drift
+    100-150bb; 1-2 winners hold 150-400bb ($1.5k-4k at $10/bb).
+
+    Mixture: 40% pinned at exactly 100bb, 25% short Uniform(30, 100),
+    20% Uniform(100, 150), 15% Uniform(150, 400). At 6 seats that's
+    ≈1.5 short / ≈3.6 at-or-near 100-150 / ≈0.9 deep — matching the
+    described table.
+    """
+    r = rng.random()
+    if r < 0.40:
+        return 100.0
+    if r < 0.65:
+        return float(rng.uniform(30.0, 100.0))
+    if r < 0.85:
+        return float(rng.uniform(100.0, 150.0))
+    return float(rng.uniform(150.0, 400.0))
+
 
 def _sample_clubgg_stack_bb(
     stack_lo_bb: float,
@@ -311,17 +344,21 @@ def _sample_clubgg_stack_bb(
 
 
 def _sample_clubgg_seats(
-    seats_choices: tuple[int, ...], rng: np.random.Generator
+    seats_choices: tuple[int, ...],
+    rng: np.random.Generator,
+    weights: dict[int, float] | None = None,
 ) -> int:
-    # Restrict to the intersection of clubgg weights and user-supplied
-    # seat range; renormalize. Seats not in _CLUBGG_SEAT_WEIGHTS fall
-    # back to uniform probability across the remaining clubgg-weighted
-    # seats so we never silently drop them.
-    weights = [_CLUBGG_SEAT_WEIGHTS.get(n, 0.0) for n in seats_choices]
-    total = sum(weights)
+    # Restrict to the intersection of the weight table and user-supplied
+    # seat range; renormalize. Seats not in the table fall back to
+    # uniform probability across the remaining weighted seats so we
+    # never silently drop them. Default table = ClubGG PLO weights;
+    # `nlh_ring` passes its own.
+    table = _CLUBGG_SEAT_WEIGHTS if weights is None else weights
+    weights_l = [table.get(n, 0.0) for n in seats_choices]
+    total = sum(weights_l)
     if total <= 0.0:
         return int(rng.choice(seats_choices))
-    probs = [w / total for w in weights]
+    probs = [w / total for w in weights_l]
     return int(rng.choice(seats_choices, p=probs))
 
 
@@ -339,6 +376,10 @@ def _sample_game_config(
 ) -> tuple[GameConfig, str]:
     if seats_dist == "clubgg":
         n_seats = _sample_clubgg_seats(seats_choices, rng)
+    elif seats_dist == "nlh_ring":
+        n_seats = _sample_clubgg_seats(
+            seats_choices, rng, weights=_NLH_RING_SEAT_WEIGHTS
+        )
     else:
         n_seats = int(rng.choice(seats_choices))
 
@@ -362,6 +403,10 @@ def _sample_game_config(
                 )
                 for _ in range(n_seats)
             ]
+        )
+    elif effective_stack_dist == "nlh_topoff":
+        depths_bb = np.array(
+            [_sample_nlh_topoff_stack_bb(rng) for _ in range(n_seats)]
         )
     elif effective_stack_dist in ("agro_deep", "deep"):
         depths_bb = rng.uniform(100.0, 250.0, size=n_seats)
@@ -488,7 +533,10 @@ def main() -> None:
     parser.add_argument(
         "--stack-dist",
         type=str,
-        choices=("uniform", "clubgg", "clubgg_deep", "clubgg_mix", "agro_deep", "deep", "full_mix"),
+        choices=(
+            "uniform", "clubgg", "clubgg_deep", "clubgg_mix", "agro_deep",
+            "deep", "full_mix", "nlh_topoff",
+        ),
         default="uniform",
         help="'uniform' samples within --stack-range; 'clubgg' uses piecewise "
         "weighted bands (Short 5%%, Hover 50%%, Warm 18%%, Big 17%%, Monster 10%%) "
@@ -590,11 +638,12 @@ def main() -> None:
     parser.add_argument(
         "--seats-dist",
         type=str,
-        choices=("uniform", "clubgg"),
+        choices=("uniform", "clubgg", "nlh_ring"),
         default="uniform",
         help="'uniform' samples from --num-seats-range equiprobably; 'clubgg' "
         "weights 6:30/5:25/4:25/3:15/2:10 (normalized) restricted to "
-        "--num-seats-range.",
+        "--num-seats-range; 'nlh_ring' slightly favors 5-6 handed "
+        "(1.25x the 2/3/4 weight — ~22.7% each vs ~18.2%).",
     )
     parser.add_argument(
         "--bb",

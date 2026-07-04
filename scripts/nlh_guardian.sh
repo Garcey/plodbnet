@@ -1,12 +1,19 @@
 #!/bin/bash
-# nlh1 guardian — first NLH training run (cold start, 2026-07-03).
+# nlh<N> guardian (STEM below) — NLH training runs (cold start lineage).
 #
-# Launched after vFour4 (PLO5DBBP) was PAUSED gracefully at the user's
-# request — NOT collapsed. vFour4 resumes later via warm-start; its pool
-# rebuilds from checkpoints/vFour4_*.pt (warm-start pool seeding,
-# 2026-07-03) — do NOT prune those files.
+# nlh1 (2026-07-03, ~4 updates): first launch, --stack-dist deep. Replaced
+# same night by nlh2 when the user specified the REAL table curriculum:
+# --stack-dist nlh_topoff (40% pinned at the 100bb auto-top-off, 25%
+# short 30-100bb, 20% at 100-150bb, 15% winners 150-400bb) +
+# --seats-dist nlh_ring (5-6 handed slightly favored, 2-4 even).
+# nlh1's Hg trend before replacement: 0.17 -> 0.52 (cold-init sharpness
+# recovering under the 0.30 entropy bonus — healthy).
 #
-# nlh1 config (USER-DIRECTED 2026-07-03):
+# vFour4 (PLO5DBBP) was PAUSED gracefully for this GPU — NOT collapsed.
+# It resumes later via warm-start; its pool rebuilds from
+# checkpoints/vFour4_*.pt (warm-start pool seeding) — do NOT prune those.
+#
+# Config (USER-DIRECTED 2026-07-03):
 #   - COLD START (user mandate: no cross-variant warm-starts — equities
 #     and made-hand strength differ too much by game; the guard refuses
 #     them anyway).
@@ -19,7 +26,7 @@
 #   - rollout 11.6M / 16 minibatches / 2 epochs (user's pick — the
 #     computed max at ~90 GiB on the 96 GB card with the minibatch
 #     growing to ~725k; watch nvidia-smi on the first updates).
-#   - --stack-dist deep (100-250bb — the reference 5/10($5) table), seats
+#   - --stack-dist nlh_topoff + --seats-dist nlh_ring (see above), seats
 #     2-6 sampled per update. NO --mix-configs (its tiers are PLO stack
 #     blocks; NLH resamples a config every update instead).
 #   - batched collector (NLH packer + vectorized encoder shipped
@@ -27,21 +34,22 @@
 #   - 5/10 with $5/player ante falls out of the defaults at bb=10000
 #     (sb=bb/2, ante=bb/2).
 #
-# Relaunches warm-load the newest nlh1_*.pt (same-variant warm start; the
-# opponent pool auto-reseeds from siblings). Stop cleanly:
-#   touch runs/nlh1.stop
+# Relaunches warm-load the newest ${STEM}_*.pt (same-variant warm start;
+# the opponent pool auto-reseeds from siblings). Stop cleanly:
+#   touch runs/<stem>.stop
 set -uo pipefail
 cd /workspace/plodbnet || exit 1
 
-GLOG=runs/nlh1_guardian.log
-STOPFLAG=runs/nlh1.stop
-LOG=runs/nlh1.log
-COLLFLAG=runs/nlh1_collapsed.flag
+STEM=nlh2
+GLOG=runs/${STEM}_guardian.log
+STOPFLAG=runs/${STEM}.stop
+LOG=runs/${STEM}.log
+COLLFLAG=runs/${STEM}_collapsed.flag
 MAX_RESTARTS=4
 POLL=300
 restarts=0
 
-log(){ echo "[nlh1-guardian $(date -u '+%m-%d %H:%M:%S')] $*" >> "$GLOG"; }
+log(){ echo "[${STEM}-guardian $(date -u '+%m-%d %H:%M:%S')] $*" >> "$GLOG"; }
 train_pid(){ pgrep -f "python -u scripts/[t]rain.py" | head -1; }
 
 launch(){  # $1 = checkpoint to warm-load ("" = cold start)
@@ -54,17 +62,17 @@ launch(){  # $1 = checkpoint to warm-load ("" = cold start)
     --batched --device cuda --hidden-dim 2048 --num-layers 4 \
     --critic-hidden-dim 1536 --critic-num-blocks 2 \
     --num-envs 49134 --rollout-length 11600000 --num-minibatches 16 --ppo-epochs 2 \
-    --stack-dist deep --num-seats-range "2,3,4,5,6" \
+    --stack-dist nlh_topoff --seats-dist nlh_ring --num-seats-range "2,3,4,5,6" \
     --entropy-coef 0.30 --sizing-entropy-scale 1.0 \
     --lr 1.5e-4 --lr-warmup-updates 75 --target-kl 0.5 --kl-hard 10.0 --adv-clip 8 \
     --snapshot-every 5 \
-    $load --checkpoint checkpoints/nlh1.pt \
+    $load --checkpoint checkpoints/${STEM}.pt \
     --num-updates 100000000 >> "$LOG" 2>&1 < /dev/null &
   disown 2>/dev/null || true
 }
 
 if [ -z "$(train_pid)" ]; then
-  L=$(ls -t checkpoints/nlh1_*.pt 2>/dev/null | head -1)
+  L=$(ls -t checkpoints/${STEM}_*.pt 2>/dev/null | head -1)
   WARM="${L:-}"
   if [ -n "$WARM" ]; then
     log "initial launch warm-loading ${WARM}"
@@ -88,7 +96,7 @@ while true; do
     if [ -z "$PID" ]; then
       if [ "$restarts" -ge "$MAX_RESTARTS" ]; then log "DEAD; restart cap ($MAX_RESTARTS) hit -> STOP"; touch "$STOPFLAG"; exit 0; fi
       restarts=$((restarts+1))
-      L=$(ls -t checkpoints/nlh1_*.pt 2>/dev/null | head -1)
+      L=$(ls -t checkpoints/${STEM}_*.pt 2>/dev/null | head -1)
       WARM="${L:-}"
       log "process DEAD (crash/OOM); relaunch #$restarts warm-loading ${WARM:-COLD}"
       launch "$WARM"; sleep 45; continue
