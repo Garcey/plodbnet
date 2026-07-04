@@ -13,7 +13,19 @@
 # It resumes later via warm-start; its pool rebuilds from
 # checkpoints/vFour4_*.pt (warm-start pool seeding) — do NOT prune those.
 #
-# Config (USER-DIRECTED 2026-07-03):
+# nlh2 POSTMORTEM (2026-07-04, 24-agent verified): collapsed u21-25 into a
+# card-blind all-fold absorbing state (p_raise ~1e-8, 18-24 nat logit gap).
+# NO code/reward bug — an NLH-specific optimization trap: fold is the only
+# zero-variance zero-return action under forward-EV (blinds sunk), cold
+# raises sample overbet-heavy sizes and realize terrible EV before the
+# sizing head learns, and the 4.5bb steal signal drowns in 100-400bb clash
+# variance under global adv normalization. PLO's 0.30 coef doesn't
+# transfer (bomb pots have no fold-to-win-blinds node). nlh3 = warm from
+# nlh2_20 (probed CLEAN: 5% fold rate, AA-BTN raise 57%) at 0.45 with
+# sizing_entropy_scale 0.65 (gate pressure x1.5, sizing pressure ~const;
+# scale<1 does NOT add gate pressure itself — network detaches p_raise).
+#
+# Config (USER-DIRECTED 2026-07-03, entropy REVISED by collapse mandate):
 #   - COLD START (user mandate: no cross-variant warm-starts — equities
 #     and made-hand strength differ too much by game; the guard refuses
 #     them anyway).
@@ -40,7 +52,7 @@
 set -uo pipefail
 cd /workspace/plodbnet || exit 1
 
-STEM=nlh2
+STEM=nlh3
 GLOG=runs/${STEM}_guardian.log
 STOPFLAG=runs/${STEM}.stop
 LOG=runs/${STEM}.log
@@ -63,7 +75,7 @@ launch(){  # $1 = checkpoint to warm-load ("" = cold start)
     --critic-hidden-dim 1536 --critic-num-blocks 2 \
     --num-envs 49134 --rollout-length 11600000 --num-minibatches 16 --ppo-epochs 2 \
     --stack-dist nlh_topoff --seats-dist nlh_ring --num-seats-range "2,3,4,5,6" \
-    --entropy-coef 0.30 --sizing-entropy-scale 1.0 \
+    --entropy-coef 0.45 --sizing-entropy-scale 0.65 \
     --lr 1.5e-4 --lr-warmup-updates 75 --target-kl 0.5 --kl-hard 10.0 --adv-clip 8 \
     --snapshot-every 5 \
     $load --checkpoint checkpoints/${STEM}.pt \
@@ -73,16 +85,12 @@ launch(){  # $1 = checkpoint to warm-load ("" = cold start)
 
 if [ -z "$(train_pid)" ]; then
   L=$(ls -t checkpoints/${STEM}_*.pt 2>/dev/null | head -1)
-  WARM="${L:-}"
-  if [ -n "$WARM" ]; then
-    log "initial launch warm-loading ${WARM}"
-  else
-    log "initial launch COLD (first NLH run)"
-  fi
+  WARM="${L:-checkpoints/nlh2_20.pt}"
+  log "initial launch warm-loading ${WARM}"
   launch "$WARM"; sleep 45
 fi
 
-log "started; watching pid=$(train_pid) (nlh_single cold, entropy=0.30, rollout=11.6M, lr=1.5e-4 warmup=75, target_kl=0.5, max_restarts=$MAX_RESTARTS)"
+log "started; watching pid=$(train_pid) (nlh_single, entropy=0.45, sizing_scale=0.65, rollout=11.6M, lr=1.5e-4 warmup=75, target_kl=0.5, max_restarts=$MAX_RESTARTS)"
 while true; do
   [ -f "$STOPFLAG" ] && { log "stop flag present -> exiting"; exit 0; }
   sleep "$POLL"
@@ -101,6 +109,15 @@ while true; do
       log "process DEAD (crash/OOM); relaunch #$restarts warm-loading ${WARM:-COLD}"
       launch "$WARM"; sleep 45; continue
     fi
+  fi
+
+  LOW45=$(grep -E "update +[0-9]" "$LOG" 2>/dev/null | tail -12 | grep -oE "Hg/Ha/Hb=[0-9.]+" | sed 's#.*=##' | awk '{if($1+0<0.45)c++} END{print c+0}')
+  if [ "${NUPD:-0}" -ge 15 ] && [ "${LOW45:-0}" -ge 12 ]; then
+    GP=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | head -1 | tr -d " ")
+    if [ -n "$GP" ]; then kill "$GP" 2>/dev/null; sleep 6; kill -9 "$GP" 2>/dev/null; fi
+    log "SUSTAINED SUB-FLOOR Hg (12/12 last < 0.45, last=${LASTHG:-?}) -> STOPPED (nlh2 collapsed inside this band without tripping 0.15). flag=$COLLFLAG"
+    date -u "+%Y-%m-%d %H:%M:%S" > "$COLLFLAG"
+    touch "$STOPFLAG"; exit 0
   fi
 
   if [ "${NUPD:-0}" -ge 10 ] && [ "${COLL:-0}" -ge 5 ]; then
