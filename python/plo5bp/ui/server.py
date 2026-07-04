@@ -1716,6 +1716,10 @@ def formats() -> dict[str, Any]:
                 "label": f["label"],
                 "model_loaded": bool(f["loaded"]),
                 "locked": _format_locked(vid),
+                # Betting cap class: pot-limit formats cap raises at pot
+                # (the client's b100 preset is "pot" and nothing larger
+                # exists); no-limit formats allow overbets + all-in.
+                "pot_limit": vid != VARIANT_NLH,
             }
             for vid, f in FORMATS.items()
         ],

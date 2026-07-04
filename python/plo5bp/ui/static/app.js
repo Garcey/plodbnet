@@ -335,6 +335,7 @@ function render(s) {
   renderPotLabel(s);
   renderActorBanner(s);
   renderActions(s);
+  syncPresetPop(s);
   renderRecommendation(s);
   renderHistory(s);
   renderCardGrid(s);
@@ -1155,16 +1156,20 @@ function renderRaiseSection(s, actorSeat) {
     const total = ac + toCall + extra;
     return Math.max(minChips + ac, Math.min(maxChips + ac, total));
   };
-  const items = [
-    { label: "b25", chips: potSize(0.25) },
-    { label: "b33", chips: potSize(1 / 3) },
-    { label: "b50", chips: potSize(0.5) },
-    { label: "b75", chips: potSize(0.75) },
-    { label: "pot", chips: potSize(1.0) },
-  ];
+  const potLimit = isPotLimit(s);
+  // "b33" has always meant a THIRD of pot (mult 1/3, not 0.33) — keep exact.
+  const presetMult = (n) => (n === 33 ? 1 / 3 : n / 100);
+  const items = betPresets(potLimit).map((n) => (
+    { label: presetChipLabel(n, potLimit), chips: potSize(presetMult(n)) }
+  ));
+  if (!potLimit) {
+    // No-limit only: an all-in prefill chip (in pot-limit the pot chip IS the
+    // cap). Prefills the max raise-TO total; the user still clicks Raise.
+    items.push({ label: "all-in", chips: maxChips + ac, cls: "raise-shortcut-allin" });
+  }
   for (const it of items) {
     const b = document.createElement("button");
-    b.className = "raise-shortcut";
+    b.className = "raise-shortcut" + (it.cls ? ` ${it.cls}` : "");
     b.textContent = it.label;
     b.addEventListener("click", () => {
       input.value = chipsToCurrentUnit(it.chips, s).toFixed(2);
@@ -1172,6 +1177,208 @@ function renderRaiseSection(s, actorSeat) {
     });
     shortcuts.appendChild(b);
   }
+  const plus = document.createElement("button");
+  plus.id = "preset-edit-btn";
+  plus.type = "button";
+  plus.className = "raise-shortcut raise-shortcut-edit";
+  plus.textContent = "+";
+  plus.title = "Edit bet-size presets";
+  plus.addEventListener("click", () => toggleBetPresetEditor(plus, potLimit));
+  shortcuts.appendChild(plus);
+}
+
+// --- Bet-size preset chips ---------------------------------------------------
+// The raise shortcuts row is driven by a per-cap-class preset list (numbers =
+// % of pot after call, the potSize formula above). Pot-limit and no-limit
+// formats keep SEPARATE localStorage lists so preferences don't collide; the
+// "+" chip opens a popover editor. The all-in chip (NL) is not part of the
+// list — always present in NL, never in PL.
+
+const BET_PRESET_DEFAULTS = { pl: [25, 33, 50, 75, 100], nl: [25, 33, 50, 75, 100, 150] };
+const BET_PRESET_CAP = { pl: 100, nl: 1000 };
+
+// Cap class of the active format, from state.format + the /formats cache
+// (nothing hardcodes format ids). Unknown → pot-limit, the legacy behavior.
+function isPotLimit(s) {
+  if (s && s.format && UI.formats) {
+    const f = UI.formats.find((x) => x.id === s.format);
+    if (f && f.pot_limit !== undefined && f.pot_limit !== null) return !!f.pot_limit;
+  }
+  return true;
+}
+
+function betPresetKey(potLimit) {
+  return potLimit ? "plo5bp-bet-presets-pl" : "plo5bp-bet-presets-nl";
+}
+
+// Load the preset list: numbers > 0 within the cap, one decimal place,
+// deduped, ascending. Malformed storage falls back to the defaults; a valid
+// but emptied list stays empty (the user removed every preset on purpose).
+function betPresets(potLimit) {
+  const cls = potLimit ? "pl" : "nl";
+  let raw = null;
+  try { raw = JSON.parse(localStorage.getItem(betPresetKey(potLimit))); }
+  catch (_) { raw = null; }
+  if (!Array.isArray(raw)) return BET_PRESET_DEFAULTS[cls].slice();
+  const clean = [...new Set(
+    raw.filter((n) => typeof n === "number" && isFinite(n)
+                      && n > 0 && n <= BET_PRESET_CAP[cls])
+       .map((n) => Math.round(n * 10) / 10),
+  )].sort((a, b) => a - b);
+  return clean;
+}
+
+function saveBetPresets(potLimit, list) {
+  try { localStorage.setItem(betPresetKey(potLimit), JSON.stringify(list)); }
+  catch (_) { /* storage unavailable — presets stay session-default */ }
+}
+
+// Chip label: "b25", "b33.3", … — except 100% of pot in a pot-limit format,
+// which IS the cap and keeps its historical "pot" label.
+function presetChipLabel(n, potLimit) {
+  return potLimit && n === 100 ? "pot" : `b${n}`;
+}
+
+// --- Preset editor popover ---------------------------------------------------
+
+function closeBetPresetEditor() {
+  const pop = document.getElementById("preset-pop");
+  if (pop) pop.remove();
+  document.removeEventListener("pointerdown", onPresetPopOutside, true);
+  document.removeEventListener("keydown", onPresetPopKey, true);
+}
+
+function onPresetPopOutside(e) {
+  const pop = document.getElementById("preset-pop");
+  if (!pop || pop.contains(e.target)) return;
+  const plus = document.getElementById("preset-edit-btn");
+  if (plus && plus.contains(e.target)) return;  // the "+" click toggles
+  closeBetPresetEditor();
+}
+
+function onPresetPopKey(e) {
+  if (e.key !== "Escape") return;
+  e.preventDefault();
+  e.stopPropagation();
+  closeBetPresetEditor();
+}
+
+function presetPopHint(msg) {
+  const el = document.getElementById("preset-hint");
+  if (!el) return;
+  el.textContent = msg || "";
+  el.classList.toggle("error", !!msg);
+}
+
+function renderPresetPopContent(pop) {
+  const potLimit = pop.dataset.cap === "pl";
+  const list = betPresets(potLimit);
+  const pills = pop.querySelector(".preset-pill-list");
+  pills.innerHTML = "";
+  for (const n of list) {
+    const pill = document.createElement("span");
+    pill.className = "preset-pill";
+    pill.appendChild(document.createTextNode(presetChipLabel(n, potLimit)));
+    const x = document.createElement("button");
+    x.type = "button";
+    x.className = "preset-pill-x";
+    x.setAttribute("aria-label", `Remove b${n}`);
+    x.textContent = "×";
+    x.addEventListener("click", () => {
+      saveBetPresets(potLimit, betPresets(potLimit).filter((v) => v !== n));
+      presetPopHint("");
+      if (UI.lastState) render(UI.lastState);  // refreshes row + this popover
+    });
+    pill.appendChild(x);
+    pills.appendChild(pill);
+  }
+  if (!list.length) {
+    const none = document.createElement("span");
+    none.className = "muted";
+    none.textContent = "No presets";
+    pills.appendChild(none);
+  }
+}
+
+function presetPopAdd(pop) {
+  const potLimit = pop.dataset.cap === "pl";
+  const inp = document.getElementById("preset-add-input");
+  const v = parseFloat(inp.value);
+  if (!isFinite(v) || v <= 0) { presetPopHint("Enter a size above 0"); return; }
+  const n = Math.round(v * 10) / 10;  // up to one decimal place
+  if (potLimit && n > 100) { presetPopHint("pot-limit caps at pot (b100)"); return; }
+  if (!potLimit && n > 1000) { presetPopHint("no-limit presets cap at b1000"); return; }
+  const list = betPresets(potLimit);
+  if (list.includes(n)) { presetPopHint(`b${n} is already a preset`); return; }
+  list.push(n);
+  list.sort((a, b) => a - b);
+  saveBetPresets(potLimit, list);
+  inp.value = "";
+  presetPopHint("");
+  if (UI.lastState) render(UI.lastState);
+}
+
+// Fixed-position near the "+" chip, clamped into the viewport (mobile-safe);
+// flips above the chip when there is no room below.
+function positionPresetPop(pop, plus) {
+  const r = plus.getBoundingClientRect();
+  const popW = pop.offsetWidth, popH = pop.offsetHeight;
+  const left = Math.max(8, Math.min(r.left, window.innerWidth - popW - 8));
+  let top = r.bottom + 6;
+  if (top + popH > window.innerHeight - 8) top = Math.max(8, r.top - popH - 6);
+  pop.style.left = `${left}px`;
+  pop.style.top = `${top}px`;
+}
+
+function toggleBetPresetEditor(plus, potLimit) {
+  if (document.getElementById("preset-pop")) { closeBetPresetEditor(); return; }
+  const pop = document.createElement("div");
+  pop.id = "preset-pop";
+  pop.className = "preset-pop";
+  pop.dataset.cap = potLimit ? "pl" : "nl";
+  pop.innerHTML = `
+    <div class="preset-pop-title">Bet-size presets <span class="muted">% of pot</span></div>
+    <div class="preset-pill-list"></div>
+    <div class="preset-add-row">
+      <input id="preset-add-input" type="number" min="0" step="0.1"
+             max="${potLimit ? 100 : 1000}" placeholder="% of pot" />
+      <button id="preset-add-btn" type="button">Add</button>
+    </div>
+    <div id="preset-hint" class="preset-hint muted"></div>
+    <button id="preset-reset-btn" class="preset-reset" type="button">Reset to defaults</button>
+  `;
+  document.body.appendChild(pop);
+  renderPresetPopContent(pop);
+  positionPresetPop(pop, plus);
+  document.getElementById("preset-add-btn").addEventListener("click", () => presetPopAdd(pop));
+  document.getElementById("preset-add-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); presetPopAdd(pop); }
+  });
+  document.getElementById("preset-reset-btn").addEventListener("click", () => {
+    try { localStorage.removeItem(betPresetKey(pop.dataset.cap === "pl")); } catch (_) {}
+    presetPopHint("");
+    if (UI.lastState) render(UI.lastState);
+  });
+  document.addEventListener("pointerdown", onPresetPopOutside, true);
+  document.addEventListener("keydown", onPresetPopKey, true);
+  document.getElementById("preset-add-input").focus();
+}
+
+// Called from render(): keeps an open popover in sync — refresh its pills,
+// track the (rebuilt) "+" chip, and close it when the raise row is gone or
+// the active cap class changed (format switch).
+function syncPresetPop(s) {
+  const pop = document.getElementById("preset-pop");
+  if (!pop) return;
+  const plus = document.getElementById("preset-edit-btn");
+  const section = document.getElementById("raise-section");
+  const capNow = isPotLimit(s) ? "pl" : "nl";
+  if (!plus || !section || section.hidden || pop.dataset.cap !== capNow) {
+    closeBetPresetEditor();
+    return;
+  }
+  renderPresetPopContent(pop);
+  positionPresetPop(pop, plus);
 }
 
 function distRowsHTML(dist, callName) {
@@ -1829,6 +2036,9 @@ async function initFormats() {
   }
   const active = (UI.lastState && UI.lastState.format) || data.active;
   if (active) sel.value = active;
+  // The raise-preset row derives its cap class (pot-limit vs no-limit) from
+  // this payload — refresh a state rendered before it arrived.
+  if (UI.lastState) render(UI.lastState);
 }
 
 // --- Public build: account, sign-in gate, paywall -------------------------

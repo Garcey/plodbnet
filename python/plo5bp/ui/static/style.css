@@ -484,6 +484,70 @@ main {
   border-color: rgba(24, 210, 195, 0.45);
 }
 .raise-shortcut:disabled { opacity: 0.35; cursor: not-allowed; }
+/* No-limit all-in prefill chip: a different KIND of action than the bNN
+   pot-fraction chips — carries the theme's all-in color (warn amber). */
+.raise-shortcut-allin {
+  color: var(--warn); background: rgba(240, 162, 60, 0.10);
+  border-color: rgba(240, 162, 60, 0.45); font-weight: 700;
+}
+.raise-shortcut-allin:hover:not(:disabled) {
+  background: rgba(240, 162, 60, 0.20); color: var(--warn);
+  border-color: var(--warn);
+}
+/* "+" chip: opens the preset editor popover */
+.raise-shortcut-edit { min-width: 26px; padding: 4px 9px; font-size: 12.5px; }
+
+/* Bet-size preset editor popover (fixed near the "+" chip, viewport-clamped) */
+.preset-pop {
+  position: fixed; z-index: 900;
+  width: 250px; max-width: calc(100vw - 16px);
+  background: var(--panel-2); border: 1px solid var(--border-strong);
+  border-radius: 8px; box-shadow: var(--shadow-1);
+  padding: 10px 11px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.preset-pop-title {
+  font-size: 11px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.6px; color: var(--muted);
+}
+.preset-pill-list { display: flex; flex-wrap: wrap; gap: 5px; }
+.preset-pill {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 4px 2px 9px; border-radius: 999px;
+  background: var(--panel-3); border: 1px solid var(--border);
+  font-size: 11px; font-weight: 600; color: var(--text);
+}
+.preset-pill-x {
+  width: 16px; height: 16px; border: none; border-radius: 50%;
+  background: transparent; color: var(--muted); cursor: pointer;
+  font-size: 12px; line-height: 1; padding: 0;
+}
+.preset-pill-x:hover { color: var(--danger); background: var(--danger-soft); }
+.preset-add-row { display: flex; gap: 6px; }
+.preset-add-row input {
+  flex: 1; min-width: 0; padding: 5px 8px;
+  background: var(--panel); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  font-size: 12.5px;
+}
+.preset-add-row button {
+  padding: 5px 12px; background: var(--panel-3); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  cursor: pointer; font-size: 12px; font-weight: 600;
+}
+.preset-add-row button:hover {
+  background: var(--accent-soft); color: var(--accent-2);
+  border-color: rgba(24, 210, 195, 0.45);
+}
+.preset-hint { font-size: 11px; }
+.preset-hint:empty { display: none; }
+.preset-hint.error { color: var(--danger); }
+.preset-reset {
+  align-self: flex-start; padding: 0; background: none; border: none;
+  color: var(--muted); font-size: 11px; cursor: pointer;
+  text-decoration: underline dotted;
+}
+.preset-reset:hover { color: var(--text); }
 
 /* Terminal pane */
 #terminal-pane {
