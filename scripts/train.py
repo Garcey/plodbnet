@@ -142,15 +142,24 @@ def _apply_anneal_control(
     tier_ent: dict[str, float],
     step: float,
     live_lr: float,
+    live_ent: float,
+    live_ent_deep: float,
     trainer=None,
-) -> tuple[float, str | None, float]:
+) -> tuple[float, str | None, float, float, float]:
     """Apply a live `runs/anneal_control.json` edit without pausing
-    training. Returns (anneal_step, applied_content, live_lr); mutates
-    `tier_ent` in place (and `trainer.target_kl` / `trainer.kl_hard`
-    when given). Re-applies only when the file CONTENT changes:
+    training. Returns (anneal_step, applied_content, live_lr, live_ent,
+    live_ent_deep); mutates `tier_ent` in place (and `trainer.target_kl`
+    / `trainer.kl_hard` when given). Read for EVERY run since 2026-07-04
+    (previously block-rotation/mix-configs only — NLH runs needed a
+    restart per entropy step). Re-applies only when the file CONTENT
+    changes:
 
       {"step": 0.003}                     — change the per-block decrement
       {"tier_ent": {"deep": 0.08}}        — manually set a tier's coef
+      {"entropy_coef": 0.38}              — FLAT coef (non-tier runs: NLH /
+                                            plain --stack-dist; ignored by
+                                            the tiered branches)
+      {"entropy_coef_deep": 0.1}          — the deep-dist flat variant
       {"target_kl": 2.0}                  — retune the soft KL early-stop
       {"kl_hard": 12.0}                   — retune the hard rollback level
       {"lr": 1e-4}                        — retune the base learning rate
@@ -162,7 +171,7 @@ def _apply_anneal_control(
     warmup scale still multiplies it. Malformed JSON is ignored (and
     retried on the next loop, so a half-written save is harmless)."""
     if raw is None or raw == last_raw:
-        return step, last_raw, live_lr
+        return step, last_raw, live_lr, live_ent, live_ent_deep
     try:
         ctrl = json.loads(raw)
         new_step = float(ctrl["step"]) if "step" in ctrl else step
@@ -181,8 +190,16 @@ def _apply_anneal_control(
             if "sizing_entropy_scale" in ctrl
             else None
         )
+        new_ent = (
+            float(ctrl["entropy_coef"]) if "entropy_coef" in ctrl else None
+        )
+        new_ent_deep = (
+            float(ctrl["entropy_coef_deep"])
+            if "entropy_coef_deep" in ctrl
+            else None
+        )
     except (ValueError, TypeError):
-        return step, last_raw, live_lr
+        return step, last_raw, live_lr, live_ent, live_ent_deep
     if new_step != step:
         print(f"[anneal-control] step {step} -> {new_step}")
     for tier, v in new_tiers.items():
@@ -211,7 +228,19 @@ def _apply_anneal_control(
         if live_lr != new_lr:
             print(f"[anneal-control] lr {live_lr} -> {new_lr}")
         out_lr = new_lr
-    return new_step, raw, out_lr
+    out_ent = live_ent
+    if new_ent is not None:
+        if live_ent != new_ent:
+            print(f"[anneal-control] entropy_coef {live_ent} -> {new_ent}")
+        out_ent = new_ent
+    out_ent_deep = live_ent_deep
+    if new_ent_deep is not None:
+        if live_ent_deep != new_ent_deep:
+            print(
+                f"[anneal-control] entropy_coef_deep {live_ent_deep} -> {new_ent_deep}"
+            )
+        out_ent_deep = new_ent_deep
+    return new_step, raw, out_lr, out_ent, out_ent_deep
 
 
 def _anneal_decision(
@@ -1157,6 +1186,15 @@ def main() -> None:
     anneal_control_file = Path("runs/anneal_control.json")
     live_anneal_step = float(args.anneal_step)
     live_lr = float(train_cfg.lr)
+    # Flat (non-tier) entropy coefs — what NLH / plain --stack-dist runs
+    # consume each update. Live-tunable via {"entropy_coef": X} /
+    # {"entropy_coef_deep": X}; tier runs keep using tier_ent. (Same
+    # expression as the later `entropy_coef_deep` local — that one is
+    # defined further down in main.)
+    live_entropy_coef = float(args.entropy_coef)
+    live_entropy_coef_deep = float(
+        args.entropy_coef if args.entropy_coef_deep is None else args.entropy_coef_deep
+    )
     # Seed the baseline with any PRE-EXISTING anneal_control.json so a stale
     # file left from a prior run/session is treated as ALREADY-APPLIED — not as
     # a fresh edit that silently overrides THIS run's launch args (--lr,
@@ -1267,14 +1305,24 @@ def main() -> None:
             if update >= train_cfg.num_updates:
                 break
 
-        if (blocks or args.mix_configs) and anneal_control_file.exists():
+        # Live tuning for EVERY run (was block/mix-configs only until
+        # 2026-07-04, which made NLH entropy steps require a restart).
+        # The startup-seeded baseline still guards against stale files.
+        if anneal_control_file.exists():
             try:
                 control_raw = anneal_control_file.read_text()
             except OSError:
                 control_raw = None
-            live_anneal_step, last_anneal_control, live_lr = _apply_anneal_control(
+            (
+                live_anneal_step,
+                last_anneal_control,
+                live_lr,
+                live_entropy_coef,
+                live_entropy_coef_deep,
+            ) = _apply_anneal_control(
                 control_raw, last_anneal_control, tier_ent, live_anneal_step,
-                live_lr, trainer=trainer,
+                live_lr, live_entropy_coef, live_entropy_coef_deep,
+                trainer=trainer,
             )
 
         if args.mix_configs:
@@ -1337,7 +1385,9 @@ def main() -> None:
         else:
             batch = collector(model, pool, sampled_game_cfg, train_cfg, rng, critic=critic)
             update_entropy_coef = (
-                entropy_coef_deep if sampled_eff_dist == "deep" else args.entropy_coef
+                live_entropy_coef_deep
+                if sampled_eff_dist == "deep"
+                else live_entropy_coef
             )
         # Cold-start LR warmup: small early steps keep per-minibatch KL
         # inside the guard's trust region, so all minibatches apply and
