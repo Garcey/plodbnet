@@ -3,18 +3,35 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>PLO5 Bomb-Pot Study Tool</title>
+    <title>WrapGTO — AI PLO Training</title>
+    <meta name="description" content="WrapGTO — AI-powered PLO training. Drill double-board PLO5 bomb pots against a self-play AI with EV-graded post-hand review." />
+    <link rel="icon" type="image/svg+xml" href="/static/brand/wrap-app-icon-dark.svg" />
+    <link rel="icon" type="image/png" sizes="48x48" href="/static/brand/favicon-48.png" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/static/brand/favicon-32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/static/brand/favicon-16.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/static/brand/apple-touch-icon-180.png" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400..700&family=Geist+Mono:wght@400..700&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="/static/style.css" />
   </head>
   <body>
     <header id="top-bar">
       <div class="brand">
-        <span class="brand-mark">&#9824;</span>
-        <span class="brand-name">PLO5 <span class="sub">Bomb-Pot Study</span></span>
+        <svg class="brand-logo" viewBox="0 0 96 96" aria-hidden="true">
+          <path d="M28 12 H68 Q84 12 84 28 V68 Q84 84 68 84 H28 Q12 84 12 68 V44 Q12 30 26 30 H44 Q56 30 56 42 V46 Q56 56 46 56"
+                fill="none" stroke="currentColor" stroke-width="11"
+                stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <span class="brand-name">Wrap<span class="brand-gto">GTO</span></span>
       </div>
       <div id="mode-tabs">
         <button id="tab-study" class="mode-tab active" type="button">Study</button>
         <button id="tab-trainer" class="mode-tab" type="button">Trainer</button>
+      </div>
+      <div class="top-bar-item">
+        <label for="format-select">Format</label>
+        <select id="format-select"></select>
       </div>
       <div class="top-bar-item study-only">
         <label>Seats</label>
@@ -42,19 +59,31 @@
         <button id="trainer-repeat-btn" type="button" title="Re-deal the same hand (excluded from stats)">Repeat</button>
         <button id="trainer-new-hand-btn" type="button">New Hand</button>
       </div>
+      <div class="top-bar-item" id="account-chip" style="display:none"></div>
+      <!-- WGLIVE:START -->
       <div class="top-bar-item ocr-group study-only">
-        <label for="ocr-window-button">OCR</label>
-        <div class="ocr-window-picker">
-          <button id="ocr-window-button" type="button" aria-haspopup="listbox"
-                  aria-expanded="false" title="Pick the window to screen-read">— pick window —</button>
-        </div>
-        <button id="ocr-toggle" type="button" aria-pressed="false">Off</button>
-        <button id="ocr-simple-toggle" type="button" aria-pressed="true"
-                title="Skip OCR action inference; manual action entry only">Simple: On</button>
-        <button id="ocr-save-frame" type="button"
-                title="Save the current OCR frame to screenrecords/frames/">Save frame</button>
-        <span id="ocr-status" class="muted"></span>
+        <label for="source-toggle">Live</label>
+        <button id="source-toggle" type="button"
+                title="Switch the live-capture source between ClubGG (pixel OCR) and PokerNow (browser DOM)">Source: ClubGG</button>
+        <span id="clubgg-controls">
+          <div class="ocr-window-picker">
+            <button id="ocr-window-button" type="button" aria-haspopup="listbox"
+                    aria-expanded="false" title="Pick the window to screen-read">— pick window —</button>
+          </div>
+          <button id="ocr-toggle" type="button" aria-pressed="false">Off</button>
+          <button id="ocr-simple-toggle" type="button" aria-pressed="true"
+                  title="Skip OCR action inference; manual action entry only">Simple: On</button>
+          <button id="ocr-save-frame" type="button"
+                  title="Save the current OCR frame to screenrecords/frames/">Save frame</button>
+          <span id="ocr-status" class="muted"></span>
+        </span>
+        <span id="pokernow-controls" style="display:none">
+          <button id="pokernow-help" type="button"
+                  title="How to connect the PokerNow browser bridge">Install bridge</button>
+          <span id="pokernow-status" class="muted">waiting for browser…</span>
+        </span>
       </div>
+      <!-- WGLIVE:END -->
       <div class="top-bar-item study-only">
         <button id="new-hand-btn" type="button">New Hand</button>
       </div>
@@ -126,7 +155,9 @@
             </g>
 
             <g id="seats"></g>
+            <g id="hero-hand-labels"></g>
             <g id="hero-hole" transform="translate(400 500)"></g>
+            <!-- WGLIVE:START -->
             <g id="ocr-rescan-group" style="display:none">
               <foreignObject x="218" y="506" width="88" height="32">
                 <button xmlns="http://www.w3.org/1999/xhtml" id="ocr-rescan-hole-btn"
@@ -139,6 +170,7 @@
                         title="Re-OCR flop/turn/river from the current frame">Rescan Board</button>
               </foreignObject>
             </g>
+            <!-- WGLIVE:END -->
             <g id="dealer-button"><circle r="14" class="dealer-circle" /><text class="dealer-text" text-anchor="middle" dy="5">D</text></g>
             <g id="insert-icon" hidden>
               <circle r="14" class="insert-icon-bg" />
@@ -203,6 +235,8 @@
             <div id="terminal-pane" hidden>
               <div id="terminal-message"></div>
             </div>
+            <h3>History</h3>
+            <div id="history"></div>
           </div>
 
           <div id="info-panel" class="panel">
@@ -210,8 +244,6 @@
             <div id="recommendation">
               <p class="muted">Place hero's 5 hole cards to see network output.</p>
             </div>
-            <h3>History</h3>
-            <div id="history"></div>
           </div>
         </div>
       </section>
@@ -307,6 +339,150 @@
     </div>
 
     <div id="toast-container"></div>
+
+    <!-- Public build: landing page (shown when PLO5BP_PUBLIC and no session) -->
+    <div id="login-overlay" style="display:none">
+      <div class="landing">
+        <header class="l-top">
+          <div class="gate-brand">
+            <svg class="brand-logo" viewBox="0 0 96 96" aria-hidden="true">
+              <path d="M28 12 H68 Q84 12 84 28 V68 Q84 84 68 84 H28 Q12 84 12 68 V44 Q12 30 26 30 H44 Q56 30 56 42 V46 Q56 56 46 56"
+                    fill="none" stroke="currentColor" stroke-width="11"
+                    stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            <span>Wrap<span class="brand-gto">GTO</span></span>
+          </div>
+          <button type="button" class="landing-signin l-top-cta">Sign in</button>
+        </header>
+
+        <section class="l-hero">
+          <p class="l-kicker">AI-powered PLO training</p>
+          <h1>Train double-board PLO5 bomb pots against a neural network.</h1>
+          <p class="l-sub">A self-play model with over <b>800 million hands</b> — more
+            than eight billion decisions — of training behind it, wrapped in a GTO-style
+            trainer: drill random spots against the network, get every decision graded,
+            and review the EV of every line you didn't take. More formats are on the way
+            — with bundle subscriptions for the games you actually play.</p>
+          <button id="google-signin-btn" type="button" class="gate-google">
+            <svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
+            Sign in with Google
+          </button>
+          <p class="l-note"><span id="gate-free-hands">5</span> free trainer hands every day
+            · <s>$50</s> <b class="l-price">$10/month</b> for early users — 80% off, locked in for life</p>
+          <div id="dev-login-row" style="display:none">
+            <input id="dev-login-email" type="email" placeholder="dev login email" />
+            <button id="dev-login-btn" type="button">Dev sign-in</button>
+          </div>
+        </section>
+
+        <section class="l-section">
+          <p class="l-kicker">Why a neural network</p>
+          <h2>Classical solvers can't touch this format. A network can.</h2>
+          <div class="l-cards">
+            <div class="l-card">
+              <h3>Any stack depth</h3>
+              <p>Real games don't come in preset configurations. The model trains across
+                two- to six-handed pots with stacks from short to 300bb deep — and reads
+                the exact stacks in front of it, not the nearest template.</p>
+            </div>
+            <div class="l-card">
+              <h3>Any bet size</h3>
+              <p>No fixed bet menu. The network converges on its own preferred size for
+                each spot — a continuous choice from min-bet to pot — and grades your
+                sizing against that judgment, not a coarse grid.</p>
+            </div>
+            <div class="l-card">
+              <h3>Every multiway spot</h3>
+              <p>Bomb pots are multiway by nature, which is exactly where game trees
+                explode. The network doesn't enumerate the tree — it just plays the spot
+                in front of it, however many players are in.</p>
+            </div>
+          </div>
+        </section>
+
+        <section class="l-section">
+          <p class="l-kicker">What it is — and isn't</p>
+          <h2>Not a true solver. Honestly better than pretending.</h2>
+          <p class="l-body">WrapGTO does not compute a Nash equilibrium. The model
+            <em>approximates</em> GTO play, learned through self-play — that's a real
+            limitation, and we'd rather state it than market around it.</p>
+          <p class="l-body">The alternative doesn't exist: a true CFR solver for
+            double-board PLO5 bomb pots would require crushing abstractions —
+            pre-configured seat and stack layouts, a handful of allowed bet sizes, and
+            heavy card bucketing — before the tree fits in any computer. What you'd gain
+            in theoretical purity, you'd lose in relevance to the hand you actually played.</p>
+          <div class="l-stat">
+            <div class="l-stat-num">&mdash;<span class="l-stat-unit">bb/100</span></div>
+            <div class="l-stat-cap">Measured exploitability</div>
+            <p class="l-stat-note">We train a best-response adversary against the live
+              model and publish how much it can extract. The current probe hasn't
+              finished; the number will appear here when it does — whatever it says.</p>
+          </div>
+        </section>
+
+        <section class="l-section">
+          <p class="l-kicker">Why this exists</p>
+          <h2>A study tool first. A business barely.</h2>
+          <p class="l-body">WrapGTO started as a personal project: one player who wanted
+            to study double-board bomb pots and found that nothing for the format existed
+            — no solver, no trainer, no library. The model, the engine, and this site grew
+            out of that.</p>
+          <p class="l-body">It's priced to cover GPU time, not to build a rocket ship.
+            Most — if not all — of what it earns goes straight back into training runs
+            for new formats: PLO4 and PLO6, single board, hi-lo variants, and whatever
+            the games spread next.</p>
+        </section>
+
+        <section class="l-section l-pricing">
+          <p class="l-kicker">Pricing</p>
+          <div class="l-price-card">
+            <div class="l-badge">Early user — locked for life</div>
+            <div class="l-price-row"><s>$50</s><span class="l-price-big">$10</span><span class="l-price-per">/ month</span></div>
+            <p class="l-price-note">80% off the standard rate. The price you join at is
+              the price you keep, for as long as you stay subscribed.</p>
+            <ul class="l-list">
+              <li>Unlimited trainer hands, graded move by move</li>
+              <li>Full Study mode — set up any spot, replay any line</li>
+              <li>EV-loss review on every decision</li>
+              <li>New formats as they ship (choose-your-format bundles later)</li>
+            </ul>
+            <button type="button" class="gate-primary landing-signin">Start with 5 free hands a day</button>
+            <p class="l-fine">No card required to try. Cancel anytime.</p>
+          </div>
+        </section>
+
+        <footer class="l-foot">
+          Study tool only — no real-time play assistance. &copy; 2026 WrapGTO
+          &nbsp;·&nbsp; <a href="/terms" style="color:var(--muted)">Terms</a>
+          &nbsp;·&nbsp; <a href="/privacy" style="color:var(--muted)">Privacy</a>
+        </footer>
+      </div>
+    </div>
+
+    <!-- Mobile card picker: the #card-grid node is re-parented in here while
+         a slot is selected on a small screen (study entry + trainer what-if). -->
+    <div id="card-picker-modal" style="display:none">
+      <div class="picker-backdrop"></div>
+      <div class="picker-sheet">
+        <div class="picker-head">
+          <span id="picker-title">Place card</span>
+          <button id="picker-clear-btn" type="button" style="display:none">Clear slot</button>
+          <button id="picker-close-btn" type="button" aria-label="Close">&#10005;</button>
+        </div>
+        <div id="picker-grid-host"></div>
+      </div>
+    </div>
+
+    <!-- Public build: paywall modal (free limit / study gating) -->
+    <div id="paywall-modal" class="gate-overlay" style="display:none">
+      <div class="gate-card">
+        <h2 id="paywall-title">Daily free limit reached</h2>
+        <p id="paywall-msg" class="gate-tag"></p>
+        <button id="paywall-subscribe-btn" type="button" class="gate-primary">Subscribe — $10 / month</button>
+        <p class="gate-fine">Early-user rate: 80% off the standard $50/mo, locked in for life.</p>
+        <button id="paywall-close-btn" type="button" class="gate-secondary">Not now</button>
+      </div>
+    </div>
 
     <script src="/static/app.js"></script>
   </body>

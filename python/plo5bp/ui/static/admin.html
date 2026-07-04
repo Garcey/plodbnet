@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Admin — WrapGTO</title>
+    <link rel="icon" type="image/svg+xml" href="/static/brand/wrap-app-icon-dark.svg" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/static/brand/favicon-32.png" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400..700&family=Geist+Mono:wght@400..700&display=swap" rel="stylesheet" />
+    <style>
+      :root {
+        --bg: #0C1117; --panel: #151B23; --panel-2: #1B222C;
+        --border: #252d3a; --border-strong: #313c4c;
+        --text: #dbe2ec; --bright: #F4F7FA; --muted: #8A97A6;
+        --accent: #18D2C3; --ok: #3DC46F; --danger: #ef5666; --warn: #f0a23c;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0; padding: 24px; background: var(--bg); color: var(--text);
+        font: 14px/1.45 "Geist", "Segoe UI Variable Text", "Segoe UI", Inter, system-ui, sans-serif;
+      }
+      .num, .pill { font-family: "Geist Mono", "Cascadia Mono", Consolas, ui-monospace, monospace; }
+      h1 { font-size: 18px; margin: 0 0 4px; color: var(--bright); }
+      h1 .sub { color: var(--muted); font-weight: 600; }
+      .crumb { font-size: 12px; color: var(--muted); margin-bottom: 20px; }
+      .crumb a { color: var(--accent); text-decoration: none; }
+      .cards { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 22px; }
+      .card {
+        background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+        padding: 14px 18px; min-width: 150px;
+      }
+      .card .k { font-size: 11px; text-transform: uppercase; letter-spacing: 0.7px; color: var(--muted); font-weight: 700; }
+      .card .v { font-size: 22px; font-weight: 700; color: var(--bright); margin-top: 4px; }
+      .card .v small { font-size: 12px; color: var(--muted); font-weight: 600; }
+      h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.8px; color: var(--muted); margin: 26px 0 10px; }
+      table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+      th, td { text-align: left; padding: 9px 12px; font-size: 13px; border-bottom: 1px solid var(--border); }
+      th { background: var(--panel-2); color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+      tr:last-child td { border-bottom: none; }
+      .pill { font-size: 10.5px; font-weight: 700; padding: 2px 8px; border-radius: 999px; letter-spacing: 0.4px; }
+      .pill.active-stripe { background: rgba(24,210,195,0.15); color: var(--accent); }
+      .pill.active-comp { background: rgba(61,196,111,0.15); color: var(--ok); }
+      .pill.none { background: var(--panel-2); color: var(--muted); }
+      .pill.admin { background: rgba(240,162,60,0.15); color: var(--warn); }
+      button {
+        padding: 4px 10px; font-size: 12px; cursor: pointer; border-radius: 6px;
+        background: var(--panel-2); color: var(--text); border: 1px solid var(--border-strong);
+      }
+      button:hover { background: var(--border); }
+      button.grant { color: var(--ok); }
+      button.revoke { color: var(--danger); }
+      .muted { color: var(--muted); }
+      .num { font-variant-numeric: tabular-nums; }
+      #err { color: var(--danger); margin: 14px 0; display: none; }
+    </style>
+  </head>
+  <body>
+    <h1>Admin <span class="sub">— WrapGTO</span></h1>
+    <div class="crumb"><a href="/">&larr; back to app</a></div>
+    <div id="err"></div>
+
+    <div class="cards" id="metric-cards"></div>
+
+    <h2>Users</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Email</th><th>Name</th><th>Joined</th><th>Last login</th>
+          <th>Subscription</th><th>Hands today</th><th>Hands total</th><th></th>
+        </tr>
+      </thead>
+      <tbody id="user-rows"></tbody>
+    </table>
+
+    <h2>Recent payments</h2>
+    <table>
+      <thead><tr><th>When</th><th>User</th><th>Amount</th><th>Ref</th></tr></thead>
+      <tbody id="payment-rows"></tbody>
+    </table>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const fmtUsd = (c) => `$${(c / 100).toFixed(2)}`;
+      const fmtDay = (iso) => (iso ? iso.slice(0, 10) : "—");
+
+      async function j(url, opts) {
+        const res = await fetch(url, opts);
+        if (!res.ok) {
+          const t = await res.text();
+          throw new Error(`${res.status}: ${t.slice(0, 200)}`);
+        }
+        return res.json();
+      }
+
+      function metricCard(k, v, sub) {
+        return `<div class="card"><div class="k">${k}</div><div class="v num">${v}${sub ? ` <small>${sub}</small>` : ""}</div></div>`;
+      }
+
+      async function load() {
+        try {
+          const [m, u] = await Promise.all([j("/admin/api/metrics"), j("/admin/api/users")]);
+          $("metric-cards").innerHTML =
+            metricCard("Users", m.users) +
+            metricCard("Paying subs", m.active_stripe_subs) +
+            metricCard("Comp subs", m.active_comp_subs) +
+            metricCard("MRR", fmtUsd(m.mrr_cents)) +
+            metricCard("Revenue (recorded)", fmtUsd(m.revenue_cents_total)) +
+            metricCard("Price", fmtUsd(m.price_cents), "/mo") +
+            metricCard("Free hands/day", m.free_hands_per_day) +
+            metricCard("Hands (30d)", m.hands_by_day.reduce((a, r) => a + r.n, 0));
+
+          $("user-rows").innerHTML = u.users.map((x) => {
+            const sub = x.is_admin
+              ? '<span class="pill admin">ADMIN</span>'
+              : x.sub_status === "active"
+                ? `<span class="pill active-${x.sub_source}">${x.sub_source.toUpperCase()}</span>` +
+                  (x.period_end ? ` <span class="muted">→ ${fmtDay(x.period_end)}</span>` : "")
+                : '<span class="pill none">FREE</span>';
+            const btn = x.sub_status === "active" && x.sub_source === "comp"
+              ? `<button class="revoke" data-uid="${x.id}" data-action="revoke">Revoke comp</button>`
+              : x.sub_status !== "active"
+                ? `<button class="grant" data-uid="${x.id}" data-action="grant">Grant comp</button>`
+                : '<span class="muted">via Stripe</span>';
+            return `<tr>
+              <td>${x.email}</td><td>${x.name || "—"}</td>
+              <td class="num">${fmtDay(x.created_at)}</td>
+              <td class="num">${fmtDay(x.last_login_at)}</td>
+              <td>${sub}</td>
+              <td class="num">${x.hands_today}</td>
+              <td class="num">${x.hands_total}</td>
+              <td>${btn}</td>
+            </tr>`;
+          }).join("");
+
+          $("payment-rows").innerHTML = m.recent_payments.length
+            ? m.recent_payments.map((p) => `<tr>
+                <td class="num">${p.created_at.replace("T", " ").slice(0, 16)}</td>
+                <td>${p.email}</td>
+                <td class="num">${fmtUsd(p.amount_cents)}</td>
+                <td class="muted">${p.ref}</td>
+              </tr>`).join("")
+            : '<tr><td colspan="4" class="muted">No payments recorded yet.</td></tr>';
+
+          document.querySelectorAll("button[data-uid]").forEach((b) => {
+            b.addEventListener("click", async () => {
+              b.disabled = true;
+              try {
+                await j("/admin/api/grant", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ user_id: parseInt(b.dataset.uid, 10), action: b.dataset.action }),
+                });
+                await load();
+              } catch (e) {
+                $("err").textContent = e.message; $("err").style.display = "block";
+                b.disabled = false;
+              }
+            });
+          });
+        } catch (e) {
+          $("err").textContent = e.message + " — are you signed in as an admin?";
+          $("err").style.display = "block";
+        }
+      }
+      load();
+    </script>
+  </body>
+</html>

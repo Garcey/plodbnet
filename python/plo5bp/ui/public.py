@@ -455,6 +455,7 @@ def install(
     trainer_session_factory: Callable[[Path], Any],
     set_trainer_resolver: Callable[[Callable[[], Any] | None], None],
     static_dir: Path,
+    set_format_gate: Callable[[Any], None] | None = None,
 ) -> None:
     """Wire auth/billing/admin into the public app. Called from server.py."""
     global _REGISTRY
@@ -475,6 +476,20 @@ def install(
 
     set_study_resolver(_study_for_request)
     set_trainer_resolver(_trainer_for_request)
+
+    if set_format_gate is not None:
+        def _format_gate(fmt_id: str) -> bool:
+            """Non-default formats are admin-only on the public site
+            while their models train — everyone else sees the dropdown
+            entry greyed out as "coming soon!". PLO5 (the launched
+            product) is never gated."""
+            if fmt_id == "plo5_double_bomb":
+                return False
+            uid = _CURRENT_USER_ID.get()
+            user = _user_by_id(int(uid)) if uid is not None else None
+            return not _is_admin(user)
+
+        set_format_gate(_format_gate)
 
     # OAuth (Authlib). Configured lazily so the app boots without credentials
     # (dev login covers local testing until Google creds exist).

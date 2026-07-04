@@ -262,6 +262,29 @@ def _fmt() -> dict[str, Any]:
     return FORMATS[session.variant]
 
 
+#: Optional per-request format gate, installed by the public build:
+#: callable(format_id) -> True when the CURRENT user may not select the
+#: format (rendered greyed-out "coming soon!" in the dropdown; POST
+#: /format returns 403). None (the local build) = everything unlocked.
+_FORMAT_GATE: Any = None
+
+
+def set_format_gate(fn: Any) -> None:
+    global _FORMAT_GATE
+    _FORMAT_GATE = fn
+
+
+def _format_locked(fmt_id: str) -> bool:
+    if _FORMAT_GATE is None:
+        return False
+    try:
+        return bool(_FORMAT_GATE(fmt_id))
+    except Exception:
+        logger.exception("format gate failed")
+        # Fail closed for non-default formats; never lock the default.
+        return fmt_id != VARIANT_PLO5
+
+
 # --- Session state ----------------------------------------------------------
 
 class Session:
@@ -1683,10 +1706,17 @@ def reset() -> dict[str, Any]:
 @app.get("/formats")
 def formats() -> dict[str, Any]:
     """Formats the server can serve, for the UI dropdown. `model_loaded`
-    False = a random-init placeholder answers (no checkpoint promoted)."""
+    False = a random-init placeholder answers (no checkpoint promoted).
+    `locked` True = greyed out "coming soon!" for this user (public
+    build gates non-default formats to admins while they train)."""
     return {
         "formats": [
-            {"id": vid, "label": f["label"], "model_loaded": bool(f["loaded"])}
+            {
+                "id": vid,
+                "label": f["label"],
+                "model_loaded": bool(f["loaded"]),
+                "locked": _format_locked(vid),
+            }
             for vid, f in FORMATS.items()
         ],
         "active": session.variant,
@@ -1699,6 +1729,11 @@ def set_format(req: FormatRequest) -> dict[str, Any]:
     swaps the game config to the format default (PLO5: 6-max 200bb bomb
     pot; NLH: 6-max 100bb 5/10 with a $5/player ante). The trainer's
     format follows via its own setter so both tabs stay on one game."""
+    if _format_locked(req.format):
+        raise HTTPException(
+            status_code=403,
+            detail="This format isn't available on your account yet — coming soon!",
+        )
     if req.format != session.variant:
         session.variant = req.format
         if req.format == VARIANT_NLH:
@@ -3241,4 +3276,5 @@ if PLO5BP_PUBLIC:
         ),
         set_trainer_resolver=_set_trainer_resolver,
         static_dir=STATIC_DIR,
+        set_format_gate=set_format_gate,
     )
