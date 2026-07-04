@@ -84,6 +84,13 @@ class EngineView:
     # replay). Surfaced here so the walk can skip them and avoid
     # emitting phantom FOLD events for seats with no cards.
     sitting_out: tuple[bool, ...] = ()
+    # When True (PokerNow, where the DOM exposes an exact `fold` class), the
+    # walk NEVER infers a fold from "faced a bet but added no chips" — a
+    # closing call sweeps its chips to the pot and would otherwise be misread
+    # as a fold. Real folds still come from `obs.folded` (Fix J / reveal fold
+    # reconcile). The OCR path leaves this False (its fold signal is noisy, so
+    # the inference is load-bearing there).
+    exact_folds: bool = False
 
 
 @dataclass(frozen=True)
@@ -393,6 +400,27 @@ class EventReconstructor:
         steps_left = self.num_seats * 2  # conservative guard
         while steps_left > 0:
             steps_left -= 1
+
+            # Betting round closed: every seat still in the hand has matched
+            # the current bet, so there are no more actions to infer this
+            # street. Stop — coasting further re-emits phantom check/call (and
+            # can even synthesize a phantom raise) for seats that already
+            # acted. This is the closing-call frame: PokerNow shows every
+            # player's matched bet simultaneously the instant the last caller
+            # acts, before sweeping the chips to the pot. (Only applies once a
+            # bet exists; a quiet check-round closes via the normal CHECK
+            # walk + the StreetReveal reconciler.)
+            if facing_bet > 0:
+                still_in = [
+                    i
+                    for i in range(self.num_seats)
+                    if not folded[i]
+                    and not engine_view.all_in[i]
+                    and not sitting_out[i]
+                ]
+                if still_in and all(base_commit[i] >= facing_bet for i in still_in):
+                    break
+
             if folded[actor] or engine_view.all_in[actor] or sitting_out[actor]:
                 actor = (actor + 1) % self.num_seats
                 continue
@@ -630,6 +658,16 @@ class EventReconstructor:
                         # This seat is *downstream* of a raise we just
                         # emitted in this same pass — they're waiting,
                         # not folded. Let the next poll re-observe.
+                        break
+                    if engine_view.exact_folds and not obs.folded:
+                        # Exact-fold source (PokerNow): a seat facing a bet
+                        # with no committed change that is NOT flagged folded
+                        # has NOT folded — this is a closing call whose chips
+                        # were swept to the pot (committed reads 0). Inferring
+                        # a fold here is the "last caller registers as a fold,
+                        # hand ends" bug. Break; the call is recovered via the
+                        # stack-delta next frame or the StreetReveal
+                        # call-reconcile, and real folds arrive via obs.folded.
                         break
                     events.append(
                         SeatAction(seat=actor, gate="fold", chips=0)

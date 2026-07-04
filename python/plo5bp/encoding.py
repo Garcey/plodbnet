@@ -914,7 +914,7 @@ def _draw_flags_batch(
     board_suits = (board & 3).astype(np.int64)
     hole_suit_counts = np.zeros((n, 4), dtype=np.int32)
     board_suit_counts = np.zeros((n, 4), dtype=np.int32)
-    for k in range(5):
+    for k in range(hole.shape[1]):
         vh = hole_valid[:, k]
         if vh.any():
             np.add.at(
@@ -922,6 +922,7 @@ def _draw_flags_batch(
                 (np.nonzero(vh)[0], hole_suits[vh, k]),
                 1,
             )
+    for k in range(5):
         vb = board_valid[:, k]
         if vb.any():
             np.add.at(
@@ -935,10 +936,11 @@ def _draw_flags_batch(
     hole_ranks = (hole >> 2).astype(np.int64)
     board_ranks = (board >> 2).astype(np.int64)
     rank_mask = np.zeros((n, 14), dtype=bool)
-    for k in range(5):
+    for k in range(hole.shape[1]):
         vh = hole_valid[:, k]
         if vh.any():
             rank_mask[np.nonzero(vh)[0], hole_ranks[vh, k]] = True
+    for k in range(5):
         vb = board_valid[:, k]
         if vb.any():
             rank_mask[np.nonzero(vb)[0], board_ranks[vb, k]] = True
@@ -976,7 +978,7 @@ def _pair_features_batch(
     board_ranks = (board >> 2).astype(np.int64)
     hole_rank_counts = np.zeros((n, 13), dtype=np.int32)
     board_rank_counts = np.zeros((n, 13), dtype=np.int32)
-    for k in range(5):
+    for k in range(hole.shape[1]):
         vh = hole_valid[:, k]
         if vh.any():
             np.add.at(
@@ -984,6 +986,7 @@ def _pair_features_batch(
                 (np.nonzero(vh)[0], hole_ranks[vh, k]),
                 1,
             )
+    for k in range(5):
         vb = board_valid[:, k]
         if vb.any():
             np.add.at(
@@ -1054,13 +1057,14 @@ def _straight_flush_features_batch(
     # (N, 4) suit counts on hole / board.
     hole_suit_counts = np.zeros((n, 4), dtype=np.int32)
     board_suit_counts = np.zeros((n, 4), dtype=np.int32)
-    for k in range(5):
+    for k in range(hole.shape[1]):
         vh = hole_valid[:, k]
         if vh.any():
             idx = np.nonzero(vh)[0]
             hole_rank_mask[idx, hole_ranks[vh, k]] = True
             hole_rank_suit[idx, hole_ranks[vh, k], hole_suits[vh, k]] = True
             np.add.at(hole_suit_counts, (idx, hole_suits[vh, k]), 1)
+    for k in range(5):
         vb = board_valid[:, k]
         if vb.any():
             idx = np.nonzero(vb)[0]
@@ -1073,7 +1077,7 @@ def _straight_flush_features_batch(
 
     # Per-suit max hole rank — -1 if hero has no card of that suit.
     hole_max_per_suit = -np.ones((n, 4), dtype=np.int32)
-    for k in range(5):
+    for k in range(hole.shape[1]):
         vh = hole_valid[:, k]
         if vh.any():
             idx = np.nonzero(vh)[0]
@@ -1401,7 +1405,7 @@ def encode_observation_batch(
     hole_valid = hole < 52
     hole_ranks = (hole >> 2).astype(np.int64)
     hist = np.zeros((n, 13), dtype=np.float32)
-    for k in range(5):
+    for k in range(hole.shape[1]):
         vh = hole_valid[:, k]
         if vh.any():
             np.add.at(hist, (np.nonzero(vh)[0], hole_ranks[vh, k]), 1.0)
@@ -1473,10 +1477,12 @@ def encode_observation_batch(
     hole_rank_mask = np.zeros((n, 13), dtype=bool)
     ba_rank_mask = np.zeros((n, 13), dtype=bool)
     bb_rank_mask = np.zeros((n, 13), dtype=bool)
-    for k in range(5):
+    # Hole and board widths differ under PLO6 (6 vs 5) — iterate separately.
+    for k in range(hole.shape[1]):
         vh = hole_valid[:, k]
         if vh.any():
             hole_rank_mask[np.nonzero(vh)[0], hole_ranks_idx[vh, k]] = True
+    for k in range(5):
         va = ba_valid[:, k]
         if va.any():
             ba_rank_mask[np.nonzero(va)[0], ba_ranks_idx[va, k]] = True
@@ -1497,7 +1503,7 @@ def encode_observation_batch(
         (bb_valid, bb, bb_suit_counts),
     ):
         suits = (src_arr & 3).astype(np.int64)
-        for k in range(5):
+        for k in range(src_arr.shape[1]):
             vk = src_valid[:, k]
             if vk.any():
                 np.add.at(dest, (np.nonzero(vk)[0], suits[vk, k]), 1)

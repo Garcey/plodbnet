@@ -1,9 +1,11 @@
-"""Batched multi-seat bomb-pot env.
+"""Batched multi-seat env (PLO double-bomb family + NLH).
 
 Array-shaped analogue of `BombPotEnv`. Owns a single `PyBatchedEngine` and
 returns observations / rewards / legal masks as stacked NumPy arrays for
 all N envs at once. Does *not* auto-reset terminal envs — the caller uses
 `reset_terminal_batch` to re-seed the envs whose `dones[i]` came back true.
+The observation layout follows the config's variant (991-dim PLO or
+995-dim NLH), same as the scalar env.
 
 Design goals:
   - Bit-exact parity with `BombPotEnv` on (obs, legal_mask, reward, done)
@@ -32,8 +34,9 @@ from plo5bp.actions import (
     NUM_ACTIONS,
     gate_mask_from_bounds,
 )
-from plo5bp.config import GameConfig
+from plo5bp.config import GameConfig, VARIANT_NLH
 from plo5bp.encoding import OBS_DIM, encode_observation_batch
+from plo5bp.encoding_nlh import OBS_DIM_NLH, encode_observation_batch_nlh
 
 
 @dataclass
@@ -61,9 +64,14 @@ class BatchedBombPotEnv:
     ):
         self.n = int(num_envs)
         self.config = config or GameConfig()
+        # Per-variant observation layout, mirroring the scalar env: the
+        # PLO double-bomb family shares the 991-dim layout; NLH is 995.
+        self._is_nlh = self.config.variant == VARIANT_NLH
+        self._obs_dim = OBS_DIM_NLH if self._is_nlh else OBS_DIM
         # k=3/k=4 Monte-Carlo budget for the opp-outcome obs feature.
         # 1024 (serial/UI/eval fidelity) by default; training rollout
         # passes a lower count for speed. See rollout.TRAIN_OPP_OUTCOME_MC.
+        # NLH ignores it (its 3-dim opp-outcome block is exhaustive).
         self._opp_outcome_mc = int(opp_outcome_mc)
         # Default-off switch for the Rust observation encoder. When set, the
         # finished obs comes straight from the engine (one FFI call, no numpy
@@ -72,9 +80,13 @@ class BatchedBombPotEnv:
         # exists so a bit-mismatch surfacing in a long run can be reverted
         # instantly with `PLO5_RUST_ENCODER=0` and a restart — no rebuild.
         # Falls back to numpy if the rebuilt engine lacks the method.
-        self._use_rust_encoder = bool(
-            int(os.environ.get("PLO5_RUST_ENCODER", "0"))
-        ) and hasattr(BatchedEngine, "observation_encoded_batch")
+        # PLO-only: the Rust encoder implements the 991-dim PLO layout
+        # (the engine refuses it for NLH), so NLH always encodes in numpy.
+        self._use_rust_encoder = (
+            bool(int(os.environ.get("PLO5_RUST_ENCODER", "0")))
+            and hasattr(BatchedEngine, "observation_encoded_batch")
+            and not self._is_nlh
+        )
         stacks = np.asarray(self.config.resolved_stacks, dtype=np.uint64)
         self._be = BatchedEngine(
             self.n,
@@ -84,12 +96,14 @@ class BatchedBombPotEnv:
             bb=self.config.bb,
             starting_stacks=stacks,
             opp_outcome_mc=self._opp_outcome_mc,
+            variant=self.config.variant,
+            sb=self.config.sb,
         )
         self._ev_runout_samples = int(ev_runout_samples)
         self._reset_seeds = np.zeros(self.n, dtype=np.uint64)
 
         # Cached "current" arrays; refreshed after every reset/step.
-        self._obs = np.zeros((self.n, OBS_DIM), dtype=np.float32)
+        self._obs = np.zeros((self.n, self._obs_dim), dtype=np.float32)
         self._legal = np.zeros((self.n, NUM_ACTIONS), dtype=bool)
         self._gate_mask = np.zeros((self.n, GATE_ACTIONS), dtype=bool)
         self._min_raise = np.zeros(self.n, dtype=np.uint64)
@@ -132,7 +146,7 @@ class BatchedBombPotEnv:
 
     @property
     def obs_dim(self) -> int:
-        return OBS_DIM
+        return self._obs_dim
 
     def reset_batch(
         self, seeds: np.ndarray, buttons: np.ndarray
@@ -278,9 +292,14 @@ class BatchedBombPotEnv:
                 cat_a = np.asarray(bundle["hero_cat_a"])
                 cat_b = np.asarray(bundle["hero_cat_b"])
             with record_function("step1/encoder"):
-                self._obs = encode_observation_batch(
-                    bundle, cat_a, cat_b, self.config
-                )
+                if self._is_nlh:
+                    self._obs = encode_observation_batch_nlh(
+                        bundle, cat_a, self.config
+                    )
+                else:
+                    self._obs = encode_observation_batch(
+                        bundle, cat_a, cat_b, self.config
+                    )
         with record_function("step1a_unpack/post"):
             actors = np.asarray(bundle["actor"], dtype=np.int8)
             dones = actors == -1
@@ -336,7 +355,14 @@ class BatchedBombPotEnv:
                 cat_a = np.asarray(bundle["hero_cat_a"])
                 cat_b = np.asarray(bundle["hero_cat_b"])
             with record_function("step1/encoder"):
-                obs_sub = encode_observation_batch(bundle, cat_a, cat_b, self.config)
+                if self._is_nlh:
+                    obs_sub = encode_observation_batch_nlh(
+                        bundle, cat_a, self.config
+                    )
+                else:
+                    obs_sub = encode_observation_batch(
+                        bundle, cat_a, cat_b, self.config
+                    )
 
         with record_function("step1a_unpack/post"):
             dones_sub = actors_sub == -1

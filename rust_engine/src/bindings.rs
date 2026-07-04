@@ -13,7 +13,23 @@ use rayon::prelude::*;
 
 use crate::actions::{Action, NUM_ACTIONS};
 use crate::cards::Card;
-use crate::state::{GameConfig, GameState, StudyTerminal};
+use crate::state::{GameConfig, GameState, StudyTerminal, Variant};
+
+/// Parse the Python-facing variant string. Kept as strings (not an
+/// exported enum class) so the Python config layer stays a plain
+/// dataclass field.
+fn parse_variant(s: &str) -> PyResult<Variant> {
+    match s {
+        "plo4_double_bomb" => Ok(Variant::Plo4DoubleBomb),
+        "plo5_double_bomb" => Ok(Variant::Plo5DoubleBomb),
+        "plo6_double_bomb" => Ok(Variant::Plo6DoubleBomb),
+        "nlh_single" => Ok(Variant::NlhSingle),
+        _ => Err(PyValueError::new_err(format!(
+            "unknown variant '{s}' (expected 'plo4_double_bomb', 'plo5_double_bomb', \
+             'plo6_double_bomb', or 'nlh_single')"
+        ))),
+    }
+}
 
 /// Python-facing `GameState`. Construct with config, then `reset(seed, button)`
 /// to deal a hand. Subsequent calls drive the state machine.
@@ -26,15 +42,18 @@ pub struct PyGameState {
 #[pymethods]
 impl PyGameState {
     #[new]
-    #[pyo3(signature = (num_seats=6, starting_stack=200000, ante=30000, bb=10000, starting_stacks=None))]
+    #[pyo3(signature = (num_seats=6, starting_stack=200000, ante=30000, bb=10000, starting_stacks=None, variant="plo5_double_bomb", sb=0))]
     fn new(
         num_seats: usize,
         starting_stack: u64,
         ante: u64,
         bb: u64,
         starting_stacks: Option<PyReadonlyArray1<'_, u64>>,
+        variant: &str,
+        sb: u64,
     ) -> PyResult<Self> {
         let stacks = resolve_starting_stacks(num_seats, starting_stack, starting_stacks)?;
+        let variant = parse_variant(variant)?;
         Ok(PyGameState {
             inner: None,
             config: GameConfig {
@@ -42,6 +61,8 @@ impl PyGameState {
                 starting_stacks: stacks,
                 ante,
                 bb,
+                sb,
+                variant,
             },
         })
     }
@@ -121,6 +142,47 @@ impl PyGameState {
     fn set_river(&mut self, card_a: u8, card_b: u8) -> PyResult<()> {
         let g = self.get_mut()?;
         g.set_river(card_from_index(card_a)?, card_from_index(card_b)?)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// NLH study-mode entry: user-supplied 2-card hero hole, hand starts
+    /// at the PREFLOP with blinds posted. Streets are supplied via
+    /// `set_flop_nlh` / `set_turn_nlh` / `set_river_nlh` as rounds close.
+    fn reset_study_nlh(
+        &mut self,
+        button: usize,
+        hero_seat: usize,
+        hero_hole: Vec<u8>,
+    ) -> PyResult<()> {
+        let hero_hole = cards_from_indices::<2>(&hero_hole, "hero_hole")?;
+        match GameState::new_study_nlh(self.config.clone(), button, hero_seat, hero_hole) {
+            Ok(g) => {
+                self.inner = Some(g);
+                Ok(())
+            }
+            Err(e) => Err(PyValueError::new_err(e.to_string())),
+        }
+    }
+
+    fn set_flop_nlh(&mut self, c0: u8, c1: u8, c2: u8) -> PyResult<()> {
+        let g = self.get_mut()?;
+        g.set_flop_nlh([
+            card_from_index(c0)?,
+            card_from_index(c1)?,
+            card_from_index(c2)?,
+        ])
+        .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    fn set_turn_nlh(&mut self, card: u8) -> PyResult<()> {
+        let g = self.get_mut()?;
+        g.set_turn_nlh(card_from_index(card)?)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    fn set_river_nlh(&mut self, card: u8) -> PyResult<()> {
+        let g = self.get_mut()?;
+        g.set_river_nlh(card_from_index(card)?)
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
@@ -270,6 +332,8 @@ impl PyGameState {
         d.set_item("eff_stack_cap", g.eff_stack_cap_at_hand_start.clone())?;
         d.set_item("actor", g.actor)?;
         d.set_item("button", g.button)?;
+        d.set_item("sb_seat", g.sb_seat)?;
+        d.set_item("bb_seat", g.bb_seat)?;
         d.set_item(
             "last_aggressor",
             g.last_aggressor.map(|s| s as i64).unwrap_or(-1),
@@ -283,6 +347,9 @@ impl PyGameState {
         d.set_item("history", history)?;
 
         d.set_item("opp_outcome_fractions", g.opp_outcome_fractions())?;
+        // NLH 3-dim [opp_ahead, tied, opp_behind]; cheap zeros for other
+        // variants (the method's variant guard returns before any eval).
+        d.set_item("nlh_opp_outcome", g.nlh_opp_outcome_fractions())?;
 
         let awaiting = g.awaiting_next_street.map(|s| s.index() as u8);
         d.set_item("awaiting_next_street", awaiting)?;
@@ -544,7 +611,8 @@ pub fn compute_aggression_bonus_batch<'py>(
 /// [`crate::double_board::double_board_payout`] function so Python can
 /// verify side-pot handling without driving a real GameState.
 ///
-/// `hole_cards` must be `5 * num_seats` card indices, flat-packed by seat
+/// `hole_cards` must be `hole_count * num_seats` card indices (5 or 6 per
+/// seat), flat-packed by seat
 /// (seat 0's 5 cards, then seat 1's 5 cards, ...). `board_a` / `board_b`
 /// are 5 indices each. Returns chips *won* per seat (sum equals
 /// `total_commit.sum()`).
@@ -563,18 +631,33 @@ pub fn compute_double_board_payout(
             "total_commit length must equal num_seats",
         ));
     }
-    if hole_cards.len() != 5 * n {
+    let hole_w = if n > 0 && hole_cards.len() == 6 * n {
+        6
+    } else if n > 0 && hole_cards.len() == 4 * n {
+        4
+    } else {
+        5
+    };
+    if hole_cards.len() != hole_w * n {
         return Err(PyValueError::new_err(
-            "hole_cards must have 5 * num_seats indices",
+            "hole_cards must have 4*num_seats (PLO4), 5*num_seats (PLO5), \
+             or 6*num_seats (PLO6) indices",
         ));
     }
     if button >= n {
         return Err(PyValueError::new_err("button out of range"));
     }
-    let mut holes: Vec<[Card; 5]> = Vec::with_capacity(n);
+    let mut holes: Vec<Vec<Card>> = Vec::with_capacity(n);
     for s in 0..n {
-        let slice = &hole_cards[5 * s..5 * (s + 1)];
-        holes.push(cards_from_indices::<5>(slice, "hole_cards")?);
+        let slice = &hole_cards[hole_w * s..hole_w * (s + 1)];
+        let mut hole = Vec::with_capacity(hole_w);
+        for &ix in slice {
+            if ix >= 52 {
+                return Err(PyValueError::new_err("hole_cards index out of range"));
+            }
+            hole.push(Card::from_index(ix));
+        }
+        holes.push(hole);
     }
     let board_a = cards_from_indices::<5>(&board_a, "board_a")?;
     let board_b = cards_from_indices::<5>(&board_b, "board_b")?;
@@ -662,6 +745,19 @@ impl PyGameState {
 
 const HISTORY_CAP: usize = 32;
 
+/// Batched-packer history width per variant. Must equal the variant's
+/// batch-encoder slot count EXACTLY: the packer keeps the LAST `cap`
+/// records oldest-first from slot 0, so a buffer wider than the encoder's
+/// depth would hand it the oldest records instead of the newest. PLO
+/// encodes 32 slots (`encoding._HISTORY_DEPTH`); NLH encodes 40
+/// (`encoding_nlh._HISTORY_DEPTH` — the preflop round adds actions).
+fn history_cap(variant: Variant) -> usize {
+    match variant {
+        Variant::NlhSingle => 40,
+        _ => HISTORY_CAP,
+    }
+}
+
 /// Python-facing batched game engine. Construct with `(num_envs, config)`,
 /// then `reset_batch(seeds, buttons)` to seed all envs. `apply_action_batch`
 /// steps every env; terminal envs stay terminal until `reset_terminal_batch`.
@@ -678,7 +774,7 @@ pub struct PyBatchedEngine {
 #[pymethods]
 impl PyBatchedEngine {
     #[new]
-    #[pyo3(signature = (num_envs, num_seats=6, starting_stack=200000, ante=30000, bb=10000, starting_stacks=None, opp_outcome_mc=1024))]
+    #[pyo3(signature = (num_envs, num_seats=6, starting_stack=200000, ante=30000, bb=10000, starting_stacks=None, opp_outcome_mc=1024, variant="plo5_double_bomb", sb=0))]
     fn new(
         num_envs: usize,
         num_seats: usize,
@@ -687,6 +783,8 @@ impl PyBatchedEngine {
         bb: u64,
         starting_stacks: Option<PyReadonlyArray1<'_, u64>>,
         opp_outcome_mc: usize,
+        variant: &str,
+        sb: u64,
     ) -> PyResult<Self> {
         if num_envs == 0 {
             return Err(PyValueError::new_err("num_envs must be >= 1"));
@@ -697,6 +795,7 @@ impl PyBatchedEngine {
         if opp_outcome_mc == 0 {
             return Err(PyValueError::new_err("opp_outcome_mc must be >= 1"));
         }
+        let variant = parse_variant(variant)?;
         let stacks = resolve_starting_stacks(num_seats, starting_stack, starting_stacks)?;
         Ok(PyBatchedEngine {
             states: (0..num_envs).map(|_| None).collect(),
@@ -705,6 +804,8 @@ impl PyBatchedEngine {
                 starting_stacks: stacks,
                 ante,
                 bb,
+                sb,
+                variant,
             },
             opp_outcome_mc,
         })
@@ -728,11 +829,12 @@ impl PyBatchedEngine {
     ) -> PyResult<Bound<'py, PyArray3<u8>>> {
         let n = self.states.len();
         let s = self.config.num_seats;
-        let mut arr = numpy::ndarray::Array3::<u8>::from_elem((n, s, 5), 255u8);
+        let hole_w = self.config.variant.hole_count();
+        let mut arr = numpy::ndarray::Array3::<u8>::from_elem((n, s, hole_w), 255u8);
         for (i, st) in self.states.iter().enumerate() {
             if let Some(g) = st {
                 for seat in 0..s {
-                    for c in 0..5 {
+                    for c in 0..hole_w {
                         arr[[i, seat, c]] = g.hole_cards[seat][c].index();
                     }
                 }
@@ -1254,7 +1356,7 @@ impl PyBatchedEngine {
 
     /// Stacked view of every field the vectorized encoder needs. Keys:
     ///
-    /// - `hero_hole`         (N, 5)   u8   — hole of current actor per env;
+    /// - `hero_hole`         (N, hole_count) u8 — hole of current actor per env;
     ///                                        255 sentinel when terminal.
     /// - `board_a` / `board_b` (N, 5) u8   — padded with 255 sentinels for
     ///                                        unrevealed cards.
@@ -1397,6 +1499,9 @@ impl PyBatchedEngine {
             "opp_outcome_fractions",
             packed.opp_outcome_fractions.into_pyarray(py),
         )?;
+        d.set_item("sb_seat", packed.sb_seat.into_pyarray(py))?;
+        d.set_item("bb_seat", packed.bb_seat.into_pyarray(py))?;
+        d.set_item("nlh_opp_outcome", packed.nlh_opp_outcome.into_pyarray(py))?;
         d.set_item("legal_mask", legal_mask.into_pyarray(py))?;
         d.set_item("hero_cat_a", cat_a.into_pyarray(py))?;
         d.set_item("hero_cat_b", cat_b.into_pyarray(py))?;
@@ -1474,6 +1579,9 @@ impl PyBatchedEngine {
             "opp_outcome_fractions",
             packed.opp_outcome_fractions.into_pyarray(py),
         )?;
+        d.set_item("sb_seat", packed.sb_seat.into_pyarray(py))?;
+        d.set_item("bb_seat", packed.bb_seat.into_pyarray(py))?;
+        d.set_item("nlh_opp_outcome", packed.nlh_opp_outcome.into_pyarray(py))?;
         d.set_item("legal_mask", legal_mask.into_pyarray(py))?;
         d.set_item("hero_cat_a", cat_a.into_pyarray(py))?;
         d.set_item("hero_cat_b", cat_b.into_pyarray(py))?;
@@ -1532,6 +1640,13 @@ struct PackedObservation {
     history_street: Array2<i8>,
     history_len: Array1<u8>,
     opp_outcome_fractions: Array2<f32>,
+    /// Blind seats (-1 when the variant has none). NLH batch encoder input.
+    sb_seat: Array1<i8>,
+    bb_seat: Array1<i8>,
+    /// NLH 3-dim [opp_ahead, tied, opp_behind] exhaustive fractions;
+    /// all-zero rows for PLO variants (mirrors `nlh_opp_outcome_fractions`'s
+    /// variant guard on the serial path).
+    nlh_opp_outcome: Array2<f32>,
 }
 
 impl PyBatchedEngine {
@@ -1548,7 +1663,10 @@ impl PyBatchedEngine {
     /// changed (e.g. the reset-terminal subset) without touching the rest.
     fn pack_observation_indexed(&self, idx: &[usize], s: usize) -> PackedObservation {
         let n = idx.len();
-        let mut hero_hole = Array2::<u8>::from_elem((n, 5), 255u8);
+        let hole_w = self.config.variant.hole_count();
+        let hist_cap = history_cap(self.config.variant);
+        let is_nlh = matches!(self.config.variant, Variant::NlhSingle);
+        let mut hero_hole = Array2::<u8>::from_elem((n, hole_w), 255u8);
         let mut board_a = Array2::<u8>::from_elem((n, 5), 255u8);
         let mut board_b = Array2::<u8>::from_elem((n, 5), 255u8);
         let mut board_a_len = Array1::<u8>::zeros(n);
@@ -1569,34 +1687,61 @@ impl PyBatchedEngine {
         let mut actor = Array1::<i8>::from_elem(n, -1i8);
         let mut button = Array1::<u8>::zeros(n);
         let mut last_aggressor = Array1::<i8>::from_elem(n, -1i8);
-        let mut history_seat = Array2::<i8>::from_elem((n, HISTORY_CAP), -1i8);
-        let mut history_action = Array2::<i8>::from_elem((n, HISTORY_CAP), -1i8);
-        let mut history_chips = Array2::<u64>::zeros((n, HISTORY_CAP));
-        let mut history_street = Array2::<i8>::from_elem((n, HISTORY_CAP), -1i8);
+        let mut history_seat = Array2::<i8>::from_elem((n, hist_cap), -1i8);
+        let mut history_action = Array2::<i8>::from_elem((n, hist_cap), -1i8);
+        let mut history_chips = Array2::<u64>::zeros((n, hist_cap));
+        let mut history_street = Array2::<i8>::from_elem((n, hist_cap), -1i8);
         let mut history_len = Array1::<u8>::zeros(n);
         let mut opp_outcome_fractions = Array2::<f32>::zeros((n, 12));
+        let mut sb_seat = Array1::<i8>::from_elem(n, -1i8);
+        let mut bb_seat = Array1::<i8>::from_elem(n, -1i8);
+        let mut nlh_opp_outcome = Array2::<f32>::zeros((n, 3));
 
-        // Compute opp_outcome_fractions in parallel — this is the
-        // expensive per-env work (k=2 exhaustive + k=3/k=4 MC at
-        // `self.opp_outcome_mc` draws). The remaining per-env writes
-        // below are cheap memcpy and stay serial.
-        let opp_outcome_mc = self.opp_outcome_mc;
-        let opp_fr_per_env: Vec<[f32; 12]> = (0..n)
-            .into_par_iter()
-            .map(|i| {
-                let mut out = [0.0f32; 12];
-                if let Some(state) = self.states[idx[i]].as_ref() {
-                    let fr = state.opp_outcome_fractions_mc(opp_outcome_mc);
-                    for j in 0..12 {
-                        out[j] = fr[j];
+        // Compute the variant's opp-outcome block in parallel — this is
+        // the expensive per-env work. PLO: k=2 exhaustive + k=3/k=4 MC
+        // at `self.opp_outcome_mc` draws (12 dims). NLH: exhaustive
+        // 2-card unseen sweep (3 dims); the other block stays zeros,
+        // mirroring the serial `observation_dict` (both keys always
+        // present, only the variant's own is populated). The remaining
+        // per-env writes below are cheap memcpy and stay serial.
+        if is_nlh {
+            let nlh_fr_per_env: Vec<[f32; 3]> = (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    let mut out = [0.0f32; 3];
+                    if let Some(state) = self.states[idx[i]].as_ref() {
+                        let fr = state.nlh_opp_outcome_fractions();
+                        for j in 0..3 {
+                            out[j] = fr[j];
+                        }
                     }
+                    out
+                })
+                .collect();
+            for i in 0..n {
+                for j in 0..3 {
+                    nlh_opp_outcome[[i, j]] = nlh_fr_per_env[i][j];
                 }
-                out
-            })
-            .collect();
-        for i in 0..n {
-            for j in 0..12 {
-                opp_outcome_fractions[[i, j]] = opp_fr_per_env[i][j];
+            }
+        } else {
+            let opp_outcome_mc = self.opp_outcome_mc;
+            let opp_fr_per_env: Vec<[f32; 12]> = (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    let mut out = [0.0f32; 12];
+                    if let Some(state) = self.states[idx[i]].as_ref() {
+                        let fr = state.opp_outcome_fractions_mc(opp_outcome_mc);
+                        for j in 0..12 {
+                            out[j] = fr[j];
+                        }
+                    }
+                    out
+                })
+                .collect();
+            for i in 0..n {
+                for j in 0..12 {
+                    opp_outcome_fractions[[i, j]] = opp_fr_per_env[i][j];
+                }
             }
         }
 
@@ -1633,6 +1778,8 @@ impl PyBatchedEngine {
             history_chips: *mut u64,
             history_street: *mut i8,
             history_len: *mut u8,
+            sb_seat: *mut i8,
+            bb_seat: *mut i8,
         }
         unsafe impl Send for OutPtrs {}
         unsafe impl Sync for OutPtrs {}
@@ -1664,6 +1811,8 @@ impl PyBatchedEngine {
             history_chips: history_chips.as_mut_ptr(),
             history_street: history_street.as_mut_ptr(),
             history_len: history_len.as_mut_ptr(),
+            sb_seat: sb_seat.as_mut_ptr(),
+            bb_seat: bb_seat.as_mut_ptr(),
         };
 
         (0..n).into_par_iter().for_each(|i| {
@@ -1679,7 +1828,7 @@ impl PyBatchedEngine {
             };
             // SAFETY: every write below indexes into a disjoint slice
             // of its target array (row i for 1D arrays; row stride
-            // {5, s, HISTORY_CAP} for 2D arrays). No two parallel
+            // {5, s, hist_cap} for 2D arrays). No two parallel
             // iterations touch the same byte. All output buffers are
             // C-contiguous (default ndarray layout).
             unsafe {
@@ -1693,10 +1842,12 @@ impl PyBatchedEngine {
                 *ptrs.button.add(i) = state.button as u8;
                 *ptrs.last_aggressor.add(i) =
                     state.last_aggressor.map(|s| s as i8).unwrap_or(-1);
+                *ptrs.sb_seat.add(i) = state.sb_seat.map(|x| x as i8).unwrap_or(-1);
+                *ptrs.bb_seat.add(i) = state.bb_seat.map(|x| x as i8).unwrap_or(-1);
 
                 if let Some(a) = state.current_actor() {
                     *ptrs.actor.add(i) = a as i8;
-                    let hole_base = i * 5;
+                    let hole_base = i * hole_w;
                     for (j, c) in state.hole_cards[a].iter().enumerate() {
                         *ptrs.hero_hole.add(hole_base + j) = c.index();
                     }
@@ -1726,10 +1877,10 @@ impl PyBatchedEngine {
                 }
 
                 let hist_len = state.history.len();
-                let start = hist_len.saturating_sub(HISTORY_CAP);
+                let start = hist_len.saturating_sub(hist_cap);
                 let kept = hist_len - start;
                 *ptrs.history_len.add(i) = kept as u8;
-                let hist_base = i * HISTORY_CAP;
+                let hist_base = i * hist_cap;
                 for (slot, rec) in state.history[start..].iter().enumerate() {
                     *ptrs.history_seat.add(hist_base + slot) = rec.seat as i8;
                     *ptrs.history_action.add(hist_base + slot) = rec.action.index() as i8;
@@ -1767,6 +1918,9 @@ impl PyBatchedEngine {
             history_street,
             history_len,
             opp_outcome_fractions,
+            sb_seat,
+            bb_seat,
+            nlh_opp_outcome,
         }
     }
 
@@ -1784,6 +1938,16 @@ impl PyBatchedEngine {
         py: Python<'py>,
         idx: &[usize],
     ) -> PyResult<Bound<'py, PyDict>> {
+        // The Rust encoder implements the 991-dim PLO layout only
+        // (obs_layout + encode_obs_row assume dual boards, the 12-dim
+        // opp-outcome block, and 32 history slots). NLH batches encode
+        // via the numpy `encode_observation_batch_nlh` path.
+        if matches!(self.config.variant, Variant::NlhSingle) {
+            return Err(PyRuntimeError::new_err(
+                "observation_encoded_batch is PLO-only; NLH uses the \
+                 numpy batch encoder (observation_and_features_batch)",
+            ));
+        }
         let n = idx.len();
         let s = self.config.num_seats;
         let bb = self.config.bb;
@@ -2428,8 +2592,11 @@ pub fn straight_flush_features_batch<'py>(
     let vc_v = visible_count.as_array();
 
     let n = hole_v.shape()[0];
-    if hole_v.shape() != [n, 5] {
-        return Err(PyValueError::new_err("hole shape must be (N, 5)"));
+    let hole_w = if n > 0 { hole_v.shape()[1] } else { 5 };
+    if !(4..=6).contains(&hole_w) || hole_v.shape() != [n, hole_w] {
+        return Err(PyValueError::new_err(
+            "hole shape must be (N, 4), (N, 5), or (N, 6)",
+        ));
     }
     if ba_v.shape() != [n, 5] || bb_v.shape() != [n, 5] {
         return Err(PyValueError::new_err(
@@ -2883,8 +3050,11 @@ pub fn draw_flags_batch<'py>(
     let bb_v = board_b.as_array();
 
     let n = hole_v.shape()[0];
-    if hole_v.shape() != [n, 5] {
-        return Err(PyValueError::new_err("hole shape must be (N, 5)"));
+    let hole_w = if n > 0 { hole_v.shape()[1] } else { 5 };
+    if !(4..=6).contains(&hole_w) || hole_v.shape() != [n, hole_w] {
+        return Err(PyValueError::new_err(
+            "hole shape must be (N, 4), (N, 5), or (N, 6)",
+        ));
     }
     if ba_v.shape() != [n, 5] || bb_v.shape() != [n, 5] {
         return Err(PyValueError::new_err(
@@ -3024,8 +3194,11 @@ pub fn pair_features_batch<'py>(
     let bb_v = board_b.as_array();
 
     let n = hole_v.shape()[0];
-    if hole_v.shape() != [n, 5] {
-        return Err(PyValueError::new_err("hole shape must be (N, 5)"));
+    let hole_w = if n > 0 { hole_v.shape()[1] } else { 5 };
+    if !(4..=6).contains(&hole_w) || hole_v.shape() != [n, hole_w] {
+        return Err(PyValueError::new_err(
+            "hole shape must be (N, 4), (N, 5), or (N, 6)",
+        ));
     }
     if ba_v.shape() != [n, 5] || bb_v.shape() != [n, 5] {
         return Err(PyValueError::new_err(

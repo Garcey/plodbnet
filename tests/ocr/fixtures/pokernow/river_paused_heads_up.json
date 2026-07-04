@@ -1,0 +1,37 @@
+{
+ "schema": "pokernow.v1",
+ "variant": "plo5",
+ "bombPot": true,
+ "pot": 12,
+ "button": 6,
+ "boards": [
+  { "run": "1", "cards": ["2c", "5h", "Ac", "6d", "3h"] },
+  { "run": "2", "cards": ["7h", "Ks", "6s", "Kh", "Qs"] }
+ ],
+ "seats": [
+  {
+   "seat": 1,
+   "name": "Miles",
+   "stack": 74,
+   "bet": null,
+   "cards": ["Ts", "As", "4h", "3d", "2d"],
+   "cardCount": 5,
+   "isHero": true,
+   "isActor": true,
+   "folded": false,
+   "classes": "table-player table-player-1 decision-current  you-player  five-cards"
+  },
+  {
+   "seat": 6,
+   "name": "JJ",
+   "stack": 74,
+   "bet": null,
+   "cards": [null, null, null, null, null],
+   "cardCount": 5,
+   "isHero": false,
+   "isActor": false,
+   "folded": false,
+   "classes": "table-player table-player-6 five-cards"
+  }
+ ]
+}

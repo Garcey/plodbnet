@@ -42,3 +42,7 @@ ui.log
 .idea/
 .DS_Store
 Thumbs.db
+
+# Public-build secrets + user data (never commit)
+.env.public
+data/

@@ -29,7 +29,7 @@ from plo5bp.actions import GATE_RAISE
 from plo5bp.config import TrainingConfig
 from plo5bp.network import ActorCritic, CentralCritic, opp_holes_multihot
 from plo5bp.rollout import Batch, iter_minibatches
-from plo5bp.sizing import ANCHOR_COUNT, anchor_grid_torch
+from plo5bp.sizing import PLO_ANCHOR_SPEC, anchor_grid_torch
 import numpy as np
 
 
@@ -79,7 +79,8 @@ def _kl_to_reference(
         g_cur, a_cur, r_cur, _ = model(obs, mb.gate_masks)
         with torch.no_grad():
             g_ref, a_ref, r_ref, _ = ref(obs, mb.gate_masks)
-        grid = anchor_grid_torch(mb.sizing)
+        spec = getattr(model, "anchor_spec", PLO_ANCHOR_SPEC)
+        grid = anchor_grid_torch(mb.sizing, spec)
         a_cur = a_cur.masked_fill(~grid.legal, -1e9)
         a_ref = a_ref.masked_fill(~grid.legal, -1e9)
         cat = torch.distributions.Categorical
@@ -95,9 +96,9 @@ def _kl_to_reference(
             beta(r_ref[..., 0].float(), r_ref[..., 1].float()),
         )  # (B, 9)
         anchor_probs = F.softmax(a_cur.float(), dim=-1)
-        interior_ok = grid.refine_ok[..., 1 : ANCHOR_COUNT - 1]
+        interior_ok = grid.refine_ok[..., 1 : spec.count - 1]
         kl_refine = (
-            anchor_probs[..., 1 : ANCHOR_COUNT - 1] * kl_refine_all * interior_ok
+            anchor_probs[..., 1 : spec.count - 1] * kl_refine_all * interior_ok
         ).sum(-1)
         p_raise = F.softmax(g_cur.float(), dim=-1)[..., GATE_RAISE]
         return (kl_gate + p_raise * (kl_anchor + kl_refine)).mean()

@@ -22,7 +22,7 @@ POSITION_BY_SEAT_SHORT = {
 }
 
 STREET_NAMES = {0: "preflop", 1: "flop", 2: "turn", 3: "river", 4: "showdown"}
-AWAITING_NAMES = {2: "turn", 3: "river"}
+AWAITING_NAMES = {1: "flop", 2: "turn", 3: "river"}
 
 HISTORY_NAMES = (
     "Fold", "CheckCall", "BetPct10", "BetPct25", "BetPct50",
@@ -68,6 +68,18 @@ def anchor_label(k: int) -> str:
     """Display label for sizing anchor k (pot fraction k/10). Anchor 0
     clamps to the min-raise floor — "min", never "0%"."""
     return "min" if k == 0 else f"{k * 10}%"
+
+
+def anchor_label_spec(spec: Any, k: int) -> str:
+    """Spec-aware anchor label: 'min' atom, pot-percent interior anchors,
+    'ALL-IN' top atom (NLH). Reproduces `anchor_label` exactly on the PLO
+    spec ('min', '10%', …, '100%')."""
+    if k == 0:
+        return "min"
+    if spec.allin_atom and k == spec.count - 1:
+        return "ALL-IN"
+    pct = spec.fracs_pm[k] / 10.0
+    return f"{pct:g}%"
 
 
 def history_entries(

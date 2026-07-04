@@ -15,7 +15,7 @@ cd /workspace/plodbnet || exit 1
 GLOG=runs/guardian.log
 STOPFLAG=runs/guardian.stop
 LOG=runs/vThree.log
-CLEAN=checkpoints/vTwo10_445.pt   # clean mature base (Hg ~0.8); warm source for the sizing-scale restart
+CLEAN=checkpoints/vThree_10_clean.pt   # proven low-LR warm source: vThree u10, Ha 1.34, Hg 0.59
 MAX_RESTARTS=4
 POLL=300                          # seconds between checks
 restarts=0
@@ -33,7 +33,7 @@ launch(){  # $1 = checkpoint to warm-load
     --num-envs 49134 --rollout-length 9000000 --num-minibatches 16 --ppo-epochs 2 \
     --mix-configs --configs-per-tier 10 --mix-tiers clubgg,clubgg_deep,deep \
     --entropy-coef 0.45 \
-    --target-kl 2.0 --kl-hard 10.0 --adv-clip 8 --lr-warmup-updates 75 \
+    --target-kl 2.0 --kl-hard 10.0 --adv-clip 8 --lr-warmup-updates 5 \
     --snapshot-every 5 \
     --load-checkpoint "$1" --checkpoint checkpoints/vThree.pt \
     --num-updates 100000000 >> "$LOG" 2>&1 < /dev/null &

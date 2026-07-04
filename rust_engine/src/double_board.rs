@@ -7,7 +7,7 @@
 //! first tied winner encountered clockwise from button.
 
 use crate::cards::Card;
-use crate::hand_eval::{evaluate_plo5, HandRank};
+use crate::hand_eval::{evaluate_nlh, evaluate_plo5, HandRank};
 
 /// Distribute chips across seats via side-pot layers + double-board split.
 ///
@@ -15,7 +15,7 @@ use crate::hand_eval::{evaluate_plo5, HandRank};
 /// `total_commit`). The sum of the return values equals the sum of
 /// `total_commit` (zero-sum by construction).
 pub fn double_board_payout(
-    hole_cards: &[[Card; 5]],
+    hole_cards: &[Vec<Card>],
     folded: &[bool],
     total_commit: &[u64],
     board_a: &[Card; 5],
@@ -71,11 +71,89 @@ pub fn double_board_payout(
     result
 }
 
+/// Distribute chips across seats via side-pot layers on a single board
+/// under NLH rules (best 5 of hole + board, any combination). Same layer
+/// construction as [`double_board_payout`], but each layer's chips go
+/// entirely to the best hand(s) on the one board.
+///
+/// Returns chips *won* per seat; sum equals the sum of `total_commit`.
+pub fn single_board_payout(
+    hole_cards: &[Vec<Card>],
+    folded: &[bool],
+    total_commit: &[u64],
+    board: &[Card; 5],
+    button: usize,
+) -> Vec<u64> {
+    let n = hole_cards.len();
+    assert_eq!(folded.len(), n);
+    assert_eq!(total_commit.len(), n);
+    let mut result = vec![0u64; n];
+
+    // Fold-out: single survivor takes all chips (no showdown).
+    let alive: Vec<usize> = (0..n).filter(|&i| !folded[i]).collect();
+    if alive.len() == 1 {
+        result[alive[0]] = total_commit.iter().sum();
+        return result;
+    }
+
+    // Rank every alive seat once; layers only re-select among eligible.
+    let ranks: Vec<Option<HandRank>> = (0..n)
+        .map(|i| {
+            if folded[i] {
+                None
+            } else {
+                Some(evaluate_nlh(&hole_cards[i], board))
+            }
+        })
+        .collect();
+
+    let mut levels: Vec<u64> = total_commit.iter().copied().collect();
+    levels.sort_unstable();
+    levels.dedup();
+
+    let mut prev_level = 0u64;
+    for &level in &levels {
+        if level == 0 {
+            continue;
+        }
+        let contributors: u64 = total_commit.iter().filter(|&&c| c >= level).count() as u64;
+        let layer_chips = (level - prev_level) * contributors;
+        prev_level = level;
+        if layer_chips == 0 {
+            continue;
+        }
+
+        let eligible: Vec<usize> = (0..n)
+            .filter(|&i| total_commit[i] >= level && !folded[i])
+            .collect();
+
+        if eligible.is_empty() {
+            // Orphaned layer (shouldn't occur with ≥2 survivors at showdown).
+            distribute_evenly(&mut result, &alive, layer_chips, button);
+            continue;
+        }
+
+        let best = eligible
+            .iter()
+            .map(|&s| ranks[s].expect("eligible seat must have a rank"))
+            .max()
+            .unwrap();
+        let winners: Vec<usize> = eligible
+            .iter()
+            .copied()
+            .filter(|&s| ranks[s] == Some(best))
+            .collect();
+        distribute_evenly(&mut result, &winners, layer_chips, button);
+    }
+
+    result
+}
+
 /// Award `half` chips on one board to the best hand(s) among `eligible`.
 fn award_half(
     result: &mut [u64],
     eligible: &[usize],
-    hole_cards: &[[Card; 5]],
+    hole_cards: &[Vec<Card>],
     board: &[Card; 5],
     half: u64,
     button: usize,
@@ -136,6 +214,12 @@ mod tests {
         Card::new(rank, suit)
     }
 
+    /// Test fixtures use fixed-size arrays; the payout API takes
+    /// variant-sized Vecs.
+    fn holes(arr: &[[Card; 5]]) -> Vec<Vec<Card>> {
+        arr.iter().map(|h| h.to_vec()).collect()
+    }
+
     #[test]
     fn fold_out_single_survivor() {
         // 3 seats, seat 0 alive, others folded. Commits 500/500/500.
@@ -143,7 +227,7 @@ mod tests {
         let folded = vec![false, true, true];
         let commit = vec![500u64, 500, 500];
         let board = [c(0, 0); 5];
-        let result = double_board_payout(&hole, &folded, &commit, &board, &board, 0);
+        let result = double_board_payout(&holes(&hole), &folded, &commit, &board, &board, 0);
         assert_eq!(result, vec![1500u64, 0, 0]);
     }
 
@@ -159,7 +243,7 @@ mod tests {
         let commit = vec![1000u64, 1000];
         let board_a = [c(11, 0), c(10, 1), c(8, 2), c(6, 3), c(4, 0)]; // K Q T 8 6
         let board_b = [c(9, 0), c(7, 1), c(5, 2), c(4, 3), c(0, 1)]; // J 9 7 6 2
-        let result = double_board_payout(&hole, &folded, &commit, &board_a, &board_b, 0);
+        let result = double_board_payout(&holes(&hole), &folded, &commit, &board_a, &board_b, 0);
         assert_eq!(result, vec![2000u64, 0]);
     }
 
@@ -177,7 +261,7 @@ mod tests {
         let board_a = [c(6, 0), c(5, 1), c(3, 2), c(1, 0), c(0, 3)]; // 8 7 5 3 2
         // Board B: Kh Ks + junk → seat 1 makes quad kings.
         let board_b = [c(11, 0), c(11, 1), c(5, 2), c(3, 3), c(0, 3)]; // KK 7 5 2
-        let result = double_board_payout(&hole, &folded, &commit, &board_a, &board_b, 0);
+        let result = double_board_payout(&holes(&hole), &folded, &commit, &board_a, &board_b, 0);
         assert_eq!(result, vec![1000u64, 1000]);
     }
 
@@ -193,7 +277,7 @@ mod tests {
         let commit = vec![1000u64, 1000];
         let board_a = [c(11, 0), c(8, 1), c(5, 2), c(3, 3), c(0, 3)]; // K T 7 5 2 rainbow
         let board_b = [c(10, 1), c(7, 2), c(4, 3), c(2, 0), c(1, 3)]; // Q 9 6 4 3 rainbow
-        let result = double_board_payout(&hole, &folded, &commit, &board_a, &board_b, 0);
+        let result = double_board_payout(&holes(&hole), &folded, &commit, &board_a, &board_b, 0);
         assert_eq!(result, vec![1000u64, 1000], "perfect chop");
     }
 
@@ -214,7 +298,7 @@ mod tests {
         let board_a = [c(11, 1), c(8, 2), c(5, 3), c(3, 0), c(1, 3)]; // Kd Th 7s 5c 3s
         // Board B: 3 clubs present → seat 0 uses Jc+Qc + board clubs → Q-high flush.
         let board_b = [c(7, 0), c(5, 0), c(3, 0), c(4, 1), c(0, 2)]; // 9c 7c 5c 6d 2h
-        let result = double_board_payout(&hole, &folded, &commit, &board_a, &board_b, 0);
+        let result = double_board_payout(&holes(&hole), &folded, &commit, &board_a, &board_b, 0);
         // Board A chops (500 each). Board B to seat 0 (1000).
         // Seat 0: 500 + 1000 = 1500. Seat 1: 500.
         assert_eq!(result, vec![1500u64, 500]);
@@ -236,7 +320,7 @@ mod tests {
         let commit = vec![500u64, 500, 1500];
         let board_a = [c(10, 0), c(10, 1), c(9, 2), c(8, 2), c(7, 3)]; // Qc Qd Jh Th 9s
         let board_b = [c(10, 2), c(10, 3), c(9, 1), c(8, 0), c(7, 0)]; // Qh Qs Jd Tc 9c
-        let result = double_board_payout(&hole, &folded, &commit, &board_a, &board_b, 0);
+        let result = double_board_payout(&holes(&hole), &folded, &commit, &board_a, &board_b, 0);
         // Layer 1 (main, 500×3=1500): seat 0 scoops → 1500.
         // Layer 2 (side, 1000×1=1000): seat 2 alone → 1000.
         assert_eq!(result, vec![1500u64, 0, 1000]);
@@ -274,7 +358,7 @@ mod tests {
         let board_a = [c(10, 0), c(10, 1), c(5, 0), c(7, 1), c(0, 3)];
         // Board B: Qh Qs 8d 4c 3s.
         let board_b = [c(10, 2), c(10, 3), c(6, 1), c(2, 0), c(1, 3)];
-        let result = double_board_payout(&hole, &folded, &commit, &board_a, &board_b, 0);
+        let result = double_board_payout(&holes(&hole), &folded, &commit, &board_a, &board_b, 0);
         assert_eq!(result, vec![0u64, 0, 0, 3700]);
         assert_eq!(result.iter().sum::<u64>(), commit.iter().sum::<u64>());
     }
@@ -294,12 +378,76 @@ mod tests {
         let board_a = [c(10, 0), c(10, 1), c(9, 2), c(8, 2), c(7, 3)];
         // Board B: 8c 7h 5d 2s 3c → seat 1 makes trips 8s (beats AA pair).
         let board_b = [c(6, 0), c(5, 2), c(3, 1), c(0, 3), c(1, 0)];
-        let result = double_board_payout(&hole, &folded, &commit, &board_a, &board_b, 0);
+        let result = double_board_payout(&holes(&hole), &folded, &commit, &board_a, &board_b, 0);
         // Main pot = 1500, split across boards → 750 each.
         //   Board A: seat 0 wins 750.
         //   Board B: seat 1 wins 750.
         // Side pot = 1000, seat 2 alone across both boards → 1000.
         assert_eq!(result, vec![750u64, 750, 1000]);
         assert_eq!(result.iter().sum::<u64>(), commit.iter().sum::<u64>());
+    }
+
+    // ---- NLH single-board payout ----
+
+    #[test]
+    fn nlh_payout_one_hole_card_flush_beats_pocket_aces() {
+        // Any-combo rule: seat 0 makes an A-high flush with ONE hole heart
+        // (impossible under PLO's exactly-2 rule); seat 1's pocket aces
+        // make only a pair on this board.
+        let hole = vec![
+            vec![c(12, 2), c(0, 0)],  // Ah 2c
+            vec![c(12, 3), c(12, 1)], // As Ad
+        ];
+        let folded = vec![false, false];
+        let commit = vec![1_000u64, 1_000];
+        let board = [c(11, 2), c(10, 2), c(9, 2), c(7, 2), c(1, 3)]; // Kh Qh Jh 9h 3s
+        let result = single_board_payout(&hole, &folded, &commit, &board, 0);
+        assert_eq!(result, vec![2_000u64, 0]);
+    }
+
+    #[test]
+    fn nlh_payout_play_the_board_chops() {
+        // Board is a broadway straight; neither hole improves → both seats
+        // play the board (ZERO hole cards) and chop.
+        let hole = vec![
+            vec![c(0, 0), c(1, 1)], // 2c 3d
+            vec![c(0, 2), c(1, 3)], // 2h 3s
+        ];
+        let folded = vec![false, false];
+        let commit = vec![1_000u64, 1_000];
+        let board = [c(12, 0), c(11, 1), c(10, 2), c(9, 3), c(8, 0)]; // A K Q J T rainbow
+        let result = single_board_payout(&hole, &folded, &commit, &board, 0);
+        assert_eq!(result, vec![1_000u64, 1_000]);
+    }
+
+    #[test]
+    fn nlh_payout_side_pot_layers() {
+        // Commits [500, 1000, 2000]. Seat 0 (short) has trips queens and
+        // wins the main pot only; seat 2 (pair of queens, ace kicker)
+        // beats seat 1 (unpaired) for the middle layer and collects the
+        // uncalled top layer as a refund.
+        let hole = vec![
+            vec![c(10, 0), c(10, 1)], // Qc Qd → trips with board Qs
+            vec![c(6, 0), c(1, 1)],   // 8c 3d → high card
+            vec![c(12, 3), c(10, 2)], // As Qh → pair of queens, A kicker
+        ];
+        let folded = vec![false, false, false];
+        let commit = vec![500u64, 1_000, 2_000];
+        let board = [c(10, 3), c(5, 1), c(0, 2), c(7, 0), c(2, 3)]; // Qs 7d 2h 9c 4s
+        let result = single_board_payout(&hole, &folded, &commit, &board, 0);
+        // Layer 1 (500 × 3 = 1500): seat 0. Layer 2 (500 × 2 = 1000):
+        // seat 2. Layer 3 (1000 × 1): seat 2 refund.
+        assert_eq!(result, vec![1_500u64, 0, 2_000]);
+        assert_eq!(result.iter().sum::<u64>(), commit.iter().sum::<u64>());
+    }
+
+    #[test]
+    fn nlh_payout_fold_out_short_circuits() {
+        let hole = vec![vec![c(0, 0), c(1, 0)], vec![c(2, 0), c(3, 0)]];
+        let folded = vec![false, true];
+        let commit = vec![700u64, 300];
+        let board = [c(12, 0), c(11, 1), c(10, 2), c(9, 3), c(8, 0)];
+        let result = single_board_payout(&hole, &folded, &commit, &board, 0);
+        assert_eq!(result, vec![1_000u64, 0]);
     }
 }

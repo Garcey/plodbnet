@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import time
 from pathlib import Path
@@ -31,15 +32,29 @@ import numpy as np
 import torch
 
 from plo5bp.actions import GATE_ACTIONS
-from plo5bp.config import GameConfig, TrainingConfig
+from plo5bp.config import (
+    VARIANT_NLH,
+    VARIANT_PLO4,
+    VARIANT_PLO5,
+    VARIANT_PLO6,
+    GameConfig,
+    TrainingConfig,
+)
+from plo5bp.encoding import OBS_DIM
+from plo5bp.encoding_nlh import OBS_DIM_NLH
 from plo5bp.network import ActorCriticV2, ActorCriticV4, CentralCritic
+from plo5bp.sizing import NLH_ANCHOR_SPEC, PLO_ANCHOR_SPEC
 from plo5bp.ppo import PPOTrainer
 from plo5bp.rollout import (
     collect_rollout,
     collect_rollout_batched,
     collect_rollout_multiconfig,
 )
-from plo5bp.selfplay import OpponentPool
+from plo5bp.selfplay import (
+    OpponentPool,
+    discover_checkpoint_family,
+    seed_pool_from_checkpoints,
+)
 
 
 def _parse_seats_range(spec: str) -> tuple[int, ...]:
@@ -319,6 +334,8 @@ def _sample_game_config(
     rng: np.random.Generator,
     stack_dist: str = "uniform",
     seats_dist: str = "uniform",
+    variant: str = VARIANT_PLO5,
+    sb: int = 0,
 ) -> tuple[GameConfig, str]:
     if seats_dist == "clubgg":
         n_seats = _sample_clubgg_seats(seats_choices, rng)
@@ -359,6 +376,8 @@ def _sample_game_config(
         ante=ante,
         bb=bb,
         starting_stacks=stacks,
+        sb=sb,
+        variant=variant,
     )
     return cfg, effective_stack_dist
 
@@ -586,14 +605,53 @@ def main() -> None:
     parser.add_argument(
         "--ante",
         type=int,
-        default=30000,
-        help="Ante in chips (default 30000 → 3bb).",
+        default=None,
+        help="Per-player ante in chips. Default: 3bb for the bomb pot "
+        "(the historical 30000), 0.5bb for NLH (the 5/10(5) structure).",
+    )
+    parser.add_argument(
+        "--variant",
+        choices=[VARIANT_PLO5, VARIANT_PLO4, VARIANT_PLO6, VARIANT_NLH],
+        default=VARIANT_PLO5,
+        help="Game variant. 'plo4/plo6_double_bomb' = the PLO5 bomb pot "
+        "with 4/6 hole cards (same obs layout + 11-anchor PL head). "
+        "'nlh_single' = no-limit hold'em: 2 hole cards, single board, "
+        "SB/BB + per-player ante, preflop street, and the 12-anchor NLH "
+        "sizing ladder. All variants support --batched. Checkpoints are "
+        "variant-specific: every variant trains from scratch (no "
+        "cross-variant warm-start).",
+    )
+    parser.add_argument(
+        "--sb",
+        type=int,
+        default=None,
+        help="Small blind in chips (NLH only). Default bb/2. Ignored for "
+        "the bomb-pot variant.",
     )
     parser.add_argument(
         "--load-checkpoint",
         type=Path,
         default=None,
         help="Optional warm-start: load model weights from this .pt before training.",
+    )
+    parser.add_argument(
+        "--warmstart-pool",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="On --load-checkpoint, reconstruct the opponent pool from the "
+        "checkpoint's numbered siblings (<stem>_<N>.pt) — the members a "
+        "never-stopped run would hold: the exact prior membership when "
+        "the checkpoint recorded pool_member_updates, else the nearest "
+        "files to the natural snapshot grid. Without it a resumed run "
+        "plays pure self-play until the first snapshot tick. "
+        "--no-warmstart-pool restores the old empty-pool resume.",
+    )
+    parser.add_argument(
+        "--warmstart-pool-dir",
+        type=Path,
+        default=None,
+        help="Directory to scan for pool-seed checkpoints (default: the "
+        "--load-checkpoint file's own directory).",
     )
     parser.add_argument(
         "--critic-hidden-dim",
@@ -704,9 +762,11 @@ def main() -> None:
     parser.add_argument(
         "--batched",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
         help="Use collect_rollout_batched (Phase A-D speedup path) instead of the serial collector. "
-        "Pass --no-batched to use the serial collector.",
+        "Pass --no-batched to use the serial collector. Default: batched "
+        "for every variant (NLH gained its batched packer + encoder "
+        "2026-07-03).",
     )
     parser.add_argument(
         "--device",
@@ -725,6 +785,19 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Variant resolution: NLH defaults to the 5/10(5)-style structure
+    # (sb = bb/2, ante = bb/2 per player); the bomb pot keeps its
+    # historical 3bb ante and no blinds.
+    is_nlh = args.variant == VARIANT_NLH
+    if args.ante is None:
+        args.ante = args.bb // 2 if is_nlh else 3 * args.bb
+    if args.sb is None:
+        args.sb = args.bb // 2 if is_nlh else 0
+    if not is_nlh:
+        args.sb = 0
+    if args.batched is None:
+        args.batched = True
+
     if args.aggression_bonus_c is None:
         args.aggression_bonus_c = 5.0 if args.stack_dist == "agro_deep" else 0.0
 
@@ -739,6 +812,21 @@ def main() -> None:
             f"[batch-size] derived {args.batch_size} from "
             f"rollout_length={args.rollout_length} / num_minibatches={args.num_minibatches}"
         )
+
+    # The block-rotation default cycles PLO-named stack tiers (clubgg
+    # bands, PLO-tuned entropy seeds). Running those against an NLH
+    # table would be the silent-wrong-default failure mode again (cf.
+    # the 128x2 hidden-dim incident), so NLH disables block rotation
+    # unless the user explicitly overrides the cycle — plain
+    # --stack-dist + --entropy-coef govern instead.
+    _BLOCK_ROTATION_DEFAULT = "clubgg:0.1,clubgg_deep:0.1,deep:0.2"
+    if is_nlh and args.block_rotation == _BLOCK_ROTATION_DEFAULT:
+        print(
+            "[variant] nlh_single: block-rotation default (PLO tiers) "
+            "disabled; sampling via --stack-dist "
+            f"{args.stack_dist!r} at --entropy-coef {args.entropy_coef}"
+        )
+        args.block_rotation = ""
 
     blocks = _parse_block_rotation(args.block_rotation)
     if args.mix_configs:
@@ -821,15 +909,22 @@ def main() -> None:
     )
 
     model_cls = ActorCriticV4 if args.sizing_head == "logistic" else ActorCriticV2
+    obs_dim = OBS_DIM_NLH if is_nlh else OBS_DIM
+    anchor_spec = NLH_ANCHOR_SPEC if is_nlh else PLO_ANCHOR_SPEC
     model = model_cls(
-        hidden_dim=train_cfg.hidden_dim, num_layers=train_cfg.num_layers
+        hidden_dim=train_cfg.hidden_dim,
+        num_layers=train_cfg.num_layers,
+        obs_dim=obs_dim,
+        anchor_spec=anchor_spec,
     )
     print(
         f"[head] sizing-head={args.sizing_head} "
-        f"(head_version={model.head_version})"
+        f"(head_version={model.head_version}) variant={args.variant} "
+        f"obs_dim={obs_dim} anchors={anchor_spec.count} ({anchor_spec.name})"
     )
     model.to(train_cfg.device)
     critic = CentralCritic(
+        obs_dim=obs_dim,
         hidden_dim=train_cfg.critic_hidden_dim,
         num_blocks=train_cfg.critic_num_blocks,
     )
@@ -840,8 +935,22 @@ def main() -> None:
     restored_tier_ent: dict | None = None
     restored_baseline: dict | None = None
     restored_block_acc: dict | None = None
+    restored_pool_updates: list | None = None
     if args.load_checkpoint is not None:
         ckpt = torch.load(args.load_checkpoint, map_location="cpu", weights_only=False)
+        ckpt_variant = str(ckpt.get("variant", VARIANT_PLO5))
+        if ckpt_variant != args.variant:
+            # Unconditional: even dims-identical pairs (plo4/plo5/plo6
+            # share OBS_DIM 991 + the 11-anchor head) are refused. The
+            # games' equities and minimum made-hand strengths differ so
+            # much by hole-card count that transferred weights are a
+            # confused prior, not a head start — every variant trains
+            # from scratch (decision 2026-07-03).
+            raise SystemExit(
+                f"variant mismatch: checkpoint={ckpt_variant} vs "
+                f"--variant={args.variant}. Cross-variant warm-starts are "
+                "refused: each variant trains from scratch."
+            )
         ckpt_head = int(ckpt.get("head_version", 1))
         if ckpt_head != model.head_version:
             raise SystemExit(
@@ -896,6 +1005,7 @@ def main() -> None:
         restored_tier_ent = ckpt.get("anneal_tier_ent")
         restored_baseline = ckpt.get("anneal_baseline")
         restored_block_acc = ckpt.get("anneal_block_acc")
+        restored_pool_updates = ckpt.get("pool_member_updates")
 
     # Per-tier entropy-anneal state. `tier_ent` is always seeded from the
     # --block-rotation initial values and is what the loop reads for the entropy
@@ -945,6 +1055,54 @@ def main() -> None:
     pool = OpponentPool(capacity=train_cfg.opponent_pool_size)
     rng = np.random.default_rng(args.seed)
 
+    # Warm-start pool reconstruction: refill the (ephemeral) opponent
+    # pool from the loaded checkpoint's numbered siblings so a resumed
+    # run faces the same opponents a never-stopped one would, instead of
+    # pure self-play until the first snapshot tick.
+    if args.load_checkpoint is not None and args.warmstart_pool:
+        ws_target = restored_update
+        if ws_target is None:
+            m = re.match(r"^.+_(\d+)\.pt$", args.load_checkpoint.name)
+            ws_target = int(m.group(1)) if m else None
+        if ws_target is None:
+            _, family = discover_checkpoint_family(
+                args.load_checkpoint, args.warmstart_pool_dir
+            )
+            ws_target = max(family) if family else None
+        if ws_target is None:
+            print(
+                "[pool] warm-start seeding skipped: source update unknown "
+                "(no update_counter in the checkpoint, no _<N> filename, "
+                "no numbered siblings on disk)"
+            )
+        else:
+            seeded = seed_pool_from_checkpoints(
+                pool,
+                args.load_checkpoint,
+                int(ws_target),
+                train_cfg.snapshot_every,
+                args.variant,
+                model.head_version,
+                model.state_dict(),
+                preferred=restored_pool_updates,
+                directory=args.warmstart_pool_dir,
+            )
+            if seeded:
+                print(
+                    f"[pool] warm-start seeded {len(seeded)}/{pool.capacity} "
+                    f"members from updates {seeded} "
+                    f"(target u{ws_target}, snapshot_every={train_cfg.snapshot_every}"
+                    + (", exact prior membership honored"
+                       if restored_pool_updates else "")
+                    + ")"
+                )
+            else:
+                print(
+                    "[pool] warm-start seeding found no compatible sibling "
+                    "checkpoints — pool starts empty (pure self-play until "
+                    "the first snapshot)"
+                )
+
     # Live anneal control (step changes + manual tier-coef overrides)
     # without pausing training — see --anneal-step help.
     anneal_control_file = Path("runs/anneal_control.json")
@@ -982,7 +1140,13 @@ def main() -> None:
                 "config": train_cfg.__dict__,
                 "game_config": game_cfg_snap,
                 "gate_count": GATE_ACTIONS,
+                "variant": args.variant,
+                "anchor_count": model._anchor_count,
                 "update_counter": update_idx,
+                # Metadata only (update indices, not weights): lets a
+                # warm-start reconstruct the exact pool membership from
+                # the sibling files still on disk.
+                "pool_member_updates": list(pool.tags),
                 "anneal_tier_ent": tier_ent,
                 "anneal_baseline": tier_baseline,
                 "anneal_block_acc": block_acc,
@@ -1007,6 +1171,8 @@ def main() -> None:
         rng,
         stack_dist=args.stack_dist,
         seats_dist=args.seats_dist,
+        variant=args.variant,
+        sb=args.sb,
     )
     entropy_coef_deep = (
         args.entropy_coef if args.entropy_coef_deep is None else args.entropy_coef_deep
@@ -1070,6 +1236,7 @@ def main() -> None:
                 _sample_game_config(
                     seats_choices, stack_lo, stack_hi, args.bb, args.ante, rng,
                     stack_dist=tier, seats_dist=args.seats_dist,
+                    variant=args.variant, sb=args.sb,
                 )[0]
                 for tier in mix_tiers
                 for _ in range(args.configs_per_tier)
@@ -1083,6 +1250,7 @@ def main() -> None:
             sampled_game_cfg, sampled_eff_dist = _sample_game_config(
                 seats_choices, stack_lo, stack_hi, args.bb, args.ante, rng,
                 stack_dist=active_tier, seats_dist=args.seats_dist,
+                variant=args.variant, sb=args.sb,
             )
         else:
             block_idx = -1
@@ -1090,6 +1258,7 @@ def main() -> None:
             sampled_game_cfg, sampled_eff_dist = _sample_game_config(
                 seats_choices, stack_lo, stack_hi, args.bb, args.ante, rng,
                 stack_dist=active_tier, seats_dist=args.seats_dist,
+                variant=args.variant, sb=args.sb,
             )
         _profile_this = args.profile_one_update and update == 0
         _prof = None
@@ -1148,9 +1317,9 @@ def main() -> None:
 
         # Snapshot on update count, then also on wall-clock if configured.
         if update % train_cfg.snapshot_every == 0:
-            pool.snapshot(model)
+            pool.snapshot(model, tag=update)
         if args.snapshot_every_sec > 0 and now - last_snapshot_sec >= args.snapshot_every_sec:
-            pool.snapshot(model)
+            pool.snapshot(model, tag=update)
             last_snapshot_sec = now
 
         if _prof is not None:
@@ -1265,7 +1434,10 @@ def main() -> None:
             "config": train_cfg.__dict__,
             "game_config": sampled_game_cfg.__dict__,
             "gate_count": GATE_ACTIONS,
+            "variant": args.variant,
+            "anchor_count": model._anchor_count,
             "update_counter": update,
+            "pool_member_updates": list(pool.tags),
             "anneal_tier_ent": tier_ent,
             "anneal_baseline": tier_baseline,
             "anneal_block_acc": block_acc,

@@ -4,6 +4,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+#: PLO5 double-board bomb pot: 5 hole cards, two boards, pot-limit,
+#: ante-only (no blinds; hands start at the flop). The original format.
+VARIANT_PLO5 = "plo5_double_bomb"
+#: PLO4 double-board bomb pot: identical rules to PLO5 double-board
+#: (two boards, pot-limit, ante-only, starts at the flop) with 4 hole cards.
+VARIANT_PLO4 = "plo4_double_bomb"
+#: PLO6 double-board bomb pot: identical rules to PLO5 double-board
+#: (two boards, pot-limit, ante-only, starts at the flop) with 6 hole cards.
+VARIANT_PLO6 = "plo6_double_bomb"
+#: No-limit hold'em, single board: 2 hole cards, best-5-of-7, NL cap,
+#: SB/BB blinds + per-player ante, preflop betting round.
+VARIANT_NLH = "nlh_single"
+
+_VARIANTS = (VARIANT_PLO5, VARIANT_PLO4, VARIANT_PLO6, VARIANT_NLH)
+
 
 @dataclass(frozen=True)
 class GameConfig:
@@ -11,6 +26,10 @@ class GameConfig:
 
     Heterogeneous stacks: pass ``starting_stacks=(s0, s1, ...)`` with
     ``len == num_seats``. Otherwise ``starting_stack`` expands uniformly.
+
+    ``variant`` selects the game; ``sb`` is the small blind in chips and
+    only meaningful for blind variants (0 for bomb pots). ``ante`` is
+    per player in both variants.
     """
 
     num_seats: int = 6
@@ -18,12 +37,49 @@ class GameConfig:
     ante: int = 30000
     bb: int = 10000
     starting_stacks: tuple[int, ...] | None = None
+    sb: int = 0
+    variant: str = VARIANT_PLO5
 
     def __post_init__(self) -> None:
+        if self.variant not in _VARIANTS:
+            raise ValueError(
+                f"unknown variant {self.variant!r} (expected one of {_VARIANTS})"
+            )
         if self.starting_stacks is not None and len(self.starting_stacks) != self.num_seats:
             raise ValueError(
                 f"starting_stacks length {len(self.starting_stacks)} != num_seats {self.num_seats}"
             )
+
+    @classmethod
+    def nlh_default(
+        cls,
+        num_seats: int = 6,
+        starting_stack: int = 1_000_000,
+        starting_stacks: tuple[int, ...] | None = None,
+    ) -> "GameConfig":
+        """The UI default NLH stake: $5/$10 with a $5 per-player ante at
+        1bb = 10000 chips ($10) → sb 5000, bb 10000, ante 5000. Default
+        stacks 100bb (the reference ClubGG table runs 100-250bb)."""
+        return cls(
+            num_seats=num_seats,
+            starting_stack=starting_stack,
+            ante=5_000,
+            bb=10_000,
+            starting_stacks=starting_stacks,
+            sb=5_000,
+            variant=VARIANT_NLH,
+        )
+
+    @property
+    def hole_count(self) -> int:
+        """Hole cards per seat for this variant (mirrors Rust
+        ``Variant::hole_count``)."""
+        return {
+            VARIANT_PLO4: 4,
+            VARIANT_PLO5: 5,
+            VARIANT_PLO6: 6,
+            VARIANT_NLH: 2,
+        }[self.variant]
 
     @property
     def resolved_stacks(self) -> tuple[int, ...]:

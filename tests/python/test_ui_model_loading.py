@@ -70,14 +70,16 @@ def test_server_load_model_dual_path(tmp_path, monkeypatch):
     )
 
     monkeypatch.setenv("PLO5BP_CHECKPOINT", str(p1))
-    m1 = server._load_model()
+    m1, loaded1 = server._load_model()
     assert type(m1) is ActorCritic
     assert getattr(m1, "head_version", 1) == 1
+    assert loaded1 is True
 
     monkeypatch.setenv("PLO5BP_CHECKPOINT", str(p2))
-    m2 = server._load_model()
+    m2, loaded2 = server._load_model()
     assert type(m2) is ActorCriticV2
     assert m2.head_version == 2
+    assert loaded2 is True
 
 
 def test_server_load_model_v1_era_959_checkpoint(tmp_path, monkeypatch):
@@ -95,7 +97,7 @@ def test_server_load_model_v1_era_959_checkpoint(tmp_path, monkeypatch):
         p,
     )
     monkeypatch.setenv("PLO5BP_CHECKPOINT", str(p))
-    m = server._load_model()
+    m, _loaded = server._load_model()
     w_loaded = m.torso[0].weight.detach()
     assert w_loaded.shape == (16, OBS_DIM_V1)
     assert torch.equal(w_loaded, old.torso[0].weight.detach())

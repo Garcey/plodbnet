@@ -35,7 +35,24 @@ import torch.nn.functional as F
 
 from plo5bp.actions import GATE_ACTIONS, GATE_RAISE
 from plo5bp.encoding import OBS_DIM
-from plo5bp.sizing import ANCHOR_COUNT, anchor_grid_torch, refine_chips_torch
+from plo5bp.sizing import (
+    ANCHOR_COUNT,
+    NLH_ANCHOR_SPEC,
+    PLO_ANCHOR_SPEC,
+    AnchorSpec,
+    anchor_grid_torch,
+    refine_chips_torch,
+)
+
+
+def anchor_spec_for_count(count: int) -> AnchorSpec:
+    """Resolve the anchor spec a checkpoint was trained with from its
+    head width. Each variant has exactly one ladder, so the count is a
+    sufficient fingerprint (PLO 11, NLH 12)."""
+    for spec in (PLO_ANCHOR_SPEC, NLH_ANCHOR_SPEC):
+        if spec.count == count:
+            return spec
+    raise ValueError(f"no anchor spec with {count} anchors")
 
 
 class ActOut(NamedTuple):
@@ -280,6 +297,7 @@ class ActorCriticV2(nn.Module):
         hidden_dim: int = 512,
         obs_dim: int = OBS_DIM,
         num_layers: int = 2,
+        anchor_spec: AnchorSpec = PLO_ANCHOR_SPEC,
     ):
         super().__init__()
         if num_layers < 1:
@@ -295,10 +313,16 @@ class ActorCriticV2(nn.Module):
             for _ in range(num_layers - 1):
                 layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
             self.torso = nn.Sequential(*layers)
+        # The spec is the variant's ladder (PLO 11 anchors / NLH 12 with
+        # the all-in atom). Atoms are always first+last, so the refine
+        # head is `count - 2` interior slots in every spec.
+        self.anchor_spec = anchor_spec
+        self._anchor_count = anchor_spec.count
+        self._interior = anchor_spec.count - 2
         self.gate_head = nn.Linear(hidden_dim, GATE_ACTIONS)
-        self.anchor_head = nn.Linear(hidden_dim, ANCHOR_COUNT)
+        self.anchor_head = nn.Linear(hidden_dim, self._anchor_count)
         # (α, β) per interior anchor; softplus+1 keeps each Beta unimodal.
-        self.refine_head = nn.Linear(hidden_dim, _INTERIOR * 2)
+        self.refine_head = nn.Linear(hidden_dim, self._interior * 2)
         self.value_head = nn.Linear(hidden_dim, 1)
 
     def forward(
@@ -322,18 +346,17 @@ class ActorCriticV2(nn.Module):
         gate_logits = self.gate_head(z).masked_fill(~gate_mask, -1e9)
         anchor_logits = self.anchor_head(z)
         refine = F.softplus(self.refine_head(z)).view(
-            *z.shape[:-1], _INTERIOR, 2
+            *z.shape[:-1], self._interior, 2
         ) + 1.0
         value = self.value_head(z.detach()).squeeze(-1)
         return gate_logits, anchor_logits, refine, value
 
-    @staticmethod
     def _gather_refine(
-        refine: torch.Tensor, anchor: torch.Tensor
+        self, refine: torch.Tensor, anchor: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Per-row (α, β) of the chosen anchor; atoms clamp to a valid
         interior index (their Beta term is masked out downstream)."""
-        idx = (anchor - 1).clamp(0, _INTERIOR - 1)
+        idx = (anchor - 1).clamp(0, self._interior - 1)
         ab = refine.gather(
             -2, idx[..., None, None].expand(*idx.shape, 1, 2)
         ).squeeze(-2)
@@ -360,7 +383,7 @@ class ActorCriticV2(nn.Module):
         """Sample or argmax. `sizing` is (B, 4) int64
         [min_raise, max_raise, pot, to_call]."""
         gate_logits, anchor_logits, refine, value = self.forward(obs, gate_mask)
-        grid = anchor_grid_torch(sizing)
+        grid = anchor_grid_torch(sizing, self.anchor_spec)
 
         gate_dist = torch.distributions.Categorical(logits=gate_logits)
         if deterministic:
@@ -386,7 +409,7 @@ class ActorCriticV2(nn.Module):
 
         refine_active = grid.refine_ok.gather(-1, anchor[..., None]).squeeze(-1)
         anchor_chips = grid.chips.gather(-1, anchor[..., None]).squeeze(-1)
-        refined_chips = refine_chips_torch(anchor, u, sizing)
+        refined_chips = refine_chips_torch(anchor, u, sizing, self.anchor_spec)
         raise_chips = torch.where(refine_active, refined_chips, anchor_chips)
 
         beta_log = beta_dist.log_prob(u)
@@ -449,7 +472,7 @@ class ActorCriticV2(nn.Module):
         why this never bit before the anchor head existed.
         """
         gate_logits, anchor_logits, refine, value = self.forward(obs, gate_mask)
-        grid = anchor_grid_torch(sizing)
+        grid = anchor_grid_torch(sizing, self.anchor_spec)
 
         gate_dist = torch.distributions.Categorical(logits=gate_logits)
         gate_log_prob = gate_dist.log_prob(gate_actions)
@@ -477,10 +500,10 @@ class ActorCriticV2(nn.Module):
         p_raise = gate_probs[..., GATE_RAISE]
         anchor_probs = anchor_dist.probs
         all_beta = torch.distributions.Beta(refine[..., 0], refine[..., 1])
-        beta_h = all_beta.entropy()                       # (B, 9)
-        interior_ok = grid.refine_ok[..., 1:ANCHOR_COUNT - 1]
+        beta_h = all_beta.entropy()                       # (B, interior)
+        interior_ok = grid.refine_ok[..., 1:self._anchor_count - 1]
         beta_h_eff = (
-            anchor_probs[..., 1:ANCHOR_COUNT - 1] * beta_h * interior_ok
+            anchor_probs[..., 1:self._anchor_count - 1] * beta_h * interior_ok
         ).sum(-1)
         anchor_entropy = anchor_dist.entropy()
         entropy = gate_entropy + p_raise.detach() * (anchor_entropy + beta_h_eff)
@@ -494,7 +517,7 @@ def _discretized_logistic_probs(
     mu: torch.Tensor,
     s: torch.Tensor,
     legal: torch.Tensor,
-    count: int = ANCHOR_COUNT,
+    count: int | None = None,
 ) -> torch.Tensor:
     """P(anchor k) from a Logistic(mu, s) latent discretized over the ordered
     anchor-index axis: anchor k owns the unit interval [k-0.5, k+0.5], and the
@@ -507,7 +530,12 @@ def _discretized_logistic_probs(
     The standardized bin edges are clamped for tail stability. The end-bin tail
     absorption is what avoids v1's failure (a plain continuous density gives the
     exact endpoints ~0 mass); the low-dimensional ordered (mu, s) parameterization
-    is what avoids the v2/v3 flat-categorical instability."""
+    is what avoids the v2/v3 flat-categorical instability.
+
+    `count` defaults to the legal mask's trailing width (the spec's
+    anchor count), so the same head serves any ladder length."""
+    if count is None:
+        count = int(legal.shape[-1])
     idx = torch.arange(count, device=mu.device, dtype=mu.dtype)
     mu_e = mu[..., None]
     s_e = s[..., None].clamp_min(1e-3)
@@ -561,9 +589,17 @@ class ActorCriticV4(ActorCriticV2):
         num_layers: int = 2,
         size_scale_floor: float = 0.3,
         size_scale_cap: float = 5.0,
+        anchor_spec: AnchorSpec = PLO_ANCHOR_SPEC,
     ):
-        super().__init__(hidden_dim=hidden_dim, obs_dim=obs_dim, num_layers=num_layers)
-        # Swap the flat 11-way anchor head for a 2-output (mu_raw, s_raw) head.
+        super().__init__(
+            hidden_dim=hidden_dim,
+            obs_dim=obs_dim,
+            num_layers=num_layers,
+            anchor_spec=anchor_spec,
+        )
+        # Swap the flat anchor head for a 2-output (mu_raw, s_raw) head.
+        # The (mu, s) parameterization is count-independent — a longer
+        # ladder only lengthens the support the logistic is sliced over.
         del self.anchor_head
         self.size_head = nn.Linear(hidden_dim, 2)
         self._size_floor = float(size_scale_floor)
@@ -574,7 +610,7 @@ class ActorCriticV4(ActorCriticV2):
         gate_logits = self.gate_head(z).masked_fill(~gate_mask, -1e9)
         size_params = self.size_head(z)  # (..., 2): mu_raw, s_raw
         refine = F.softplus(self.refine_head(z)).view(
-            *z.shape[:-1], _INTERIOR, 2
+            *z.shape[:-1], self._interior, 2
         ) + 1.0
         value = self.value_head(z.detach()).squeeze(-1)
         return gate_logits, size_params, refine, value
@@ -583,7 +619,7 @@ class ActorCriticV4(ActorCriticV2):
         # mu on the index axis: center (count-1)/2, ranging +/-((count-1)/2 + 2)
         # so it reaches BEYOND [0, count-1] and an end anchor can carry the
         # majority of the mass. s floored (no spike) and soft-capped (not flat).
-        c = (ANCHOR_COUNT - 1) / 2.0
+        c = (self._anchor_count - 1) / 2.0
         mu = c + (c + 2.0) * torch.tanh(size_params[..., 0])
         s = self._size_floor + self._size_span * torch.sigmoid(size_params[..., 1])
         probs = _discretized_logistic_probs(mu, s, grid.legal)
@@ -634,25 +670,41 @@ def state_dict_obs_dim(state_dict: dict) -> int:
     return int(w.shape[1])
 
 
+def state_dict_anchor_count(state_dict: dict) -> int | None:
+    """Anchor-ladder length the checkpoint was trained with, sniffed
+    from the refine head (`interior * 2` rows → count = rows/2 + 2 —
+    atoms are always first+last in every spec). Present on v2/v4
+    checkpoints; None for v1 (no anchor ladder)."""
+    w = state_dict.get("refine_head.weight")
+    if w is None:
+        return None
+    return int(w.shape[0]) // 2 + 2
+
+
 def build_actor_from_state_dict(
     state_dict: dict, hidden_dim: int, num_layers: int
 ) -> nn.Module:
     """Build the actor a checkpoint was saved from: sniffs the head
-    class AND the trained obs width (constructing at the current
-    OBS_DIM default would shape-fail on 959-era checkpoints), then
-    loads the weights. Pair with `obs_adapter` at inference time."""
+    class, the trained obs width (constructing at the current OBS_DIM
+    default would shape-fail on 959-era checkpoints), and the anchor
+    spec (PLO 11 / NLH 12), then loads the weights. Pair with
+    `obs_adapter` at inference time."""
     cls = model_class_for_state_dict(state_dict)
-    model = cls(
+    kwargs = dict(
         hidden_dim=hidden_dim,
         obs_dim=state_dict_obs_dim(state_dict),
         num_layers=num_layers,
     )
+    count = state_dict_anchor_count(state_dict)
+    if count is not None and cls is not ActorCritic:
+        kwargs["anchor_spec"] = anchor_spec_for_count(count)
+    model = cls(**kwargs)
     model.load_state_dict(state_dict)
     return model
 
 
 def opp_holes_multihot(holes: torch.Tensor) -> torch.Tensor:
-    """Expand compact (B, 5, 5) uint8/int hole-card indices (255 =
+    """Expand compact (B, 5, hole_w) uint8/int hole-card indices (255 =
     empty slot) into the (B, 260) multi-hot the CentralCritic consumes."""
     b = holes.shape[0]
     holes_l = holes.long()

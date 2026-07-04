@@ -66,6 +66,62 @@ impl Street {
     }
 }
 
+/// Game variant. Selects hole-card count, board count, betting cap, and
+/// street structure. Every playable format is an explicit enum arm with
+/// derived properties — never free-floating config flags — so the set of
+/// supported rule combinations is closed and each is tested by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Variant {
+    /// PLO5 double-board bomb pot: 5 hole cards, two boards, pot-limit
+    /// cap, ante-only (no blinds, no preflop betting round — hands start
+    /// at the flop). The original format; all pre-variant behavior.
+    Plo5DoubleBomb,
+    /// PLO6 double-board bomb pot: identical to `Plo5DoubleBomb` in every
+    /// rule (two boards, pot-limit cap, ante-only, hands start at the
+    /// flop, exactly-2-hole + 3-board eval) except each seat is dealt 6
+    /// hole cards. Deck feasibility: 6 seats × 6 + 10 board = 46 ≤ 52.
+    Plo6DoubleBomb,
+    /// PLO4 double-board bomb pot: identical to `Plo5DoubleBomb` in every
+    /// rule except each seat is dealt 4 hole cards (classic Omaha hole
+    /// width). Deck feasibility: 6 seats × 4 + 10 board = 34 ≤ 52.
+    Plo4DoubleBomb,
+    /// No-limit hold'em, single board: 2 hole cards, best-5-of-7
+    /// any-combo eval, no-limit cap, SB/BB blinds + per-player ante,
+    /// betting starts preflop.
+    NlhSingle,
+}
+
+impl Variant {
+    pub fn hole_count(self) -> usize {
+        match self {
+            Variant::Plo4DoubleBomb => 4,
+            Variant::Plo5DoubleBomb => 5,
+            Variant::Plo6DoubleBomb => 6,
+            Variant::NlhSingle => 2,
+        }
+    }
+
+    pub fn num_boards(self) -> usize {
+        match self {
+            Variant::Plo4DoubleBomb | Variant::Plo5DoubleBomb | Variant::Plo6DoubleBomb => 2,
+            Variant::NlhSingle => 1,
+        }
+    }
+
+    pub fn pot_limit(self) -> bool {
+        matches!(
+            self,
+            Variant::Plo4DoubleBomb | Variant::Plo5DoubleBomb | Variant::Plo6DoubleBomb
+        )
+    }
+
+    /// True when hands begin with a preflop betting round (blinds posted
+    /// live, no board revealed until the round closes).
+    pub fn has_preflop(self) -> bool {
+        matches!(self, Variant::NlhSingle)
+    }
+}
+
 /// Static configuration for a hand: seats, per-seat starting stacks, ante, bb unit.
 #[derive(Debug, Clone)]
 pub struct GameConfig {
@@ -73,6 +129,10 @@ pub struct GameConfig {
     pub starting_stacks: Vec<u64>,
     pub ante: u64,
     pub bb: u64,
+    /// Small blind in chips. Only meaningful for variants with blinds
+    /// (`variant.has_preflop()`); 0 for bomb pots.
+    pub sb: u64,
+    pub variant: Variant,
 }
 
 impl GameConfig {
@@ -82,12 +142,34 @@ impl GameConfig {
     }
 
     /// Uniform-stack constructor: every seat starts at `stack` chips.
+    /// Bomb-pot variant (no blinds) — the pre-variant behavior.
     pub fn new_uniform(num_seats: usize, stack: u64, ante: u64, bb: u64) -> Self {
         GameConfig {
             num_seats,
             starting_stacks: vec![stack; num_seats],
             ante,
             bb,
+            sb: 0,
+            variant: Variant::Plo5DoubleBomb,
+        }
+    }
+
+    /// Uniform-stack NLH constructor. `ante` is per player (every
+    /// dealt-in seat posts it, dead, before the blinds).
+    pub fn new_nlh_uniform(
+        num_seats: usize,
+        stack: u64,
+        sb: u64,
+        bb: u64,
+        ante: u64,
+    ) -> Self {
+        GameConfig {
+            num_seats,
+            starting_stacks: vec![stack; num_seats],
+            ante,
+            bb,
+            sb,
+            variant: Variant::NlhSingle,
         }
     }
 }
@@ -111,16 +193,25 @@ pub struct ActionRecord {
 pub struct GameState {
     pub config: GameConfig,
     pub button: usize,
+    /// Blind seats for variants with a preflop round; `None` for bomb
+    /// pots. Stored (not re-derived) because the clockwise walk skips
+    /// sitting-out seats — downstream consumers must not duplicate it.
+    pub sb_seat: Option<usize>,
+    pub bb_seat: Option<usize>,
     pub street: Street,
     pub pot: u64,
     pub stacks: Vec<u64>,
     pub folded: Vec<bool>,
     pub all_in: Vec<bool>,
-    pub hole_cards: Vec<[Card; 5]>,
+    /// Per-seat hole cards, `config.variant.hole_count()` each. Sized by
+    /// what was actually dealt so no reader can see phantom cards.
+    pub hole_cards: Vec<Vec<Card>>,
     pub board_a: Vec<Card>,
     pub board_b: Vec<Card>,
     /// Pre-dealt full board A; `board_a` above is a progressive view.
     pub full_board_a: [Card; 5],
+    /// Pre-dealt full board B. Single-board variants leave this as
+    /// `Card(0)` sentinels and never reveal or read it.
     pub full_board_b: [Card; 5],
     /// Per-seat chips committed this street only.
     pub street_commit: Vec<u64>,

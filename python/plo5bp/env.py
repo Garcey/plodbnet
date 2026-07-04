@@ -32,8 +32,9 @@ from plo5bp.actions import (
     NUM_ACTIONS,
     gate_mask_from_bounds,
 )
-from plo5bp.config import GameConfig
+from plo5bp.config import VARIANT_NLH, GameConfig
 from plo5bp.encoding import OBS_DIM, encode_observation
+from plo5bp.encoding_nlh import OBS_DIM_NLH, encode_observation_nlh
 
 
 @dataclass
@@ -81,8 +82,17 @@ class BombPotEnv:
             ante=self.config.ante,
             bb=self.config.bb,
             starting_stacks=stacks,
+            variant=self.config.variant,
+            sb=self.config.sb,
         )
-        self._last_obs_vec = np.zeros(OBS_DIM, dtype=np.float32)
+        # Per-variant observation layout: PLO5 991 dims, NLH 995.
+        if self.config.variant == VARIANT_NLH:
+            self._obs_dim = OBS_DIM_NLH
+            self._encode = encode_observation_nlh
+        else:
+            self._obs_dim = OBS_DIM
+            self._encode = encode_observation
+        self._last_obs_vec = np.zeros(self._obs_dim, dtype=np.float32)
         self._last_mask = np.zeros(NUM_ACTIONS, dtype=bool)
         self._ev_runout_samples = int(ev_runout_samples)
         self._reset_seed: int = 0
@@ -132,6 +142,28 @@ class BombPotEnv:
         self._rs.set_river(int(card_a), int(card_b))
         return self._pack_obs()
 
+    def reset_study_nlh(
+        self, button: int, hero_seat: int, hero_hole: list[int]
+    ) -> tuple[np.ndarray, StepInfo]:
+        """NLH study entry: 2-card hero hole, hand starts PREFLOP with
+        blinds posted. Streets arrive via the *_nlh setters."""
+        self._rs.reset_study_nlh(button, hero_seat, list(hero_hole))
+        return self._pack_obs()
+
+    def set_flop_nlh(
+        self, c0: int, c1: int, c2: int
+    ) -> tuple[np.ndarray, StepInfo]:
+        self._rs.set_flop_nlh(int(c0), int(c1), int(c2))
+        return self._pack_obs()
+
+    def set_turn_nlh(self, card: int) -> tuple[np.ndarray, StepInfo]:
+        self._rs.set_turn_nlh(int(card))
+        return self._pack_obs()
+
+    def set_river_nlh(self, card: int) -> tuple[np.ndarray, StepInfo]:
+        self._rs.set_river_nlh(int(card))
+        return self._pack_obs()
+
     def awaiting_next_street(self) -> int | None:
         return self._rs.awaiting_next_street()
 
@@ -162,7 +194,7 @@ class BombPotEnv:
                 )
             else:
                 rewards = np.asarray(self._rs.payouts(), dtype=np.float32)
-            obs_vec = np.zeros(OBS_DIM, dtype=np.float32)
+            obs_vec = np.zeros(self._obs_dim, dtype=np.float32)
             mask = np.zeros(NUM_ACTIONS, dtype=bool)
             gate_mask = np.zeros(GATE_ACTIONS, dtype=bool)
             raw = dict(self._rs.observation_dict())
@@ -233,7 +265,7 @@ class BombPotEnv:
 
     @property
     def obs_dim(self) -> int:
-        return OBS_DIM
+        return self._obs_dim
 
     def current_actor(self) -> int | None:
         return self._rs.current_actor()
@@ -242,7 +274,7 @@ class BombPotEnv:
         return bool(self._rs.is_terminal())
 
     def all_hole_cards(self) -> list[list[int]]:
-        """Every seat's 5 hole cards as raw indices. Trainer-only reveal
+        """Every seat's hole cards (variant hole count) as raw indices. Trainer-only reveal
         accessor — never feed into observations mid-hand."""
         return [[int(c) for c in hole] for hole in self._rs.all_hole_cards()]
 
@@ -258,8 +290,10 @@ class BombPotEnv:
         actor = raw["actor"]
         if actor is not None:
             raw["hero_category_a"] = int(self._rs.hero_category(actor, 0))
+            # Board B is empty for single-board variants; the engine
+            # returns 0 before evaluating, so no variant branch needed.
             raw["hero_category_b"] = int(self._rs.hero_category(actor, 1))
-        vec = encode_observation(raw, self.config)
+        vec = self._encode(raw, self.config)
         self._last_obs_vec = vec
         self._last_mask = mask
         n = self.config.num_seats

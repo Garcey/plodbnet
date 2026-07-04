@@ -2,8 +2,10 @@
 
 use crate::actions::{Action, NUM_ACTIONS};
 use crate::cards::{Card, Deck};
-use crate::double_board::double_board_payout;
-use crate::state::{ActionRecord, GameConfig, GameState, Street, StudyError, StudyTerminal};
+use crate::double_board::{double_board_payout, single_board_payout};
+use crate::state::{
+    ActionRecord, GameConfig, GameState, Street, StudyError, StudyTerminal, Variant,
+};
 
 impl GameState {
     /// Deal a fresh hand: shuffle deck with `ChaCha8Rng::seed_from_u64(seed)`,
@@ -38,12 +40,17 @@ impl GameState {
         }
 
         let mut deck = Deck::new_shuffled(seed);
+        let hole_count = config.variant.hole_count();
+        let num_boards = config.variant.num_boards();
 
-        let mut hole_cards: Vec<[Card; 5]> = Vec::with_capacity(n);
+        // Deal order (determinism contract): `hole_count` cards per seat,
+        // seat 0 first, then full board A, then full board B (two-board
+        // variants only).
+        let mut hole_cards: Vec<Vec<Card>> = Vec::with_capacity(n);
         for _ in 0..n {
-            let mut h = [Card(0); 5];
-            for c in h.iter_mut() {
-                *c = deck.deal_one();
+            let mut h = Vec::with_capacity(hole_count);
+            for _ in 0..hole_count {
+                h.push(deck.deal_one());
             }
             hole_cards.push(h);
         }
@@ -52,9 +59,12 @@ impl GameState {
         for c in full_board_a.iter_mut() {
             *c = deck.deal_one();
         }
+        // Single-board variants leave board B as never-read sentinels.
         let mut full_board_b = [Card(0); 5];
-        for c in full_board_b.iter_mut() {
-            *c = deck.deal_one();
+        if num_boards == 2 {
+            for c in full_board_b.iter_mut() {
+                *c = deck.deal_one();
+            }
         }
 
         assert_eq!(
@@ -82,9 +92,43 @@ impl GameState {
             }
         }
 
-        let board_a: Vec<Card> = full_board_a[0..3].to_vec();
-        let board_b: Vec<Card> = full_board_b[0..3].to_vec();
-        let street_commit = vec![0u64; n];
+        // Blinds (variants with a preflop round): posted LIVE into
+        // street_commit after the dead antes. Posting is not an action —
+        // no history record, `acted_this_street` stays false, so the BB
+        // option (round can't close until the BB acts) falls out of the
+        // existing round-close machinery. Short posts go all-in;
+        // `bet_to_call` stays at the NOMINAL bb so callers owe the full
+        // blind and side pots absorb any shortfall.
+        let mut street_commit = vec![0u64; n];
+        let mut bet_to_call = 0u64;
+        let mut blind_seats: Option<(usize, usize)> = None;
+        if config.variant.has_preflop() {
+            let (sb_seat, bb_seat) = nlh_blind_seats(n, button, &folded);
+            for (seat, amount) in [(sb_seat, config.sb), (bb_seat, config.bb)] {
+                let paid = stacks[seat].min(amount);
+                stacks[seat] -= paid;
+                street_commit[seat] += paid;
+                total_commit[seat] += paid;
+                pot += paid;
+                if stacks[seat] == 0 {
+                    all_in[seat] = true;
+                }
+            }
+            bet_to_call = config.bb;
+            blind_seats = Some((sb_seat, bb_seat));
+        }
+
+        // Preflop variants reveal nothing until the first round closes;
+        // bomb pots start with both flops exposed.
+        let (street, board_a, board_b) = if config.variant.has_preflop() {
+            (Street::Preflop, Vec::new(), Vec::new())
+        } else {
+            (
+                Street::Flop,
+                full_board_a[0..3].to_vec(),
+                full_board_b[0..3].to_vec(),
+            )
+        };
         let acted_this_street = vec![false; n];
         let street_level_acted = vec![0u64; n];
 
@@ -94,7 +138,9 @@ impl GameState {
         let mut state = GameState {
             config,
             button,
-            street: Street::Flop,
+            sb_seat: blind_seats.map(|(sb, _)| sb),
+            bb_seat: blind_seats.map(|(_, bb)| bb),
+            street,
             pot,
             stacks,
             folded,
@@ -106,7 +152,7 @@ impl GameState {
             full_board_b,
             street_commit,
             total_commit,
-            bet_to_call: 0,
+            bet_to_call,
             last_raise_size: 0, // set below from bb
             last_aggression_was_full_raise: true,
             street_level_acted,
@@ -123,7 +169,10 @@ impl GameState {
         };
         state.last_raise_size = state.config.bb;
 
-        state.actor = state.first_to_act_postflop();
+        state.actor = match blind_seats {
+            Some((_, bb_seat)) => state.first_to_act_preflop(bb_seat),
+            None => state.first_to_act_postflop(),
+        };
 
         // If nobody can voluntarily act (e.g., 5 of 6 went all-in on antes —
         // impossible at 20bb/3bb but keep robust), auto-run to showdown.
@@ -171,6 +220,13 @@ impl GameState {
         flop_b: [Card; 3],
         in_hand_mask: Option<Vec<bool>>,
     ) -> Result<Self, StudyError> {
+        // Study mode is PLO5-double-board-only for now: its card-entry
+        // surface (5-card hero hole, paired flops, set_turn/set_river
+        // taking two cards) is dual-board-shaped. NLH study support is a
+        // separate workstream — reject rather than half-behave.
+        if config.variant != Variant::Plo5DoubleBomb {
+            return Err(StudyError::WrongState);
+        }
         let n = config.num_seats;
         if n < 2 || button >= n || hero_seat >= n {
             return Err(StudyError::SeatOutOfRange);
@@ -223,14 +279,14 @@ impl GameState {
         let mut next = 0usize;
 
         // Deal 5 placeholder holes per non-hero seat; hero seat uses hero_hole.
-        let mut hole_cards: Vec<[Card; 5]> = Vec::with_capacity(n);
+        let mut hole_cards: Vec<Vec<Card>> = Vec::with_capacity(n);
         for seat in 0..n {
             if seat == hero_seat {
-                hole_cards.push(hero_hole);
+                hole_cards.push(hero_hole.to_vec());
             } else {
-                let mut h = [Card(0); 5];
-                for c in h.iter_mut() {
-                    *c = deck_order[next];
+                let mut h = Vec::with_capacity(5);
+                for _ in 0..5 {
+                    h.push(deck_order[next]);
                     next += 1;
                 }
                 hole_cards.push(h);
@@ -282,6 +338,8 @@ impl GameState {
         let mut state = GameState {
             config,
             button,
+            sb_seat: None,
+            bb_seat: None,
             street: Street::Flop,
             pot,
             stacks,
@@ -341,6 +399,11 @@ impl GameState {
         if !self.study_mode {
             return Err(StudyError::WrongState);
         }
+        // Dual-board setter: NLH study (single board) uses the *_nlh
+        // setters — two cards here would corrupt board B.
+        if self.config.variant == Variant::NlhSingle {
+            return Err(StudyError::WrongState);
+        }
         if self.awaiting_next_street != Some(expected) {
             return Err(StudyError::WrongState);
         }
@@ -371,8 +434,14 @@ impl GameState {
         self.full_board_b[idx] = card_b;
         self.board_a.push(card_a);
         self.board_b.push(card_b);
-        self.street = expected;
+        self.study_advance_street(expected);
+        Ok(())
+    }
 
+    /// Shared tail of every study street setter: enter `street`, reset the
+    /// per-street betting state, and seat the first postflop actor.
+    fn study_advance_street(&mut self, street: Street) {
+        self.street = street;
         let n = self.config.num_seats;
         self.street_commit = vec![0u64; n];
         self.bet_to_call = 0;
@@ -383,6 +452,189 @@ impl GameState {
         self.acted_this_street = vec![false; n];
         self.awaiting_next_street = None;
         self.actor = self.first_to_act_postflop();
+    }
+
+    /// Deal an NLH study-mode hand at the PREFLOP with a user-supplied
+    /// 2-card hero hole. Antes post dead, blinds post live (exactly as
+    /// [`Self::new_hand`]); no board exists yet — the UI supplies streets
+    /// via [`Self::set_flop_nlh`] / [`Self::set_turn_nlh`] /
+    /// [`Self::set_river_nlh`] as each round closes. Non-hero seats get
+    /// deterministic placeholder holes (never surfaced; non-fold terminals
+    /// pay zeros), mirroring the PLO study contract.
+    pub fn new_study_nlh(
+        config: GameConfig,
+        button: usize,
+        hero_seat: usize,
+        hero_hole: [Card; 2],
+    ) -> Result<Self, StudyError> {
+        if config.variant != Variant::NlhSingle {
+            return Err(StudyError::WrongState);
+        }
+        let n = config.num_seats;
+        if n < 2 || button >= n || hero_seat >= n {
+            return Err(StudyError::SeatOutOfRange);
+        }
+        if config.starting_stacks.len() != n {
+            return Err(StudyError::SeatOutOfRange);
+        }
+
+        let mut used = [false; 52];
+        for c in hero_hole.iter() {
+            let i = c.index() as usize;
+            if i >= 52 || used[i] {
+                return Err(StudyError::DuplicateCard);
+            }
+            used[i] = true;
+        }
+
+        // Deterministic placeholder holes from a hash of the user inputs
+        // (same recipe as the PLO study constructor).
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hasher::write_u8(&mut hasher, button as u8);
+        std::hash::Hasher::write_u8(&mut hasher, hero_seat as u8);
+        for c in hero_hole.iter() {
+            std::hash::Hasher::write_u8(&mut hasher, c.index());
+        }
+        let seed = std::hash::Hasher::finish(&hasher);
+        let mut deck_order: Vec<Card> = (0..52u8)
+            .filter(|&i| !used[i as usize])
+            .map(Card::from_index)
+            .collect();
+        {
+            use rand::seq::SliceRandom;
+            use rand_chacha::ChaCha8Rng;
+            use rand_chacha::rand_core::SeedableRng;
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            deck_order.shuffle(&mut rng);
+        }
+        let mut next = 0usize;
+        let mut hole_cards: Vec<Vec<Card>> = Vec::with_capacity(n);
+        for seat in 0..n {
+            if seat == hero_seat {
+                hole_cards.push(hero_hole.to_vec());
+            } else {
+                let mut h = Vec::with_capacity(2);
+                for _ in 0..2 {
+                    h.push(deck_order[next]);
+                    next += 1;
+                }
+                hole_cards.push(h);
+            }
+        }
+
+        // Antes (dead) then blinds (live) — the exact new_hand sequence.
+        let mut stacks = config.starting_stacks.clone();
+        let mut total_commit = vec![0u64; n];
+        let mut all_in = vec![false; n];
+        let folded = vec![false; n];
+        let mut pot: u64 = 0;
+        for i in 0..n {
+            let paid = stacks[i].min(config.ante);
+            stacks[i] -= paid;
+            total_commit[i] = paid;
+            pot += paid;
+            if stacks[i] == 0 {
+                all_in[i] = true;
+            }
+        }
+        let mut street_commit = vec![0u64; n];
+        let (sb_seat, bb_seat) = nlh_blind_seats(n, button, &folded);
+        for (seat, amount) in [(sb_seat, config.sb), (bb_seat, config.bb)] {
+            let paid = stacks[seat].min(amount);
+            stacks[seat] -= paid;
+            street_commit[seat] += paid;
+            total_commit[seat] += paid;
+            pot += paid;
+            if stacks[seat] == 0 {
+                all_in[seat] = true;
+            }
+        }
+        let bet_to_call = config.bb;
+
+        let eff_stack_cap_at_hand_start =
+            compute_eff_stack_cap(&config.starting_stacks, &folded);
+
+        let mut state = GameState {
+            config,
+            button,
+            sb_seat: Some(sb_seat),
+            bb_seat: Some(bb_seat),
+            street: Street::Preflop,
+            pot,
+            stacks,
+            folded,
+            all_in,
+            hole_cards,
+            board_a: Vec::new(),
+            board_b: Vec::new(),
+            full_board_a: [Card(0); 5],
+            full_board_b: [Card(0); 5],
+            street_commit,
+            total_commit,
+            bet_to_call,
+            last_raise_size: 0,
+            last_aggression_was_full_raise: true,
+            street_level_acted: vec![0u64; n],
+            actor: None,
+            last_aggressor: None,
+            acted_this_street: vec![false; n],
+            history: Vec::new(),
+            study_mode: true,
+            awaiting_next_street: None,
+            study_terminal: None,
+            study_hero_seat: Some(hero_seat),
+            action_close_board_len: None,
+            eff_stack_cap_at_hand_start,
+        };
+        state.last_raise_size = state.config.bb;
+        state.actor = state.first_to_act_preflop(bb_seat);
+        Ok(state)
+    }
+
+    /// NLH study: supply the 3-card flop after the preflop round closes.
+    pub fn set_flop_nlh(&mut self, cards: [Card; 3]) -> Result<(), StudyError> {
+        self.set_next_street_nlh(Street::Flop, &cards)
+    }
+
+    /// NLH study: supply the turn card. Single board — one card.
+    pub fn set_turn_nlh(&mut self, card: Card) -> Result<(), StudyError> {
+        self.set_next_street_nlh(Street::Turn, &[card])
+    }
+
+    /// NLH study: supply the river card.
+    pub fn set_river_nlh(&mut self, card: Card) -> Result<(), StudyError> {
+        self.set_next_street_nlh(Street::River, &[card])
+    }
+
+    fn set_next_street_nlh(
+        &mut self,
+        expected: Street,
+        cards: &[Card],
+    ) -> Result<(), StudyError> {
+        if !self.study_mode || self.config.variant != Variant::NlhSingle {
+            return Err(StudyError::WrongState);
+        }
+        if self.awaiting_next_street != Some(expected) {
+            return Err(StudyError::WrongState);
+        }
+        let hero_seat = self.study_hero_seat.ok_or(StudyError::WrongState)?;
+        let mut used = [false; 52];
+        for c in self.hole_cards[hero_seat].iter().chain(self.board_a.iter()) {
+            used[c.index() as usize] = true;
+        }
+        for c in cards {
+            let i = c.index() as usize;
+            if i >= 52 || used[i] {
+                return Err(StudyError::DuplicateCard);
+            }
+            used[i] = true;
+        }
+        let base = self.board_a.len();
+        for (j, c) in cards.iter().enumerate() {
+            self.full_board_a[base + j] = *c;
+            self.board_a.push(*c);
+        }
+        self.study_advance_street(expected);
         Ok(())
     }
 
@@ -611,14 +863,23 @@ impl GameState {
                 None => return vec![0i64; n],
             }
         }
-        let won = double_board_payout(
-            &self.hole_cards,
-            &self.folded,
-            &self.total_commit,
-            &self.full_board_a,
-            &self.full_board_b,
-            self.button,
-        );
+        let won = match self.config.variant.num_boards() {
+            2 => double_board_payout(
+                &self.hole_cards,
+                &self.folded,
+                &self.total_commit,
+                &self.full_board_a,
+                &self.full_board_b,
+                self.button,
+            ),
+            _ => single_board_payout(
+                &self.hole_cards,
+                &self.folded,
+                &self.total_commit,
+                &self.full_board_a,
+                self.button,
+            ),
+        };
         (0..n)
             .map(|i| won[i] as i64 - self.total_commit[i] as i64)
             .collect()
@@ -652,9 +913,10 @@ impl GameState {
             _ => return self.payouts(),
         };
         let missing = 5 - close_len;
-        let draw_per_sample = missing * 2;
+        let num_boards = self.config.variant.num_boards();
+        let draw_per_sample = missing * num_boards;
 
-        // Unseen deck: 52 − all hole cards − known prefix of both boards.
+        // Unseen deck: 52 − all hole cards − known prefix of the board(s).
         let mut used = [false; 52];
         for hole in &self.hole_cards {
             for c in hole.iter() {
@@ -664,8 +926,10 @@ impl GameState {
         for c in &self.full_board_a[..close_len] {
             used[c.index() as usize] = true;
         }
-        for c in &self.full_board_b[..close_len] {
-            used[c.index() as usize] = true;
+        if num_boards == 2 {
+            for c in &self.full_board_b[..close_len] {
+                used[c.index() as usize] = true;
+            }
         }
         let mut deck: Vec<Card> = (0..52u8)
             .filter(|&i| !used[i as usize])
@@ -692,17 +956,27 @@ impl GameState {
             for i in 0..missing {
                 full_a[close_len + i] = deck[i];
             }
-            for i in 0..missing {
-                full_b[close_len + i] = deck[missing + i];
-            }
-            let won = double_board_payout(
-                &self.hole_cards,
-                &self.folded,
-                &self.total_commit,
-                &full_a,
-                &full_b,
-                self.button,
-            );
+            let won = if num_boards == 2 {
+                for i in 0..missing {
+                    full_b[close_len + i] = deck[missing + i];
+                }
+                double_board_payout(
+                    &self.hole_cards,
+                    &self.folded,
+                    &self.total_commit,
+                    &full_a,
+                    &full_b,
+                    self.button,
+                )
+            } else {
+                single_board_payout(
+                    &self.hole_cards,
+                    &self.folded,
+                    &self.total_commit,
+                    &full_a,
+                    self.button,
+                )
+            };
             for i in 0..n {
                 totals[i] += won[i] as i128;
             }
@@ -743,19 +1017,25 @@ impl GameState {
             .unwrap_or(0)
     }
 
-    /// Pot-limit cap on total street_commit, further capped at the
+    /// Variant betting cap on total street_commit, further capped at the
     /// maximum total any alive opponent can match. Above the latter,
-    /// chips are dead money under side-pot rules.
+    /// chips are dead money under side-pot rules. Pot-limit variants cap
+    /// at the PL total; no-limit variants have no size cap of their own
+    /// (the actor's stack is applied by `max_raise_chips`).
     pub fn max_bet_total(&self) -> u64 {
         let actor = match self.actor {
             Some(a) => a,
             None => return 0,
         };
+        let reachable = self.max_other_reachable_total();
+        if !self.config.variant.pot_limit() {
+            return reachable;
+        }
         let current_commit = self.street_commit[actor];
         let stack = self.stacks[actor];
         let to_call = self.bet_to_call.saturating_sub(current_commit).min(stack);
         let pl_total = self.bet_to_call + self.pot + to_call;
-        pl_total.min(self.max_other_reachable_total())
+        pl_total.min(reachable)
     }
 
     /// True when the current actor is locked out of raising by the
@@ -942,14 +1222,21 @@ impl GameState {
     }
 
     /// Hand category index (0..=8 per `CAT_*` constants) of seat's current
-    /// best PLO5 hand on `board` (0=A, 1=B). Returns 0 if board has <3 cards.
+    /// best hand on `board` (0=A, 1=B) under the variant's evaluation
+    /// rule. Returns 0 if board has <3 cards (always for board B on
+    /// single-board variants — its progressive view stays empty).
     pub fn hero_category(&self, seat: usize, board: u8) -> u8 {
         let b = if board == 0 { &self.board_a } else { &self.board_b };
         if b.len() < 3 {
             return 0;
         }
         let hole = &self.hole_cards[seat];
-        let rank = crate::hand_eval::evaluate_plo5_partial(hole, b);
+        let rank = match self.config.variant {
+            Variant::Plo4DoubleBomb | Variant::Plo5DoubleBomb | Variant::Plo6DoubleBomb => {
+                crate::hand_eval::evaluate_plo5_partial(hole, b)
+            }
+            Variant::NlhSingle => crate::hand_eval::evaluate_nlh(hole, b),
+        };
         (rank >> 20) as u8
     }
 
@@ -1140,6 +1427,64 @@ impl GameState {
         self.opp_outcome_fractions_mc(1024)
     }
 
+    /// NLH single-board opponent-outcome fractions: the share of
+    /// unseen-deck 2-card opponent combos currently AHEAD of / TIED with
+    /// / BEHIND the hero (current actor) at the visible board, evaluated
+    /// exhaustively (≤ C(47, 2) = 1081 combos) under the any-combo NLH
+    /// rule. Current-rank dominance, no runout sampling — the same
+    /// convention as the PLO opp-outcome feature. Exhaustive enumeration
+    /// makes it exactly reproducible with no seed.
+    ///
+    /// Returns `[opp_ahead, tied, opp_behind]`. All-zero preflop, on
+    /// terminal states, and for non-NLH variants.
+    pub fn nlh_opp_outcome_fractions(&self) -> Vec<f32> {
+        const N_OUT: usize = 3;
+        if self.config.variant != Variant::NlhSingle {
+            return vec![0.0; N_OUT];
+        }
+        let hero_seat = match self.actor {
+            Some(s) => s,
+            None => return vec![0.0; N_OUT],
+        };
+        if self.board_a.len() < 3 {
+            return vec![0.0; N_OUT];
+        }
+        let hero_hole = &self.hole_cards[hero_seat];
+        let hero_rank = crate::hand_eval::evaluate_nlh(hero_hole, &self.board_a);
+
+        let mut used = [false; 52];
+        for c in hero_hole.iter().chain(self.board_a.iter()) {
+            used[c.index() as usize] = true;
+        }
+        let unseen: Vec<Card> = (0..52u8)
+            .filter(|&i| !used[i as usize])
+            .map(Card::from_index)
+            .collect();
+        let m = unseen.len();
+        let mut counters = [0u64; N_OUT];
+        let mut total = 0u64;
+        for i in 0..m {
+            for j in (i + 1)..m {
+                let opp = [unseen[i], unseen[j]];
+                let opp_rank = crate::hand_eval::evaluate_nlh(&opp, &self.board_a);
+                let k = if opp_rank > hero_rank {
+                    0
+                } else if opp_rank == hero_rank {
+                    1
+                } else {
+                    2
+                };
+                counters[k] += 1;
+                total += 1;
+            }
+        }
+        if total == 0 {
+            return vec![0.0; N_OUT];
+        }
+        let inv = 1.0f32 / total as f32;
+        counters.iter().map(|&c| c as f32 * inv).collect()
+    }
+
     // ---- Internal helpers ----
 
     fn compute_sizing_chips(&self, action: Action, actor: usize) -> u64 {
@@ -1180,6 +1525,24 @@ impl GameState {
     fn first_to_act_postflop(&self) -> Option<usize> {
         let n = self.config.num_seats;
         let start = (self.button + 1) % n;
+        for i in 0..n {
+            let s = (start + i) % n;
+            if !self.folded[s] && !self.all_in[s] {
+                return Some(s);
+            }
+        }
+        None
+    }
+
+    /// First seat-to-act for the preflop round: first non-folded,
+    /// non-all-in seat walking clockwise from the seat after the big
+    /// blind. Heads-up this lands on the button/SB (the only other
+    /// in-hand seat), which is correct — the button acts first preflop.
+    /// The walk wraps all the way to the BB itself, so a BB who is the
+    /// only seat with chips behind still gets their option.
+    fn first_to_act_preflop(&self, bb_seat: usize) -> Option<usize> {
+        let n = self.config.num_seats;
+        let start = (bb_seat + 1) % n;
         for i in 0..n {
             let s = (start + i) % n;
             if !self.folded[s] && !self.all_in[s] {
@@ -1254,18 +1617,25 @@ impl GameState {
                 }
             };
             self.street = next;
+            let two_boards = self.config.variant.num_boards() == 2;
             match next {
                 Street::Flop => {
                     self.board_a = self.full_board_a[0..3].to_vec();
-                    self.board_b = self.full_board_b[0..3].to_vec();
+                    if two_boards {
+                        self.board_b = self.full_board_b[0..3].to_vec();
+                    }
                 }
                 Street::Turn => {
                     self.board_a.push(self.full_board_a[3]);
-                    self.board_b.push(self.full_board_b[3]);
+                    if two_boards {
+                        self.board_b.push(self.full_board_b[3]);
+                    }
                 }
                 Street::River => {
                     self.board_a.push(self.full_board_a[4]);
-                    self.board_b.push(self.full_board_b[4]);
+                    if two_boards {
+                        self.board_b.push(self.full_board_b[4]);
+                    }
                 }
                 Street::Showdown => {
                     self.finalize_terminal();
@@ -1314,6 +1684,11 @@ impl GameState {
             return;
         }
         match self.street {
+            Street::Preflop => {
+                // NLH study starts preflop; the UI supplies the flop next.
+                self.awaiting_next_street = Some(Street::Flop);
+                self.actor = None;
+            }
             Street::Flop => {
                 self.awaiting_next_street = Some(Street::Turn);
                 self.actor = None;
@@ -1327,8 +1702,8 @@ impl GameState {
                 self.actor = None;
                 self.street = Street::Showdown;
             }
-            Street::Preflop | Street::Showdown => {
-                // Unreachable in study mode (start at Flop, end at Showdown).
+            Street::Showdown => {
+                // Unreachable in study mode.
                 self.actor = None;
             }
         }
@@ -1349,12 +1724,35 @@ impl GameState {
             if self.board_a.len() < 5 {
                 self.board_a = self.full_board_a.to_vec();
             }
-            if self.board_b.len() < 5 {
+            if self.config.variant.num_boards() == 2 && self.board_b.len() < 5 {
                 self.board_b = self.full_board_b.to_vec();
             }
         }
         self.street = Street::Showdown;
         self.actor = None;
+    }
+}
+
+/// Small/big-blind seats for a variant with blinds. Walks in-hand
+/// (non-folded-at-deal) seats clockwise. Heads-up (exactly 2 seats in
+/// hand): the button — or the first in-hand seat at/after it when the
+/// nominal button seat sits out — is the SB. 3+ handed: SB is the first
+/// in-hand seat strictly after the button, BB the next.
+fn nlh_blind_seats(n: usize, button: usize, folded: &[bool]) -> (usize, usize) {
+    let in_hand: Vec<usize> = (0..n).filter(|&i| !folded[i]).collect();
+    assert!(in_hand.len() >= 2, "blinds need at least 2 seats in hand");
+    if in_hand.len() == 2 {
+        let sb = (0..n)
+            .map(|i| (button + i) % n)
+            .find(|&s| !folded[s])
+            .expect("at least 2 in-hand seats");
+        let bb = in_hand.into_iter().find(|&s| s != sb).unwrap();
+        (sb, bb)
+    } else {
+        let mut walk = (1..=n).map(|i| (button + i) % n).filter(|&s| !folded[s]);
+        let sb = walk.next().expect("at least 2 in-hand seats");
+        let bb = walk.next().expect("at least 2 in-hand seats");
+        (sb, bb)
     }
 }
 
@@ -2514,5 +2912,540 @@ mod tests {
         );
         // Exact bounds succeed.
         assert!(g.apply_raise_chips(min).is_ok());
+    }
+
+    // ---- NLH variant (blinds, preflop street, NL cap, single board) ----
+
+    /// User-facing default stake: $5/$10 with a $5 per-player ante at
+    /// 1bb = 10000 chips ($10) → sb 5000, bb 10000, ante 5000.
+    fn nlh_cfg(num_seats: usize, stack: u64) -> GameConfig {
+        GameConfig::new_nlh_uniform(num_seats, stack, 5_000, 10_000, 5_000)
+    }
+
+    #[test]
+    fn nlh_new_hand_posts_antes_and_blinds() {
+        let g = GameState::new_hand(nlh_cfg(6, 1_000_000), 42, 0);
+        // 6 × 5000 antes + 5000 SB + 10000 BB = 45000 — the "$45 pre-pot"
+        // from the ClubGG 5/10(5) reference table.
+        assert_eq!(g.pot, 45_000);
+        assert_eq!(g.street, Street::Preflop);
+        assert!(g.board_a.is_empty(), "no board revealed preflop");
+        assert!(g.board_b.is_empty(), "single-board variant never fills B");
+        // Button 0 → SB seat 1, BB seat 2, UTG (first actor) seat 3.
+        assert_eq!(g.street_commit[1], 5_000);
+        assert_eq!(g.street_commit[2], 10_000);
+        assert_eq!(g.bet_to_call, 10_000);
+        assert_eq!(g.actor, Some(3));
+        for s in 0..6 {
+            assert_eq!(g.hole_cards[s].len(), 2, "2 hole cards in NLH");
+            // Antes are dead (in total, not street); blinds live.
+            assert_eq!(g.total_commit[s], 5_000 + g.street_commit[s]);
+        }
+        assert_eq!(g.stacks[1], 1_000_000 - 5_000 - 5_000);
+        assert_eq!(g.stacks[2], 1_000_000 - 5_000 - 10_000);
+        // Blinds are forced posts, not actions: no history, nobody acted.
+        assert!(g.history.is_empty());
+        assert!(!g.acted_this_street.iter().any(|&b| b));
+    }
+
+    #[test]
+    fn nlh_no_limit_cap_exceeds_pot_limit() {
+        let g = GameState::new_hand(nlh_cfg(6, 1_000_000), 42, 0);
+        // UTG min open = raise-to 2bb → delta 20000.
+        assert_eq!(g.min_raise_chips(), 20_000);
+        // NL cap: UTG's whole post-ante stack is a legal raise delta —
+        // far above the PL total (btc 10000 + pot 45000 + call 10000).
+        assert_eq!(g.max_raise_chips(), 995_000);
+    }
+
+    #[test]
+    fn nlh_min_reraise_uses_last_raise_increment() {
+        let mut g = GameState::new_hand(nlh_cfg(6, 1_000_000), 42, 0);
+        assert!(g.apply_raise_chips(30_000).is_ok()); // UTG opens to 3bb
+        assert_eq!(g.bet_to_call, 30_000);
+        assert_eq!(g.last_raise_size, 20_000);
+        // Next seat's min re-raise: to 5bb (30000 + 20000).
+        assert_eq!(g.min_bet_total(), 50_000);
+        assert_eq!(g.min_raise_chips(), 50_000);
+    }
+
+    #[test]
+    fn nlh_limp_around_bb_option_then_flop() {
+        let mut g = GameState::new_hand(nlh_cfg(6, 1_000_000), 42, 0);
+        // UTG(3), 4, 5, button(0) call; SB(1) completes.
+        for _ in 0..5 {
+            g.apply(Action::CheckCall);
+        }
+        // The BB posted but has not ACTED — round must stay open.
+        assert_eq!(g.actor, Some(2), "BB gets the option after limps");
+        assert_eq!(g.street, Street::Preflop);
+        // BB is not facing a bet, so Fold is masked (check is free).
+        assert!(!g.legal_action_mask()[Action::Fold as usize]);
+        g.apply(Action::CheckCall); // BB checks
+        assert_eq!(g.street, Street::Flop);
+        assert_eq!(g.board_a.len(), 3);
+        assert!(g.board_b.is_empty());
+        assert_eq!(g.actor, Some(1), "SB first to act postflop");
+        assert_eq!(g.bet_to_call, 0);
+        assert_eq!(g.pot, 90_000); // 45000 pre-pot + 6 × 10000 - blinds already in
+    }
+
+    #[test]
+    fn nlh_bb_raise_reopens_limpers() {
+        let mut g = GameState::new_hand(nlh_cfg(6, 1_000_000), 42, 0);
+        for _ in 0..5 {
+            g.apply(Action::CheckCall); // limps to BB
+        }
+        assert_eq!(g.actor, Some(2));
+        assert!(g.apply_raise_chips(20_000).is_ok()); // BB raises to 3bb
+        assert_eq!(g.bet_to_call, 30_000);
+        assert_eq!(g.street, Street::Preflop, "raise keeps the round open");
+        assert_eq!(g.actor, Some(3), "action returns to the first limper");
+    }
+
+    #[test]
+    fn nlh_fold_to_bb_walk() {
+        let mut g = GameState::new_hand(nlh_cfg(6, 1_000_000), 42, 0);
+        for _ in 0..5 {
+            g.apply(Action::Fold); // UTG..SB all fold
+        }
+        assert!(g.is_terminal(), "walk ends the hand preflop");
+        let p = g.payouts();
+        assert_eq!(p.iter().sum::<i64>(), 0);
+        // BB (seat 2) collects the antes + SB, net of its own 15000 in.
+        assert_eq!(p[2], 30_000);
+        assert_eq!(p[1], -10_000, "SB loses ante + blind");
+        assert_eq!(p[0], -5_000, "non-blind seats lose the ante only");
+    }
+
+    #[test]
+    fn nlh_heads_up_button_is_sb_and_acts_first() {
+        let mut g = GameState::new_hand(nlh_cfg(2, 1_000_000), 7, 0);
+        assert_eq!(g.street_commit[0], 5_000, "button posts the SB heads-up");
+        assert_eq!(g.street_commit[1], 10_000);
+        assert_eq!(g.actor, Some(0), "button/SB acts first preflop");
+        g.apply(Action::CheckCall); // SB completes
+        assert_eq!(g.actor, Some(1), "BB has the option");
+        g.apply(Action::CheckCall); // BB checks
+        assert_eq!(g.street, Street::Flop);
+        assert_eq!(g.actor, Some(1), "BB (non-button) acts first postflop");
+    }
+
+    #[test]
+    fn nlh_preflop_allin_call_runs_out_single_board() {
+        let mut g = GameState::new_hand(nlh_cfg(6, 1_000_000), 123, 0);
+        let max = g.max_raise_chips();
+        assert!(g.apply_raise_chips(max).is_ok()); // UTG jams
+        g.apply(Action::Fold); // seat 4
+        g.apply(Action::Fold); // seat 5
+        g.apply(Action::Fold); // button 0
+        g.apply(Action::Fold); // SB 1
+        g.apply(Action::CheckCall); // BB calls all-in
+        assert!(g.is_terminal());
+        assert_eq!(g.board_a.len(), 5, "single board runs out");
+        assert!(g.board_b.is_empty(), "board B never dealt in NLH");
+        let p = g.payouts();
+        assert_eq!(p.iter().sum::<i64>(), 0, "payouts are zero-sum");
+        assert_eq!(p[0], -5_000);
+        assert_eq!(p[1], -10_000);
+    }
+
+    #[test]
+    fn nlh_short_bb_post_keeps_nominal_call() {
+        // BB (seat 2 for button 0) can post only 3000 of the 10000 blind
+        // after the 5000 ante. Callers still owe the FULL nominal bb;
+        // side pots absorb the shortfall at settlement.
+        let mut stacks = vec![1_000_000u64; 6];
+        stacks[2] = 8_000;
+        let cfg = GameConfig {
+            num_seats: 6,
+            starting_stacks: stacks,
+            ante: 5_000,
+            bb: 10_000,
+            sb: 5_000,
+            variant: Variant::NlhSingle,
+        };
+        let mut g = GameState::new_hand(cfg, 9, 0);
+        assert_eq!(g.street_commit[2], 3_000, "short post");
+        assert!(g.all_in[2]);
+        assert_eq!(g.bet_to_call, 10_000, "nominal bb");
+        assert_eq!(g.actor, Some(3));
+        g.apply(Action::CheckCall);
+        assert_eq!(g.street_commit[3], 10_000, "caller owes the full blind");
+    }
+
+    #[test]
+    fn nlh_hand_is_replayable_from_seed() {
+        let a = GameState::new_hand(nlh_cfg(6, 1_000_000), 777, 3);
+        let b = GameState::new_hand(nlh_cfg(6, 1_000_000), 777, 3);
+        let idx = |g: &GameState| -> Vec<Vec<u8>> {
+            g.hole_cards
+                .iter()
+                .map(|h| h.iter().map(|c| c.index()).collect())
+                .collect()
+        };
+        assert_eq!(idx(&a), idx(&b));
+        let board = |g: &GameState| -> Vec<u8> {
+            g.full_board_a.iter().map(|c| c.index()).collect()
+        };
+        assert_eq!(board(&a), board(&b));
+        assert_eq!(a.actor, b.actor);
+    }
+
+    #[test]
+    fn nlh_check_through_to_showdown_zero_sum() {
+        // Full passive hand: limps + checks on every street; exercises
+        // Preflop → Flop → Turn → River → Showdown with the single-board
+        // payout path.
+        let mut g = GameState::new_hand(nlh_cfg(3, 1_000_000), 55, 0);
+        let mut guard = 0;
+        while !g.is_terminal() {
+            g.apply(Action::CheckCall);
+            guard += 1;
+            assert!(guard < 40, "hand must terminate");
+        }
+        assert_eq!(g.street, Street::Showdown);
+        assert_eq!(g.board_a.len(), 5);
+        let p = g.payouts();
+        assert_eq!(p.iter().sum::<i64>(), 0);
+    }
+
+    #[test]
+    fn nlh_study_mode_rejected() {
+        let cfg = nlh_cfg(6, 1_000_000);
+        let r = GameState::new_study(
+            cfg,
+            0,
+            0,
+            [Card::from_index(0); 5],
+            [Card::from_index(10), Card::from_index(11), Card::from_index(12)],
+            [Card::from_index(20), Card::from_index(21), Card::from_index(22)],
+        );
+        assert_eq!(r.err(), Some(StudyError::WrongState));
+    }
+}
+
+#[cfg(test)]
+mod plo6_tests {
+    use super::*;
+
+    fn plo6_cfg(num_seats: usize, stack: u64) -> GameConfig {
+        GameConfig {
+            num_seats,
+            starting_stacks: vec![stack; num_seats],
+            ante: 30_000,
+            bb: 10_000,
+            sb: 0,
+            variant: Variant::Plo6DoubleBomb,
+        }
+    }
+
+    #[test]
+    fn plo6_deals_six_unique_cards_per_seat_full_ring() {
+        let g = GameState::new_hand(plo6_cfg(6, 200_000), 42, 0);
+        let mut seen = [false; 52];
+        for h in &g.hole_cards {
+            assert_eq!(h.len(), 6, "PLO6 deals 6 hole cards");
+            for card in h {
+                assert!(!seen[card.index() as usize], "duplicate hole card");
+                seen[card.index() as usize] = true;
+            }
+        }
+        for card in g.full_board_a.iter().chain(g.full_board_b.iter()) {
+            assert!(!seen[card.index() as usize], "board reuses a hole card");
+            seen[card.index() as usize] = true;
+        }
+        assert_eq!(seen.iter().filter(|&&x| x).count(), 6 * 6 + 10);
+    }
+
+    #[test]
+    fn plo6_replayable_from_seed() {
+        let a = GameState::new_hand(plo6_cfg(4, 500_000), 777, 2);
+        let b = GameState::new_hand(plo6_cfg(4, 500_000), 777, 2);
+        let idx = |g: &GameState| -> Vec<Vec<u8>> {
+            g.hole_cards
+                .iter()
+                .map(|h| h.iter().map(|c| c.index()).collect())
+                .collect()
+        };
+        assert_eq!(idx(&a), idx(&b));
+    }
+
+    #[test]
+    fn plo6_starts_on_flop_and_checkdown_conserves_chips() {
+        let mut g = GameState::new_hand(plo6_cfg(6, 200_000), 7, 3);
+        assert_eq!(g.street, Street::Flop, "bomb pot starts on the flop");
+        let mut guard = 0;
+        while !g.is_terminal() && guard < 200 {
+            g.apply(Action::CheckCall);
+            guard += 1;
+        }
+        assert!(g.is_terminal(), "checkdown must reach showdown");
+        let payouts = g.payouts();
+        let net: i64 = payouts.iter().sum();
+        assert_eq!(net, 0, "zero-sum payouts");
+        assert!(payouts.iter().any(|&p| p > 0), "someone wins the antes");
+    }
+
+    #[test]
+    fn plo6_pot_limit_cap_matches_plo5_math() {
+        // Same stacks/antes → identical pot-limit max on the flop
+        // regardless of hole-card count.
+        let g5 = GameState::new_hand(GameConfig::new_uniform(6, 200_000, 30_000, 10_000), 11, 0);
+        let g6 = GameState::new_hand(plo6_cfg(6, 200_000), 11, 0);
+        assert_eq!(g5.max_raise_chips(), g6.max_raise_chips());
+        assert_eq!(g5.min_bet_total(), g6.min_bet_total());
+    }
+
+    #[test]
+    fn plo6_hero_category_uses_six_cards() {
+        // Deterministic construction via seeds is opaque; instead assert
+        // the category call runs and returns a valid index for every seat.
+        let g = GameState::new_hand(plo6_cfg(6, 200_000), 99, 1);
+        for seat in 0..6 {
+            let cat_a = g.hero_category(seat, 0);
+            let cat_b = g.hero_category(seat, 1);
+            assert!(cat_a <= 8 && cat_b <= 8);
+        }
+    }
+
+    #[test]
+    fn plo6_study_mode_rejected() {
+        let cfg = plo6_cfg(6, 200_000);
+        let hero = [
+            Card::from_index(0),
+            Card::from_index(4),
+            Card::from_index(8),
+            Card::from_index(12),
+            Card::from_index(16),
+        ];
+        let fa = [Card::from_index(20), Card::from_index(24), Card::from_index(28)];
+        let fb = [Card::from_index(32), Card::from_index(36), Card::from_index(40)];
+        let r = GameState::new_study(cfg, 0, 0, hero, fa, fb);
+        assert!(r.is_err(), "study mode is PLO5-only until the UI phase");
+    }
+}
+
+#[cfg(test)]
+mod plo4_tests {
+    use super::*;
+
+    fn plo4_cfg(num_seats: usize, stack: u64) -> GameConfig {
+        GameConfig {
+            num_seats,
+            starting_stacks: vec![stack; num_seats],
+            ante: 30_000,
+            bb: 10_000,
+            sb: 0,
+            variant: Variant::Plo4DoubleBomb,
+        }
+    }
+
+    #[test]
+    fn plo4_deals_four_unique_cards_per_seat_full_ring() {
+        let g = GameState::new_hand(plo4_cfg(6, 200_000), 42, 0);
+        let mut seen = [false; 52];
+        for h in &g.hole_cards {
+            assert_eq!(h.len(), 4, "PLO4 deals 4 hole cards");
+            for card in h {
+                assert!(!seen[card.index() as usize], "duplicate hole card");
+                seen[card.index() as usize] = true;
+            }
+        }
+        for card in g.full_board_a.iter().chain(g.full_board_b.iter()) {
+            assert!(!seen[card.index() as usize], "board reuses a hole card");
+            seen[card.index() as usize] = true;
+        }
+        assert_eq!(seen.iter().filter(|&&x| x).count(), 6 * 4 + 10);
+    }
+
+    #[test]
+    fn plo4_replayable_from_seed() {
+        let a = GameState::new_hand(plo4_cfg(4, 500_000), 777, 2);
+        let b = GameState::new_hand(plo4_cfg(4, 500_000), 777, 2);
+        let idx = |g: &GameState| -> Vec<Vec<u8>> {
+            g.hole_cards
+                .iter()
+                .map(|h| h.iter().map(|c| c.index()).collect())
+                .collect()
+        };
+        assert_eq!(idx(&a), idx(&b));
+    }
+
+    #[test]
+    fn plo4_starts_on_flop_and_checkdown_conserves_chips() {
+        let mut g = GameState::new_hand(plo4_cfg(6, 200_000), 7, 3);
+        assert_eq!(g.street, Street::Flop, "bomb pot starts on the flop");
+        let mut guard = 0;
+        while !g.is_terminal() && guard < 200 {
+            g.apply(Action::CheckCall);
+            guard += 1;
+        }
+        assert!(g.is_terminal(), "checkdown must reach showdown");
+        let payouts = g.payouts();
+        let net: i64 = payouts.iter().sum();
+        assert_eq!(net, 0, "zero-sum payouts");
+        assert!(payouts.iter().any(|&p| p > 0), "someone wins the antes");
+    }
+
+    #[test]
+    fn plo4_pot_limit_cap_matches_plo5_math() {
+        // Same stacks/antes → identical pot-limit max on the flop
+        // regardless of hole-card count.
+        let g5 = GameState::new_hand(GameConfig::new_uniform(6, 200_000, 30_000, 10_000), 11, 0);
+        let g4 = GameState::new_hand(plo4_cfg(6, 200_000), 11, 0);
+        assert_eq!(g5.max_raise_chips(), g4.max_raise_chips());
+        assert_eq!(g5.min_bet_total(), g4.min_bet_total());
+    }
+
+    #[test]
+    fn plo4_hero_category_valid_all_seats_both_boards() {
+        let g = GameState::new_hand(plo4_cfg(6, 200_000), 99, 1);
+        for seat in 0..6 {
+            let cat_a = g.hero_category(seat, 0);
+            let cat_b = g.hero_category(seat, 1);
+            assert!(cat_a <= 8 && cat_b <= 8);
+        }
+    }
+
+    #[test]
+    fn plo4_study_mode_rejected() {
+        let cfg = plo4_cfg(6, 200_000);
+        let hero = [
+            Card::from_index(0),
+            Card::from_index(4),
+            Card::from_index(8),
+            Card::from_index(12),
+            Card::from_index(16),
+        ];
+        let fa = [Card::from_index(20), Card::from_index(24), Card::from_index(28)];
+        let fb = [Card::from_index(32), Card::from_index(36), Card::from_index(40)];
+        let r = GameState::new_study(cfg, 0, 0, hero, fa, fb);
+        assert!(r.is_err(), "study mode is PLO5-only until the UI phase");
+    }
+}
+
+#[cfg(test)]
+mod nlh_study_tests {
+    use super::*;
+
+    fn cfg(num_seats: usize) -> GameConfig {
+        GameConfig::new_nlh_uniform(num_seats, 1_000_000, 5_000, 10_000, 5_000)
+    }
+
+    fn hero2(a: u8, b: u8) -> [Card; 2] {
+        [Card::from_index(a), Card::from_index(b)]
+    }
+
+    #[test]
+    fn nlh_study_starts_preflop_with_blinds() {
+        let g = GameState::new_study_nlh(cfg(6), 0, 3, hero2(51, 47)).unwrap();
+        assert_eq!(g.street, Street::Preflop);
+        assert!(g.board_a.is_empty() && g.board_b.is_empty());
+        // 6 antes + SB + BB = 45,000 (the 5/10(5) $45 pre-pot).
+        assert_eq!(g.pot, 45_000);
+        assert_eq!((g.sb_seat, g.bb_seat), (Some(1), Some(2)));
+        assert_eq!(g.street_commit[1], 5_000);
+        assert_eq!(g.street_commit[2], 10_000);
+        assert_eq!(g.bet_to_call, 10_000);
+        assert_eq!(g.actor, Some(3), "UTG first preflop");
+        assert!(g.study_mode);
+        assert_eq!(g.hole_cards[3].len(), 2);
+        for (seat, h) in g.hole_cards.iter().enumerate() {
+            assert_eq!(h.len(), 2, "seat {seat} must hold 2 cards");
+        }
+    }
+
+    #[test]
+    fn nlh_study_full_hand_walkthrough() {
+        // 3-max: button 0 = first preflop actor is button (SB=1, BB=2 →
+        // UTG=0). Limp around → flop; bet/call → turn; check around →
+        // river; check around → Showdown terminal with zero payouts.
+        let mut g = GameState::new_study_nlh(cfg(3), 0, 0, hero2(51, 47)).unwrap();
+        assert_eq!(g.actor, Some(0));
+        for _ in 0..3 {
+            g.apply(Action::CheckCall);
+        }
+        assert_eq!(g.awaiting_next_street, Some(Street::Flop));
+        assert_eq!(g.actor, None);
+        g.set_flop_nlh([
+            Card::from_index(0),
+            Card::from_index(5),
+            Card::from_index(10),
+        ])
+        .unwrap();
+        assert_eq!(g.street, Street::Flop);
+        assert_eq!(g.board_a.len(), 3);
+        assert!(g.board_b.is_empty(), "single board never fills B");
+        assert_eq!(g.actor, Some(1), "SB first postflop");
+        // SB bets 20k, others call.
+        assert!(g.apply_raise_chips(20_000).is_ok());
+        g.apply(Action::CheckCall);
+        g.apply(Action::CheckCall);
+        assert_eq!(g.awaiting_next_street, Some(Street::Turn));
+        g.set_turn_nlh(Card::from_index(15)).unwrap();
+        assert_eq!(g.board_a.len(), 4);
+        for _ in 0..3 {
+            g.apply(Action::CheckCall);
+        }
+        assert_eq!(g.awaiting_next_street, Some(Street::River));
+        g.set_river_nlh(Card::from_index(20)).unwrap();
+        assert_eq!(g.board_a.len(), 5);
+        for _ in 0..3 {
+            g.apply(Action::CheckCall);
+        }
+        assert_eq!(g.study_terminal, Some(StudyTerminal::Showdown));
+        assert!(g.payouts().iter().all(|&p| p == 0), "opp cards unknown");
+    }
+
+    #[test]
+    fn nlh_study_preflop_foldout_pays_hero() {
+        let mut g = GameState::new_study_nlh(cfg(2), 0, 0, hero2(51, 47)).unwrap();
+        // HU: button/SB acts first preflop; SB raises, BB folds.
+        assert_eq!(g.actor, Some(0));
+        assert!(g.apply_raise_chips(30_000).is_ok());
+        g.apply(Action::Fold);
+        assert_eq!(g.study_terminal, Some(StudyTerminal::FoldOut));
+        let p = g.payouts();
+        assert!(p[0] > 0 && p[1] < 0, "uncontested pot goes to hero");
+    }
+
+    #[test]
+    fn nlh_study_card_validation() {
+        // Duplicate hero cards rejected.
+        assert!(GameState::new_study_nlh(cfg(3), 0, 0, hero2(5, 5)).is_err());
+        // Flop colliding with hero hole rejected; PLO dual-board setter
+        // rejected on an NLH state.
+        let mut g = GameState::new_study_nlh(cfg(3), 0, 0, hero2(51, 47)).unwrap();
+        for _ in 0..3 {
+            g.apply(Action::CheckCall);
+        }
+        assert_eq!(g.awaiting_next_street, Some(Street::Flop));
+        let r = g.set_flop_nlh([
+            Card::from_index(51),
+            Card::from_index(1),
+            Card::from_index(2),
+        ]);
+        assert_eq!(r, Err(StudyError::DuplicateCard));
+        let r2 = g.set_turn(Card::from_index(1), Card::from_index(2));
+        assert_eq!(r2, Err(StudyError::WrongState));
+        // Wrong-order setter (turn before flop) rejected.
+        let r3 = g.set_turn_nlh(Card::from_index(1));
+        assert_eq!(r3, Err(StudyError::WrongState));
+        // Valid flop still works after the failed attempts.
+        assert!(g
+            .set_flop_nlh([
+                Card::from_index(0),
+                Card::from_index(1),
+                Card::from_index(2),
+            ])
+            .is_ok());
+    }
+
+    #[test]
+    fn nlh_study_rejected_for_plo() {
+        let plo = GameConfig::new_uniform(6, 200_000, 30_000, 10_000);
+        let r = GameState::new_study_nlh(plo, 0, 0, hero2(0, 4));
+        assert_eq!(r.err(), Some(StudyError::WrongState));
     }
 }

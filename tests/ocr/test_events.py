@@ -91,6 +91,7 @@ def _engine(
     chips_per_cent: float = 1.0,
     min_bet_cents: int = 0,
     sitting_out: list[bool] | None = None,
+    exact_folds: bool = False,
 ) -> EngineView:
     n = len(commits)
     folded = folded if folded is not None else [False] * n
@@ -111,6 +112,7 @@ def _engine(
         chips_per_cent=chips_per_cent,
         min_bet_cents=min_bet_cents,
         sitting_out=tuple(sitting_out),
+        exact_folds=exact_folds,
     )
 
 
@@ -2097,3 +2099,84 @@ def test_no_phantom_check_from_banner_only_downstream_seat():
         f"phantom action emitted from banner-only downstream signal: "
         f"{seat_actions}"
     )
+
+
+def test_closing_call_stops_walk_and_emits_no_phantoms():
+    """The street-closing call must emit exactly one action, no phantoms.
+
+    PokerNow shows every player's matched bet simultaneously the instant the
+    closing caller acts (before sweeping chips to the pot). The walk used to
+    coast past the already-acted seats and emit phantom check_calls — and even
+    a phantom raise — inflating the pot. The betting-round-closed guard at the
+    top of the walk stops it once everyone still in has matched the bet.
+    """
+    rec = EventReconstructor(num_seats=3)
+    # Baseline: hero(0) bet 100, seat1(1) called 100, seat2(2) to act.
+    base = _fs([100, 100, 0], [900, 900, 1000], actors=[False, False, True])
+    rec.step(base, _engine(current_actor=2, commits=[100, 100, 0],
+                           stacks=[900, 900, 1000], bet_to_call=100))
+
+    # Closing frame: seat2 calls — all three now show a matched 100, bets not
+    # yet swept. The engine still has seat2 to act (commits=[100,100,0]).
+    closing = _fs([100, 100, 100], [900, 900, 900], actors=[False, False, True])
+    events = rec.step(closing, _engine(current_actor=2, commits=[100, 100, 0],
+                                       stacks=[900, 900, 1000], bet_to_call=100))
+    actions = [e for e in events if isinstance(e, SeatAction)]
+    assert len(actions) == 1
+    assert actions[0].seat == 2
+    assert actions[0].gate == "check_call"
+
+
+def test_allin_shove_recorded_when_stack_reads_zero():
+    """An all-in shove (stack rendered 0, not None) is recorded as a raise.
+
+    PokerNow shows "all in" instead of the stack number; the mapper maps that to
+    a 0 stack. With 0 (not None) the corroboration guard sees the full stack
+    drop backing the shove, so the bet survives and routes through the
+    short-shove path — instead of being discarded and collapsing the hand to a
+    phantom check-down.
+    """
+    rec = EventReconstructor(num_seats=2)
+    base = _fs([0, 0], [8800, 1800], actors=[False, True])
+    rec.step(base, _engine(current_actor=1, commits=[0, 0],
+                           stacks=[8800, 1800], bet_to_call=0, street=2))
+
+    # seat 1 shoves: committed = their whole 1800, stack now 0 (all in).
+    allin = _fs([0, 1800], [8800, 0], actors=[False, True])
+    events = rec.step(allin, _engine(current_actor=1, commits=[0, 0],
+                                     stacks=[8800, 1800], bet_to_call=0, street=2))
+    actions = [e for e in events if isinstance(e, SeatAction)]
+    assert len(actions) == 1
+    assert actions[0].seat == 1
+    assert actions[0].gate == "raise"
+    assert actions[0].chips == 1800  # chips_per_cent=1.0 in _engine
+
+
+def test_exact_folds_suppresses_inferred_fold_on_coasted_seat():
+    """With exact fold data (PokerNow), the walk must not INFER a fold for a
+    seat that is merely facing a bet with no committed change.
+
+    seat2 bet 100; seat1 already has 50 in and is yet to respond; seat0 calls.
+    The walk coasts past seat1 (committed unchanged at 50, facing 100) — the
+    OCR path infers a FOLD there, but PokerNow says seat1 hasn't folded, so it
+    must be left alone (it's a thinking/closing-call seat). This is the
+    "last caller registers as a fold and the hand ends" bug.
+    """
+    def run(exact):
+        rec = EventReconstructor(num_seats=3)
+        base = _fs([0, 50, 100], [200, 150, 100], actors=[True, False, False])
+        rec.step(base, _engine(current_actor=0, commits=[0, 50, 100],
+                               stacks=[200, 150, 100], bet_to_call=100,
+                               exact_folds=exact))
+        fs2 = _fs([100, 50, 100], [100, 150, 100], actors=[False, True, False])
+        return rec.step(fs2, _engine(current_actor=0, commits=[0, 50, 100],
+                                     stacks=[200, 150, 100], bet_to_call=100,
+                                     exact_folds=exact))
+
+    inferred = [e for e in run(False)
+                if isinstance(e, SeatAction) and e.gate == "fold" and e.seat == 1]
+    assert inferred, "scenario should trigger the inferred fold without exact_folds"
+
+    suppressed = [e for e in run(True)
+                  if isinstance(e, SeatAction) and e.gate == "fold" and e.seat == 1]
+    assert not suppressed, "exact_folds must not infer a fold for a non-folded seat"

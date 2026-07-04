@@ -11,7 +11,7 @@ Each stored transition carries:
   - the sampled anchor index and refinement u (v2 head; v1 stores -1/u)
   - the gate+sizing log-prob under the sampling policy
   - the value estimate (CentralCritic when provided, else the actor's)
-  - the hero-rotated opponent hole cards, compact (5, 5) u8 — the
+  - the hero-rotated opponent hole cards, compact (5, hole_count) u8 — the
     centralized critic's extra input (255 = empty slot)
 
 Only learner-seat trajectories contribute to the batch; pool-mix
@@ -32,10 +32,14 @@ from torch.profiler import record_function
 from plo5bp._engine import compute_aggression_bonus_batch  # type: ignore[attr-defined]
 from plo5bp.actions import ALL_IN, GATE_ACTIONS, GATE_CHECK_CALL, GATE_RAISE
 from plo5bp.config import GameConfig, TrainingConfig
-from plo5bp.encoding import OBS_DIM
 from plo5bp.env import BombPotEnv
 from plo5bp.env_batched import BatchedBombPotEnv
-from plo5bp.network import ActorCritic, CentralCritic, opp_holes_multihot
+from plo5bp.network import (
+    ActorCritic,
+    CentralCritic,
+    build_actor_from_state_dict,
+    opp_holes_multihot,
+)
 from plo5bp.selfplay import OpponentPool
 from plo5bp.sizing import sizing_from_info
 
@@ -49,7 +53,7 @@ class Batch:
     sizing: torch.Tensor        # (T, 4) long — (min, max, pot, to_call)
     anchor_actions: torch.Tensor  # (T,) long — sampled anchor (-1 for v1)
     refine_u: torch.Tensor      # (T,) f32 — sampled refinement u
-    opp_holes: torch.Tensor     # (T, 5, 5) u8 — rotated opp hole cards
+    opp_holes: torch.Tensor     # (T, 5, hole_count) u8 — rotated opp holes
     log_probs: torch.Tensor     # (T,) f32 — sampling JOINT log-prob
     values: torch.Tensor        # (T,) f32 — critic at sampling time
     returns: torch.Tensor       # (T,) f32
@@ -84,10 +88,15 @@ def _build_frozen_model(
     num_layers: int = 2,
     model_cls: type = ActorCritic,
 ) -> ActorCritic:
-    # `model_cls` follows the learner's class so v2 pool snapshots build
-    # ActorCriticV2 (a hardcoded ActorCritic would fail at load_state_dict).
-    model = model_cls(hidden_dim=hidden_dim, num_layers=num_layers)
-    model.load_state_dict(state_dict)
+    # Class, obs width, AND anchor spec are sniffed from the state dict
+    # itself so pool snapshots rebuild exactly what was frozen across
+    # head versions and variants — an NLH v4 snapshot has a 995-wide
+    # torso and a 12-anchor ladder that the old hardcoded defaults
+    # shape-failed on. `model_cls` is retained for caller compatibility;
+    # the sniffed class always matches it for well-formed snapshots.
+    model = build_actor_from_state_dict(
+        state_dict, hidden_dim=hidden_dim, num_layers=num_layers
+    )
     model.to(device)
     model.eval()
     for p in model.parameters():
@@ -95,12 +104,25 @@ def _build_frozen_model(
     return model
 
 
+def _hole_cache(env) -> np.ndarray:
+    """(num_seats, 5) u8 per-hand hole cache from `env.all_hole_cards()`.
+    Variants with fewer hole cards (NLH: 2) are right-padded with 255 —
+    the multihot expansion's empty sentinel — so the critic's opponent
+    input width is fixed across variants. PLO rows are unchanged."""
+    holes = env.all_hole_cards()
+    out = np.full((len(holes), 5), 255, dtype=np.uint8)
+    for s, h in enumerate(holes):
+        out[s, : len(h)] = h
+    return out
+
+
 def _rotate_opp_holes(holes: np.ndarray, actor: int) -> np.ndarray:
-    """(num_seats, 5) per-hand hole cards → hero-rotated (5, 5) opponent
-    block: slot j = seat (actor + 1 + j) % num_seats; 255 padding for
-    slots beyond num_seats - 1. Matches the encoder's rotation."""
+    """(num_seats, hole_w) per-hand hole cards → hero-rotated
+    (5, hole_w) opponent block (hole_w = 5 for PLO5, 6 for PLO6): slot
+    j = seat (actor + 1 + j) % num_seats; 255 padding for slots beyond
+    num_seats - 1. Matches the encoder's rotation."""
     n_seats = holes.shape[0]
-    out = np.full((5, 5), 255, dtype=np.uint8)
+    out = np.full((5, holes.shape[1]), 255, dtype=np.uint8)
     for j in range(min(5, n_seats - 1)):
         out[j] = holes[(actor + 1 + j) % n_seats]
     return out
@@ -109,8 +131,8 @@ def _rotate_opp_holes(holes: np.ndarray, actor: int) -> np.ndarray:
 def _rotate_opp_holes_batch(
     holes_cache: np.ndarray, env_idx: np.ndarray, actors: np.ndarray
 ) -> np.ndarray:
-    """Vectorized `_rotate_opp_holes`: holes_cache (N, S, 5) u8 →
-    (B, 5, 5) u8 for the given env rows/actors."""
+    """Vectorized `_rotate_opp_holes`: holes_cache (N, S, hole_w) u8 →
+    (B, 5, hole_w) u8 for the given env rows/actors."""
     n_seats = holes_cache.shape[1]
     j5 = np.arange(5)
     seats = (actors[:, None].astype(np.int64) + 1 + j5[None, :]) % n_seats
@@ -508,7 +530,7 @@ def collect_rollout(
         o, info = env.reset(seed, button)
         obs_vecs.append(o)
         infos.append(info)
-        hole_caches[i] = np.asarray(env.all_hole_cards(), dtype=np.uint8)
+        hole_caches[i] = _hole_cache(env)
 
     # Per env, per seat: list of (obs, gate_mask, gate, chips, bounds, log_p, value).
     trajectories: list[list[list[tuple]]] = [
@@ -756,7 +778,7 @@ def collect_rollout(
                 seed = int(rng.integers(0, 2**63 - 1))
                 button = int(rng.integers(0, n_seats))
                 next_obs, next_info = env.reset(seed, button)
-                hole_caches[i] = np.asarray(env.all_hole_cards(), dtype=np.uint8)
+                hole_caches[i] = _hole_cache(env)
 
             obs_vecs[i] = next_obs
             infos[i] = next_info
@@ -931,7 +953,9 @@ def collect_rollout_batched(
     # silent numpy shape mismatch. 32 steps/env is ~50x observed need.
     POOL_SLACK_PER_ENV = 32
     pool_cap = rollout_target + n_envs * POOL_SLACK_PER_ENV
-    step_obs_pool = np.empty((pool_cap, OBS_DIM), dtype=np.float32)
+    # env.obs_dim, not the OBS_DIM constant: the batched env's layout is
+    # per-variant (991 PLO / 995 NLH).
+    step_obs_pool = np.empty((pool_cap, env.obs_dim), dtype=np.float32)
     step_gm_pool = np.empty((pool_cap, GATE_ACTIONS), dtype=bool)
     pool_cursor = 0
 
@@ -964,14 +988,16 @@ def collect_rollout_batched(
             return t.numpy()
         return np.empty(shape, dtype=np_dtype)
 
-    all_obs_arr = _alloc_slab((out_cap, OBS_DIM), np.float32, torch.float32)
+    all_obs_arr = _alloc_slab((out_cap, env.obs_dim), np.float32, torch.float32)
     all_gm_arr = _alloc_slab((out_cap, GATE_ACTIONS), bool, torch.bool)
     all_ga_arr = _alloc_slab(out_cap, np.int64, torch.int64)
     all_rc_arr = _alloc_slab(out_cap, np.int64, torch.int64)
     all_sz_arr = _alloc_slab((out_cap, 4), np.int64, torch.int64)
     all_an_arr = _alloc_slab(out_cap, np.int64, torch.int64)
     all_ru_arr = _alloc_slab(out_cap, np.float32, torch.float32)
-    all_oh_arr = _alloc_slab((out_cap, 5, 5), np.uint8, torch.uint8)
+    all_oh_arr = _alloc_slab(
+        (out_cap, 5, game_config.hole_count), np.uint8, torch.uint8
+    )
     all_lp_arr = _alloc_slab(out_cap, np.float32, torch.float32)
     all_glp_arr = _alloc_slab(out_cap, np.float32, torch.float32)
     all_alp_arr = _alloc_slab(out_cap, np.float32, torch.float32)
@@ -1389,7 +1415,9 @@ def collect_rollout_batched(
                             )
                         ts_idx = sel // L
                         all_oh_arr[wcursor:end] = (
-                            rot_block.reshape(T * S, 5, 5)[ts_idx]
+                            rot_block.reshape(
+                                T * S, 5, game_config.hole_count
+                            )[ts_idx]
                         )
                         all_lp_arr[wcursor:end] = traj_log_p[term_envs, :, :L].ravel()[sel]
                         all_glp_arr[wcursor:end] = traj_gate_lp[term_envs, :, :L].ravel()[sel]

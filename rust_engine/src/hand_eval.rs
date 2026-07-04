@@ -287,6 +287,16 @@ pub fn evaluate_5(cards: &[Card; 5]) -> HandRank {
 
 // ---------- PLO5 evaluator (100 combos) ----------
 
+/// C(4,2) = 6 hole-pair index combinations for 4-card (PLO4) holes.
+const PAIRS_4: [(usize, usize); 6] = [
+    (0, 1),
+    (0, 2),
+    (0, 3),
+    (1, 2),
+    (1, 3),
+    (2, 3),
+];
+
 const PAIRS_5: [(usize, usize); 10] = [
     (0, 1),
     (0, 2),
@@ -298,6 +308,25 @@ const PAIRS_5: [(usize, usize); 10] = [
     (2, 3),
     (2, 4),
     (3, 4),
+];
+
+/// C(6,2) = 15 hole-pair index combinations for 6-card (PLO6) holes.
+const PAIRS_6: [(usize, usize); 15] = [
+    (0, 1),
+    (0, 2),
+    (0, 3),
+    (0, 4),
+    (0, 5),
+    (1, 2),
+    (1, 3),
+    (1, 4),
+    (1, 5),
+    (2, 3),
+    (2, 4),
+    (2, 5),
+    (3, 4),
+    (3, 5),
+    (4, 5),
 ];
 
 const TRIPLES_5: [(usize, usize, usize); 10] = [
@@ -313,22 +342,28 @@ const TRIPLES_5: [(usize, usize, usize); 10] = [
     (2, 3, 4),
 ];
 
-/// Partial-board PLO5 evaluator. `board` may have 3, 4, or 5 cards.
+/// Partial-board PLO evaluator (4-, 5-, or 6-card holes). `board` may have 3, 4, or 5 cards.
 /// Returns the best hand hero can currently make using exactly 2 hole + 3
 /// visible board cards. Used for the "current hand category" feature pre-river.
-pub fn evaluate_plo5_partial(hole: &[Card; 5], board: &[Card]) -> HandRank {
+pub fn evaluate_plo5_partial(hole: &[Card], board: &[Card]) -> HandRank {
+    assert!(
+        (4..=6).contains(&hole.len()),
+        "PLO hole must have exactly 4 (PLO4), 5 (PLO5), or 6 (PLO6) cards"
+    );
     assert!(
         board.len() >= 3 && board.len() <= 5,
         "partial board must have 3..=5 cards"
     );
     let t = tables();
-    let h: [u32; 5] = [
-        card_to_ck(hole[0]),
-        card_to_ck(hole[1]),
-        card_to_ck(hole[2]),
-        card_to_ck(hole[3]),
-        card_to_ck(hole[4]),
-    ];
+    let mut h = [0u32; 6];
+    for (i, c) in hole.iter().enumerate() {
+        h[i] = card_to_ck(*c);
+    }
+    let pairs: &[(usize, usize)] = match hole.len() {
+        4 => &PAIRS_4,
+        5 => &PAIRS_5,
+        _ => &PAIRS_6,
+    };
     let bn = board.len();
     let mut best_ck: u16 = u16::MAX;
     for i0 in 0..bn {
@@ -337,7 +372,7 @@ pub fn evaluate_plo5_partial(hole: &[Card; 5], board: &[Card]) -> HandRank {
                 let b0 = card_to_ck(board[i0]);
                 let b1 = card_to_ck(board[i1]);
                 let b2 = card_to_ck(board[i2]);
-                for &(hi0, hi1) in &PAIRS_5 {
+                for &(hi0, hi1) in pairs {
                     let c = [h[hi0], h[hi1], b0, b1, b2];
                     let ck = ck_eval_inline(c, t);
                     // Skip degenerate 5-card hands (duplicate card).
@@ -359,7 +394,7 @@ pub fn evaluate_plo5_partial(hole: &[Card; 5], board: &[Card]) -> HandRank {
 
 /// Evaluate a k-card opponent hand on a 3..=5-card board under PLO5
 /// rules ("exactly 2 from hole + 3 from board"). Generalizes
-/// [`evaluate_plo5_partial`] to k = 2..=5 hole cards. Used for the
+/// [`evaluate_plo5_partial`] to k = 2..=6 hole cards. Used for the
 /// opp-vs-hero outcome-fraction features.
 ///
 /// For k=2 there is exactly one hole-pair choice. For k=3,4,5 the
@@ -367,8 +402,8 @@ pub fn evaluate_plo5_partial(hole: &[Card; 5], board: &[Card]) -> HandRank {
 /// board-triple combinations and returns the strongest 5-card rank.
 pub fn evaluate_plo5_k_partial(hole: &[Card], board: &[Card]) -> HandRank {
     assert!(
-        hole.len() >= 2 && hole.len() <= 5,
-        "hole must have 2..=5 cards"
+        hole.len() >= 2 && hole.len() <= 6,
+        "hole must have 2..=6 cards"
     );
     assert!(
         board.len() >= 3 && board.len() <= 5,
@@ -377,7 +412,7 @@ pub fn evaluate_plo5_k_partial(hole: &[Card], board: &[Card]) -> HandRank {
     let t = tables();
     let kn = hole.len();
     let bn = board.len();
-    let mut h_ck = [0u32; 5];
+    let mut h_ck = [0u32; 6];
     for i in 0..kn {
         h_ck[i] = card_to_ck(hole[i]);
     }
@@ -405,17 +440,64 @@ pub fn evaluate_plo5_k_partial(hole: &[Card], board: &[Card]) -> HandRank {
     ck_to_hand_rank(safe_ck)
 }
 
-/// PLO5 evaluator: must use exactly 2 from hole + 3 from board.
-/// Enumerates all 100 combinations and returns the best rank.
-pub fn evaluate_plo5(hole: &[Card; 5], board: &[Card; 5]) -> HandRank {
+/// NLH evaluator: best 5-card hand from ANY combination of hole + board
+/// cards (0, 1, or 2 hole cards may play — "play the board" included).
+/// `hole` must have exactly 2 cards; `board` 3..=5 (partial boards give
+/// the current best made hand, mirroring [`evaluate_plo5_partial`]).
+/// Enumerates all C(hole+board, 5) five-card subsets of the pooled
+/// cards — 1 at the flop, 6 at the turn, 21 at the river.
+pub fn evaluate_nlh(hole: &[Card], board: &[Card]) -> HandRank {
+    assert!(hole.len() == 2, "NLH hole must have exactly 2 cards");
+    assert!(
+        board.len() >= 3 && board.len() <= 5,
+        "board must have 3..=5 cards"
+    );
     let t = tables();
-    let h: [u32; 5] = [
-        card_to_ck(hole[0]),
-        card_to_ck(hole[1]),
-        card_to_ck(hole[2]),
-        card_to_ck(hole[3]),
-        card_to_ck(hole[4]),
-    ];
+    let pn = hole.len() + board.len();
+    let mut pool = [0u32; 7];
+    for (i, c) in hole.iter().chain(board.iter()).enumerate() {
+        pool[i] = card_to_ck(*c);
+    }
+    let mut best_ck: u16 = u16::MAX;
+    for i0 in 0..pn {
+        for i1 in (i0 + 1)..pn {
+            for i2 in (i1 + 1)..pn {
+                for i3 in (i2 + 1)..pn {
+                    for i4 in (i3 + 1)..pn {
+                        let c = [pool[i0], pool[i1], pool[i2], pool[i3], pool[i4]];
+                        let ck = ck_eval_inline(c, t);
+                        // Degenerate (duplicate-card) subsets eval to 0;
+                        // unreachable in production deals but keep the
+                        // same guard discipline as the PLO evaluators.
+                        if ck != 0 && ck < best_ck {
+                            best_ck = ck;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let safe_ck = if best_ck == u16::MAX { 7462 } else { best_ck };
+    ck_to_hand_rank(safe_ck)
+}
+
+/// PLO evaluator (4-, 5-, or 6-card holes): exactly 2 from hole + 3 from board.
+/// Enumerates all C(hole, 2) × 10 combinations and returns the best rank.
+pub fn evaluate_plo5(hole: &[Card], board: &[Card; 5]) -> HandRank {
+    assert!(
+        (4..=6).contains(&hole.len()),
+        "PLO hole must have exactly 4 (PLO4), 5 (PLO5), or 6 (PLO6) cards"
+    );
+    let t = tables();
+    let mut h = [0u32; 6];
+    for (i, c) in hole.iter().enumerate() {
+        h[i] = card_to_ck(*c);
+    }
+    let pairs: &[(usize, usize)] = match hole.len() {
+        4 => &PAIRS_4,
+        5 => &PAIRS_5,
+        _ => &PAIRS_6,
+    };
     let b: [u32; 5] = [
         card_to_ck(board[0]),
         card_to_ck(board[1]),
@@ -424,7 +506,7 @@ pub fn evaluate_plo5(hole: &[Card; 5], board: &[Card; 5]) -> HandRank {
         card_to_ck(board[4]),
     ];
     let mut best_ck: u16 = u16::MAX; // lower CK = stronger
-    for &(h0, h1) in &PAIRS_5 {
+    for &(h0, h1) in pairs {
         for &(b0, b1, b2) in &TRIPLES_5 {
             let c = [h[h0], h[h1], b[b0], b[b1], b[b2]];
             let ck = ck_eval_inline(c, t);
@@ -808,5 +890,201 @@ mod tests {
         let rank = evaluate_plo5_k_partial(&hole, &board);
         // Best pair = pocket 8s + 8 on board → trips.
         assert_eq!(category(rank), CAT_TRIPS);
+    }
+
+    // ---- NLH any-combo evaluator ----
+
+    #[test]
+    fn nlh_one_hole_card_flush() {
+        // Illegal under PLO's exactly-2 rule; the whole point of NLH eval.
+        let hole = [c(12, 2), c(0, 0)]; // Ah 2c
+        let board = [c(11, 2), c(10, 2), c(9, 2), c(7, 2), c(1, 3)]; // Kh Qh Jh 9h 3s
+        let rank = evaluate_nlh(&hole, &board);
+        assert_eq!(category(rank), CAT_FLUSH);
+    }
+
+    #[test]
+    fn nlh_zero_hole_cards_plays_the_board() {
+        let hole = [c(0, 0), c(1, 1)]; // 2c 3d
+        let board = [c(12, 0), c(11, 1), c(10, 2), c(9, 3), c(8, 0)]; // broadway
+        let rank = evaluate_nlh(&hole, &board);
+        assert_eq!(category(rank), CAT_STRAIGHT);
+        // Identical to another junk hand playing the same board.
+        let other = evaluate_nlh(&[c(0, 2), c(1, 3)], &board);
+        assert_eq!(rank, other);
+    }
+
+    #[test]
+    fn nlh_two_hole_cards_when_best() {
+        let hole = [c(12, 0), c(12, 1)]; // AcAd
+        let board = [c(12, 2), c(7, 3), c(5, 1), c(2, 0), c(0, 2)];
+        let rank = evaluate_nlh(&hole, &board);
+        assert_eq!(category(rank), CAT_TRIPS);
+    }
+
+    #[test]
+    fn nlh_partial_boards() {
+        // Flop: pool of exactly 5 → the single possible hand.
+        let hole = [c(12, 0), c(12, 1)];
+        let flop = [c(12, 2), c(7, 3), c(5, 1)];
+        assert_eq!(category(evaluate_nlh(&hole, &flop)), CAT_TRIPS);
+        // Turn adds a pairing card → full house among C(6,5) subsets.
+        let turn = [c(12, 2), c(7, 3), c(5, 1), c(7, 0)];
+        assert_eq!(category(evaluate_nlh(&hole, &turn)), CAT_FULL_HOUSE);
+    }
+
+    #[test]
+    fn nlh_matches_exhaustive_reference_on_random_deals() {
+        // Cross-check the pooled-combination evaluator against a direct
+        // "best evaluate_5 over C(7,5)" reference on random full boards.
+        let mut rng = ChaCha8Rng::seed_from_u64(0xD1CE);
+        for _ in 0..200 {
+            // Draw 7 distinct cards.
+            let mut idx: Vec<u8> = (0..52).collect();
+            for i in 0..7 {
+                let j = rng.gen_range(i..52);
+                idx.swap(i, j);
+            }
+            let cards: Vec<Card> = idx[..7].iter().map(|&i| Card::from_index(i)).collect();
+            let hole = [cards[0], cards[1]];
+            let board = [cards[2], cards[3], cards[4], cards[5], cards[6]];
+            let got = evaluate_nlh(&hole, &board);
+
+            let mut best = 0u32;
+            let pool = &cards[..7];
+            for a in 0..7 {
+                for b in (a + 1)..7 {
+                    for cc in (b + 1)..7 {
+                        for d in (cc + 1)..7 {
+                            for e in (d + 1)..7 {
+                                let r = evaluate_5(&[
+                                    pool[a], pool[b], pool[cc], pool[d], pool[e],
+                                ]);
+                                if r > best {
+                                    best = r;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!(got, best);
+        }
+    }
+}
+
+#[cfg(test)]
+mod plo6_tests {
+    use super::*;
+
+    fn c(rank: u8, suit: u8) -> Card {
+        Card::new(rank, suit)
+    }
+
+    /// The 6th hole card must participate: trip aces need BOTH hole aces,
+    /// which sit at hole indices 4 and 5 — a pair only PAIRS_6 covers.
+    #[test]
+    fn plo6_sixth_card_pairs_into_trips() {
+        let hole = [c(0, 0), c(1, 1), c(5, 3), c(6, 2), c(12, 3), c(12, 1)];
+        let board = [c(12, 0), c(11, 1), c(9, 2)];
+        let r = evaluate_plo5_partial(&hole, &board);
+        assert_eq!(category(r), CAT_TRIPS, "As+Ad (hole idx 4,5) + board Ac");
+    }
+
+    /// Exactly-2-hole rule survives 6-card holes: four hearts in hand +
+    /// two on board is NOT a flush (needs exactly 2 hole + 3 board).
+    #[test]
+    fn plo6_exactly_two_hole_cards_rule() {
+        let hole = [c(12, 2), c(11, 2), c(9, 2), c(7, 2), c(2, 0), c(3, 1)];
+        let board = [c(5, 2), c(6, 2), c(1, 3)];
+        let r = evaluate_plo5_partial(&hole, &board);
+        assert!(
+            category(r) < CAT_FLUSH,
+            "2 board hearts cannot complete a flush regardless of hole hearts"
+        );
+        // ...but three board hearts CAN.
+        let board5 = [c(5, 2), c(6, 2), c(1, 2), c(0, 3), c(3, 3)];
+        let r5 = evaluate_plo5(&hole, &board5);
+        assert_eq!(category(r5), CAT_FLUSH);
+    }
+
+    /// k_partial generic accepts 6-card holes (opp-outcome path).
+    #[test]
+    fn plo6_k_partial_six_cards() {
+        let hole = [c(12, 0), c(12, 1), c(3, 2), c(4, 3), c(8, 0), c(9, 1)];
+        let board = [c(12, 2), c(7, 3), c(2, 0)];
+        let r = evaluate_plo5_k_partial(&hole, &board);
+        assert_eq!(category(r), CAT_TRIPS);
+    }
+
+    /// PLO5 result is identical through the widened evaluator (regression:
+    /// the pairs-table selection must not disturb 5-card behavior).
+    #[test]
+    fn plo5_path_unchanged_by_widening() {
+        let hole = [c(12, 0), c(11, 1), c(9, 2), c(7, 3), c(2, 0)];
+        let board = [c(12, 2), c(11, 3), c(4, 1)];
+        let r = evaluate_plo5_partial(&hole, &board);
+        assert_eq!(category(r), CAT_TWO_PAIR);
+    }
+}
+
+#[cfg(test)]
+mod plo4_tests {
+    use super::*;
+
+    fn c(rank: u8, suit: u8) -> Card {
+        Card::new(rank, suit)
+    }
+
+    /// PAIRS_4 must cover the trailing pair (hole idx 2,3): pocket aces
+    /// there + a board ace = trips.
+    #[test]
+    fn plo4_trailing_pair_makes_trips() {
+        let hole = [c(0, 0), c(5, 1), c(12, 3), c(12, 1)];
+        let board = [c(12, 0), c(11, 1), c(9, 2)];
+        let r = evaluate_plo5_partial(&hole, &board);
+        assert_eq!(category(r), CAT_TRIPS, "As+Ad (hole idx 2,3) + board Ac");
+    }
+
+    /// Exactly-2-hole rule with 4-card holes: three hearts in hand + two
+    /// on board is NOT a flush; three board hearts complete it.
+    #[test]
+    fn plo4_exactly_two_hole_cards_rule() {
+        let hole = [c(12, 2), c(11, 2), c(9, 2), c(2, 0)];
+        let board = [c(5, 2), c(6, 2), c(1, 3)];
+        let r = evaluate_plo5_partial(&hole, &board);
+        assert!(
+            category(r) < CAT_FLUSH,
+            "2 board hearts cannot complete a flush regardless of hole hearts"
+        );
+        let board5 = [c(5, 2), c(6, 2), c(1, 2), c(0, 3), c(3, 3)];
+        let r5 = evaluate_plo5(&hole, &board5);
+        assert_eq!(category(r5), CAT_FLUSH);
+    }
+
+    /// The specialized 4-card path must agree with the generic k-partial
+    /// evaluator on identical inputs (they enumerate the same 6 pairs).
+    #[test]
+    fn plo4_partial_matches_k_partial() {
+        let hole = [c(12, 0), c(11, 1), c(7, 2), c(4, 3)];
+        let board5 = [c(10, 1), c(9, 2), c(8, 3), c(0, 0), c(6, 1)];
+        for n in 3..=5 {
+            let board = &board5[..n];
+            let r_specific = evaluate_plo5_partial(&hole, board);
+            let r_general = evaluate_plo5_k_partial(&hole, board);
+            assert_eq!(
+                r_specific, r_general,
+                "mismatch at board len {n}: specific {r_specific:08x} vs general {r_general:08x}",
+            );
+        }
+    }
+
+    /// PLO5 result is identical through the 4-card widening (regression).
+    #[test]
+    fn plo5_path_unchanged_by_plo4_widening() {
+        let hole = [c(12, 0), c(11, 1), c(9, 2), c(7, 3), c(2, 0)];
+        let board = [c(12, 2), c(11, 3), c(4, 1)];
+        let r = evaluate_plo5_partial(&hole, &board);
+        assert_eq!(category(r), CAT_TWO_PAIR);
     }
 }
