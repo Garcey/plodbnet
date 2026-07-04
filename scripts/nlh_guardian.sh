@@ -25,6 +25,17 @@
 # sizing_entropy_scale 0.65 (gate pressure x1.5, sizing pressure ~const;
 # scale<1 does NOT add gate pressure itself — network detaches p_raise).
 #
+# nlh4 (2026-07-04): FIRST DELIBERATE ANNEAL STEP. nlh3 held Hg 0.75-0.92
+# through u121 and built correct preferences (AA/72o ordering, min-click
+# opens) but frequencies stayed soft (62o UTG: fold only 38%). User
+# directive: MILD sharpening, err toward undershoot — a collapse cannot
+# be un-collapsed, a too-small step just sharpens slower. Step:
+# 0.45 -> 0.40 (~11%; the known cliff is 0.30 — keep 2/3 of the gap).
+# Warm from the newest nlh3_* ckpt. Re-evaluate after 50-100 updates:
+# if still soft AND Hg stable >= 0.6, next step ~0.36. NEVER jump to
+# <= 0.35 in one move. Expected healthy Hg band at 0.40: ~0.65-0.85;
+# the 12/12<0.45 detector stays as an intentionally tight stop-and-look.
+#
 # Config (USER-DIRECTED 2026-07-03, entropy REVISED by collapse mandate):
 #   - COLD START (user mandate: no cross-variant warm-starts — equities
 #     and made-hand strength differ too much by game; the guard refuses
@@ -52,7 +63,7 @@
 set -uo pipefail
 cd /workspace/plodbnet || exit 1
 
-STEM=nlh3
+STEM=nlh4
 GLOG=runs/${STEM}_guardian.log
 STOPFLAG=runs/${STEM}.stop
 LOG=runs/${STEM}.log
@@ -75,7 +86,7 @@ launch(){  # $1 = checkpoint to warm-load ("" = cold start)
     --critic-hidden-dim 1536 --critic-num-blocks 2 \
     --num-envs 49134 --rollout-length 11600000 --num-minibatches 16 --ppo-epochs 2 \
     --stack-dist nlh_topoff --seats-dist nlh_ring --num-seats-range "2,3,4,5,6" \
-    --entropy-coef 0.45 --sizing-entropy-scale 0.65 \
+    --entropy-coef 0.40 --sizing-entropy-scale 0.65 \
     --lr 1.5e-4 --lr-warmup-updates 75 --target-kl 0.5 --kl-hard 10.0 --adv-clip 8 \
     --snapshot-every 5 \
     $load --checkpoint checkpoints/${STEM}.pt \
@@ -85,12 +96,12 @@ launch(){  # $1 = checkpoint to warm-load ("" = cold start)
 
 if [ -z "$(train_pid)" ]; then
   L=$(ls -t checkpoints/${STEM}_*.pt 2>/dev/null | head -1)
-  WARM="${L:-checkpoints/nlh2_20.pt}"
+  WARM="${L:-$(ls -t checkpoints/nlh3_*.pt 2>/dev/null | head -1)}"
   log "initial launch warm-loading ${WARM}"
   launch "$WARM"; sleep 45
 fi
 
-log "started; watching pid=$(train_pid) (nlh_single, entropy=0.45, sizing_scale=0.65, rollout=11.6M, lr=1.5e-4 warmup=75, target_kl=0.5, max_restarts=$MAX_RESTARTS)"
+log "started; watching pid=$(train_pid) (nlh_single, entropy=0.40, sizing_scale=0.65, rollout=11.6M, lr=1.5e-4 warmup=75, target_kl=0.5, max_restarts=$MAX_RESTARTS)"
 while true; do
   [ -f "$STOPFLAG" ] && { log "stop flag present -> exiting"; exit 0; }
   sleep "$POLL"
