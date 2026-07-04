@@ -137,6 +137,71 @@ def test_switch_back_to_plo5_is_clean(client):
     assert rec_ready_state["pot_chips"] > 0
 
 
+def test_trainer_settings_are_per_format(client):
+    """Each format owns its settings object: NLH edits must never leak
+    into PLO5 (a shared object once persisted NLH's 0.5bb ante and
+    reloaded it under PLO5 — the 1bb-pot heads-up 'Bet $10' bug)."""
+    # PLO5 baseline: factory defaults.
+    t = client.get("/trainer/state").json()["state"]
+    assert t["trainer"]["settings"]["ante_bb"] == 3.0
+    assert t["trainer"]["settings"]["dollars_per_bb"] == 20.0
+
+    # NLH: its own defaults; then customize its fixed stack.
+    client.post("/format", json={"format": "nlh_single"})
+    t = client.get("/trainer/state").json()["state"]
+    nlh_settings = dict(t["trainer"]["settings"])
+    assert nlh_settings["ante_bb"] == 0.5
+    assert nlh_settings["stack_bb"] == 100.0
+    assert nlh_settings["dollars_per_bb"] == 10.0
+    nlh_settings["stack_bb"] = 200.0
+    r = client.post("/trainer/settings", json=nlh_settings)
+    assert r.status_code == 200
+
+    # Back to PLO5: untouched factory defaults, not NLH residue.
+    client.post("/format", json={"format": "plo5_double_bomb"})
+    t = client.get("/trainer/state").json()["state"]
+    s = t["trainer"]["settings"]
+    assert s["ante_bb"] == 3.0 and s["stack_bb"] == 20.0
+    assert s["dollars_per_bb"] == 20.0
+
+    # And NLH kept the user's edit.
+    client.post("/format", json={"format": "nlh_single"})
+    t = client.get("/trainer/state").json()["state"]
+    assert t["trainer"]["settings"]["stack_bb"] == 200.0
+
+
+def test_trainer_legacy_settings_file_healed(tmp_path):
+    """A v1 stats file (single 'settings' key — possibly polluted with
+    the other format's stakes) is discarded on load: both formats
+    restart at their own defaults, lifetime stats survive."""
+    import json
+    import torch
+
+    from plo5bp.network import ActorCriticV2
+    from plo5bp.ui.trainer import TrainerSession
+
+    stats = tmp_path / "stats.json"
+    stats.write_text(json.dumps({
+        "version": 1,
+        "lifetime": {"hands": 42, "decisions": 100, "sum_score": 9000.0,
+                     "ev_loss_bb": 1.5, "cat_counts": {}},
+        "settings": {"ante_bb": 0.5, "stack_bb": 100.0,
+                     "dollars_per_bb": 10.0},
+    }))
+    torch.manual_seed(0)
+    net = ActorCriticV2(obs_dim=991, hidden_dim=16, num_layers=1)
+    ts = TrainerSession(net, torch.device("cpu"), stats_path=stats)
+    assert ts.settings.ante_bb == 3.0, "polluted legacy settings discarded"
+    assert ts.settings.stack_bb == 20.0
+    assert ts.lifetime_stats.hands == 42, "lifetime stats preserved"
+    # v2 round-trip: per-format entries persist and reload.
+    ts.settings_by_variant["nlh_single"].mc_rollouts  # exists
+    ts._persist()
+    reloaded = TrainerSession(net, torch.device("cpu"), stats_path=stats)
+    assert reloaded.settings_by_variant["nlh_single"].ante_bb == 0.5
+    assert reloaded.settings_by_variant["plo5_double_bomb"].ante_bb == 3.0
+
+
 def test_trainer_follows_format(client):
     client.post("/format", json={"format": "nlh_single"})
     t = client.post("/trainer/new_hand").json()["state"]

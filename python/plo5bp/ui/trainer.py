@@ -437,6 +437,25 @@ class TrainerSettings(BaseModel):
         return self
 
 
+def _default_settings(variant: str) -> TrainerSettings:
+    """The format's factory settings. PLO5 = the TrainerSettings field
+    defaults (20bb bomb pot, 3bb ante, $20/bb). NLH = the 5/10($5)
+    table: 100bb top-off baseline, 100-250bb random band, 0.5bb ante,
+    $10/bb. Each format OWNS its settings object — switching formats
+    swaps objects, never overwrites values (a shared object once leaked
+    NLH's 0.5bb ante into PLO5 hands across a restart, 2026-07-04)."""
+    if variant == VARIANT_NLH:
+        return TrainerSettings(
+            stack_bb=100.0,
+            stack_min_bb=100.0,
+            stack_max_bb=250.0,
+            stacks_per_seat_bb=[(100.0, 100.0)] * 6,
+            ante_bb=0.5,
+            dollars_per_bb=10.0,
+        )
+    return TrainerSettings()
+
+
 class TrainerActRequest(BaseModel):
     gate: str = Field(..., pattern=r"^(fold|check_call|raise)$")
     chips: int | None = Field(default=None, ge=0)
@@ -586,10 +605,15 @@ class TrainerSession:
         # → review shows only the actor's own (blind) value estimate.
         self.critic = critic
         # Active game format. `set_format` swaps model/critic to the new
-        # format's pair and re-defaults the stake settings.
+        # format's pair and points `self.settings` at that format's OWN
+        # settings object (see settings_by_variant).
         self.variant = VARIANT_PLO5
         self.lock = threading.Lock()
-        self.settings = TrainerSettings()
+        self.settings_by_variant: dict[str, TrainerSettings] = {
+            VARIANT_PLO5: _default_settings(VARIANT_PLO5),
+            VARIANT_NLH: _default_settings(VARIANT_NLH),
+        }
+        self.settings = self.settings_by_variant[self.variant]
         self.hand: HandRecord | None = None
         self.hand_no = 0
         self.session_stats = StatsBlock()
@@ -613,9 +637,10 @@ class TrainerSession:
         critic: CentralCritic | None,
     ) -> None:
         """Switch the trainer's game format: swap the served model/critic
-        pair, drop the live hand (it belongs to the other game), and apply
-        the format's default stake settings (NLH: 100-250bb at 5/10 with a
-        0.5bb ante; PLO5: the historical 20bb bomb pot). Session/lifetime
+        pair, drop the live hand (it belongs to the other game), and
+        point `self.settings` at the format's OWN settings object.
+        Formats never share or overwrite each other's settings; each
+        keeps whatever the user last configured for it. Session/lifetime
         stats keep accumulating across formats."""
         if variant == self.variant:
             return
@@ -625,25 +650,14 @@ class TrainerSession:
         self._policy = model_policy(model, deterministic=False)
         self._obs_adapt = obs_adapter(model)
         self.hand = None
-        s = self.settings
-        if variant == VARIANT_NLH:
-            self.settings = s.model_copy(update={
-                "stack_bb": 100.0,
-                "stack_min_bb": 100.0,
-                "stack_max_bb": 250.0,
-                "stacks_per_seat_bb": [(100.0, 100.0)] * 6,
-                "ante_bb": 0.5,
-                "dollars_per_bb": 10.0,
-            })
-        else:
-            self.settings = s.model_copy(update={
-                "stack_bb": 20.0,
-                "stack_min_bb": 10.0,
-                "stack_max_bb": 50.0,
-                "stacks_per_seat_bb": [(20.0, 20.0)] * 6,
-                "ante_bb": 3.0,
-                "dollars_per_bb": 20.0,
-            })
+        self.settings = self.settings_by_variant[variant]
+
+    def set_settings(self, settings: TrainerSettings) -> None:
+        """Replace the ACTIVE format's settings (and keep the per-format
+        registry in sync — `self.settings` must always be the same object
+        as its registry entry)."""
+        self.settings_by_variant[self.variant] = settings
+        self.settings = settings
 
     # -- persistence ----------------------------------------------------------
 
@@ -658,17 +672,32 @@ class TrainerSession:
             return
         try:
             self.lifetime_stats = StatsBlock.from_dict(data.get("lifetime", {}))
-            if isinstance(data.get("settings"), dict):
-                self.settings = TrainerSettings.model_validate(data["settings"])
+            # v2 schema: settings stored PER FORMAT. The legacy v1
+            # single "settings" key is deliberately DISCARDED (not
+            # migrated): a shared-object bug once persisted NLH stakes
+            # into it and re-loaded them under PLO5 (0.5bb-ante bomb
+            # pots, 2026-07-04) — legacy content can't be trusted to
+            # belong to either format, so both restart at defaults.
+            by_fmt = data.get("settings_by_format")
+            if isinstance(by_fmt, dict):
+                for variant in (VARIANT_PLO5, VARIANT_NLH):
+                    if isinstance(by_fmt.get(variant), dict):
+                        self.settings_by_variant[variant] = (
+                            TrainerSettings.model_validate(by_fmt[variant])
+                        )
+                self.settings = self.settings_by_variant[self.variant]
         except Exception as e:
             logger.warning("trainer stats file %s malformed (%s) — starting fresh",
                            self.stats_path, e)
 
     def _persist(self) -> None:
         payload = {
-            "version": 1,
+            "version": 2,
             "lifetime": self.lifetime_stats.to_dict(),
-            "settings": self.settings.model_dump(),
+            "settings_by_format": {
+                variant: s.model_dump()
+                for variant, s in self.settings_by_variant.items()
+            },
         }
         try:
             self.stats_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1903,7 +1932,9 @@ def create_trainer_router(
     def trainer_settings(req: TrainerSettings) -> dict[str, Any]:
         ts = _ts()
         with ts.lock:
-            ts.settings = req
+            # Applies to the ACTIVE format only (each format owns its
+            # settings; set_settings keeps the per-format registry in sync).
+            ts.set_settings(req)
             ts._persist()
             _ensure_hand(ts)
             return {"state": ts.project_state()}
