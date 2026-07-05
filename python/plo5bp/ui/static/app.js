@@ -2660,6 +2660,19 @@ function setupRaiseInput() {
 }
 
 async function init() {
+  // Signed-out public visitors receive landing-only markup (the app chrome
+  // between the WGAPP markers is stripped server-side). Wire just the gate
+  // and bail BEFORE the app setups below, which query app-chrome elements
+  // that don't exist in that markup. setupPublicUI is null-guarded and only
+  // touches landing/paywall elements, so it's safe to run first.
+  if (window.PLO5BP_PUBLIC) {
+    setupPublicUI();
+    await refreshMe();
+    if (!UI.me || !UI.me.signed_in) {
+      showLoginOverlay(true);
+      return;
+    }
+  }
   setupTopBar();
   setupDealerDrag();
   setupInsertHover();
@@ -2675,14 +2688,6 @@ async function init() {
     toggleStatsBlock(block && block.id === "stats-lifetime" ? "lifetime" : "session");
   });
   if (window.PLO5BP_PUBLIC) {
-    setupPublicUI();
-    await refreshMe();
-    if (!UI.me || !UI.me.signed_in) {
-      // Signed out: show the gate; skip state fetches (they would 401).
-      showLoginOverlay(true);
-      applyModeUI();
-      return;
-    }
     await handleCheckoutReturn();
     // Free accounts land in the trainer (Study is subscriber-only).
     if (!isEntitled() && UI.mode === "study") UI.mode = "trainer";
