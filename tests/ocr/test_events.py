@@ -2180,3 +2180,85 @@ def test_exact_folds_suppresses_inferred_fold_on_coasted_seat():
     suppressed = [e for e in run(True)
                   if isinstance(e, SeatAction) and e.gate == "fold" and e.seat == 1]
     assert not suppressed, "exact_folds must not infer a fold for a non-folded seat"
+
+
+# --- Bug #8: last_fs stack carry-forward over a banner-occluded read -----
+
+
+def test_banner_occluded_stack_is_carried_forward_into_baseline():
+    """Bug #8: on the action tick the blue bet-banner covers the bettor's
+    stack label, so `stack_chips` OCR-reads None while the commit oval is
+    also mid-animation (None). The walk emits a banner-only OcrWarning and
+    breaks (branch 3). `last_fs` used to be stored UNCONDITIONALLY, baking
+    that None stack into the baseline; the next tick — stack now readable,
+    commit oval reads late — could not compute a stack-drop (prev stack is
+    None) and the corroboration guard (needs same-tick banner or matching
+    drop, both gone) rejected the commit. The bet became permanently
+    invisible.
+
+    Fix: when storing the baseline, carry forward the PREVIOUS tick's
+    `stack_chips` for any seat whose current read is None, so a transient
+    banner-occluded stack read doesn't destroy next-tick drop detection.
+
+    This test drives the exact 3-tick sequence and asserts the raise is
+    recovered on the second post-bet tick. Pre-fix it fails: tick B emits
+    no SeatAction (see the poisoned-baseline assertion for why).
+    """
+    rec = EventReconstructor(num_seats=6)
+
+    eng = _engine(
+        current_actor=1,
+        commits=[0] * 6,
+        stacks=[163_513 * 5] * 6,
+        bet_to_call=0,
+        chips_per_cent=5.0,
+        min_bet_cents=2_000,
+    )
+
+    # Bootstrap (pre-bet): seat 1 stack reads 163_513 cents, no commits.
+    base = _fs([0] * 6, [163_513] * 6)
+    rec.step(base, eng)
+
+    # Tick A — seat 1 bets $180. Banner covers the stack label (stack
+    # reads None) and the chip oval is mid-animation (commit reads None).
+    # Branch 3 fires: banner-only warning, walk breaks, no SeatAction.
+    from plo5bp.ocr.events import OcrWarning
+
+    tick_a = _fs(
+        [None, None, 0, 0, 0, 0],
+        [163_513, None, 163_513, 163_513, 163_513, 163_513],
+        banners=[False, True, False, False, False, False],
+    )
+    ev_a = rec.step(tick_a, eng)
+    assert not [e for e in ev_a if isinstance(e, SeatAction)], (
+        f"tick A should emit no SeatAction (banner-only), got {ev_a}"
+    )
+    assert any(isinstance(e, OcrWarning) for e in ev_a)
+
+    # The fix: seat 1's None stack must NOT have poisoned the baseline —
+    # the previous tick's 163_513 is carried forward so next tick can
+    # compute the drop. (Pre-fix this is None and the bet is lost.)
+    assert rec.last_fs is not None
+    assert rec.last_fs.seats[1].stack_chips == 163_513, (
+        "banner-occluded None stack was baked into baseline; drop can no "
+        "longer be computed next tick"
+    )
+    # Seats whose stack genuinely read this tick pass through unchanged.
+    assert rec.last_fs.seats[0].stack_chips == 163_513
+    # committed_chips must NOT be carried forward — its None/0 semantics
+    # are load-bearing in the ladder.
+    assert rec.last_fs.seats[1].committed_chips is None
+
+    # Tick B — banner clears, stack now reads the post-bet 145_513 cents
+    # (dropped 18_000 = $180). Commit oval STILL missing (None). The
+    # carried-forward 163_513 baseline lets branch 2 derive the bet from
+    # the 18_000-cent stack drop × 5 = 90_000 engine-chips.
+    tick_b = _fs(
+        [None, None, 0, 0, 0, 0],
+        [163_513, 145_513, 163_513, 163_513, 163_513, 163_513],
+    )
+    ev_b = rec.step(tick_b, eng)
+    seat_actions = [e for e in ev_b if isinstance(e, SeatAction)]
+    assert SeatAction(seat=1, gate="raise", chips=90_000) in seat_actions, (
+        f"bet lost — carried-forward stack baseline failed; got {seat_actions}"
+    )

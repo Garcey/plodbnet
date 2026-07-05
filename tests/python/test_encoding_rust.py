@@ -22,7 +22,12 @@ import numpy as np
 import pytest
 
 from plo5bp._engine import BatchedEngine, GameState  # type: ignore[attr-defined]
-from plo5bp.config import GameConfig
+from plo5bp.config import (
+    VARIANT_PLO4,
+    VARIANT_PLO5,
+    VARIANT_PLO6,
+    GameConfig,
+)
 from plo5bp.encoding import encode_observation, encode_observation_batch
 
 _HAS_RUST_ENCODER = hasattr(BatchedEngine, "observation_encoded_batch")
@@ -46,28 +51,32 @@ def _augmented_scalar_obs(gs: GameState) -> dict:
     return raw
 
 
-def _make_serial(num_seats, starting_stack, ante, bb, starting_stacks, seed, button):
+def _make_serial(num_seats, starting_stack, ante, bb, starting_stacks, seed, button,
+                 variant=VARIANT_PLO5):
     if starting_stacks is None:
-        gs = GameState(num_seats, starting_stack, ante, bb)
+        gs = GameState(num_seats, starting_stack, ante, bb, variant=variant)
     else:
         gs = GameState(
             num_seats, starting_stack, ante, bb,
             starting_stacks=np.asarray(starting_stacks, dtype=np.uint64),
+            variant=variant,
         )
     gs.reset(int(seed), int(button))
     return gs
 
 
-def _make_batched(batch_size, num_seats, starting_stack, ante, bb, starting_stacks):
+def _make_batched(batch_size, num_seats, starting_stack, ante, bb, starting_stacks,
+                  variant=VARIANT_PLO5):
     if starting_stacks is None:
         return BatchedEngine(
             batch_size, num_seats=num_seats, starting_stack=starting_stack,
-            ante=ante, bb=bb,
+            ante=ante, bb=bb, variant=variant,
         )
     return BatchedEngine(
         batch_size, num_seats=num_seats, starting_stack=starting_stack,
         ante=ante, bb=bb,
         starting_stacks=np.asarray(starting_stacks, dtype=np.uint64),
+        variant=variant,
     )
 
 
@@ -100,19 +109,20 @@ def _assert_rust_matches(be, serial, config, step: int) -> None:
         ), f"step {step}: aux field {key} mismatch"
 
 
-def _config(num_seats, starting_stack, ante, bb, starting_stacks):
+def _config(num_seats, starting_stack, ante, bb, starting_stacks, variant=VARIANT_PLO5):
     kw = {}
     if starting_stacks is not None:
         kw["starting_stacks"] = tuple(int(x) for x in starting_stacks)
     return GameConfig(
-        num_seats=num_seats, starting_stack=starting_stack, ante=ante, bb=bb, **kw
+        num_seats=num_seats, starting_stack=starting_stack, ante=ante, bb=bb,
+        variant=variant, **kw
     )
 
 
 def _drive(num_seats, starting_stack, batch_size, base_seed,
-           starting_stacks=None, max_steps=200) -> None:
+           starting_stacks=None, max_steps=200, variant=VARIANT_PLO5) -> None:
     ante, bb = 30000, 10000
-    config = _config(num_seats, starting_stack, ante, bb, starting_stacks)
+    config = _config(num_seats, starting_stack, ante, bb, starting_stacks, variant)
     rng = np.random.default_rng(base_seed)
     env_rngs = [np.random.default_rng(base_seed * 1000 + i) for i in range(batch_size)]
     seeds = rng.integers(0, 2**63 - 1, size=batch_size, dtype=np.int64).astype(np.uint64)
@@ -120,10 +130,11 @@ def _drive(num_seats, starting_stack, batch_size, base_seed,
 
     serial = [
         _make_serial(num_seats, starting_stack, ante, bb, starting_stacks,
-                     seeds[i], buttons[i])
+                     seeds[i], buttons[i], variant=variant)
         for i in range(batch_size)
     ]
-    be = _make_batched(batch_size, num_seats, starting_stack, ante, bb, starting_stacks)
+    be = _make_batched(batch_size, num_seats, starting_stack, ante, bb, starting_stacks,
+                       variant=variant)
     be.reset_batch(seeds, buttons)
 
     _assert_rust_matches(be, serial, config, step=-1)  # initial state
@@ -201,3 +212,46 @@ def test_rust_encoder_subset_matches_full() -> None:
         be.observation_encoded_subset_batch(np.zeros(0, dtype=np.int64))["obs"]
     )
     assert empty.shape[0] == 0
+
+
+# --- PLO4 / PLO6 variant parity (the batch encoder must key the hole
+# multi-hot off the variant's hole width, not a hardcoded 5). Regression
+# guard for the merged hole/board loop that panicked on PLO4 (index OOB)
+# and silently dropped the 6th hole card on PLO6. ---
+
+
+@pytest.mark.parametrize(
+    "variant, hole_count",
+    [(VARIANT_PLO4, 4), (VARIANT_PLO6, 6)],
+)
+@pytest.mark.parametrize("num_seats", [2, 6])
+@pytest.mark.parametrize("batch_size", [1, 8])
+def test_rust_encoder_parity_plo4_plo6(variant, hole_count, num_seats, batch_size) -> None:
+    """Rust==numpy==scalar three-way parity over a full rollout for PLO4/PLO6.
+    Exercises (via `_drive` -> `_assert_rust_matches`) that the Rust encoder no
+    longer panics on PLO4 (hole width 4) and is byte-identical to the numpy
+    encoder on PLO6 (hole width 6)."""
+    _drive(num_seats, 200000, batch_size, base_seed=13, variant=variant)
+
+
+@pytest.mark.parametrize(
+    "variant, hole_count",
+    [(VARIANT_PLO4, 4), (VARIANT_PLO5, 5), (VARIANT_PLO6, 6)],
+)
+def test_rust_encoder_hole_multihot_popcount(variant, hole_count) -> None:
+    """The Rust-encoded hole multi-hot (obs[:52]) must have popcount == the
+    variant's hole width at the initial (flop) state — PLO4 4, PLO5 5, PLO6 6.
+    PLO4 also confirms the encoder returns instead of panicking with an
+    index-out-of-bounds on the 5th (nonexistent) hole slot."""
+    ante, bb, num_seats = 30000, 10000, 6
+    n = 8
+    be = _make_batched(n, num_seats, 200000, ante, bb, None, variant=variant)
+    seeds = np.arange(100, 100 + n, dtype=np.uint64)
+    buttons = np.zeros(n, dtype=np.uint8)
+    be.reset_batch(seeds, buttons)
+    obs = np.asarray(be.observation_encoded_batch()["obs"])  # must not panic
+    for i in range(n):
+        pc = int(obs[i, :52].sum())
+        assert pc == hole_count, (
+            f"{variant} env {i}: hole multi-hot popcount {pc} != {hole_count}"
+        )

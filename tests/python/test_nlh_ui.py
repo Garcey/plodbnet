@@ -20,7 +20,22 @@ import plo5bp.ui.server as srv
 
 
 @pytest.fixture()
-def client():
+def client(tmp_path):
+    # Reset the module-global trainer session to fresh per-format defaults and
+    # an isolated stats file. These tests switch formats and one persists NLH
+    # settings, so without the reset they read order-dependent stale state and
+    # without isolation they overwrite the real checkpoints/trainer_stats.json
+    # (which then self-poisons the next run).
+    from plo5bp.ui.trainer import _default_settings, VARIANT_NLH, VARIANT_PLO5
+
+    ts = srv.trainer_router.trainer_session
+    ts.stats_path = tmp_path / "trainer_stats.json"
+    ts.settings_by_variant = {
+        VARIANT_PLO5: _default_settings(VARIANT_PLO5),
+        VARIANT_NLH: _default_settings(VARIANT_NLH),
+    }
+    ts.variant = VARIANT_PLO5
+    ts.settings = ts.settings_by_variant[VARIANT_PLO5]
     c = TestClient(srv.app)
     # Always leave the module-global session back on PLO5 for other tests.
     yield c

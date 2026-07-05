@@ -242,7 +242,11 @@ fn ck_eval_inline(c: [u32; 5], t: &CkTables) -> u16 {
     let prod = (c[0] & 0xFF) * (c[1] & 0xFF) * (c[2] & 0xFF) * (c[3] & 0xFF) * (c[4] & 0xFF);
     match t.paired.binary_search_by_key(&prod, |&(p, _)| p) {
         Ok(i) => t.paired[i].1,
-        Err(_) => unreachable!("prime product {prod} not in paired table"),
+        // Degenerate sentinel (same 0 the combo loops filter with `ck != 0`):
+        // a study-mode duplicate hole can give a >4-of-a-kind rank multiset
+        // (e.g. five-of-a-kind, prime product 41^5) with no paired-table
+        // entry; production deals are duplicate-free and can't reach it.
+        Err(_) => 0,
     }
 }
 

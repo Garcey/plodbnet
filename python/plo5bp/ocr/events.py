@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from plo5bp.ocr.types import Card, FrameState
 
@@ -343,7 +343,28 @@ class EventReconstructor:
         if now_active is not None:
             self._observed_active_actor = now_active
 
-        self.last_fs = fs
+        # Store the new baseline, but carry forward the PREVIOUS tick's
+        # `stack_chips` for any seat whose current read is None. ClubGG's
+        # blue bet-banner covers the stack label on the action tick, so a
+        # bettor's `stack_chips` OCR-reads None exactly when we most need
+        # it. If we baked that None in, next tick's stack-drop would be
+        # incomputable (prev_stack is None) and the bet — whose commit
+        # oval reads late — would be permanently lost (its corroboration
+        # needs a same-tick banner or stack drop, both gone by then).
+        # STACK ONLY: `committed_chips`'s None/0 semantics are load-bearing
+        # in the ladder (a None/0 commit legitimately means "no action"),
+        # so it is NOT carried forward. Board/street/button/actor fields
+        # all come from `fs`, preserving the StreetReveal dedupe (which
+        # compares board counts between last_fs and fs).
+        prev_seats = {s.seat: s for s in last.seats}
+        merged_seats = tuple(
+            s
+            if s.stack_chips is not None or s.seat not in prev_seats
+            or prev_seats[s.seat].stack_chips is None
+            else replace(s, stack_chips=prev_seats[s.seat].stack_chips)
+            for s in fs.seats
+        )
+        self.last_fs = replace(fs, seats=merged_seats)
         return events
 
     # -- helpers ------------------------------------------------------

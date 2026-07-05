@@ -119,6 +119,13 @@ const UI = {
   settingsOpen: false,
   animSeq: 0,             // bumped to cancel an in-flight frame animation
   animating: false,
+  // In-flight guard for state-mutating action / new-hand / raise POSTs.
+  // Set true BEFORE the POST is issued and cleared in a finally after the
+  // response is fully handled (incl. 401/402/500). Blocks double-clicks
+  // (double-graded decisions, wrong-seat folds, burned free hands) while
+  // one request is outstanding. Composes with `animating`: this covers the
+  // network round-trip, `animating` covers the subsequent frame playback.
+  actionInFlight: false,
 };
 
 const TRAINER_ANIM_MS = 1200;
@@ -213,17 +220,48 @@ async function postSeats(body) {
   try { const data = await postJSON("/seats", body); applyState(data.state); }
   catch (e) { showToast(e.message); }
 }
+// Visually disable the action controls while a state-mutating POST is in
+// flight, so a double-click both no-ops (via UI.actionInFlight) AND looks
+// disabled. Purely cosmetic — the guard is the flag; this just mirrors it.
+// Best-effort: elements may be absent/re-rendered, so guard every lookup.
+function setActionsBusy(busy) {
+  const ids = [
+    "raise-submit",
+    "trainer-new-hand-btn", "trainer-repeat-btn",
+    "review-next-hand", "review-repeat-hand",
+  ];
+  for (const id of ids) {
+    const el = document.getElementById(id);
+    if (el) el.disabled = busy;
+  }
+  const gate = document.getElementById("gate-buttons");
+  if (gate) {
+    gate.classList.toggle("busy", busy);
+    for (const b of gate.querySelectorAll("button")) b.disabled = busy;
+  }
+}
 async function postAction(body) {
+  // In-flight guard: a second click while the first POST is outstanding is
+  // a no-op (prevents double-graded trainer decisions / wrong-seat study
+  // folds / double raise-submits). `animating` still gates the subsequent
+  // opponent frame playback; this gates the network round-trip before it.
+  if (UI.actionInFlight) return;
   if (UI.mode === "trainer") {
     if (UI.animating) return;
+    UI.actionInFlight = true;
+    setActionsBusy(true);
     try {
       const data = await postJSON("/trainer/act", body);
       await animateTrainerResponse(data);
     } catch (e) { showToast(e.message); }
+    finally { UI.actionInFlight = false; setActionsBusy(false); }
     return;
   }
+  UI.actionInFlight = true;
+  setActionsBusy(true);
   try { const data = await postJSON("/action", body); applyState(data.state); }
   catch (e) { showToast(e.message); }
+  finally { UI.actionInFlight = false; setActionsBusy(false); }
 }
 async function postTrainer(path, body) {
   try {
@@ -2504,20 +2542,25 @@ async function saveTrainerSettings() {
 function setupTrainerControls() {
   document.getElementById("tab-study").addEventListener("click", () => setMode("study"));
   document.getElementById("tab-trainer").addEventListener("click", () => setMode("trainer"));
-  const newHand = () => {
+  // Both share the in-flight guard: the public build's free-tier middleware
+  // counts every POST /trainer/new_hand, so an unguarded double-click burns
+  // 2 of 5 daily hands while showing one. `postTrainer` never rejects
+  // (its own try/catch), so clearing in `.finally` is always reached.
+  const dealGuarded = (path) => {
+    if (UI.actionInFlight) return;
     cancelTrainerPick();
     UI.reviewDecision = null;
     UI.reviewNode = null;
     UI.selectedSlot = null;
-    postTrainer("new_hand");
+    UI.actionInFlight = true;
+    setActionsBusy(true);
+    postTrainer(path).finally(() => {
+      UI.actionInFlight = false;
+      setActionsBusy(false);
+    });
   };
-  const repeatHand = () => {
-    cancelTrainerPick();
-    UI.reviewDecision = null;
-    UI.reviewNode = null;
-    UI.selectedSlot = null;
-    postTrainer("repeat");
-  };
+  const newHand = () => dealGuarded("new_hand");
+  const repeatHand = () => dealGuarded("repeat");
   document.getElementById("trainer-new-hand-btn").addEventListener("click", newHand);
   document.getElementById("trainer-repeat-btn").addEventListener("click", repeatHand);
   document.getElementById("review-next-hand").addEventListener("click", newHand);

@@ -2106,11 +2106,17 @@ fn encode_obs_row(
     let bb_slice = bb_view.as_slice().unwrap();
 
     // --- Card multi-hots (hole / board A / board B). ---
-    for slot in 0..5 {
-        let c = hole_slice[slot];
+    // Hole width is variant-dependent (PLO4=4, PLO5=5, PLO6=6), so the
+    // hole loop is driven by `hole_slice.len()`; boards are always 5
+    // wide and stay `0..5`. Do NOT merge these — a `0..5` hole loop
+    // reads out of bounds on PLO4 and silently drops the 6th card on
+    // PLO6 (CLAUDE.md variant-encoding gotcha).
+    for &c in hole_slice {
         if c < 52 {
             out[HOLE_OFF + c as usize] = 1.0;
         }
+    }
+    for slot in 0..5 {
         let ca = ba_slice[slot];
         if ca < 52 {
             out[BOARD_A_OFF + ca as usize] = 1.0;
