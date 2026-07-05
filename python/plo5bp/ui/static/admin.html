@@ -84,6 +84,14 @@
       const $ = (id) => document.getElementById(id);
       const fmtUsd = (c) => `$${(c / 100).toFixed(2)}`;
       const fmtDay = (iso) => (iso ? iso.slice(0, 10) : "—");
+      // Escape every DB/user-derived string before it goes into innerHTML.
+      // `name`/`email` originate from the Google profile (fully user-controlled)
+      // and `ref`/`sub_source` from Stripe/DB — none may inject markup here or a
+      // crafted display name becomes stored XSS in the admin's own session.
+      const esc = (s) =>
+        String(s ?? "").replace(/[&<>"']/g, (c) =>
+          ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
+        );
 
       async function j(url, opts) {
         const res = await fetch(url, opts);
@@ -115,7 +123,7 @@
             const sub = x.is_admin
               ? '<span class="pill admin">ADMIN</span>'
               : x.sub_status === "active"
-                ? `<span class="pill active-${x.sub_source}">${x.sub_source.toUpperCase()}</span>` +
+                ? `<span class="pill active-${esc(x.sub_source)}">${esc(x.sub_source).toUpperCase()}</span>` +
                   (x.period_end ? ` <span class="muted">→ ${fmtDay(x.period_end)}</span>` : "")
                 : '<span class="pill none">FREE</span>';
             const btn = x.sub_status === "active" && x.sub_source === "comp"
@@ -124,7 +132,7 @@
                 ? `<button class="grant" data-uid="${x.id}" data-action="grant">Grant comp</button>`
                 : '<span class="muted">via Stripe</span>';
             return `<tr>
-              <td>${x.email}</td><td>${x.name || "—"}</td>
+              <td>${esc(x.email)}</td><td>${esc(x.name) || "—"}</td>
               <td class="num">${fmtDay(x.created_at)}</td>
               <td class="num">${fmtDay(x.last_login_at)}</td>
               <td>${sub}</td>
@@ -136,10 +144,10 @@
 
           $("payment-rows").innerHTML = m.recent_payments.length
             ? m.recent_payments.map((p) => `<tr>
-                <td class="num">${p.created_at.replace("T", " ").slice(0, 16)}</td>
-                <td>${p.email}</td>
+                <td class="num">${esc(p.created_at).replace("T", " ").slice(0, 16)}</td>
+                <td>${esc(p.email)}</td>
                 <td class="num">${fmtUsd(p.amount_cents)}</td>
-                <td class="muted">${p.ref}</td>
+                <td class="muted">${esc(p.ref)}</td>
               </tr>`).join("")
             : '<tr><td colspan="4" class="muted">No payments recorded yet.</td></tr>';
 
