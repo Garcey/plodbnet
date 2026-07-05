@@ -75,6 +75,18 @@ restarts=0
 log(){ echo "[${STEM}-guardian $(date -u '+%m-%d %H:%M:%S')] $*" >> "$GLOG"; }
 train_pid(){ pgrep -f "python -u scripts/[t]rain.py" | head -1; }
 
+# Resolve the checkpoint to warm-load: newest ${STEM}_*.pt, else fall back to
+# the nlh3 lineage nlh4 was warm-started from. nlh4 runs at entropy 0.40 —
+# BELOW the 0.45 cold-start floor — so it must NEVER cold-start: a random-init
+# net at 0.40 is the exact nlh2 all-fold collapse configuration. An empty
+# result means the caller REFUSES to launch rather than drop into that trap.
+warm_ckpt(){
+  local l
+  l=$(ls -t checkpoints/${STEM}_*.pt 2>/dev/null | head -1)
+  [ -n "$l" ] || l=$(ls -t checkpoints/nlh3_*.pt 2>/dev/null | head -1)
+  echo "$l"
+}
+
 launch(){  # $1 = checkpoint to warm-load ("" = cold start)
   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
   export PATH="$HOME/.cargo/bin:$PATH"
@@ -95,8 +107,11 @@ launch(){  # $1 = checkpoint to warm-load ("" = cold start)
 }
 
 if [ -z "$(train_pid)" ]; then
-  L=$(ls -t checkpoints/${STEM}_*.pt 2>/dev/null | head -1)
-  WARM="${L:-$(ls -t checkpoints/nlh3_*.pt 2>/dev/null | head -1)}"
+  WARM="$(warm_ckpt)"
+  if [ -z "$WARM" ]; then
+    log "REFUSING initial launch: no ${STEM}_*/nlh3_* checkpoint to warm from — a 0.40 cold start is the nlh2 collapse config. Seed a checkpoint first."
+    touch "$STOPFLAG"; exit 1
+  fi
   log "initial launch warm-loading ${WARM}"
   launch "$WARM"; sleep 45
 fi
@@ -115,9 +130,12 @@ while true; do
     if [ -z "$PID" ]; then
       if [ "$restarts" -ge "$MAX_RESTARTS" ]; then log "DEAD; restart cap ($MAX_RESTARTS) hit -> STOP"; touch "$STOPFLAG"; exit 0; fi
       restarts=$((restarts+1))
-      L=$(ls -t checkpoints/${STEM}_*.pt 2>/dev/null | head -1)
-      WARM="${L:-}"
-      log "process DEAD (crash/OOM); relaunch #$restarts warm-loading ${WARM:-COLD}"
+      WARM="$(warm_ckpt)"
+      if [ -z "$WARM" ]; then
+        log "process DEAD but NO ${STEM}_*/nlh3_* checkpoint found — REFUSING cold relaunch (0.40 cold = nlh2 collapse config) -> STOP"
+        touch "$STOPFLAG"; exit 1
+      fi
+      log "process DEAD (crash/OOM); relaunch #$restarts warm-loading ${WARM}"
       launch "$WARM"; sleep 45; continue
     fi
   fi

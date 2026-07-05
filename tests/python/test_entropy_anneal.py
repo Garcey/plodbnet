@@ -170,46 +170,63 @@ def test_apply_anneal_control_step_and_tiers():
     apply = train._apply_anneal_control
     tier_ent = {"clubgg": 0.09, "deep": 0.15}
     lr0 = 3e-4
+    ent0 = 0.40   # flat live entropy coef (NLH / plain --stack-dist runs)
+    entd0 = 0.45  # the deep-dist flat variant
 
-    # No file content -> unchanged (now a 3-tuple incl. live_lr).
-    step, last, lr = apply(None, None, tier_ent, 0.002, lr0)
+    # No file content -> everything unchanged. Return is a 5-tuple:
+    # (step, applied_content, live_lr, live_ent, live_ent_deep).
+    step, last, lr, ent, entd = apply(None, None, tier_ent, 0.002, lr0, ent0, entd0)
     assert step == 0.002 and last is None and lr == lr0
+    assert ent == ent0 and entd == entd0
 
     # Step change applies once and is remembered via content tracking.
     raw1 = '{"step": 0.003}'
-    step, last, lr = apply(raw1, None, tier_ent, 0.002, lr)
+    step, last, lr, ent, entd = apply(raw1, None, tier_ent, 0.002, lr, ent, entd)
     assert step == 0.003 and last == raw1
-    step, last, lr = apply(raw1, last, tier_ent, step, lr)  # same -> no-op
+    step, last, lr, ent, entd = apply(raw1, last, tier_ent, step, lr, ent, entd)  # same -> no-op
     assert step == 0.003
 
     # Tier override applies in place; unknown tiers ignored.
     raw2 = '{"tier_ent": {"deep": 0.08, "bogus": 1.0}}'
-    step, last, lr = apply(raw2, last, tier_ent, step, lr)
+    step, last, lr, ent, entd = apply(raw2, last, tier_ent, step, lr, ent, entd)
     assert tier_ent["deep"] == 0.08
     assert tier_ent["clubgg"] == 0.09
     assert "bogus" not in tier_ent
 
     # Both at once.
     raw3 = '{"step": 0.001, "tier_ent": {"clubgg": 0.05}}'
-    step, last, lr = apply(raw3, last, tier_ent, step, lr)
+    step, last, lr, ent, entd = apply(raw3, last, tier_ent, step, lr, ent, entd)
     assert step == 0.001 and tier_ent["clubgg"] == 0.05
 
     # Live LR override returns the new base lr.
     raw4 = '{"lr": 0.0001}'
-    step, last, lr = apply(raw4, last, tier_ent, step, lr)
+    step, last, lr, ent, entd = apply(raw4, last, tier_ent, step, lr, ent, entd)
     assert lr == 0.0001
+
+    # Flat entropy_coef / entropy_coef_deep overrides return the new coefs
+    # independently (the flat keys the 2026-07-04 anneal refactor added for
+    # NLH / plain --stack-dist runs). The flat key must NOT touch the deep
+    # coef and vice-versa.
+    raw_ent = '{"entropy_coef": 0.38}'
+    step, last, lr, ent, entd = apply(raw_ent, last, tier_ent, step, lr, ent, entd)
+    assert ent == 0.38 and entd == 0.45
+
+    raw_entd = '{"entropy_coef_deep": 0.30}'
+    step, last, lr, ent, entd = apply(raw_entd, last, tier_ent, step, lr, ent, entd)
+    assert entd == 0.30 and ent == 0.38
 
     # target_kl / kl_hard / sizing_entropy_scale mutate the trainer in place.
     trn = _StubTrainer()
     raw5 = '{"target_kl": 1.5, "kl_hard": 12.0, "sizing_entropy_scale": 2.5}'
-    step, last, lr = apply(raw5, last, tier_ent, step, lr, trainer=trn)
+    step, last, lr, ent, entd = apply(raw5, last, tier_ent, step, lr, ent, entd, trainer=trn)
     assert trn.target_kl == 1.5 and trn.kl_hard == 12.0
     assert trn.sizing_entropy_scale == 2.5
 
     # Malformed JSON: ignored, not marked applied (so a half-written
-    # save retries next loop).
-    step2, last2, lr2 = apply('{"step": 0.0', last, tier_ent, step, lr)
+    # save retries next loop). Every field comes back unchanged.
+    step2, last2, lr2, ent2, entd2 = apply('{"step": 0.0', last, tier_ent, step, lr, ent, entd)
     assert step2 == step and last2 == last and lr2 == lr
+    assert ent2 == ent and entd2 == entd
 
 
 def test_default_tolerance_and_start_update_flags():

@@ -1216,8 +1216,15 @@ def main() -> None:
     last_ckpt_sec = t_start
 
     def _save_mid(update_idx: int) -> None:
+        # `update_idx` is the LOCAL loop counter; numbered checkpoints are named
+        # and stamped on the GLOBAL update axis (base_update + local). Without
+        # this, an anneal-off warm relaunch (which resets the loop counter to 0)
+        # would rewrite a prior segment's nlh4_5.pt/_10.pt... over the originals
+        # AND stamp update_counter=5, poisoning the next warm-start's pool
+        # seeding (ws_target reads that counter). See base_update below.
+        global_idx = base_update + update_idx
         game_cfg_snap = sampled_game_cfg.__dict__
-        mid_path = args.checkpoint.with_name(f"{args.checkpoint.stem}_{update_idx}.pt")
+        mid_path = args.checkpoint.with_name(f"{args.checkpoint.stem}_{global_idx}.pt")
         mid_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
@@ -1229,7 +1236,7 @@ def main() -> None:
                 "gate_count": GATE_ACTIONS,
                 "variant": args.variant,
                 "anchor_count": model._anchor_count,
-                "update_counter": update_idx,
+                "update_counter": global_idx,
                 # Metadata only (update indices, not weights): lets a
                 # warm-start reconstruct the exact pool membership from
                 # the sibling files still on disk.
@@ -1243,12 +1250,20 @@ def main() -> None:
 
     # Restore the update counter only when annealing, so the block cycle
     # continues across a relaunch instead of resetting to block 1 (which
-    # under-trains the deep tier). Anneal-off keeps today's reset-to-0.
-    update = (
-        int(restored_update)
-        if (args.anneal_entropy and restored_update is not None)
-        else 0
-    )
+    # under-trains the deep tier). Anneal-off keeps today's reset-to-0 for the
+    # LOOP counter so the LR-warmup ramp and block-cycle position resume with
+    # their current gentle-restart semantics. `base_update` carries the true
+    # cumulative update index onto which checkpoint filenames / update_counter /
+    # pool snapshot tags are stamped, so a same-stem relaunch never clobbers
+    # prior nlh4_<N>.pt files and the counter a later warm-start reads stays
+    # truthful (fixes silent checkpoint overwrite + pool-seeding poison).
+    _restored = int(restored_update) if restored_update is not None else 0
+    if args.anneal_entropy and restored_update is not None:
+        update = _restored  # loop counter continues; offset already folded in
+        base_update = 0
+    else:
+        update = 0
+        base_update = _restored
     sampled_game_cfg, sampled_eff_dist = _sample_game_config(
         seats_choices,
         stack_lo,
@@ -1415,10 +1430,13 @@ def main() -> None:
         now = time.time()
 
         # Snapshot on update count, then also on wall-clock if configured.
+        # Tag on the GLOBAL axis so pool_member_updates stays consistent with
+        # the numbered checkpoint filenames a warm-start reads (base_update
+        # is 0 on a fresh/annealing run, so this is a no-op there).
         if update % train_cfg.snapshot_every == 0:
-            pool.snapshot(model, tag=update)
+            pool.snapshot(model, tag=base_update + update)
         if args.snapshot_every_sec > 0 and now - last_snapshot_sec >= args.snapshot_every_sec:
-            pool.snapshot(model, tag=update)
+            pool.snapshot(model, tag=base_update + update)
             last_snapshot_sec = now
 
         if _prof is not None:
@@ -1535,7 +1553,7 @@ def main() -> None:
             "gate_count": GATE_ACTIONS,
             "variant": args.variant,
             "anchor_count": model._anchor_count,
-            "update_counter": update,
+            "update_counter": base_update + update,
             "pool_member_updates": list(pool.tags),
             "anneal_tier_ent": tier_ent,
             "anneal_baseline": tier_baseline,
@@ -1545,8 +1563,8 @@ def main() -> None:
     )
     elapsed = time.time() - t_start
     print(
-        f"Saved checkpoint to {args.checkpoint} after {update} updates "
-        f"({elapsed:.1f}s wall-clock)"
+        f"Saved checkpoint to {args.checkpoint} after {update} updates this run "
+        f"(global u{base_update + update}, {elapsed:.1f}s wall-clock)"
     )
     if train_cfg.device == "cuda" and torch.cuda.is_available():
         peak_mb = torch.cuda.max_memory_allocated() / 1e6
