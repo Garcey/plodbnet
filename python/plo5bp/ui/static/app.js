@@ -2094,18 +2094,25 @@ function isEntitled() {
 
 // Admin-only "safe to deploy?" signal: distinct non-admin users who made an
 // authenticated request inside the server's activity window (default 5 min).
+const ACTIVE_POLL_MS = 10000;
 let ACTIVE_POLL_TIMER = null;
 
 async function refreshActiveCount() {
+  if (document.hidden) return; // resync on visibilitychange instead
   const pill = document.getElementById("acct-active-pill");
   if (!pill) return;
   try {
     const d = await getJSON("/admin/api/active");
     pill.textContent = `Active: ${d.active_users}`;
     const mins = Math.max(1, Math.round(d.window_seconds / 60));
-    pill.title = d.emails && d.emails.length
-      ? `Active in the last ${mins} min:\n${d.emails.join("\n")}`
-      : `No users active in the last ${mins} min — safe to deploy`;
+    const lines = d.emails && d.emails.length
+      ? [`Active in the last ${mins} min:`, ...d.emails]
+      : [`No users active in the last ${mins} min — safe to deploy`];
+    const admins = (d.active_total || 0) - d.active_users;
+    if (admins > 0) {
+      lines.push(`+${admins} admin${admins > 1 ? "s" : ""} online (not counted)`);
+    }
+    pill.title = lines.join("\n");
     pill.classList.toggle("busy", d.active_users > 0);
   } catch (_) {
     pill.textContent = "Active: ?";
@@ -2116,7 +2123,7 @@ async function refreshActiveCount() {
 function startActivePoll() {
   refreshActiveCount(); // re-render wiped the pill node; fill it now
   if (!ACTIVE_POLL_TIMER) {
-    ACTIVE_POLL_TIMER = setInterval(refreshActiveCount, 30000);
+    ACTIVE_POLL_TIMER = setInterval(refreshActiveCount, ACTIVE_POLL_MS);
   }
 }
 
@@ -2126,6 +2133,11 @@ function stopActivePoll() {
     ACTIVE_POLL_TIMER = null;
   }
 }
+
+// Hidden tabs skip polls; catch up the instant the admin looks back.
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && ACTIVE_POLL_TIMER) refreshActiveCount();
+});
 
 function renderAccountChip() {
   const el = document.getElementById("account-chip");
