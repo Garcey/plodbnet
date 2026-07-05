@@ -1124,6 +1124,8 @@ body.trainer-mode.trainer-pick #card-grid-panel {
 }
 .acct-pill.pro { background: rgba(24, 210, 195, 0.16); color: var(--accent); border: 1px solid rgba(24,210,195,0.35); }
 .acct-pill.free { background: var(--panel-2); color: var(--muted); border: 1px solid var(--border-strong); }
+.acct-pill.activity { background: var(--panel-2); color: var(--muted); border: 1px solid var(--border-strong); }
+.acct-pill.activity.busy { background: var(--ok-soft); color: var(--ok); border-color: rgba(61, 196, 111, 0.35); }
 .acct-btn {
   padding: 4px 10px; font-size: 12px; cursor: pointer;
   background: var(--panel-2); color: var(--text);

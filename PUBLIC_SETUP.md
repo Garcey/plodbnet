@@ -139,3 +139,4 @@ base URL is https. A real deploy (Docker etc.) is the next slice.
 | `STRIPE_WEBHOOK_SECRET` | unset | Only if running `stripe listen` / hosted webhook |
 | `STRIPE_PRICE_ID` | auto-created | Pin an existing Stripe price |
 | `PLO5BP_MAX_RUNTIMES` | `300` | LRU cap on in-memory per-user states |
+| `PLO5BP_ACTIVE_WINDOW` | `300` | Seconds a user counts as "active" (admin top-bar counter) |

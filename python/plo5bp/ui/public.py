@@ -71,6 +71,9 @@ STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID", "")
 
 MAX_USER_RUNTIMES = int(os.environ.get("PLO5BP_MAX_RUNTIMES", "300"))
+# A signed-in user counts as "active" for this many seconds after their last
+# authenticated request (the admin top-bar deploy-safety counter).
+ACTIVE_WINDOW_S = int(os.environ.get("PLO5BP_ACTIVE_WINDOW", "300"))
 
 # Study-mode routes: subscription required (the full product). The trainer
 # tree is the free-tier surface.
@@ -368,6 +371,29 @@ def _current_runtime() -> _Runtime | None:
     return _REGISTRY.get(uid)
 
 
+# --- Active-user tracking --------------------------------------------------------
+
+# uid -> last authenticated-request time. In-memory on purpose: it feeds the
+# admin "safe to deploy?" counter, and a restart (the event it protects
+# against) legitimately resets it.
+_ACTIVITY: dict[int, float] = {}
+_ACTIVITY_LOCK = threading.Lock()
+
+
+def _record_activity(uid: int) -> None:
+    with _ACTIVITY_LOCK:
+        _ACTIVITY[uid] = time.time()
+
+
+def _active_uids() -> list[int]:
+    """Users seen within ACTIVE_WINDOW_S; prunes expired entries."""
+    cutoff = time.time() - ACTIVE_WINDOW_S
+    with _ACTIVITY_LOCK:
+        for uid in [u for u, t in _ACTIVITY.items() if t < cutoff]:
+            del _ACTIVITY[uid]
+        return list(_ACTIVITY)
+
+
 # --- Middleware ----------------------------------------------------------------
 
 
@@ -396,6 +422,7 @@ class AccessMiddleware(BaseHTTPMiddleware):
 
         entitled = _entitled(user)
         admin = _is_admin(user)
+        _record_activity(int(user["id"]))
 
         if path == "/admin" or path.startswith("/admin/"):
             if not admin:
@@ -871,6 +898,20 @@ def install(
                 }
                 for r in payments
             ],
+        }
+
+    @app.get("/admin/api/active")
+    def admin_active():
+        """Deploy-safety signal: who is on the site right now. The headline
+        count excludes admins so the asking admin's own browsing never makes
+        the site look busy."""
+        rows = [r for r in (_user_by_id(u) for u in _active_uids()) if r is not None]
+        non_admin = [r for r in rows if not _is_admin(r)]
+        return {
+            "window_seconds": ACTIVE_WINDOW_S,
+            "active_users": len(non_admin),
+            "active_total": len(rows),
+            "emails": sorted(r["email"] for r in non_admin),
         }
 
     # Middleware LAST (add_middleware prepends: Session must wrap Access).

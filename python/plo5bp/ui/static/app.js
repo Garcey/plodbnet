@@ -2092,11 +2092,47 @@ function isEntitled() {
   return !window.PLO5BP_PUBLIC || !!(UI.me && UI.me.sub && UI.me.sub.active);
 }
 
+// Admin-only "safe to deploy?" signal: distinct non-admin users who made an
+// authenticated request inside the server's activity window (default 5 min).
+let ACTIVE_POLL_TIMER = null;
+
+async function refreshActiveCount() {
+  const pill = document.getElementById("acct-active-pill");
+  if (!pill) return;
+  try {
+    const d = await getJSON("/admin/api/active");
+    pill.textContent = `Active: ${d.active_users}`;
+    const mins = Math.max(1, Math.round(d.window_seconds / 60));
+    pill.title = d.emails && d.emails.length
+      ? `Active in the last ${mins} min:\n${d.emails.join("\n")}`
+      : `No users active in the last ${mins} min — safe to deploy`;
+    pill.classList.toggle("busy", d.active_users > 0);
+  } catch (_) {
+    pill.textContent = "Active: ?";
+    pill.title = "Couldn't reach /admin/api/active";
+  }
+}
+
+function startActivePoll() {
+  refreshActiveCount(); // re-render wiped the pill node; fill it now
+  if (!ACTIVE_POLL_TIMER) {
+    ACTIVE_POLL_TIMER = setInterval(refreshActiveCount, 30000);
+  }
+}
+
+function stopActivePoll() {
+  if (ACTIVE_POLL_TIMER) {
+    clearInterval(ACTIVE_POLL_TIMER);
+    ACTIVE_POLL_TIMER = null;
+  }
+}
+
 function renderAccountChip() {
   const el = document.getElementById("account-chip");
   if (!el) return;
   if (!window.PLO5BP_PUBLIC || !UI.me || !UI.me.signed_in) {
     el.style.display = "none";
+    stopActivePoll();
     return;
   }
   const me = UI.me;
@@ -2114,7 +2150,7 @@ function renderAccountChip() {
     ? `<button class="acct-btn" id="acct-manage-btn" type="button">Billing</button>`
     : "";
   const admin = me.is_admin
-    ? `<button class="acct-btn" id="acct-admin-btn" type="button">Admin</button>`
+    ? `<span class="acct-pill activity" id="acct-active-pill" title="">Active: –</span><button class="acct-btn" id="acct-admin-btn" type="button">Admin</button>`
     : "";
   el.innerHTML = `${pill}${avatar}<span class="acct-email" title="${me.email}">${me.email}</span>${upgrade}${manage}${admin}<button class="acct-btn" id="acct-signout-btn" type="button">Sign out</button>`;
   const up = document.getElementById("acct-upgrade-btn");
@@ -2129,6 +2165,8 @@ function renderAccountChip() {
   document.getElementById("acct-signout-btn").addEventListener("click", () => {
     window.location.href = "/auth/logout";
   });
+  if (me.is_admin) startActivePoll();
+  else stopActivePoll();
 }
 
 function showLoginOverlay(show) {

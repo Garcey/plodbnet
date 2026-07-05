@@ -163,3 +163,38 @@ def test_admin_page_served(clients):
     _, _, adm = clients
     r = adm.get("/admin")
     assert r.status_code == 200 and "Admin" in r.text
+
+
+def test_active_users_counter(server, clients):
+    """/admin/api/active: admin-gated; counts non-admin users seen inside the
+    window (every earlier test kept alice/bob warm); the admin's own traffic
+    is excluded from the headline count; stale entries expire."""
+    import time as _time
+
+    a, _, adm = clients
+    c = TestClient(server.app)
+    assert c.get("/admin/api/active").status_code == 401  # signed out
+    assert a.get("/admin/api/active").status_code == 403  # signed in, not admin
+
+    d = adm.get("/admin/api/active").json()
+    assert d["window_seconds"] > 0
+    assert {"alice@example.com", "bob@example.com"} <= set(d["emails"])
+    assert ADMIN_EMAIL not in d["emails"]
+    assert d["active_users"] == len(d["emails"])
+    assert d["active_total"] >= d["active_users"] + 1  # admin in the total
+
+    # Age alice out of the window: she drops from the count and is pruned.
+    pub = sys.modules["plo5bp.ui.public"]
+    users = adm.get("/admin/api/users").json()["users"]
+    alice_id = next(u["id"] for u in users if u["email"] == "alice@example.com")
+    pub._ACTIVITY[alice_id] = _time.time() - pub.ACTIVE_WINDOW_S - 1
+    d = adm.get("/admin/api/active").json()
+    assert "alice@example.com" not in d["emails"]
+    assert alice_id not in pub._ACTIVITY  # pruned, not just filtered
+
+    # One authenticated request to a gated route brings her back. (/me is an
+    # OPEN route — signed-out landing needs it — so it deliberately does NOT
+    # count as activity.)
+    assert a.get("/trainer/state").status_code == 200
+    d = adm.get("/admin/api/active").json()
+    assert "alice@example.com" in d["emails"]
