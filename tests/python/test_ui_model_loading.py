@@ -13,9 +13,12 @@ import numpy as np
 import torch
 
 from plo5bp.encoding import OBS_DIM, OBS_DIM_V1
+from plo5bp.encoding_nlh import OBS_DIM_NLH
 from plo5bp.network import (
     ActorCritic,
     ActorCriticV2,
+    CentralCritic,
+    build_critic_from_state_dict,
     model_class_for_state_dict,
     obs_adapter,
 )
@@ -104,3 +107,42 @@ def test_server_load_model_v1_era_959_checkpoint(tmp_path, monkeypatch):
     # And the matching adapter feeds it 959-wide observations.
     obs = np.zeros(OBS_DIM, dtype=np.float32)
     assert obs_adapter(m)(obs).shape == (OBS_DIM_V1,)
+
+
+def test_build_critic_from_state_dict_widths():
+    """The builder reconstructs whatever width/depth the critic was saved
+    at — PLO 991 and NLH 995 — with weights intact and a working forward."""
+    for obs_dim, blocks in ((OBS_DIM, 2), (OBS_DIM_NLH, 1)):
+        src = CentralCritic(obs_dim=obs_dim, hidden_dim=32, num_blocks=blocks)
+        crit = build_critic_from_state_dict(src.state_dict())
+        assert crit.obs_dim == obs_dim
+        assert torch.equal(
+            crit.torso[0][0].weight.detach(), src.torso[0][0].weight.detach()
+        )
+        out = crit(torch.zeros(3, obs_dim), torch.zeros(3, 5 * 52))
+        assert out.shape == (3,)
+
+
+def test_server_load_critic_variant_widths(tmp_path, monkeypatch):
+    """Regression (prod hit 2026-07-04..05): the NLH stub's 995-wide critic
+    shape-failed on every boot because _load_critic constructed at the PLO
+    width; it must load now, and a genuine width/variant mismatch must
+    degrade to None (true-EV off) rather than raise."""
+    import plo5bp.ui.server as server
+
+    nlh_critic = CentralCritic(obs_dim=OBS_DIM_NLH, hidden_dim=32, num_blocks=2)
+    p = tmp_path / "nlh.pt"
+    torch.save(
+        {"head_version": 3, "critic": nlh_critic.state_dict(), "config": {}}, p
+    )
+    monkeypatch.setenv("PLO5BP_CHECKPOINT_NLH", str(p))
+    crit = server._load_critic(torch.device("cpu"), server.VARIANT_NLH)
+    assert crit is not None and crit.obs_dim == OBS_DIM_NLH
+    assert torch.equal(
+        crit.torso[0][0].weight.detach(),
+        nlh_critic.torso[0][0].weight.detach(),
+    )
+
+    # The same file served as the PLO format trips the serve-width guard.
+    monkeypatch.setenv("PLO5BP_CHECKPOINT", str(p))
+    assert server._load_critic(torch.device("cpu"), server.VARIANT_PLO5) is None

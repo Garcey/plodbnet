@@ -22,7 +22,7 @@ from typing import Any, Literal
 import numpy as np
 import torch
 import torch.nn.functional as F
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -37,11 +37,13 @@ from plo5bp.actions import (
 from plo5bp.config import GameConfig, VARIANT_NLH, VARIANT_PLO5
 from plo5bp.encoding import encode_observation
 from plo5bp.env import BombPotEnv
+from plo5bp.encoding import OBS_DIM
 from plo5bp.network import (
     ActorCritic,
     ActorCriticV4,
     CentralCritic,
     build_actor_from_state_dict,
+    build_critic_from_state_dict,
     obs_adapter,
 )
 from plo5bp.encoding_nlh import OBS_DIM_NLH
@@ -201,24 +203,31 @@ def _load_critic(device: torch.device, variant: str = VARIANT_PLO5) -> CentralCr
         and "critic" in ckpt
     ):
         return None
-    cfg_block = ckpt.get("config", {}) or {}
-    hidden_dim = int(cfg_block.get("critic_hidden_dim", 1536))
-    num_blocks = int(cfg_block.get("critic_num_blocks", 2))
     try:
-        critic = CentralCritic(hidden_dim=hidden_dim, num_blocks=num_blocks)
-        critic.load_state_dict(ckpt["critic"])
+        # Dims (obs width, hidden, residual depth) are sniffed from the
+        # state dict — NLH critics are 995-wide, PLO 991, and constructing
+        # at the PLO default used to shape-fail every NLH load.
+        critic = build_critic_from_state_dict(ckpt["critic"])
     except Exception as e:
         logger.warning(
             "checkpoint %s critic incompatible (%s) — true-EV disabled",
             ckpt_path, e,
         )
         return None
+    serve_obs_dim = OBS_DIM_NLH if variant == VARIANT_NLH else OBS_DIM
+    if critic.obs_dim != serve_obs_dim:
+        logger.warning(
+            "checkpoint %s critic obs width %d != %s serve width %d — "
+            "true-EV disabled",
+            ckpt_path, critic.obs_dim, variant, serve_obs_dim,
+        )
+        return None
     critic.to(device).eval()
     for p in critic.parameters():
         p.requires_grad_(False)
     logger.info(
-        "loaded centralized critic (hidden_dim=%d, num_blocks=%d, device=%s)",
-        hidden_dim, num_blocks, device,
+        "loaded centralized critic (obs_dim=%d, hidden_dim=%d, device=%s)",
+        critic.obs_dim, critic.value_head.in_features, device,
     )
     return critic
 
@@ -3204,6 +3213,20 @@ def _strip_wglive(text: str) -> str:
     return _re.sub(r"[^\n]*WGLIVE:START.*?WGLIVE:END[^\n]*\n?", "", text, flags=_re.S)
 
 
+def _strip_wgapp(text: str) -> str:
+    """Drop the app-chrome region (WGAPP:START..END) from the landing HTML.
+
+    A signed-out public visitor only ever sees the landing overlay, so the
+    trainer/study chrome (top bar + table + panels) is removed server-side
+    rather than merely hidden client-side. This kills the first-paint flash
+    of the empty app and means there is nothing to reveal by deleting the
+    overlay in devtools — the markup simply isn't sent.
+    """
+    import re as _re
+
+    return _re.sub(r"[^\n]*WGAPP:START.*?WGAPP:END[^\n]*\n?", "", text, flags=_re.S)
+
+
 if STATIC_DIR.exists():
     if PLO5BP_PUBLIC:
         # Serve stripped app.js / style.css via explicit routes that shadow
@@ -3232,12 +3255,23 @@ if STATIC_DIR.exists():
     app.mount("/static", NoCacheStaticFiles(directory=STATIC_DIR), name="static")
 
     @app.get("/")
-    def index() -> HTMLResponse:
+    def index(request: Request) -> HTMLResponse:
         # Inject the build mode so the frontend knows its mode before first
         # paint; in the public build also strip the WGLIVE markup regions.
         html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
         if PLO5BP_PUBLIC:
             html = _strip_wglive(html)
+            # Signed-out visitors get the landing page ONLY — the app chrome
+            # is stripped server-side so it can't flash on load or be revealed
+            # by deleting the overlay. session.uid is set at login (public.py).
+            try:
+                signed_in = bool(request.session.get("uid"))
+            except (AssertionError, KeyError):
+                # SessionMiddleware not installed (shouldn't happen in public
+                # build) — fall back to sending the full markup.
+                signed_in = True
+            if not signed_in:
+                html = _strip_wgapp(html)
         flag = "true" if PLO5BP_PUBLIC else "false"
         html = html.replace(
             "</head>", f"<script>window.PLO5BP_PUBLIC={flag};</script></head>", 1

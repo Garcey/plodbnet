@@ -745,3 +745,25 @@ class CentralCritic(nn.Module):
     ) -> torch.Tensor:
         z = self.torso(torch.cat([obs, opp_multihot], dim=-1))
         return self.value_head(z).squeeze(-1)
+
+    @property
+    def obs_dim(self) -> int:
+        return self.torso[0][0].in_features - 5 * 52
+
+
+def build_critic_from_state_dict(state_dict: dict) -> CentralCritic:
+    """Build the CentralCritic a checkpoint's ``critic`` block was saved
+    from: obs width, hidden width, and residual depth are sniffed from the
+    state dict (constructing at the PLO OBS_DIM default would shape-fail
+    on NLH's 995-wide critics), then the weights load strictly."""
+    w = state_dict["torso.0.0.weight"]
+    hidden_dim = int(w.shape[0])
+    obs_dim = int(w.shape[1]) - 5 * 52
+    num_blocks = (
+        len({k.split(".")[1] for k in state_dict if k.startswith("torso.")}) - 1
+    )
+    critic = CentralCritic(
+        obs_dim=obs_dim, hidden_dim=hidden_dim, num_blocks=num_blocks
+    )
+    critic.load_state_dict(state_dict)
+    return critic
