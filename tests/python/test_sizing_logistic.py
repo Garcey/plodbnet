@@ -132,7 +132,7 @@ def test_v4_act_evaluate_finite_and_parity() -> None:
     assert torch.isfinite(out.log_prob).all()
     assert (out.chips >= 0).all()
 
-    lp, ent, val, gate_h, anchor_h, beta_h, glp, alp = m.evaluate(
+    lp, ent, val, gate_h, anchor_h, beta_h, glp, alp, *_raw = m.evaluate(
         obs, gate_mask, sizing, out.gate, out.anchor, out.refine_u
     )
     for t in (lp, ent, val, gate_h, anchor_h, beta_h):

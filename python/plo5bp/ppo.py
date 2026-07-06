@@ -70,10 +70,20 @@ def _kl_to_reference(
     model: ActorCritic,
     ref: ActorCritic,
     mb: Batch,
+    cur: "tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None" = None,
 ) -> torch.Tensor:
     """Mean KL(current || reference) over the full action distribution.
 
-    Computed in f32 outside autocast (Beta KL uses lgamma/digamma).
+    The reference forward is f32 (Beta KL uses lgamma/digamma). The
+    CURRENT-model outputs are REUSED from evaluate()'s forward via `cur`
+    (V5_DESIGN.md magnet memory fix): the KL term backprops through that
+    same graph, so the magnet adds only the reference forward (no_grad,
+    transient) instead of a second full actor forward-with-grad
+    (~+18-20 GiB, which OOM'd the pod). `cur` = evaluate()'s
+    (gate_logits, anchor_head_out, refine); it is autocast bf16, upcast
+    to f32 below for the KL math. Falls back to a fresh forward when
+    `cur` is None (v1 / callers without the reuse).
+
     Masks are identical on both sides (same states), so masked
     categorical entries contribute zero. v1 models use gate + Beta;
     v2 adds the anchor categorical and per-anchor refinement Betas.
@@ -81,7 +91,10 @@ def _kl_to_reference(
     head_version = getattr(model, "head_version", 1)
     obs = mb.obs.float()
     if head_version >= 2:
-        g_cur, a_cur, r_cur, _ = model(obs, mb.gate_masks)
+        if cur is not None:
+            g_cur, a_cur, r_cur = cur
+        else:
+            g_cur, a_cur, r_cur, _ = model(obs, mb.gate_masks)
         with torch.no_grad():
             g_ref, a_ref, r_ref, _ = ref(obs, mb.gate_masks)
         spec = getattr(model, "anchor_spec", PLO_ANCHOR_SPEC)
@@ -289,6 +302,7 @@ class PPOTrainer:
                                     log_prob, entropy, display_value,
                                     gate_h, anchor_h, beta_h,
                                     gate_lp_new, anchor_lp_new,
+                                    cur_gate_logits, cur_anchor_out, cur_refine,
                                 ) = self._evaluate(
                                     mb.obs,
                                     mb.gate_masks,
@@ -397,12 +411,18 @@ class PPOTrainer:
                                 + self._q_aux_coef * q_loss
                             )
 
-                    # KL anchor in f32 OUTSIDE autocast (lgamma/digamma).
+                    # KL anchor: reference forward in f32 outside autocast
+                    # (lgamma/digamma); the current-model outputs are
+                    # REUSED from evaluate above (no second forward-with-grad).
                     kl_anchor_term = torch.zeros((), device=device)
                     if self._ref is not None:
                         with record_function("step12b2/kl_anchor"):
+                            cur_raw = (
+                                (cur_gate_logits, cur_anchor_out, cur_refine)
+                                if self.head_version >= 2 else None
+                            )
                             kl_anchor_term = _kl_to_reference(
-                                self.model, self._ref, mb
+                                self.model, self._ref, mb, cur=cur_raw
                             )
                             loss = loss + self.kl_anchor_coef * kl_anchor_term
 

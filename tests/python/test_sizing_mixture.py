@@ -41,7 +41,7 @@ from plo5bp.network import (
     model_class_for_state_dict,
 )
 from plo5bp.ppo import PPOTrainer
-from plo5bp.rollout import collect_rollout_batched
+from plo5bp.rollout import Batch, collect_rollout_batched
 from plo5bp.selfplay import OpponentPool
 from plo5bp.sizing import anchor_grid_torch
 
@@ -165,7 +165,7 @@ def test_evaluate_anchor_entropy_is_exact_marginal_entropy() -> None:
     gm = torch.ones(B, GATE_ACTIONS, dtype=torch.bool)
     sizing = _SIZING.expand(B, 4).contiguous()
     out = m.act(obs, gm, sizing)
-    _, _, _, _, anchor_h, _, _, _ = m.evaluate(
+    _, _, _, _, anchor_h, _, _, _, *_raw = m.evaluate(
         obs, gm, sizing, out.gate, out.anchor, out.refine_u
     )
     with torch.no_grad():
@@ -234,7 +234,7 @@ def test_v5_act_evaluate_finite_and_parity() -> None:
     assert out.anchor.min() >= 0 and out.anchor.max() < ANCHOR_COUNT
     assert torch.isfinite(out.log_prob).all()
 
-    lp, ent, val, gate_h, anchor_h, beta_h, glp, alp = m.evaluate(
+    lp, ent, val, gate_h, anchor_h, beta_h, glp, alp, *_raw = m.evaluate(
         obs, gate_mask, sizing, out.gate, out.anchor, out.refine_u
     )
     for t in (lp, ent, val, gate_h, anchor_h, beta_h):
@@ -331,6 +331,45 @@ def test_kl_anchor_magnet_runs_on_ordinal_heads(model_cls) -> None:
     trainer2.load_ref_state_dict(ref_sd)
     for a, b in zip(trainer2._ref.state_dict().values(), ref_sd.values()):
         assert torch.equal(a, b)
+
+
+# ---- magnet memory fix: reuse evaluate's forward ---------------------------
+
+def test_kl_reference_reuse_matches_fresh_forward() -> None:
+    # The magnet memory fix reuses evaluate()'s current-model forward for
+    # KL(current||ref) instead of a second forward. In f32 (no autocast)
+    # the reused path must equal the fresh-forward path bit-for-bit.
+    from plo5bp.ppo import _kl_to_reference
+    import copy
+
+    torch.manual_seed(0)
+    m = ActorCriticV5(hidden_dim=32).eval()
+    ref = copy.deepcopy(m).eval()
+    with torch.no_grad():  # perturb ref so KL > 0
+        ref.mix_head.weight.add_(torch.randn_like(ref.mix_head.weight) * 0.2)
+        ref.gate_head.weight.add_(torch.randn_like(ref.gate_head.weight) * 0.2)
+    B = 40
+    obs = torch.randn(B, OBS_DIM)
+    gm = torch.ones(B, GATE_ACTIONS, dtype=torch.bool)
+    sizing = _SIZING.expand(B, 4).contiguous()
+    out = m.act(obs, gm, sizing)
+    mb = Batch(
+        obs=obs, gate_masks=gm, gate_actions=out.gate,
+        raise_chips=out.chips, sizing=sizing, anchor_actions=out.anchor,
+        refine_u=out.refine_u,
+        opp_holes=torch.full((B, 5, 5), 255, dtype=torch.uint8),
+        log_probs=out.log_prob.detach(), values=torch.zeros(B),
+        returns=torch.zeros(B), advantages=torch.zeros(B),
+        old_gate_logp=torch.zeros(B), old_anchor_logp=torch.zeros(B),
+    )
+    # fresh path (cur=None → second forward)
+    kl_fresh = _kl_to_reference(m, ref, mb, cur=None)
+    # reuse path: pass evaluate's raw head outputs
+    res = m.evaluate(obs, gm, sizing, out.gate, out.anchor, out.refine_u)
+    cur = (res[8], res[9], res[10])  # gate_logits, anchor_out, refine
+    kl_reuse = _kl_to_reference(m, ref, mb, cur=cur)
+    assert torch.allclose(kl_fresh, kl_reuse, atol=1e-5), (kl_fresh, kl_reuse)
+    assert float(kl_reuse.detach()) > 1e-4  # actually nonzero (ref perturbed)
 
 
 # ---- converter -------------------------------------------------------------

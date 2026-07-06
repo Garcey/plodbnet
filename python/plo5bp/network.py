@@ -517,9 +517,17 @@ class ActorCriticV2(nn.Module):
         beta_h_eff = (w_interior * beta_h * interior_ok).sum(-1)
         anchor_entropy = anchor_dist.entropy()
         entropy = gate_entropy + p_raise.detach() * (anchor_entropy + beta_h_eff)
+        # The raw head outputs (gate_logits, the head-specific 2nd output
+        # — v2 anchor logits / v4 (mu,s) / v5 mixture params — and refine)
+        # ride along so the kl-anchor magnet can compute KL(current||ref)
+        # from THIS forward instead of a second forward-with-grad per
+        # minibatch (~+18-20 GiB; ppo._kl_to_reference `cur=`). They are
+        # intermediate tensors already in the graph, so returning them is
+        # free memory-wise.
         return (
             log_prob, entropy, value, gate_entropy, anchor_entropy,
             beta_h_eff, gate_log_prob, anchor_log_prob,
+            gate_logits, anchor_logits, refine,
         )
 
 

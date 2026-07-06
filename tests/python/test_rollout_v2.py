@@ -54,7 +54,7 @@ def _collect(collector, seed: int, critic: CentralCritic | None = None):
 def test_evaluate_reproduces_stored_logprobs(collector) -> None:
     model, batch = _collect(collector, seed=0)
     with torch.no_grad():
-        lp, ent, _val, gh, ah, bh, _glp, _alp = model.evaluate(
+        lp, ent, _val, gh, ah, bh, _glp, _alp, *_raw = model.evaluate(
             batch.obs,
             batch.gate_masks,
             batch.sizing,
