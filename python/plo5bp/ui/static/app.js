@@ -128,7 +128,18 @@ const UI = {
   actionInFlight: false,
 };
 
-const TRAINER_ANIM_MS = 1200;
+// Opponent-action playback prefs (client-only, global across formats; set in
+// the trainer settings modal). animMs = pause between opponent action frames
+// (0 = instant). ffFold = once the hero folds, skip watching opponents finish.
+const TRAINER_ANIM_DEFAULT_MS = 1200;
+const TRAINER_ANIM_MAX_MS = 8000;
+const trainerPrefs = (() => {
+  let ms = parseInt(localStorage.getItem("plo5bp-trainer-anim-ms"), 10);
+  if (!Number.isFinite(ms) || ms < 0) ms = TRAINER_ANIM_DEFAULT_MS;
+  ms = Math.min(ms, TRAINER_ANIM_MAX_MS);
+  const ff = localStorage.getItem("plo5bp-trainer-ff-fold");
+  return { animMs: ms, ffFold: ff === null ? true : ff === "true" };
+})();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function apiBase() {
@@ -252,7 +263,10 @@ async function postAction(body) {
     setActionsBusy(true);
     try {
       const data = await postJSON("/trainer/act", body);
-      await animateTrainerResponse(data);
+      // Once the hero folds, fast-forward past the opponents finishing the
+      // hand (unless the user turned that off).
+      const instant = body.gate === "fold" && trainerPrefs.ffFold;
+      await animateTrainerResponse(data, { instant });
     } catch (e) { showToast(e.message); }
     finally { UI.actionInFlight = false; setActionsBusy(false); }
     return;
@@ -274,10 +288,19 @@ async function postTrainer(path, body) {
 // Play the per-action frames the trainer returns (one snapshot per
 // opponent action), then settle on the authoritative final state. Any
 // applyState from elsewhere bumps animSeq and cancels the playback.
-async function animateTrainerResponse(data) {
+async function animateTrainerResponse(data, opts) {
   const frames = data.frames || [];
   const final = data.state;
+  const instant = !!(opts && opts.instant);
   if (UI.mode !== "trainer" || frames.length === 0) {
+    applyState(final);
+    return;
+  }
+  // Fast-forward (e.g. after the hero folds): still flash the graded verdict,
+  // but skip watching the opponents play the hand out.
+  if (instant) {
+    ++UI.animSeq; // cancel any in-flight playback
+    if (final.trainer && final.trainer.feedback) renderFeedbackFlash(final, true);
     applyState(final);
     return;
   }
@@ -291,7 +314,7 @@ async function animateTrainerResponse(data) {
     for (let i = 0; i < frames.length; i++) {
       if (UI.animSeq !== seq) return;
       render(frames[i]);
-      if (i < frames.length - 1) await sleep(TRAINER_ANIM_MS);
+      if (i < frames.length - 1) await sleep(trainerPrefs.animMs);
     }
     if (UI.animSeq !== seq) return;
   } finally {
@@ -2541,6 +2564,11 @@ function openTrainerSettings() {
   document.getElementById("ts-ante-bb").value = t.ante_bb;
   document.getElementById("ts-mc-rollouts").value = t.mc_rollouts;
   document.getElementById("ts-dollars-bb").value = t.dollars_per_bb;
+  document.getElementById("ts-anim-ms").value = String(trainerPrefs.animMs);
+  document.getElementById("ts-anim-ms-range").value = String(
+    Math.min(trainerPrefs.animMs, 4000)
+  );
+  document.getElementById("ts-ff-fold").checked = trainerPrefs.ffFold;
   const wrap = document.getElementById("ts-per-seat");
   wrap.innerHTML = "";
   for (let i = 0; i < 6; i++) {
@@ -2585,6 +2613,16 @@ async function saveTrainerSettings() {
     mc_rollouts: _tsInt("ts-mc-rollouts"),
     dollars_per_bb: _tsNum("ts-dollars-bb"),
   };
+  // Playback prefs are client-only (global, format-independent) — persist to
+  // localStorage and apply live, independent of the server settings POST.
+  let animMs = parseInt(document.getElementById("ts-anim-ms").value, 10);
+  if (!Number.isFinite(animMs) || animMs < 0) animMs = TRAINER_ANIM_DEFAULT_MS;
+  animMs = Math.min(animMs, TRAINER_ANIM_MAX_MS);
+  trainerPrefs.animMs = animMs;
+  trainerPrefs.ffFold = document.getElementById("ts-ff-fold").checked;
+  localStorage.setItem("plo5bp-trainer-anim-ms", String(trainerPrefs.animMs));
+  localStorage.setItem("plo5bp-trainer-ff-fold", trainerPrefs.ffFold ? "true" : "false");
+
   const ok = await postTrainer("settings", body);
   if (ok) closeTrainerSettings();
 }
@@ -2641,6 +2679,15 @@ function setupTrainerControls() {
   for (const id of ["ts-seats-mode", "ts-stacks-mode", "ts-hero-mode"]) {
     document.getElementById(id).addEventListener("change", syncSettingsVisibility);
   }
+  // Opponent-speed slider and text box mirror each other. The slider caps at
+  // 4000ms; the box accepts up to 8000 for the patient.
+  const animRange = document.getElementById("ts-anim-ms-range");
+  const animNum = document.getElementById("ts-anim-ms");
+  animRange.addEventListener("input", () => { animNum.value = animRange.value; });
+  animNum.addEventListener("input", () => {
+    const v = parseInt(animNum.value, 10);
+    if (Number.isFinite(v)) animRange.value = String(Math.min(Math.max(v, 0), 4000));
+  });
   document.getElementById("trainer-settings-modal").addEventListener("pointerdown", (e) => {
     if (e.target === e.currentTarget) closeTrainerSettings();
   });

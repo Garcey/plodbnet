@@ -332,7 +332,22 @@
           <input id="ts-dollars-bb" type="number" min="0.01" max="100000" step="0.5"
                  title="Dollar value of one big blind when the display unit is $" />
         </div>
-        <p class="muted">Changes apply from the next hand.</p>
+        <div class="ts-row">
+          <label>Opponent speed</label>
+          <span class="ts-sub ts-speed">
+            <input id="ts-anim-ms-range" type="range" min="0" max="4000" step="100"
+                   title="Pause between opponent actions (0 = instant, higher = slower)" />
+            <input id="ts-anim-ms" type="number" min="0" max="8000" step="100"
+                   title="Pause between opponent actions in milliseconds (0 = instant)" />
+            <span class="ts-unit">ms</span>
+          </span>
+        </div>
+        <div class="ts-row">
+          <label>Fast-forward after fold</label>
+          <input id="ts-ff-fold" type="checkbox"
+                 title="When you fold, skip straight to the result instead of watching the opponents finish the hand" />
+        </div>
+        <p class="muted">Playback settings apply immediately; the rest from the next hand.</p>
         <div class="modal-buttons">
           <button id="ts-cancel" type="button">Cancel</button>
           <button id="ts-save" class="primary" type="button">Save</button>
