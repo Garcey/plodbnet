@@ -1410,3 +1410,149 @@ body.trainer-mode.trainer-pick #card-grid-panel {
 .rescan-btn:hover { background: var(--panel-3); border-color: var(--border-strong); }
 body.trainer-mode #ocr-rescan-group { display: none !important; }
 /* WGLIVE:END */
+
+/* --- Ranges tab (NLH range grid; local build only) ------------------------ */
+:root {
+  --rg-raise: #D65A5E;
+  --rg-allin: #7E1F26;
+  --rg-call: #3DA56B;
+  --rg-fold: #3E6FA8;
+}
+#rg-view { display: none; }
+body.ranges-mode main > *:not(#rg-view) { display: none !important; }
+body.ranges-mode #rg-view { display: block; padding: 12px 18px 24px; }
+body.ranges-mode .study-only { display: none !important; }
+body.ranges-mode .trainer-only { display: none !important; }
+#rg-view.busy { opacity: 0.65; pointer-events: none; }
+
+#rg-topbar {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 6px 0 10px;
+}
+#rg-topbar label {
+  display: inline-flex; align-items: center; gap: 6px;
+  color: var(--muted); font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.5px;
+}
+#rg-topbar select, #rg-topbar input {
+  padding: 5px 8px; background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  font-size: 13px; font-family: inherit;
+}
+#rg-topbar input { width: 80px; }
+#rg-topbar button {
+  padding: 5px 12px; background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
+  cursor: pointer; font-size: 12px;
+}
+#rg-model { font-size: 11.5px; margin-left: auto; }
+.rg-untrained {
+  color: #E2B93B; border: 1px solid rgba(226, 185, 59, 0.4);
+  padding: 1px 6px; border-radius: 999px; font-size: 10px; font-weight: 700;
+}
+
+#rg-strips {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  padding: 4px 0 12px;
+}
+.rg-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 5px 10px; font-size: 12px; cursor: pointer;
+  background: var(--panel-2); color: var(--text); font-family: inherit;
+  border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
+}
+.rg-chip:hover { border-color: var(--accent); }
+.rg-chip.viewing { outline: 2px solid var(--accent); outline-offset: 1px; }
+.rg-chip.cfg { color: var(--muted); }
+.rg-chip.live { color: var(--accent); font-weight: 700; }
+.rg-chip.gate-fold { border-left: 3px solid var(--rg-fold); }
+.rg-chip.gate-check_call { border-left: 3px solid var(--rg-call); }
+.rg-chip.gate-raise { border-left: 3px solid var(--rg-raise); }
+.rg-chip i { font-style: normal; color: var(--muted); font-size: 11px; }
+
+#rg-flex { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+#rg-grid-wrap { flex: 0 1 700px; min-width: 320px; }
+#rg-grid-wrap.inactive { opacity: 0.25; pointer-events: none; }
+#rg-grid {
+  display: grid; grid-template-columns: repeat(13, 1fr); gap: 2px;
+  aspect-ratio: 1 / 1;
+}
+.rg-cell {
+  position: relative; border-radius: 2px; overflow: hidden;
+  background: var(--panel-2); cursor: default; min-width: 0;
+}
+.rg-cell-name {
+  position: absolute; top: 1px; left: 3px;
+  font-size: clamp(7px, 1.05vw, 11px); font-weight: 700;
+  color: rgba(255, 255, 255, 0.94);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.65);
+  pointer-events: none;
+}
+.rg-cell:hover { outline: 2px solid var(--accent); z-index: 2; }
+.rg-cell.dead { opacity: 0.3; }
+.rg-cell.empty { opacity: 0.15; }
+
+#rg-side { flex: 1 1 340px; min-width: 300px; display: flex; flex-direction: column; gap: 12px; }
+.rg-node-head { font-size: 13px; color: var(--text); margin-bottom: 8px; }
+.rg-action-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+.rg-sizes-row .rg-chip { font-size: 11.5px; padding: 4px 8px; }
+.rg-custom input {
+  width: 130px; padding: 5px 8px; background: var(--panel-2);
+  color: var(--text); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); font-size: 12.5px; font-family: inherit;
+}
+.rg-banner {
+  padding: 10px 12px; border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm); color: var(--muted); font-size: 12.5px;
+  background: var(--panel-2);
+}
+.rg-chip.pick-cards { border-color: var(--accent); color: var(--accent); font-weight: 700; }
+
+.rg-sumbar {
+  display: flex; height: 16px; border-radius: 4px; overflow: hidden;
+  background: var(--panel-2); border: 1px solid var(--border);
+}
+.rg-sumbar span { height: 100%; }
+.rg-sumleg { display: flex; gap: 12px; flex-wrap: wrap; padding-top: 6px; font-size: 11.5px; color: var(--text); }
+.rg-leg-item { display: inline-flex; align-items: center; gap: 5px; }
+.rg-leg-item i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+.rg-leg-item .muted { font-size: 10.5px; }
+
+.rg-sizes-hist { display: flex; gap: 10px; flex-wrap: wrap; font-size: 11.5px; }
+.rg-size-item {
+  padding: 3px 8px; background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: 999px; color: var(--text);
+}
+.rg-size-item i { font-style: normal; color: var(--muted); font-size: 10.5px; }
+
+#rg-hover {
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--panel-2); padding: 8px 10px; min-height: 60px;
+  max-height: 300px; overflow-y: auto; font-size: 12px;
+}
+.rg-hover-head { font-weight: 700; margin-bottom: 6px; }
+.rg-hover-row { display: flex; align-items: center; gap: 8px; padding: 2px 0; }
+.rg-hover-combo { width: 58px; font-weight: 700; letter-spacing: 0.3px; }
+.rg-hover-bar { flex: 0 0 90px; height: 10px; border-radius: 3px; }
+.rg-hover-nums { color: var(--muted); font-size: 11px; white-space: nowrap; }
+.rg-hover-nums .rg-r { color: var(--rg-raise); }
+.rg-hover-nums .rg-c { color: var(--rg-call); }
+.rg-hover-nums .rg-f { color: var(--rg-fold); }
+
+.rg-card.suit-h, .rg-pick-card.suit-h { color: #E5484D; }
+.rg-card.suit-d, .rg-pick-card.suit-d { color: #4E8FD9; }
+.rg-card.suit-c, .rg-pick-card.suit-c { color: #3DC46F; }
+.rg-card.suit-s, .rg-pick-card.suit-s { color: #E8ECF2; }
+
+.rg-card-picker { max-width: 560px; }
+#rg-card-grid {
+  display: grid; grid-template-columns: repeat(13, 1fr); gap: 4px;
+  padding: 10px 0;
+}
+.rg-pick-card {
+  padding: 6px 0; font-size: 13px; font-weight: 700; text-align: center;
+  background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); cursor: pointer; font-family: inherit;
+}
+.rg-pick-card:disabled { opacity: 0.25; cursor: not-allowed; }
+.rg-pick-card.chosen { outline: 2px solid var(--accent); background: rgba(24, 210, 195, 0.12); }

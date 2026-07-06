@@ -164,6 +164,16 @@ class BombPotEnv:
         self._rs.set_river_nlh(int(card))
         return self._pack_obs()
 
+    def pack_range_nlh(self, holes: np.ndarray) -> dict[str, np.ndarray]:
+        """Range-grid support: pack the CURRENT decision node once per
+        candidate actor hole (N, 2 card indices), in the batched-packer
+        layout `encode_observation_batch_nlh` consumes. NLH-only; the
+        observation is villain-blind so only the hole-derived fields
+        differ across rows."""
+        return dict(
+            self._rs.pack_range_nlh(np.ascontiguousarray(holes, dtype=np.uint8))
+        )
+
     def awaiting_next_street(self) -> int | None:
         return self._rs.awaiting_next_street()
 

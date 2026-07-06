@@ -74,6 +74,11 @@ def test_live_routes_absent(server):
     c.get("/auth/dev", params={"email": "probe@example.com"})
     assert c.get("/ocr/status").status_code == 404
     assert c.get("/pokernow/status").status_code == 404
+    # The NLH range grid is local-only until validated: stripped like /ocr.
+    r = c.post(
+        "/ranges/query", json={"seats": 6, "stack_bb": 100.0, "line": []}
+    )
+    assert r.status_code == 404
 
 
 def test_me_shape(clients):

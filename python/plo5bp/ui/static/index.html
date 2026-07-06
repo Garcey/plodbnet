@@ -29,6 +29,7 @@
       <div id="mode-tabs">
         <button id="tab-study" class="mode-tab active" type="button">Study</button>
         <button id="tab-trainer" class="mode-tab" type="button">Trainer</button>
+        <button id="tab-ranges" class="mode-tab" type="button" hidden>Ranges</button>
       </div>
       <div class="top-bar-item">
         <label for="format-select">Format</label>
@@ -91,6 +92,44 @@
     </header>
 
     <main>
+      <!-- NLH range grid (Ranges tab) — local build only; ranges.js gates
+           the tab on format + PLO5BP_PUBLIC, and the /ranges routes are
+           stripped server-side on the public build. -->
+      <section id="rg-view">
+        <div id="rg-topbar">
+          <label>Seats
+            <select id="rg-seats">
+              <option>2</option><option>3</option><option>4</option>
+              <option>5</option><option selected>6</option>
+            </select>
+          </label>
+          <label>Stack (bb)
+            <input id="rg-stack" type="number" min="2" max="1000" step="5" value="100" />
+          </label>
+          <button id="rg-reset" type="button">Reset</button>
+          <span id="rg-model" class="muted"></span>
+        </div>
+        <div id="rg-strips"></div>
+        <div id="rg-flex">
+          <div id="rg-grid-wrap"><div id="rg-grid"></div></div>
+          <div id="rg-side">
+            <div id="rg-actions"></div>
+            <div id="rg-summary"></div>
+            <div id="rg-sizes"></div>
+            <div id="rg-hover"></div>
+          </div>
+        </div>
+        <div id="rg-card-modal" class="modal-backdrop" hidden>
+          <div class="modal rg-card-picker">
+            <h3 id="rg-card-title">Pick cards</h3>
+            <div id="rg-card-grid"></div>
+            <div class="modal-buttons">
+              <button id="rg-card-cancel" type="button">Cancel</button>
+              <button id="rg-card-ok" class="primary" type="button" disabled>Confirm</button>
+            </div>
+          </div>
+        </div>
+      </section>
       <section id="table-area">
         <div id="table-wrap">
           <svg id="table-svg" viewBox="0 0 800 560" xmlns="http://www.w3.org/2000/svg">
@@ -506,5 +545,6 @@
     </div>
 
     <script src="/static/app.js"></script>
+    <script src="/static/ranges.js"></script>
   </body>
 </html>

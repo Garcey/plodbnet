@@ -250,6 +250,36 @@ ante 5000; 6-max preflop pot = 45000 ("$45").
   --stack-dist deep --num-seats-range "2,3,4,5,6"
 ```
 
+### NLH range grid ("Ranges" tab, LOCAL BUILD ONLY)
+
+GTO-Wizard-style 169-hand strategy grid (built 2026-07-06). The tab
+appears next to Study/Trainer only when format=NLH AND not
+`PLO5BP_PUBLIC`; the public build strips every `/ranges` route (same
+filter as `/ocr`) — do NOT un-strip without an explicit user decision
+(and admin-gate it first when that day comes).
+
+- Rust: `PyGameState.pack_range_nlh(holes)` packs ONE decision node once
+  per candidate hole in the exact batched-packer layout (the obs is
+  villain-blind; only the hole multi-hot + `hero_cat_a` +
+  `nlh_opp_outcome` vary per row — the latter two via
+  `nlh_category_for` / `nlh_opp_outcome_for` free fns, rayon).
+  **Bit-exact vs serial study obs**, pinned by
+  `tests/python/test_ranges.py` — keep that parity.
+- Backend: `plo5bp/ui/ranges.py`, stateless `POST /ranges/query`
+  (seats, stack_bb, `line` = ONE ordered list interleaving actions and
+  street cards, optional node = prefix length). Ephemeral study replay
+  (never the user's study Session), one batched forward per node
+  (in-process cache per line-prefix), reach = per-seat gate-level Π of
+  the seat's own action probs (no size-conditional reach in v1), fixed
+  5/10($5) stake with button=seat 0 so positions are canonical. A study
+  street boundary sets the env's done flag — check awaiting FIRST.
+- Frontend: `static/ranges.js`, self-contained (app.js untouched — the
+  tab toggles `body.ranges-mode`); strips builder with GTO-Wizard
+  rebranching (acting at a viewed past node truncates the line there),
+  anchor-size raise buttons, street card popup, hover combo breakdown.
+  Client queries NEVER drop-when-busy: latest-response-wins via RG_SEQ
+  (dropping desyncs the line from the render — bug found in validation).
+
 ## Promote good checkpoints to the UI
 
 After a training run finishes, if the checkpoint looks good, push it to

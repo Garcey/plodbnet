@@ -363,6 +363,217 @@ impl PyGameState {
         Ok(d)
     }
 
+    /// Range-grid packer: this NLH decision node packed once per candidate
+    /// actor hole, in the exact `observation_and_features_batch` layout
+    /// (`nlh_single`) consumed by `encode_observation_batch_nlh`. The
+    /// observation is villain-blind, so every field is identical across
+    /// rows except the actor's hole cards and the two hole-derived inputs
+    /// (`hero_cat_a`, `nlh_opp_outcome`), recomputed per combo in
+    /// parallel. `holes` is (N, 2) card indices; each combo must be two
+    /// distinct cards, none on the board (villain-placeholder collisions
+    /// are fine — placeholders never enter the observation). Requires a
+    /// live actor (not terminal, not awaiting a street card).
+    fn pack_range_nlh<'py>(
+        &self,
+        py: Python<'py>,
+        holes: PyReadonlyArray2<'_, u8>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let g = self.get()?;
+        if g.config.variant != Variant::NlhSingle {
+            return Err(PyValueError::new_err("pack_range_nlh is NLH-only"));
+        }
+        if g.current_actor().is_none() {
+            return Err(PyValueError::new_err(
+                "no current actor (terminal or awaiting a street card)",
+            ));
+        }
+        let actor = g.current_actor().unwrap();
+        let holes = holes.as_array();
+        if holes.ncols() != 2 {
+            return Err(PyValueError::new_err("holes must have shape (N, 2)"));
+        }
+        let n = holes.nrows();
+        let s = self.config.num_seats;
+
+        let mut on_board = [false; 52];
+        for c in g.board_a.iter() {
+            on_board[c.index() as usize] = true;
+        }
+        let mut combos: Vec<[Card; 2]> = Vec::with_capacity(n);
+        for i in 0..n {
+            let (c0, c1) = (holes[[i, 0]], holes[[i, 1]]);
+            if c0 >= 52 || c1 >= 52 || c0 == c1 {
+                return Err(PyValueError::new_err(format!(
+                    "invalid combo at row {i}: ({c0}, {c1})"
+                )));
+            }
+            if on_board[c0 as usize] || on_board[c1 as usize] {
+                return Err(PyValueError::new_err(format!(
+                    "combo at row {i} collides with the board"
+                )));
+            }
+            combos.push([Card::from_index(c0), Card::from_index(c1)]);
+        }
+
+        let hist_cap = history_cap(Variant::NlhSingle);
+        let (packed, hero_cat_a) = py.allow_threads(move || {
+            // Per-combo hole-derived features — the only expensive part
+            // (exhaustive opp-outcome sweep per combo postflop).
+            let per_combo: Vec<(u8, [f32; 3])> = combos
+                .par_iter()
+                .map(|h| {
+                    (
+                        crate::engine::nlh_category_for(h, &g.board_a),
+                        crate::engine::nlh_opp_outcome_for(h, &g.board_a),
+                    )
+                })
+                .collect();
+
+            let mut hero_hole = Array2::<u8>::from_elem((n, 2), 255u8);
+            let mut board_a = Array2::<u8>::from_elem((n, 5), 255u8);
+            let board_b = Array2::<u8>::from_elem((n, 5), 255u8);
+            let la = g.board_a.len().min(5);
+            let board_a_len = Array1::<u8>::from_elem(n, la as u8);
+            let board_b_len = Array1::<u8>::zeros(n);
+            let street = Array1::<u8>::from_elem(n, g.street.index() as u8);
+            let pot = Array1::<u64>::from_elem(n, g.pot);
+            let bet_to_call = Array1::<u64>::from_elem(n, g.bet_to_call);
+            let min_bet = Array1::<u64>::from_elem(n, g.min_bet_total());
+            let max_bet = Array1::<u64>::from_elem(n, g.max_bet_total());
+            let min_raise = Array1::<u64>::from_elem(n, g.min_raise_chips());
+            let max_raise = Array1::<u64>::from_elem(n, g.max_raise_chips());
+            let actor_arr = Array1::<i8>::from_elem(n, actor as i8);
+            let button = Array1::<u8>::from_elem(n, g.button as u8);
+            let last_aggressor = Array1::<i8>::from_elem(
+                n,
+                g.last_aggressor.map(|x| x as i8).unwrap_or(-1),
+            );
+            let sb_seat =
+                Array1::<i8>::from_elem(n, g.sb_seat.map(|x| x as i8).unwrap_or(-1));
+            let bb_seat =
+                Array1::<i8>::from_elem(n, g.bb_seat.map(|x| x as i8).unwrap_or(-1));
+
+            let mut stacks = Array2::<u64>::zeros((n, s));
+            let mut folded = Array2::<bool>::default((n, s));
+            let mut all_in = Array2::<bool>::default((n, s));
+            let mut street_commit = Array2::<u64>::zeros((n, s));
+            let mut total_commit = Array2::<u64>::zeros((n, s));
+            let mut eff_stack_cap = Array2::<u64>::zeros((n, s));
+            let mut history_seat = Array2::<i8>::from_elem((n, hist_cap), -1i8);
+            let mut history_action = Array2::<i8>::from_elem((n, hist_cap), -1i8);
+            let mut history_chips = Array2::<u64>::zeros((n, hist_cap));
+            let mut history_street = Array2::<i8>::from_elem((n, hist_cap), -1i8);
+
+            let hist_len = g.history.len();
+            let start = hist_len.saturating_sub(hist_cap);
+            let kept = hist_len - start;
+            let history_len = Array1::<u8>::from_elem(n, kept as u8);
+
+            for i in 0..n {
+                for j in 0..la {
+                    board_a[[i, j]] = g.board_a[j].index();
+                }
+                for k in 0..s {
+                    stacks[[i, k]] = g.stacks[k];
+                    folded[[i, k]] = g.folded[k];
+                    all_in[[i, k]] = g.all_in[k];
+                    street_commit[[i, k]] = g.street_commit[k];
+                    total_commit[[i, k]] = g.total_commit[k];
+                    eff_stack_cap[[i, k]] = g.eff_stack_cap_at_hand_start[k];
+                }
+                for (slot, rec) in g.history[start..].iter().enumerate() {
+                    history_seat[[i, slot]] = rec.seat as i8;
+                    history_action[[i, slot]] = rec.action.index() as i8;
+                    history_chips[[i, slot]] = rec.chips;
+                    history_street[[i, slot]] = rec.street.index() as i8;
+                }
+            }
+
+            let mut cat = Array1::<u8>::zeros(n);
+            let mut nlh_opp_outcome = Array2::<f32>::zeros((n, 3));
+            for (i, (c, fr)) in per_combo.iter().enumerate() {
+                hero_hole[[i, 0]] = combos[i][0].index();
+                hero_hole[[i, 1]] = combos[i][1].index();
+                cat[i] = *c;
+                for j in 0..3 {
+                    nlh_opp_outcome[[i, j]] = fr[j];
+                }
+            }
+
+            let packed = PackedObservation {
+                hero_hole,
+                board_a,
+                board_b,
+                board_a_len,
+                board_b_len,
+                street,
+                pot,
+                stacks,
+                folded,
+                all_in,
+                bet_to_call,
+                street_commit,
+                total_commit,
+                min_bet,
+                max_bet,
+                min_raise,
+                max_raise,
+                eff_stack_cap,
+                actor: actor_arr,
+                button,
+                last_aggressor,
+                history_seat,
+                history_action,
+                history_chips,
+                history_street,
+                history_len,
+                opp_outcome_fractions: Array2::<f32>::zeros((n, 12)),
+                sb_seat,
+                bb_seat,
+                nlh_opp_outcome,
+            };
+            (packed, cat)
+        });
+
+        let d = PyDict::new(py);
+        d.set_item("hero_hole", packed.hero_hole.into_pyarray(py))?;
+        d.set_item("board_a", packed.board_a.into_pyarray(py))?;
+        d.set_item("board_b", packed.board_b.into_pyarray(py))?;
+        d.set_item("board_a_len", packed.board_a_len.into_pyarray(py))?;
+        d.set_item("board_b_len", packed.board_b_len.into_pyarray(py))?;
+        d.set_item("street", packed.street.into_pyarray(py))?;
+        d.set_item("pot", packed.pot.into_pyarray(py))?;
+        d.set_item("stacks", packed.stacks.into_pyarray(py))?;
+        d.set_item("folded", packed.folded.into_pyarray(py))?;
+        d.set_item("all_in", packed.all_in.into_pyarray(py))?;
+        d.set_item("bet_to_call", packed.bet_to_call.into_pyarray(py))?;
+        d.set_item("street_commit", packed.street_commit.into_pyarray(py))?;
+        d.set_item("total_commit", packed.total_commit.into_pyarray(py))?;
+        d.set_item("min_bet", packed.min_bet.into_pyarray(py))?;
+        d.set_item("max_bet", packed.max_bet.into_pyarray(py))?;
+        d.set_item("min_raise", packed.min_raise.into_pyarray(py))?;
+        d.set_item("max_raise", packed.max_raise.into_pyarray(py))?;
+        d.set_item("eff_stack_cap", packed.eff_stack_cap.into_pyarray(py))?;
+        d.set_item("actor", packed.actor.into_pyarray(py))?;
+        d.set_item("button", packed.button.into_pyarray(py))?;
+        d.set_item("last_aggressor", packed.last_aggressor.into_pyarray(py))?;
+        d.set_item("history_seat", packed.history_seat.into_pyarray(py))?;
+        d.set_item("history_action", packed.history_action.into_pyarray(py))?;
+        d.set_item("history_chips", packed.history_chips.into_pyarray(py))?;
+        d.set_item("history_street", packed.history_street.into_pyarray(py))?;
+        d.set_item("history_len", packed.history_len.into_pyarray(py))?;
+        d.set_item(
+            "opp_outcome_fractions",
+            packed.opp_outcome_fractions.into_pyarray(py),
+        )?;
+        d.set_item("sb_seat", packed.sb_seat.into_pyarray(py))?;
+        d.set_item("bb_seat", packed.bb_seat.into_pyarray(py))?;
+        d.set_item("nlh_opp_outcome", packed.nlh_opp_outcome.into_pyarray(py))?;
+        d.set_item("hero_cat_a", hero_cat_a.into_pyarray(py))?;
+        d.set_item("hero_cat_b", Array1::<u8>::zeros(n).into_pyarray(py))?;
+        Ok(d)
+    }
+
     /// All seats' hole cards as raw indices, 5 per seat. Trainer-only
     /// accessor for opponent reveal at hand end; never feed into
     /// observations mid-hand.

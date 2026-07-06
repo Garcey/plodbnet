@@ -1561,6 +1561,19 @@ trainer_router = create_trainer_router(
 )
 app.include_router(trainer_router)
 
+# NLH range grid (/ranges/*) — LOCAL BUILD ONLY for now: the public build
+# strips these routes below (same mechanism as /ocr, /pokernow) until the
+# feature is validated and deliberately shipped.
+from plo5bp.ui.ranges import create_ranges_router  # noqa: E402
+
+app.include_router(
+    create_ranges_router(
+        FORMATS,
+        MODEL_DEVICE,
+        nlh_ckpt_name=_format_ckpt_path(VARIANT_NLH).name,
+    )
+)
+
 
 @app.get("/state")
 def state() -> dict[str, Any]:
@@ -3183,7 +3196,9 @@ if PLO5BP_PUBLIC:
     app.router.routes[:] = [
         r
         for r in app.router.routes
-        if not str(getattr(r, "path", "")).startswith(("/ocr", "/pokernow"))
+        if not str(getattr(r, "path", "")).startswith(
+            ("/ocr", "/pokernow", "/ranges")
+        )
     ]
     logger.info(
         "PUBLIC build: dropped %d live route(s); /ocr and /pokernow disabled",

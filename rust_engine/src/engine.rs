@@ -1446,43 +1446,7 @@ impl GameState {
             Some(s) => s,
             None => return vec![0.0; N_OUT],
         };
-        if self.board_a.len() < 3 {
-            return vec![0.0; N_OUT];
-        }
-        let hero_hole = &self.hole_cards[hero_seat];
-        let hero_rank = crate::hand_eval::evaluate_nlh(hero_hole, &self.board_a);
-
-        let mut used = [false; 52];
-        for c in hero_hole.iter().chain(self.board_a.iter()) {
-            used[c.index() as usize] = true;
-        }
-        let unseen: Vec<Card> = (0..52u8)
-            .filter(|&i| !used[i as usize])
-            .map(Card::from_index)
-            .collect();
-        let m = unseen.len();
-        let mut counters = [0u64; N_OUT];
-        let mut total = 0u64;
-        for i in 0..m {
-            for j in (i + 1)..m {
-                let opp = [unseen[i], unseen[j]];
-                let opp_rank = crate::hand_eval::evaluate_nlh(&opp, &self.board_a);
-                let k = if opp_rank > hero_rank {
-                    0
-                } else if opp_rank == hero_rank {
-                    1
-                } else {
-                    2
-                };
-                counters[k] += 1;
-                total += 1;
-            }
-        }
-        if total == 0 {
-            return vec![0.0; N_OUT];
-        }
-        let inv = 1.0f32 / total as f32;
-        counters.iter().map(|&c| c as f32 * inv).collect()
+        nlh_opp_outcome_for(&self.hole_cards[hero_seat], &self.board_a).to_vec()
     }
 
     // ---- Internal helpers ----
@@ -1754,6 +1718,66 @@ fn nlh_blind_seats(n: usize, button: usize, folded: &[bool]) -> (usize, usize) {
         let bb = walk.next().expect("at least 2 in-hand seats");
         (sb, bb)
     }
+}
+
+/// The (hole, board)-parameterized core of `nlh_opp_outcome_fractions`,
+/// shared with the range-grid packer where candidate holes belong to no
+/// engine state: the share of unseen-deck 2-card opponent combos AHEAD
+/// of / TIED with / BEHIND `hole` at `board` under the any-combo NLH
+/// rule (exhaustive, ≤ C(47, 2)). All-zero when the board has fewer
+/// than 3 cards, matching the state method's preflop guard bit-exactly.
+pub fn nlh_opp_outcome_for(hole: &[Card], board: &[Card]) -> [f32; 3] {
+    const N_OUT: usize = 3;
+    if board.len() < 3 {
+        return [0.0; N_OUT];
+    }
+    let hero_rank = crate::hand_eval::evaluate_nlh(hole, board);
+
+    let mut used = [false; 52];
+    for c in hole.iter().chain(board.iter()) {
+        used[c.index() as usize] = true;
+    }
+    let unseen: Vec<Card> = (0..52u8)
+        .filter(|&i| !used[i as usize])
+        .map(Card::from_index)
+        .collect();
+    let m = unseen.len();
+    let mut counters = [0u64; N_OUT];
+    let mut total = 0u64;
+    for i in 0..m {
+        for j in (i + 1)..m {
+            let opp = [unseen[i], unseen[j]];
+            let opp_rank = crate::hand_eval::evaluate_nlh(&opp, board);
+            let k = if opp_rank > hero_rank {
+                0
+            } else if opp_rank == hero_rank {
+                1
+            } else {
+                2
+            };
+            counters[k] += 1;
+            total += 1;
+        }
+    }
+    if total == 0 {
+        return [0.0; N_OUT];
+    }
+    let inv = 1.0f32 / total as f32;
+    [
+        counters[0] as f32 * inv,
+        counters[1] as f32 * inv,
+        counters[2] as f32 * inv,
+    ]
+}
+
+/// Any-combo NLH hand-category (0..=8) for an arbitrary (hole, board);
+/// 0 when the board has fewer than 3 cards — the (hole, board) core of
+/// `hero_category` for the NLH variant (same `rank >> 20` extraction).
+pub fn nlh_category_for(hole: &[Card], board: &[Card]) -> u8 {
+    if board.len() < 3 {
+        return 0;
+    }
+    (crate::hand_eval::evaluate_nlh(hole, board) >> 20) as u8
 }
 
 /// Per-seat hand-start effective-stack cap. For seat `i`:
@@ -3447,5 +3471,42 @@ mod nlh_study_tests {
         let plo = GameConfig::new_uniform(6, 200_000, 30_000, 10_000);
         let r = GameState::new_study_nlh(plo, 0, 0, hero2(0, 4));
         assert_eq!(r.err(), Some(StudyError::WrongState));
+    }
+
+    #[test]
+    fn nlh_hole_feature_free_fns_match_state_methods() {
+        // The range-grid packer computes per-combo features via the free
+        // fns; pin them bit-exact against the state methods for the
+        // ACTUAL actor hole, preflop (both zero) and on a flop.
+        let mut g = GameState::new_study_nlh(cfg(3), 0, 0, hero2(51, 47)).unwrap();
+        let a = g.actor.unwrap();
+        assert_eq!(
+            nlh_opp_outcome_for(&g.hole_cards[a], &g.board_a),
+            [0.0f32; 3],
+            "preflop opp-outcome must be zeros"
+        );
+        assert_eq!(nlh_category_for(&g.hole_cards[a], &g.board_a), 0);
+        for _ in 0..3 {
+            g.apply(Action::CheckCall);
+        }
+        g.set_flop_nlh([
+            Card::from_index(0),
+            Card::from_index(5),
+            Card::from_index(10),
+        ])
+        .unwrap();
+        let a = g.actor.unwrap();
+        let free = nlh_opp_outcome_for(&g.hole_cards[a], &g.board_a);
+        let method = g.nlh_opp_outcome_fractions();
+        assert_eq!(free.to_vec(), method);
+        assert!(free.iter().sum::<f32>() > 0.99, "flop fractions populated");
+        assert_eq!(
+            nlh_category_for(&g.hole_cards[a], &g.board_a),
+            g.hero_category(a, 0)
+        );
+        // An arbitrary non-actor combo also works (no state required).
+        let combo = [Card::from_index(30), Card::from_index(31)];
+        let fr = nlh_opp_outcome_for(&combo, &g.board_a);
+        assert!((fr.iter().sum::<f32>() - 1.0).abs() < 1e-5);
     }
 }
