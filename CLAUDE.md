@@ -603,6 +603,14 @@ curl -X POST http://127.0.0.1:8765/ocr/save_frame \
   reconstructor walks forward from `engine_view.current_actor` and
   explains as many deltas as it can. Prefer adding fallback signals
   over raising.
+- **Labeled ground-truth frames are LOCAL-ONLY and were lost
+  (2026-06-26)**: `tests/ocr/fixtures/labels.json` referenced five
+  frame PNGs under gitignored `screenrecords/frames/`; a disk cleanup
+  deleted them (unrecoverable), so the two card-accuracy tests SKIP.
+  New/recovered labeled frames go in **tracked**
+  `tests/ocr/fixtures/frames/` (see its README) — never only in
+  `screenrecords/`. Do not "fix" the skips by loosening accuracy
+  thresholds.
 
 ## PokerNow live source (DOM, not OCR)
 

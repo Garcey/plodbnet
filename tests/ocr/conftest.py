@@ -17,6 +17,23 @@ cv2 = pytest.importorskip("cv2")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LABELS_PATH = Path(__file__).parent / "fixtures" / "labels.json"
+FIXTURE_FRAMES_DIR = Path(__file__).parent / "fixtures" / "frames"
+
+
+def resolve_frame(rel: str) -> Path | None:
+    """Resolve a labeled frame: the recorded repo-relative path first
+    (screenrecords/ is gitignored — LOCAL-ONLY ground truth, and the
+    original five frame_*.png were lost in a 2026-06-26 disk cleanup),
+    then the TRACKED tests/ocr/fixtures/frames/ fallback by basename.
+    Recovered or freshly labeled frames dropped there revive the
+    accuracy tests without touching labels.json. None = nowhere."""
+    p = REPO_ROOT / rel
+    if p.exists():
+        return p
+    fallback = FIXTURE_FRAMES_DIR / Path(rel).name
+    if fallback.exists():
+        return fallback
+    return None
 
 
 def _load_labels():
@@ -27,6 +44,11 @@ def _load_labels():
 @pytest.fixture(scope="session")
 def labels():
     return _load_labels()
+
+
+@pytest.fixture(scope="session")
+def frame_resolver():
+    return resolve_frame
 
 
 @pytest.fixture(scope="session")
@@ -42,8 +64,8 @@ def rank_templates_bootstrapped(labels) -> bool:
     }
 
     for fx in labels:
-        frame_path = REPO_ROOT / fx["frame"]
-        if not frame_path.exists():
+        frame_path = resolve_frame(fx["frame"])
+        if frame_path is None:
             continue
         state = fx["state"]
         for group in groups:

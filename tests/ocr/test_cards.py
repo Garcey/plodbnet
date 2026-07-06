@@ -29,10 +29,10 @@ MIN_SUIT_ACCURACY = 0.50
 MIN_RANK_ACCURACY = 0.40
 
 
-def _iter_labeled_cards(labels):
+def _iter_labeled_cards(labels, resolve):
     for fx in labels:
-        frame_path = REPO_ROOT / fx["frame"]
-        if not frame_path.exists():
+        frame_path = resolve(fx["frame"])
+        if frame_path is None:
             continue
         img = cv2.imread(str(frame_path))
         if img is None:
@@ -50,11 +50,26 @@ def _iter_labeled_cards(labels):
                 }
 
 
-def test_suit_accuracy_on_revealed_cards(labels, rank_templates_bootstrapped):
+def _skip_if_no_ground_truth(total: int) -> None:
+    """The labeled frames are LOCAL-ONLY (screenrecords/ is gitignored;
+    the originals were lost in a 2026-06-26 cleanup). With zero collected
+    crops there is nothing to measure — skip loudly rather than fail on
+    0/0. Recovered or newly labeled frames dropped into
+    tests/ocr/fixtures/frames/ (TRACKED) re-arm these tests."""
+    if total == 0:
+        pytest.skip(
+            "no labeled fixture frames on disk — see "
+            "tests/ocr/fixtures/frames/README.md to re-arm"
+        )
+
+
+def test_suit_accuracy_on_revealed_cards(
+    labels, rank_templates_bootstrapped, frame_resolver
+):
     correct = 0
     total = 0
     wrong: list[str] = []
-    for item in _iter_labeled_cards(labels):
+    for item in _iter_labeled_cards(labels, frame_resolver):
         label = item["label"]
         if label is None:
             continue
@@ -68,6 +83,7 @@ def test_suit_accuracy_on_revealed_cards(labels, rank_templates_bootstrapped):
                 f"{item['frame']} {item['group']}[{item['slot']}]: "
                 f"expected {SUIT_CHARS[label.suit]} got {pred_s}"
             )
+    _skip_if_no_ground_truth(total)
     acc = correct / max(total, 1)
     print(f"\nsuit accuracy: {correct}/{total} = {acc:.2%}")
     for m in wrong[:20]:
@@ -75,13 +91,15 @@ def test_suit_accuracy_on_revealed_cards(labels, rank_templates_bootstrapped):
     assert acc >= MIN_SUIT_ACCURACY, f"suit accuracy {acc:.2%} < {MIN_SUIT_ACCURACY:.0%}"
 
 
-def test_rank_accuracy_on_revealed_cards(labels, rank_templates_bootstrapped):
+def test_rank_accuracy_on_revealed_cards(
+    labels, rank_templates_bootstrapped, frame_resolver
+):
     if not rank_templates_bootstrapped:
         pytest.skip("not enough rank templates bootstrapped")
     correct = 0
     total = 0
     wrong: list[str] = []
-    for item in _iter_labeled_cards(labels):
+    for item in _iter_labeled_cards(labels, frame_resolver):
         label = item["label"]
         if label is None:
             continue
@@ -94,6 +112,7 @@ def test_rank_accuracy_on_revealed_cards(labels, rank_templates_bootstrapped):
                 f"{item['frame']} {item['group']}[{item['slot']}]: "
                 f"expected rank {label.rank} got {pred}"
             )
+    _skip_if_no_ground_truth(total)
     acc = correct / max(total, 1)
     print(f"\nrank accuracy: {correct}/{total} = {acc:.2%}")
     for m in wrong[:20]:
