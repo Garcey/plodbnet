@@ -131,6 +131,11 @@ class TrainingConfig:
     # the other.
     retroactive_bonus_c: float = 0.0
 
+    # Auxiliary Q(s, a) regression coefficient for the critic's dueling
+    # head (v5 stems; head exists zero-init regardless so the VRPO
+    # advantage flip is not a checkpoint break). 0 = untrained.
+    q_aux_coef: float = 0.0
+
     # v2 (anchor head + centralized critic) hyperparameters. Ignored on
     # v1 runs — the critic is only built when train.py constructs one.
     critic_hidden_dim: int = 1536

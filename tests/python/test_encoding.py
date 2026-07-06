@@ -942,9 +942,13 @@ def _opp_slice(obs: np.ndarray) -> np.ndarray:
 
 
 def test_opp_outcome_dim_constants() -> None:
+    from plo5bp.encoding import OBS_DIM_V2, _PER_BOARD_OUTCOME_OFF
+
     assert _OPP_OUTCOME_DIM == 12
     assert _OPP_OUTCOME_OFF + _OPP_OUTCOME_DIM == _BET_PCT_POT_OFF
-    assert _BET_PCT_POT_OFF + 1 == OBS_DIM
+    # bet-faced closed the pre-v5 layout; the obs-v2 tail appends after it.
+    assert _BET_PCT_POT_OFF + 1 == OBS_DIM_V2
+    assert _PER_BOARD_OUTCOME_OFF == OBS_DIM_V2
 
 
 def test_opp_outcome_slice_default_zero_when_dict_missing_key() -> None:

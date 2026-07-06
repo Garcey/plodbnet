@@ -73,20 +73,23 @@ class BatchedBombPotEnv:
         # passes a lower count for speed. See rollout.TRAIN_OPP_OUTCOME_MC.
         # NLH ignores it (its 3-dim opp-outcome block is exhaustive).
         self._opp_outcome_mc = int(opp_outcome_mc)
-        # Default-off switch for the Rust observation encoder. When set, the
-        # finished obs comes straight from the engine (one FFI call, no numpy
-        # assembly); otherwise the numpy `encode_observation_batch` reference
-        # path runs. Bit-exact equivalent (test_encoding_batch.py); the switch
-        # exists so a bit-mismatch surfacing in a long run can be reverted
-        # instantly with `PLO5_RUST_ENCODER=0` and a restart — no rebuild.
-        # Falls back to numpy if the rebuilt engine lacks the method.
-        # PLO-only: the Rust encoder implements the 991-dim PLO layout
-        # (the engine refuses it for NLH), so NLH always encodes in numpy.
-        self._use_rust_encoder = (
+        # The Rust observation encoder (PLO5_RUST_ENCODER, default-off)
+        # implements the pre-obs-v2 991-dim PLO layout only. The 2026-07-06
+        # obs-v2 tail (OBS_DIM 1020: per-board outcome, blockers, effective
+        # price, log1p SPR — V5_DESIGN.md §3.2) is NOT ported to it, so the
+        # switch is FORCE-DISABLED — a 991-wide Rust row would misalign the
+        # whole pipeline. Re-enable only after porting the tail blocks and
+        # re-pinning 3-way parity in test_encoding_rust.py.
+        self._use_rust_encoder = False
+        if (
             bool(int(os.environ.get("PLO5_RUST_ENCODER", "0")))
-            and hasattr(BatchedEngine, "observation_encoded_batch")
             and not self._is_nlh
-        )
+        ):
+            print(
+                "[env_batched] PLO5_RUST_ENCODER=1 ignored: the Rust obs "
+                f"encoder predates the obs-v2 layout (991 vs {OBS_DIM}); "
+                "using the numpy encoder."
+            )
         stacks = np.asarray(self.config.resolved_stacks, dtype=np.uint64)
         self._be = BatchedEngine(
             self.n,

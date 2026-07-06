@@ -42,7 +42,12 @@ from plo5bp.config import (
 )
 from plo5bp.encoding import OBS_DIM
 from plo5bp.encoding_nlh import OBS_DIM_NLH
-from plo5bp.network import ActorCriticV2, ActorCriticV4, CentralCritic
+from plo5bp.network import (
+    ActorCriticV2,
+    ActorCriticV4,
+    ActorCriticV5,
+    CentralCritic,
+)
 from plo5bp.sizing import NLH_ANCHOR_SPEC, PLO_ANCHOR_SPEC
 from plo5bp.ppo import PPOTrainer
 from plo5bp.rollout import (
@@ -469,12 +474,48 @@ def main() -> None:
     parser.add_argument("--num-layers", type=int, default=4)
     parser.add_argument(
         "--sizing-head",
-        choices=["anchor", "logistic"],
+        choices=["anchor", "logistic", "mixture"],
         default="anchor",
         help="Sizing-head architecture. 'anchor' = v2 flat 11-way categorical "
         "(head_version 2). 'logistic' = v4 ordinal discretized-logistic over the "
         "same 11 anchors (head_version 3): location+scale, stable under PPO, with "
-        "the min/pot end anchors tail-absorbed so they stay hittable.",
+        "the min/pot end anchors tail-absorbed so they stay hittable. "
+        "'mixture' = v5 K-component mixture of discretized logistics "
+        "(head_version 4): multi-modal solver-style size menus, exact "
+        "closed-form marginal (V5_DESIGN.md §2).",
+    )
+    parser.add_argument(
+        "--mixture-k",
+        type=int,
+        default=3,
+        help="Component count for --sizing-head mixture (ignored otherwise).",
+    )
+    parser.add_argument(
+        "--value-clip",
+        type=float,
+        default=0.2,
+        help="PPO clipped-value-loss radius in RAW bb (V5_DESIGN.md B4: 0.2 "
+        "against ±250bb returns rate-limits the critic; A/B {2, 10, 1e9} on "
+        "a throwaway stem before changing production runs).",
+    )
+    parser.add_argument(
+        "--q-aux-coef",
+        type=float,
+        default=0.0,
+        help="Coefficient for the critic's auxiliary Q(s,a) regression "
+        "(dueling head, v5 stems). 0 = head exists (mixture runs) but "
+        "untrained; the Expected-SARSA advantage flip (VRPO, W2.5) needs "
+        "it warmed first.",
+    )
+    parser.add_argument(
+        "--ev-runout-samples",
+        type=int,
+        default=EV_RUNOUT_SAMPLES,
+        help="MC runout samples for the terminal-reward EV when a hand "
+        "closes before the river with 2+ live seats (cuts runout luck "
+        f"from the reward). Default {EV_RUNOUT_SAMPLES}; higher = lower "
+        "reward variance at more engine time (measure — engine is a few %% "
+        "of update wall-clock).",
     )
     parser.add_argument("--num-envs", type=int, default=1536)
     parser.add_argument("--rollout-length", type=int, default=262_144)
@@ -969,7 +1010,7 @@ def main() -> None:
         ppo_epochs=args.ppo_epochs,
         seed=args.seed,
         snapshot_every=args.snapshot_every,
-        ev_runout_samples=EV_RUNOUT_SAMPLES,
+        ev_runout_samples=args.ev_runout_samples,
         pool_mix_prob=args.pool_mix_prob,
         pool_opp_seats=args.pool_opp_seats,
         entropy_coef=args.entropy_coef,
@@ -983,17 +1024,27 @@ def main() -> None:
         kl_hard=args.kl_hard,
         sizing_entropy_scale=args.sizing_entropy_scale,
         adv_clip=args.adv_clip,
+        value_clip=args.value_clip,
+        q_aux_coef=args.q_aux_coef,
         device=args.device,
     )
 
-    model_cls = ActorCriticV4 if args.sizing_head == "logistic" else ActorCriticV2
     obs_dim = OBS_DIM_NLH if is_nlh else OBS_DIM
     anchor_spec = NLH_ANCHOR_SPEC if is_nlh else PLO_ANCHOR_SPEC
+    head_kwargs: dict = {}
+    if args.sizing_head == "mixture":
+        model_cls = ActorCriticV5
+        head_kwargs["mixture_k"] = int(args.mixture_k)
+    elif args.sizing_head == "logistic":
+        model_cls = ActorCriticV4
+    else:
+        model_cls = ActorCriticV2
     model = model_cls(
         hidden_dim=train_cfg.hidden_dim,
         num_layers=train_cfg.num_layers,
         obs_dim=obs_dim,
         anchor_spec=anchor_spec,
+        **head_kwargs,
     )
     print(
         f"[head] sizing-head={args.sizing_head} "
@@ -1001,10 +1052,15 @@ def main() -> None:
         f"obs_dim={obs_dim} anchors={anchor_spec.count} ({anchor_spec.name})"
     )
     model.to(train_cfg.device)
+    # v5 stems build the critic WITH the dueling Q head from day one
+    # (zero-init; Q == V until --q-aux-coef trains it) so the VRPO
+    # advantage flip later is a code change, not a checkpoint break.
+    critic_q_actions = 2 + anchor_spec.count if args.sizing_head == "mixture" else 0
     critic = CentralCritic(
         obs_dim=obs_dim,
         hidden_dim=train_cfg.critic_hidden_dim,
         num_blocks=train_cfg.critic_num_blocks,
+        q_actions=critic_q_actions,
     )
     critic.to(train_cfg.device)
     print(f"[device] learner on {train_cfg.device}")
@@ -1130,7 +1186,15 @@ def main() -> None:
         )
 
     trainer = PPOTrainer(model, train_cfg, critic=critic)
-    pool = OpponentPool(capacity=train_cfg.opponent_pool_size)
+    # KL-anchor EMA magnet persistence: restore the reference from the
+    # checkpoint so the pull-toward-history survives relaunches (absent
+    # the key it re-initializes to the loaded weights and ramps in).
+    if args.load_checkpoint is not None and trainer._ref is not None:
+        ema_sd = ckpt.get("model_ema")
+        if ema_sd:
+            trainer.load_ref_state_dict(ema_sd)
+            print("[kl-anchor] restored EMA reference from checkpoint")
+    pool = OpponentPool(capacity=train_cfg.opponent_pool_size, seed=args.seed)
     rng = np.random.default_rng(args.seed)
 
     # Warm-start pool reconstruction: refill the (ephemeral) opponent
@@ -1244,6 +1308,18 @@ def main() -> None:
                 "anneal_tier_ent": tier_ent,
                 "anneal_baseline": tier_baseline,
                 "anneal_block_acc": block_acc,
+                # Truthful regimen stamp under --mix-configs (game_config
+                # above is just the first sub-rollout's draw — B9).
+                "mix_configs": bool(args.mix_configs),
+                "mix_tiers": list(mix_tiers) if args.mix_configs else None,
+                "configs_per_tier": (
+                    int(args.configs_per_tier) if args.mix_configs else None
+                ),
+                # KL-anchor EMA reference (None when the magnet is off);
+                # restored on warm-start so the pull-toward-history
+                # survives relaunches. Doubles as the smoother serving
+                # actor (promote model_ema instead of the last iterate).
+                "model_ema": trainer.ref_state_dict(),
             },
             mid_path,
         )
@@ -1328,6 +1404,8 @@ def main() -> None:
                 control_raw = anneal_control_file.read_text()
             except OSError:
                 control_raw = None
+            _prev_live_ent = live_entropy_coef
+            _pre_tier_ent = dict(tier_ent)
             (
                 live_anneal_step,
                 last_anneal_control,
@@ -1339,6 +1417,26 @@ def main() -> None:
                 live_lr, live_entropy_coef, live_entropy_coef_deep,
                 trainer=trainer,
             )
+            # Mix-configs consumes tier_ent (per-row coefs), not
+            # live_entropy_coef — an `entropy_coef` control edit used to be
+            # a silent no-op here (V5_DESIGN.md B5). Broadcast it to every
+            # tier so the natural key works in both modes, but SKIP any
+            # tier an explicit `tier_ent` edit changed in this SAME write
+            # (that override wins — otherwise a combined
+            # {"tier_ent":{"deep":X},"entropy_coef":Y} write would clobber
+            # deep with Y). Order-independent: `_pre_tier_ent` is the
+            # pre-call snapshot, so a tier changed by tier_ent this pass
+            # differs from it and is left alone.
+            if args.mix_configs and live_entropy_coef != _prev_live_ent:
+                for _t in tier_ent:
+                    if tier_ent[_t] != _pre_tier_ent[_t]:
+                        continue  # explicit tier_ent edit this write — keep it
+                    if tier_ent[_t] != live_entropy_coef:
+                        print(
+                            f"[anneal-control] tier_ent[{_t}] {tier_ent[_t]} "
+                            f"-> {live_entropy_coef} (entropy_coef broadcast)"
+                        )
+                    tier_ent[_t] = live_entropy_coef
 
         if args.mix_configs:
             # vThree: every update mixes `configs_per_tier` (seats,stacks) draws
@@ -1350,6 +1448,11 @@ def main() -> None:
                     stack_dist=tier, seats_dist=args.seats_dist,
                     variant=args.variant, sb=args.sb,
                 )[0]
+                for tier in mix_tiers
+                for _ in range(args.configs_per_tier)
+            ]
+            mix_cfg_tiers = [
+                tier
                 for tier in mix_tiers
                 for _ in range(args.configs_per_tier)
             ]
@@ -1386,11 +1489,15 @@ def main() -> None:
             _prof.__enter__()
 
         if args.mix_configs:
+            # Per-tier coefs ride the batch as per-row ent_coef_rows
+            # (V5_DESIGN.md B5): each tier's transitions are paid that
+            # tier's own rate, so `{"tier_ent": {"deep": X}}` control
+            # edits now genuinely apply under mixing. The scalar below is
+            # only the ppo fallback + the log-line display value.
             batch = collect_rollout_multiconfig(
-                model, pool, mix_cfgs, train_cfg, rng, critic=critic
+                model, pool, mix_cfgs, train_cfg, rng, critic=critic,
+                config_tiers=mix_cfg_tiers, tier_ent=tier_ent,
             )
-            # One coef for the mixed update (all mix tiers seeded equal);
-            # live-tunable via anneal_control {"tier_ent": {...}}.
             update_entropy_coef = tier_ent.get(mix_tiers[0], args.entropy_coef)
         elif blocks:
             batch = collector(model, pool, sampled_game_cfg, train_cfg, rng, critic=critic)
@@ -1407,9 +1514,14 @@ def main() -> None:
         # Cold-start LR warmup: small early steps keep per-minibatch KL
         # inside the guard's trust region, so all minibatches apply and
         # the critic actually trains (a tripped update aborts the critic
-        # too — huge advantages then keep the next step violent). Uses
-        # the GLOBAL update index, so warm restarts past the window run
-        # at full LR from the first update.
+        # too — huge advantages then keep the next step violent). Counter
+        # semantics (see base_update above): with --anneal-entropy the
+        # loop counter continues from the checkpoint, so a resumed run
+        # past the window is at full LR immediately; anneal-off relaunches
+        # reset the loop counter and DELIBERATELY re-run the warmup ramp
+        # (gentle-restart semantics — every vFour collapse recovery relied
+        # on it). Checkpoint names/counters stay on the global axis either
+        # way via base_update.
         lr_scale = _lr_warmup_scale(update, args.lr_warmup_updates)
         for _pg in trainer.optimizer.param_groups:
             _pg["lr"] = live_lr * lr_scale
@@ -1478,6 +1590,7 @@ def main() -> None:
                 f"klG/klA/klB={stats.gate_kl:+.3f}/{stats.anchor_kl:+.3f}/"
                 f"{stats.beta_kl:+.3f}  "
                 + (f"klanc={stats.kl_anchor:.4f}  " if args.kl_anchor_coef > 0 else "")
+                + (f"q={stats.q_loss:.4f}  " if args.q_aux_coef > 0 else "")
                 + (
                     (
                         f"KLROLLBACK@mb{stats.kl_stopped_at}"
@@ -1498,6 +1611,20 @@ def main() -> None:
                 + (f"  lr×{lr_scale:.2f}" if lr_scale < 1.0 else "")
                 + (f"  block={block_idx + 1}/{len(blocks)}({active_tier})" if blocks else "")
             )
+            # Per-tier F/T/R under mix-configs (V5_DESIGN.md B5): the
+            # pooled line above can't drive the per-tier stop-loss; this
+            # one can. Same semantics as bonus%(F/T/R), bucketed by tier.
+            if getattr(batch, "tier_ftr", None):
+                parts = []
+                for _t, (_bonus, _steps) in batch.tier_ftr.items():
+                    f_, t_, r_ = (
+                        100.0 * _bonus[s] / max(1, _steps[s]) for s in range(3)
+                    )
+                    parts.append(
+                        f"{_t}={f_:4.1f}/{t_:4.1f}/{r_:4.1f}"
+                        f"(ent {tier_ent.get(_t, update_entropy_coef):.3f})"
+                    )
+                print("        [ftr-tier] " + "  ".join(parts))
 
         # End-of-block entropy anneal: this tier's 50-update block just finished.
         if blocks and args.anneal_entropy and (update + 1) % args.block_size == 0:
@@ -1558,6 +1685,12 @@ def main() -> None:
             "anneal_tier_ent": tier_ent,
             "anneal_baseline": tier_baseline,
             "anneal_block_acc": block_acc,
+            "mix_configs": bool(args.mix_configs),
+            "mix_tiers": list(mix_tiers) if args.mix_configs else None,
+            "configs_per_tier": (
+                int(args.configs_per_tier) if args.mix_configs else None
+            ),
+            "model_ema": trainer.ref_state_dict(),
         },
         args.checkpoint,
     )

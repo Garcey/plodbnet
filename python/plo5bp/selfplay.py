@@ -35,10 +35,15 @@ class OpponentPool:
     see tags.
     """
 
-    def __init__(self, capacity: int = 16):
+    def __init__(self, capacity: int = 16, seed: int | None = None):
         self.capacity = capacity
         self.snapshots: list[dict[str, Any]] = []
         self.tags: list[int] = []
+        # Serial-path sampling RNG, seeded per run (train.py passes the
+        # run seed) so serial/eval rollouts reproduce. Previously sampled
+        # via the GLOBAL unseeded `random` module (V5_DESIGN.md B8);
+        # None preserves that OS-entropy behavior for ad-hoc callers.
+        self._rng = random.Random(seed)
 
     def _push(self, sd: dict[str, Any], tag: int) -> None:
         if len(self.snapshots) >= self.capacity:
@@ -61,7 +66,7 @@ class OpponentPool:
     def sample(self) -> dict[str, Any] | None:
         if not self.snapshots:
             return None
-        return copy.deepcopy(random.choice(self.snapshots))
+        return copy.deepcopy(self._rng.choice(self.snapshots))
 
     def __len__(self) -> int:
         return len(self.snapshots)

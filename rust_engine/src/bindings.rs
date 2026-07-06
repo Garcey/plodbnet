@@ -294,6 +294,13 @@ impl PyGameState {
         Ok(self.get()?.opp_outcome_fractions())
     }
 
+    /// 20-dim superset: the 12 joint outcome fractions + the 8-dim
+    /// per-board decomposition (obs v2 P1), one fused pass. See
+    /// `GameState::outcome_features_mc`.
+    fn outcome_features_mc(&self, mc_samples: usize) -> PyResult<Vec<f32>> {
+        Ok(self.get()?.outcome_features_mc(mc_samples))
+    }
+
     /// Like `opp_outcome_fractions` but with an explicit k=3/k=4 MC
     /// sample budget (the no-arg form uses 1024). For tests / benchmarks
     /// of the training-vs-UI fidelity split.
@@ -346,7 +353,12 @@ impl PyGameState {
             .collect();
         d.set_item("history", history)?;
 
-        d.set_item("opp_outcome_fractions", g.opp_outcome_fractions())?;
+        // One fused pass computes both the 12 joint fractions and the
+        // 8-dim per-board decomposition (obs v2 P1) — same cost as the
+        // old opp_outcome_fractions-only call.
+        let outcome_feats = g.outcome_features_mc(1024);
+        d.set_item("opp_outcome_fractions", outcome_feats[..12].to_vec())?;
+        d.set_item("per_board_outcome", outcome_feats[12..].to_vec())?;
         // NLH 3-dim [opp_ahead, tied, opp_behind]; cheap zeros for other
         // variants (the method's variant guard returns before any eval).
         d.set_item("nlh_opp_outcome", g.nlh_opp_outcome_fractions())?;
@@ -528,6 +540,7 @@ impl PyGameState {
                 history_street,
                 history_len,
                 opp_outcome_fractions: Array2::<f32>::zeros((n, 12)),
+                per_board_outcome: Array2::<f32>::zeros((n, 8)),
                 sb_seat,
                 bb_seat,
                 nlh_opp_outcome,
@@ -565,6 +578,10 @@ impl PyGameState {
         d.set_item(
             "opp_outcome_fractions",
             packed.opp_outcome_fractions.into_pyarray(py),
+        )?;
+        d.set_item(
+            "per_board_outcome",
+            packed.per_board_outcome.into_pyarray(py),
         )?;
         d.set_item("sb_seat", packed.sb_seat.into_pyarray(py))?;
         d.set_item("bb_seat", packed.bb_seat.into_pyarray(py))?;
@@ -1632,6 +1649,10 @@ impl PyBatchedEngine {
             "opp_outcome_fractions",
             packed.opp_outcome_fractions.into_pyarray(py),
         )?;
+        d.set_item(
+            "per_board_outcome",
+            packed.per_board_outcome.into_pyarray(py),
+        )?;
         Ok(d)
     }
 
@@ -1709,6 +1730,10 @@ impl PyBatchedEngine {
         d.set_item(
             "opp_outcome_fractions",
             packed.opp_outcome_fractions.into_pyarray(py),
+        )?;
+        d.set_item(
+            "per_board_outcome",
+            packed.per_board_outcome.into_pyarray(py),
         )?;
         d.set_item("sb_seat", packed.sb_seat.into_pyarray(py))?;
         d.set_item("bb_seat", packed.bb_seat.into_pyarray(py))?;
@@ -1790,6 +1815,10 @@ impl PyBatchedEngine {
             "opp_outcome_fractions",
             packed.opp_outcome_fractions.into_pyarray(py),
         )?;
+        d.set_item(
+            "per_board_outcome",
+            packed.per_board_outcome.into_pyarray(py),
+        )?;
         d.set_item("sb_seat", packed.sb_seat.into_pyarray(py))?;
         d.set_item("bb_seat", packed.bb_seat.into_pyarray(py))?;
         d.set_item("nlh_opp_outcome", packed.nlh_opp_outcome.into_pyarray(py))?;
@@ -1851,6 +1880,9 @@ struct PackedObservation {
     history_street: Array2<i8>,
     history_len: Array1<u8>,
     opp_outcome_fractions: Array2<f32>,
+    /// Per-board hero ahead/tie/behind + win-one/tie-both fractions
+    /// (obs v2 P1; k=2 exhaustive, same fused pass). All-zero for NLH.
+    per_board_outcome: Array2<f32>,
     /// Blind seats (-1 when the variant has none). NLH batch encoder input.
     sb_seat: Array1<i8>,
     bb_seat: Array1<i8>,
@@ -1904,6 +1936,7 @@ impl PyBatchedEngine {
         let mut history_street = Array2::<i8>::from_elem((n, hist_cap), -1i8);
         let mut history_len = Array1::<u8>::zeros(n);
         let mut opp_outcome_fractions = Array2::<f32>::zeros((n, 12));
+        let mut per_board_outcome = Array2::<f32>::zeros((n, 8));
         let mut sb_seat = Array1::<i8>::from_elem(n, -1i8);
         let mut bb_seat = Array1::<i8>::from_elem(n, -1i8);
         let mut nlh_opp_outcome = Array2::<f32>::zeros((n, 3));
@@ -1936,13 +1969,15 @@ impl PyBatchedEngine {
             }
         } else {
             let opp_outcome_mc = self.opp_outcome_mc;
-            let opp_fr_per_env: Vec<[f32; 12]> = (0..n)
+            // One fused pass per env yields BOTH the 12 joint fractions
+            // and the 8 per-board dims (obs v2 P1) — same eval cost.
+            let opp_fr_per_env: Vec<[f32; 20]> = (0..n)
                 .into_par_iter()
                 .map(|i| {
-                    let mut out = [0.0f32; 12];
+                    let mut out = [0.0f32; 20];
                     if let Some(state) = self.states[idx[i]].as_ref() {
-                        let fr = state.opp_outcome_fractions_mc(opp_outcome_mc);
-                        for j in 0..12 {
+                        let fr = state.outcome_features_mc(opp_outcome_mc);
+                        for j in 0..20 {
                             out[j] = fr[j];
                         }
                     }
@@ -1952,6 +1987,9 @@ impl PyBatchedEngine {
             for i in 0..n {
                 for j in 0..12 {
                     opp_outcome_fractions[[i, j]] = opp_fr_per_env[i][j];
+                }
+                for j in 0..8 {
+                    per_board_outcome[[i, j]] = opp_fr_per_env[i][12 + j];
                 }
             }
         }
@@ -2129,6 +2167,7 @@ impl PyBatchedEngine {
             history_street,
             history_len,
             opp_outcome_fractions,
+            per_board_outcome,
             sb_seat,
             bb_seat,
             nlh_opp_outcome,

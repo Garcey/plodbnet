@@ -291,6 +291,15 @@ class ActorCriticV2(nn.Module):
     """
 
     head_version = 2
+    # v5 sets this True: detach the anchor-prob weighting inside
+    # beta_h_eff so the maximized entropy BONUS cannot pay the sizing
+    # head to shift anchor mass onto the (Beta-masked) atom anchors —
+    # Beta differential entropy is <= 0 for alpha,beta >= 1, so with
+    # the weight in the graph the bonus rewards moving mass OFF the
+    # refinable interior anchors, a verified pressure toward min/pot
+    # sizing (2026-07-06 review, V5_DESIGN.md B3). Kept False here and
+    # on v4 so those stems stay byte-identical on resume.
+    _detach_beta_h_weight = False
 
     def __init__(
         self,
@@ -502,9 +511,10 @@ class ActorCriticV2(nn.Module):
         all_beta = torch.distributions.Beta(refine[..., 0], refine[..., 1])
         beta_h = all_beta.entropy()                       # (B, interior)
         interior_ok = grid.refine_ok[..., 1:self._anchor_count - 1]
-        beta_h_eff = (
-            anchor_probs[..., 1:self._anchor_count - 1] * beta_h * interior_ok
-        ).sum(-1)
+        w_interior = anchor_probs[..., 1:self._anchor_count - 1]
+        if self._detach_beta_h_weight:
+            w_interior = w_interior.detach()
+        beta_h_eff = (w_interior * beta_h * interior_ok).sum(-1)
         anchor_entropy = anchor_dist.entropy()
         entropy = gate_entropy + p_raise.detach() * (anchor_entropy + beta_h_eff)
         return (
@@ -626,29 +636,177 @@ class ActorCriticV4(ActorCriticV2):
         return torch.distributions.Categorical(probs=probs)
 
 
+class ActorCriticV5(ActorCriticV4):
+    """v5 sizing head: a K-component MIXTURE of discretized logistics.
+
+    One Logistic(mu, s) sliced over the ordered ladder is unimodal in the
+    interior (only the legal-edge tail absorption can add end bumps), so v4
+    provably cannot put meaningful mass on an interior size AND a distant
+    size at the same node — the solver-style menu (e.g. 33% block vs pot).
+    v5 emits K (mu_k, s_k) pairs plus K mixture logits; the anchor
+    distribution is the weighted sum of the K discretized logistics.
+    Because anchors are DISCRETE, that marginal is itself just a
+    Categorical over the <= count legal anchors: log-prob and entropy are
+    exact closed forms, sampling the marginal is distributionally
+    identical to sampling a component first, and no component index is
+    ever stored — `act`/`evaluate`, the rollout buffer, PPO, and the UI
+    anchors histogram all inherit unchanged through `_anchor_dist`.
+
+    Guardrails from the v2 collapse postmortem (V5_DESIGN.md §2):
+
+    - EPSILON WEIGHT FLOOR (`mix_weight_floor`): keeps every component's
+      gradient alive (no permanently dead components — a zero-weight
+      component's (mu, s) receive no responsibility-weighted gradient and
+      never recover) and bounds importance ratios (P(a) >= eps*P_k(a)).
+      Applied INSIDE `_anchor_dist` so act/evaluate see identical weights.
+      A fixed constant by design — it is not stored in the state dict, so
+      a run-time flag would let serving silently diverge from training.
+    - NO H(w) ENTROPY BONUS: the marginal entropy `evaluate` already
+      returns pays for multimodal spread exactly when it spreads the
+      anchor pmf; a direct bonus on the weight entropy is v2's
+      flat-collapse analog (it pins w uniform and blurs the menu into a
+      fat unimodal average). `mixture_params` exposes (mu, s, w) so Hw
+      can be LOGGED as a diagnostic.
+    - INIT SPREAD: zeroed head weights + bias-driven component locations
+      spread across the ladder (see `_init_mix_head`), so cold starts
+      explore a genuine menu instead of three coincident humps (mode
+      collapse to unimodal is graceful — w one-hot IS v4 — but starting
+      coalesced makes it the default outcome).
+    - per-component s inherits v4's floor/cap — the anti-spike property
+      that made v4 trainable — and `_detach_beta_h_weight` is True here
+      (the B3 entropy-artifact fix; v4/v2 keep the legacy behavior).
+
+    Checkpoints sniff on `mix_head.weight`, shape (3K, hidden): rows
+    [0:K) = mu_raw, [K:2K) = s_raw, [2K:3K) = mixture logits. The tensor
+    name is deliberately NOT `size_head` — the UI's class sniffer checks
+    key names, and reusing v4's name would rebuild a V4, shape-fail, and
+    silently serve a random-init placeholder."""
+
+    head_version = 4
+    _detach_beta_h_weight = True
+
+    def __init__(
+        self,
+        hidden_dim: int = 512,
+        obs_dim: int = OBS_DIM,
+        num_layers: int = 2,
+        size_scale_floor: float = 0.3,
+        size_scale_cap: float = 5.0,
+        anchor_spec: AnchorSpec = PLO_ANCHOR_SPEC,
+        mixture_k: int = 3,
+        mix_weight_floor: float = 0.03,
+    ):
+        super().__init__(
+            hidden_dim=hidden_dim,
+            obs_dim=obs_dim,
+            num_layers=num_layers,
+            size_scale_floor=size_scale_floor,
+            size_scale_cap=size_scale_cap,
+            anchor_spec=anchor_spec,
+        )
+        if mixture_k < 1:
+            raise ValueError(f"mixture_k must be >= 1, got {mixture_k}")
+        if not 0.0 <= mix_weight_floor < 1.0 / mixture_k:
+            raise ValueError(
+                "mix_weight_floor must be in [0, 1/mixture_k), got "
+                f"{mix_weight_floor} (K={mixture_k})"
+            )
+        del self.size_head
+        self._mixture_k = int(mixture_k)
+        self._mix_floor = float(mix_weight_floor)
+        self.mix_head = nn.Linear(hidden_dim, 3 * self._mixture_k)
+        self._init_mix_head()
+
+    def _init_mix_head(self) -> None:
+        """Zero weights + bias-driven spread. mu_raw biases linspace(-1, 1)
+        put component locations at ~(-0.3, mid, count+0.3) on the index
+        axis for K=3 (tanh(±1) ≈ ±0.76); s_raw bias 0 = mid-scale; logit
+        biases 0 = uniform weights (the floor then leaves them uniform).
+        Weights must be exactly zero for the spread to hold at init — a
+        default-init Linear at hidden 2048 produces O(1) random logits
+        that swamp the biases."""
+        with torch.no_grad():
+            self.mix_head.weight.zero_()
+            self.mix_head.bias.zero_()
+            k = self._mixture_k
+            if k > 1:
+                self.mix_head.bias[0:k] = torch.linspace(-1.0, 1.0, k)
+
+    def forward(self, obs, gate_mask):
+        z = self.torso(obs)
+        gate_logits = self.gate_head(z).masked_fill(~gate_mask, -1e9)
+        mix_params = self.mix_head(z)  # (..., 3K)
+        refine = F.softplus(self.refine_head(z)).view(
+            *z.shape[:-1], self._interior, 2
+        ) + 1.0
+        value = self.value_head(z.detach()).squeeze(-1)
+        return gate_logits, mix_params, refine, value
+
+    def mixture_params(
+        self, mix_params: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """(mu, s, w), each (..., K): component locations on the anchor
+        index axis, per-component scales, and the FLOORED mixture weights.
+        The canonical consumer is `_anchor_dist`; exposed for training
+        logs (component diagnostics, Hw) and the UI `mixture` payload."""
+        k = self._mixture_k
+        c = (self._anchor_count - 1) / 2.0
+        mu = c + (c + 2.0) * torch.tanh(mix_params[..., 0:k])
+        s = self._size_floor + self._size_span * torch.sigmoid(
+            mix_params[..., k:2 * k]
+        )
+        w = F.softmax(mix_params[..., 2 * k:3 * k], dim=-1)
+        if self._mix_floor > 0.0:
+            w = self._mix_floor + (1.0 - k * self._mix_floor) * w
+        return mu, s, w
+
+    def _anchor_dist(self, mix_params: torch.Tensor, grid):
+        mu, s, w = self.mixture_params(mix_params)
+        legal = grid.legal[..., None, :].expand(
+            *mu.shape, grid.legal.shape[-1]
+        )
+        probs_k = _discretized_logistic_probs(mu, s, legal)  # (..., K, count)
+        probs = (w[..., None] * probs_k).sum(-2)
+        # Each component sums to 1 over the legal set and the floored
+        # weights sum to 1; the renorm is numerical hygiene only.
+        probs = probs / probs.sum(-1, keepdim=True).clamp_min(1e-12)
+        return torch.distributions.Categorical(probs=probs)
+
+
 def obs_adapter(model: nn.Module):
     """Return a numpy function mapping freshly-encoded (..., OBS_DIM)
     observations to the model's expected input width.
 
-    v1-era checkpoints were trained at OBS_DIM_V1=959, before the
-    pot-fraction history dims; the encoder now always emits 991, so
-    those models need the exact `downgrade_obs_to_v1` projection.
-    Models whose first layer already takes the current OBS_DIM (fresh
-    v1 nets included) get identity."""
-    from plo5bp.encoding import OBS_DIM_V1, downgrade_obs_to_v1
+    Three generations serve side by side: v1-era checkpoints (OBS_DIM_V1
+    = 959, pre-pot-fraction-history) get the exact `downgrade_obs_to_v1`
+    projection (its index map only touches dims < 991, so it also drops
+    the obs-v2 tail); 991-era v2/v4 checkpoints (through vFour4) get the
+    `downgrade_obs_to_v2` tail slice; models whose first layer already
+    takes the current OBS_DIM get identity."""
+    from plo5bp.encoding import (
+        OBS_DIM_V1,
+        OBS_DIM_V2,
+        downgrade_obs_to_v1,
+        downgrade_obs_to_v2,
+    )
 
     first = model.torso[0]
     lin = first[0] if isinstance(first, nn.Sequential) else first
     if int(lin.in_features) == OBS_DIM_V1:
         return downgrade_obs_to_v1
+    if int(lin.in_features) == OBS_DIM_V2:
+        return downgrade_obs_to_v2
     return lambda obs: obs
 
 
 def model_class_for_state_dict(state_dict: dict) -> type:
     """Sniff a checkpoint's actor class from its head parameters:
+    'mix_head.weight' → ActorCriticV5 (mixture of discretized logistics),
     'size_head.weight' → ActorCriticV4 (ordinal logistic), 'anchor_head.weight'
     → ActorCriticV2, 'raise_head.weight' → v1. Shared by the UI server and the
     eval/exploit/bankroll loaders so every consumer serves all generations."""
+    if "mix_head.weight" in state_dict:
+        return ActorCriticV5
     if "size_head.weight" in state_dict:
         return ActorCriticV4
     if "anchor_head.weight" in state_dict:
@@ -656,8 +814,9 @@ def model_class_for_state_dict(state_dict: dict) -> type:
     if "raise_head.weight" in state_dict:
         return ActorCritic
     raise ValueError(
-        "state_dict has none of 'size_head.weight' (v4), 'anchor_head.weight' "
-        "(v2), or 'raise_head.weight' (v1) — not a plo5bp actor checkpoint"
+        "state_dict has none of 'mix_head.weight' (v5), 'size_head.weight' "
+        "(v4), 'anchor_head.weight' (v2), or 'raise_head.weight' (v1) — not "
+        "a plo5bp actor checkpoint"
     )
 
 
@@ -698,6 +857,9 @@ def build_actor_from_state_dict(
     count = state_dict_anchor_count(state_dict)
     if count is not None and cls is not ActorCritic:
         kwargs["anchor_spec"] = anchor_spec_for_count(count)
+    if cls is ActorCriticV5:
+        # mix_head is (3K, hidden): K (mu, s) pairs + K mixture logits.
+        kwargs["mixture_k"] = int(state_dict["mix_head.weight"].shape[0]) // 3
     model = cls(**kwargs)
     model.load_state_dict(state_dict)
     return model
@@ -731,6 +893,7 @@ class CentralCritic(nn.Module):
         opp_dim: int = 5 * 52,
         hidden_dim: int = 1536,
         num_blocks: int = 2,
+        q_actions: int = 0,
     ):
         super().__init__()
         input_block = nn.Sequential(
@@ -739,12 +902,39 @@ class CentralCritic(nn.Module):
         blocks = [_ResidualBlock(hidden_dim) for _ in range(num_blocks)]
         self.torso = nn.Sequential(input_block, *blocks)
         self.value_head = nn.Linear(hidden_dim, 1)
+        # Optional dueling Q head (v5 stems): Q(s, a) = V(s).detach() +
+        # A(s, a), zero-init so Q == V from step 0. Trained as an
+        # AUXILIARY regression (`q_aux_coef` in ppo.py); GAE advantages
+        # keep coming from V until the Expected-SARSA estimator lands
+        # (VRPO, V5_DESIGN.md W2.5). Built into the checkpoint from day
+        # one precisely so flipping the estimator later is a code change,
+        # not a checkpoint break. Action index = 0 Fold, 1 CheckCall,
+        # 2+k Raise@anchor_k → q_actions = 2 + anchor_count (13 for PLO,
+        # 14 for NLH). 0 = no head (pre-v5 checkpoints load unchanged).
+        self.q_actions = int(q_actions)
+        if self.q_actions > 0:
+            self.adv_head = nn.Linear(hidden_dim, self.q_actions)
+            with torch.no_grad():
+                self.adv_head.weight.zero_()
+                self.adv_head.bias.zero_()
 
     def forward(
         self, obs: torch.Tensor, opp_multihot: torch.Tensor
     ) -> torch.Tensor:
         z = self.torso(torch.cat([obs, opp_multihot], dim=-1))
         return self.value_head(z).squeeze(-1)
+
+    def q_values(
+        self, obs: torch.Tensor, opp_multihot: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """(V, Q): V (B,) exactly as forward(); Q (B, q_actions) =
+        V.detach() + A(s, a). The detach keeps the aux Q regression from
+        double-driving V through the sum (V already has the clipped value
+        loss); the trunk still receives the aux gradient through A."""
+        z = self.torso(torch.cat([obs, opp_multihot], dim=-1))
+        v = self.value_head(z).squeeze(-1)
+        q = v.detach()[..., None] + self.adv_head(z)
+        return v, q
 
     @property
     def obs_dim(self) -> int:
@@ -762,8 +952,14 @@ def build_critic_from_state_dict(state_dict: dict) -> CentralCritic:
     num_blocks = (
         len({k.split(".")[1] for k in state_dict if k.startswith("torso.")}) - 1
     )
+    q_actions = 0
+    if "adv_head.weight" in state_dict:
+        q_actions = int(state_dict["adv_head.weight"].shape[0])
     critic = CentralCritic(
-        obs_dim=obs_dim, hidden_dim=hidden_dim, num_blocks=num_blocks
+        obs_dim=obs_dim,
+        hidden_dim=hidden_dim,
+        num_blocks=num_blocks,
+        q_actions=q_actions,
     )
     critic.load_state_dict(state_dict)
     return critic

@@ -106,13 +106,19 @@ from plo5bp._engine import (  # type: ignore[attr-defined]
 from plo5bp.actions import CHECK_CALL, FOLD
 from plo5bp.config import GameConfig
 
-OBS_DIM: int = 991
+OBS_DIM: int = 1020
 
 # v1 (pre-anchor-head era) observation layout: 17-dim history slots, no
 # pot-fraction dim, tail blocks 32 lower. v1 checkpoints can keep
 # serving in the UI via `downgrade_obs_to_v1`, which is an EXACT
 # projection — the v2 layout is purely additive.
 OBS_DIM_V1: int = 959
+
+# The 991-dim layout that v2/v4 stems (through vFour4) trained at —
+# everything before the obs-v2 tail append of 2026-07-06 (V5_DESIGN.md
+# §3.2). Those checkpoints keep serving via `downgrade_obs_to_v2` (a
+# plain tail slice; the append is exactly function-preserving).
+OBS_DIM_V2: int = 991
 
 _HOLE_OFF = 0
 _BOARD_A_OFF = 52
@@ -191,7 +197,20 @@ _STRAIGHT_MIXED_OFF = 977  # 1 dim; same hero pair made on one, drawing on other
 
 _OPP_OUTCOME_OFF = 978  # 12 dims; [k=2,3,4][outcome] fractions in [0,1]
 _OPP_OUTCOME_DIM = 12
-_BET_PCT_POT_OFF = 990  # 1 dim; to_call / max(pot, 1), clipped [0, 4]
+_BET_PCT_POT_OFF = 990  # 1 dim; to_call / max(pot - to_call, 1), clipped [0, 4]
+
+# ---- obs v2 tail (appended 2026-07-06, V5_DESIGN.md §3.2) -------------------
+# Everything below is a pure append: dims 0..991 are byte-identical to the
+# pre-v5 layout, so 991-era checkpoints serve via `downgrade_obs_to_v2` and
+# warm-starts zero-pad the first-layer columns (function-preserving).
+_PER_BOARD_OUTCOME_OFF = 991  # 8 dims; hero ahead/tie/behind per board
+_PER_BOARD_OUTCOME_DIM = 8    # (k=2 exhaustive) + win-exactly-one + tie-both
+_BLOCKER_A_OFF = 999   # 4 dims; unconditional blockers-to-nuts, board A
+_BLOCKER_B_OFF = 1003  # 4 dims; board B (see _blocker_features)
+_EFF_PRICE_OFF = 1007  # 5 dims; stack-capped price + commitment + log1p money
+_SPR_LOG_OFF = 1012    # 8 dims; log1p(effective SPR) per seat, UNCLIPPED —
+#                        the [0,4]-clipped _SPR_OFF block saturates for the
+#                        entire deep tier at the flop (true SPR 5.4-13.9)
 
 # Index map projecting the v2 (991) layout onto the exact v1 (959)
 # layout: pre-history block verbatim, first 17 of each 18-dim history
@@ -203,19 +222,27 @@ _V1_INDEX: np.ndarray = np.concatenate([
         _HISTORY_OFF + s * _HISTORY_SLOT_DIM + np.arange(_V1_SLOT_DIM)
         for s in range(_HISTORY_DEPTH)
     ]),
-    np.arange(_SPR_OFF, OBS_DIM),
+    np.arange(_SPR_OFF, OBS_DIM_V2),
 ]).astype(np.int64)
 assert _V1_INDEX.shape[0] == OBS_DIM_V1
 
 
 def downgrade_obs_to_v1(vec: np.ndarray) -> np.ndarray:
-    """Project a v2 (..., 991) observation onto the v1 (..., 959) layout.
+    """Project a current-layout observation onto the v1 (..., 959) layout.
 
-    Exact: drops each history slot's pot-fraction dim and un-shifts the
-    post-history tail. Used by the UI to keep serving v1-era checkpoints
-    (trained at OBS_DIM 959) after the encoder upgrade.
+    Exact: drops each history slot's pot-fraction dim, un-shifts the
+    post-history tail, and (all indices being < 991) implicitly drops the
+    obs-v2 tail. Used by the UI to keep serving v1-era checkpoints
+    (trained at OBS_DIM 959) after the encoder upgrades.
     """
     return np.ascontiguousarray(vec[..., _V1_INDEX])
+
+
+def downgrade_obs_to_v2(vec: np.ndarray) -> np.ndarray:
+    """Slice a current-layout observation onto the 991-dim layout that
+    v2/v4 stems trained at. Exact — the obs-v2 additions are a pure tail
+    append."""
+    return np.ascontiguousarray(vec[..., :OBS_DIM_V2])
 
 
 # 10 straight windows: slot 0 = wheel (A,2,3,4,5); slots 1..9 = consecutive
@@ -232,6 +259,144 @@ _STRAIGHT_WINDOWS: tuple[frozenset[int], ...] = (
     frozenset({7, 8, 9, 10, 11}),
     frozenset({8, 9, 10, 11, 12}),
 )
+
+
+#: (10, 13) bool matrix form of _STRAIGHT_WINDOWS for the batched path;
+#: row order matches the tuple (wheel first → broadway last, i.e. sorted
+#: by the straight's top rank).
+_WINDOW_MATRIX: np.ndarray = np.zeros((10, 13), dtype=bool)
+for _wi, _w in enumerate(_STRAIGHT_WINDOWS):
+    for _r in _w:
+        _WINDOW_MATRIX[_wi, _r] = True
+del _wi, _w, _r
+
+
+def _blocker_features(hole_idx: list[int], board_idx: list[int]) -> np.ndarray:
+    """Unconditional blockers-to-nuts for ONE board (obs v2 P3, 4 dims).
+
+    "Unconditional": hero need not hold the made hand or the draw — the
+    pre-v5 flush/straight digests only fired when hero was drawing or
+    made, leaving bare-blocker information (the bluff-selection signal)
+    recoverable only from the raw 52-bit multi-hots. Dims:
+
+    0. hero holds the TOP missing card of the board's flush suit (a suit
+       with >= 3 board cards; two such suits cannot coexist on 5 cards).
+       0 when no flush is possible.
+    1. count of the top-3 missing flush-suit cards hero holds, / 3.
+    2. hero cards whose rank completes the NUT straight (the highest
+       5-rank window where the board supplies >= 3 distinct ranks),
+       counted over the window's missing ranks, / 4, clipped to 1.
+       0 when no straight is possible.
+    3. hero cards matching the board's highest PAIRED rank, / 2 (the
+       trips/boat blocker). 0 on unpaired boards.
+    """
+    out = np.zeros(4, dtype=np.float32)
+    if len(board_idx) < 3:
+        return out
+
+    board_rank_counts = [0] * 13
+    board_suit_counts = [0] * 4
+    board_suit_ranks: list[set[int]] = [set(), set(), set(), set()]
+    for c in board_idx:
+        r, s = c // 4, c % 4
+        board_rank_counts[r] += 1
+        board_suit_counts[s] += 1
+        board_suit_ranks[s].add(r)
+    hero_rank_counts = [0] * 13
+    hero_cards = set(hole_idx)
+    for c in hole_idx:
+        hero_rank_counts[c // 4] += 1
+
+    # Flush blockers.
+    for s in range(4):
+        if board_suit_counts[s] >= 3:
+            missing = [r for r in range(12, -1, -1) if r not in board_suit_ranks[s]]
+            if missing and (missing[0] * 4 + s) in hero_cards:
+                out[0] = 1.0
+            held = sum(1 for r in missing[:3] if (r * 4 + s) in hero_cards)
+            out[1] = held / 3.0
+            break
+
+    # Nut-straight blockers: highest qualifying window (tuple is ordered
+    # by top rank, so scan from the end).
+    board_rank_set = {r for r in range(13) if board_rank_counts[r] > 0}
+    for w in reversed(_STRAIGHT_WINDOWS):
+        if len(w & board_rank_set) >= 3:
+            missing_ranks = w - board_rank_set
+            blockers = sum(hero_rank_counts[r] for r in missing_ranks)
+            out[2] = min(blockers, 4) / 4.0
+            break
+
+    # Board-pair blockers: highest paired rank.
+    for r in range(12, -1, -1):
+        if board_rank_counts[r] >= 2:
+            out[3] = min(hero_rank_counts[r], 2) / 2.0
+            break
+
+    return out
+
+
+def _blocker_features_batch(
+    hole: np.ndarray,
+    hole_valid: np.ndarray,
+    board: np.ndarray,
+    board_valid: np.ndarray,
+) -> np.ndarray:
+    """Vectorized `_blocker_features` for one board: (N, 4) float32.
+    Bit-exact vs the scalar helper (integer counts, identical f64
+    divisions, same first-match tie-breaks: argmax on a reversed mask ==
+    the scalar's descending-rank / tuple-order scans)."""
+    n = hole.shape[0]
+    out = np.zeros((n, 4), dtype=np.float32)
+    has_board = board_valid.sum(axis=1) >= 3
+    if not has_board.any():
+        return out
+    rows = np.arange(n)
+
+    board_presence = np.zeros((n, 13, 4), dtype=bool)
+    ei, si = np.nonzero(board_valid)
+    cards = board[ei, si].astype(np.int64)
+    board_presence[ei, cards >> 2, cards & 3] = True
+    hero_presence = np.zeros((n, 13, 4), dtype=bool)
+    ei, si = np.nonzero(hole_valid)
+    hcards = hole[ei, si].astype(np.int64)
+    hero_presence[ei, hcards >> 2, hcards & 3] = True
+
+    # Flush blockers (unique suit with >= 3 board cards, when it exists).
+    board_suit_counts = board_presence.sum(axis=1)
+    flush_suit_exists = board_suit_counts >= 3
+    has_flush = flush_suit_exists.any(axis=1)
+    suit_idx = np.argmax(flush_suit_exists, axis=1)
+    suit_board_desc = board_presence[rows, :, suit_idx][:, ::-1]  # idx 0 = rank 12
+    suit_hero_desc = hero_presence[rows, :, suit_idx][:, ::-1]
+    missing_desc = ~suit_board_desc
+    cum = np.cumsum(missing_desc, axis=1)
+    top1 = missing_desc & (cum <= 1)
+    top3 = missing_desc & (cum <= 3)
+    out[:, 0] = ((suit_hero_desc & top1).any(axis=1) & has_flush).astype(np.float32)
+    out[:, 1] = np.where(has_flush, (suit_hero_desc & top3).sum(axis=1) / 3.0, 0.0)
+
+    # Nut-straight blockers.
+    board_rank_mask = board_presence.any(axis=2)
+    win_counts = board_rank_mask.astype(np.int8) @ _WINDOW_MATRIX.T.astype(np.int8)
+    qualifying = win_counts >= 3
+    has_straight = qualifying.any(axis=1)
+    nut_idx = (len(_STRAIGHT_WINDOWS) - 1) - np.argmax(qualifying[:, ::-1], axis=1)
+    missing_ranks = _WINDOW_MATRIX[nut_idx] & ~board_rank_mask
+    hero_rank_counts = hero_presence.sum(axis=2)
+    blockers = (hero_rank_counts * missing_ranks).sum(axis=1)
+    out[:, 2] = np.where(has_straight, np.minimum(blockers, 4) / 4.0, 0.0)
+
+    # Board-pair blockers (highest paired rank).
+    board_rank_counts = board_presence.sum(axis=2)
+    paired = board_rank_counts >= 2
+    has_pair = paired.any(axis=1)
+    pair_rank = 12 - np.argmax(paired[:, ::-1], axis=1)
+    pair_block = hero_rank_counts[rows, pair_rank]
+    out[:, 3] = np.where(has_pair, np.minimum(pair_block, 2) / 2.0, 0.0)
+
+    out[~has_board] = 0.0
+    return out
 
 
 def _cross_board_straight(
@@ -690,7 +855,7 @@ def _straight_flush_features(
 
 
 def encode_observation(obs: Mapping[str, Any], config: GameConfig) -> np.ndarray:
-    """Encode a single observation dict into a (886,) float32 array."""
+    """Encode a single observation dict into a (OBS_DIM,) float32 array."""
     out = np.zeros(OBS_DIM, dtype=np.float32)
     num_seats = config.num_seats
     hero = obs["actor"]
@@ -874,6 +1039,47 @@ def encode_observation(obs: Mapping[str, Any], config: GameConfig) -> np.ndarray
         out[_OPP_OUTCOME_OFF : _OPP_OUTCOME_OFF + _OPP_OUTCOME_DIM] = np.asarray(
             opp_fr, dtype=np.float32
         )
+
+    # ---- obs v2 tail (V5_DESIGN.md §3.2) --------------------------------
+    # Per-board current-rank decomposition (exhaustive k=2 universe, same
+    # fused Rust pass as opp_outcome_fractions). Zeros preflop/terminal.
+    pb = obs.get("per_board_outcome")
+    if pb is not None:
+        out[
+            _PER_BOARD_OUTCOME_OFF : _PER_BOARD_OUTCOME_OFF + _PER_BOARD_OUTCOME_DIM
+        ] = np.asarray(pb, dtype=np.float32)
+
+    # Unconditional blockers-to-nuts per board.
+    out[_BLOCKER_A_OFF : _BLOCKER_A_OFF + 4] = _blocker_features(
+        hole_list, board_a_list
+    )
+    out[_BLOCKER_B_OFF : _BLOCKER_B_OFF + 4] = _blocker_features(
+        hole_list, board_b_list
+    )
+
+    # Effective price: to_call capped by hero's EFFECTIVE remaining stack
+    # — the uncapped _POT_ODDS_OFF overstates the price whenever a PL
+    # pot-bet covers hero — plus commitment fraction and log1p money
+    # companions. Effective (dead-chip-subtracted, same as _STACKS_OFF)
+    # rather than raw: chips above max-other-reachable can never be bet,
+    # and the whole encoding is invariant to them by contract.
+    hero_stack = float(eff_per_seat[hero])
+    eff_to_call = min(to_call, hero_stack)
+    if eff_to_call > 0.0:
+        out[_EFF_PRICE_OFF + 0] = eff_to_call / (pot + eff_to_call)
+    if to_call > 0.0 and to_call >= hero_stack:
+        out[_EFF_PRICE_OFF + 1] = 1.0
+    hero_commit = float(total_commit[hero])
+    commit_denom = hero_commit + hero_stack
+    if commit_denom > 0.0:
+        out[_EFF_PRICE_OFF + 2] = hero_commit / commit_denom
+    out[_EFF_PRICE_OFF + 3] = np.log1p(eff_to_call * inv_bb)
+    out[_EFF_PRICE_OFF + 4] = np.log1p(pot * inv_bb)
+
+    # log1p effective SPR, UNCLIPPED (see _SPR_LOG_OFF comment).
+    for k in range(num_seats):
+        seat = (hero + k) % num_seats
+        out[_SPR_LOG_OFF + k] = np.log1p(eff_per_seat[seat] / pot_safe)
 
     return out
 
@@ -1539,5 +1745,47 @@ def encode_observation_batch(
         out[:, _OPP_OUTCOME_OFF : _OPP_OUTCOME_OFF + _OPP_OUTCOME_DIM] = opp_fr.astype(
             np.float32, copy=False
         )
+
+    # ---- obs v2 tail (V5_DESIGN.md §3.2) — mirrors the scalar encoder ----
+    pb = obs_arrays.get("per_board_outcome")
+    if pb is not None:
+        out[
+            :, _PER_BOARD_OUTCOME_OFF : _PER_BOARD_OUTCOME_OFF + _PER_BOARD_OUTCOME_DIM
+        ] = pb.astype(np.float32, copy=False)
+
+    blk_a = _blocker_features_batch(hole, hole_valid, ba, ba_valid)
+    blk_b = _blocker_features_batch(hole, hole_valid, bb, bb_valid)
+    out[live_mask, _BLOCKER_A_OFF : _BLOCKER_A_OFF + 4] = blk_a[live_mask]
+    out[live_mask, _BLOCKER_B_OFF : _BLOCKER_B_OFF + 4] = blk_b[live_mask]
+
+    # Effective price (capped by hero's EFFECTIVE stack — dead-chip
+    # invariance, see the scalar encoder) + commitment + log1p money.
+    # effective_rot column 0 is hero's (rotation starts at hero).
+    hero_stack = effective_rot[:, 0]
+    eff_to_call = np.minimum(to_call, hero_stack)
+    eff_denom = pot + eff_to_call
+    eff_odds = np.where(
+        eff_to_call > 0.0,
+        eff_to_call / np.where(eff_denom > 0.0, eff_denom, 1.0),
+        0.0,
+    )
+    out[live_mask, _EFF_PRICE_OFF + 0] = eff_odds[live_mask]
+    allin_call = (to_call > 0.0) & (to_call >= hero_stack)
+    out[live_mask, _EFF_PRICE_OFF + 1] = allin_call[live_mask].astype(np.float32)
+    hero_commit = np.take_along_axis(total_commit, hero_idx[:, None], axis=1)[:, 0]
+    commit_denom = hero_commit + hero_stack
+    commit_frac = np.where(
+        commit_denom > 0.0,
+        hero_commit / np.where(commit_denom > 0.0, commit_denom, 1.0),
+        0.0,
+    )
+    out[live_mask, _EFF_PRICE_OFF + 2] = commit_frac[live_mask]
+    out[live_mask, _EFF_PRICE_OFF + 3] = np.log1p(eff_to_call * inv_bb)[live_mask]
+    out[live_mask, _EFF_PRICE_OFF + 4] = np.log1p(pot * inv_bb)[live_mask]
+
+    # log1p effective SPR, UNCLIPPED (see _SPR_LOG_OFF comment).
+    out[live_mask, _SPR_LOG_OFF : _SPR_LOG_OFF + num_seats] = np.log1p(
+        effective_rot / pot_safe[:, None]
+    )[live_mask]
 
     return out

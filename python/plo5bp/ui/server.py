@@ -153,6 +153,24 @@ def _load_model(variant: str = VARIANT_PLO5) -> tuple[ActorCritic, bool]:
         cfg_block = ckpt.get("config", {}) or {}
         hidden_dim = int(cfg_block.get("hidden_dim", 128))
         num_layers = int(cfg_block.get("num_layers", 2))
+        # Optional EMA serving (PLO5BP_SERVE_EMA=1): serve the slow
+        # EMA-of-past-iterates actor (`model_ema`, persisted by training
+        # when the kl-anchor magnet is on) instead of the last iterate.
+        # The EMA is a smoother, less-exploitable policy — exactly what a
+        # study tool should show. Falls through to the last iterate when
+        # the flag is off, the key is absent, or it's None (magnet-off
+        # runs). Same architecture, so it's a drop-in for the actor; the
+        # critic (review "true EV") is never EMA'd.
+        if os.environ.get("PLO5BP_SERVE_EMA") == "1":
+            ema = ckpt.get("model_ema")
+            if ema:
+                state_dict = ema
+                logger.info("serving EMA actor (PLO5BP_SERVE_EMA=1) for %s", variant)
+            else:
+                logger.info(
+                    "PLO5BP_SERVE_EMA=1 but %s has no model_ema — serving last "
+                    "iterate", ckpt_path,
+                )
     else:
         state_dict = ckpt
         hidden_dim = 128
@@ -1329,6 +1347,19 @@ def _recommendation_v2(
         "check_call" if gate == GATE_CHECK_CALL else
         "raise"
     )
+    # v5 mixture heads: expose the per-component (mu, s, w) so the client
+    # can annotate the multi-modal menu. The `anchors` histogram already
+    # renders the mixture marginal — this block is purely additive.
+    mixture_block = None
+    if hasattr(model, "mixture_params"):
+        with torch.no_grad():
+            mu_t, s_t, w_t = model.mixture_params(anchor_head_out)
+        mixture_block = {
+            "mu": [round(float(x), 4) for x in mu_t.squeeze(0).tolist()],
+            "s": [round(float(x), 4) for x in s_t.squeeze(0).tolist()],
+            "w": [round(float(x), 4) for x in w_t.squeeze(0).tolist()],
+        }
+
     return {
         "head_version": model.head_version,
         "pot_ref_chips": int(sizing[2]) + 2 * int(sizing[3]),
@@ -1342,6 +1373,7 @@ def _recommendation_v2(
         "rec_anchor": rec_anchor,
         "refine": refine_block,
         "anchor_count": int(spec.count),
+        "mixture": mixture_block,
         "model_loaded": bool(_fmt()["loaded"]),
     }
 

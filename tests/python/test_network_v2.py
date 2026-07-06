@@ -20,7 +20,7 @@ from plo5bp.network import (
 )
 from plo5bp.sizing import anchor_grid_np
 
-OBS_DIM = 991
+from plo5bp.encoding import OBS_DIM
 
 
 def _model(seed=0):

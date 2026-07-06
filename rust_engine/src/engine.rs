@@ -1269,11 +1269,32 @@ impl GameState {
     /// per-decision encode cost, so halving the MC budget roughly
     /// doubles obs-build throughput at a benign ~1-3% extra noise.
     pub fn opp_outcome_fractions_mc(&self, mc_samples: usize) -> Vec<f32> {
-        const N_OUT: usize = 12;
+        self.outcome_features_mc(mc_samples)[..12].to_vec()
+    }
+
+    /// Superset of [`Self::opp_outcome_fractions_mc`]: the 12 joint
+    /// outcome fractions PLUS an 8-dim PER-BOARD decomposition (obs v2,
+    /// V5_DESIGN.md P1), all from the SAME single pass — the extra dims
+    /// are counter increments inside the existing k=2 exhaustive loop
+    /// (no extra evals, no extra RNG draws, so dims 0..12 stay
+    /// bit-identical to the pre-v5 feature).
+    ///
+    /// Dims 12..20, hero-centric, k=2 EXHAUSTIVE universe only (exact,
+    /// deterministic):
+    /// - 12/13/14: board A — fraction of combos hero currently beats /
+    ///   ties / is behind (sums to 1 when active).
+    /// - 15/16/17: board B — same.
+    /// - 18: win-exactly-one (hero ahead on one board, behind on the
+    ///   other, either direction) — the modal double-board outcome the
+    ///   12-dim block folds into its residual.
+    /// - 19: tie on BOTH boards.
+    pub fn outcome_features_mc(&self, mc_samples: usize) -> Vec<f32> {
+        const N_OUT: usize = 20;
         const SCOOP_OPP: usize = 0;
         const QUARTER_OPP: usize = 1;
         const SCOOP_HERO: usize = 2;
         const QUARTER_HERO: usize = 3;
+        const PER_BOARD_OFF: usize = 12;
 
         let hero_seat = match self.actor {
             Some(s) => s,
@@ -1324,13 +1345,12 @@ impl GameState {
         let mut out = vec![0.0f32; N_OUT];
         let mut opp_buf: Vec<Card> = Vec::with_capacity(4);
 
-        let classify = |opp: &[Card],
-                        board_a: &[Card],
-                        board_b: &[Card],
-                        counters: &mut [u32; 4]| {
-            let opp_a = crate::hand_eval::evaluate_plo5_k_partial(opp, board_a);
-            let opp_b = crate::hand_eval::evaluate_plo5_k_partial(opp, board_b);
-            // Higher HandRank = stronger.
+        // Per-combo board comparisons; +1 = opp ahead, 0 = tie, -1 = opp
+        // behind (higher HandRank = stronger). Joint/per-board tallying
+        // happens at the call sites.
+        let outcomes = |opp: &[Card]| -> (i8, i8) {
+            let opp_a = crate::hand_eval::evaluate_plo5_k_partial(opp, &self.board_a);
+            let opp_b = crate::hand_eval::evaluate_plo5_k_partial(opp, &self.board_b);
             let cmp_a: i8 = if opp_a > hero_a {
                 1
             } else if opp_a < hero_a {
@@ -1345,6 +1365,9 @@ impl GameState {
             } else {
                 0
             };
+            (cmp_a, cmp_b)
+        };
+        let tally_joint = |counters: &mut [u32; 4], cmp_a: i8, cmp_b: i8| {
             match (cmp_a, cmp_b) {
                 (1, 1) => counters[SCOOP_OPP] += 1,
                 (-1, -1) => counters[SCOOP_HERO] += 1,
@@ -1363,13 +1386,33 @@ impl GameState {
             // at turn+river (C(39,3) and C(37,3) both <= 10k), but that's
             // ~18k evals/env vs ~2*mc_samples for MC — dominated bundle cost.
             if k == 2 {
+                // Per-board counters (obs v2 P1): [ahead, tie, behind] per
+                // board from HERO's perspective + win-exactly-one + tie-both.
+                let mut pb = [0u32; 8];
                 let mut idx: Vec<usize> = (0..k).collect();
                 loop {
                     opp_buf.clear();
                     for &i in idx.iter() {
                         opp_buf.push(unseen[i]);
                     }
-                    classify(&opp_buf, &self.board_a, &self.board_b, &mut counters);
+                    let (cmp_a, cmp_b) = outcomes(&opp_buf);
+                    tally_joint(&mut counters, cmp_a, cmp_b);
+                    match cmp_a {
+                        -1 => pb[0] += 1, // hero ahead on A
+                        0 => pb[1] += 1,
+                        _ => pb[2] += 1,
+                    }
+                    match cmp_b {
+                        -1 => pb[3] += 1, // hero ahead on B
+                        0 => pb[4] += 1,
+                        _ => pb[5] += 1,
+                    }
+                    if (cmp_a == -1 && cmp_b == 1) || (cmp_a == 1 && cmp_b == -1) {
+                        pb[6] += 1; // win exactly one
+                    }
+                    if cmp_a == 0 && cmp_b == 0 {
+                        pb[7] += 1; // tie both
+                    }
                     samples += 1;
                     let mut pos = k;
                     let advanced = loop {
@@ -1389,6 +1432,12 @@ impl GameState {
                         break;
                     }
                 }
+                if samples > 0 {
+                    let inv = 1.0f32 / samples as f32;
+                    for j in 0..8 {
+                        out[PER_BOARD_OFF + j] = pb[j] as f32 * inv;
+                    }
+                }
             } else {
                 debug_assert!(n_unseen <= 64);
                 for _ in 0..mc_samples {
@@ -1404,7 +1453,8 @@ impl GameState {
                             written += 1;
                         }
                     }
-                    classify(&opp_buf, &self.board_a, &self.board_b, &mut counters);
+                    let (cmp_a, cmp_b) = outcomes(&opp_buf);
+                    tally_joint(&mut counters, cmp_a, cmp_b);
                     samples += 1;
                 }
             }

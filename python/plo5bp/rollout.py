@@ -79,6 +79,16 @@ class Batch:
     aggr_bonus_steps: int = 0
     aggr_steps_total_by_street: tuple[int, int, int] = (0, 0, 0)
     aggr_bonus_steps_by_street: tuple[int, int, int] = (0, 0, 0)
+    # Per-row ABSOLUTE entropy coefficient (V5_DESIGN.md B5): mix-configs
+    # attaches each sub-rollout's tier coef so per-tier entropy control
+    # exists under mixing (previously one coef covered the whole mixed
+    # update and the per-tier anneal design silently didn't apply).
+    # None = single-config batch; ppo uses its scalar coef.
+    ent_coef_rows: torch.Tensor | None = None
+    # Per-tier F/T/R counters (mix-configs only): tier -> (bonus_steps_by
+    # _street, steps_by_street). Restores per-tier aggression telemetry
+    # that the concat used to pool away.
+    tier_ftr: dict | None = None
 
 
 def _build_frozen_model(
@@ -1493,9 +1503,10 @@ def _batch_to_device(batch: Batch, device: torch.device) -> Batch:
     """Move every tensor field of a Batch to `device`; scalar diagnostics ride
     along unchanged. Used to evacuate each sub-rollout to host RAM before the
     next starts, so GPU peak stays at a single sub-rollout (not all N)."""
-    return replace(
-        batch, **{f: getattr(batch, f).to(device) for f in _BATCH_TENSOR_FIELDS}
-    )
+    moved = {f: getattr(batch, f).to(device) for f in _BATCH_TENSOR_FIELDS}
+    if batch.ent_coef_rows is not None:
+        moved["ent_coef_rows"] = batch.ent_coef_rows.to(device)
+    return replace(batch, **moved)
 
 
 def _concat_batches(batches: list[Batch], adv_clip: float) -> Batch:
@@ -1542,6 +1553,8 @@ def collect_rollout_multiconfig(
     train_config: TrainingConfig,
     rng: np.random.Generator,
     critic: CentralCritic | None = None,
+    config_tiers: "list[str] | None" = None,
+    tier_ent: "dict[str, float] | None" = None,
 ) -> Batch:
     """One update's rollout MIXED across `configs` distinct (seats,stacks) setups.
 
@@ -1552,10 +1565,21 @@ def collect_rollout_multiconfig(
     device once with a global advantage re-normalization. Reuses the single-
     config collector verbatim; the only new logic is split / host-concat /
     re-norm. Pool snapshots are taken by the caller per-update, so calling the
-    collector N times here does not over-snapshot."""
+    collector N times here does not over-snapshot.
+
+    Per-tier machinery (V5_DESIGN.md B5, both optional and additive):
+    `config_tiers` labels each config with its stack tier; with `tier_ent`
+    it attaches per-row ABSOLUTE entropy coefs (`ent_coef_rows`) so each
+    tier keeps its own coefficient inside the mixed update, and per-tier
+    F/T/R counters (`tier_ftr`) so the aggression stop-loss telemetry
+    survives the concat."""
     n = len(configs)
     if n == 0:
         raise ValueError("collect_rollout_multiconfig requires >= 1 config")
+    if config_tiers is not None and len(config_tiers) != n:
+        raise ValueError(
+            f"config_tiers length {len(config_tiers)} != configs {n}"
+        )
     device = next(learner.parameters()).device
     host = torch.device("cpu")
     sub_config = replace(
@@ -1569,6 +1593,25 @@ def collect_rollout_multiconfig(
         host_batches.append(_batch_to_device(sub, host))
         del sub
     combined = _concat_batches(host_batches, float(getattr(train_config, "adv_clip", 0.0)))
+    if config_tiers is not None:
+        if tier_ent is not None:
+            combined.ent_coef_rows = torch.cat([
+                torch.full(
+                    (b.obs.shape[0],),
+                    float(tier_ent[t]),
+                    dtype=torch.float32,
+                )
+                for b, t in zip(host_batches, config_tiers)
+            ])
+        ftr: dict[str, tuple[list[int], list[int]]] = {}
+        for b, t in zip(host_batches, config_tiers):
+            bonus, steps = ftr.setdefault(t, ([0, 0, 0], [0, 0, 0]))
+            for s in range(3):
+                bonus[s] += int(b.aggr_bonus_steps_by_street[s])
+                steps[s] += int(b.aggr_steps_total_by_street[s])
+        combined.tier_ftr = {
+            t: (tuple(v[0]), tuple(v[1])) for t, v in ftr.items()
+        }
     return _batch_to_device(combined, device)
 
 
@@ -1596,4 +1639,9 @@ def iter_minibatches(
             advantages=batch.advantages[sel],
             old_gate_logp=batch.old_gate_logp[sel],
             old_anchor_logp=batch.old_anchor_logp[sel],
+            ent_coef_rows=(
+                batch.ent_coef_rows[sel]
+                if batch.ent_coef_rows is not None
+                else None
+            ),
         )

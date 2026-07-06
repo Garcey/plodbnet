@@ -9,9 +9,12 @@ v2 additions (anchor sizing head + centralized critic):
 - Optional KL-to-EMA-reference regularizer (`kl_anchor_coef > 0`):
   magnetic-mirror-descent-style pull toward a slow EMA copy of the
   actor for last-iterate stability. Fully zero-overhead when the flag
-  is off (no EMA model is even built). The reference is NOT persisted
-  in checkpoints — on (re)start it re-initializes to the current
-  weights and ramps in over ~1/(1-ema) updates.
+  is off (no EMA model is even built). The reference IS persistable:
+  train.py saves `ref_state_dict()` as ckpt["model_ema"] and restores
+  it on warm-start, so the magnet's memory survives relaunches; absent
+  that key it re-initializes to the loaded weights and ramps in over
+  ~1/(1-ema) updates. The same EMA weights double as a smoother
+  serving actor (promote model_ema instead of the last iterate).
 """
 
 from __future__ import annotations
@@ -41,6 +44,8 @@ class PPOStats:
     approx_kl: float
     display_loss: float = 0.0
     kl_anchor: float = 0.0
+    # Auxiliary Q(s,a) regression loss (v5 critic dueling head); 0 when off.
+    q_loss: float = 0.0
     gate_entropy: float = 0.0
     anchor_entropy: float = 0.0
     beta_entropy: float = 0.0
@@ -81,26 +86,40 @@ def _kl_to_reference(
             g_ref, a_ref, r_ref, _ = ref(obs, mb.gate_masks)
         spec = getattr(model, "anchor_spec", PLO_ANCHOR_SPEC)
         grid = anchor_grid_torch(mb.sizing, spec)
-        a_cur = a_cur.masked_fill(~grid.legal, -1e9)
-        a_ref = a_ref.masked_fill(~grid.legal, -1e9)
         cat = torch.distributions.Categorical
         kl_gate = torch.distributions.kl_divergence(
             cat(logits=g_cur.float()), cat(logits=g_ref.float())
         )
-        kl_anchor = torch.distributions.kl_divergence(
-            cat(logits=a_cur.float()), cat(logits=a_ref.float())
-        )
+        # Head-agnostic anchor KL: `_anchor_dist` maps each head's raw
+        # second output (v2 flat logits / v4 (mu, s) / v5 mixture
+        # params) to the legal-anchor Categorical. The old path
+        # masked_fill'ed the raw output as if it were logits — a shape
+        # crash on v4's (B, 2) size params and semantically wrong even
+        # shape-fixed (V5_DESIGN.md B1). Computed manually over probs
+        # (v4/v5 hard-zero illegal anchors) with an explicit clamp_min so
+        # the 0-prob terms are 0·(log ε − log ε) = 0, matching torch's
+        # own eps-clamp but without depending on it.
+        p_cur = model._anchor_dist(a_cur.float(), grid).probs
+        with torch.no_grad():
+            p_ref = ref._anchor_dist(a_ref.float(), grid).probs
+        kl_anchor = (
+            p_cur
+            * (p_cur.clamp_min(1e-12).log() - p_ref.clamp_min(1e-12).log())
+        ).sum(-1)
         beta = torch.distributions.Beta
         kl_refine_all = torch.distributions.kl_divergence(
             beta(r_cur[..., 0].float(), r_cur[..., 1].float()),
             beta(r_ref[..., 0].float(), r_ref[..., 1].float()),
         )  # (B, 9)
-        anchor_probs = F.softmax(a_cur.float(), dim=-1)
         interior_ok = grid.refine_ok[..., 1 : spec.count - 1]
         kl_refine = (
-            anchor_probs[..., 1 : spec.count - 1] * kl_refine_all * interior_ok
+            p_cur[..., 1 : spec.count - 1] * kl_refine_all * interior_ok
         ).sum(-1)
-        p_raise = F.softmax(g_cur.float(), dim=-1)[..., GATE_RAISE]
+        # p_raise DETACHED: this term is MINIMIZED, so with the gate
+        # weight in the graph it pays the gate to shrink p_raise
+        # whenever the sizing KL is high — a fold bias. Mirror of the
+        # 2026-06-11 entropy-bonus detach (V5_DESIGN.md B2).
+        p_raise = F.softmax(g_cur.float(), dim=-1)[..., GATE_RAISE].detach()
         return (kl_gate + p_raise * (kl_anchor + kl_refine)).mean()
 
     g_cur, rp_cur, _ = model(obs, mb.gate_masks)
@@ -161,6 +180,15 @@ class PPOTrainer:
         self.sizing_entropy_scale = float(
             getattr(config, "sizing_entropy_scale", 1.0)
         )
+        # Auxiliary Q(s, a) regression on the critic's dueling head (v5
+        # stems). Only wired when the critic actually HAS the head; the
+        # coef gates training (0 = head stays zero-init).
+        self._q_aux_coef = float(getattr(config, "q_aux_coef", 0.0))
+        self._critic_qv = (
+            critic.q_values
+            if critic is not None and getattr(critic, "q_actions", 0) > 0
+            else None
+        )
         self._ref: ActorCritic | None = None
         if self.kl_anchor_coef > 0.0:
             self._ref = copy.deepcopy(model).eval()
@@ -188,6 +216,18 @@ class PPOTrainer:
             for p_ref, p in zip(self._ref.parameters(), self.model.parameters()):
                 p_ref.lerp_(p.detach(), 1.0 - self.kl_anchor_ema)
 
+    def ref_state_dict(self) -> dict | None:
+        """EMA-reference weights for checkpointing (None when the magnet
+        is off). Persisting them keeps the magnet's memory across warm
+        restarts; they also serve as the smoother `model_ema` actor."""
+        return self._ref.state_dict() if self._ref is not None else None
+
+    def load_ref_state_dict(self, state_dict: dict | None) -> None:
+        """Restore a persisted EMA reference (no-op when the magnet is
+        off or the checkpoint predates model_ema)."""
+        if self._ref is not None and state_dict:
+            self._ref.load_state_dict(state_dict)
+
     def update(
         self,
         batch: Batch,
@@ -208,6 +248,7 @@ class PPOTrainer:
         total_entropy = torch.zeros((), device=device)
         total_kl = torch.zeros((), device=device)
         total_kl_anchor = torch.zeros((), device=device)
+        total_q = torch.zeros((), device=device)
         total_gate_h = torch.zeros((), device=device)
         total_anchor_h = torch.zeros((), device=device)
         total_beta_h = torch.zeros((), device=device)
@@ -277,7 +318,29 @@ class PPOTrainer:
                             # Value source: the centralized critic when
                             # present (buffer `values` came from it), else
                             # the actor's own head.
-                            if self._critic_fwd is not None:
+                            q_loss = torch.zeros((), device=device)
+                            if (
+                                self._q_aux_coef > 0.0
+                                and self._critic_qv is not None
+                            ):
+                                # One critic forward yields V (identical to
+                                # forward()) AND the dueling Q row; the
+                                # taken action's Q regresses to the same
+                                # returns. Index: 0 Fold, 1 CheckCall,
+                                # 2+anchor Raise.
+                                value, q_all = self._critic_qv(
+                                    mb.obs, opp_holes_multihot(mb.opp_holes)
+                                )
+                                q_idx = torch.where(
+                                    mb.gate_actions == GATE_RAISE,
+                                    2 + mb.anchor_actions,
+                                    mb.gate_actions,
+                                )
+                                q_taken = q_all.gather(
+                                    -1, q_idx[..., None]
+                                ).squeeze(-1)
+                                q_loss = (q_taken - mb.returns).pow(2).mean()
+                            elif self._critic_fwd is not None:
                                 value = self._critic_fwd(
                                     mb.obs, opp_holes_multihot(mb.opp_holes)
                                 )
@@ -317,11 +380,21 @@ class PPOTrainer:
                             else:
                                 entropy_for_loss = entropy
                             entropy_loss = -entropy_for_loss.mean()
+                            # Per-row coefs (mix-configs per-tier entropy,
+                            # V5_DESIGN.md B5) override the scalar coef —
+                            # each transition is paid its own tier's rate.
+                            if mb.ent_coef_rows is not None:
+                                entropy_bonus = -(
+                                    mb.ent_coef_rows * entropy_for_loss
+                                ).mean()
+                            else:
+                                entropy_bonus = eff_entropy_coef * entropy_loss
                             loss = (
                                 policy_loss
                                 + 0.5 * value_loss
                                 + display_coef * display_loss
-                                + eff_entropy_coef * entropy_loss
+                                + entropy_bonus
+                                + self._q_aux_coef * q_loss
                             )
 
                     # KL anchor in f32 OUTSIDE autocast (lgamma/digamma).
@@ -414,6 +487,7 @@ class PPOTrainer:
                     total_entropy += -entropy_loss.detach().float()
                     total_kl += kl.float()
                     total_kl_anchor += kl_anchor_term.detach().float()
+                    total_q += q_loss.detach().float()
                     total_gate_h += gate_h.detach().float().mean()
                     total_anchor_h += anchor_h.detach().float().mean()
                     total_beta_h += beta_h.detach().float().mean()
@@ -432,6 +506,7 @@ class PPOTrainer:
                 approx_kl=float(total_kl.item()) / denom,
                 display_loss=float(total_display.item()) / denom,
                 kl_anchor=float(total_kl_anchor.item()) / denom,
+                q_loss=float(total_q.item()) / denom,
                 gate_entropy=float(total_gate_h.item()) / denom,
                 anchor_entropy=float(total_anchor_h.item()) / denom,
                 beta_entropy=float(total_beta_h.item()) / denom,
