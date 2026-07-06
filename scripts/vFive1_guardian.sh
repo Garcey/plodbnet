@@ -8,17 +8,30 @@
 #   - entropy-coef 0.45 (vFour4's proven floor; re-seeded HIGH, not an
 #     annealed floor — the mixture head is a harder exploration problem;
 #     anneal is one-way down so err high).
-#   - kl-anchor-coef 0.05 (the MMD magnet; EMA ref starts as a clone so
-#     KL~=0 early and ramps in over ~1/(1-0.999) updates — negligible
-#     disturbance to the warm-start bake-in, present for later annealing).
-#   - value-clip 0.2 (vFour4-proven; deliberately NOT loosened here — do
-#     the value-clip A/B on a throwaway stem, not the real launch).
+#   - kl-anchor-coef 0 (MAGNET OFF). Root cause of the 11M AND 9M OOMs:
+#     _kl_to_reference does a SECOND full actor forward-with-grad per
+#     minibatch (on top of evaluate's), ~DOUBLING actor activation memory
+#     (~+18-20 GiB) — vFour4 fit at 10M/78 GiB precisely because it had no
+#     magnet. The magnet is near-inert during the warm-start bake-in
+#     anyway (EMA ref = clone, KL~=0). Re-enable LATER, after optimizing
+#     _kl_to_reference to REUSE evaluate's current-model outputs instead
+#     of recomputing them (then it's ~free), or with a smaller rollout.
+#     NOTE: with the magnet off, no model_ema is saved (EMA serving N/A).
+#   - value-clip 10 (loosened from vFour4's 0.2 per user: the fresh v5
+#     critic — new obs dims + zero-init Q head — is rate-limited most by
+#     the 0.2bb leash exactly now; 10bb ~= effectively unclipped. WATCH
+#     for critic-loss (v=) instability; revert to 0.2 (or 2) from the
+#     seed if it diverges. Not a memory factor.
 #   - q-aux-coef 0 (the critic's dueling Q head is built + zero-init so
 #     the VRPO flip is not a checkpoint break, but left UNTRAINED so the
 #     critic forward stays torch.compiled/fast). Enable later for VRPO.
-#   - rollout 11M (comfortable VRAM point; v5's +29 obs dims add ~1.25GiB
-#     over vFour4 — watch the first `[cuda] peak` line and bump toward
-#     11.5M only if there's headroom).
+#   - rollout 9M. v5 at 11M OOM'd (~98.5 GiB > 95 cap): the K=3 mixture
+#     head's autograd activations are ~3x v4's single logistic
+#     (_discretized_logistic_probs builds (B,K,11) not (B,11)), ~+11 GiB
+#     over vFour4 at this minibatch. 9M -> est ~81 GiB peak (~14 GiB
+#     margin). Bump toward 9.5-10M ONLY after confirming the real
+#     `[cuda] peak memory` line has room. Future: gradient-checkpoint the
+#     sizing head to reclaim rollout.
 #   - uniform 2-6 seats (INTENTIONAL — rounded model incl. deep 3-4-handed
 #     home games; do NOT add --seats-dist).
 #
@@ -53,10 +66,10 @@ launch(){  # $1 = checkpoint to warm-load
     --sizing-head mixture --mixture-k 3 \
     --batched --device cuda --hidden-dim 2048 --num-layers 4 \
     --critic-hidden-dim 1536 --critic-num-blocks 2 \
-    --num-envs 49134 --rollout-length 11000000 --num-minibatches 16 --ppo-epochs 2 \
+    --num-envs 49134 --rollout-length 9000000 --num-minibatches 16 --ppo-epochs 2 \
     --mix-configs --configs-per-tier 10 --mix-tiers clubgg,clubgg_deep,deep \
     --entropy-coef 0.45 --sizing-entropy-scale 1.0 \
-    --kl-anchor-coef 0.05 --value-clip 0.2 \
+    --value-clip 10 \
     --lr 1.5e-4 --lr-warmup-updates 75 --target-kl 0.5 --kl-hard 10.0 --adv-clip 8 \
     --snapshot-every 5 \
     $load --checkpoint checkpoints/vFive1.pt \
@@ -71,7 +84,7 @@ if [ -z "$(train_pid)" ]; then
   launch "$WARM"; sleep 45
 fi
 
-log "started; watching pid=$(train_pid) (mixture K=3, entropy=0.45, kl-anchor=0.05, lr=1.5e-4 warmup=75, target_kl=0.5, max_restarts=$MAX_RESTARTS)"
+log "started; watching pid=$(train_pid) (mixture K=3, entropy=0.45, kl-anchor=OFF, value-clip=10, rollout=9M, lr=1.5e-4 warmup=75, target_kl=0.5, max_restarts=$MAX_RESTARTS)"
 while true; do
   [ -f "$STOPFLAG" ] && { log "stop flag present -> exiting"; exit 0; }
   sleep "$POLL"
