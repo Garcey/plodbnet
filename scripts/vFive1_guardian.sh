@@ -8,15 +8,15 @@
 #   - entropy-coef 0.45 (vFour4's proven floor; re-seeded HIGH, not an
 #     annealed floor — the mixture head is a harder exploration problem;
 #     anneal is one-way down so err high).
-#   - kl-anchor-coef 0 (MAGNET OFF). Root cause of the 11M AND 9M OOMs:
-#     _kl_to_reference does a SECOND full actor forward-with-grad per
-#     minibatch (on top of evaluate's), ~DOUBLING actor activation memory
-#     (~+18-20 GiB) — vFour4 fit at 10M/78 GiB precisely because it had no
-#     magnet. The magnet is near-inert during the warm-start bake-in
-#     anyway (EMA ref = clone, KL~=0). Re-enable LATER, after optimizing
-#     _kl_to_reference to REUSE evaluate's current-model outputs instead
-#     of recomputing them (then it's ~free), or with a smaller rollout.
-#     NOTE: with the magnet off, no model_ema is saved (EMA serving N/A).
+#   - kl-anchor-coef 0.05 (MAGNET ON — the MMD equilibrium regularizer,
+#     the point of v5's convergence story). The earlier OOMs came from
+#     _kl_to_reference doing a SECOND full actor forward-with-grad per
+#     minibatch (~+18-20 GiB); that's now FIXED (389b8a0) — evaluate()
+#     hands back its raw head outputs and the KL reuses that forward, so
+#     the magnet adds only the no_grad reference forward (~free). The EMA
+#     ref starts as a clone of the warm-loaded weights (KL~=0) and ramps
+#     in over ~1/(1-0.999) updates, so it disturbs the bake-in gently.
+#     model_ema is now persisted -> enables EMA serving later.
 #   - value-clip 10 (loosened from vFour4's 0.2 per user: the fresh v5
 #     critic — new obs dims + zero-init Q head — is rate-limited most by
 #     the 0.2bb leash exactly now; 10bb ~= effectively unclipped. WATCH
@@ -69,7 +69,7 @@ launch(){  # $1 = checkpoint to warm-load
     --num-envs 49134 --rollout-length 9000000 --num-minibatches 16 --ppo-epochs 2 \
     --mix-configs --configs-per-tier 10 --mix-tiers clubgg,clubgg_deep,deep \
     --entropy-coef 0.45 --sizing-entropy-scale 1.0 \
-    --value-clip 10 \
+    --kl-anchor-coef 0.05 --value-clip 10 \
     --lr 1.5e-4 --lr-warmup-updates 75 --target-kl 0.5 --kl-hard 10.0 --adv-clip 8 \
     --snapshot-every 5 \
     $load --checkpoint checkpoints/vFive1.pt \
@@ -84,7 +84,7 @@ if [ -z "$(train_pid)" ]; then
   launch "$WARM"; sleep 45
 fi
 
-log "started; watching pid=$(train_pid) (mixture K=3, entropy=0.45, kl-anchor=OFF, value-clip=10, rollout=9M, lr=1.5e-4 warmup=75, target_kl=0.5, max_restarts=$MAX_RESTARTS)"
+log "started; watching pid=$(train_pid) (mixture K=3, entropy=0.45, kl-anchor=0.05 MAGNET-ON, value-clip=10, rollout=9M, lr=1.5e-4 warmup=75, target_kl=0.5, max_restarts=$MAX_RESTARTS)"
 while true; do
   [ -f "$STOPFLAG" ] && { log "stop flag present -> exiting"; exit 0; }
   sleep "$POLL"
