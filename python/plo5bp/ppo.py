@@ -151,6 +151,23 @@ def _kl_to_reference(
     return (kl_gate + p_raise * kl_beta).mean()
 
 
+def _adaptive_grad_clip_(params, clip: float, eps: float = 1e-3) -> None:
+    """Stateless per-tensor adaptive gradient clipping (NFNet AGC): clip each
+    param's grad norm to ``clip * max(||param||, eps)``. In-place, no running
+    state (nothing for the kl_hard rollback to corrupt). A per-tensor complement
+    to the per-group split ``clip_grad_norm_``: scale-adapts to each tensor so a
+    wide torso matrix and a small head are clipped proportionally."""
+    with torch.no_grad():
+        for p in params:
+            g = p.grad
+            if g is None:
+                continue
+            g_norm = g.detach().norm()
+            max_norm = clip * p.detach().norm().clamp_min(eps)
+            if float(g_norm) > float(max_norm):
+                g.mul_(max_norm / g_norm.clamp_min(1e-12))
+
+
 class PPOTrainer:
     def __init__(
         self,
@@ -173,8 +190,50 @@ class PPOTrainer:
             list(critic.parameters()) if critic is not None else []
         )
         params = self._actor_params + self._critic_params
-        self.optimizer = optim.AdamW(params, lr=config.lr, fused=self._cuda)
+        self.optimizer = optim.AdamW(
+            params,
+            lr=config.lr,
+            betas=(0.9, float(getattr(config, "adam_b2", 0.999))),
+            fused=self._cuda,
+        )
         self._all_params = params
+        # Stateless adaptive gradient clipping (NFNet AGC), per-tensor; 0 = off.
+        # No running state → nothing for the kl_hard rollback to restore.
+        self._agc_clip = float(getattr(config, "agc_clip", 0.0))
+        # v6 probability-dependent gate clip (Over-mixing §6). Widens the clip
+        # band for rare gate actions, narrows it near 50/50; keyed on the gate's
+        # OLD prob (old_gate_logp) so the sizing menu isn't over-loosened. Off =
+        # the flat cfg.clip band. See TrainingConfig.clip_prob_dependent.
+        self._clip_prob_dependent = bool(
+            getattr(config, "clip_prob_dependent", False)
+        )
+        self._clip_room_ext = float(getattr(config, "clip_room_ext", 0.10))
+        self._clip_room_mid = float(getattr(config, "clip_room_mid", 0.05))
+        self._clip_prob_floor = float(getattr(config, "clip_prob_floor", 1e-3))
+        # Gradient checkpointing: identical math, recompute-for-memory. Runtime
+        # flag on the trainable model + critic only (rollout is no-grad).
+        _gc = bool(getattr(config, "grad_checkpoint", False))
+        model._grad_checkpoint = _gc
+        if critic is not None:
+            critic._grad_checkpoint = _gc
+
+        # Weight-decay-to-init companion for torso LayerNorm (V6_RESEARCH.md #4).
+        # L2 penalty pulling the TRUNK weight matrices toward their run-start
+        # values (regenerative regularization) — bounds weight-norm growth so
+        # the effective LR doesn't decay, and counters the generalization hit of
+        # norm-solo. Snapshots init once; 0 = off (no snapshot, no term). Trunk
+        # only (name contains "torso", 2D weights) so the heads stay free.
+        self._l2_init_coef = float(getattr(config, "l2_init_coef", 0.0))
+        self._l2_init_pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
+        if self._l2_init_coef > 0.0:
+            named = list(model.named_parameters())
+            if critic is not None:
+                named += list(critic.named_parameters())
+            self._l2_init_pairs = [
+                (p, p.detach().clone())
+                for name, p in named
+                if "torso" in name and p.dim() >= 2
+            ]
 
         # KL-to-EMA reference: zero overhead unless the flag is on.
         self.kl_anchor_coef = float(getattr(config, "kl_anchor_coef", 0.0))
@@ -202,6 +261,13 @@ class PPOTrainer:
             if critic is not None and getattr(critic, "q_actions", 0) > 0
             else None
         )
+        # Distributional (HL-Gauss) value path: one torso pass → (V, logits, Q).
+        # Bound only when the critic has a categorical value head; else None and
+        # the scalar clipped-MSE path runs unchanged.
+        self._distributional = (
+            critic is not None and getattr(critic, "value_bins", 0) > 0
+        )
+        self._critic_train = critic.train_outputs if self._distributional else None
         self._ref: ActorCritic | None = None
         if self.kl_anchor_coef > 0.0:
             self._ref = copy.deepcopy(model).eval()
@@ -241,6 +307,33 @@ class PPOTrainer:
         if self._ref is not None and state_dict:
             self._ref.load_state_dict(state_dict)
 
+    def _gate_clip_bounds(
+        self, old_gate_logp: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-sample PPO ratio band from the gate's OLD probability (v6
+        probability-dependent clip, Over-mixing §6). Target absolute
+        probability-movement room is a symmetric U in p = π_old(gate):
+
+            R(p) = room_ext − (room_ext − room_mid)·4·p·(1−p),
+
+        and the ratio band is [1 − R/p, 1 + R/p]. p is floored by
+        `clip_prob_floor` so the max ratio stays ~1 + room_ext/floor. A rare
+        gate (p→0) gets ~room_ext of upward room (fast recovery) and may fall to
+        0 (the lower bound clamps at 0); a 50/50 gate gets the tight room_mid
+        band. Applied to the joint action ratio, but keyed on the gate prob so
+        the parametric sizing menu is not over-loosened (check/fold have no
+        sizing, so for them the joint ratio IS the gate ratio)."""
+        p = old_gate_logp.exp().clamp(
+            self._clip_prob_floor, 1.0 - self._clip_prob_floor
+        )
+        room = self._clip_room_ext - (
+            self._clip_room_ext - self._clip_room_mid
+        ) * 4.0 * p * (1.0 - p)
+        r_over_p = room / p
+        hi = 1.0 + r_over_p
+        lo = (1.0 - r_over_p).clamp_min(0.0)
+        return lo, hi
+
     def update(
         self,
         batch: Batch,
@@ -252,6 +345,7 @@ class PPOTrainer:
             float(cfg.entropy_coef) if entropy_coef is None else float(entropy_coef)
         )
         display_coef = float(getattr(cfg, "display_value_coef", 0.125))
+        value_coef = float(getattr(cfg, "value_loss_coef", 0.5))
         device = batch.obs.device
         # Accumulate as device tensors; one .item() at the end avoids
         # per-minibatch CUDA syncs that serialize against compute.
@@ -323,49 +417,82 @@ class PPOTrainer:
 
                         with record_function("step12b/loss"):
                             ratio = torch.exp(log_prob - mb.log_probs)
+                            if self._clip_prob_dependent:
+                                clip_lo, clip_hi = self._gate_clip_bounds(
+                                    mb.old_gate_logp
+                                )
+                            else:
+                                clip_lo = 1.0 - cfg.clip
+                                clip_hi = 1.0 + cfg.clip
                             surr1 = ratio * mb.advantages
-                            surr2 = torch.clamp(
-                                ratio, 1.0 - cfg.clip, 1.0 + cfg.clip
-                            ) * mb.advantages
+                            surr2 = (
+                                torch.clamp(ratio, clip_lo, clip_hi)
+                                * mb.advantages
+                            )
                             policy_loss = -torch.min(surr1, surr2).mean()
 
                             # Value source: the centralized critic when
                             # present (buffer `values` came from it), else
                             # the actor's own head.
                             q_loss = torch.zeros((), device=device)
-                            if (
-                                self._q_aux_coef > 0.0
-                                and self._critic_qv is not None
-                            ):
-                                # One critic forward yields V (identical to
-                                # forward()) AND the dueling Q row; the
-                                # taken action's Q regresses to the same
-                                # returns. Index: 0 Fold, 1 CheckCall,
-                                # 2+anchor Raise.
-                                value, q_all = self._critic_qv(
+                            if self._distributional:
+                                # Distributional / HL-Gauss value head: one torso
+                                # pass gives V (=symexp(E[bins]), scalar), the
+                                # categorical logits, and the scalar dueling Q.
+                                # value loss = HL-Gauss cross-entropy — no MSE
+                                # clip (the categorical support IS the bound).
+                                value, value_logits, q_all = self._critic_train(
                                     mb.obs, opp_holes_multihot(mb.opp_holes)
                                 )
-                                q_idx = torch.where(
-                                    mb.gate_actions == GATE_RAISE,
-                                    2 + mb.anchor_actions,
-                                    mb.gate_actions,
-                                )
-                                q_taken = q_all.gather(
-                                    -1, q_idx[..., None]
-                                ).squeeze(-1)
-                                q_loss = (q_taken - mb.returns).pow(2).mean()
-                            elif self._critic_fwd is not None:
-                                value = self._critic_fwd(
-                                    mb.obs, opp_holes_multihot(mb.opp_holes)
+                                if self._q_aux_coef > 0.0 and q_all is not None:
+                                    q_idx = torch.where(
+                                        mb.gate_actions == GATE_RAISE,
+                                        2 + mb.anchor_actions,
+                                        mb.gate_actions,
+                                    )
+                                    q_taken = q_all.gather(
+                                        -1, q_idx[..., None]
+                                    ).squeeze(-1)
+                                    q_loss = (q_taken - mb.returns).pow(2).mean()
+                                value_loss = self.critic.hlgauss_value_loss(
+                                    value_logits, mb.returns
                                 )
                             else:
-                                value = display_value
-                            value_pred_clipped = mb.values + torch.clamp(
-                                value - mb.values, -cfg.value_clip, cfg.value_clip
-                            )
-                            v1 = (value - mb.returns).pow(2)
-                            v2 = (value_pred_clipped - mb.returns).pow(2)
-                            value_loss = 0.5 * torch.max(v1, v2).mean()
+                                if (
+                                    self._q_aux_coef > 0.0
+                                    and self._critic_qv is not None
+                                ):
+                                    # One critic forward yields V (identical to
+                                    # forward()) AND the dueling Q row; the
+                                    # taken action's Q regresses to the same
+                                    # returns. Index: 0 Fold, 1 CheckCall,
+                                    # 2+anchor Raise.
+                                    value, q_all = self._critic_qv(
+                                        mb.obs, opp_holes_multihot(mb.opp_holes)
+                                    )
+                                    q_idx = torch.where(
+                                        mb.gate_actions == GATE_RAISE,
+                                        2 + mb.anchor_actions,
+                                        mb.gate_actions,
+                                    )
+                                    q_taken = q_all.gather(
+                                        -1, q_idx[..., None]
+                                    ).squeeze(-1)
+                                    q_loss = (q_taken - mb.returns).pow(2).mean()
+                                elif self._critic_fwd is not None:
+                                    value = self._critic_fwd(
+                                        mb.obs, opp_holes_multihot(mb.opp_holes)
+                                    )
+                                else:
+                                    value = display_value
+                                value_pred_clipped = mb.values + torch.clamp(
+                                    value - mb.values,
+                                    -cfg.value_clip,
+                                    cfg.value_clip,
+                                )
+                                v1 = (value - mb.returns).pow(2)
+                                v2 = (value_pred_clipped - mb.returns).pow(2)
+                                value_loss = 0.5 * torch.max(v1, v2).mean()
 
                             # Display head: plain regression (no clipping —
                             # buffer values belong to the critic), small
@@ -405,7 +532,7 @@ class PPOTrainer:
                                 entropy_bonus = eff_entropy_coef * entropy_loss
                             loss = (
                                 policy_loss
-                                + 0.5 * value_loss
+                                + value_coef * value_loss
                                 + display_coef * display_loss
                                 + entropy_bonus
                                 + self._q_aux_coef * q_loss
@@ -425,6 +552,15 @@ class PPOTrainer:
                                 self.model, self._ref, mb, cur=cur_raw
                             )
                             loss = loss + self.kl_anchor_coef * kl_anchor_term
+
+                    # Weight-decay-to-init (torso LayerNorm companion): pull the
+                    # trunk weights toward their run-start values. No-op unless
+                    # l2_init_coef > 0. f32, outside autocast.
+                    if self._l2_init_pairs:
+                        l2_init = torch.zeros((), device=device)
+                        for p, p0 in self._l2_init_pairs:
+                            l2_init = l2_init + ((p - p0) ** 2).sum()
+                        loss = loss + self._l2_init_coef * l2_init
 
                     with record_function("step12e/kl"):
                         with torch.no_grad():
@@ -493,6 +629,10 @@ class PPOTrainer:
                         self.optimizer.zero_grad()
                         loss.backward()
                     with record_function("step12d/optimizer_step"):
+                        # Per-tensor adaptive clip (opt-in) BEFORE the per-group
+                        # split clip: tames heavy-tailed spikes tensor-by-tensor.
+                        if self._agc_clip > 0.0:
+                            _adaptive_grad_clip_(self._all_params, self._agc_clip)
                         # Clip actor and critic grads SEPARATELY — a single
                         # global clip over both lets a chip-scale critic-loss
                         # spike inflate the shared grad-norm and throttle the

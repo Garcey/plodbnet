@@ -167,6 +167,22 @@ def _critic_values(
     return v_t.float().cpu().numpy()
 
 
+def _critic_q_values(
+    critic: CentralCritic,
+    device: torch.device,
+    obs_np: np.ndarray,
+    opp_np: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """(V, Q) from the centralized critic's dueling head — the VRPO /
+    Expected-SARSA advantage path. Q is (B, q_actions) over
+    [Fold, CheckCall, Raise@anchor_0..k]; at the zero-init head Q == V."""
+    o_t = torch.from_numpy(obs_np).to(device)
+    h_t = torch.from_numpy(opp_np).to(device)
+    with torch.inference_mode():
+        v_t, q_t = critic.q_values(o_t, opp_holes_multihot(h_t))
+    return v_t.float().cpu().numpy(), q_t.float().cpu().numpy()
+
+
 def _aggression_bonus_bb(
     gate: int,
     commit_delta_chips: int,
@@ -505,6 +521,15 @@ def collect_rollout(
     pool_opp_seats = max(0, min(pool_opp_seats, n_seats - 1))
 
     device = next(learner.parameters()).device
+
+    if getattr(train_config, "advantage_estimator", "gae") == "vrpo":
+        # VRPO / Expected-SARSA advantages are implemented only in the batched
+        # collector (the training path). The serial driver serves UI / eval /
+        # exploit, which always use GAE.
+        raise NotImplementedError(
+            "advantage_estimator='vrpo' is supported only by "
+            "collect_rollout_batched; the serial collect_rollout uses GAE."
+        )
 
     envs = [BombPotEnv(game_config, ev_runout_samples=train_config.ev_runout_samples)
             for _ in range(n_envs)]
@@ -852,6 +877,16 @@ def collect_rollout_batched(
     pool_opp_seats = max(0, min(pool_opp_seats, n_seats - 1))
     device = next(learner.parameters()).device
 
+    # VRPO / Expected-SARSA advantage flip (V5_DESIGN.md W2.5). Needs the
+    # centralized critic's dueling Q head; train.py additionally requires
+    # q_aux_coef>0 so the head is trained (else the flip is identical to GAE).
+    use_vrpo = getattr(train_config, "advantage_estimator", "gae") == "vrpo"
+    if use_vrpo and (critic is None or getattr(critic, "q_actions", 0) <= 0):
+        raise ValueError(
+            "advantage_estimator='vrpo' needs a CentralCritic with a dueling "
+            "Q head (q_actions>0)."
+        )
+
     env = BatchedBombPotEnv(
         n_envs,
         game_config,
@@ -940,6 +975,17 @@ def collect_rollout_batched(
     traj_gate_lp = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.float32)
     traj_anchor_lp = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.float32)
     traj_value = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.float32)
+    # VRPO: Q(s_t, a_t) and V^π(s_t)=Σ_a π(a)Q(s_t,a) per learner step, laid
+    # out like traj_value; the Expected-SARSA(λ) scan consumes them. None when
+    # the estimator is GAE (never indexed in that path).
+    traj_q_taken = (
+        np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.float32)
+        if use_vrpo else None
+    )
+    traj_vpi = (
+        np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.float32)
+        if use_vrpo else None
+    )
     # Per-step cost / pot / street parallel arrays, mirrored shape.
     costs_arr = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.float32)
     pots_arr = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.float32)
@@ -1029,7 +1075,7 @@ def collect_rollout_batched(
     def _forward(model: ActorCritic, group: np.ndarray, obs_arr: np.ndarray,
                  gate_mask_arr: np.ndarray, sizing_arr: np.ndarray) -> tuple[
         np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
-        np.ndarray, np.ndarray,
+        np.ndarray, np.ndarray, np.ndarray | None,
     ]:
         b_obs = obs_arr[group]
         b_gm = gate_mask_arr[group]
@@ -1040,7 +1086,10 @@ def collect_rollout_batched(
             b_t = torch.from_numpy(b_sizing).to(device)
         with record_function("step3/learner_forward"):
             with torch.inference_mode():
-                _fw_out = model.act(o_t, m_t, b_t)
+                if use_vrpo:
+                    _fw_out = model.act(o_t, m_t, b_t, return_marginal=True)
+                else:
+                    _fw_out = model.act(o_t, m_t, b_t)
         with record_function("step5/action_d2h"):
             # Coalesce device->host copies (each forces a full CUDA sync)
             # into two by stacking same-dtype outputs: one int64 transfer
@@ -1054,6 +1103,11 @@ def collect_rollout_batched(
                 (_fw_out.log_prob, _fw_out.refine_u, _fw_out.value,
                  _fw_out.gate_log_prob, _fw_out.anchor_log_prob), dim=0
             ).cpu().numpy()
+            marg_np = (
+                _fw_out.action_marginal.float().cpu().numpy()
+                if _fw_out.action_marginal is not None
+                else None
+            )
             return (
                 ints[0].astype(np.uint8),
                 ints[1].astype(np.int64),
@@ -1063,6 +1117,7 @@ def collect_rollout_batched(
                 floats[2],
                 floats[3],
                 floats[4],
+                marg_np,
             )
 
     env_idx_range = np.arange(n_envs)
@@ -1098,6 +1153,9 @@ def collect_rollout_batched(
         gate_logp_per_env = np.zeros(n_envs, dtype=np.float32)
         anchor_logp_per_env = np.zeros(n_envs, dtype=np.float32)
         values_per_env = np.zeros(n_envs, dtype=np.float32)
+        if use_vrpo:
+            q_taken_per_env = np.zeros(n_envs, dtype=np.float32)
+            vpi_per_env = np.zeros(n_envs, dtype=np.float32)
 
         # Per-step sizing context (min, max, pot, to_call) — built once;
         # the same array feeds act() and the trajectory store.
@@ -1117,7 +1175,7 @@ def collect_rollout_batched(
         )
 
         if learner_idx_np.size:
-            g_np, c_np, an_np, lp_np, ru_np, v_np, glp_np, alp_np = _forward(
+            g_np, c_np, an_np, lp_np, ru_np, v_np, glp_np, alp_np, marg_np = _forward(
                 learner, learner_idx_np, obs, gate_masks, sizing_step
             )
             gates_per_env[learner_idx_np] = g_np
@@ -1132,9 +1190,23 @@ def collect_rollout_batched(
                     opp_block = _rotate_opp_holes_batch(
                         holes_cache, learner_idx_np, safe_actors[learner_idx_np]
                     )
-                    values_per_env[learner_idx_np] = _critic_values(
-                        critic, device, obs[learner_idx_np], opp_block
-                    )
+                    if use_vrpo:
+                        v_l, q_l = _critic_q_values(
+                            critic, device, obs[learner_idx_np], opp_block
+                        )
+                        values_per_env[learner_idx_np] = v_l
+                        # q index: Fold/CheckCall use the gate directly, Raise
+                        # uses 2+anchor (matches ppo.py q_idx and the marginal).
+                        q_idx_l = np.where(
+                            g_np == GATE_RAISE, 2 + an_np, g_np.astype(np.int64)
+                        )
+                        rows_l = np.arange(learner_idx_np.size)
+                        q_taken_per_env[learner_idx_np] = q_l[rows_l, q_idx_l]
+                        vpi_per_env[learner_idx_np] = (marg_np * q_l).sum(-1)
+                    else:
+                        values_per_env[learner_idx_np] = _critic_values(
+                            critic, device, obs[learner_idx_np], opp_block
+                        )
             else:
                 values_per_env[learner_idx_np] = v_np
 
@@ -1147,7 +1219,7 @@ def collect_rollout_batched(
                     sd_idx_int = int(sd_idx)
                     group = np.nonzero(opp_snap_col == sd_idx)[0]
                     m = _get_snapshot_model(sd_idx_int)
-                    g_np, c_np, _, _, _, _, _, _ = _forward(
+                    g_np, c_np, _, _, _, _, _, _, _ = _forward(
                         m, group, obs, gate_masks, sizing_step
                     )
                     gates_per_env[group] = g_np
@@ -1206,6 +1278,13 @@ def collect_rollout_batched(
             traj_value[learner_idx_np, learner_actors, slots] = (
                 values_per_env[learner_idx_np]
             )
+            if use_vrpo:
+                traj_q_taken[learner_idx_np, learner_actors, slots] = (
+                    q_taken_per_env[learner_idx_np]
+                )
+                traj_vpi[learner_idx_np, learner_actors, slots] = (
+                    vpi_per_env[learner_idx_np]
+                )
 
         # Short-shove redirect: rows where the network emitted GATE_RAISE
         # but the engine zeroed `min_raise` (sub-min-raise stack with
@@ -1384,6 +1463,39 @@ def collect_rollout_batched(
                         advs_t[..., t] = np.where(active_tm, last_gae, np.float32(0.0))
                     rets_t = advs_t + vals_t
 
+                    # VRPO / Expected-SARSA(λ): the same λ-trace with the
+                    # dueling Q as baseline — δ⁺ = r + γ·V^π(s') − Q(s,a),
+                    # V^π(s')=Σ_a π(a|s')Q(s',a) (traj_vpi). `advantages` use
+                    # this trace; `returns` stay GAE (the V-head target). At
+                    # Q≡V (zero-init head) q==vals and vpi==vals, so it is
+                    # bit-identical to the GAE scan above.
+                    if use_vrpo:
+                        q_es = traj_q_taken[term_envs, :, :L]        # (T, S, L)
+                        vpi_es = traj_vpi[term_envs, :, :L]          # (T, S, L)
+                        last_es = np.zeros((T, S), dtype=np.float32)
+                        advs_es_t = np.zeros((T, S, L), dtype=np.float32)
+                        for t in range(L - 1, -1, -1):
+                            is_last = (t == last_t_arr) & flush_mask
+                            active_tm = (t <= last_t_arr) & flush_mask
+                            reward_t = costs_t[..., t] + np.where(
+                                is_last, won_bb, np.float32(0.0)
+                            )
+                            if t + 1 < L:
+                                next_vpi = np.where(
+                                    is_last, np.float32(0.0), vpi_es[..., t + 1]
+                                )
+                            else:
+                                next_vpi = np.zeros((T, S), dtype=np.float32)
+                            delta = reward_t + gamma_f * next_vpi - q_es[..., t]
+                            new_es = delta + gamma_f * lam_f * last_es
+                            last_es = np.where(active_tm, new_es, last_es)
+                            advs_es_t[..., t] = np.where(
+                                active_tm, last_es, np.float32(0.0)
+                            )
+                        adv_out_t = advs_es_t
+                    else:
+                        adv_out_t = advs_t
+
                 # Gather the (T, S, L) → (n_new,) flat slab and copy
                 # into the preallocated output arrays at `wcursor`.
                 with record_function("step9d/slab_copies"):
@@ -1434,7 +1546,7 @@ def collect_rollout_batched(
                         all_alp_arr[wcursor:end] = traj_anchor_lp[term_envs, :, :L].ravel()[sel]
                         all_v_arr[wcursor:end] = vals_t.ravel()[sel]
                         all_ret_arr[wcursor:end] = rets_t.ravel()[sel]
-                        all_adv_arr[wcursor:end] = advs_t.ravel()[sel]
+                        all_adv_arr[wcursor:end] = adv_out_t.ravel()[sel]
                         wcursor = end
 
                 with record_function("step9e/pool_mix"):

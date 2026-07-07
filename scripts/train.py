@@ -508,6 +508,125 @@ def main() -> None:
         "it warmed first.",
     )
     parser.add_argument(
+        "--advantage-estimator",
+        choices=["gae", "vrpo"],
+        default="gae",
+        help="Policy-gradient advantage estimator. 'gae' (default) = V-based "
+        "GAE(lambda), unchanged. 'vrpo' = Expected-SARSA(lambda) off the "
+        "critic's dueling Q head (VRPO, Fan & Farina 2026; V5_DESIGN.md W2.5) "
+        "— analytically averages out future-action-sampling variance at mixed "
+        "nodes. Requires --sizing-head mixture AND --q-aux-coef>0 (warm the Q "
+        "head first); at the zero-init head it reduces exactly to GAE.",
+    )
+    parser.add_argument(
+        "--torso-norm",
+        action="store_true",
+        help="Insert pre-activation LayerNorm into the residual torso of BOTH "
+        "actor and critic (v6 plasticity, V6_RESEARCH.md #4). Fresh stem only "
+        "(not function-preserving; needs --num-layers>=3). Pair with "
+        "--l2-init-coef>0 — LayerNorm-solo can hurt generalization (Nauman 2024).",
+    )
+    parser.add_argument(
+        "--l2-init-coef",
+        type=float,
+        default=0.0,
+        help="Weight-decay-to-init coefficient: L2 penalty pulling the trunk "
+        "weight matrices toward their run-start values (the required companion "
+        "for --torso-norm). 0 = off.",
+    )
+    parser.add_argument(
+        "--adam-b2",
+        type=float,
+        default=0.999,
+        help="AdamW second-moment beta2 (V6 internals). Sweep {0.98,0.99,0.999} "
+        "against heavy-tailed policy-ratio spikes; 0.999 = current default.",
+    )
+    parser.add_argument(
+        "--agc-clip",
+        type=float,
+        default=0.0,
+        help="Stateless per-tensor adaptive gradient-clip coefficient (NFNet "
+        "AGC): clip each param's grad to agc_clip*||param||. 0 = off; "
+        "rollback-safe (no running state).",
+    )
+    parser.add_argument(
+        "--grad-checkpoint",
+        action="store_true",
+        help="Recompute torso activations in backward (identical math, less "
+        "memory) to buy back rollout headroom. Trains slower per step.",
+    )
+    parser.add_argument(
+        "--value-bins",
+        type=int,
+        default=0,
+        help="Distributional/HL-Gauss critic value head with this many bins "
+        "over a symlog support (V6 keystone). 0 = scalar MSE head (default). "
+        "Try 51. Fresh critic value head on warm-start.",
+    )
+    parser.add_argument(
+        "--value-support",
+        type=float,
+        default=1500.0,
+        help="Max |value| in bb the distributional support covers (via symlog).",
+    )
+    parser.add_argument(
+        "--value-hlgauss-sigma",
+        type=float,
+        default=0.75,
+        help="HL-Gauss Gaussian sigma in bin-widths (→0 = hard two-hot; A/B "
+        "small first).",
+    )
+    parser.add_argument(
+        "--value-loss-coef",
+        type=float,
+        default=0.5,
+        help="Weight on the critic value loss in the total loss (0.5 = the old "
+        "hardcoded value). Re-tune for the distributional head (cross-entropy "
+        "!= MSE magnitude); also the critic-weight-lift A/B.",
+    )
+    parser.add_argument(
+        "--clip-prob-dependent",
+        action="store_true",
+        help="v6 probability-dependent GATE clip (Over-mixing §6, generalized "
+        "Clip-Higher): widen the clip band for RARE gate actions (fast recovery "
+        "of a suppressed-but-correct check/bet) and tighten it near 50/50 (less "
+        "thrash at genuinely-mixed nodes), keyed on the gate's old prob. Scoped "
+        "to the gate so the sizing menu isn't over-loosened. Off = flat --clip.",
+    )
+    parser.add_argument(
+        "--clip-room-ext",
+        type=float,
+        default=0.10,
+        help="Target absolute prob-movement room at the gate extremes (p->0/1) "
+        "for --clip-prob-dependent. 0.10 = ~10 points/update.",
+    )
+    parser.add_argument(
+        "--clip-room-mid",
+        type=float,
+        default=0.05,
+        help="Target absolute prob-movement room at a 50/50 gate for "
+        "--clip-prob-dependent. 0.05 = ~5 points/update (tighter than the "
+        "extremes -> the symmetric U).",
+    )
+    parser.add_argument(
+        "--clip-prob-floor",
+        type=float,
+        default=1e-3,
+        help="Floor on the gate prob in R/p for --clip-prob-dependent; caps the "
+        "max ratio at ~1 + clip_room_ext/floor.",
+    )
+    parser.add_argument(
+        "--v6",
+        action="store_true",
+        help="V6 PRESET: turn the whole v6 feature kit ON together (sizing-head "
+        "mixture, advantage-estimator vrpo + q-aux, torso LayerNorm + l2-init, "
+        "distributional value head, AGC, grad-checkpoint, probability-dependent "
+        "gate clip). Sets each only where you did NOT pass it explicitly (your "
+        "flags win); prints the resolved set. Fresh cold-start stem (not "
+        "function-preserving). Use for v6 launches so no feature is silently "
+        "left off (cf. the 2048x4 rule in CLAUDE.md).",
+    )
+    parser.add_argument(
         "--ev-runout-samples",
         type=int,
         default=EV_RUNOUT_SAMPLES,
@@ -713,7 +832,7 @@ def main() -> None:
         help="'uniform' samples from --num-seats-range equiprobably; 'clubgg' "
         "weights 6:30/5:25/4:25/3:15/2:10 (normalized) restricted to "
         "--num-seats-range; 'nlh_ring' slightly favors 5-6 handed "
-        "(1.25x the 2/3/4 weight — ~22.7% each vs ~18.2%).",
+        "(1.25x the 2/3/4 weight — ~22.7%% each vs ~18.2%%).",
     )
     parser.add_argument(
         "--bb",
@@ -904,6 +1023,33 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # --v6 preset: turn the whole v6 feature kit on together, but only where the
+    # user did NOT pass the flag explicitly (compared against the parser default;
+    # explicit flags win). Prints the resolved set so nothing is silently on/off.
+    if args.v6:
+        _v6_preset = {
+            "sizing_head": "mixture",
+            "advantage_estimator": "vrpo",
+            "q_aux_coef": 0.5,
+            "torso_norm": True,
+            "l2_init_coef": 1e-4,
+            "agc_clip": 0.1,
+            "grad_checkpoint": True,
+            "value_bins": 51,
+            "clip_prob_dependent": True,
+        }
+        _v6_applied: dict = {}
+        _v6_kept: dict = {}
+        for _k, _v in _v6_preset.items():
+            if getattr(args, _k) == parser.get_default(_k):
+                setattr(args, _k, _v)
+                _v6_applied[_k] = _v
+            else:
+                _v6_kept[_k] = getattr(args, _k)
+        print(f"[v6] preset ON - applied: {_v6_applied}")
+        if _v6_kept:
+            print(f"[v6] kept your explicit overrides: {_v6_kept}")
+
     # Variant resolution: NLH defaults to the 5/10(5)-style structure
     # (sb = bb/2, ante = bb/2 per player); the bomb pot keeps its
     # historical 3bb ante and no blinds.
@@ -1026,6 +1172,20 @@ def main() -> None:
         adv_clip=args.adv_clip,
         value_clip=args.value_clip,
         q_aux_coef=args.q_aux_coef,
+        advantage_estimator=args.advantage_estimator,
+        torso_layernorm=args.torso_norm,
+        l2_init_coef=args.l2_init_coef,
+        adam_b2=args.adam_b2,
+        agc_clip=args.agc_clip,
+        grad_checkpoint=args.grad_checkpoint,
+        value_bins=args.value_bins,
+        value_support=args.value_support,
+        value_hlgauss_sigma=args.value_hlgauss_sigma,
+        value_loss_coef=args.value_loss_coef,
+        clip_prob_dependent=args.clip_prob_dependent,
+        clip_room_ext=args.clip_room_ext,
+        clip_room_mid=args.clip_room_mid,
+        clip_prob_floor=args.clip_prob_floor,
         device=args.device,
     )
 
@@ -1044,6 +1204,7 @@ def main() -> None:
         num_layers=train_cfg.num_layers,
         obs_dim=obs_dim,
         anchor_spec=anchor_spec,
+        torso_layernorm=train_cfg.torso_layernorm,
         **head_kwargs,
     )
     print(
@@ -1056,11 +1217,33 @@ def main() -> None:
     # (zero-init; Q == V until --q-aux-coef trains it) so the VRPO
     # advantage flip later is a code change, not a checkpoint break.
     critic_q_actions = 2 + anchor_spec.count if args.sizing_head == "mixture" else 0
+    if args.torso_norm and args.l2_init_coef <= 0.0:
+        print(
+            "[warn] --torso-norm without --l2-init-coef>0: LayerNorm-solo can "
+            "hurt generalization (Nauman 2024). Strongly consider a companion, "
+            "e.g. --l2-init-coef 1e-4."
+        )
+    if args.advantage_estimator == "vrpo":
+        if critic_q_actions <= 0:
+            raise SystemExit(
+                "error: --advantage-estimator vrpo requires --sizing-head "
+                "mixture (it reads the critic's dueling Q head)."
+            )
+        if args.q_aux_coef <= 0.0:
+            raise SystemExit(
+                "error: --advantage-estimator vrpo requires --q-aux-coef > 0 "
+                "so the Q head is trained first; at the untrained head the flip "
+                "is identical to GAE (V5_DESIGN.md W2.5)."
+            )
     critic = CentralCritic(
         obs_dim=obs_dim,
         hidden_dim=train_cfg.critic_hidden_dim,
         num_blocks=train_cfg.critic_num_blocks,
         q_actions=critic_q_actions,
+        torso_layernorm=train_cfg.torso_layernorm,
+        value_bins=train_cfg.value_bins,
+        value_support=train_cfg.value_support,
+        hlgauss_sigma=train_cfg.value_hlgauss_sigma,
     )
     critic.to(train_cfg.device)
     print(f"[device] learner on {train_cfg.device}")
