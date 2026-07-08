@@ -1288,6 +1288,34 @@ impl GameState {
     ///   other, either direction) — the modal double-board outcome the
     ///   12-dim block folds into its residual.
     /// - 19: tie on BOTH boards.
+    /// Deterministic key for the opp-outcome MC — a hash of exactly the inputs
+    /// the MC depends on (hero seat, street, hero hole, both boards). Returns
+    /// `None` in precisely the cases `outcome_features_mc` returns all-zeros
+    /// (no actor, or fewer than 3 board cards on either board). Used as the
+    /// per-env cache key in the batched pack: equal key => the MC would produce
+    /// the identical 20-dim output, so the cached value can be reused.
+    ///
+    /// MUST hash the same fields, in the same order, with the same hasher as
+    /// the inline seed in `outcome_features_mc` below — keep them in lockstep.
+    pub fn outcome_seed(&self) -> Option<u64> {
+        let hero_seat = self.actor?;
+        if self.board_a.len() < 3 || self.board_b.len() < 3 {
+            return None;
+        }
+        let hero_hole = &self.hole_cards[hero_seat];
+        use std::hash::Hasher;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        hasher.write_u8(hero_seat as u8);
+        hasher.write_u8(self.street.index() as u8);
+        for c in hero_hole.iter() {
+            hasher.write_u8(c.index());
+        }
+        for c in self.board_a.iter().chain(self.board_b.iter()) {
+            hasher.write_u8(c.index());
+        }
+        Some(hasher.finish())
+    }
+
     pub fn outcome_features_mc(&self, mc_samples: usize) -> Vec<f32> {
         const N_OUT: usize = 20;
         const SCOOP_OPP: usize = 0;

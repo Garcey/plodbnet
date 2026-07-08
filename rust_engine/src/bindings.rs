@@ -997,6 +997,16 @@ pub struct PyBatchedEngine {
     /// engine. Serial/UI/eval use 1024; batched TRAINING sets it lower
     /// (256) to cut the dominant per-decision encode cost.
     opp_outcome_mc: usize,
+    /// Per-env memoization of the opp-outcome MC output (the 20-dim fused
+    /// pass), keyed on `GameState::outcome_seed` = hash of exactly the MC's
+    /// inputs (hero seat + street + hero hole + both boards). The MC is a pure
+    /// function of those, so within a street (board unchanged across the
+    /// street's actions) it recomputes identically every step; this reuses it
+    /// and recomputes only when the seed changes (street advance / new hand).
+    /// Bit-exact vs always-recompute (pinned by test_encoding_rust: cached
+    /// batched == fresh serial). Accessed only serially (locked outside the
+    /// parallel MC), so the Mutex adds no contention and keeps the pyclass Sync.
+    outcome_cache: std::sync::Mutex<Vec<Option<(u64, [f32; 20])>>>,
 }
 
 #[pymethods]
@@ -1036,6 +1046,7 @@ impl PyBatchedEngine {
                 variant,
             },
             opp_outcome_mc,
+            outcome_cache: std::sync::Mutex::new(vec![None; num_envs]),
         })
     }
 
@@ -1969,21 +1980,59 @@ impl PyBatchedEngine {
             }
         } else {
             let opp_outcome_mc = self.opp_outcome_mc;
-            // One fused pass per env yields BOTH the 12 joint fractions
-            // and the 8 per-board dims (obs v2 P1) — same eval cost.
-            let opp_fr_per_env: Vec<[f32; 20]> = (0..n)
+            let states = &self.states;
+            // Per-env deterministic outcome seed (cheap hash of hero + street +
+            // both boards). The fused MC is a pure function of exactly those, so
+            // it is constant across a street's actions; recompute only when the
+            // seed changes (street advance / new hand) and reuse the cached
+            // 20-dim result otherwise. Bit-exact vs always-recompute — pinned by
+            // test_encoding_rust (cached batched == fresh serial). Non-actor /
+            // <3-board rows have seed None and stay all-zeros, matching the
+            // early return in `outcome_features_mc`.
+            let seeds: Vec<Option<u64>> = (0..n)
                 .into_par_iter()
-                .map(|i| {
+                .map(|i| states[idx[i]].as_ref().and_then(|st| st.outcome_seed()))
+                .collect();
+            // Decide which envs need a fresh MC (seed changed, or never cached).
+            let recompute: Vec<usize> = {
+                let cache = self.outcome_cache.lock().unwrap();
+                (0..n)
+                    .filter(|&i| match (seeds[i], &cache[idx[i]]) {
+                        (Some(sd), Some((csd, _))) => sd != *csd,
+                        (Some(_), None) => true,
+                        (None, _) => false,
+                    })
+                    .collect()
+            };
+            // Expensive fused pass — only for the changed envs (12 joint
+            // fractions + 8 per-board dims, obs v2 P1).
+            let fresh: Vec<(usize, [f32; 20])> = recompute
+                .par_iter()
+                .map(|&i| {
                     let mut out = [0.0f32; 20];
-                    if let Some(state) = self.states[idx[i]].as_ref() {
+                    if let Some(state) = states[idx[i]].as_ref() {
                         let fr = state.outcome_features_mc(opp_outcome_mc);
-                        for j in 0..20 {
-                            out[j] = fr[j];
-                        }
+                        out.copy_from_slice(&fr[..20]);
                     }
-                    out
+                    (i, out)
                 })
                 .collect();
+            // Store fresh results, then assemble every env's vector from the
+            // cache (unchanged envs reuse; None-seed envs stay all-zeros).
+            let opp_fr_per_env: Vec<[f32; 20]> = {
+                let mut cache = self.outcome_cache.lock().unwrap();
+                for &(i, out) in &fresh {
+                    if let Some(sd) = seeds[i] {
+                        cache[idx[i]] = Some((sd, out));
+                    }
+                }
+                (0..n)
+                    .map(|i| match (seeds[i], &cache[idx[i]]) {
+                        (Some(_), Some((_, out))) => *out,
+                        _ => [0.0f32; 20],
+                    })
+                    .collect()
+            };
             for i in 0..n {
                 for j in 0..12 {
                     opp_outcome_fractions[[i, j]] = opp_fr_per_env[i][j];
