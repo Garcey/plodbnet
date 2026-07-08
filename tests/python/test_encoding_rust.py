@@ -37,7 +37,7 @@ _HAS_RUST_ENCODER = hasattr(BatchedEngine, "observation_encoded_batch")
 # parity suite stays skipped until the Rust port catches up — do NOT
 # "fix" it by comparing only the first 991 dims (a silently truncated
 # obs is exactly the bug the gate exists to prevent).
-_RUST_ENCODER_CURRENT = False
+_RUST_ENCODER_CURRENT = True
 pytestmark = pytest.mark.skipif(
     not (_HAS_RUST_ENCODER and _RUST_ENCODER_CURRENT),
     reason=(

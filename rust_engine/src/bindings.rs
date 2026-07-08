@@ -2265,7 +2265,7 @@ impl PyBatchedEngine {
 // misplaces a whole feature block, so keep in lockstep with the Python side.
 // =============================================================================
 mod obs_layout {
-    pub const OBS_DIM: usize = 991;
+    pub const OBS_DIM: usize = 1020;
     pub const HOLE_OFF: usize = 0;
     pub const BOARD_A_OFF: usize = 52;
     pub const BOARD_B_OFF: usize = 104;
@@ -2313,6 +2313,14 @@ mod obs_layout {
     pub const OPP_OUTCOME_OFF: usize = 978;
     pub const OPP_OUTCOME_DIM: usize = 12;
     pub const BET_PCT_POT_OFF: usize = 990;
+    // obs v2 tail (V5_DESIGN.md §3.2, dims 991..1020) — a pure append after the
+    // 991-dim v1 core. Offsets are byte-identical to the numpy encoder's tail
+    // (_PER_BOARD_OUTCOME_OFF etc. in python/plo5bp/encoding.py).
+    pub const PER_BOARD_OUTCOME_OFF: usize = 991; // 8: hero ahead/tie/behind per board
+    pub const BLOCKER_A_OFF: usize = 999; // 4: unconditional blockers-to-nuts, board A
+    pub const BLOCKER_B_OFF: usize = 1003; // 4: unconditional blockers-to-nuts, board B
+    pub const EFF_PRICE_OFF: usize = 1007; // 5: eff price + commit frac + log1p money
+    pub const SPR_LOG_OFF: usize = 1012; // 8: log1p effective SPR, unclipped
 }
 
 /// Encode one env's observation into `out` (length OBS_DIM, pre-zeroed). A
@@ -2633,6 +2641,136 @@ fn encode_obs_row(
     // --- Opp-outcome fractions (already f32; live rows only). ---
     for t in 0..OPP_OUTCOME_DIM {
         out[OPP_OUTCOME_OFF + t] = packed.opp_outcome_fractions[[j, t]];
+    }
+
+    // ===== obs v2 tail (V5_DESIGN.md §3.2, dims 991..1020) =====
+    // Per-board hero ahead/tie/behind + win-one/tie-both — already f32 from the
+    // fused MC pass (packed by pack_observation_indexed); all-zero preflop/terminal.
+    for m in 0..8 {
+        out[PER_BOARD_OUTCOME_OFF + m] = packed.per_board_outcome[[j, m]];
+    }
+    // Unconditional blockers-to-nuts per board (4 dims each).
+    blocker_features_one_board(hole_slice, ba_slice, &mut out[BLOCKER_A_OFF..BLOCKER_A_OFF + 4]);
+    blocker_features_one_board(hole_slice, bb_slice, &mut out[BLOCKER_B_OFF..BLOCKER_B_OFF + 4]);
+    // Effective price: to_call capped by hero's EFFECTIVE remaining stack, plus
+    // commitment fraction and log1p money companions. f64 throughout, cast on store.
+    let hero_stack = eff_per_seat[hero];
+    let eff_to_call = to_call.min(hero_stack);
+    if eff_to_call > 0.0 {
+        out[EFF_PRICE_OFF] = (eff_to_call / (pot + eff_to_call)) as f32;
+    }
+    if to_call > 0.0 && to_call >= hero_stack {
+        out[EFF_PRICE_OFF + 1] = 1.0;
+    }
+    let hero_commit = packed.total_commit[[j, hero]] as f64;
+    let commit_denom = hero_commit + hero_stack;
+    if commit_denom > 0.0 {
+        out[EFF_PRICE_OFF + 2] = (hero_commit / commit_denom) as f32;
+    }
+    out[EFF_PRICE_OFF + 3] = (eff_to_call * inv_bb).ln_1p() as f32;
+    out[EFF_PRICE_OFF + 4] = (pot * inv_bb).ln_1p() as f32;
+    // log1p effective SPR, unclipped (hero-rotated).
+    for k in 0..num_seats {
+        let seat = (hero + k) % num_seats;
+        out[SPR_LOG_OFF + k] = (eff_per_seat[seat] / pot_safe).ln_1p() as f32;
+    }
+}
+
+/// Unconditional blockers-to-nuts for ONE board (obs v2 P3, 4 dims). Bit-exact
+/// port of `_blocker_features` (python/plo5bp/encoding.py): flush-suit top-card
+/// blocker + top-3 held, nut-straight window blockers, top board-pair blocker.
+/// `out` is a 4-wide pre-zeroed slice. Divisions are done in f64 then cast to
+/// f32 (matching numpy's `held / 3.0` → f32-array assignment).
+fn blocker_features_one_board(hole: &[u8], board: &[u8], out: &mut [f32]) {
+    let mut board_rank_counts = [0i32; 13];
+    let mut board_suit_counts = [0i32; 4];
+    let mut board_suit_ranks = [0u16; 4]; // rank bitmask per suit
+    let mut nboard = 0usize;
+    for &c in board {
+        if c < 52 {
+            nboard += 1;
+            board_rank_counts[(c >> 2) as usize] += 1;
+            board_suit_counts[(c & 3) as usize] += 1;
+            board_suit_ranks[(c & 3) as usize] |= 1u16 << (c >> 2);
+        }
+    }
+    if nboard < 3 {
+        return;
+    }
+    let mut hero_rank_counts = [0i32; 13];
+    let mut hero_cards: u64 = 0;
+    for &c in hole {
+        if c < 52 {
+            hero_rank_counts[(c >> 2) as usize] += 1;
+            hero_cards |= 1u64 << c;
+        }
+    }
+
+    // Flush blockers: first suit with >= 3 board cards (two can't coexist on 5).
+    for s in 0..4usize {
+        if board_suit_counts[s] >= 3 {
+            let mut missing: Vec<usize> = Vec::with_capacity(13);
+            for r in (0..13usize).rev() {
+                if board_suit_ranks[s] & (1u16 << r) == 0 {
+                    missing.push(r);
+                }
+            }
+            if let Some(&top) = missing.first() {
+                if hero_cards & (1u64 << (top * 4 + s)) != 0 {
+                    out[0] = 1.0;
+                }
+            }
+            let held = missing
+                .iter()
+                .take(3)
+                .filter(|&&r| hero_cards & (1u64 << (r * 4 + s)) != 0)
+                .count();
+            out[1] = (held as f64 / 3.0) as f32;
+            break;
+        }
+    }
+
+    // Nut-straight blockers: highest qualifying window (broadway-first scan).
+    // Windows match _STRAIGHT_WINDOWS: slot 0 = wheel, slot 9 = broadway.
+    const STRAIGHT_WINDOWS: [u16; 10] = [
+        (1 << 12) | (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3), // wheel A2345
+        (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4),
+        (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5),
+        (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6),
+        (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7),
+        (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8),
+        (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9),
+        (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10),
+        (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11),
+        (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11) | (1 << 12), // broadway TJQKA
+    ];
+    let mut board_rank_set: u16 = 0;
+    for r in 0..13usize {
+        if board_rank_counts[r] > 0 {
+            board_rank_set |= 1u16 << r;
+        }
+    }
+    for wi in (0..10usize).rev() {
+        let w = STRAIGHT_WINDOWS[wi];
+        if (w & board_rank_set).count_ones() >= 3 {
+            let missing = w & !board_rank_set;
+            let mut blockers = 0i32;
+            for r in 0..13usize {
+                if missing & (1u16 << r) != 0 {
+                    blockers += hero_rank_counts[r];
+                }
+            }
+            out[2] = (blockers.min(4) as f64 / 4.0) as f32;
+            break;
+        }
+    }
+
+    // Board-pair blockers: highest paired rank.
+    for r in (0..13usize).rev() {
+        if board_rank_counts[r] >= 2 {
+            out[3] = (hero_rank_counts[r].min(2) as f64 / 2.0) as f32;
+            break;
+        }
     }
 }
 
