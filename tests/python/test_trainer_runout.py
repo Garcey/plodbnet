@@ -65,3 +65,50 @@ def test_residual_allin_call_is_betting_moot():
     # ...yet the seat can neither bet nor be meaningfully bet into, so the
     # actor's node is moot -> _advance auto-checks -> the hand runs out.
     assert T._betting_moot(raw, actor) is True
+
+
+def test_allin_showdown_terminal_frame_carries_review(trainer_factory):
+    """The terminal FRAME emitted for an all-in showdown must carry the review
+    block, not only the endpoint's final `state`. The client opens the review
+    from the frame stream; when the review lived solely in the post-animation
+    `applyState(final)` settle, a long run-out animation whose playback got
+    pre-empted (animSeq abort) never revealed it — the reported 'all-in hand
+    completes but the review never comes up' bug.
+
+    Root cause was ordering: the hero decision was appended to h.decisions
+    AFTER `_advance`, so the terminal frame (snapshotted inside `_advance`)
+    saw no decision and shipped review=None. Shallow 6bb stacks + seed 0 pin a
+    3-way flop all-in with one hero decision."""
+    ts = trainer_factory(
+        rng_seed=0, seats_mode="fixed", seats_fixed=6,
+        stack_bb=6.0, ante_bb=3.0, mc_rollouts=0,
+    )
+    ts.new_hand()
+    term_frames = None
+    for _ in range(40):
+        if ts.hand is None or ts.hand.terminal:
+            break
+        s = ts.project_state()
+        legal = s["legal"]
+        if legal.get("raise") and s["raise_bounds"]["max_chips"] > 0:
+            frames = ts.act("raise", s["raise_bounds"]["max_chips"])  # shove
+        elif legal.get("check_call"):
+            frames = ts.act("check_call", None)
+        else:
+            frames = ts.act("fold", None)
+        if ts.hand.terminal:
+            term_frames = frames
+
+    assert ts.hand is not None and ts.hand.terminal
+    # Reproduced the buggy shape: an all-in SHOWDOWN after a hero decision.
+    assert ts.project_state()["terminal"] == "showdown"
+    assert ts.hand.decisions, "expected a hero decision before the all-in"
+    # The terminal frame the client animates must itself carry the review, so
+    # the pane opens from frame playback — not only the fragile final settle.
+    assert term_frames, "the terminating act() returned no frames"
+    last = term_frames[-1]
+    assert last["terminal"] == "showdown"
+    assert last["trainer"]["hand_active"] is False
+    assert last["trainer"]["review"] is not None, (
+        "terminal frame shipped review=None — the review pane can be missed"
+    )

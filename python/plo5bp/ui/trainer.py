@@ -933,6 +933,19 @@ class TrainerSession:
                              "chips": int(chips), "street": street})
         h.opp_actions_since_hero = []
         h.last_obs, h.last_info = obs, info2
+        # Record the decision (+ its EV-loss estimate and feedback) BEFORE
+        # building any terminal frame. The terminal frame's review block is
+        # gated on the decision being in h.decisions; a multiway all-in run-out
+        # snapshots its terminal frame INSIDE _advance — i.e. before the old
+        # post-branch append — so it shipped `review: null`, and the review pane
+        # only ever opened via the post-animation applyState(final). On long
+        # run-out animations the client's animSeq abort skips that settle and
+        # the review never appeared. Recording first makes the terminal frame
+        # self-sufficient. (Non-terminal frames stay review-less — the review
+        # block is also gated on h.terminal.)
+        self._estimate_ev_loss(decision)
+        h.decisions.append(decision)
+        h.feedback = self._feedback_payload(decision)
         frames: list[dict[str, Any]] = []
         if done:
             self._finalize(rewards)
@@ -940,10 +953,6 @@ class TrainerSession:
         else:
             frames.append(self.project_state())  # hero's action landed
             self._advance(frames)
-
-        self._estimate_ev_loss(decision)
-        h.decisions.append(decision)
-        h.feedback = self._feedback_payload(decision)
 
         if not h.is_repeat:
             for block in (self.session_stats, self.lifetime_stats):
