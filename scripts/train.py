@@ -1021,6 +1021,25 @@ def main() -> None:
         "Adds ~10-30%% overhead; use only when diagnosing per-step CPU/GPU "
         "attribution.",
     )
+    parser.add_argument(
+        "--profile-at-update",
+        type=int,
+        default=0,
+        help="With --profile-one-update, which update index to profile. >0 skips "
+        "the one-time torch.compile/Inductor JIT (fires on the first forward/"
+        "backward) so the trace is STEADY-STATE, not compilation. Warmup updates "
+        "run normally, then the chosen update is profiled and the process exits.",
+    )
+    parser.add_argument(
+        "--cpu-threads",
+        type=int,
+        default=0,
+        help="Torch intra-op thread count for host-side rollout/post-rollout CPU "
+        "work. The _concat_batches staging copy is memory-bandwidth-bound and runs "
+        "~5x slower at the 192-thread default (NUMA oversubscription); ~8-32 is "
+        "optimal. 0 = torch default / OMP_NUM_THREADS. Applies on cpu AND cuda; "
+        "also live-tunable via runs/threads.txt.",
+    )
     args = parser.parse_args()
 
     # --v6 preset: turn the whole v6 feature kit on together, but only where the
@@ -1132,15 +1151,23 @@ def main() -> None:
 
     threads_file = Path("runs/threads.txt")
     current_threads: int | None = None
-    if args.device == "cpu":
-        # Initial thread count: prefer OMP_NUM_THREADS env var on launch
-        # (matches BLAS threadpool); torch's intra-op pool is independent
-        # and needs explicit set_num_threads.
+    # Torch's intra-op thread count governs the host-side rollout AND
+    # post-rollout CPU work (the _concat_batches staging copy, h2d assembly)
+    # on BOTH cpu and CUDA runs — the whole rollout is CPU-side even when the
+    # learner is on cuda. This was formerly gated on device=="cpu", which
+    # pinned CUDA runs at the 192-thread default; the _concat_batches obs copy
+    # is memory-bandwidth-bound and ran ~5x slower at 192 threads than at its
+    # ~8-32-thread optimum (NUMA oversubscription; profiled 2026-07-08). Honor
+    # --cpu-threads, else OMP_NUM_THREADS, regardless of device.
+    _cpu_threads = int(args.cpu_threads or 0)
+    if _cpu_threads <= 0:
         omp_env = os.environ.get("OMP_NUM_THREADS", "").strip()
         if omp_env.isdigit() and int(omp_env) > 0:
-            torch.set_num_threads(int(omp_env))
-        current_threads = torch.get_num_threads()
-        print(f"[threads] initial torch threads = {current_threads}")
+            _cpu_threads = int(omp_env)
+    if _cpu_threads > 0:
+        torch.set_num_threads(_cpu_threads)
+    current_threads = torch.get_num_threads()
+    print(f"[threads] initial torch threads = {current_threads}")
 
     seats_choices = _parse_seats_range(args.num_seats_range)
     stack_lo, stack_hi = _parse_stack_range(args.stack_range)
@@ -1562,7 +1589,7 @@ def main() -> None:
         # change torch's intra-op threadpool without restarting the
         # run. Malformed reads are ignored. CUDA runs skip this —
         # set_num_threads is a CPU-pool concept.
-        if train_cfg.device == "cpu" and threads_file.exists():
+        if threads_file.exists():
             try:
                 desired = int(threads_file.read_text().strip())
                 if desired > 0 and desired != current_threads:
@@ -1658,7 +1685,7 @@ def main() -> None:
                 stack_dist=active_tier, seats_dist=args.seats_dist,
                 variant=args.variant, sb=args.sb,
             )
-        _profile_this = args.profile_one_update and update == 0
+        _profile_this = args.profile_one_update and update == args.profile_at_update
         _prof = None
         if _profile_this:
             _prof = torch.profiler.profile(
@@ -1736,12 +1763,15 @@ def main() -> None:
 
         if _prof is not None:
             _prof.__exit__(None, None, None)
-            trace_path = Path("runs/profile_update0.json")
+            trace_path = Path(f"runs/profile_update{update}.json")
             trace_path.parent.mkdir(parents=True, exist_ok=True)
             _prof.export_chrome_trace(str(trace_path))
-            print(_prof.key_averages().table(
-                sort_by="self_cuda_time_total", row_limit=40
-            ))
+            _ka = _prof.key_averages()
+            _tag = "(post-compile)" if update > 0 else "(incl. one-time compile)"
+            print(f"\n===== profiled update {update} {_tag} — SELF CUDA =====")
+            print(_ka.table(sort_by="self_cuda_time_total", row_limit=40))
+            print(f"\n===== profiled update {update} {_tag} — SELF CPU =====")
+            print(_ka.table(sort_by="self_cpu_time_total", row_limit=40))
             print(f"[profile] chrome trace -> {trace_path}")
             stop_requested["flag"] = True
 
