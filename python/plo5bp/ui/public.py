@@ -753,8 +753,15 @@ def install(
             raise HTTPException(status_code=400, detail=f"invalid webhook: {e}")
         etype = event["type"]
         obj = event["data"]["object"]
-        if etype == "checkout.session.completed":
-            _activate_from_checkout(obj)
+        if etype in ("checkout.session.completed", "checkout.session.async_payment_succeeded"):
+            # Only activate once payment has actually settled. For async
+            # payment methods (ACH / bank transfer) `checkout.session.completed`
+            # fires immediately with payment_status="unpaid"; activating then
+            # would grant paid access before money clears. The matching
+            # `async_payment_succeeded` event fires when it does. Mirrors the
+            # /billing/confirm gate above ("paid" or "no_payment_required").
+            if _sv(obj, "payment_status") != "unpaid":
+                _activate_from_checkout(obj)
         elif etype in ("customer.subscription.updated", "customer.subscription.deleted"):
             row = DB.one(
                 "SELECT * FROM users WHERE stripe_subscription_id=?", (obj["id"],)
