@@ -203,3 +203,98 @@ def test_active_users_counter(server, clients):
     assert a.get("/trainer/state").status_code == 200
     d = adm.get("/admin/api/active").json()
     assert "alice@example.com" in d["emails"]
+
+
+def test_session_instances_do_not_share_mutable_state(server):
+    """Regression: each Session() must own its mutable state. In the public
+    multi-user build every signed-in user gets their own Session(), so a
+    shared class-level list/dict default would alias one user's action_log /
+    cards / slot-locks into another's session (a cross-user leak)."""
+    Session = server.Session
+    a, b = Session(), Session()
+    # Distinct container identities.
+    assert a.action_log is not b.action_log
+    assert a.hero_hole is not b.hero_hole
+    assert a.game_config is not b.game_config
+    assert a._card_slot_locked is not b._card_slot_locked
+    assert a._card_slot_locked["hero_hole"] is not b._card_slot_locked["hero_hole"]
+    assert a._card_slot_pending is not b._card_slot_pending
+    # In-place mutation on one must not bleed into the other.
+    a.action_log.append({"gate": 1, "chips": 999})
+    a.hero_hole[0] = 42
+    a._card_slot_locked["hero_hole"][0] = True
+    assert b.action_log == []
+    assert b.hero_hole[0] is None
+    assert b._card_slot_locked["hero_hole"][0] is False
+
+
+def test_webhook_requires_settled_payment(server, clients, monkeypatch):
+    """Regression: the Stripe webhook must NOT grant a subscription for a
+    checkout event whose payment hasn't settled (payment_status='unpaid', as
+    async ACH / bank-transfer methods fire) — only once it is paid."""
+    pub = sys.modules["plo5bp.ui.public"]
+    _, _, adm = clients
+
+    c = TestClient(server.app)
+    assert c.get("/auth/dev", params={"email": "wh@example.com"}).status_code == 200
+    uid = next(
+        u["id"]
+        for u in adm.get("/admin/api/users").json()["users"]
+        if u["email"] == "wh@example.com"
+    )
+    assert c.get("/me").json()["sub"]["active"] is False
+
+    # Fake Stripe: bypass signature verification and inject a crafted event.
+    monkeypatch.setattr(pub, "STRIPE_SECRET_KEY", "sk_test_x")
+    monkeypatch.setattr(pub, "STRIPE_WEBHOOK_SECRET", "whsec_x")
+    injected: dict = {}
+
+    class _FakeWebhook:
+        @staticmethod
+        def construct_event(payload, sig, secret):
+            return injected
+
+    class _FakeSub:
+        @staticmethod
+        def retrieve(sid):  # only hit if a stale refresh fires; keep it sane
+            return {"status": "active", "current_period_end": 9999999999}
+
+    class _FakeStripe:
+        Webhook = _FakeWebhook
+        Subscription = _FakeSub
+
+    monkeypatch.setattr(pub, "_stripe", lambda: _FakeStripe)
+
+    def fire(payment_status):
+        injected.clear()
+        injected.update(
+            {
+                "type": "checkout.session.completed",
+                "data": {
+                    "object": {
+                        "client_reference_id": str(uid),
+                        "payment_status": payment_status,
+                        "subscription": "sub_test",
+                        "customer": "cus_test",
+                        "id": "cs_test",
+                        "amount_total": 1000,
+                        "currency": "usd",
+                    }
+                },
+            }
+        )
+        return c.post(
+            "/stripe/webhook",
+            content=b"{}",
+            headers={"stripe-signature": "t=1,v1=fake"},
+        )
+
+    # Unpaid async checkout "completed" → must NOT activate.
+    assert fire("unpaid").status_code == 200
+    assert c.get("/me").json()["sub"]["active"] is False
+
+    # Settled payment → activates via stripe.
+    assert fire("paid").status_code == 200
+    me = c.get("/me").json()
+    assert me["sub"]["active"] is True
+    assert me["sub"]["source"] == "stripe"

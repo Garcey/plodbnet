@@ -316,7 +316,7 @@ def _format_locked(fmt_id: str) -> bool:
 
 class Session:
     env: BombPotEnv | None = None
-    game_config: GameConfig = GameConfig(starting_stack=400000)
+    game_config: GameConfig
     dollars_per_bb: float = 2.0
 
     # Active game format. Switching (POST /format) swaps the game config
@@ -331,18 +331,20 @@ class Session:
     hero_seat: int = 0
 
     # Nullable user-entered cards. Server pads nulls with unused deck cards.
-    hero_hole: list[int | None] = [None] * 5
-    flop_a: list[int | None] = [None] * 3
-    flop_b: list[int | None] = [None] * 3
-    turn_cards: list[int | None] = [None, None]   # [board_a_turn, board_b_turn]
-    river_cards: list[int | None] = [None, None]
+    # (Created per-instance in __init__ — mutable, must not be shared.)
+    hero_hole: list[int | None]
+    flop_a: list[int | None]
+    flop_b: list[int | None]
+    turn_cards: list[int | None]   # [board_a_turn, board_b_turn]
+    river_cards: list[int | None]
 
     last_obs: np.ndarray | None = None
     last_info: Any = None
 
     # Action log contains only action entries: {"gate": int, "chips": int}.
     # Street transitions are inferred during replay from engine state.
-    action_log: list[dict[str, Any]] = []
+    # (Created per-instance in __init__ — mutable, must not be shared.)
+    action_log: list[dict[str, Any]]
 
     # Seats that weren't dealt into this hand (OCR saw no card-backs).
     # `_rebuild_env` auto-folds any of these seats as soon as the engine
@@ -437,25 +439,44 @@ class Session:
     # to True and OCR will skip it for the rest of the hand. Lets
     # the user override OCR misreads without the next tick clobbering
     # their edit. Reset to all-False by `_new_session_defaults`.
-    _card_slot_locked: dict[str, list[bool]] = {
-        "hero_hole": [False] * 5,
-        "flop_a": [False] * 3,
-        "flop_b": [False] * 3,
-        "turn_cards": [False, False],
-        "river_cards": [False, False],
-    }
+    _card_slot_locked: dict[str, list[bool]]
     # Per-slot stability debounce for the AUTO mirror path: (card_idx, count)
     # of consecutive identical OCR reads, or None. A slot only commits+locks
     # after `_CARD_STABLE_TICKS` identical reads, so a transient mid-reveal
     # misread (dark flipping card -> spurious spade) never latches. Manual
     # rescan bypasses this. Reset by `_new_session_defaults`.
-    _card_slot_pending: dict[str, list[tuple[int, int] | None]] = {
-        "hero_hole": [None] * 5,
-        "flop_a": [None] * 3,
-        "flop_b": [None] * 3,
-        "turn_cards": [None, None],
-        "river_cards": [None, None],
-    }
+    _card_slot_pending: dict[str, list[tuple[int, int] | None]]
+
+    def __init__(self) -> None:
+        # Per-instance mutable state. These MUST be created here, not as
+        # class-level defaults: in the multi-user public build every signed-in
+        # user gets their own Session(), and a shared class-level list/dict
+        # would alias one user's action_log / cards / slot-locks into
+        # another's session (a cross-user state leak). Immutable defaults
+        # (None / int / str / tuple / frozenset) stay as class attributes
+        # above — reassignment can't leak. Sizes match the PLO5 default
+        # variant; _new_session_defaults re-sizes per variant on reset.
+        self.game_config = GameConfig(starting_stack=400000)
+        self.hero_hole = [None] * 5
+        self.flop_a = [None] * 3
+        self.flop_b = [None] * 3
+        self.turn_cards = [None, None]
+        self.river_cards = [None, None]
+        self.action_log = []
+        self._card_slot_locked = {
+            "hero_hole": [False] * 5,
+            "flop_a": [False] * 3,
+            "flop_b": [False] * 3,
+            "turn_cards": [False, False],
+            "river_cards": [False, False],
+        }
+        self._card_slot_pending = {
+            "hero_hole": [None] * 5,
+            "flop_a": [None] * 3,
+            "flop_b": [None] * 3,
+            "turn_cards": [None, None],
+            "river_cards": [None, None],
+        }
 
 
 # The study session. Locally there is exactly one (module-global semantics,
