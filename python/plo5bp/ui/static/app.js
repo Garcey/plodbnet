@@ -306,21 +306,31 @@ async function animateTrainerResponse(data, opts) {
   }
   const seq = ++UI.animSeq;
   UI.animating = true;
+  // A completed hand's `final` is authoritative and MUST settle, even if a
+  // stray background applyState (e.g. init's late /trainer/state on a cold
+  // server) bumps animSeq mid-animation and trips the abort below. Without
+  // this, the abort skipped the settle and left UI.lastState stuck at the
+  // pre-action hand (hand_active:true, no review) while the screen showed the
+  // run-out — the "post-hand review never appears on the first hand after a
+  // promote+refresh" bug. Mid-hand frames (hero to act again) still yield to a
+  // genuinely newer state; only the terminal settle overrides the abort.
+  const terminalFinal = !!(final.trainer && final.trainer.hand_active === false);
+  let aborted = false;
   try {
     // Hero's verdict flashes immediately, while opponents play out.
     if (final.trainer && final.trainer.feedback) {
       renderFeedbackFlash(final, true);
     }
     for (let i = 0; i < frames.length; i++) {
-      if (UI.animSeq !== seq) return;
+      if (UI.animSeq !== seq) { aborted = true; break; }
       render(frames[i]);
       if (i < frames.length - 1) await sleep(trainerPrefs.animMs);
     }
-    if (UI.animSeq !== seq) return;
+    if (UI.animSeq !== seq) aborted = true;
   } finally {
     UI.animating = false;
   }
-  applyState(final);
+  if (!aborted || terminalFinal) applyState(final);
 }
 async function trainerReviewGoto(decision) {
   try {
@@ -1561,7 +1571,9 @@ function betCurveSVG(rec, s, raiseActive) {
     ? `<text x="${hiX.toFixed(1)}" y="${allinY.toFixed(1)}" class="bc-allin" text-anchor="middle">all-in</text>`
     : "";
 
-  const hiF = xf(hi.chips);
+  const tickText = (frac, lbl, dim) =>
+    `<text x="${px(frac).toFixed(1)}" y="${(baseY + 13).toFixed(1)}" ` +
+    `class="bc-tick${dim ? " dim" : ""}" text-anchor="middle">${lbl}</text>`;
   let ticks = "";
   if (idxMode) {
     // Ticks are a spread of the anchors' own labels (always both ends, so
@@ -1569,14 +1581,74 @@ function betCurveSVG(rec, s, raiseActive) {
     const tickIdx = new Set([0, n1]);
     for (let j = 1; j <= 3; j++) tickIdx.add(Math.round((j * n1) / 4));
     for (const i of [...tickIdx].sort((a, b) => a - b)) {
-      const lbl = anchors[i].label != null ? anchors[i].label : "";
-      ticks += `<text x="${px(i / n1).toFixed(1)}" y="${(baseY + 13).toFixed(1)}" class="bc-tick" text-anchor="middle">${lbl}</text>`;
+      ticks += tickText(i / n1, anchors[i].label != null ? anchors[i].label : "");
     }
   } else {
-    for (const t of [[0, "min"], [0.25, "1/4"], [0.5, "1/2"], [0.75, "3/4"], [1, "pot"]]) {
-      const dim = capped && t[0] > hiF + 0.002;
-      ticks += `<text x="${px(t[0]).toFixed(1)}" y="${(baseY + 13).toFixed(1)}" class="bc-tick${dim ? " dim" : ""}" text-anchor="middle">${t[1]}</text>`;
+    // Endpoints are always labelled; "pot" dims when the stack caps the range.
+    ticks += tickText(0, "min") + tickText(1, "pot", capped);
+    // Interior labels annotate the HUMPS OF THE DRAWN CURVE — the local
+    // maxima of the anchor distribution the spline passes through — never the
+    // head's latent parameters. (Mixture component centers routinely sit off
+    // the blended marginal's peaks: components overlap, the marginal is
+    // discretized onto the anchor grid, and the ε weight floor lifts the
+    // whole baseline. Labelling μ's put text on flat stretches and left
+    // visible humps unlabelled.) Works identically for every anchor head
+    // (v2/v4/v5+). Anchors that clamp to the same chips (min-raise / all-in
+    // dupes) collapse to one point first. The white dot — the recommended
+    // size — always gets the first interior label, at its exact pot-%, so the
+    // rec reads straight off the axis; the hump it sits on then yields to it.
+    // Remaining humps are labelled tallest-first with a pixel-space gap so
+    // nothing overlaps at this width. When the stack caps the ladder, the
+    // all-in column already carries the "all-in" text, so no %-label lands
+    // under it.
+    const MINGAP = 28;  // min px between label centers ("100%" ≈ 25px @ 11px)
+    const PROM = 0.02;  // min hump prominence, as a fraction of the tallest anchor
+    const placed = [px(0), px(1)];
+    if (capped) placed.push(hiX);
+    const free = (x) => placed.every((q) => Math.abs(q - x) >= MINGAP);
+    const put = (x, frac) => {
+      placed.push(x);
+      ticks += tickText((x - padL) / plotW, `${Math.round(frac * 100)}%`);
+    };
+    // Collapse clamped dupes to distinct axis positions (max prob wins).
+    const dx = [];
+    for (const a of anchors) {
+      const x = px(xf(a.chips));
+      const last = dx[dx.length - 1];
+      if (last && x - last.x < 0.75) {
+        if (a.prob > last.p) { last.p = a.prob; last.frac = a.frac; }
+      } else dx.push({ x, p: a.prob, frac: a.frac != null ? a.frac : a.k / n1 });
     }
+    // Pot-% at an arbitrary chips position: piecewise-linear between distinct
+    // anchors — exact wherever the ladder isn't clamped, since raise-to chips
+    // are linear in frac there.
+    const fracAt = (c) => {
+      const cx = px(xf(c));
+      if (cx <= dx[0].x) return dx[0].frac;
+      for (let i = 0; i + 1 < dx.length; i++) {
+        const a = dx[i], b = dx[i + 1];
+        if (cx <= b.x) return a.frac + ((cx - a.x) / (b.x - a.x)) * (b.frac - a.frac);
+      }
+      return dx[dx.length - 1].frac;
+    };
+    if (free(dotX)) put(dotX, fracAt(recChips));
+    // Interior local maxima, with valley-to-valley prominence: immediate
+    // neighbors understate a broad hump (they sit on its shoulders), so walk
+    // outward to the nearest higher ground and measure against the deepest
+    // valley on the way. The absolute floor keeps near-uniform ripple quiet.
+    const promMin = Math.max(PROM * pmax, 0.004);
+    const humps = [];
+    for (let i = 1; i + 1 < dx.length; i++) {
+      const c = dx[i].p;
+      if (c < dx[i - 1].p || c < dx[i + 1].p) continue;
+      if (c === dx[i - 1].p && c === dx[i + 1].p) continue; // plateau interior
+      let lv = c, rv = c;
+      for (let j = i - 1; j >= 0 && dx[j].p <= c; j--) lv = Math.min(lv, dx[j].p);
+      for (let j = i + 1; j < dx.length && dx[j].p <= c; j++) rv = Math.min(rv, dx[j].p);
+      if (c - Math.max(lv, rv) >= promMin) humps.push(dx[i]);
+    }
+    humps.sort((a, b) => b.p - a.p);
+    for (const h of humps) if (free(h.x)) put(h.x, h.frac);
   }
 
   return `<svg class="bet-curve" viewBox="0 0 ${W} 113" xmlns="http://www.w3.org/2000/svg">`
