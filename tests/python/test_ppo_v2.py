@@ -142,7 +142,7 @@ def test_entropy_bonus_gate_gradient_is_pure_gate_entropy() -> None:
         batch.gate_actions[:n], batch.anchor_actions[:n],
         batch.refine_u[:n],
     )
-    _, entropy, _, gate_h, _, _, _, _ = model.evaluate(*args)
+    _, entropy, _, gate_h, _, _, _, _, *_raw = model.evaluate(*args)
     g_total = torch.autograd.grad(
         entropy.sum(), model.gate_head.weight, retain_graph=True
     )[0]
@@ -161,7 +161,7 @@ def test_display_value_head_detached_from_torso() -> None:
     trainer, batch, rng = _setup(critic_hidden_dim=64, critic_num_blocks=1)
     model = trainer.model
     n = min(64, batch.obs.shape[0])
-    _, _, value, _, _, _, _, _ = model.evaluate(
+    _, _, value, _, _, _, _, _, *_raw = model.evaluate(
         batch.obs[:n], batch.gate_masks[:n], batch.sizing[:n],
         batch.gate_actions[:n], batch.anchor_actions[:n],
         batch.refine_u[:n],

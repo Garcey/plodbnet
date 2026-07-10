@@ -294,6 +294,13 @@ impl PyGameState {
         Ok(self.get()?.opp_outcome_fractions())
     }
 
+    /// 20-dim superset: the 12 joint outcome fractions + the 8-dim
+    /// per-board decomposition (obs v2 P1), one fused pass. See
+    /// `GameState::outcome_features_mc`.
+    fn outcome_features_mc(&self, mc_samples: usize) -> PyResult<Vec<f32>> {
+        Ok(self.get()?.outcome_features_mc(mc_samples))
+    }
+
     /// Like `opp_outcome_fractions` but with an explicit k=3/k=4 MC
     /// sample budget (the no-arg form uses 1024). For tests / benchmarks
     /// of the training-vs-UI fidelity split.
@@ -346,7 +353,12 @@ impl PyGameState {
             .collect();
         d.set_item("history", history)?;
 
-        d.set_item("opp_outcome_fractions", g.opp_outcome_fractions())?;
+        // One fused pass computes both the 12 joint fractions and the
+        // 8-dim per-board decomposition (obs v2 P1) — same cost as the
+        // old opp_outcome_fractions-only call.
+        let outcome_feats = g.outcome_features_mc(1024);
+        d.set_item("opp_outcome_fractions", outcome_feats[..12].to_vec())?;
+        d.set_item("per_board_outcome", outcome_feats[12..].to_vec())?;
         // NLH 3-dim [opp_ahead, tied, opp_behind]; cheap zeros for other
         // variants (the method's variant guard returns before any eval).
         d.set_item("nlh_opp_outcome", g.nlh_opp_outcome_fractions())?;
@@ -528,6 +540,7 @@ impl PyGameState {
                 history_street,
                 history_len,
                 opp_outcome_fractions: Array2::<f32>::zeros((n, 12)),
+                per_board_outcome: Array2::<f32>::zeros((n, 8)),
                 sb_seat,
                 bb_seat,
                 nlh_opp_outcome,
@@ -565,6 +578,10 @@ impl PyGameState {
         d.set_item(
             "opp_outcome_fractions",
             packed.opp_outcome_fractions.into_pyarray(py),
+        )?;
+        d.set_item(
+            "per_board_outcome",
+            packed.per_board_outcome.into_pyarray(py),
         )?;
         d.set_item("sb_seat", packed.sb_seat.into_pyarray(py))?;
         d.set_item("bb_seat", packed.bb_seat.into_pyarray(py))?;
@@ -980,6 +997,16 @@ pub struct PyBatchedEngine {
     /// engine. Serial/UI/eval use 1024; batched TRAINING sets it lower
     /// (256) to cut the dominant per-decision encode cost.
     opp_outcome_mc: usize,
+    /// Per-env memoization of the opp-outcome MC output (the 20-dim fused
+    /// pass), keyed on `GameState::outcome_seed` = hash of exactly the MC's
+    /// inputs (hero seat + street + hero hole + both boards). The MC is a pure
+    /// function of those, so within a street (board unchanged across the
+    /// street's actions) it recomputes identically every step; this reuses it
+    /// and recomputes only when the seed changes (street advance / new hand).
+    /// Bit-exact vs always-recompute (pinned by test_encoding_rust: cached
+    /// batched == fresh serial). Accessed only serially (locked outside the
+    /// parallel MC), so the Mutex adds no contention and keeps the pyclass Sync.
+    outcome_cache: std::sync::Mutex<Vec<Option<(u64, [f32; 20])>>>,
 }
 
 #[pymethods]
@@ -1019,6 +1046,7 @@ impl PyBatchedEngine {
                 variant,
             },
             opp_outcome_mc,
+            outcome_cache: std::sync::Mutex::new(vec![None; num_envs]),
         })
     }
 
@@ -1632,6 +1660,10 @@ impl PyBatchedEngine {
             "opp_outcome_fractions",
             packed.opp_outcome_fractions.into_pyarray(py),
         )?;
+        d.set_item(
+            "per_board_outcome",
+            packed.per_board_outcome.into_pyarray(py),
+        )?;
         Ok(d)
     }
 
@@ -1709,6 +1741,10 @@ impl PyBatchedEngine {
         d.set_item(
             "opp_outcome_fractions",
             packed.opp_outcome_fractions.into_pyarray(py),
+        )?;
+        d.set_item(
+            "per_board_outcome",
+            packed.per_board_outcome.into_pyarray(py),
         )?;
         d.set_item("sb_seat", packed.sb_seat.into_pyarray(py))?;
         d.set_item("bb_seat", packed.bb_seat.into_pyarray(py))?;
@@ -1790,6 +1826,10 @@ impl PyBatchedEngine {
             "opp_outcome_fractions",
             packed.opp_outcome_fractions.into_pyarray(py),
         )?;
+        d.set_item(
+            "per_board_outcome",
+            packed.per_board_outcome.into_pyarray(py),
+        )?;
         d.set_item("sb_seat", packed.sb_seat.into_pyarray(py))?;
         d.set_item("bb_seat", packed.bb_seat.into_pyarray(py))?;
         d.set_item("nlh_opp_outcome", packed.nlh_opp_outcome.into_pyarray(py))?;
@@ -1851,6 +1891,9 @@ struct PackedObservation {
     history_street: Array2<i8>,
     history_len: Array1<u8>,
     opp_outcome_fractions: Array2<f32>,
+    /// Per-board hero ahead/tie/behind + win-one/tie-both fractions
+    /// (obs v2 P1; k=2 exhaustive, same fused pass). All-zero for NLH.
+    per_board_outcome: Array2<f32>,
     /// Blind seats (-1 when the variant has none). NLH batch encoder input.
     sb_seat: Array1<i8>,
     bb_seat: Array1<i8>,
@@ -1904,6 +1947,7 @@ impl PyBatchedEngine {
         let mut history_street = Array2::<i8>::from_elem((n, hist_cap), -1i8);
         let mut history_len = Array1::<u8>::zeros(n);
         let mut opp_outcome_fractions = Array2::<f32>::zeros((n, 12));
+        let mut per_board_outcome = Array2::<f32>::zeros((n, 8));
         let mut sb_seat = Array1::<i8>::from_elem(n, -1i8);
         let mut bb_seat = Array1::<i8>::from_elem(n, -1i8);
         let mut nlh_opp_outcome = Array2::<f32>::zeros((n, 3));
@@ -1936,22 +1980,65 @@ impl PyBatchedEngine {
             }
         } else {
             let opp_outcome_mc = self.opp_outcome_mc;
-            let opp_fr_per_env: Vec<[f32; 12]> = (0..n)
+            let states = &self.states;
+            // Per-env deterministic outcome seed (cheap hash of hero + street +
+            // both boards). The fused MC is a pure function of exactly those, so
+            // it is constant across a street's actions; recompute only when the
+            // seed changes (street advance / new hand) and reuse the cached
+            // 20-dim result otherwise. Bit-exact vs always-recompute — pinned by
+            // test_encoding_rust (cached batched == fresh serial). Non-actor /
+            // <3-board rows have seed None and stay all-zeros, matching the
+            // early return in `outcome_features_mc`.
+            let seeds: Vec<Option<u64>> = (0..n)
                 .into_par_iter()
-                .map(|i| {
-                    let mut out = [0.0f32; 12];
-                    if let Some(state) = self.states[idx[i]].as_ref() {
-                        let fr = state.opp_outcome_fractions_mc(opp_outcome_mc);
-                        for j in 0..12 {
-                            out[j] = fr[j];
-                        }
+                .map(|i| states[idx[i]].as_ref().and_then(|st| st.outcome_seed()))
+                .collect();
+            // Decide which envs need a fresh MC (seed changed, or never cached).
+            let recompute: Vec<usize> = {
+                let cache = self.outcome_cache.lock().unwrap();
+                (0..n)
+                    .filter(|&i| match (seeds[i], &cache[idx[i]]) {
+                        (Some(sd), Some((csd, _))) => sd != *csd,
+                        (Some(_), None) => true,
+                        (None, _) => false,
+                    })
+                    .collect()
+            };
+            // Expensive fused pass — only for the changed envs (12 joint
+            // fractions + 8 per-board dims, obs v2 P1).
+            let fresh: Vec<(usize, [f32; 20])> = recompute
+                .par_iter()
+                .map(|&i| {
+                    let mut out = [0.0f32; 20];
+                    if let Some(state) = states[idx[i]].as_ref() {
+                        let fr = state.outcome_features_mc(opp_outcome_mc);
+                        out.copy_from_slice(&fr[..20]);
                     }
-                    out
+                    (i, out)
                 })
                 .collect();
+            // Store fresh results, then assemble every env's vector from the
+            // cache (unchanged envs reuse; None-seed envs stay all-zeros).
+            let opp_fr_per_env: Vec<[f32; 20]> = {
+                let mut cache = self.outcome_cache.lock().unwrap();
+                for &(i, out) in &fresh {
+                    if let Some(sd) = seeds[i] {
+                        cache[idx[i]] = Some((sd, out));
+                    }
+                }
+                (0..n)
+                    .map(|i| match (seeds[i], &cache[idx[i]]) {
+                        (Some(_), Some((_, out))) => *out,
+                        _ => [0.0f32; 20],
+                    })
+                    .collect()
+            };
             for i in 0..n {
                 for j in 0..12 {
                     opp_outcome_fractions[[i, j]] = opp_fr_per_env[i][j];
+                }
+                for j in 0..8 {
+                    per_board_outcome[[i, j]] = opp_fr_per_env[i][12 + j];
                 }
             }
         }
@@ -2129,6 +2216,7 @@ impl PyBatchedEngine {
             history_street,
             history_len,
             opp_outcome_fractions,
+            per_board_outcome,
             sb_seat,
             bb_seat,
             nlh_opp_outcome,
@@ -2226,7 +2314,7 @@ impl PyBatchedEngine {
 // misplaces a whole feature block, so keep in lockstep with the Python side.
 // =============================================================================
 mod obs_layout {
-    pub const OBS_DIM: usize = 991;
+    pub const OBS_DIM: usize = 1020;
     pub const HOLE_OFF: usize = 0;
     pub const BOARD_A_OFF: usize = 52;
     pub const BOARD_B_OFF: usize = 104;
@@ -2274,6 +2362,14 @@ mod obs_layout {
     pub const OPP_OUTCOME_OFF: usize = 978;
     pub const OPP_OUTCOME_DIM: usize = 12;
     pub const BET_PCT_POT_OFF: usize = 990;
+    // obs v2 tail (V5_DESIGN.md §3.2, dims 991..1020) — a pure append after the
+    // 991-dim v1 core. Offsets are byte-identical to the numpy encoder's tail
+    // (_PER_BOARD_OUTCOME_OFF etc. in python/plo5bp/encoding.py).
+    pub const PER_BOARD_OUTCOME_OFF: usize = 991; // 8: hero ahead/tie/behind per board
+    pub const BLOCKER_A_OFF: usize = 999; // 4: unconditional blockers-to-nuts, board A
+    pub const BLOCKER_B_OFF: usize = 1003; // 4: unconditional blockers-to-nuts, board B
+    pub const EFF_PRICE_OFF: usize = 1007; // 5: eff price + commit frac + log1p money
+    pub const SPR_LOG_OFF: usize = 1012; // 8: log1p effective SPR, unclipped
 }
 
 /// Encode one env's observation into `out` (length OBS_DIM, pre-zeroed). A
@@ -2594,6 +2690,136 @@ fn encode_obs_row(
     // --- Opp-outcome fractions (already f32; live rows only). ---
     for t in 0..OPP_OUTCOME_DIM {
         out[OPP_OUTCOME_OFF + t] = packed.opp_outcome_fractions[[j, t]];
+    }
+
+    // ===== obs v2 tail (V5_DESIGN.md §3.2, dims 991..1020) =====
+    // Per-board hero ahead/tie/behind + win-one/tie-both — already f32 from the
+    // fused MC pass (packed by pack_observation_indexed); all-zero preflop/terminal.
+    for m in 0..8 {
+        out[PER_BOARD_OUTCOME_OFF + m] = packed.per_board_outcome[[j, m]];
+    }
+    // Unconditional blockers-to-nuts per board (4 dims each).
+    blocker_features_one_board(hole_slice, ba_slice, &mut out[BLOCKER_A_OFF..BLOCKER_A_OFF + 4]);
+    blocker_features_one_board(hole_slice, bb_slice, &mut out[BLOCKER_B_OFF..BLOCKER_B_OFF + 4]);
+    // Effective price: to_call capped by hero's EFFECTIVE remaining stack, plus
+    // commitment fraction and log1p money companions. f64 throughout, cast on store.
+    let hero_stack = eff_per_seat[hero];
+    let eff_to_call = to_call.min(hero_stack);
+    if eff_to_call > 0.0 {
+        out[EFF_PRICE_OFF] = (eff_to_call / (pot + eff_to_call)) as f32;
+    }
+    if to_call > 0.0 && to_call >= hero_stack {
+        out[EFF_PRICE_OFF + 1] = 1.0;
+    }
+    let hero_commit = packed.total_commit[[j, hero]] as f64;
+    let commit_denom = hero_commit + hero_stack;
+    if commit_denom > 0.0 {
+        out[EFF_PRICE_OFF + 2] = (hero_commit / commit_denom) as f32;
+    }
+    out[EFF_PRICE_OFF + 3] = (eff_to_call * inv_bb).ln_1p() as f32;
+    out[EFF_PRICE_OFF + 4] = (pot * inv_bb).ln_1p() as f32;
+    // log1p effective SPR, unclipped (hero-rotated).
+    for k in 0..num_seats {
+        let seat = (hero + k) % num_seats;
+        out[SPR_LOG_OFF + k] = (eff_per_seat[seat] / pot_safe).ln_1p() as f32;
+    }
+}
+
+/// Unconditional blockers-to-nuts for ONE board (obs v2 P3, 4 dims). Bit-exact
+/// port of `_blocker_features` (python/plo5bp/encoding.py): flush-suit top-card
+/// blocker + top-3 held, nut-straight window blockers, top board-pair blocker.
+/// `out` is a 4-wide pre-zeroed slice. Divisions are done in f64 then cast to
+/// f32 (matching numpy's `held / 3.0` → f32-array assignment).
+fn blocker_features_one_board(hole: &[u8], board: &[u8], out: &mut [f32]) {
+    let mut board_rank_counts = [0i32; 13];
+    let mut board_suit_counts = [0i32; 4];
+    let mut board_suit_ranks = [0u16; 4]; // rank bitmask per suit
+    let mut nboard = 0usize;
+    for &c in board {
+        if c < 52 {
+            nboard += 1;
+            board_rank_counts[(c >> 2) as usize] += 1;
+            board_suit_counts[(c & 3) as usize] += 1;
+            board_suit_ranks[(c & 3) as usize] |= 1u16 << (c >> 2);
+        }
+    }
+    if nboard < 3 {
+        return;
+    }
+    let mut hero_rank_counts = [0i32; 13];
+    let mut hero_cards: u64 = 0;
+    for &c in hole {
+        if c < 52 {
+            hero_rank_counts[(c >> 2) as usize] += 1;
+            hero_cards |= 1u64 << c;
+        }
+    }
+
+    // Flush blockers: first suit with >= 3 board cards (two can't coexist on 5).
+    for s in 0..4usize {
+        if board_suit_counts[s] >= 3 {
+            let mut missing: Vec<usize> = Vec::with_capacity(13);
+            for r in (0..13usize).rev() {
+                if board_suit_ranks[s] & (1u16 << r) == 0 {
+                    missing.push(r);
+                }
+            }
+            if let Some(&top) = missing.first() {
+                if hero_cards & (1u64 << (top * 4 + s)) != 0 {
+                    out[0] = 1.0;
+                }
+            }
+            let held = missing
+                .iter()
+                .take(3)
+                .filter(|&&r| hero_cards & (1u64 << (r * 4 + s)) != 0)
+                .count();
+            out[1] = (held as f64 / 3.0) as f32;
+            break;
+        }
+    }
+
+    // Nut-straight blockers: highest qualifying window (broadway-first scan).
+    // Windows match _STRAIGHT_WINDOWS: slot 0 = wheel, slot 9 = broadway.
+    const STRAIGHT_WINDOWS: [u16; 10] = [
+        (1 << 12) | (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3), // wheel A2345
+        (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4),
+        (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5),
+        (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6),
+        (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7),
+        (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8),
+        (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9),
+        (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10),
+        (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11),
+        (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11) | (1 << 12), // broadway TJQKA
+    ];
+    let mut board_rank_set: u16 = 0;
+    for r in 0..13usize {
+        if board_rank_counts[r] > 0 {
+            board_rank_set |= 1u16 << r;
+        }
+    }
+    for wi in (0..10usize).rev() {
+        let w = STRAIGHT_WINDOWS[wi];
+        if (w & board_rank_set).count_ones() >= 3 {
+            let missing = w & !board_rank_set;
+            let mut blockers = 0i32;
+            for r in 0..13usize {
+                if missing & (1u16 << r) != 0 {
+                    blockers += hero_rank_counts[r];
+                }
+            }
+            out[2] = (blockers.min(4) as f64 / 4.0) as f32;
+            break;
+        }
+    }
+
+    // Board-pair blockers: highest paired rank.
+    for r in (0..13usize).rev() {
+        if board_rank_counts[r] >= 2 {
+            out[3] = (hero_rank_counts[r].min(2) as f64 / 2.0) as f32;
+            break;
+        }
     }
 }
 

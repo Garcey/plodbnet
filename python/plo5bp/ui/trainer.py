@@ -305,6 +305,17 @@ def compute_node_distribution(
                 .probs.squeeze(0).float().cpu().numpy()
             )
             refine_np = refine.squeeze(0).float().cpu().numpy()  # (interior, 2)
+            # v5 mixture head: per-component (mu, s, w) so the client can
+            # annotate the size menu — parity with the study recommendation
+            # (_recommendation_v2), which already exposes this block.
+            mixture = None
+            if hasattr(model, "mixture_params"):
+                mu_t, s_t, w_t = model.mixture_params(anchor_head_out)
+                mixture = {
+                    "mu": [round(float(x), 4) for x in mu_t.squeeze(0).tolist()],
+                    "s": [round(float(x), 4) for x in s_t.squeeze(0).tolist()],
+                    "w": [round(float(x), 4) for x in w_t.squeeze(0).tolist()],
+                }
         grid = anchor_grid_np(sizing[0], sizing[1], sizing[2], sizing[3], spec)
         return {
             "head_version": model.head_version,
@@ -323,6 +334,7 @@ def compute_node_distribution(
             "rec_gate": int(_act_out.gate.item()),
             "rec_chips": int(_act_out.chips.item()),
             "value_bb": float(value.squeeze(0).item()),
+            "mixture": mixture,
         }
 
     bounds_t = torch.tensor(
@@ -374,6 +386,15 @@ def _anchors_payload(
         {
             "k": int(k),
             "label": anchor_label_spec(spec, int(k)),
+            # Pot fraction (None for the ALL-IN atom, whose chips are max_raise
+            # not a pot fraction). WITHOUT this the client's hi.frac is
+            # undefined and betCurveSVG falls into idxMode (the NLH all-in
+            # ladder layout) — skipping the chips-space axis AND the mixture
+            # size labels. Parity with the study rec (_recommendation_v2).
+            "frac": (
+                None if (spec.allin_atom and int(k) == spec.count - 1)
+                else spec.fracs_pm[int(k)] / 1000.0
+            ),
             "prob": round(float(anchor_probs[k]), 4),
             "chips": int(anchor_chips[k]),
             "chips_bb": round(chips_to_bb(int(anchor_chips[k]), bb), 4),
@@ -933,6 +954,19 @@ class TrainerSession:
                              "chips": int(chips), "street": street})
         h.opp_actions_since_hero = []
         h.last_obs, h.last_info = obs, info2
+        # Record the decision (+ its EV-loss estimate and feedback) BEFORE
+        # building any terminal frame. The terminal frame's review block is
+        # gated on the decision being in h.decisions; a multiway all-in run-out
+        # snapshots its terminal frame INSIDE _advance — i.e. before the old
+        # post-branch append — so it shipped `review: null`, and the review pane
+        # only ever opened via the post-animation applyState(final). On long
+        # run-out animations the client's animSeq abort skips that settle and
+        # the review never appeared. Recording first makes the terminal frame
+        # self-sufficient. (Non-terminal frames stay review-less — the review
+        # block is also gated on h.terminal.)
+        self._estimate_ev_loss(decision)
+        h.decisions.append(decision)
+        h.feedback = self._feedback_payload(decision)
         frames: list[dict[str, Any]] = []
         if done:
             self._finalize(rewards)
@@ -940,10 +974,6 @@ class TrainerSession:
         else:
             frames.append(self.project_state())  # hero's action landed
             self._advance(frames)
-
-        self._estimate_ev_loss(decision)
-        h.decisions.append(decision)
-        h.feedback = self._feedback_payload(decision)
 
         if not h.is_repeat:
             for block in (self.session_stats, self.lifetime_stats):
@@ -1204,6 +1234,7 @@ class TrainerSession:
                 spec=getattr(self.model, "anchor_spec", PLO_ANCHOR_SPEC),
             )
             nc["rec_anchor"] = dist["rec_anchor"]
+            nc["mixture"] = dist.get("mixture")
             # Mark where the actor's ACTUAL raise landed (the ● on the EQ
             # bars): nearest legal anchor by chip distance, tie -> lower.
             if actual_gate == GATE_RAISE:
@@ -1482,6 +1513,7 @@ class TrainerSession:
                 spec=getattr(self.model, "anchor_spec", PLO_ANCHOR_SPEC),
             )
             recommendation["rec_anchor"] = dist["rec_anchor"]
+            recommendation["mixture"] = dist.get("mixture")
             recommendation["refine"] = (
                 {"alpha": round(rec_alpha, 4), "beta": round(rec_beta, 4)}
                 if dist["refine_ok"][dist["rec_anchor"]] else None

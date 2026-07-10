@@ -42,7 +42,12 @@ from plo5bp.config import (
 )
 from plo5bp.encoding import OBS_DIM
 from plo5bp.encoding_nlh import OBS_DIM_NLH
-from plo5bp.network import ActorCriticV2, ActorCriticV4, CentralCritic
+from plo5bp.network import (
+    ActorCriticV2,
+    ActorCriticV4,
+    ActorCriticV5,
+    CentralCritic,
+)
 from plo5bp.sizing import NLH_ANCHOR_SPEC, PLO_ANCHOR_SPEC
 from plo5bp.ppo import PPOTrainer
 from plo5bp.rollout import (
@@ -174,6 +179,13 @@ def _apply_anneal_control(
         return step, last_raw, live_lr, live_ent, live_ent_deep
     try:
         ctrl = json.loads(raw)
+        if not isinstance(ctrl, dict):
+            # C1: valid JSON but not an object (a list, bare string, or number
+            # from a live-tune typo). The except below catches decode + scalar
+            # errors, but ctrl.get()/.items() on a non-dict raises AttributeError,
+            # which was NOT caught → the live trainer crashed within one update of
+            # the bad save. Treat as malformed and ignore, per the docstring.
+            return step, last_raw, live_lr, live_ent, live_ent_deep
         new_step = float(ctrl["step"]) if "step" in ctrl else step
         new_tiers = {
             tier: float(v)
@@ -198,7 +210,9 @@ def _apply_anneal_control(
             if "entropy_coef_deep" in ctrl
             else None
         )
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, AttributeError):
+        # AttributeError backstop: a non-dict `tier_ent` value (e.g.
+        # {"tier_ent": ["deep", 0.08]}) makes .items() raise; ignore it too.
         return step, last_raw, live_lr, live_ent, live_ent_deep
     if new_step != step:
         print(f"[anneal-control] step {step} -> {new_step}")
@@ -456,6 +470,54 @@ def _sample_game_config(
     return cfg, effective_stack_dist
 
 
+# ---- --v6 preset (C2) ------------------------------------------------------
+# attr -> (legacy_default, v6_value). The covered flags use default=None
+# sentinels in argparse so "flag not passed" is distinguishable from
+# "explicitly passed at the default value" — the old parser.get_default
+# comparison could not tell those apart and silently overrode explicit
+# ablation flags (`--v6 --advantage-estimator gae` trained vrpo;
+# `--v6 --q-aux-coef 0` trained the Q head at 0.5). TrainingConfig dataclass
+# defaults are deliberately NOT the mechanism (breaks live stems + parity).
+_V6_PRESET: "dict[str, tuple[object, object]]" = {
+    "sizing_head": ("anchor", "mixture"),
+    "advantage_estimator": ("gae", "vrpo"),
+    "q_aux_coef": (0.0, 0.5),
+    # 2026-07-09 Q-head audit revision: pooled raise column + dense fold
+    # supervision (fold forward-return == 0, free labels) so the VRPO Q
+    # surface can actually calibrate; adv_head is AGC-exempt (ppo.py).
+    "q_pooled": (False, True),
+    "q_fold_sup_coef": (0.0, 1.0),
+    "torso_norm": (False, True),
+    "l2_init_coef": (0.0, 1e-4),
+    "agc_clip": (0.0, 0.1),
+    "grad_checkpoint": (False, True),
+    "value_bins": (0, 51),
+    "clip_prob_dependent": (False, True),
+}
+
+
+def _apply_v6_preset(args) -> "tuple[dict, dict]":
+    """Resolve the None-sentinel flags covered by the --v6 preset.
+
+    None (flag not passed) -> the v6 value when --v6 is on, else the legacy
+    default. Any non-None value was passed EXPLICITLY — even one equal to a
+    default — and always wins ("your flags win", including the --no-<flag>
+    boolean forms). Runs on EVERY invocation; non-v6 runs just get the
+    legacy defaults filled in. Returns (applied, kept_overrides) for the
+    launch log. Tests: tests/python/test_v6_preset.py."""
+    applied: dict = {}
+    kept: dict = {}
+    for attr, (legacy_default, v6_value) in _V6_PRESET.items():
+        cur = getattr(args, attr)
+        if cur is None:
+            setattr(args, attr, v6_value if args.v6 else legacy_default)
+            if args.v6:
+                applied[attr] = v6_value
+        elif args.v6:
+            kept[attr] = cur
+    return applied, kept
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-updates", type=int, default=100_000_000)
@@ -469,12 +531,192 @@ def main() -> None:
     parser.add_argument("--num-layers", type=int, default=4)
     parser.add_argument(
         "--sizing-head",
-        choices=["anchor", "logistic"],
-        default="anchor",
+        choices=["anchor", "logistic", "mixture"],
+        default=None,  # C2 sentinel — resolved by _apply_v6_preset (legacy "anchor")
         help="Sizing-head architecture. 'anchor' = v2 flat 11-way categorical "
         "(head_version 2). 'logistic' = v4 ordinal discretized-logistic over the "
         "same 11 anchors (head_version 3): location+scale, stable under PPO, with "
-        "the min/pot end anchors tail-absorbed so they stay hittable.",
+        "the min/pot end anchors tail-absorbed so they stay hittable. "
+        "'mixture' = v5 K-component mixture of discretized logistics "
+        "(head_version 4): multi-modal solver-style size menus, exact "
+        "closed-form marginal (V5_DESIGN.md §2).",
+    )
+    parser.add_argument(
+        "--mixture-k",
+        type=int,
+        default=3,
+        help="Component count for --sizing-head mixture (ignored otherwise).",
+    )
+    parser.add_argument(
+        "--value-clip",
+        type=float,
+        default=0.2,
+        help="PPO clipped-value-loss radius in RAW bb (V5_DESIGN.md B4: 0.2 "
+        "against ±250bb returns rate-limits the critic; A/B {2, 10, 1e9} on "
+        "a throwaway stem before changing production runs).",
+    )
+    parser.add_argument(
+        "--q-aux-coef",
+        type=float,
+        default=None,  # C2 sentinel — resolved by _apply_v6_preset (legacy 0.0)
+        help="Coefficient for the critic's auxiliary Q(s,a) regression "
+        "(dueling head, v5 stems). 0 = head exists (mixture runs) but "
+        "untrained; the Expected-SARSA advantage flip (VRPO, W2.5) needs "
+        "it warmed first.",
+    )
+    parser.add_argument(
+        "--q-pooled",
+        action=argparse.BooleanOptionalAction,
+        default=None,  # C2 sentinel — resolved by _apply_v6_preset (legacy False)
+        help="Pool the dueling head's per-anchor raise columns into ONE "
+        "raise column (q_actions=3: Fold/CheckCall/Raise). 2026-07-09 Q-head "
+        "audit: the 11 anchor columns saw ~3%% of rows each and dominated "
+        "the VRPO advantage noise; pooling gives the raise Q 11x the "
+        "training density. Warm-starting across widths drops adv_head to "
+        "fresh zero-init (Q==V; VRPO==GAE until retrained).",
+    )
+    parser.add_argument(
+        "--q-fold-sup-coef",
+        type=float,
+        default=None,  # C2 sentinel — resolved by _apply_v6_preset (legacy 0.0)
+        help="Dense fold-column supervision weight inside the q-aux loss: "
+        "fold's forward return is EXACTLY 0 (per-step-cost rewards, sunk "
+        "chips excluded), so q[FOLD] regresses to 0 on every fold-LEGAL "
+        "row — free perfect labels, ~3x the fold-column data. 0 = off.",
+    )
+    parser.add_argument(
+        "--advantage-estimator",
+        choices=["gae", "vrpo"],
+        default=None,  # C2 sentinel — resolved by _apply_v6_preset (legacy "gae")
+        help="Policy-gradient advantage estimator. 'gae' (default) = V-based "
+        "GAE(lambda), unchanged. 'vrpo' = Expected-SARSA(lambda) off the "
+        "critic's dueling Q head (VRPO, Fan & Farina 2026; V5_DESIGN.md W2.5) "
+        "— analytically averages out future-action-sampling variance at mixed "
+        "nodes. Requires --sizing-head mixture AND --q-aux-coef>0 (warm the Q "
+        "head first); at the zero-init head it reduces exactly to GAE.",
+    )
+    parser.add_argument(
+        "--torso-norm",
+        action=argparse.BooleanOptionalAction,
+        default=None,  # C2 sentinel — resolved by _apply_v6_preset (legacy False)
+        help="Insert pre-activation LayerNorm into the residual torso of BOTH "
+        "actor and critic (v6 plasticity, V6_RESEARCH.md #4). Fresh stem only "
+        "(not function-preserving; needs --num-layers>=3). Pair with "
+        "--l2-init-coef>0 — LayerNorm-solo can hurt generalization (Nauman 2024).",
+    )
+    parser.add_argument(
+        "--l2-init-coef",
+        type=float,
+        default=None,  # C2 sentinel — resolved by _apply_v6_preset (legacy 0.0)
+        help="Weight-decay-to-init coefficient: L2 penalty pulling the trunk "
+        "weight matrices toward their run-start values (the required companion "
+        "for --torso-norm). 0 = off.",
+    )
+    parser.add_argument(
+        "--adam-b2",
+        type=float,
+        default=0.999,
+        help="AdamW second-moment beta2 (V6 internals). Sweep {0.98,0.99,0.999} "
+        "against heavy-tailed policy-ratio spikes; 0.999 = current default.",
+    )
+    parser.add_argument(
+        "--agc-clip",
+        type=float,
+        default=None,  # C2 sentinel — resolved by _apply_v6_preset (legacy 0.0)
+        help="Stateless per-tensor adaptive gradient-clip coefficient (NFNet "
+        "AGC): clip each param's grad to agc_clip*||param||. 0 = off; "
+        "rollback-safe (no running state).",
+    )
+    parser.add_argument(
+        "--grad-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=None,  # C2 sentinel — resolved by _apply_v6_preset (legacy False)
+        help="Recompute torso activations in backward (identical math, less "
+        "memory) to buy back rollout headroom. Trains slower per step.",
+    )
+    parser.add_argument(
+        "--value-bins",
+        type=int,
+        default=None,  # C2 sentinel — resolved by _apply_v6_preset (legacy 0)
+        help="Distributional/HL-Gauss critic value head with this many bins "
+        "over a symlog support (V6 keystone). 0 = scalar MSE head (default). "
+        "Try 51. Fresh critic value head on warm-start.",
+    )
+    parser.add_argument(
+        "--value-support",
+        type=float,
+        default=1500.0,
+        help="Max |value| in bb the distributional support covers (via symlog).",
+    )
+    parser.add_argument(
+        "--value-hlgauss-sigma",
+        type=float,
+        default=0.75,
+        help="HL-Gauss Gaussian sigma in bin-widths (→0 = hard two-hot; A/B "
+        "small first).",
+    )
+    parser.add_argument(
+        "--value-loss-coef",
+        type=float,
+        default=0.5,
+        help="Weight on the critic value loss in the total loss (0.5 = the old "
+        "hardcoded value). Re-tune for the distributional head (cross-entropy "
+        "!= MSE magnitude); also the critic-weight-lift A/B.",
+    )
+    parser.add_argument(
+        "--clip-prob-dependent",
+        action=argparse.BooleanOptionalAction,
+        default=None,  # C2 sentinel — resolved by _apply_v6_preset (legacy False)
+        help="v6 probability-dependent GATE clip (Over-mixing §6, generalized "
+        "Clip-Higher): widen the clip band for RARE gate actions (fast recovery "
+        "of a suppressed-but-correct check/bet) and tighten it near 50/50 (less "
+        "thrash at genuinely-mixed nodes), keyed on the gate's old prob. Scoped "
+        "to the gate so the sizing menu isn't over-loosened. Off = flat --clip.",
+    )
+    parser.add_argument(
+        "--clip-room-ext",
+        type=float,
+        default=0.10,
+        help="Target absolute prob-movement room at the gate extremes (p->0/1) "
+        "for --clip-prob-dependent. 0.10 = ~10 points/update.",
+    )
+    parser.add_argument(
+        "--clip-room-mid",
+        type=float,
+        default=0.05,
+        help="Target absolute prob-movement room at a 50/50 gate for "
+        "--clip-prob-dependent. 0.05 = ~5 points/update (tighter than the "
+        "extremes -> the symmetric U).",
+    )
+    parser.add_argument(
+        "--clip-prob-floor",
+        type=float,
+        default=1e-3,
+        help="Floor on the gate prob in R/p for --clip-prob-dependent; caps the "
+        "max ratio at ~1 + clip_room_ext/floor.",
+    )
+    parser.add_argument(
+        "--v6",
+        action="store_true",
+        help="V6 PRESET: turn the whole v6 feature kit ON together (sizing-head "
+        "mixture, advantage-estimator vrpo + q-aux, torso LayerNorm + l2-init, "
+        "distributional value head, AGC, grad-checkpoint, probability-dependent "
+        "gate clip). Sets each only where you did NOT pass it explicitly (your "
+        "flags win — INCLUDING flags passed at their default value, and the "
+        "booleans accept --no-<flag> to force a feature off under --v6); "
+        "prints the resolved set. Fresh cold-start stem (not "
+        "function-preserving). Use for v6 launches so no feature is silently "
+        "left off (cf. the 2048x4 rule in CLAUDE.md).",
+    )
+    parser.add_argument(
+        "--ev-runout-samples",
+        type=int,
+        default=EV_RUNOUT_SAMPLES,
+        help="MC runout samples for the terminal-reward EV when a hand "
+        "closes before the river with 2+ live seats (cuts runout luck "
+        f"from the reward). Default {EV_RUNOUT_SAMPLES}; higher = lower "
+        "reward variance at more engine time (measure — engine is a few %% "
+        "of update wall-clock).",
     )
     parser.add_argument("--num-envs", type=int, default=1536)
     parser.add_argument("--rollout-length", type=int, default=262_144)
@@ -672,7 +914,7 @@ def main() -> None:
         help="'uniform' samples from --num-seats-range equiprobably; 'clubgg' "
         "weights 6:30/5:25/4:25/3:15/2:10 (normalized) restricted to "
         "--num-seats-range; 'nlh_ring' slightly favors 5-6 handed "
-        "(1.25x the 2/3/4 weight — ~22.7% each vs ~18.2%).",
+        "(1.25x the 2/3/4 weight — ~22.7%% each vs ~18.2%%).",
     )
     parser.add_argument(
         "--bb",
@@ -861,7 +1103,50 @@ def main() -> None:
         "Adds ~10-30%% overhead; use only when diagnosing per-step CPU/GPU "
         "attribution.",
     )
+    parser.add_argument(
+        "--profile-at-update",
+        type=int,
+        default=0,
+        help="With --profile-one-update, which update index to profile. >0 skips "
+        "the one-time torch.compile/Inductor JIT (fires on the first forward/"
+        "backward) so the trace is STEADY-STATE, not compilation. Warmup updates "
+        "run normally, then the chosen update is profiled and the process exits.",
+    )
+    parser.add_argument(
+        "--cpu-threads",
+        type=int,
+        default=0,
+        help="Torch intra-op thread count for host-side rollout/post-rollout CPU "
+        "work. The _concat_batches staging copy is memory-bandwidth-bound and runs "
+        "~5x slower at the 192-thread default (host cores oversubscribing the "
+        "pod's ~40-vCPU quota); ~8-32 is optimal. 0 = OMP_NUM_THREADS if set, "
+        "else min(32, cpu_count) on CUDA / torch default on CPU. Applies on cpu "
+        "AND cuda; also live-tunable via runs/threads.txt.",
+    )
+    parser.add_argument(
+        "--rayon-threads",
+        type=int,
+        default=0,
+        help="Thread count for the Rust engine's rayon pool (opp-outcome MC + "
+        "obs encoder — the bulk of the update). Rayon otherwise defaults to the "
+        "host's ~192 logical cores, oversubscribing the pod's ~40-vCPU quota "
+        "~4.7x. 0 = leave rayon's default / any pre-set RAYON_NUM_THREADS "
+        "untouched. UNMEASURED: A/B 32/40/48 (lead 40 = the quota) on a throwaway "
+        "run; changes no training numbers (per-env deterministic MC seeds).",
+    )
     args = parser.parse_args()
+
+    # --v6 preset resolution (C2): sentinel defaults + _apply_v6_preset (module
+    # level, above main) — explicit flags win FOR REAL now, including ones
+    # passed at their default value and the --no-<flag> boolean forms (the old
+    # parser.get_default comparison couldn't see "explicitly passed the
+    # default" and silently overrode ablation flags). Runs on every
+    # invocation; non-v6 runs just get the legacy defaults filled in.
+    _v6_applied, _v6_kept = _apply_v6_preset(args)
+    if args.v6:
+        print(f"[v6] preset ON - applied: {_v6_applied}")
+        if _v6_kept:
+            print(f"[v6] kept your explicit overrides: {_v6_kept}")
 
     # Variant resolution: NLH defaults to the 5/10(5)-style structure
     # (sb = bb/2, ante = bb/2 per player); the bomb pot keeps its
@@ -945,15 +1230,80 @@ def main() -> None:
 
     threads_file = Path("runs/threads.txt")
     current_threads: int | None = None
-    if args.device == "cpu":
-        # Initial thread count: prefer OMP_NUM_THREADS env var on launch
-        # (matches BLAS threadpool); torch's intra-op pool is independent
-        # and needs explicit set_num_threads.
+    # Torch's intra-op thread count governs the host-side rollout AND
+    # post-rollout CPU work (the _concat_batches staging copy, h2d assembly)
+    # on BOTH cpu and CUDA runs — the whole rollout is CPU-side even when the
+    # learner is on cuda. This was formerly gated on device=="cpu", which
+    # pinned CUDA runs at the 192-thread default; the _concat_batches obs copy
+    # is memory-bandwidth-bound and ran ~5x slower at 192 threads than at its
+    # ~8-32-thread optimum (NUMA oversubscription; profiled 2026-07-08). Honor
+    # --cpu-threads, else OMP_NUM_THREADS, regardless of device.
+    _cpu_threads = int(args.cpu_threads or 0)
+    _thread_src = "--cpu-threads" if _cpu_threads > 0 else ""
+    if _cpu_threads <= 0:
         omp_env = os.environ.get("OMP_NUM_THREADS", "").strip()
         if omp_env.isdigit() and int(omp_env) > 0:
-            torch.set_num_threads(int(omp_env))
-        current_threads = torch.get_num_threads()
-        print(f"[threads] initial torch threads = {current_threads}")
+            _cpu_threads = int(omp_env)
+            _thread_src = "OMP_NUM_THREADS"
+    if _cpu_threads <= 0 and args.device == "cuda":
+        # P4: nothing specified on a CUDA run — apply the measured quota-safe
+        # default (32) instead of leaving torch at the host's physical-core count
+        # (~192 on the pod). The pod's ~40-vCPU cgroup quota then ~4.7x
+        # oversubscribes that, and the memory-bandwidth-bound _concat_batches copy
+        # ran ~5x slower (36s@192 vs 6.9s@32, profiled 2026-07-08). min() keeps a
+        # smaller CUDA box sane. Override via --cpu-threads / OMP_NUM_THREADS /
+        # runs/threads.txt. Thread count changes no training numbers; CPU-only
+        # runs are left alone (their compute IS on the CPU pool).
+        _cpu_threads = min(32, os.cpu_count() or 32)
+        _thread_src = "cuda default (P4)"
+    if _cpu_threads > 0:
+        torch.set_num_threads(_cpu_threads)
+    current_threads = torch.get_num_threads()
+    print(
+        f"[threads] initial torch threads = {current_threads}"
+        + (f" (via {_thread_src})" if _thread_src else "")
+    )
+    if args.device == "cuda" and current_threads > 64:
+        print(
+            f"[threads] WARNING: {current_threads} torch threads on a CUDA run "
+            "oversubscribes the pod's ~40-vCPU quota; the host-side rollout + "
+            "_concat_batches copy is memory-bandwidth-bound and ~5x slower wide. "
+            "Pass --cpu-threads 32 (or edit runs/threads.txt) unless deliberate."
+        )
+
+    # P12: cap the Rust engine's rayon pool (opp-outcome MC + obs encoder). Rayon
+    # reads RAYON_NUM_THREADS lazily at its first par_iter (the first rollout,
+    # after this startup), so setting it here takes effect; Python os.environ
+    # writes reach Rust's std::env in-process. Default 0 leaves rayon's default /
+    # any pre-set env untouched (byte-identical). Thread count changes no training
+    # numbers (per-env deterministic outcome_seed + disjoint-row par writes).
+    # UNMEASURED — A/B 32/40/48 vs unset on a throwaway run before trusting one.
+    if int(args.rayon_threads or 0) > 0:
+        os.environ["RAYON_NUM_THREADS"] = str(int(args.rayon_threads))
+        print(
+            f"[threads] rayon threads -> {int(args.rayon_threads)} "
+            "(via --rayon-threads)"
+        )
+    else:
+        _rayon_env = os.environ.get("RAYON_NUM_THREADS", "").strip()
+        print(
+            "[threads] rayon threads = "
+            + (
+                f"{_rayon_env} (via RAYON_NUM_THREADS env)"
+                if _rayon_env.isdigit()
+                else "default (~host logical cores)"
+            )
+        )
+
+    # P13: disable torch.distributions argument/support validation process-wide.
+    # Each Categorical/Beta construct + log_prob otherwise runs constraint checks
+    # ending in `.all()` -> bool() on a CUDA tensor = a forced stream sync; ~7-9
+    # per act() x ~50-100k act() calls/update land on the CPU-bound collection
+    # path (GPU ~86% idle). Validation is read-only, so outputs/samples/RNG are
+    # byte-identical (the test suite keeps validation ON and still passes). A NaN
+    # logit, formerly caught here, now surfaces at the policy/value-loss NaN
+    # asserts a few lines downstream.
+    torch.distributions.Distribution.set_default_validate_args(False)
 
     seats_choices = _parse_seats_range(args.num_seats_range)
     stack_lo, stack_hi = _parse_stack_range(args.stack_range)
@@ -969,7 +1319,7 @@ def main() -> None:
         ppo_epochs=args.ppo_epochs,
         seed=args.seed,
         snapshot_every=args.snapshot_every,
-        ev_runout_samples=EV_RUNOUT_SAMPLES,
+        ev_runout_samples=args.ev_runout_samples,
         pool_mix_prob=args.pool_mix_prob,
         pool_opp_seats=args.pool_opp_seats,
         entropy_coef=args.entropy_coef,
@@ -983,17 +1333,44 @@ def main() -> None:
         kl_hard=args.kl_hard,
         sizing_entropy_scale=args.sizing_entropy_scale,
         adv_clip=args.adv_clip,
+        value_clip=args.value_clip,
+        q_aux_coef=args.q_aux_coef,
+        q_pooled=args.q_pooled,
+        q_fold_sup_coef=args.q_fold_sup_coef,
+        advantage_estimator=args.advantage_estimator,
+        torso_layernorm=args.torso_norm,
+        l2_init_coef=args.l2_init_coef,
+        adam_b2=args.adam_b2,
+        agc_clip=args.agc_clip,
+        grad_checkpoint=args.grad_checkpoint,
+        value_bins=args.value_bins,
+        value_support=args.value_support,
+        value_hlgauss_sigma=args.value_hlgauss_sigma,
+        value_loss_coef=args.value_loss_coef,
+        clip_prob_dependent=args.clip_prob_dependent,
+        clip_room_ext=args.clip_room_ext,
+        clip_room_mid=args.clip_room_mid,
+        clip_prob_floor=args.clip_prob_floor,
         device=args.device,
     )
 
-    model_cls = ActorCriticV4 if args.sizing_head == "logistic" else ActorCriticV2
     obs_dim = OBS_DIM_NLH if is_nlh else OBS_DIM
     anchor_spec = NLH_ANCHOR_SPEC if is_nlh else PLO_ANCHOR_SPEC
+    head_kwargs: dict = {}
+    if args.sizing_head == "mixture":
+        model_cls = ActorCriticV5
+        head_kwargs["mixture_k"] = int(args.mixture_k)
+    elif args.sizing_head == "logistic":
+        model_cls = ActorCriticV4
+    else:
+        model_cls = ActorCriticV2
     model = model_cls(
         hidden_dim=train_cfg.hidden_dim,
         num_layers=train_cfg.num_layers,
         obs_dim=obs_dim,
         anchor_spec=anchor_spec,
+        torso_layernorm=train_cfg.torso_layernorm,
+        **head_kwargs,
     )
     print(
         f"[head] sizing-head={args.sizing_head} "
@@ -1001,10 +1378,42 @@ def main() -> None:
         f"obs_dim={obs_dim} anchors={anchor_spec.count} ({anchor_spec.name})"
     )
     model.to(train_cfg.device)
+    # v5 stems build the critic WITH the dueling Q head from day one
+    # (zero-init; Q == V until --q-aux-coef trains it) so the VRPO
+    # advantage flip later is a code change, not a checkpoint break.
+    # --q-pooled collapses the per-anchor raise columns to one (audit
+    # 2026-07-09: 11 starving columns dominated the VRPO noise).
+    if args.sizing_head == "mixture":
+        critic_q_actions = 3 if args.q_pooled else 2 + anchor_spec.count
+    else:
+        critic_q_actions = 0
+    if args.torso_norm and args.l2_init_coef <= 0.0:
+        print(
+            "[warn] --torso-norm without --l2-init-coef>0: LayerNorm-solo can "
+            "hurt generalization (Nauman 2024). Strongly consider a companion, "
+            "e.g. --l2-init-coef 1e-4."
+        )
+    if args.advantage_estimator == "vrpo":
+        if critic_q_actions <= 0:
+            raise SystemExit(
+                "error: --advantage-estimator vrpo requires --sizing-head "
+                "mixture (it reads the critic's dueling Q head)."
+            )
+        if args.q_aux_coef <= 0.0:
+            raise SystemExit(
+                "error: --advantage-estimator vrpo requires --q-aux-coef > 0 "
+                "so the Q head is trained first; at the untrained head the flip "
+                "is identical to GAE (V5_DESIGN.md W2.5)."
+            )
     critic = CentralCritic(
         obs_dim=obs_dim,
         hidden_dim=train_cfg.critic_hidden_dim,
         num_blocks=train_cfg.critic_num_blocks,
+        q_actions=critic_q_actions,
+        torso_layernorm=train_cfg.torso_layernorm,
+        value_bins=train_cfg.value_bins,
+        value_support=train_cfg.value_support,
+        hlgauss_sigma=train_cfg.value_hlgauss_sigma,
     )
     critic.to(train_cfg.device)
     print(f"[device] learner on {train_cfg.device}")
@@ -1076,7 +1485,33 @@ def main() -> None:
                 "This checkpoint was trained with a different gate-head width and cannot be warm-started."
             )
         model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt)
-        critic.load_state_dict(ckpt["critic"])
+        crit_sd = ckpt["critic"]
+        ck_adv = crit_sd.get("adv_head.weight")
+        if (
+            critic.q_actions > 0
+            and ck_adv is not None
+            and tuple(ck_adv.shape) != tuple(critic.adv_head.weight.shape)
+        ):
+            # Dueling-head width changed (e.g. --q-pooled 13->3): keep the
+            # torso + value head, drop the old adv_head — it re-enters at
+            # zero-init, so Q == V and the VRPO advantage is exactly GAE
+            # until the (pooled) head retrains. Everything else is strict.
+            crit_sd = {
+                k: v for k, v in crit_sd.items()
+                if not k.startswith("adv_head.")
+            }
+            missing, unexpected = critic.load_state_dict(crit_sd, strict=False)
+            assert not unexpected, f"unexpected critic keys: {unexpected}"
+            assert all(k.startswith("adv_head.") for k in missing), (
+                f"non-adv_head keys missing from checkpoint critic: {missing}"
+            )
+            print(
+                f"[q-pooled] checkpoint adv_head {tuple(ck_adv.shape)} != "
+                f"built {tuple(critic.adv_head.weight.shape)} — dropped; "
+                "fresh zero-init head (Q==V; VRPO==GAE until retrained)"
+            )
+        else:
+            critic.load_state_dict(crit_sd)
         prior_game = ckpt.get("game_config")
         print(f"warm-started from {args.load_checkpoint} (prior game_config: {prior_game})")
         restored_update = ckpt.get("update_counter")
@@ -1130,7 +1565,15 @@ def main() -> None:
         )
 
     trainer = PPOTrainer(model, train_cfg, critic=critic)
-    pool = OpponentPool(capacity=train_cfg.opponent_pool_size)
+    # KL-anchor EMA magnet persistence: restore the reference from the
+    # checkpoint so the pull-toward-history survives relaunches (absent
+    # the key it re-initializes to the loaded weights and ramps in).
+    if args.load_checkpoint is not None and trainer._ref is not None:
+        ema_sd = ckpt.get("model_ema")
+        if ema_sd:
+            trainer.load_ref_state_dict(ema_sd)
+            print("[kl-anchor] restored EMA reference from checkpoint")
+    pool = OpponentPool(capacity=train_cfg.opponent_pool_size, seed=args.seed)
     rng = np.random.default_rng(args.seed)
 
     # Warm-start pool reconstruction: refill the (ephemeral) opponent
@@ -1225,6 +1668,28 @@ def main() -> None:
         global_idx = base_update + update_idx
         game_cfg_snap = sampled_game_cfg.__dict__
         mid_path = args.checkpoint.with_name(f"{args.checkpoint.stem}_{global_idx}.pt")
+        if (
+            args.load_checkpoint is not None
+            and mid_path.resolve() == Path(args.load_checkpoint).resolve()
+        ):
+            # C3 (narrowed after adversarial review): never overwrite THE
+            # checkpoint this run warm-started from. An anneal-ON resume
+            # continues the loop counter from the restored update, so its first
+            # iteration lands back on the loaded file's own grid index — saving
+            # would rewrite the exact restore point just loaded with weights
+            # carrying one extra PPO update (either cadence branch can fire),
+            # destroying the clean-recovery file the collapse playbook depends
+            # on. Skip; the next cadence tick writes a fresh number. Guarding
+            # ONLY the loaded file (not blanket write-once) preserves
+            # last-write-wins for every legitimate collision: orchestrations
+            # that re-run a phase from a fixed source must refresh their
+            # outputs, and an anneal-ON resume must checkpoint its new lineage
+            # over the old segment's later files.
+            print(
+                f"[ckpt] skip: {mid_path.name} is this run's warm-start source "
+                "(never overwritten)"
+            )
+            return
         mid_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
@@ -1244,6 +1709,18 @@ def main() -> None:
                 "anneal_tier_ent": tier_ent,
                 "anneal_baseline": tier_baseline,
                 "anneal_block_acc": block_acc,
+                # Truthful regimen stamp under --mix-configs (game_config
+                # above is just the first sub-rollout's draw — B9).
+                "mix_configs": bool(args.mix_configs),
+                "mix_tiers": list(mix_tiers) if args.mix_configs else None,
+                "configs_per_tier": (
+                    int(args.configs_per_tier) if args.mix_configs else None
+                ),
+                # KL-anchor EMA reference (None when the magnet is off);
+                # restored on warm-start so the pull-toward-history
+                # survives relaunches. Doubles as the smoother serving
+                # actor (promote model_ema instead of the last iterate).
+                "model_ema": trainer.ref_state_dict(),
             },
             mid_path,
         )
@@ -1299,11 +1776,12 @@ def main() -> None:
         if stop_requested["flag"]:
             break
 
-        # Live thread-count adjustment: edit runs/threads.txt to
-        # change torch's intra-op threadpool without restarting the
-        # run. Malformed reads are ignored. CUDA runs skip this —
-        # set_num_threads is a CPU-pool concept.
-        if train_cfg.device == "cpu" and threads_file.exists():
+        # Live thread-count adjustment: edit runs/threads.txt to change
+        # torch's intra-op threadpool without restarting the run. Malformed
+        # reads are ignored. Applies on CUDA too — the whole rollout +
+        # _concat_batches copy is CPU-side even when the learner is on GPU
+        # (8becc82 de-gated it; the cap matters MOST on CUDA).
+        if threads_file.exists():
             try:
                 desired = int(threads_file.read_text().strip())
                 if desired > 0 and desired != current_threads:
@@ -1328,6 +1806,8 @@ def main() -> None:
                 control_raw = anneal_control_file.read_text()
             except OSError:
                 control_raw = None
+            _prev_live_ent = live_entropy_coef
+            _pre_tier_ent = dict(tier_ent)
             (
                 live_anneal_step,
                 last_anneal_control,
@@ -1339,6 +1819,26 @@ def main() -> None:
                 live_lr, live_entropy_coef, live_entropy_coef_deep,
                 trainer=trainer,
             )
+            # Mix-configs consumes tier_ent (per-row coefs), not
+            # live_entropy_coef — an `entropy_coef` control edit used to be
+            # a silent no-op here (V5_DESIGN.md B5). Broadcast it to every
+            # tier so the natural key works in both modes, but SKIP any
+            # tier an explicit `tier_ent` edit changed in this SAME write
+            # (that override wins — otherwise a combined
+            # {"tier_ent":{"deep":X},"entropy_coef":Y} write would clobber
+            # deep with Y). Order-independent: `_pre_tier_ent` is the
+            # pre-call snapshot, so a tier changed by tier_ent this pass
+            # differs from it and is left alone.
+            if args.mix_configs and live_entropy_coef != _prev_live_ent:
+                for _t in tier_ent:
+                    if tier_ent[_t] != _pre_tier_ent[_t]:
+                        continue  # explicit tier_ent edit this write — keep it
+                    if tier_ent[_t] != live_entropy_coef:
+                        print(
+                            f"[anneal-control] tier_ent[{_t}] {tier_ent[_t]} "
+                            f"-> {live_entropy_coef} (entropy_coef broadcast)"
+                        )
+                    tier_ent[_t] = live_entropy_coef
 
         if args.mix_configs:
             # vThree: every update mixes `configs_per_tier` (seats,stacks) draws
@@ -1350,6 +1850,11 @@ def main() -> None:
                     stack_dist=tier, seats_dist=args.seats_dist,
                     variant=args.variant, sb=args.sb,
                 )[0]
+                for tier in mix_tiers
+                for _ in range(args.configs_per_tier)
+            ]
+            mix_cfg_tiers = [
+                tier
                 for tier in mix_tiers
                 for _ in range(args.configs_per_tier)
             ]
@@ -1372,7 +1877,7 @@ def main() -> None:
                 stack_dist=active_tier, seats_dist=args.seats_dist,
                 variant=args.variant, sb=args.sb,
             )
-        _profile_this = args.profile_one_update and update == 0
+        _profile_this = args.profile_one_update and update == args.profile_at_update
         _prof = None
         if _profile_this:
             _prof = torch.profiler.profile(
@@ -1386,11 +1891,15 @@ def main() -> None:
             _prof.__enter__()
 
         if args.mix_configs:
+            # Per-tier coefs ride the batch as per-row ent_coef_rows
+            # (V5_DESIGN.md B5): each tier's transitions are paid that
+            # tier's own rate, so `{"tier_ent": {"deep": X}}` control
+            # edits now genuinely apply under mixing. The scalar below is
+            # only the ppo fallback + the log-line display value.
             batch = collect_rollout_multiconfig(
-                model, pool, mix_cfgs, train_cfg, rng, critic=critic
+                model, pool, mix_cfgs, train_cfg, rng, critic=critic,
+                config_tiers=mix_cfg_tiers, tier_ent=tier_ent,
             )
-            # One coef for the mixed update (all mix tiers seeded equal);
-            # live-tunable via anneal_control {"tier_ent": {...}}.
             update_entropy_coef = tier_ent.get(mix_tiers[0], args.entropy_coef)
         elif blocks:
             batch = collector(model, pool, sampled_game_cfg, train_cfg, rng, critic=critic)
@@ -1407,9 +1916,14 @@ def main() -> None:
         # Cold-start LR warmup: small early steps keep per-minibatch KL
         # inside the guard's trust region, so all minibatches apply and
         # the critic actually trains (a tripped update aborts the critic
-        # too — huge advantages then keep the next step violent). Uses
-        # the GLOBAL update index, so warm restarts past the window run
-        # at full LR from the first update.
+        # too — huge advantages then keep the next step violent). Counter
+        # semantics (see base_update above): with --anneal-entropy the
+        # loop counter continues from the checkpoint, so a resumed run
+        # past the window is at full LR immediately; anneal-off relaunches
+        # reset the loop counter and DELIBERATELY re-run the warmup ramp
+        # (gentle-restart semantics — every vFour collapse recovery relied
+        # on it). Checkpoint names/counters stay on the global axis either
+        # way via base_update.
         lr_scale = _lr_warmup_scale(update, args.lr_warmup_updates)
         for _pg in trainer.optimizer.param_groups:
             _pg["lr"] = live_lr * lr_scale
@@ -1441,12 +1955,15 @@ def main() -> None:
 
         if _prof is not None:
             _prof.__exit__(None, None, None)
-            trace_path = Path("runs/profile_update0.json")
+            trace_path = Path(f"runs/profile_update{update}.json")
             trace_path.parent.mkdir(parents=True, exist_ok=True)
             _prof.export_chrome_trace(str(trace_path))
-            print(_prof.key_averages().table(
-                sort_by="self_cuda_time_total", row_limit=40
-            ))
+            _ka = _prof.key_averages()
+            _tag = "(post-compile)" if update > 0 else "(incl. one-time compile)"
+            print(f"\n===== profiled update {update} {_tag} — SELF CUDA =====")
+            print(_ka.table(sort_by="self_cuda_time_total", row_limit=40))
+            print(f"\n===== profiled update {update} {_tag} — SELF CPU =====")
+            print(_ka.table(sort_by="self_cpu_time_total", row_limit=40))
             print(f"[profile] chrome trace -> {trace_path}")
             stop_requested["flag"] = True
 
@@ -1478,6 +1995,7 @@ def main() -> None:
                 f"klG/klA/klB={stats.gate_kl:+.3f}/{stats.anchor_kl:+.3f}/"
                 f"{stats.beta_kl:+.3f}  "
                 + (f"klanc={stats.kl_anchor:.4f}  " if args.kl_anchor_coef > 0 else "")
+                + (f"q={stats.q_loss:.4f}  " if args.q_aux_coef > 0 else "")
                 + (
                     (
                         f"KLROLLBACK@mb{stats.kl_stopped_at}"
@@ -1498,6 +2016,35 @@ def main() -> None:
                 + (f"  lr×{lr_scale:.2f}" if lr_scale < 1.0 else "")
                 + (f"  block={block_idx + 1}/{len(blocks)}({active_tier})" if blocks else "")
             )
+            # Per-tier F/T/R under mix-configs (V5_DESIGN.md B5): the
+            # pooled line above can't drive the per-tier stop-loss; this
+            # one can. Same semantics as bonus%(F/T/R), bucketed by tier.
+            if getattr(batch, "tier_ftr", None):
+                parts = []
+                for _t, (_bonus, _steps) in batch.tier_ftr.items():
+                    f_, t_, r_ = (
+                        100.0 * _bonus[s] / max(1, _steps[s]) for s in range(3)
+                    )
+                    parts.append(
+                        f"{_t}={f_:4.1f}/{t_:4.1f}/{r_:4.1f}"
+                        f"(ent {tier_ent.get(_t, update_entropy_coef):.3f})"
+                    )
+                print("        [ftr-tier] " + "  ".join(parts))
+
+            # P11 measurement: peak GPU memory over this log window. `del batch`
+            # (below) frees the prior update's batch before the next collection
+            # allocates its own, removing the collect-end 2x-batch spike; this
+            # line shows where the true per-update peak now lands so the rollout
+            # can be grown to fit. Bit-exact — reporting only.
+            if args.device == "cuda":
+                _peak_alloc = torch.cuda.max_memory_allocated() / (1024 ** 3)
+                _peak_resv = torch.cuda.max_memory_reserved() / (1024 ** 3)
+                print(
+                    f"        [vram] peak alloc={_peak_alloc:.1f} GiB  "
+                    f"reserved={_peak_resv:.1f} GiB  "
+                    f"(rollout={batch.obs.shape[0]:,} rows)"
+                )
+                torch.cuda.reset_peak_memory_stats()
 
         # End-of-block entropy anneal: this tier's 50-update block just finished.
         if blocks and args.anneal_entropy and (update + 1) % args.block_size == 0:
@@ -1540,6 +2087,16 @@ def main() -> None:
                 )
             block_acc = {"bonus_steps": [0, 0, 0], "steps": [0, 0, 0], "tier": None}
 
+        # P11: drop this update's ~45GB batch (all fields on CUDA) now that its
+        # last reads (the log/anneal blocks above) are done. Python otherwise
+        # keeps `batch` bound until the next iteration's `batch = collect_...`
+        # RHS finishes — i.e. through the whole next collection — so the old and
+        # new batches sit co-resident (the 2x-batch VRAM peak = the measured
+        # 78GiB@10M ceiling). Freeing here lets the caching allocator reuse the
+        # blocks for the next collection. Bit-exact: nothing reads `batch` after
+        # this point (the final save uses model/critic only).
+        del batch
+
         update += 1
 
     args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
@@ -1558,6 +2115,12 @@ def main() -> None:
             "anneal_tier_ent": tier_ent,
             "anneal_baseline": tier_baseline,
             "anneal_block_acc": block_acc,
+            "mix_configs": bool(args.mix_configs),
+            "mix_tiers": list(mix_tiers) if args.mix_configs else None,
+            "configs_per_tier": (
+                int(args.configs_per_tier) if args.mix_configs else None
+            ),
+            "model_ema": trainer.ref_state_dict(),
         },
         args.checkpoint,
     )

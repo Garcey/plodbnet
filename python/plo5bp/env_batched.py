@@ -73,18 +73,16 @@ class BatchedBombPotEnv:
         # passes a lower count for speed. See rollout.TRAIN_OPP_OUTCOME_MC.
         # NLH ignores it (its 3-dim opp-outcome block is exhaustive).
         self._opp_outcome_mc = int(opp_outcome_mc)
-        # Default-off switch for the Rust observation encoder. When set, the
-        # finished obs comes straight from the engine (one FFI call, no numpy
-        # assembly); otherwise the numpy `encode_observation_batch` reference
-        # path runs. Bit-exact equivalent (test_encoding_batch.py); the switch
-        # exists so a bit-mismatch surfacing in a long run can be reverted
-        # instantly with `PLO5_RUST_ENCODER=0` and a restart — no rebuild.
-        # Falls back to numpy if the rebuilt engine lacks the method.
-        # PLO-only: the Rust encoder implements the 991-dim PLO layout
-        # (the engine refuses it for NLH), so NLH always encodes in numpy.
+        # The Rust observation encoder (PLO5_RUST_ENCODER, default-off) now
+        # implements the full obs-v2 1020-dim PLO layout (per-board outcome,
+        # blockers, effective price, log1p SPR — ported 2026-07-08; bit-exact
+        # 3-way parity vs numpy+scalar pinned in test_encoding_rust.py). It is
+        # env-gated and DEFAULT-OFF so the numpy encoder stays the fallback;
+        # opt a run in via PLO5_RUST_ENCODER=1 (the rollout then skips the
+        # numpy assembly, ~its 22% of update CPU). NLH keeps numpy — the Rust
+        # encoder path is PLO-only.
         self._use_rust_encoder = (
             bool(int(os.environ.get("PLO5_RUST_ENCODER", "0")))
-            and hasattr(BatchedEngine, "observation_encoded_batch")
             and not self._is_nlh
         )
         stacks = np.asarray(self.config.resolved_stacks, dtype=np.uint64)

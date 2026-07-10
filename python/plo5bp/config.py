@@ -131,6 +131,100 @@ class TrainingConfig:
     # the other.
     retroactive_bonus_c: float = 0.0
 
+    # Auxiliary Q(s, a) regression coefficient for the critic's dueling
+    # head (v5 stems; head exists zero-init regardless so the VRPO
+    # advantage flip is not a checkpoint break). 0 = untrained.
+    q_aux_coef: float = 0.0
+
+    # Pool the dueling head's per-anchor raise columns into ONE raise
+    # column (q_actions = 3: Fold/CheckCall/Raise, instead of 2+anchors).
+    # 2026-07-09 Q-head audit: the 11 anchor columns each saw ~3% of the
+    # rows and dominated the VRPO advantage noise (per-node |E_π[Q]−V|
+    # p95 30-60bb at deep tiers); pooling gives the raise column 11× the
+    # training density. The Q baseline's job is variance reduction —
+    # size-specific credit still arrives through the reward trace.
+    # Consumers (ppo q_idx, rollout marginal, UI loader) key off the Q
+    # tensor's WIDTH, so 13-column checkpoints keep loading unchanged;
+    # a warm-start across widths drops adv_head to fresh zero-init.
+    q_pooled: bool = False
+
+    # Dense supervision on the fold column: fold's forward return is
+    # EXACTLY 0 under the reward convention (per-step costs, sunk chips
+    # excluded, a folder wins nothing), so q[..., FOLD] regresses to 0
+    # on EVERY fold-legal row — free perfect labels on all facing-a-bet
+    # rows, not just the ~third where fold was taken. Anchors the head's
+    # hardest sub-task (A_fold ≡ −V). Relative weight vs the taken-action
+    # MSE inside the q_aux term; 0 = off.
+    q_fold_sup_coef: float = 0.0
+
+    # Advantage estimator (V5_DESIGN.md W2.5; VRPO, Fan & Farina 2026).
+    #   "gae"  = V-based GAE(λ) (default; the pre-VRPO path, unchanged).
+    #   "vrpo" = Expected-SARSA(λ) off the centralized dueling Q head:
+    #            δ⁺ = r + γ·V^π(s') − Q(s,a), V^π(s') = Σ_a π(a|s')·Q(s',a),
+    #            which analytically averages out the future-action-sampling
+    #            variance GAE carries at mixed nodes. Requires the critic Q
+    #            head AND q_aux_coef>0 (the head must be trained first). At the
+    #            zero-init Q head Q≡V, so it reduces byte-exactly to GAE.
+    #            `returns` (value-head target) stay GAE-based. Batched collector
+    #            only (the training path); the serial collector rejects it.
+    advantage_estimator: str = "gae"
+
+    # v6 plasticity (V6_RESEARCH.md #4). `torso_layernorm` inserts pre-activation
+    # LayerNorm into the residual torso of BOTH the actor and the critic
+    # (x + ReLU(Linear(LayerNorm(x)))) to fight plasticity loss over long runs;
+    # NOT function-preserving → fresh stem, num_layers>=3 only. `l2_init_coef` is
+    # the REQUIRED companion: an L2-to-init penalty on the TRUNK weight matrices
+    # that keeps weight-norm (hence effective LR) from decaying and counters the
+    # generalization hit of norm-solo (Nauman 2024). Both default off = byte-
+    # identical to pre-v6.
+    torso_layernorm: bool = False
+    l2_init_coef: float = 0.0
+
+    # Optimizer hygiene (V6_RESEARCH.md internals). adam_b2 = AdamW's second-
+    # moment β2 (sweep {0.98,0.99,0.999} against heavy-tailed policy-ratio
+    # spikes; 0.999 = the current default). agc_clip = stateless adaptive
+    # gradient clipping coefficient: per-tensor, clip each param's grad to
+    # agc_clip*||param|| (NFNet AGC) — a per-tensor complement to the existing
+    # per-group split clip; 0 = off, no running state (kl_hard-rollback-safe).
+    adam_b2: float = 0.999
+    agc_clip: float = 0.0
+
+    # v6 probability-dependent PPO clip (Over-mixing §6; a generalization of
+    # DAPO "Clip-Higher"). When True, the GATE's clip band widens for RARE gate
+    # actions and narrows near 50/50, keyed on the sampled gate's OLD probability
+    # p, so a suppressed-but-correct gate (e.g. a check that should recover)
+    # climbs in a few updates instead of ~25 (the multiplicative clip freezes it
+    # at 1.2× of a tiny base), while genuinely-mixed nodes take smaller, less-
+    # thrashy steps. The band is set by a target ABSOLUTE probability-movement
+    # room R(p) shaped as a symmetric U in p:
+    #     R(p) = clip_room_ext − (clip_room_ext − clip_room_mid)·4p(1−p)
+    # and the per-sample ratio band is [1 − R/p, 1 + R/p] (p floored by
+    # clip_prob_floor, capping the max ratio at ~1 + clip_room_ext/floor).
+    # Defaults 0.10 / 0.05 give ~10 points of room at the extremes and ~5 at the
+    # middle. Scoped to the GATE (uses old_gate_logp) so the parametric sizing
+    # menu is NOT over-loosened. clip_prob_dependent=False → the flat cfg.clip
+    # band, byte-identical to pre-v6.
+    clip_prob_dependent: bool = False
+    clip_room_ext: float = 0.10
+    clip_room_mid: float = 0.05
+    clip_prob_floor: float = 1e-3
+
+    # Gradient checkpointing (V6 internals): recompute torso activations in
+    # backward instead of storing them — identical math, trades compute for
+    # memory to buy back rollout headroom (the K=3 head OOM'd 11M→9M). Runtime
+    # flag on the trainable model+critic only; rollout is no-grad (unaffected).
+    grad_checkpoint: bool = False
+
+    # Distributional / HL-Gauss critic value head (V6 internals, the keystone).
+    # value_bins > 0 replaces the scalar critic value head with a categorical
+    # head over a symlog-transformed support (±value_support bb), trained with
+    # HL-Gauss cross-entropy (Gaussian σ = value_hlgauss_sigma bin-widths; →0 =
+    # hard two-hot). V = symexp(E[bins]) stays scalar (dueling Q + serving
+    # unchanged). 0 = scalar MSE head (default, byte-identical to pre-v6).
+    value_bins: int = 0
+    value_support: float = 1500.0
+    value_hlgauss_sigma: float = 0.75
+
     # v2 (anchor head + centralized critic) hyperparameters. Ignored on
     # v1 runs — the critic is only built when train.py constructs one.
     critic_hidden_dim: int = 1536
@@ -139,6 +233,11 @@ class TrainingConfig:
     # when a CentralCritic owns the GAE values. Plain regression, no
     # clipping; small so it stays subordinate to the policy loss.
     display_value_coef: float = 0.125
+    # Weight on the centralized critic's value loss in the total loss. 0.5 = the
+    # historical hardcoded value. Exposed for the distributional head (HL-Gauss
+    # cross-entropy has a different magnitude than the old MSE, so the weight
+    # needs re-tuning) and for the "critic-weight lift" A/B.
+    value_loss_coef: float = 0.5
     # KL-to-EMA-reference regularizer. 0.0 = off (no EMA model built).
     # The reference re-initializes to current weights on every (re)start
     # — it is NOT persisted in checkpoints.

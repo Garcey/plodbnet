@@ -225,6 +225,9 @@ def test_v2_session_payload_schema(trainer_factory):
     assert cur["head_version"] == 2
     assert isinstance(cur["anchors"], list) and cur["anchors"]
     for row in cur["anchors"]:
-        assert set(row) == {"k", "label", "prob", "chips", "chips_bb"}
+        # "frac" added 2026-07-09: the client's bet-size chart needs the
+        # anchor's pot-fraction to pick the chips-space axis (idxMode
+        # otherwise) — mirrors the study payload's anchor rows.
+        assert set(row) == {"k", "label", "prob", "chips", "chips_bb", "frac"}
     assert cur["rec_anchor"] is not None
     assert cur["beta_alpha"] >= 1.0 and cur["beta_beta"] >= 1.0

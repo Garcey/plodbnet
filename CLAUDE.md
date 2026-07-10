@@ -67,9 +67,70 @@ There is no scenario in this project where 128×2 is the right
 architecture; if a flag is missing, add it. The same rule applies to
 `launch_vtwo.sh` (it hardcodes 2048×4).
 
-`scripts/train.py` is **v2-only** (anchor sizing head + centralized
-critic, `head_version: 2` checkpoints; the critic's state rides in the
-checkpoint under `"critic"`). It refuses to warm-start v1 checkpoints.
+`scripts/train.py` is **v2-family-only** (centralized critic; the
+critic's state rides in the checkpoint under `"critic"`). It refuses to
+warm-start v1 checkpoints, and head families are strict: `--sizing-head
+anchor` = v2 (head_version 2), `logistic` = v4 (3), `mixture` = v5 (4).
+
+### v5 (2026-07-06, IMPLEMENTED, not yet trained — V5_DESIGN.md canonical)
+
+- **Head**: `--sizing-head mixture` (+ `--mixture-k`, default 3) =
+  `ActorCriticV5`, tensor `mix_head` (3K rows: K mu_raw, K s_raw, K mix
+  logits) — K-component mixture of discretized logistics over the same
+  11 anchors. The marginal is a plain Categorical → exact closed-form
+  log-prob/entropy; act/evaluate/PPO/UI inherit through `_anchor_dist`
+  unchanged. ε weight floor 0.03 is a FIXED constant (not a flag — it
+  isn't in the state dict, so serving must match training). NO H(w)
+  bonus (v2 flat-collapse analog). v5 also detaches the anchor-prob
+  weight in `beta_h_eff` (kills the verified end-anchor entropy
+  subsidy); v2/v4 keep legacy behavior for byte-identical resumes.
+- **Obs v2**: OBS_DIM 991 → **1020**, pure tail append: per-board
+  ahead/tie/behind + win-one/tie-both (8, free counters inside the fused
+  Rust `outcome_features_mc` pass), unconditional blockers-to-nuts (8),
+  effective-price block (5, capped by the EFFECTIVE stack — dead-chip
+  invariance), log1p SPR (8, unclipped — the legacy [0,4] clip saturated
+  the whole deep tier at the flop). 991-era checkpoints serve via the
+  `downgrade_obs_to_v2` slice; the **Rust obs encoder is force-disabled**
+  (predates the layout; PLO5_RUST_ENCODER=1 prints a notice and uses
+  numpy — port it and re-pin test_encoding_rust.py before re-enabling).
+- **Warm-start v4→v5**: `scripts/convert_v4_to_v5.py <v4.pt> <out.pt>` —
+  component 0 = the v4 head (w₀≈0.92), zero-pads obs columns on actor AND
+  critic, adds the zero-init critic `adv_head`, strips anneal/counter/
+  pool metadata; function-preservation verified in-script (f32 kernel
+  noise allowance). Convert pool siblings with the same script if
+  prior-pool seeding is wanted. The head/variant guards stay strict —
+  the converter is the only v4→v5 bridge.
+- **Q-aux**: mixture runs build the critic WITH the zero-init dueling
+  `adv_head` (q_actions = 2 + anchors) so the later VRPO advantage flip
+  is not a checkpoint break; `--q-aux-coef` (default 0) trains it as an
+  auxiliary regression (log column `q=`).
+- **KL-anchor magnet is usable now**: the v4/v5 crash in
+  `_kl_to_reference` is fixed (head-agnostic `_anchor_dist`, manual KL
+  over probs, p_raise detached), and the EMA reference persists as
+  `ckpt["model_ema"]` (restored on warm-start).
+- **EMA serving** (`PLO5BP_SERVE_EMA=1`): the UI/study path serves the
+  `model_ema` actor (smoother, less exploitable — what a study tool
+  wants) instead of the last iterate. Env-gated, reversible, falls back
+  to the last iterate when the key is absent/None (magnet-off runs). The
+  critic is never EMA'd.
+- **`--ev-runout-samples`** (default 64, unchanged): MC runout samples
+  for the terminal-reward EV. Measured 64→256 ≈ +23% of ROLLOUT
+  wall-clock on CPU (a few % of a full pod update); left at 64 by
+  default since the extra variance reduction is marginal — opt in per run.
+- **Per-tier control under --mix-configs**: sub-rollouts attach per-row
+  entropy coefs (`Batch.ent_coef_rows`) so `{"tier_ent": {...}}` control
+  edits genuinely apply per tier; `{"entropy_coef": X}` broadcasts to all
+  tiers in mix mode (was a silent no-op); per-tier F/T/R prints as
+  `[ftr-tier]` per log line; checkpoints stamp `mix_configs`/`mix_tiers`/
+  `configs_per_tier`.
+- `--value-clip` exposed (default 0.2 RAW bb — see V5_DESIGN.md B4; A/B
+  on a throwaway stem before changing production). `OpponentPool` serial
+  sampling is seeded (`seed=` arg; train.py passes the run seed).
+- v5 entropy seeds are UNTUNED — the stem re-seeds high (~0.45), never
+  at an annealed floor (anneal is one-way down). UI serves v5
+  automatically (sniffs `mix_head.weight`); recommendations gain a
+  `mixture` payload block (per-component mu/s/w).
+
 v2 specifics:
 
 - Sizing head: 11 pot-fraction anchors (0=min,10%,…,100%=pot) with

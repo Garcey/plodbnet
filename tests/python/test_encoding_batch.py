@@ -177,3 +177,18 @@ def test_encoder_batch_terminal_row_is_zero() -> None:
     vec = encode_observation_batch(obs_arrays, cat, cat, config)
     assert vec.shape == (n, OBS_DIM)
     assert not vec.any()
+
+
+def test_env_batched_rust_encoder_opt_in(monkeypatch):
+    """PLO5_RUST_ENCODER=1 ENABLES the Rust obs encoder for PLO now that the
+    obs-v2 tail (OBS_DIM 1020) is ported bit-exact (3-way parity in
+    test_encoding_rust.py). Default-off so the numpy encoder stays the
+    fallback; NLH keeps numpy (`and not self._is_nlh` in env_batched)."""
+    import plo5bp.env_batched as eb
+    from plo5bp.config import GameConfig
+
+    # Default (flag unset): numpy encoder.
+    assert eb.BatchedBombPotEnv(2, GameConfig(num_seats=2))._use_rust_encoder is False
+    # Opt in: Rust encoder for PLO.
+    monkeypatch.setenv("PLO5_RUST_ENCODER", "1")
+    assert eb.BatchedBombPotEnv(2, GameConfig(num_seats=2))._use_rust_encoder is True
