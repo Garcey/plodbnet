@@ -588,8 +588,13 @@ combo-dominance density by design, §3.1.)
   checkpoint (pending user sign-off; cold fallback). Entropy seeds: do NOT
   cold-start at W1's annealed floors — re-seed near 0.45 and re-anneal (the
   one-way-down lesson).
-- **W2.5**: flip advantages GAE → Expected-SARSA(λ) once Q-loss converges;
-  A/B 20 updates.
+- **W2.5** (IMPLEMENTED 2026-07-07, not yet activated): flip advantages GAE →
+  Expected-SARSA(λ) once Q-loss converges; A/B 20 updates. Shipped as
+  `--advantage-estimator vrpo` (default `gae`; byte-identical off) — the batched
+  collector computes δ⁺ = r + γ·V^π(s') − Q(s,a) off the dueling Q head, with
+  `returns` staying GAE. Needs `--sizing-head mixture` + `--q-aux-coef>0` (warm
+  the head first). Golden test pins ES≡GAE at the zero-init head
+  (`tests/python/test_vrpo_advantage.py`).
 - **W3 (compute programs)**: exploiter stems feeding the pool (league-lite),
   pool-quality sampling, external validation campaign (MonkerSolver
   single-board spot checks), serving EMA promotion.
