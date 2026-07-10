@@ -1373,12 +1373,10 @@ impl GameState {
         let mut out = vec![0.0f32; N_OUT];
         let mut opp_buf: Vec<Card> = Vec::with_capacity(4);
 
-        // Per-combo board comparisons; +1 = opp ahead, 0 = tie, -1 = opp
+        // Per-holding board comparisons; +1 = opp ahead, 0 = tie, -1 = opp
         // behind (higher HandRank = stronger). Joint/per-board tallying
         // happens at the call sites.
-        let outcomes = |opp: &[Card]| -> (i8, i8) {
-            let opp_a = crate::hand_eval::evaluate_plo5_k_partial(opp, &self.board_a);
-            let opp_b = crate::hand_eval::evaluate_plo5_k_partial(opp, &self.board_b);
+        let cmp_ranks = |opp_a: u32, opp_b: u32| -> (i8, i8) {
             let cmp_a: i8 = if opp_a > hero_a {
                 1
             } else if opp_a < hero_a {
@@ -1405,6 +1403,26 @@ impl GameState {
             }
         };
 
+        // P1: per-board pair-rank scratch tables, filled by the k=2 exhaustive
+        // pass and reused by the k=3/4 MC arms. A PLO holding must use EXACTLY
+        // 2 hole cards, so a k-card holding's rank factorizes as max over its
+        // C(k,2) pairs of that pair's rank — and every MC-drawable pair is
+        // enumerated by the k=2 pass (same unseen deck), so the MC arms become
+        // table lookups instead of full evaluate_plo5_k_partial calls (~81-84%
+        // of this block's hand-eval work at 384 samples). Degenerate pairs
+        // (study-mode duplicate cards; every combo ck==0-filtered) store
+        // ck_to_hand_rank(7462) == 0 == the u32 order bottom, exactly
+        // mirroring the k-level per-combo skip — the identity holds for every
+        // reachable state, duplicates included. Indexed by unseen-deck
+        // POSITIONS (lo*STRIDE + hi, lo<hi); stride 52 covers every variant
+        // and degenerate study state (PLO4 flop = 42 unseen; duplicated
+        // hole/board cards push n_unseen higher still). Byte-identity vs the
+        // frozen pre-P1 body is pinned by outcome_mc_p1_tests.
+        const PAIR_STRIDE: usize = 52;
+        debug_assert!(n_unseen <= PAIR_STRIDE);
+        let mut tab_a = [0u32; PAIR_STRIDE * PAIR_STRIDE];
+        let mut tab_b = [0u32; PAIR_STRIDE * PAIR_STRIDE];
+
         for (idx_k, &k) in [2usize, 3, 4].iter().enumerate() {
             let mut counters = [0u32; 4];
             let mut samples: u32 = 0;
@@ -1423,7 +1441,15 @@ impl GameState {
                     for &i in idx.iter() {
                         opp_buf.push(unseen[i]);
                     }
-                    let (cmp_a, cmp_b) = outcomes(&opp_buf);
+                    let opp_a =
+                        crate::hand_eval::evaluate_plo5_k_partial(&opp_buf, &self.board_a);
+                    let opp_b =
+                        crate::hand_eval::evaluate_plo5_k_partial(&opp_buf, &self.board_b);
+                    // P1: record this pair's per-board ranks for the k=3/4
+                    // MC arms (idx[0] < idx[1] by the combination enumerator).
+                    tab_a[idx[0] * PAIR_STRIDE + idx[1]] = opp_a;
+                    tab_b[idx[0] * PAIR_STRIDE + idx[1]] = opp_b;
+                    let (cmp_a, cmp_b) = cmp_ranks(opp_a, opp_b);
                     tally_joint(&mut counters, cmp_a, cmp_b);
                     match cmp_a {
                         -1 => pb[0] += 1, // hero ahead on A
@@ -1468,20 +1494,47 @@ impl GameState {
                 }
             } else {
                 debug_assert!(n_unseen <= 64);
+                let mut pos = [0usize; 4];
                 for _ in 0..mc_samples {
                     let mut mask: u64 = 0;
-                    opp_buf.clear();
                     let mut written = 0;
                     while written < k {
                         let i = (rng.next_u32() as usize) % n_unseen;
                         let bit = 1u64 << i;
                         if mask & bit == 0 {
                             mask |= bit;
-                            opp_buf.push(unseen[i]);
+                            // P1: record the drawn POSITION. The draw loop
+                            // itself (RNG call count, modulo, rejection mask)
+                            // is untouched — the sample stream stays
+                            // byte-identical to the pre-P1 body.
+                            pos[written] = i;
                             written += 1;
                         }
                     }
-                    let (cmp_a, cmp_b) = outcomes(&opp_buf);
+                    // P1: holding rank = max over its C(k,2) pairs of the
+                    // stored pair ranks (exactly-2-of-k factorization; see
+                    // the table comment above). Drawn positions are unordered
+                    // while the table is filled for lo < hi only.
+                    let mut opp_a = 0u32;
+                    let mut opp_b = 0u32;
+                    for p0 in 0..k {
+                        for p1 in (p0 + 1)..k {
+                            let (lo, hi) = if pos[p0] < pos[p1] {
+                                (pos[p0], pos[p1])
+                            } else {
+                                (pos[p1], pos[p0])
+                            };
+                            let ra = tab_a[lo * PAIR_STRIDE + hi];
+                            if ra > opp_a {
+                                opp_a = ra;
+                            }
+                            let rb = tab_b[lo * PAIR_STRIDE + hi];
+                            if rb > opp_b {
+                                opp_b = rb;
+                            }
+                        }
+                    }
+                    let (cmp_a, cmp_b) = cmp_ranks(opp_a, opp_b);
                     tally_joint(&mut counters, cmp_a, cmp_b);
                     samples += 1;
                 }
@@ -3224,6 +3277,326 @@ mod tests {
             [Card::from_index(20), Card::from_index(21), Card::from_index(22)],
         );
         assert_eq!(r.err(), Some(StudyError::WrongState));
+    }
+}
+
+#[cfg(test)]
+mod outcome_mc_p1_tests {
+    //! P1 bit-exactness harness. `outcome_features_mc_reference` is a FROZEN
+    //! copy of the pre-pair-table function body (as of 2026-07-09). Do NOT
+    //! "sync" it with the live function — its entire purpose is to pin that
+    //! the P1 pair-table rewrite produces byte-identical output on every
+    //! reachable state class: all PLO variants, all streets, rotated heroes,
+    //! and the degenerate study-mode duplicate-card states that exercise the
+    //! all-combos-filtered pair fallback (HandRank 0) and n_unseen > 41.
+    use super::*;
+
+    #[allow(clippy::needless_range_loop)]
+    fn outcome_features_mc_reference(g: &GameState, mc_samples: usize) -> Vec<f32> {
+        const N_OUT: usize = 20;
+        const SCOOP_OPP: usize = 0;
+        const QUARTER_OPP: usize = 1;
+        const SCOOP_HERO: usize = 2;
+        const QUARTER_HERO: usize = 3;
+        const PER_BOARD_OFF: usize = 12;
+
+        let hero_seat = match g.actor {
+            Some(s) => s,
+            None => return vec![0.0; N_OUT],
+        };
+        if g.board_a.len() < 3 || g.board_b.len() < 3 {
+            return vec![0.0; N_OUT];
+        }
+
+        let hero_hole = &g.hole_cards[hero_seat];
+        let hero_a = crate::hand_eval::evaluate_plo5_partial(hero_hole, &g.board_a);
+        let hero_b = crate::hand_eval::evaluate_plo5_partial(hero_hole, &g.board_b);
+
+        let mut used = [false; 52];
+        for c in hero_hole.iter() {
+            used[c.index() as usize] = true;
+        }
+        for c in g.board_a.iter().chain(g.board_b.iter()) {
+            used[c.index() as usize] = true;
+        }
+        let unseen: Vec<Card> = (0..52u8)
+            .filter(|&i| !used[i as usize])
+            .map(Card::from_index)
+            .collect();
+        let n_unseen = unseen.len();
+
+        let seed: u64 = {
+            use std::hash::Hasher;
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            hasher.write_u8(hero_seat as u8);
+            hasher.write_u8(g.street.index() as u8);
+            for c in hero_hole.iter() {
+                hasher.write_u8(c.index());
+            }
+            for c in g.board_a.iter().chain(g.board_b.iter()) {
+                hasher.write_u8(c.index());
+            }
+            hasher.finish()
+        };
+
+        use rand_chacha::ChaCha8Rng;
+        use rand_chacha::rand_core::{RngCore, SeedableRng};
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+
+        let mut out = vec![0.0f32; N_OUT];
+        let mut opp_buf: Vec<Card> = Vec::with_capacity(4);
+
+        let outcomes = |opp: &[Card]| -> (i8, i8) {
+            let opp_a = crate::hand_eval::evaluate_plo5_k_partial(opp, &g.board_a);
+            let opp_b = crate::hand_eval::evaluate_plo5_k_partial(opp, &g.board_b);
+            let cmp_a: i8 = if opp_a > hero_a {
+                1
+            } else if opp_a < hero_a {
+                -1
+            } else {
+                0
+            };
+            let cmp_b: i8 = if opp_b > hero_b {
+                1
+            } else if opp_b < hero_b {
+                -1
+            } else {
+                0
+            };
+            (cmp_a, cmp_b)
+        };
+        let tally_joint = |counters: &mut [u32; 4], cmp_a: i8, cmp_b: i8| {
+            match (cmp_a, cmp_b) {
+                (1, 1) => counters[SCOOP_OPP] += 1,
+                (-1, -1) => counters[SCOOP_HERO] += 1,
+                (1, 0) | (0, 1) => counters[QUARTER_OPP] += 1,
+                (-1, 0) | (0, -1) => counters[QUARTER_HERO] += 1,
+                _ => {}
+            }
+        };
+
+        for (idx_k, &k) in [2usize, 3, 4].iter().enumerate() {
+            let mut counters = [0u32; 4];
+            let mut samples: u32 = 0;
+
+            if k == 2 {
+                let mut pb = [0u32; 8];
+                let mut idx: Vec<usize> = (0..k).collect();
+                loop {
+                    opp_buf.clear();
+                    for &i in idx.iter() {
+                        opp_buf.push(unseen[i]);
+                    }
+                    let (cmp_a, cmp_b) = outcomes(&opp_buf);
+                    tally_joint(&mut counters, cmp_a, cmp_b);
+                    match cmp_a {
+                        -1 => pb[0] += 1,
+                        0 => pb[1] += 1,
+                        _ => pb[2] += 1,
+                    }
+                    match cmp_b {
+                        -1 => pb[3] += 1,
+                        0 => pb[4] += 1,
+                        _ => pb[5] += 1,
+                    }
+                    if (cmp_a == -1 && cmp_b == 1) || (cmp_a == 1 && cmp_b == -1) {
+                        pb[6] += 1;
+                    }
+                    if cmp_a == 0 && cmp_b == 0 {
+                        pb[7] += 1;
+                    }
+                    samples += 1;
+                    let mut pos = k;
+                    let advanced = loop {
+                        if pos == 0 {
+                            break false;
+                        }
+                        pos -= 1;
+                        if idx[pos] < n_unseen - (k - pos) {
+                            idx[pos] += 1;
+                            for j in (pos + 1)..k {
+                                idx[j] = idx[j - 1] + 1;
+                            }
+                            break true;
+                        }
+                    };
+                    if !advanced {
+                        break;
+                    }
+                }
+                if samples > 0 {
+                    let inv = 1.0f32 / samples as f32;
+                    for j in 0..8 {
+                        out[PER_BOARD_OFF + j] = pb[j] as f32 * inv;
+                    }
+                }
+            } else {
+                debug_assert!(n_unseen <= 64);
+                for _ in 0..mc_samples {
+                    let mut mask: u64 = 0;
+                    opp_buf.clear();
+                    let mut written = 0;
+                    while written < k {
+                        let i = (rng.next_u32() as usize) % n_unseen;
+                        let bit = 1u64 << i;
+                        if mask & bit == 0 {
+                            mask |= bit;
+                            opp_buf.push(unseen[i]);
+                            written += 1;
+                        }
+                    }
+                    let (cmp_a, cmp_b) = outcomes(&opp_buf);
+                    tally_joint(&mut counters, cmp_a, cmp_b);
+                    samples += 1;
+                }
+            }
+
+            if samples > 0 {
+                let inv = 1.0f32 / samples as f32;
+                let base = idx_k * 4;
+                out[base + SCOOP_OPP] = counters[SCOOP_OPP] as f32 * inv;
+                out[base + QUARTER_OPP] = counters[QUARTER_OPP] as f32 * inv;
+                out[base + SCOOP_HERO] = counters[SCOOP_HERO] as f32 * inv;
+                out[base + QUARTER_HERO] = counters[QUARTER_HERO] as f32 * inv;
+            }
+        }
+        out
+    }
+
+    fn assert_bit_identical(g: &GameState, mc_samples: usize, tag: &str) {
+        let new = g.outcome_features_mc(mc_samples);
+        let reference = outcome_features_mc_reference(g, mc_samples);
+        assert_eq!(new.len(), reference.len(), "{tag}: length mismatch");
+        for (i, (x, y)) in new.iter().zip(reference.iter()).enumerate() {
+            assert_eq!(
+                x.to_bits(),
+                y.to_bits(),
+                "{tag}: dim {i} differs (new {x} vs ref {y})"
+            );
+        }
+    }
+
+    fn reveal_turn(g: &mut GameState) {
+        g.board_a.push(g.full_board_a[3]);
+        g.board_b.push(g.full_board_b[3]);
+        g.street = Street::Turn;
+    }
+
+    fn reveal_river(g: &mut GameState) {
+        g.board_a.push(g.full_board_a[4]);
+        g.board_b.push(g.full_board_b[4]);
+        g.street = Street::River;
+    }
+
+    fn variant_cfg(variant: Variant, num_seats: usize) -> GameConfig {
+        GameConfig {
+            num_seats,
+            starting_stacks: vec![200_000; num_seats],
+            ante: 30_000,
+            bb: 10_000,
+            sb: 0,
+            variant,
+        }
+    }
+
+    #[test]
+    fn pair_table_matches_reference() {
+        // Production-shaped states: every PLO variant x street x seeds x seat
+        // counts, with the hero rotated across every seat (the actor is the
+        // only seat the function reads).
+        let variants = [
+            Variant::Plo5DoubleBomb,
+            Variant::Plo4DoubleBomb,
+            Variant::Plo6DoubleBomb,
+        ];
+        for (vi, &variant) in variants.iter().enumerate() {
+            for &num_seats in &[2usize, 6] {
+                for seed in 0..3u64 {
+                    for street in 0..3usize {
+                        let mut g = GameState::new_hand(
+                            variant_cfg(variant, num_seats),
+                            seed * 7919 + street as u64,
+                            0,
+                        );
+                        if street >= 1 {
+                            reveal_turn(&mut g);
+                        }
+                        if street >= 2 {
+                            reveal_river(&mut g);
+                        }
+                        for hero in 0..num_seats {
+                            g.actor = Some(hero);
+                            assert_bit_identical(
+                                &g,
+                                64,
+                                &format!(
+                                    "variant#{vi} seats={num_seats} seed={seed} \
+                                     street={street} hero={hero}"
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Deployed sample count on one full-size case, plus mc_samples edges
+        // (0 exercises the samples==0 normalize guard).
+        let g = GameState::new_hand(variant_cfg(Variant::Plo5DoubleBomb, 6), 12345, 2);
+        assert_bit_identical(&g, 384, "plo5 6max flop mc=384");
+        assert_bit_identical(&g, 0, "mc=0");
+        assert_bit_identical(&g, 1, "mc=1");
+    }
+
+    #[test]
+    fn pair_table_matches_reference_degenerate_study_states() {
+        // Study-mode duplicate-card states: hole cards colliding with board
+        // cards and boards sharing cards shrink the `used` union (n_unseen
+        // past the 41 production ceiling, up to 46+) and exercise the
+        // degenerate-pair fallback (all combos ck==0-filtered -> HandRank 0).
+        // Production deals never reach these; the serial observation_dict /
+        // study path can.
+        let mut g = GameState::new_hand(variant_cfg(Variant::Plo5DoubleBomb, 6), 99, 0);
+        let hero = g.actor.unwrap();
+
+        // Hero hole card duplicated onto board_a: at the flop there is exactly
+        // one board triple, so every combo using that hole card degenerates.
+        let mut g1 = g.clone();
+        g1.board_a[0] = g1.hole_cards[hero][0];
+        assert_bit_identical(&g1, 64, "hero hole card duplicated on board_a");
+
+        // Boards sharing a card.
+        let mut g2 = g.clone();
+        g2.board_b[1] = g2.board_a[1];
+        assert_bit_identical(&g2, 64, "board_a/board_b share a card");
+
+        // Pathological mass duplication: several hero cards on both boards +
+        // a cross-board duplicate (n_unseen well past 41).
+        let mut g3 = g.clone();
+        g3.board_a[0] = g3.hole_cards[hero][0];
+        g3.board_a[1] = g3.hole_cards[hero][1];
+        g3.board_b[0] = g3.hole_cards[hero][2];
+        g3.board_b[1] = g3.hole_cards[hero][3];
+        g3.board_b[2] = g3.board_a[2];
+        assert_bit_identical(&g3, 64, "mass-duplicate study state");
+
+        // INTRA-board duplicate: the only state class where an OPP pair's
+        // evals can ALL degenerate (opp cards come from the unseen deck, so
+        // they never collide with board cards — a 5-card combo can only
+        // contain a duplicate if the board TRIPLE itself does). At the flop
+        // board_a has exactly one triple, and it contains the dup, so every
+        // opp pair's tab_a entry takes the all-combos-filtered fallback
+        // (u16::MAX -> 7462 -> HandRank 0) — pinning the max-fold identity's
+        // hardest case for real. Unreachable via study input validation
+        // (DuplicateCard guard); pinned at the function level regardless.
+        let mut g4 = g.clone();
+        g4.board_a[1] = g4.board_a[0];
+        assert_bit_identical(&g4, 64, "intra-board duplicate (all-degenerate pairs)");
+
+        // Turn-street collision: 4-card board, so the colliding pair keeps
+        // some valid triples (partial-degeneracy path).
+        reveal_turn(&mut g);
+        g.board_a[0] = g.hole_cards[hero][0];
+        assert_bit_identical(&g, 64, "turn-street hole/board collision");
     }
 }
 

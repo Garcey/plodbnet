@@ -63,14 +63,25 @@ fn card_to_ck(card: Card) -> u32 {
 
 // ---------- CK tables ----------
 
+/// P2: open-addressing table size for the paired-hand lookup (`paired_hash`).
+/// 16384 slots for 4888 entries = ~30% load factor (~1.2 probes avg). Power of
+/// two so the Fibonacci-hash index is a shift and the probe wrap is a mask.
+const PAIRED_HASH_CAP: usize = 16384;
+
 struct CkTables {
     /// 8192-entry table indexed by 13-bit rank bitset. Non-zero only for
     /// bitsets that correspond to a 5-card straight flush or plain flush.
     flushes: Vec<u16>,
     /// 8192-entry table for straight / high card (5 distinct ranks, non-flush).
     unique5: Vec<u16>,
-    /// Sorted (prime_product, ck_rank) pairs for paired hands. Binary-searched.
+    /// Sorted (prime_product, ck_rank) pairs for paired hands. Retained for the
+    /// build + the `ck_tables_sizes` parity test; the lookup path is
+    /// `paired_hash`.
     paired: Vec<(u32, u16)>,
+    /// P2: open-addressing hash of prime_product -> ck for paired hands. Slot
+    /// key 0 = empty (a real product is a product of 5 primes >= 2, never 0).
+    /// Single-probe replacement for the ~12-deep `paired` binary search.
+    paired_hash: Vec<(u32, u16)>,
 }
 
 static CK_TABLES: OnceLock<CkTables> = OnceLock::new();
@@ -220,10 +231,24 @@ fn build_tables() -> CkTables {
 
     paired.sort_by_key(|&(prod, _)| prod);
 
+    // P2: build the open-addressing paired lookup from the same (prod, ck)
+    // pairs. Fibonacci hash + linear probe; slot key 0 = empty. Products are
+    // distinct (unique prime factorizations) so there are no duplicate keys, and
+    // 4888 entries in 16384 slots guarantees a terminating probe on insert.
+    let mut paired_hash = vec![(0u32, 0u16); PAIRED_HASH_CAP];
+    for &(prod, ck) in &paired {
+        let mut slot = (prod.wrapping_mul(0x9E3779B9) >> 18) as usize;
+        while paired_hash[slot].0 != 0 {
+            slot = (slot + 1) & (PAIRED_HASH_CAP - 1);
+        }
+        paired_hash[slot] = (prod, ck);
+    }
+
     CkTables {
         flushes,
         unique5,
         paired,
+        paired_hash,
     }
 }
 
@@ -240,13 +265,23 @@ fn ck_eval_inline(c: [u32; 5], t: &CkTables) -> u16 {
         return u;
     }
     let prod = (c[0] & 0xFF) * (c[1] & 0xFF) * (c[2] & 0xFF) * (c[3] & 0xFF) * (c[4] & 0xFF);
-    match t.paired.binary_search_by_key(&prod, |&(p, _)| p) {
-        Ok(i) => t.paired[i].1,
-        // Degenerate sentinel (same 0 the combo loops filter with `ck != 0`):
-        // a study-mode duplicate hole can give a >4-of-a-kind rank multiset
-        // (e.g. five-of-a-kind, prime product 41^5) with no paired-table
-        // entry; production deals are duplicate-free and can't reach it.
-        Err(_) => 0,
+    // P2: single-probe open-addressing lookup, replacing a ~12-deep binary
+    // search. Key-verified: probe until the stored product matches `prod`
+    // (return its ck) or an empty slot (key 0) is reached. The empty-slot case
+    // returns the same 0 sentinel the old `Err(_)` did — a study-mode duplicate
+    // hole can give a >4-of-a-kind multiset (e.g. 41^5) with no table entry;
+    // production deals are duplicate-free and can't reach it. The table is
+    // <100% full, so a missing key always reaches an empty slot.
+    let mut slot = (prod.wrapping_mul(0x9E3779B9) >> 18) as usize;
+    loop {
+        let (k, v) = t.paired_hash[slot];
+        if k == prod {
+            return v;
+        }
+        if k == 0 {
+            return 0;
+        }
+        slot = (slot + 1) & (PAIRED_HASH_CAP - 1);
     }
 }
 
@@ -818,6 +853,40 @@ mod tests {
         for w in t.paired.windows(2) {
             assert!(w[0].0 < w[1].0);
         }
+    }
+
+    #[test]
+    fn paired_hash_matches_binary_search() {
+        // P2: the open-addressing paired lookup must return the identical ck to
+        // the old sorted-Vec binary search for every product, and the 0
+        // sentinel for any product not in the table.
+        let t = tables();
+        let probe = |prod: u32| -> u16 {
+            let mut slot = (prod.wrapping_mul(0x9E3779B9) >> 18) as usize;
+            loop {
+                let (k, v) = t.paired_hash[slot];
+                if k == prod {
+                    return v;
+                }
+                if k == 0 {
+                    return 0;
+                }
+                slot = (slot + 1) & (PAIRED_HASH_CAP - 1);
+            }
+        };
+        // All 4888 real products resolve to the same ck as the binary search.
+        for &(prod, ck) in &t.paired {
+            assert_eq!(probe(prod), ck, "hash != stored ck for prod {prod}");
+            let bs = match t.paired.binary_search_by_key(&prod, |&(p, _)| p) {
+                Ok(i) => t.paired[i].1,
+                Err(_) => 0,
+            };
+            assert_eq!(probe(prod), bs, "hash != binary search for prod {prod}");
+        }
+        // Not-in-table products return the 0 degenerate sentinel.
+        assert_eq!(probe(41u32.pow(5)), 0, "five-of-a-kind (41^5) sentinel");
+        assert_eq!(probe(2), 0);
+        assert_eq!(probe(u32::MAX), 0);
     }
 
     #[test]
