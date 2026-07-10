@@ -20,7 +20,6 @@ opponent seats do not store anything.
 
 from __future__ import annotations
 
-import copy
 import os
 from dataclasses import dataclass, replace
 from typing import Iterable
@@ -32,6 +31,8 @@ from torch.profiler import record_function
 from plo5bp._engine import compute_aggression_bonus_batch  # type: ignore[attr-defined]
 from plo5bp.actions import ALL_IN, GATE_ACTIONS, GATE_CHECK_CALL, GATE_RAISE
 from plo5bp.config import GameConfig, TrainingConfig
+from plo5bp.encoding import OBS_DIM
+from plo5bp.encoding_nlh import OBS_DIM_NLH
 from plo5bp.env import BombPotEnv
 from plo5bp.env_batched import BatchedBombPotEnv
 from plo5bp.network import (
@@ -42,6 +43,15 @@ from plo5bp.network import (
 )
 from plo5bp.selfplay import OpponentPool
 from plo5bp.sizing import sizing_from_info
+
+# Slack rows per env appended to the obs-pool / output-slab capacity beyond
+# rollout_target: learner steps can still be written after `wcursor` last
+# crosses the target (the in-flight hands flush to completion). 32 steps/env
+# is ~50x observed need; the overflow guards below turn the (near-impossible)
+# overshoot into a clean error. Module-level (P7+P8): collect_rollout_batched
+# AND collect_rollout_multiconfig's shared-staging allocation must derive the
+# per-sub capacity from the SAME formula.
+POOL_SLACK_PER_ENV = 32
 
 
 @dataclass
@@ -156,11 +166,19 @@ def _rotate_opp_holes_batch(
 def _critic_values(
     critic: CentralCritic,
     device: torch.device,
-    obs_np: np.ndarray,
+    obs: "np.ndarray | torch.Tensor",
     opp_np: np.ndarray,
 ) -> np.ndarray:
-    """Centralized-critic forward for a learner step group."""
-    o_t = torch.from_numpy(obs_np).to(device)
+    """Centralized-critic forward for a learner step group.
+
+    `obs` may be an already-uploaded device tensor (P9: the batched driver
+    passes the actor forward's `o_t` — identical bytes, so the values are
+    unchanged) or a numpy array (the serial driver's path, byte-identical
+    to before)."""
+    if isinstance(obs, torch.Tensor):
+        o_t = obs
+    else:
+        o_t = torch.from_numpy(obs).to(device)
     h_t = torch.from_numpy(opp_np).to(device)
     with torch.inference_mode():
         v_t = critic(o_t, opp_holes_multihot(h_t))
@@ -170,17 +188,27 @@ def _critic_values(
 def _critic_q_values(
     critic: CentralCritic,
     device: torch.device,
-    obs_np: np.ndarray,
+    obs: "np.ndarray | torch.Tensor",
     opp_np: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """(V, Q) from the centralized critic's dueling head — the VRPO /
     Expected-SARSA advantage path. Q is (B, q_actions) over
-    [Fold, CheckCall, Raise@anchor_0..k]; at the zero-init head Q == V."""
-    o_t = torch.from_numpy(obs_np).to(device)
+    [Fold, CheckCall, Raise@anchor_0..k]; at the zero-init head Q == V.
+
+    `obs` may be an already-uploaded device tensor (P9, see _critic_values).
+    V and Q return via ONE coalesced D2H (cat then split — pure copies of
+    the same float32 values, one CUDA sync instead of two); the splits are
+    numpy views, and every consumer is stride-agnostic."""
+    if isinstance(obs, torch.Tensor):
+        o_t = obs
+    else:
+        o_t = torch.from_numpy(obs).to(device)
     h_t = torch.from_numpy(opp_np).to(device)
     with torch.inference_mode():
         v_t, q_t = critic.q_values(o_t, opp_holes_multihot(h_t))
-    return v_t.float().cpu().numpy(), q_t.float().cpu().numpy()
+        vq = torch.cat((v_t.float().unsqueeze(1), q_t.float()), dim=1)
+    vq_np = vq.cpu().numpy()
+    return vq_np[:, 0], vq_np[:, 1:]
 
 
 def _aggression_bonus_bb(
@@ -864,9 +892,31 @@ def collect_rollout_batched(
     train_config: TrainingConfig,
     rng: np.random.Generator,
     critic: CentralCritic | None = None,
+    out_slabs: "dict[str, np.ndarray] | None" = None,
+    snapshot_cache: "dict[int, ActorCritic] | None" = None,
 ) -> Batch:
     """Batched rollout using `BatchedBombPotEnv` + snapshot-bucket
-    opponent forwards. Drives all envs through `apply_hybrid_batch`."""
+    opponent forwards. Drives all envs through `apply_hybrid_batch`.
+
+    `snapshot_cache` (P5): caller-owned cache of built frozen-opponent
+    models, keyed by pool snapshot index. Multiconfig passes one dict for
+    the whole update (pool membership is frozen across it — the caller
+    snapshots AFTER trainer.update), so each pool member is constructed
+    once per update instead of once per sub-rollout (~240x -> ~8x builds).
+    Default None = a fresh local dict, today's exact behavior. CUDA-run
+    bit-exact (module init consumes the CPU torch generator; batched
+    sampling uses the CUDA generator); on CPU-only runs the shared cache
+    shifts the sampling stream from the second sub-rollout on (no batched
+    bit-exact contract — parity is at the env level).
+
+    `out_slabs` (P7+P8, multiconfig shared staging): caller-provided numpy
+    VIEWS — one per output slab, keyed obs/gm/ga/rc/sz/an/ru/oh/lp/glp/alp/
+    v/ret/adv — into one big preallocated host buffer. When given, the
+    collector writes into them instead of allocating its own slabs and
+    returns a Batch of CPU view-tensors (no device copy except the tiny
+    per-sub advantage-normalization hop, which stays on the learner device
+    for bit-exactness with the legacy path). Default None = the original
+    self-allocating, finalize-to-device path, byte-identical to before."""
     n_envs = train_config.num_envs
     n_seats = game_config.num_seats
     reward_norm = 1.0 / float(game_config.bb)
@@ -894,15 +944,23 @@ def collect_rollout_batched(
         opp_outcome_mc=TRAIN_OPP_OUTCOME_MC,
     )
 
-    snapshot_models: dict[int, ActorCritic] = {}
+    # P5: reuse the caller's per-update cache when given (multiconfig), else a
+    # local one (single-config callers — unchanged behavior).
+    snapshot_models: dict[int, ActorCritic] = (
+        snapshot_cache if snapshot_cache is not None else {}
+    )
 
     def _get_snapshot_model(sd_idx: int) -> ActorCritic:
         m = snapshot_models.get(sd_idx)
         if m is not None:
             return m
-        sd = copy.deepcopy(pool.snapshots[sd_idx])
+        # No deepcopy (P5): pool.snapshot() stores detached clones, this path
+        # bypasses OpponentPool.sample() (whose deepcopy protects the SERIAL
+        # path), load_state_dict copies rather than aliases, and nothing here
+        # mutates the dict.
         m = _build_frozen_model(
-            sd, train_config.hidden_dim, device, train_config.num_layers,
+            pool.snapshots[sd_idx],
+            train_config.hidden_dim, device, train_config.num_layers,
             model_cls=type(learner),
         )
         snapshot_models[sd_idx] = m
@@ -1007,7 +1065,8 @@ def collect_rollout_batched(
     # documents the actual requirement, and the explicit guards below
     # turn a (near-impossible) overflow into a clean error instead of a
     # silent numpy shape mismatch. 32 steps/env is ~50x observed need.
-    POOL_SLACK_PER_ENV = 32
+    # (POOL_SLACK_PER_ENV is module-level — shared with multiconfig's
+    # shared-staging allocation.)
     pool_cap = rollout_target + n_envs * POOL_SLACK_PER_ENV
     # env.obs_dim, not the OBS_DIM constant: the batched env's layout is
     # per-variant (991 PLO / 995 NLH).
@@ -1021,45 +1080,76 @@ def collect_rollout_batched(
     # back the slabs with pinned host memory so the finalize transfer
     # can run with `non_blocking=True` and overlap the first PPO forward.
     out_cap = rollout_target + n_envs * POOL_SLACK_PER_ENV
-    # Pinned host memory makes the finalize H2D copy overlap downstream compute
-    # (via non_blocking=True), but PINNING THE ~36GB obs slab can cost 60+ SECONDS
-    # PER UPDATE on some hosts (measured: torch 2.11 / AMD EPYC pins 36GB in ~64s,
-    # single-threaded — it was the dominant per-update cost and looked like a
-    # hang). The pinning tax dwarfs the few seconds non_blocking saves at the
-    # finalize, so pinning is DEFAULT OFF. Re-enable with PLO5BP_PIN_ROLLOUT=1 on
-    # hosts where large-buffer pinning is cheap. Output is bit-identical either
-    # way (non_blocking=True on non-pinned memory simply degrades to a blocking
-    # copy — same data).
-    _pin = (
-        (device.type == "cuda" if isinstance(device, torch.device)
-         else str(device).startswith("cuda"))
-        and os.environ.get("PLO5BP_PIN_ROLLOUT", "0") == "1"
-    )
-    _pinned_keepalive: list[torch.Tensor] = []
+    if out_slabs is not None:
+        # P8 shared staging: write into the caller's views of one big host
+        # buffer. Capacity is computed with the SAME formula the caller used,
+        # so the slab-overflow guard below keeps identical semantics; the
+        # width assert catches any variant/obs-dim drift between the caller's
+        # allocation and this env.
+        all_obs_arr = out_slabs["obs"]
+        all_gm_arr = out_slabs["gm"]
+        all_ga_arr = out_slabs["ga"]
+        all_rc_arr = out_slabs["rc"]
+        all_sz_arr = out_slabs["sz"]
+        all_an_arr = out_slabs["an"]
+        all_ru_arr = out_slabs["ru"]
+        all_oh_arr = out_slabs["oh"]
+        all_lp_arr = out_slabs["lp"]
+        all_glp_arr = out_slabs["glp"]
+        all_alp_arr = out_slabs["alp"]
+        all_v_arr = out_slabs["v"]
+        all_ret_arr = out_slabs["ret"]
+        all_adv_arr = out_slabs["adv"]
+        assert all_obs_arr.shape[0] == out_cap, (
+            f"out_slabs capacity {all_obs_arr.shape[0]} != expected {out_cap}"
+        )
+        assert all_obs_arr.shape[1] == env.obs_dim, (
+            f"out_slabs obs width {all_obs_arr.shape[1]} != env {env.obs_dim}"
+        )
+        assert all_oh_arr.shape[2] == game_config.hole_count, (
+            f"out_slabs hole width {all_oh_arr.shape[2]} != "
+            f"config {game_config.hole_count}"
+        )
+    else:
+        # Pinned host memory makes the finalize H2D copy overlap downstream compute
+        # (via non_blocking=True), but PINNING THE ~36GB obs slab can cost 60+ SECONDS
+        # PER UPDATE on some hosts (measured: torch 2.11 / AMD EPYC pins 36GB in ~64s,
+        # single-threaded — it was the dominant per-update cost and looked like a
+        # hang). The pinning tax dwarfs the few seconds non_blocking saves at the
+        # finalize, so pinning is DEFAULT OFF. Re-enable with PLO5BP_PIN_ROLLOUT=1 on
+        # hosts where large-buffer pinning is cheap. Output is bit-identical either
+        # way (non_blocking=True on non-pinned memory simply degrades to a blocking
+        # copy — same data).
+        _pin = (
+            (device.type == "cuda" if isinstance(device, torch.device)
+             else str(device).startswith("cuda"))
+            and os.environ.get("PLO5BP_PIN_ROLLOUT", "0") == "1"
+        )
+        _pinned_keepalive: list[torch.Tensor] = []
 
-    def _alloc_slab(shape, np_dtype, torch_dtype):
-        if _pin:
-            t = torch.empty(shape, dtype=torch_dtype, pin_memory=True)
-            _pinned_keepalive.append(t)
-            return t.numpy()
-        return np.empty(shape, dtype=np_dtype)
+        def _alloc_slab(shape, np_dtype, torch_dtype):
+            if _pin:
+                t = torch.empty(shape, dtype=torch_dtype, pin_memory=True)
+                _pinned_keepalive.append(t)
+                return t.numpy()
+            return np.empty(shape, dtype=np_dtype)
 
-    all_obs_arr = _alloc_slab((out_cap, env.obs_dim), np.float32, torch.float32)
-    all_gm_arr = _alloc_slab((out_cap, GATE_ACTIONS), bool, torch.bool)
-    all_ga_arr = _alloc_slab(out_cap, np.int64, torch.int64)
-    all_rc_arr = _alloc_slab(out_cap, np.int64, torch.int64)
-    all_sz_arr = _alloc_slab((out_cap, 4), np.int64, torch.int64)
-    all_an_arr = _alloc_slab(out_cap, np.int64, torch.int64)
-    all_ru_arr = _alloc_slab(out_cap, np.float32, torch.float32)
-    all_oh_arr = _alloc_slab(
-        (out_cap, 5, game_config.hole_count), np.uint8, torch.uint8
-    )
-    all_lp_arr = _alloc_slab(out_cap, np.float32, torch.float32)
-    all_glp_arr = _alloc_slab(out_cap, np.float32, torch.float32)
-    all_alp_arr = _alloc_slab(out_cap, np.float32, torch.float32)
-    all_v_arr = _alloc_slab(out_cap, np.float32, torch.float32)
-    all_ret_arr = _alloc_slab(out_cap, np.float32, torch.float32)
-    all_adv_arr = _alloc_slab(out_cap, np.float32, torch.float32)
+        all_obs_arr = _alloc_slab((out_cap, env.obs_dim), np.float32, torch.float32)
+        all_gm_arr = _alloc_slab((out_cap, GATE_ACTIONS), bool, torch.bool)
+        all_ga_arr = _alloc_slab(out_cap, np.int64, torch.int64)
+        all_rc_arr = _alloc_slab(out_cap, np.int64, torch.int64)
+        all_sz_arr = _alloc_slab((out_cap, 4), np.int64, torch.int64)
+        all_an_arr = _alloc_slab(out_cap, np.int64, torch.int64)
+        all_ru_arr = _alloc_slab(out_cap, np.float32, torch.float32)
+        all_oh_arr = _alloc_slab(
+            (out_cap, 5, game_config.hole_count), np.uint8, torch.uint8
+        )
+        all_lp_arr = _alloc_slab(out_cap, np.float32, torch.float32)
+        all_glp_arr = _alloc_slab(out_cap, np.float32, torch.float32)
+        all_alp_arr = _alloc_slab(out_cap, np.float32, torch.float32)
+        all_v_arr = _alloc_slab(out_cap, np.float32, torch.float32)
+        all_ret_arr = _alloc_slab(out_cap, np.float32, torch.float32)
+        all_adv_arr = _alloc_slab(out_cap, np.float32, torch.float32)
     wcursor = 0
 
     aggression_bonus_c = float(train_config.aggression_bonus_c)
@@ -1076,7 +1166,7 @@ def collect_rollout_batched(
                  gate_mask_arr: np.ndarray, sizing_arr: np.ndarray,
                  want_marginal: bool) -> tuple[
         np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
-        np.ndarray, np.ndarray, np.ndarray | None,
+        np.ndarray, np.ndarray, np.ndarray | None, torch.Tensor,
     ]:
         b_obs = obs_arr[group]
         b_gm = gate_mask_arr[group]
@@ -1125,6 +1215,10 @@ def collect_rollout_batched(
                 floats[3],
                 floats[4],
                 marg_np,
+                # P9: the already-uploaded obs tensor — the critic forward for
+                # the learner group reuses it instead of re-fancy-indexing and
+                # re-uploading the identical rows (~45GB/update duplicated).
+                o_t,
             )
 
     env_idx_range = np.arange(n_envs)
@@ -1182,9 +1276,11 @@ def collect_rollout_batched(
         )
 
         if learner_idx_np.size:
-            g_np, c_np, an_np, lp_np, ru_np, v_np, glp_np, alp_np, marg_np = _forward(
-                learner, learner_idx_np, obs, gate_masks, sizing_step,
-                want_marginal=use_vrpo,
+            g_np, c_np, an_np, lp_np, ru_np, v_np, glp_np, alp_np, marg_np, o_t_l = (
+                _forward(
+                    learner, learner_idx_np, obs, gate_masks, sizing_step,
+                    want_marginal=use_vrpo,
+                )
             )
             gates_per_env[learner_idx_np] = g_np
             chips_per_env[learner_idx_np] = np.maximum(c_np, 0).astype(np.uint64)
@@ -1199,8 +1295,10 @@ def collect_rollout_batched(
                         holes_cache, learner_idx_np, safe_actors[learner_idx_np]
                     )
                     if use_vrpo:
+                        # P9: o_t_l IS from_numpy(obs[learner_idx_np]).to(device)
+                        # — identical bytes, uploaded once by _forward.
                         v_l, q_l = _critic_q_values(
-                            critic, device, obs[learner_idx_np], opp_block
+                            critic, device, o_t_l, opp_block
                         )
                         values_per_env[learner_idx_np] = v_l
                         if q_l.shape[-1] == 3:
@@ -1229,8 +1327,9 @@ def collect_rollout_batched(
                         q_taken_per_env[learner_idx_np] = q_l[rows_l, q_idx_l]
                         vpi_per_env[learner_idx_np] = (marg_l * q_l).sum(-1)
                     else:
+                        # P9: same obs-tensor reuse as the VRPO branch.
                         values_per_env[learner_idx_np] = _critic_values(
-                            critic, device, obs[learner_idx_np], opp_block
+                            critic, device, o_t_l, opp_block
                         )
             else:
                 values_per_env[learner_idx_np] = v_np
@@ -1244,7 +1343,7 @@ def collect_rollout_batched(
                     sd_idx_int = int(sd_idx)
                     group = np.nonzero(opp_snap_col == sd_idx)[0]
                     m = _get_snapshot_model(sd_idx_int)
-                    g_np, c_np, _, _, _, _, _, _, _ = _forward(
+                    g_np, c_np, _, _, _, _, _, _, _, _ = _forward(
                         m, group, obs, gate_masks, sizing_step, want_marginal=False
                     )
                     gates_per_env[group] = g_np
@@ -1596,6 +1695,50 @@ def collect_rollout_batched(
                 # `_refresh_subset` docstring + test_refresh_subset_parity).
                 env._refresh_subset(reset_mask)
 
+    if out_slabs is not None:
+        # P7 shared-staging finalize: no full H2D — the rows already sit in the
+        # caller's big host buffer. Only the per-sub advantage normalization
+        # hops to the learner device: it ran on CUDA in the legacy path
+        # (_finalize_batch_arr), and a CPU reimplementation would drift f32
+        # reduction order, so ship the tiny (wcursor,) vector up, run the
+        # IDENTICAL op sequence, and write the result back into the slab.
+        with record_function("step11/shared_adv_norm"):
+            adv_view = all_adv_arr[:wcursor]
+            adv_t = torch.from_numpy(adv_view).to(device, non_blocking=True)
+            adv_mean = adv_t.mean()
+            adv_std = adv_t.std().clamp(min=1e-8)
+            adv_t = (adv_t - adv_mean) / adv_std
+            _adv_clip = float(getattr(train_config, "adv_clip", 0.0))
+            if _adv_clip > 0.0:
+                # Same fat-tail clamp as _finalize_batch (serial parity).
+                adv_t = adv_t.clamp(-_adv_clip, _adv_clip)
+            np.copyto(adv_view, adv_t.cpu().numpy())
+        return Batch(
+            obs=torch.from_numpy(all_obs_arr[:wcursor]),
+            gate_masks=torch.from_numpy(all_gm_arr[:wcursor]),
+            gate_actions=torch.from_numpy(all_ga_arr[:wcursor]),
+            raise_chips=torch.from_numpy(all_rc_arr[:wcursor]),
+            sizing=torch.from_numpy(all_sz_arr[:wcursor]),
+            anchor_actions=torch.from_numpy(all_an_arr[:wcursor]),
+            refine_u=torch.from_numpy(all_ru_arr[:wcursor]),
+            opp_holes=torch.from_numpy(all_oh_arr[:wcursor]),
+            log_probs=torch.from_numpy(all_lp_arr[:wcursor]),
+            values=torch.from_numpy(all_v_arr[:wcursor]),
+            returns=torch.from_numpy(all_ret_arr[:wcursor]),
+            advantages=torch.from_numpy(adv_view),
+            old_gate_logp=torch.from_numpy(all_glp_arr[:wcursor]),
+            old_anchor_logp=torch.from_numpy(all_alp_arr[:wcursor]),
+            aggr_bonus_total_bb=float(aggr_bonus_total_bb),
+            aggr_steps_total=int(aggr_steps_total),
+            aggr_bonus_steps=int(aggr_bonus_steps),
+            aggr_steps_total_by_street=tuple(
+                int(x) for x in aggr_steps_total_by_street
+            ),
+            aggr_bonus_steps_by_street=tuple(
+                int(x) for x in aggr_bonus_steps_by_street
+            ),
+        )
+
     return _finalize_batch_arr(
         all_obs_arr,
         all_gm_arr,
@@ -1692,16 +1835,28 @@ def collect_rollout_multiconfig(
     critic: CentralCritic | None = None,
     config_tiers: "list[str] | None" = None,
     tier_ent: "dict[str, float] | None" = None,
+    _legacy_staging: bool = False,
 ) -> Batch:
     """One update's rollout MIXED across `configs` distinct (seats,stacks) setups.
 
     Runs `collect_rollout_batched` once per config — each sub-rollout sized
-    `num_envs // N` envs and `rollout_length // N` learner steps — evacuates the
-    sub-batch to host RAM as it finishes (GPU peak = one sub-rollout, not N),
-    concatenates on the host, then transfers the combined batch to the learner's
-    device once with a global advantage re-normalization. Reuses the single-
-    config collector verbatim; the only new logic is split / host-concat /
-    re-norm. Pool snapshots are taken by the caller per-update, so calling the
+    `num_envs // N` envs and `rollout_length // N` learner steps.
+
+    Staging (P7+P8, 2026-07-09): sub-rollouts write directly into per-sub
+    VIEWS of one big preallocated host buffer (bases chained by each sub's
+    actual row count, so the buffer holds exactly what torch.cat used to
+    produce, in the same row order, with zero staging copies). Only the tiny
+    per-sub advantage-normalization vector visits the learner device (it ran
+    on CUDA in the legacy path — CPU math would drift f32 reduction order);
+    the combined batch then ships to the device ONCE. This replaces the
+    legacy pipeline (finalize each sub to CUDA -> evacuate to host ->
+    torch.cat a second full-size host copy -> upload), which moved ~90GB of
+    redundant PCIe traffic and doubled the host transient per update. The
+    legacy path is retained behind `_legacy_staging=True` SOLELY as the
+    bit-exactness reference for tests/python/test_multiconfig_staging.py —
+    both paths must produce bitwise-identical Batches. GPU peak during
+    collection drops to just the model forwards (no sub-batch residency).
+    Pool snapshots are taken by the caller per-update, so calling the
     collector N times here does not over-snapshot.
 
     Per-tier machinery (V5_DESIGN.md B5, both optional and additive):
@@ -1724,12 +1879,131 @@ def collect_rollout_multiconfig(
         num_envs=max(1, train_config.num_envs // n),
         rollout_length=max(1, train_config.rollout_length // n),
     )
-    host_batches: list[Batch] = []
-    for cfg in configs:
-        sub = collect_rollout_batched(learner, pool, cfg, sub_config, rng, critic=critic)
-        host_batches.append(_batch_to_device(sub, host))
-        del sub
-    combined = _concat_batches(host_batches, float(getattr(train_config, "adv_clip", 0.0)))
+    adv_clip = float(getattr(train_config, "adv_clip", 0.0))
+    # P5: one frozen-opponent model cache for the WHOLE update — pool
+    # membership is frozen across it (the caller snapshots after
+    # trainer.update), so each member builds once instead of once per
+    # sub-rollout. Dies with this call; bounded at pool capacity (~8 models,
+    # ~0.5GB — the same worst case a single sub-rollout already reaches).
+    # NOT the reverted cross-update opponent cache (that one persisted
+    # across updates and grew).
+    snapshot_cache: dict[int, ActorCritic] = {}
+
+    if _legacy_staging:
+        # Reference path (test-only): finalize each sub to the learner device,
+        # evacuate to host, torch.cat, global renorm inside _concat_batches.
+        host_batches: list[Batch] = []
+        for cfg in configs:
+            sub = collect_rollout_batched(
+                learner, pool, cfg, sub_config, rng, critic=critic,
+                snapshot_cache=snapshot_cache,
+            )
+            host_batches.append(_batch_to_device(sub, host))
+            del sub
+        combined = _concat_batches(host_batches, adv_clip)
+        subs: list[Batch] = host_batches
+    else:
+        # P7+P8 shared staging: one big host buffer, per-sub views, chained
+        # bases. Capacity per sub uses the collector's own formula (asserted
+        # inside it); total = worst case of every sub filling to cap.
+        n_sub_envs = sub_config.num_envs
+        sub_cap = sub_config.rollout_length + n_sub_envs * POOL_SLACK_PER_ENV
+        total_cap = n * sub_cap
+        hole_count = configs[0].hole_count
+        assert all(c.hole_count == hole_count for c in configs), (
+            "mixed hole widths across mix-configs are unsupported"
+        )
+        obs_dim = OBS_DIM_NLH if configs[0].variant == "nlh_single" else OBS_DIM
+        # Same pin gate as the collector's own slabs (default OFF — see the
+        # pinning-tax comment there); pinning one big buffer instead of N
+        # small ones is otherwise equivalent.
+        _pin = (
+            device.type == "cuda"
+            and os.environ.get("PLO5BP_PIN_ROLLOUT", "0") == "1"
+        )
+        _pinned_keepalive: list[torch.Tensor] = []
+
+        def _alloc(shape, np_dtype, torch_dtype):
+            if _pin:
+                t = torch.empty(shape, dtype=torch_dtype, pin_memory=True)
+                _pinned_keepalive.append(t)
+                return t.numpy()
+            return np.empty(shape, dtype=np_dtype)
+
+        big = {
+            "obs": _alloc((total_cap, obs_dim), np.float32, torch.float32),
+            "gm": _alloc((total_cap, GATE_ACTIONS), bool, torch.bool),
+            "ga": _alloc(total_cap, np.int64, torch.int64),
+            "rc": _alloc(total_cap, np.int64, torch.int64),
+            "sz": _alloc((total_cap, 4), np.int64, torch.int64),
+            "an": _alloc(total_cap, np.int64, torch.int64),
+            "ru": _alloc(total_cap, np.float32, torch.float32),
+            "oh": _alloc((total_cap, 5, hole_count), np.uint8, torch.uint8),
+            "lp": _alloc(total_cap, np.float32, torch.float32),
+            "glp": _alloc(total_cap, np.float32, torch.float32),
+            "alp": _alloc(total_cap, np.float32, torch.float32),
+            "v": _alloc(total_cap, np.float32, torch.float32),
+            "ret": _alloc(total_cap, np.float32, torch.float32),
+            "adv": _alloc(total_cap, np.float32, torch.float32),
+        }
+        subs = []
+        base = 0
+        for cfg in configs:
+            views = {key: arr[base : base + sub_cap] for key, arr in big.items()}
+            sub = collect_rollout_batched(
+                learner, pool, cfg, sub_config, rng,
+                critic=critic, out_slabs=views,
+                snapshot_cache=snapshot_cache,
+            )
+            rows = sub.obs.shape[0]
+            # Chain the next sub's base to this sub's actual row count so the
+            # buffer's first `total` rows reproduce torch.cat's layout exactly.
+            assert rows <= sub_cap and base + rows <= total_cap, (
+                f"shared-staging overflow: base={base} rows={rows} "
+                f"sub_cap={sub_cap} total_cap={total_cap}"
+            )
+            subs.append(sub)
+            base += rows
+        total = base
+
+        def _t(key: str) -> torch.Tensor:
+            return torch.from_numpy(big[key][:total])
+
+        adv = _t("adv")
+        if n > 1:
+            # Global advantage re-normalization — the identical ops
+            # _concat_batches applies (and, like it, skipped when there is
+            # only one sub-rollout).
+            adv = (adv - adv.mean()) / adv.std().clamp(min=1e-8)
+            if adv_clip > 0.0:
+                adv = adv.clamp(-adv_clip, adv_clip)
+
+        def _sum3(field: str) -> tuple[int, int, int]:
+            vals = [int(sum(getattr(b, field)[i] for b in subs)) for i in range(3)]
+            return (vals[0], vals[1], vals[2])
+
+        combined = Batch(
+            obs=_t("obs"),
+            gate_masks=_t("gm"),
+            gate_actions=_t("ga"),
+            raise_chips=_t("rc"),
+            sizing=_t("sz"),
+            anchor_actions=_t("an"),
+            refine_u=_t("ru"),
+            opp_holes=_t("oh"),
+            log_probs=_t("lp"),
+            values=_t("v"),
+            returns=_t("ret"),
+            advantages=adv,
+            old_gate_logp=_t("glp"),
+            old_anchor_logp=_t("alp"),
+            aggr_bonus_total_bb=float(sum(b.aggr_bonus_total_bb for b in subs)),
+            aggr_steps_total=int(sum(b.aggr_steps_total for b in subs)),
+            aggr_bonus_steps=int(sum(b.aggr_bonus_steps for b in subs)),
+            aggr_steps_total_by_street=_sum3("aggr_steps_total_by_street"),
+            aggr_bonus_steps_by_street=_sum3("aggr_bonus_steps_by_street"),
+        )
+
     if config_tiers is not None:
         if tier_ent is not None:
             combined.ent_coef_rows = torch.cat([
@@ -1738,10 +2012,10 @@ def collect_rollout_multiconfig(
                     float(tier_ent[t]),
                     dtype=torch.float32,
                 )
-                for b, t in zip(host_batches, config_tiers)
+                for b, t in zip(subs, config_tiers)
             ])
         ftr: dict[str, tuple[list[int], list[int]]] = {}
-        for b, t in zip(host_batches, config_tiers):
+        for b, t in zip(subs, config_tiers):
             bonus, steps = ftr.setdefault(t, ([0, 0, 0], [0, 0, 0]))
             for s in range(3):
                 bonus[s] += int(b.aggr_bonus_steps_by_street[s])

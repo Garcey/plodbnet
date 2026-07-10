@@ -229,6 +229,36 @@ def test_apply_anneal_control_step_and_tiers():
     assert ent2 == ent and entd2 == entd
 
 
+def test_apply_anneal_control_ignores_wrong_shape_json():
+    # C1: valid JSON that is NOT a dict (or whose tier_ent is not a dict) must be
+    # ignored like malformed JSON, not crash the trainer. Pre-fix, ctrl.get() /
+    # .items() on a non-dict raised AttributeError, which the except clause did
+    # not catch and bare main() propagated — killing the live run within one
+    # update of the bad save. Each case returns every field unchanged, no raise.
+    apply = train._apply_anneal_control
+    base = {"clubgg": 0.09, "deep": 0.15}
+    step0, lr0, ent0, entd0 = 0.002, 3e-4, 0.40, 0.45
+
+    for bad in (
+        '[{"lr": 0.0001}]',              # top-level list (crashed at ctrl.get)
+        '"0.003"',                       # top-level string (crashed at ctrl.get)
+        '0.003',                         # top-level number (was TypeError-safe)
+        'true',                          # top-level bool
+        'null',                          # top-level null
+        '{"tier_ent": ["deep", 0.08]}',  # non-dict tier_ent (crashed at .items)
+        '{"tier_ent": "deep"}',          # str tier_ent (crashed at .items)
+    ):
+        tier_ent = dict(base)
+        step, last, lr, ent, entd = apply(
+            bad, None, tier_ent, step0, lr0, ent0, entd0
+        )
+        # Ignored: every field unchanged, content NOT marked applied (retries).
+        assert step == step0, bad
+        assert last is None, bad
+        assert lr == lr0 and ent == ent0 and entd == entd0, bad
+        assert tier_ent == base, bad
+
+
 def test_default_tolerance_and_start_update_flags():
     """The argparse defaults match the documented anneal behavior."""
     import re

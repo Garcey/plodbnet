@@ -50,8 +50,13 @@ class PPOStats:
     anchor_entropy: float = 0.0
     beta_entropy: float = 0.0
     # Per-head KL decomposition (v2 only): gate_kl + anchor_kl + beta_kl
-    # == approx_kl by construction. Diagnostics for which head drives
-    # drift. Zero on v1.
+    # == approx_kl by construction, ALL per-batch means (C4, 2026-07-10:
+    # anchor_kl was a per-RAISE-ROW mean, which contaminated the derived
+    # beta_kl with weight (1/B - 1/n_raise) — anchor drift read as a
+    # strongly NEGATIVE klB and a ~3x-overstated klA at a 33% raise
+    # fraction). Diagnostics for which head drives drift. Zero on v1.
+    # NOTE: klA on the log line reads ~3x SMALLER than in pre-2026-07-10
+    # logs (vFour/vFive/early-vSix eras) — same drift, new normalization.
     gate_kl: float = 0.0
     anchor_kl: float = 0.0
     beta_kl: float = 0.0
@@ -607,10 +612,15 @@ class PPOTrainer:
                             if self.head_version >= 2:
                                 gate_kl = (mb.old_gate_logp - gate_lp_new).mean()
                                 raise_m = (mb.gate_actions == GATE_RAISE)
-                                denom_r = raise_m.sum().clamp(min=1)
+                                # C4: batch-mean normalization (sum/B, matching
+                                # gate_kl and kl) so klG+klA+klB is a true
+                                # additive decomposition — sum/n_raise made the
+                                # derived klB absorb the anchor term with
+                                # negative weight. See PPOStats for the
+                                # log-scale note vs pre-2026-07-10 runs.
                                 anchor_kl = (
                                     (mb.old_anchor_logp - anchor_lp_new) * raise_m
-                                ).sum() / denom_r
+                                ).sum() / raise_m.numel()
                                 beta_kl = kl - gate_kl - anchor_kl
 
                     # KL guard: checked BEFORE the optimizer step so the

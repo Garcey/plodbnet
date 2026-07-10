@@ -470,6 +470,54 @@ def _sample_game_config(
     return cfg, effective_stack_dist
 
 
+# ---- --v6 preset (C2) ------------------------------------------------------
+# attr -> (legacy_default, v6_value). The covered flags use default=None
+# sentinels in argparse so "flag not passed" is distinguishable from
+# "explicitly passed at the default value" — the old parser.get_default
+# comparison could not tell those apart and silently overrode explicit
+# ablation flags (`--v6 --advantage-estimator gae` trained vrpo;
+# `--v6 --q-aux-coef 0` trained the Q head at 0.5). TrainingConfig dataclass
+# defaults are deliberately NOT the mechanism (breaks live stems + parity).
+_V6_PRESET: "dict[str, tuple[object, object]]" = {
+    "sizing_head": ("anchor", "mixture"),
+    "advantage_estimator": ("gae", "vrpo"),
+    "q_aux_coef": (0.0, 0.5),
+    # 2026-07-09 Q-head audit revision: pooled raise column + dense fold
+    # supervision (fold forward-return == 0, free labels) so the VRPO Q
+    # surface can actually calibrate; adv_head is AGC-exempt (ppo.py).
+    "q_pooled": (False, True),
+    "q_fold_sup_coef": (0.0, 1.0),
+    "torso_norm": (False, True),
+    "l2_init_coef": (0.0, 1e-4),
+    "agc_clip": (0.0, 0.1),
+    "grad_checkpoint": (False, True),
+    "value_bins": (0, 51),
+    "clip_prob_dependent": (False, True),
+}
+
+
+def _apply_v6_preset(args) -> "tuple[dict, dict]":
+    """Resolve the None-sentinel flags covered by the --v6 preset.
+
+    None (flag not passed) -> the v6 value when --v6 is on, else the legacy
+    default. Any non-None value was passed EXPLICITLY — even one equal to a
+    default — and always wins ("your flags win", including the --no-<flag>
+    boolean forms). Runs on EVERY invocation; non-v6 runs just get the
+    legacy defaults filled in. Returns (applied, kept_overrides) for the
+    launch log. Tests: tests/python/test_v6_preset.py."""
+    applied: dict = {}
+    kept: dict = {}
+    for attr, (legacy_default, v6_value) in _V6_PRESET.items():
+        cur = getattr(args, attr)
+        if cur is None:
+            setattr(args, attr, v6_value if args.v6 else legacy_default)
+            if args.v6:
+                applied[attr] = v6_value
+        elif args.v6:
+            kept[attr] = cur
+    return applied, kept
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-updates", type=int, default=100_000_000)
@@ -484,7 +532,7 @@ def main() -> None:
     parser.add_argument(
         "--sizing-head",
         choices=["anchor", "logistic", "mixture"],
-        default="anchor",
+        default=None,  # C2 sentinel — resolved by _apply_v6_preset (legacy "anchor")
         help="Sizing-head architecture. 'anchor' = v2 flat 11-way categorical "
         "(head_version 2). 'logistic' = v4 ordinal discretized-logistic over the "
         "same 11 anchors (head_version 3): location+scale, stable under PPO, with "
@@ -510,7 +558,7 @@ def main() -> None:
     parser.add_argument(
         "--q-aux-coef",
         type=float,
-        default=0.0,
+        default=None,  # C2 sentinel — resolved by _apply_v6_preset (legacy 0.0)
         help="Coefficient for the critic's auxiliary Q(s,a) regression "
         "(dueling head, v5 stems). 0 = head exists (mixture runs) but "
         "untrained; the Expected-SARSA advantage flip (VRPO, W2.5) needs "
@@ -518,7 +566,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--q-pooled",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,  # C2 sentinel — resolved by _apply_v6_preset (legacy False)
         help="Pool the dueling head's per-anchor raise columns into ONE "
         "raise column (q_actions=3: Fold/CheckCall/Raise). 2026-07-09 Q-head "
         "audit: the 11 anchor columns saw ~3%% of rows each and dominated "
@@ -529,7 +578,7 @@ def main() -> None:
     parser.add_argument(
         "--q-fold-sup-coef",
         type=float,
-        default=0.0,
+        default=None,  # C2 sentinel — resolved by _apply_v6_preset (legacy 0.0)
         help="Dense fold-column supervision weight inside the q-aux loss: "
         "fold's forward return is EXACTLY 0 (per-step-cost rewards, sunk "
         "chips excluded), so q[FOLD] regresses to 0 on every fold-LEGAL "
@@ -538,7 +587,7 @@ def main() -> None:
     parser.add_argument(
         "--advantage-estimator",
         choices=["gae", "vrpo"],
-        default="gae",
+        default=None,  # C2 sentinel — resolved by _apply_v6_preset (legacy "gae")
         help="Policy-gradient advantage estimator. 'gae' (default) = V-based "
         "GAE(lambda), unchanged. 'vrpo' = Expected-SARSA(lambda) off the "
         "critic's dueling Q head (VRPO, Fan & Farina 2026; V5_DESIGN.md W2.5) "
@@ -548,7 +597,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--torso-norm",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,  # C2 sentinel — resolved by _apply_v6_preset (legacy False)
         help="Insert pre-activation LayerNorm into the residual torso of BOTH "
         "actor and critic (v6 plasticity, V6_RESEARCH.md #4). Fresh stem only "
         "(not function-preserving; needs --num-layers>=3). Pair with "
@@ -557,7 +607,7 @@ def main() -> None:
     parser.add_argument(
         "--l2-init-coef",
         type=float,
-        default=0.0,
+        default=None,  # C2 sentinel — resolved by _apply_v6_preset (legacy 0.0)
         help="Weight-decay-to-init coefficient: L2 penalty pulling the trunk "
         "weight matrices toward their run-start values (the required companion "
         "for --torso-norm). 0 = off.",
@@ -572,21 +622,22 @@ def main() -> None:
     parser.add_argument(
         "--agc-clip",
         type=float,
-        default=0.0,
+        default=None,  # C2 sentinel — resolved by _apply_v6_preset (legacy 0.0)
         help="Stateless per-tensor adaptive gradient-clip coefficient (NFNet "
         "AGC): clip each param's grad to agc_clip*||param||. 0 = off; "
         "rollback-safe (no running state).",
     )
     parser.add_argument(
         "--grad-checkpoint",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,  # C2 sentinel — resolved by _apply_v6_preset (legacy False)
         help="Recompute torso activations in backward (identical math, less "
         "memory) to buy back rollout headroom. Trains slower per step.",
     )
     parser.add_argument(
         "--value-bins",
         type=int,
-        default=0,
+        default=None,  # C2 sentinel — resolved by _apply_v6_preset (legacy 0)
         help="Distributional/HL-Gauss critic value head with this many bins "
         "over a symlog support (V6 keystone). 0 = scalar MSE head (default). "
         "Try 51. Fresh critic value head on warm-start.",
@@ -614,7 +665,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--clip-prob-dependent",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,  # C2 sentinel — resolved by _apply_v6_preset (legacy False)
         help="v6 probability-dependent GATE clip (Over-mixing §6, generalized "
         "Clip-Higher): widen the clip band for RARE gate actions (fast recovery "
         "of a suppressed-but-correct check/bet) and tighten it near 50/50 (less "
@@ -650,7 +702,9 @@ def main() -> None:
         "mixture, advantage-estimator vrpo + q-aux, torso LayerNorm + l2-init, "
         "distributional value head, AGC, grad-checkpoint, probability-dependent "
         "gate clip). Sets each only where you did NOT pass it explicitly (your "
-        "flags win); prints the resolved set. Fresh cold-start stem (not "
+        "flags win — INCLUDING flags passed at their default value, and the "
+        "booleans accept --no-<flag> to force a feature off under --v6); "
+        "prints the resolved set. Fresh cold-start stem (not "
         "function-preserving). Use for v6 launches so no feature is silently "
         "left off (cf. the 2048x4 rule in CLAUDE.md).",
     )
@@ -1082,35 +1136,14 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # --v6 preset: turn the whole v6 feature kit on together, but only where the
-    # user did NOT pass the flag explicitly (compared against the parser default;
-    # explicit flags win). Prints the resolved set so nothing is silently on/off.
+    # --v6 preset resolution (C2): sentinel defaults + _apply_v6_preset (module
+    # level, above main) — explicit flags win FOR REAL now, including ones
+    # passed at their default value and the --no-<flag> boolean forms (the old
+    # parser.get_default comparison couldn't see "explicitly passed the
+    # default" and silently overrode ablation flags). Runs on every
+    # invocation; non-v6 runs just get the legacy defaults filled in.
+    _v6_applied, _v6_kept = _apply_v6_preset(args)
     if args.v6:
-        _v6_preset = {
-            "sizing_head": "mixture",
-            "advantage_estimator": "vrpo",
-            "q_aux_coef": 0.5,
-            # 2026-07-09 Q-head audit revision: pooled raise column + dense
-            # fold supervision (fold forward-return == 0, free labels) so the
-            # VRPO Q surface can actually calibrate; adv_head is also AGC-
-            # exempt now (ppo.py). See the audit notes in TrainingConfig.
-            "q_pooled": True,
-            "q_fold_sup_coef": 1.0,
-            "torso_norm": True,
-            "l2_init_coef": 1e-4,
-            "agc_clip": 0.1,
-            "grad_checkpoint": True,
-            "value_bins": 51,
-            "clip_prob_dependent": True,
-        }
-        _v6_applied: dict = {}
-        _v6_kept: dict = {}
-        for _k, _v in _v6_preset.items():
-            if getattr(args, _k) == parser.get_default(_k):
-                setattr(args, _k, _v)
-                _v6_applied[_k] = _v
-            else:
-                _v6_kept[_k] = getattr(args, _k)
         print(f"[v6] preset ON - applied: {_v6_applied}")
         if _v6_kept:
             print(f"[v6] kept your explicit overrides: {_v6_kept}")
@@ -1635,6 +1668,28 @@ def main() -> None:
         global_idx = base_update + update_idx
         game_cfg_snap = sampled_game_cfg.__dict__
         mid_path = args.checkpoint.with_name(f"{args.checkpoint.stem}_{global_idx}.pt")
+        if (
+            args.load_checkpoint is not None
+            and mid_path.resolve() == Path(args.load_checkpoint).resolve()
+        ):
+            # C3 (narrowed after adversarial review): never overwrite THE
+            # checkpoint this run warm-started from. An anneal-ON resume
+            # continues the loop counter from the restored update, so its first
+            # iteration lands back on the loaded file's own grid index — saving
+            # would rewrite the exact restore point just loaded with weights
+            # carrying one extra PPO update (either cadence branch can fire),
+            # destroying the clean-recovery file the collapse playbook depends
+            # on. Skip; the next cadence tick writes a fresh number. Guarding
+            # ONLY the loaded file (not blanket write-once) preserves
+            # last-write-wins for every legitimate collision: orchestrations
+            # that re-run a phase from a fixed source must refresh their
+            # outputs, and an anneal-ON resume must checkpoint its new lineage
+            # over the old segment's later files.
+            print(
+                f"[ckpt] skip: {mid_path.name} is this run's warm-start source "
+                "(never overwritten)"
+            )
+            return
         mid_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
