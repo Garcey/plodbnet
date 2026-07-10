@@ -179,6 +179,13 @@ def _apply_anneal_control(
         return step, last_raw, live_lr, live_ent, live_ent_deep
     try:
         ctrl = json.loads(raw)
+        if not isinstance(ctrl, dict):
+            # C1: valid JSON but not an object (a list, bare string, or number
+            # from a live-tune typo). The except below catches decode + scalar
+            # errors, but ctrl.get()/.items() on a non-dict raises AttributeError,
+            # which was NOT caught → the live trainer crashed within one update of
+            # the bad save. Treat as malformed and ignore, per the docstring.
+            return step, last_raw, live_lr, live_ent, live_ent_deep
         new_step = float(ctrl["step"]) if "step" in ctrl else step
         new_tiers = {
             tier: float(v)
@@ -203,7 +210,9 @@ def _apply_anneal_control(
             if "entropy_coef_deep" in ctrl
             else None
         )
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, AttributeError):
+        # AttributeError backstop: a non-dict `tier_ent` value (e.g.
+        # {"tier_ent": ["deep", 0.08]}) makes .items() raise; ignore it too.
         return step, last_raw, live_lr, live_ent, live_ent_deep
     if new_step != step:
         print(f"[anneal-control] step {step} -> {new_step}")
@@ -506,6 +515,25 @@ def main() -> None:
         "(dueling head, v5 stems). 0 = head exists (mixture runs) but "
         "untrained; the Expected-SARSA advantage flip (VRPO, W2.5) needs "
         "it warmed first.",
+    )
+    parser.add_argument(
+        "--q-pooled",
+        action="store_true",
+        help="Pool the dueling head's per-anchor raise columns into ONE "
+        "raise column (q_actions=3: Fold/CheckCall/Raise). 2026-07-09 Q-head "
+        "audit: the 11 anchor columns saw ~3%% of rows each and dominated "
+        "the VRPO advantage noise; pooling gives the raise Q 11x the "
+        "training density. Warm-starting across widths drops adv_head to "
+        "fresh zero-init (Q==V; VRPO==GAE until retrained).",
+    )
+    parser.add_argument(
+        "--q-fold-sup-coef",
+        type=float,
+        default=0.0,
+        help="Dense fold-column supervision weight inside the q-aux loss: "
+        "fold's forward return is EXACTLY 0 (per-step-cost rewards, sunk "
+        "chips excluded), so q[FOLD] regresses to 0 on every fold-LEGAL "
+        "row — free perfect labels, ~3x the fold-column data. 0 = off.",
     )
     parser.add_argument(
         "--advantage-estimator",
@@ -1036,9 +1064,21 @@ def main() -> None:
         default=0,
         help="Torch intra-op thread count for host-side rollout/post-rollout CPU "
         "work. The _concat_batches staging copy is memory-bandwidth-bound and runs "
-        "~5x slower at the 192-thread default (NUMA oversubscription); ~8-32 is "
-        "optimal. 0 = torch default / OMP_NUM_THREADS. Applies on cpu AND cuda; "
-        "also live-tunable via runs/threads.txt.",
+        "~5x slower at the 192-thread default (host cores oversubscribing the "
+        "pod's ~40-vCPU quota); ~8-32 is optimal. 0 = OMP_NUM_THREADS if set, "
+        "else min(32, cpu_count) on CUDA / torch default on CPU. Applies on cpu "
+        "AND cuda; also live-tunable via runs/threads.txt.",
+    )
+    parser.add_argument(
+        "--rayon-threads",
+        type=int,
+        default=0,
+        help="Thread count for the Rust engine's rayon pool (opp-outcome MC + "
+        "obs encoder — the bulk of the update). Rayon otherwise defaults to the "
+        "host's ~192 logical cores, oversubscribing the pod's ~40-vCPU quota "
+        "~4.7x. 0 = leave rayon's default / any pre-set RAYON_NUM_THREADS "
+        "untouched. UNMEASURED: A/B 32/40/48 (lead 40 = the quota) on a throwaway "
+        "run; changes no training numbers (per-env deterministic MC seeds).",
     )
     args = parser.parse_args()
 
@@ -1050,6 +1090,12 @@ def main() -> None:
             "sizing_head": "mixture",
             "advantage_estimator": "vrpo",
             "q_aux_coef": 0.5,
+            # 2026-07-09 Q-head audit revision: pooled raise column + dense
+            # fold supervision (fold forward-return == 0, free labels) so the
+            # VRPO Q surface can actually calibrate; adv_head is also AGC-
+            # exempt now (ppo.py). See the audit notes in TrainingConfig.
+            "q_pooled": True,
+            "q_fold_sup_coef": 1.0,
             "torso_norm": True,
             "l2_init_coef": 1e-4,
             "agc_clip": 0.1,
@@ -1160,14 +1206,71 @@ def main() -> None:
     # ~8-32-thread optimum (NUMA oversubscription; profiled 2026-07-08). Honor
     # --cpu-threads, else OMP_NUM_THREADS, regardless of device.
     _cpu_threads = int(args.cpu_threads or 0)
+    _thread_src = "--cpu-threads" if _cpu_threads > 0 else ""
     if _cpu_threads <= 0:
         omp_env = os.environ.get("OMP_NUM_THREADS", "").strip()
         if omp_env.isdigit() and int(omp_env) > 0:
             _cpu_threads = int(omp_env)
+            _thread_src = "OMP_NUM_THREADS"
+    if _cpu_threads <= 0 and args.device == "cuda":
+        # P4: nothing specified on a CUDA run — apply the measured quota-safe
+        # default (32) instead of leaving torch at the host's physical-core count
+        # (~192 on the pod). The pod's ~40-vCPU cgroup quota then ~4.7x
+        # oversubscribes that, and the memory-bandwidth-bound _concat_batches copy
+        # ran ~5x slower (36s@192 vs 6.9s@32, profiled 2026-07-08). min() keeps a
+        # smaller CUDA box sane. Override via --cpu-threads / OMP_NUM_THREADS /
+        # runs/threads.txt. Thread count changes no training numbers; CPU-only
+        # runs are left alone (their compute IS on the CPU pool).
+        _cpu_threads = min(32, os.cpu_count() or 32)
+        _thread_src = "cuda default (P4)"
     if _cpu_threads > 0:
         torch.set_num_threads(_cpu_threads)
     current_threads = torch.get_num_threads()
-    print(f"[threads] initial torch threads = {current_threads}")
+    print(
+        f"[threads] initial torch threads = {current_threads}"
+        + (f" (via {_thread_src})" if _thread_src else "")
+    )
+    if args.device == "cuda" and current_threads > 64:
+        print(
+            f"[threads] WARNING: {current_threads} torch threads on a CUDA run "
+            "oversubscribes the pod's ~40-vCPU quota; the host-side rollout + "
+            "_concat_batches copy is memory-bandwidth-bound and ~5x slower wide. "
+            "Pass --cpu-threads 32 (or edit runs/threads.txt) unless deliberate."
+        )
+
+    # P12: cap the Rust engine's rayon pool (opp-outcome MC + obs encoder). Rayon
+    # reads RAYON_NUM_THREADS lazily at its first par_iter (the first rollout,
+    # after this startup), so setting it here takes effect; Python os.environ
+    # writes reach Rust's std::env in-process. Default 0 leaves rayon's default /
+    # any pre-set env untouched (byte-identical). Thread count changes no training
+    # numbers (per-env deterministic outcome_seed + disjoint-row par writes).
+    # UNMEASURED — A/B 32/40/48 vs unset on a throwaway run before trusting one.
+    if int(args.rayon_threads or 0) > 0:
+        os.environ["RAYON_NUM_THREADS"] = str(int(args.rayon_threads))
+        print(
+            f"[threads] rayon threads -> {int(args.rayon_threads)} "
+            "(via --rayon-threads)"
+        )
+    else:
+        _rayon_env = os.environ.get("RAYON_NUM_THREADS", "").strip()
+        print(
+            "[threads] rayon threads = "
+            + (
+                f"{_rayon_env} (via RAYON_NUM_THREADS env)"
+                if _rayon_env.isdigit()
+                else "default (~host logical cores)"
+            )
+        )
+
+    # P13: disable torch.distributions argument/support validation process-wide.
+    # Each Categorical/Beta construct + log_prob otherwise runs constraint checks
+    # ending in `.all()` -> bool() on a CUDA tensor = a forced stream sync; ~7-9
+    # per act() x ~50-100k act() calls/update land on the CPU-bound collection
+    # path (GPU ~86% idle). Validation is read-only, so outputs/samples/RNG are
+    # byte-identical (the test suite keeps validation ON and still passes). A NaN
+    # logit, formerly caught here, now surfaces at the policy/value-loss NaN
+    # asserts a few lines downstream.
+    torch.distributions.Distribution.set_default_validate_args(False)
 
     seats_choices = _parse_seats_range(args.num_seats_range)
     stack_lo, stack_hi = _parse_stack_range(args.stack_range)
@@ -1199,6 +1302,8 @@ def main() -> None:
         adv_clip=args.adv_clip,
         value_clip=args.value_clip,
         q_aux_coef=args.q_aux_coef,
+        q_pooled=args.q_pooled,
+        q_fold_sup_coef=args.q_fold_sup_coef,
         advantage_estimator=args.advantage_estimator,
         torso_layernorm=args.torso_norm,
         l2_init_coef=args.l2_init_coef,
@@ -1243,7 +1348,12 @@ def main() -> None:
     # v5 stems build the critic WITH the dueling Q head from day one
     # (zero-init; Q == V until --q-aux-coef trains it) so the VRPO
     # advantage flip later is a code change, not a checkpoint break.
-    critic_q_actions = 2 + anchor_spec.count if args.sizing_head == "mixture" else 0
+    # --q-pooled collapses the per-anchor raise columns to one (audit
+    # 2026-07-09: 11 starving columns dominated the VRPO noise).
+    if args.sizing_head == "mixture":
+        critic_q_actions = 3 if args.q_pooled else 2 + anchor_spec.count
+    else:
+        critic_q_actions = 0
     if args.torso_norm and args.l2_init_coef <= 0.0:
         print(
             "[warn] --torso-norm without --l2-init-coef>0: LayerNorm-solo can "
@@ -1342,7 +1452,33 @@ def main() -> None:
                 "This checkpoint was trained with a different gate-head width and cannot be warm-started."
             )
         model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt)
-        critic.load_state_dict(ckpt["critic"])
+        crit_sd = ckpt["critic"]
+        ck_adv = crit_sd.get("adv_head.weight")
+        if (
+            critic.q_actions > 0
+            and ck_adv is not None
+            and tuple(ck_adv.shape) != tuple(critic.adv_head.weight.shape)
+        ):
+            # Dueling-head width changed (e.g. --q-pooled 13->3): keep the
+            # torso + value head, drop the old adv_head — it re-enters at
+            # zero-init, so Q == V and the VRPO advantage is exactly GAE
+            # until the (pooled) head retrains. Everything else is strict.
+            crit_sd = {
+                k: v for k, v in crit_sd.items()
+                if not k.startswith("adv_head.")
+            }
+            missing, unexpected = critic.load_state_dict(crit_sd, strict=False)
+            assert not unexpected, f"unexpected critic keys: {unexpected}"
+            assert all(k.startswith("adv_head.") for k in missing), (
+                f"non-adv_head keys missing from checkpoint critic: {missing}"
+            )
+            print(
+                f"[q-pooled] checkpoint adv_head {tuple(ck_adv.shape)} != "
+                f"built {tuple(critic.adv_head.weight.shape)} — dropped; "
+                "fresh zero-init head (Q==V; VRPO==GAE until retrained)"
+            )
+        else:
+            critic.load_state_dict(crit_sd)
         prior_game = ckpt.get("game_config")
         print(f"warm-started from {args.load_checkpoint} (prior game_config: {prior_game})")
         restored_update = ckpt.get("update_counter")
@@ -1585,10 +1721,11 @@ def main() -> None:
         if stop_requested["flag"]:
             break
 
-        # Live thread-count adjustment: edit runs/threads.txt to
-        # change torch's intra-op threadpool without restarting the
-        # run. Malformed reads are ignored. CUDA runs skip this —
-        # set_num_threads is a CPU-pool concept.
+        # Live thread-count adjustment: edit runs/threads.txt to change
+        # torch's intra-op threadpool without restarting the run. Malformed
+        # reads are ignored. Applies on CUDA too — the whole rollout +
+        # _concat_batches copy is CPU-side even when the learner is on GPU
+        # (8becc82 de-gated it; the cap matters MOST on CUDA).
         if threads_file.exists():
             try:
                 desired = int(threads_file.read_text().strip())
@@ -1839,6 +1976,21 @@ def main() -> None:
                     )
                 print("        [ftr-tier] " + "  ".join(parts))
 
+            # P11 measurement: peak GPU memory over this log window. `del batch`
+            # (below) frees the prior update's batch before the next collection
+            # allocates its own, removing the collect-end 2x-batch spike; this
+            # line shows where the true per-update peak now lands so the rollout
+            # can be grown to fit. Bit-exact — reporting only.
+            if args.device == "cuda":
+                _peak_alloc = torch.cuda.max_memory_allocated() / (1024 ** 3)
+                _peak_resv = torch.cuda.max_memory_reserved() / (1024 ** 3)
+                print(
+                    f"        [vram] peak alloc={_peak_alloc:.1f} GiB  "
+                    f"reserved={_peak_resv:.1f} GiB  "
+                    f"(rollout={batch.obs.shape[0]:,} rows)"
+                )
+                torch.cuda.reset_peak_memory_stats()
+
         # End-of-block entropy anneal: this tier's 50-update block just finished.
         if blocks and args.anneal_entropy and (update + 1) % args.block_size == 0:
             if not _anneal_due(update, args.block_size, args.anneal_start_update):
@@ -1879,6 +2031,16 @@ def main() -> None:
                     f"base={base_str} -> {action} ent={new_ent:.4f}"
                 )
             block_acc = {"bonus_steps": [0, 0, 0], "steps": [0, 0, 0], "tier": None}
+
+        # P11: drop this update's ~45GB batch (all fields on CUDA) now that its
+        # last reads (the log/anneal blocks above) are done. Python otherwise
+        # keeps `batch` bound until the next iteration's `batch = collect_...`
+        # RHS finishes — i.e. through the whole next collection — so the old and
+        # new batches sit co-resident (the 2x-batch VRAM peak = the measured
+        # 78GiB@10M ceiling). Freeing here lets the caching allocator reuse the
+        # blocks for the next collection. Bit-exact: nothing reads `batch` after
+        # this point (the final save uses model/critic only).
+        del batch
 
         update += 1
 

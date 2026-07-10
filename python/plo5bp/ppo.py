@@ -28,7 +28,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.profiler import record_function
 
-from plo5bp.actions import GATE_RAISE
+from plo5bp.actions import GATE_FOLD, GATE_RAISE
 from plo5bp.config import TrainingConfig
 from plo5bp.network import ActorCritic, CentralCritic, opp_holes_multihot
 from plo5bp.rollout import Batch, iter_minibatches
@@ -200,6 +200,15 @@ class PPOTrainer:
         # Stateless adaptive gradient clipping (NFNet AGC), per-tensor; 0 = off.
         # No running state → nothing for the kl_hard rollback to restore.
         self._agc_clip = float(getattr(config, "agc_clip", 0.0))
+        # AGC EXEMPTS the dueling adv_head (NFNet practice excludes final
+        # layers): the head starts zero-init, so clip×‖W‖ rate-limits exactly
+        # the head that must chase a moving trunk to stay calibrated
+        # (2026-07-09 Q-head audit: fold-column error GREW 150→200 while the
+        # head norm crawled). The split clip_grad_norm_ below still bounds it.
+        self._agc_params = params
+        if critic is not None and getattr(critic, "q_actions", 0) > 0:
+            _adv_ids = {id(p) for p in critic.adv_head.parameters()}
+            self._agc_params = [p for p in params if id(p) not in _adv_ids]
         # v6 probability-dependent gate clip (Over-mixing §6). Widens the clip
         # band for rare gate actions, narrows it near 50/50; keyed on the gate's
         # OLD prob (old_gate_logp) so the sizing menu isn't over-loosened. Off =
@@ -256,6 +265,10 @@ class PPOTrainer:
         # stems). Only wired when the critic actually HAS the head; the
         # coef gates training (0 = head stays zero-init).
         self._q_aux_coef = float(getattr(config, "q_aux_coef", 0.0))
+        # Dense fold-column supervision (see TrainingConfig.q_fold_sup_coef):
+        # fold's forward return is exactly 0, so q[..., GATE_FOLD] gets a
+        # perfect-label MSE on every fold-LEGAL row, weighted into q_loss.
+        self._q_fold_sup = float(getattr(config, "q_fold_sup_coef", 0.0))
         self._critic_qv = (
             critic.q_values
             if critic is not None and getattr(critic, "q_actions", 0) > 0
@@ -333,6 +346,36 @@ class PPOTrainer:
         hi = 1.0 + r_over_p
         lo = (1.0 - r_over_p).clamp_min(0.0)
         return lo, hi
+
+    def _q_index(self, mb: Batch, q_all: torch.Tensor) -> torch.Tensor:
+        """Column of the TAKEN action in the dueling head's layout. Pooled
+        3-column heads (q_pooled) index by gate directly (GATE_RAISE == 2);
+        per-anchor heads use 2 + anchor for raises. Keyed on the Q tensor's
+        WIDTH so 13-column checkpoints keep training unchanged."""
+        if q_all.shape[-1] == 3:
+            return mb.gate_actions
+        return torch.where(
+            mb.gate_actions == GATE_RAISE,
+            2 + mb.anchor_actions,
+            mb.gate_actions,
+        )
+
+    def _q_fold_sup_term(
+        self, mb: Batch, q_all: torch.Tensor, q_loss: torch.Tensor
+    ) -> torch.Tensor:
+        """Dense fold-column supervision (TrainingConfig.q_fold_sup_coef):
+        fold's forward return is exactly 0 (per-step-cost rewards, sunk
+        chips excluded), so q[..., GATE_FOLD] takes a perfect-label MSE on
+        every fold-LEGAL row — not just the ones where fold was taken.
+        The bool mask is lifted to f32 so the reduction stays fp32 under
+        autocast (562k-row sums are garbage in bf16)."""
+        if self._q_fold_sup <= 0.0:
+            return q_loss
+        fold_ok = mb.gate_masks[..., GATE_FOLD].float()
+        fold_mse = (q_all[..., GATE_FOLD].pow(2) * fold_ok).sum() / (
+            fold_ok.sum().clamp_min(1.0)
+        )
+        return q_loss + self._q_fold_sup * fold_mse
 
     def update(
         self,
@@ -445,15 +488,11 @@ class PPOTrainer:
                                     mb.obs, opp_holes_multihot(mb.opp_holes)
                                 )
                                 if self._q_aux_coef > 0.0 and q_all is not None:
-                                    q_idx = torch.where(
-                                        mb.gate_actions == GATE_RAISE,
-                                        2 + mb.anchor_actions,
-                                        mb.gate_actions,
-                                    )
                                     q_taken = q_all.gather(
-                                        -1, q_idx[..., None]
+                                        -1, self._q_index(mb, q_all)[..., None]
                                     ).squeeze(-1)
                                     q_loss = (q_taken - mb.returns).pow(2).mean()
+                                    q_loss = self._q_fold_sup_term(mb, q_all, q_loss)
                                 value_loss = self.critic.hlgauss_value_loss(
                                     value_logits, mb.returns
                                 )
@@ -466,19 +505,15 @@ class PPOTrainer:
                                     # forward()) AND the dueling Q row; the
                                     # taken action's Q regresses to the same
                                     # returns. Index: 0 Fold, 1 CheckCall,
-                                    # 2+anchor Raise.
+                                    # 2+anchor Raise (or 2 = pooled Raise).
                                     value, q_all = self._critic_qv(
                                         mb.obs, opp_holes_multihot(mb.opp_holes)
                                     )
-                                    q_idx = torch.where(
-                                        mb.gate_actions == GATE_RAISE,
-                                        2 + mb.anchor_actions,
-                                        mb.gate_actions,
-                                    )
                                     q_taken = q_all.gather(
-                                        -1, q_idx[..., None]
+                                        -1, self._q_index(mb, q_all)[..., None]
                                     ).squeeze(-1)
                                     q_loss = (q_taken - mb.returns).pow(2).mean()
+                                    q_loss = self._q_fold_sup_term(mb, q_all, q_loss)
                                 elif self._critic_fwd is not None:
                                     value = self._critic_fwd(
                                         mb.obs, opp_holes_multihot(mb.opp_holes)
@@ -632,7 +667,7 @@ class PPOTrainer:
                         # Per-tensor adaptive clip (opt-in) BEFORE the per-group
                         # split clip: tames heavy-tailed spikes tensor-by-tensor.
                         if self._agc_clip > 0.0:
-                            _adaptive_grad_clip_(self._all_params, self._agc_clip)
+                            _adaptive_grad_clip_(self._agc_params, self._agc_clip)
                         # Clip actor and critic grads SEPARATELY — a single
                         # global clip over both lets a chip-scale critic-loss
                         # spike inflate the shared grad-norm and throttle the

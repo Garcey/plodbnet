@@ -136,6 +136,27 @@ class TrainingConfig:
     # advantage flip is not a checkpoint break). 0 = untrained.
     q_aux_coef: float = 0.0
 
+    # Pool the dueling head's per-anchor raise columns into ONE raise
+    # column (q_actions = 3: Fold/CheckCall/Raise, instead of 2+anchors).
+    # 2026-07-09 Q-head audit: the 11 anchor columns each saw ~3% of the
+    # rows and dominated the VRPO advantage noise (per-node |E_π[Q]−V|
+    # p95 30-60bb at deep tiers); pooling gives the raise column 11× the
+    # training density. The Q baseline's job is variance reduction —
+    # size-specific credit still arrives through the reward trace.
+    # Consumers (ppo q_idx, rollout marginal, UI loader) key off the Q
+    # tensor's WIDTH, so 13-column checkpoints keep loading unchanged;
+    # a warm-start across widths drops adv_head to fresh zero-init.
+    q_pooled: bool = False
+
+    # Dense supervision on the fold column: fold's forward return is
+    # EXACTLY 0 under the reward convention (per-step costs, sunk chips
+    # excluded, a folder wins nothing), so q[..., FOLD] regresses to 0
+    # on EVERY fold-legal row — free perfect labels on all facing-a-bet
+    # rows, not just the ~third where fold was taken. Anchors the head's
+    # hardest sub-task (A_fold ≡ −V). Relative weight vs the taken-action
+    # MSE inside the q_aux term; 0 = off.
+    q_fold_sup_coef: float = 0.0
+
     # Advantage estimator (V5_DESIGN.md W2.5; VRPO, Fan & Farina 2026).
     #   "gae"  = V-based GAE(λ) (default; the pre-VRPO path, unchanged).
     #   "vrpo" = Expected-SARSA(λ) off the centralized dueling Q head:

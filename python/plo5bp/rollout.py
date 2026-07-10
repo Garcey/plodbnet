@@ -1073,7 +1073,8 @@ def collect_rollout_batched(
     aggr_bonus_steps_by_street: list[int] = [0, 0, 0]
 
     def _forward(model: ActorCritic, group: np.ndarray, obs_arr: np.ndarray,
-                 gate_mask_arr: np.ndarray, sizing_arr: np.ndarray) -> tuple[
+                 gate_mask_arr: np.ndarray, sizing_arr: np.ndarray,
+                 want_marginal: bool) -> tuple[
         np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
         np.ndarray, np.ndarray, np.ndarray | None,
     ]:
@@ -1086,7 +1087,13 @@ def collect_rollout_batched(
             b_t = torch.from_numpy(b_sizing).to(device)
         with record_function("step3/learner_forward"):
             with torch.inference_mode():
-                if use_vrpo:
+                # P10: only the LEARNER's marginal is consumed (VRPO V^pi at the
+                # call site); opponent-group forwards discard it. Gate the
+                # compute + its extra D2H sync on want_marginal rather than the
+                # collector-wide use_vrpo. Bit-exact: the marginal is a pure
+                # post-sampling readout — no extra network pass, no RNG draw
+                # (network.act docstring), so the sampled action is unchanged.
+                if want_marginal:
                     _fw_out = model.act(o_t, m_t, b_t, return_marginal=True)
                 else:
                     _fw_out = model.act(o_t, m_t, b_t)
@@ -1176,7 +1183,8 @@ def collect_rollout_batched(
 
         if learner_idx_np.size:
             g_np, c_np, an_np, lp_np, ru_np, v_np, glp_np, alp_np, marg_np = _forward(
-                learner, learner_idx_np, obs, gate_masks, sizing_step
+                learner, learner_idx_np, obs, gate_masks, sizing_step,
+                want_marginal=use_vrpo,
             )
             gates_per_env[learner_idx_np] = g_np
             chips_per_env[learner_idx_np] = np.maximum(c_np, 0).astype(np.uint64)
@@ -1195,14 +1203,31 @@ def collect_rollout_batched(
                             critic, device, obs[learner_idx_np], opp_block
                         )
                         values_per_env[learner_idx_np] = v_l
-                        # q index: Fold/CheckCall use the gate directly, Raise
-                        # uses 2+anchor (matches ppo.py q_idx and the marginal).
-                        q_idx_l = np.where(
-                            g_np == GATE_RAISE, 2 + an_np, g_np.astype(np.int64)
-                        )
+                        if q_l.shape[-1] == 3:
+                            # Pooled raise column (q_pooled): the gate IS the
+                            # q index (GATE_RAISE == 2), and the 13-way act()
+                            # marginal collapses to gate probs exactly —
+                            # Σ_k p_raise·π(k) = p_raise.
+                            q_idx_l = g_np.astype(np.int64)
+                            marg_l = np.stack(
+                                [
+                                    marg_np[:, 0],
+                                    marg_np[:, 1],
+                                    marg_np[:, 2:].sum(-1),
+                                ],
+                                axis=-1,
+                            )
+                        else:
+                            # q index: Fold/CheckCall use the gate directly,
+                            # Raise uses 2+anchor (matches ppo.py q_idx and
+                            # the marginal layout).
+                            q_idx_l = np.where(
+                                g_np == GATE_RAISE, 2 + an_np, g_np.astype(np.int64)
+                            )
+                            marg_l = marg_np
                         rows_l = np.arange(learner_idx_np.size)
                         q_taken_per_env[learner_idx_np] = q_l[rows_l, q_idx_l]
-                        vpi_per_env[learner_idx_np] = (marg_np * q_l).sum(-1)
+                        vpi_per_env[learner_idx_np] = (marg_l * q_l).sum(-1)
                     else:
                         values_per_env[learner_idx_np] = _critic_values(
                             critic, device, obs[learner_idx_np], opp_block
@@ -1220,7 +1245,7 @@ def collect_rollout_batched(
                     group = np.nonzero(opp_snap_col == sd_idx)[0]
                     m = _get_snapshot_model(sd_idx_int)
                     g_np, c_np, _, _, _, _, _, _, _ = _forward(
-                        m, group, obs, gate_masks, sizing_step
+                        m, group, obs, gate_masks, sizing_step, want_marginal=False
                     )
                     gates_per_env[group] = g_np
                     chips_per_env[group] = np.maximum(c_np, 0).astype(np.uint64)
