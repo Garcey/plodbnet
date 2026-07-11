@@ -98,6 +98,15 @@ def test_fold_supervision_masks_illegal_rows():
     assert t0._q_fold_sup_term(mb, q_all, base) is base
 
 
+def test_q_fold_err_canary_field():
+    # PPOStats carries the fold-column canary (mean Q[FOLD] over
+    # fold-legal rows; ground truth 0); defaults 0.0 when no dueling head.
+    from plo5bp.ppo import PPOStats
+
+    s = PPOStats(policy_loss=0.0, value_loss=0.0, entropy=0.0, approx_kl=0.0)
+    assert s.q_fold_err == 0.0
+
+
 def test_marginal_compression_identity():
     # act()'s 13-way marginal is [p_f, p_c, p_raise * pi(anchor_k)...];
     # the pooled compression must recover the gate probs exactly.

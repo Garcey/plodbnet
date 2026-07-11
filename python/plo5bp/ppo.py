@@ -46,6 +46,11 @@ class PPOStats:
     kl_anchor: float = 0.0
     # Auxiliary Q(s,a) regression loss (v5 critic dueling head); 0 when off.
     q_loss: float = 0.0
+    # Fold-column canary (audit 2026-07-11): mean Q[FOLD] over fold-LEGAL
+    # rows this update. Ground truth is EXACTLY 0 (per-step-cost rewards,
+    # sunk chips excluded), so sustained drift = a systematic Q-surface
+    # offset. 0.0 when the run has no dueling head.
+    q_fold_err: float = 0.0
     gate_entropy: float = 0.0
     anchor_entropy: float = 0.0
     beta_entropy: float = 0.0
@@ -404,6 +409,8 @@ class PPOTrainer:
         total_kl = torch.zeros((), device=device)
         total_kl_anchor = torch.zeros((), device=device)
         total_q = torch.zeros((), device=device)
+        total_qf = torch.zeros((), device=device)
+        total_qf_n = torch.zeros((), device=device)
         total_gate_h = torch.zeros((), device=device)
         total_anchor_h = torch.zeros((), device=device)
         total_beta_h = torch.zeros((), device=device)
@@ -483,6 +490,7 @@ class PPOTrainer:
                             # present (buffer `values` came from it), else
                             # the actor's own head.
                             q_loss = torch.zeros((), device=device)
+                            q_all = None
                             if self._distributional:
                                 # Distributional / HL-Gauss value head: one torso
                                 # pass gives V (=symexp(E[bins]), scalar), the
@@ -533,6 +541,21 @@ class PPOTrainer:
                                 v1 = (value - mb.returns).pow(2)
                                 v2 = (value_pred_clipped - mb.returns).pow(2)
                                 value_loss = 0.5 * torch.max(v1, v2).mean()
+
+                            # Fold-column canary (audit 2026-07-11): the
+                            # per-update mean of Q[FOLD] over fold-LEGAL
+                            # rows, whose ground truth is exactly 0. f32
+                            # accumulation (bf16 sums of ~500k rows are
+                            # garbage); no_grad — diagnostics only.
+                            if q_all is not None:
+                                with torch.no_grad():
+                                    fold_ok_c = (
+                                        mb.gate_masks[..., GATE_FOLD].float()
+                                    )
+                                    total_qf += (
+                                        q_all[..., GATE_FOLD].float() * fold_ok_c
+                                    ).sum()
+                                    total_qf_n += fold_ok_c.sum()
 
                             # Display head: plain regression (no clipping —
                             # buffer values belong to the critic), small
@@ -712,6 +735,9 @@ class PPOTrainer:
                 display_loss=float(total_display.item()) / denom,
                 kl_anchor=float(total_kl_anchor.item()) / denom,
                 q_loss=float(total_q.item()) / denom,
+                q_fold_err=float(
+                    (total_qf / total_qf_n.clamp_min(1.0)).item()
+                ),
                 gate_entropy=float(total_gate_h.item()) / denom,
                 anchor_entropy=float(total_anchor_h.item()) / denom,
                 beta_entropy=float(total_beta_h.item()) / denom,

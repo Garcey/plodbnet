@@ -166,6 +166,21 @@ class _StubTrainer:
     sizing_entropy_scale = 1.0
     _clip_room_mid = 0.05
     _clip_room_ext = 0.10
+    _q_fold_sup = 1.0
+
+
+def test_apply_anneal_control_q_fold_sup_live():
+    # 2026-07-11 audit #2: the fold-supervision weight must be retunable
+    # live (it was drowned at 1.0 — bb² scale mismatch vs the taken MSE).
+    apply = train._apply_anneal_control
+    tr = _StubTrainer()
+    apply('{"q_fold_sup_coef": 15.0}', None, {"clubgg": 0.2}, 0.002,
+          3e-4, 0.2, 0.2, trainer=tr)
+    assert tr._q_fold_sup == 15.0
+    tr2 = _StubTrainer()
+    apply('{"q_fold_sup_coef": "loud"}', None, {"clubgg": 0.2}, 0.002,
+          3e-4, 0.2, 0.2, trainer=tr2)
+    assert tr2._q_fold_sup == 1.0
 
 
 def test_apply_anneal_control_clip_rooms_live():

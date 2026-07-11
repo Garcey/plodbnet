@@ -173,6 +173,8 @@ def _apply_anneal_control(
                                             probability room (the per-update
                                             policy quota at ~50/50 gates)
       {"clip_room_ext": 0.12}             — same, the rare-gate ends of the U
+      {"q_fold_sup_coef": 15.0}           — fold-column supervision weight
+                                            inside the q-aux loss (qF canary)
       {"step": 0.003, "tier_ent": {...}}  — any combination
 
     A manual tier_ent set is one-shot: the anneal keeps lowering from
@@ -220,6 +222,11 @@ def _apply_anneal_control(
         new_clip_ext = (
             float(ctrl["clip_room_ext"]) if "clip_room_ext" in ctrl else None
         )
+        new_q_fold_sup = (
+            float(ctrl["q_fold_sup_coef"])
+            if "q_fold_sup_coef" in ctrl
+            else None
+        )
     except (ValueError, TypeError, AttributeError):
         # AttributeError backstop: a non-dict `tier_ent` value (e.g.
         # {"tier_ent": ["deep", 0.08]}) makes .items() raise; ignore it too.
@@ -266,6 +273,16 @@ def _apply_anneal_control(
                 f"{trainer._clip_room_ext} -> {new_clip_ext}"
             )
         trainer._clip_room_ext = new_clip_ext
+    # Fold-supervision weight: read per-minibatch in _q_fold_sup_term, so
+    # a live edit rebalances the q gradient without a restart (audit #2:
+    # the qF canary is the readout).
+    if new_q_fold_sup is not None and trainer is not None:
+        if trainer._q_fold_sup != new_q_fold_sup:
+            print(
+                f"[anneal-control] q_fold_sup_coef "
+                f"{trainer._q_fold_sup} -> {new_q_fold_sup}"
+            )
+        trainer._q_fold_sup = new_q_fold_sup
     out_lr = live_lr
     if new_lr is not None:
         if live_lr != new_lr:
@@ -514,8 +531,13 @@ _V6_PRESET: "dict[str, tuple[object, object]]" = {
     # 2026-07-09 Q-head audit revision: pooled raise column + dense fold
     # supervision (fold forward-return == 0, free labels) so the VRPO Q
     # surface can actually calibrate; adv_head is AGC-exempt (ppo.py).
+    # Coef 15.0 since 2026-07-11 (audit #2): at 1.0 the fold term was ~4%
+    # of the q gradient (raw-bb² scale mismatch vs the taken-action MSE)
+    # and the known-truth anchor lost — fold column drifted to tight
+    # −3/−16bb family offsets. 15 ≈ gradient parity. Live-tunable via
+    # anneal_control {"q_fold_sup_coef": X}.
     "q_pooled": (False, True),
-    "q_fold_sup_coef": (0.0, 1.0),
+    "q_fold_sup_coef": (0.0, 15.0),
     "torso_norm": (False, True),
     "l2_init_coef": (0.0, 1e-4),
     "agc_clip": (0.0, 0.1),
@@ -2031,6 +2053,10 @@ def main() -> None:
                 f"{stats.beta_kl:+.3f}  "
                 + (f"klanc={stats.kl_anchor:.4f}  " if args.kl_anchor_coef > 0 else "")
                 + (f"q={stats.q_loss:.4f}  " if args.q_aux_coef > 0 else "")
+                # Fold-column canary (audit 2026-07-11): mean Q[FOLD] over
+                # fold-LEGAL rows. Ground truth is exactly 0 — sustained
+                # drift = the Q surface acquiring a systematic offset.
+                + (f"qF={stats.q_fold_err:+.2f}  " if args.q_aux_coef > 0 else "")
                 + (
                     (
                         f"KLROLLBACK@mb{stats.kl_stopped_at}"
