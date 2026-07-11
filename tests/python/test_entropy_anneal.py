@@ -164,6 +164,30 @@ class _StubTrainer:
     target_kl = 2.0
     kl_hard = 10.0
     sizing_entropy_scale = 1.0
+    _clip_room_mid = 0.05
+    _clip_room_ext = 0.10
+
+
+def test_apply_anneal_control_clip_rooms_live():
+    # 2026-07-11: the prob-dependent clip's mid band IS the per-update KL
+    # ceiling at mixed gates, so it must be live-tunable like lr/ent.
+    apply = train._apply_anneal_control
+    tr = _StubTrainer()
+    tier_ent = {"clubgg": 0.2}
+    raw = '{"clip_room_mid": 0.07, "clip_room_ext": 0.12}'
+    step, last, lr, ent, entd = apply(
+        raw, None, tier_ent, 0.002, 3e-4, 0.2, 0.2, trainer=tr,
+    )
+    assert tr._clip_room_mid == 0.07 and tr._clip_room_ext == 0.12
+    assert last == raw
+    # Bad value -> the whole edit is ignored, attributes untouched.
+    tr2 = _StubTrainer()
+    apply('{"clip_room_mid": "wide"}', None, tier_ent, 0.002, 3e-4,
+          0.2, 0.2, trainer=tr2)
+    assert tr2._clip_room_mid == 0.05
+    # Without a trainer handle the keys are silently inert (parity with
+    # target_kl/kl_hard handling).
+    apply(raw, None, tier_ent, 0.002, 3e-4, 0.2, 0.2, trainer=None)
 
 
 def test_apply_anneal_control_step_and_tiers():

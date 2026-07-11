@@ -169,6 +169,10 @@ def _apply_anneal_control(
       {"kl_hard": 12.0}                   — retune the hard rollback level
       {"lr": 1e-4}                        — retune the base learning rate
       {"sizing_entropy_scale": 2.5}       — scale the sizing-head entropy
+      {"clip_room_mid": 0.07}             — prob-dependent clip: mid-band
+                                            probability room (the per-update
+                                            policy quota at ~50/50 gates)
+      {"clip_room_ext": 0.12}             — same, the rare-gate ends of the U
       {"step": 0.003, "tier_ent": {...}}  — any combination
 
     A manual tier_ent set is one-shot: the anneal keeps lowering from
@@ -210,6 +214,12 @@ def _apply_anneal_control(
             if "entropy_coef_deep" in ctrl
             else None
         )
+        new_clip_mid = (
+            float(ctrl["clip_room_mid"]) if "clip_room_mid" in ctrl else None
+        )
+        new_clip_ext = (
+            float(ctrl["clip_room_ext"]) if "clip_room_ext" in ctrl else None
+        )
     except (ValueError, TypeError, AttributeError):
         # AttributeError backstop: a non-dict `tier_ent` value (e.g.
         # {"tier_ent": ["deep", 0.08]}) makes .items() raise; ignore it too.
@@ -237,6 +247,25 @@ def _apply_anneal_control(
                 f"{trainer.sizing_entropy_scale} -> {new_sizing_scale}"
             )
         trainer.sizing_entropy_scale = new_sizing_scale
+    # Prob-dependent clip rooms: _gate_clip_bounds reads these attributes
+    # per minibatch, so mutating them live-retunes the per-update policy
+    # quota (2026-07-11: the mid band IS the KL ceiling at mixed gates —
+    # LR past saturation can't raise it, only this can). No-op unless the
+    # run was built with clip_prob_dependent.
+    if new_clip_mid is not None and trainer is not None:
+        if trainer._clip_room_mid != new_clip_mid:
+            print(
+                f"[anneal-control] clip_room_mid "
+                f"{trainer._clip_room_mid} -> {new_clip_mid}"
+            )
+        trainer._clip_room_mid = new_clip_mid
+    if new_clip_ext is not None and trainer is not None:
+        if trainer._clip_room_ext != new_clip_ext:
+            print(
+                f"[anneal-control] clip_room_ext "
+                f"{trainer._clip_room_ext} -> {new_clip_ext}"
+            )
+        trainer._clip_room_ext = new_clip_ext
     out_lr = live_lr
     if new_lr is not None:
         if live_lr != new_lr:
@@ -1565,6 +1594,12 @@ def main() -> None:
         )
 
     trainer = PPOTrainer(model, train_cfg, critic=critic)
+    if train_cfg.clip_prob_dependent:
+        print(
+            f"[clip] prob-dependent U: ext={args.clip_room_ext} "
+            f"mid={args.clip_room_mid} floor={args.clip_prob_floor} "
+            "(live-tunable via anneal_control clip_room_mid/clip_room_ext)"
+        )
     # KL-anchor EMA magnet persistence: restore the reference from the
     # checkpoint so the pull-toward-history survives relaunches (absent
     # the key it re-initializes to the loaded weights and ramps in).
