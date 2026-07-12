@@ -91,11 +91,24 @@ DUAL-4 = 25 dims. Pure-encoder Chunk A = 126 dims.
 - **Scaffolding: DONE, green (commit b70024f).** OBS_DIM 1171, all tail
   constants, 6 no-op helper stubs wired into both encoders, Rust obs-encoder
   width-gated off, test pins updated. Reserved columns zero → parity holds.
-- **Chunk A (126 pure-encoder dims): IN PROGRESS.** Fill workflow deriving
-  the 3 category helper bodies (serial+batched); integrate → parity gate
-  (test_encoding_batch.py drives full serial-vs-batched sweep) → sanity
-  tests → commit.
-- **Chunk B (5 engine dims): SCOPED, specs locked.** Recon done:
+- **Chunk A (20 pure-encoder dims, 126 cols): DONE, green (commit 5db3071).**
+  Both encoders filled for STK-2/4/5/6/7/8/9/10/11, BRD-1/2/4/5/6/8/9/10/11/13,
+  DUAL-1/3/5. Gates: serial↔batched bit-exact parity (test_encoding_batch.py
+  sweep), correctness (test_obs_v3_batch2.py + a 3-agent adversarial review
+  that re-derived every dim vs spec, ZERO bugs), full suite 684 pass / 65 skip.
+  One parity bug caught pre-commit (BRD-11 op order). obs_adapter generalized
+  to prefix-slice any width in [991, OBS_DIM).
+- **Chunk B (5 engine dims): NEXT — plumbing pattern mapped.** Each needs:
+  a `PackedObservation` field (bindings.rs:1866), a fill in the parallel
+  raw-pointer packing loop (~bindings.rs:2116), dict entries in ~5 batched
+  bundle variants (observation_arrays + encoded variants) AND the scalar
+  `observation_dict` (~bindings.rs:328), then the reserved encoder columns
+  filled (serial+batched) + reserved-zero test updated. Build in buildable
+  increments (maturin develop --release from repo root; verify PyInit symbol).
+  The fused pass returns `[f32;20]` via `outcome_features_mc`, cached as
+  `[f32;20]` (bindings.rs:2009/2022) — DUAL-4 extends this to `[f32;22]`
+  (g_min,g_max appended; existing 20 byte-identical, cache type bumps).
+  Specs (V7_OBS_CANDIDATES.md, verified 2026-07-12):
   - STK-1: `acted_this_street` already a `GameState` field (state.rs:245) —
     expose in observation_dict + batched packer (`observation_arrays` and the
     3 bundle variants in bindings.rs) + Rust encoder input.
