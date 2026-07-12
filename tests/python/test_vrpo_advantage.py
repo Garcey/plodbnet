@@ -13,6 +13,16 @@ Also pinned:
   - the serial collector rejects vrpo (batched-only);
   - `act(return_marginal=True)` returns a valid (2+anchor)-way distribution
     over the Q-head action layout, and None when not requested.
+
+2026-07-12 — fixed-Q unit pins on `_vrpo_advantage_scan` added. The golden
+parity above CANNOT discriminate the full eq-3.2 estimator
+(Â = (Q−V^π) + λ-trace of δ⁺) from the residual-only λ-trace, because the
+leading term is identically ~0 at Q ≡ V — which is exactly how the shipped
+implementation lost the leading term without any test failing (the root
+cause of the v6 lock-fold pathology: a terminal fold's advantage was
+−Q[FOLD] instead of −V^π). The pins below use exact small-integer f32
+arithmetic (every op exact) so the equalities are bit-exact, and each one
+FAILS on the residual-only form.
 """
 
 from __future__ import annotations
@@ -153,3 +163,104 @@ def test_action_marginal_is_valid_distribution() -> None:
     )
     # Off by default → free when the estimator is GAE.
     assert model.act(obs, gate_mask, sizing).action_marginal is None
+
+
+# ---------------------------------------------------------------------------
+# Fixed-Q pins on the scan itself (discriminate eq 3.2 from residual-only).
+# All arrays are small-integer-valued f32 with gamma=1 (and deltas that are
+# exactly zero where zero is intended), so float ops are exact and asserts
+# can be np.array_equal — no tolerance to hide a missing term behind.
+# ---------------------------------------------------------------------------
+
+from plo5bp.rollout import _vrpo_advantage_scan  # noqa: E402
+
+F32 = np.float32
+ONE = np.float32(1.0)
+
+
+def test_scan_bellman_consistent_q_yields_q_minus_vpi() -> None:
+    # Rewards chosen so every Expected-SARSA residual is EXACTLY zero
+    # (r_t = Q_t − γ·V^π_{t+1}, terminal reward = Q_last). The trace term
+    # then vanishes and eq 3.2 says Â ≡ Q − V^π. The residual-only form
+    # returns all-zeros here — maximal discrimination.
+    q = np.array([[[5, 2, 9], [1, 6, 3]]], dtype=F32)      # (T=1, S=2, L=3)
+    vpi = np.array([[[3, 1, 4], [2, 4, 1]]], dtype=F32)    # junk at s0,t2 (inactive)
+    last_t = np.array([[1, 2]], dtype=np.int32)            # lengths 2 and 3
+    flush = np.array([[True, True]])
+    costs = np.array(
+        [
+            [
+                [5 - 1, 0, 0],          # s0 t0: q00 − vpi01; t1 terminal via won
+                [1 - 4, 6 - 1, 0],      # s1 t0, t1; t2 terminal via won
+            ]
+        ],
+        dtype=F32,
+    )
+    won = np.array([[2, 3]], dtype=F32)                    # = q at each seat's last step
+    out = _vrpo_advantage_scan(costs, won, q, vpi, last_t, flush, ONE, F32(0.95))
+    expected = np.array(
+        [
+            [
+                [5 - 3, 2 - 1, 0],      # Q − V^π at active slots; inactive → 0
+                [1 - 2, 6 - 4, 3 - 1],
+            ]
+        ],
+        dtype=F32,
+    )
+    assert np.array_equal(out, expected), (out, expected)
+
+
+def test_scan_terminal_fold_advantage_is_minus_vpi_independent_of_qfold() -> None:
+    # THE bug signature. A terminal fold has reward exactly 0, so eq 3.2
+    # gives Â = (Q_F − V^π) + (0 − Q_F) = −V^π: the Q_F terms CANCEL. The
+    # residual-only form gives −Q_F instead — 0 once fold supervision pins
+    # the column (no anti-fold pressure at high-V states) and a SUBSIDY
+    # when the column drifts negative. Assert the fixed scan returns −V^π
+    # for two different Q_F values, bit-identically.
+    vpi = np.array([[[6.0]]], dtype=F32)
+    last_t = np.array([[0]], dtype=np.int32)
+    flush = np.array([[True]])
+    costs = np.zeros((1, 1, 1), dtype=F32)
+    won = np.zeros((1, 1), dtype=F32)
+    outs = []
+    for q_fold in (7.0, -5.0):
+        q = np.array([[[q_fold]]], dtype=F32)
+        out = _vrpo_advantage_scan(
+            costs, won, q, vpi, last_t, flush, ONE, F32(0.9)
+        )
+        assert np.array_equal(out, np.array([[[-6.0]]], dtype=F32)), (
+            f"terminal-fold advantage must be −V^π; got {out} at Q_F={q_fold}"
+        )
+        outs.append(out)
+    assert np.array_equal(outs[0], outs[1]), "Â_fold must not depend on Q_F"
+
+
+def test_scan_zero_init_equals_gae_exactly() -> None:
+    # Q ≡ V^π ≡ V (integer-valued) ⇒ leading term is exactly 0 and δ⁺ is
+    # the plain GAE residual, so the scan must reproduce hand-rolled
+    # GAE(γ=1, λ=1) bit-exactly: rewards [−1, −2, +5] on values [4, 2, 1]
+    # → deltas [−3, −3, +4] → advantages [−2, +1, +4].
+    v = np.array([[[4, 2, 1]]], dtype=F32)
+    last_t = np.array([[2]], dtype=np.int32)
+    flush = np.array([[True]])
+    costs = np.array([[[-1, -2, 0]]], dtype=F32)
+    won = np.array([[5]], dtype=F32)
+    out = _vrpo_advantage_scan(costs, won, v, v, last_t, flush, ONE, ONE)
+    assert np.array_equal(out, np.array([[[-2, 1, 4]]], dtype=F32)), out
+
+
+def test_scan_masking_flushmask_and_beyond_length_are_zero() -> None:
+    # flush_mask=False seats and beyond-length slots must come back 0 even
+    # when q/vpi hold junk there (production arrays are zero-filled, but
+    # the function's contract shouldn't depend on it).
+    q = np.array([[[9, 8, 7], [1, 2, 3]]], dtype=F32)
+    vpi = np.array([[[4, 4, 4], [1, 1, 1]]], dtype=F32)
+    last_t = np.array([[0, 2]], dtype=np.int32)
+    flush = np.array([[True, False]])
+    costs = np.zeros((1, 2, 3), dtype=F32)
+    won = np.array([[9, 0]], dtype=F32)                     # reward at s0 last = 9
+    out = _vrpo_advantage_scan(costs, won, q, vpi, last_t, flush, ONE, ONE)
+    # s0: active t0 only → (9−4) + (9 + 0 − 9) = 5; t1/t2 inactive → 0.
+    assert np.array_equal(
+        out, np.array([[[5, 0, 0], [0, 0, 0]]], dtype=F32)
+    ), out

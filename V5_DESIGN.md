@@ -591,10 +591,20 @@ combo-dominance density by design, §3.1.)
 - **W2.5** (IMPLEMENTED 2026-07-07, not yet activated): flip advantages GAE →
   Expected-SARSA(λ) once Q-loss converges; A/B 20 updates. Shipped as
   `--advantage-estimator vrpo` (default `gae`; byte-identical off) — the batched
-  collector computes δ⁺ = r + γ·V^π(s') − Q(s,a) off the dueling Q head, with
-  `returns` staying GAE. Needs `--sizing-head mixture` + `--q-aux-coef>0` (warm
-  the head first). Golden test pins ES≡GAE at the zero-init head
-  (`tests/python/test_vrpo_advantage.py`).
+  collector computes Â = (Q(s,a) − V^π(s)) + the λ-trace of
+  δ⁺ = r + γ·V^π(s') − Q(s,a) off the dueling Q head (paper eq 3.2,
+  arXiv:2605.19235), with `returns` staying GAE. Needs `--sizing-head mixture`
+  + `--q-aux-coef>0` (warm the head first). Golden test pins ES≡GAE at the
+  zero-init head PLUS fixed-Q pins that discriminate the full formula from a
+  residual-only trace (`tests/python/test_vrpo_advantage.py`).
+  **2026-07-12 BUG FIX: this spec line originally omitted the leading Q−V^π
+  action-preference term, and the implementation faithfully shipped the
+  residual-only λ-trace — under which the advantage → 0 as Q calibrates, and
+  a terminal fold's advantage is −Q[FOLD] (zero once fold supervision pins
+  the column; a subsidy when it drifts negative) instead of −V^π. Root cause
+  of the v6 lock-fold pathology (vSix1 fold-subsidy era, vSix2
+  ratchet-on-pin). Leading term restored in `rollout._vrpo_advantage_scan`;
+  the zero-init golden parity was blind to the omission by construction.**
 - **W3 (compute programs)**: exploiter stems feeding the pool (league-lite),
   pool-quality sampling, external validation campaign (MonkerSolver
   single-board spot checks), serving EMA promotion.

@@ -381,6 +381,67 @@ def _flush_trajectory(
     all_anchor_logp.extend(t[11] for t in traj)
 
 
+def _vrpo_advantage_scan(
+    costs_t: np.ndarray,
+    won_bb: np.ndarray,
+    q_taken: np.ndarray,
+    vpi: np.ndarray,
+    last_t_arr: np.ndarray,
+    flush_mask: np.ndarray,
+    gamma_f: np.float32,
+    lam_f: np.float32,
+) -> np.ndarray:
+    """VRPO / Q-boosted advantage (Fan & Farina, arXiv:2605.19235, eq 3.2):
+
+        A_t = (Q(s_t,a_t) - V^pi(s_t)) + sum_{k>=0} (lam*gamma)^k d+_{t+k},
+        d+_t = r_t + gamma*V^pi(s_{t+1}) - Q(s_t,a_t)
+
+    i.e. the action-preference LEADING TERM plus the lambda-trace of
+    Expected-SARSA residuals. Telescoped view: plain GAE whose downstream
+    bootstraps use Q at the sampled future actions — the residuals vanish
+    pathwise as Q calibrates, leaving Q - V^pi (the true advantage).
+
+    2026-07-12 FIX: the original implementation (V5_DESIGN W2.5, shipped
+    2026-07-07) lambda-traced d+ ONLY — the leading term was dropped at the
+    spec level and propagated into code and test. Under that form the
+    advantage -> 0 as Q calibrates, and a terminal fold's advantage was
+    -Q[FOLD] (0 once fold supervision pins the column; a SUBSIDY when the
+    column drifts negative) instead of -V^pi. Root cause of the v6
+    lock-fold pathology (vSix1 fold-subsidy era, vSix2 ratchet-on-pin).
+
+    Zero-init parity is preserved: at Q == V the leading term is ~0 and
+    d+ reduces to the GAE residual, so vrpo on a fresh checkpoint still
+    matches GAE up to f32 reduction noise. Pinned — along with the fixed-Q
+    pins that discriminate the full formula from the residual-only form —
+    in tests/python/test_vrpo_advantage.py.
+
+    Shapes: costs_t/q_taken/vpi are (T, S, L) f32; won_bb (f32),
+    last_t_arr (int), flush_mask (bool) are (T, S). Slots outside a seat's
+    trajectory, or with flush_mask False, return 0 — same masking as the
+    GAE scan.
+    """
+    T, S, L = q_taken.shape
+    last_es = np.zeros((T, S), dtype=np.float32)
+    trace = np.zeros((T, S, L), dtype=np.float32)
+    for t in range(L - 1, -1, -1):
+        is_last = (t == last_t_arr) & flush_mask
+        active_tm = (t <= last_t_arr) & flush_mask
+        reward_t = costs_t[..., t] + np.where(is_last, won_bb, np.float32(0.0))
+        if t + 1 < L:
+            next_vpi = np.where(is_last, np.float32(0.0), vpi[..., t + 1])
+        else:
+            next_vpi = np.zeros((T, S), dtype=np.float32)
+        delta = reward_t + gamma_f * next_vpi - q_taken[..., t]
+        new_es = delta + gamma_f * lam_f * last_es
+        last_es = np.where(active_tm, new_es, last_es)
+        trace[..., t] = np.where(active_tm, last_es, np.float32(0.0))
+    active = (
+        np.arange(L, dtype=np.int64)[None, None, :]
+        <= last_t_arr[..., None].astype(np.int64)
+    ) & flush_mask[..., None]
+    return np.where(active, (q_taken - vpi) + trace, np.float32(0.0))
+
+
 def _finalize_batch(
     all_obs: list,
     all_gate_masks: list,
@@ -1603,36 +1664,22 @@ def collect_rollout_batched(
                         advs_t[..., t] = np.where(active_tm, last_gae, np.float32(0.0))
                     rets_t = advs_t + vals_t
 
-                    # VRPO / Expected-SARSA(λ): the same λ-trace with the
-                    # dueling Q as baseline — δ⁺ = r + γ·V^π(s') − Q(s,a),
-                    # V^π(s')=Σ_a π(a|s')Q(s',a) (traj_vpi). `advantages` use
-                    # this trace; `returns` stay GAE (the V-head target). At
-                    # Q≡V (zero-init head) q==vals and vpi==vals, so it is
-                    # bit-identical to the GAE scan above.
+                    # VRPO / Q-boosted advantage (arXiv:2605.19235 eq 3.2):
+                    # Â = (Q(s,a) − V^π(s)) + λ-trace of δ⁺, with
+                    # δ⁺ = r + γ·V^π(s') − Q(s,a), V^π = Σ_a π(a)Q(s,a)
+                    # (traj_vpi). `advantages` use this; `returns` stay GAE
+                    # (the V-head target). At Q≡V (zero-init head) the
+                    # leading term is ~0 and δ⁺ reduces to the GAE residual,
+                    # so this matches the scan above (golden parity test).
+                    # 2026-07-12: leading term RESTORED — the shipped form
+                    # was residual-only; see _vrpo_advantage_scan.
                     if use_vrpo:
                         q_es = traj_q_taken[term_envs, :, :L]        # (T, S, L)
                         vpi_es = traj_vpi[term_envs, :, :L]          # (T, S, L)
-                        last_es = np.zeros((T, S), dtype=np.float32)
-                        advs_es_t = np.zeros((T, S, L), dtype=np.float32)
-                        for t in range(L - 1, -1, -1):
-                            is_last = (t == last_t_arr) & flush_mask
-                            active_tm = (t <= last_t_arr) & flush_mask
-                            reward_t = costs_t[..., t] + np.where(
-                                is_last, won_bb, np.float32(0.0)
-                            )
-                            if t + 1 < L:
-                                next_vpi = np.where(
-                                    is_last, np.float32(0.0), vpi_es[..., t + 1]
-                                )
-                            else:
-                                next_vpi = np.zeros((T, S), dtype=np.float32)
-                            delta = reward_t + gamma_f * next_vpi - q_es[..., t]
-                            new_es = delta + gamma_f * lam_f * last_es
-                            last_es = np.where(active_tm, new_es, last_es)
-                            advs_es_t[..., t] = np.where(
-                                active_tm, last_es, np.float32(0.0)
-                            )
-                        adv_out_t = advs_es_t
+                        adv_out_t = _vrpo_advantage_scan(
+                            costs_t, won_bb, q_es, vpi_es,
+                            last_t_arr, flush_mask, gamma_f, lam_f,
+                        )
                     else:
                         adv_out_t = advs_t
 

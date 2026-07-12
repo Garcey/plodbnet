@@ -80,7 +80,7 @@ The design's own verdict: face-up sizing is a **structural + regularization** pr
 **1. VRPO / Expected-SARSA(λ) advantage flip** *(cross-listed #1 in Top 5; primary home is General strength)*
 One-liner: lower-variance advantages sharpen the size gradient at the flop, the most face-up-prone node.
 - Source: verified-real — Fan & Farina, "GAE Falls Short in Imperfect-Information Self-Play RL", arXiv:2605.19235.
-- Mechanism: Expected-SARSA residual δ⁺ = r + γV^π(s′) − Q(s,a) with V^π = Σₐπ(a)Q(s,a); removes action-sampling variance the scalar-V GAE cannot.
+- Mechanism: Â = (Q(s,a) − V^π(s)) + λ-trace of Expected-SARSA residuals δ⁺ = r + γV^π(s′) − Q(s,a), V^π = Σₐπ(a)Q(s,a); removes action-sampling variance the scalar-V GAE cannot. *(2026-07-12: this line originally quoted only the residual — the omission propagated into V5_DESIGN W2.5 and the shipped code and became the v6 fold-pathology root cause; the "verified against the paper" check below missed the missing leading term. Fixed in `rollout._vrpo_advantage_scan`.)*
 - Disruption: moderate. Expected gain: **medium** (corrected from high — Q is refine-blind, so the *continuous* size dimension where #1 most lives is NOT directly de-noised; the win lands on gate + anchor). Impl cost: medium.
 - Axiom fit: clean (CTDE critic, no obs/sizing-head change, warm-start preserved, parity via a golden `Â_boost==GAE when Q≡V` test).
 - Adversarial verdict: **CONFIRMED**. Reason: formula/critic requirement/finite-action scope all verified against the paper; matches V5_DESIGN.md W2.5 verbatim. Honest caveat: the +33±19 mBB/h vs Slumbot is single-board/heads-up and the authors call it "not a decisive win"; treat magnitude as directional, not 1:1 to double-board.
