@@ -1240,6 +1240,51 @@ impl GameState {
         (rank >> 20) as u8
     }
 
+    /// v7 obs batch-2 hero/board engine dims for the CURRENT actor
+    /// (V7_OBS_CANDIDATES.md BRD-7 / BRD-12 / DUAL-2):
+    /// `[boat_a, boat_b, improve_a, improve_b, combos_a, combos_b,
+    ///   mask_a, mask_b]` — boat-or-better outs, strict-category-improve
+    /// outs, best-category combo counts (all raw counts; the encoders
+    /// normalize), and the best-holding 5-bit hole masks (bit i = i-th
+    /// hole card sorted by card index DESCENDING). The unseen deck for
+    /// the out counts is GLOBAL (hole + BOTH boards), matching the
+    /// encoder's cross-board visibility convention. All-zero when there
+    /// is no actor, for NLH (any-combo eval — these are PLO semantics),
+    /// or before both boards have flops.
+    pub fn hero_board_v3(&self) -> [u8; 8] {
+        let mut out = [0u8; 8];
+        if self.config.variant == Variant::NlhSingle {
+            return out;
+        }
+        let hero = match self.actor {
+            Some(s) => s,
+            None => return out,
+        };
+        if self.board_a.len() < 3 || self.board_b.len() < 3 {
+            return out;
+        }
+        let hole = &self.hole_cards[hero];
+        let mut used = [false; 52];
+        for c in hole
+            .iter()
+            .chain(self.board_a.iter())
+            .chain(self.board_b.iter())
+        {
+            used[c.index() as usize] = true;
+        }
+        out[0] = crate::hand_eval::boat_plus_outs(hole, &self.board_a, &used);
+        out[1] = crate::hand_eval::boat_plus_outs(hole, &self.board_b, &used);
+        let (ia, ca) = crate::hand_eval::improve_outs(hole, &self.board_a, &used);
+        let (ib, cb) = crate::hand_eval::improve_outs(hole, &self.board_b, &used);
+        out[2] = ia;
+        out[3] = ib;
+        out[4] = ca;
+        out[5] = cb;
+        out[6] = crate::hand_eval::best_pair_mask(hole, &self.board_a);
+        out[7] = crate::hand_eval::best_pair_mask(hole, &self.board_b);
+        out
+    }
+
     /// Fraction of unseen-deck k-card opponent hands that produce each of
     /// 4 outcomes vs the hero (current actor) on both boards, for
     /// k ∈ {2, 3, 4}. Returns a length-12 `Vec<f32>` in row-major
@@ -1317,12 +1362,18 @@ impl GameState {
     }
 
     pub fn outcome_features_mc(&self, mc_samples: usize) -> Vec<f32> {
-        const N_OUT: usize = 20;
+        // N_OUT 20 → 22 (2026-07-12, DUAL-4): dims 20/21 append the k=2
+        // guaranteed-pot-share bounds g_min/g_max. Dims 0..20 stay
+        // byte-identical to the pre-append body — the P1 pin test compares
+        // them against the frozen reference; the share trackers add no
+        // evals, no RNG draws, and no reordering.
+        const N_OUT: usize = 22;
         const SCOOP_OPP: usize = 0;
         const QUARTER_OPP: usize = 1;
         const SCOOP_HERO: usize = 2;
         const QUARTER_HERO: usize = 3;
         const PER_BOARD_OFF: usize = 12;
+        const SHARE_OFF: usize = 20;
 
         let hero_seat = match self.actor {
             Some(s) => s,
@@ -1435,6 +1486,13 @@ impl GameState {
                 // Per-board counters (obs v2 P1): [ahead, tie, behind] per
                 // board from HERO's perspective + win-exactly-one + tie-both.
                 let mut pb = [0u32; 8];
+                // DUAL-4: hero's per-combo pot share s = 0.5·[wins A] +
+                // 0.25·[ties A] + 0.5·[wins B] + 0.25·[ties B]; track the
+                // min/max over the exhaustive k=2 universe. Values land
+                // exactly on {0, .25, .5, .75, 1}. Free riders on the
+                // existing loop — no extra evals, no RNG.
+                let mut g_min = f32::MAX;
+                let mut g_max = f32::MIN;
                 let mut idx: Vec<usize> = (0..k).collect();
                 loop {
                     opp_buf.clear();
@@ -1467,6 +1525,16 @@ impl GameState {
                     if cmp_a == 0 && cmp_b == 0 {
                         pb[7] += 1; // tie both
                     }
+                    let share = 0.5 * ((cmp_a == -1) as u32 as f32)
+                        + 0.25 * ((cmp_a == 0) as u32 as f32)
+                        + 0.5 * ((cmp_b == -1) as u32 as f32)
+                        + 0.25 * ((cmp_b == 0) as u32 as f32);
+                    if share < g_min {
+                        g_min = share;
+                    }
+                    if share > g_max {
+                        g_max = share;
+                    }
                     samples += 1;
                     let mut pos = k;
                     let advanced = loop {
@@ -1491,6 +1559,8 @@ impl GameState {
                     for j in 0..8 {
                         out[PER_BOARD_OFF + j] = pb[j] as f32 * inv;
                     }
+                    out[SHARE_OFF] = g_min;
+                    out[SHARE_OFF + 1] = g_max;
                 }
             } else {
                 debug_assert!(n_unseen <= 64);
@@ -3466,12 +3536,29 @@ mod outcome_mc_p1_tests {
     fn assert_bit_identical(g: &GameState, mc_samples: usize, tag: &str) {
         let new = g.outcome_features_mc(mc_samples);
         let reference = outcome_features_mc_reference(g, mc_samples);
-        assert_eq!(new.len(), reference.len(), "{tag}: length mismatch");
+        // The live fn appends the DUAL-4 share bounds (dims 20/21,
+        // 2026-07-12); the frozen reference stays 20-wide by design. The
+        // pin's purpose is unchanged: dims 0..20 byte-identical.
+        assert_eq!(new.len(), 22, "{tag}: live output must be 22-wide");
+        assert_eq!(reference.len(), 20, "{tag}: frozen reference is 20-wide");
         for (i, (x, y)) in new.iter().zip(reference.iter()).enumerate() {
             assert_eq!(
                 x.to_bits(),
                 y.to_bits(),
                 "{tag}: dim {i} differs (new {x} vs ref {y})"
+            );
+        }
+        // Appended share bounds: either both zero (inactive / no combos)
+        // or a valid quantized min<=max pair.
+        let (g_min, g_max) = (new[20], new[21]);
+        assert!(
+            (g_min == 0.0 && g_max == 0.0) || g_min <= g_max,
+            "{tag}: share bounds invalid ({g_min}, {g_max})"
+        );
+        for v in [g_min, g_max] {
+            assert!(
+                [0.0, 0.25, 0.5, 0.75, 1.0].contains(&v),
+                "{tag}: share bound {v} not on the quarter grid"
             );
         }
     }

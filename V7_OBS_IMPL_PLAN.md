@@ -98,7 +98,25 @@ DUAL-4 = 25 dims. Pure-encoder Chunk A = 126 dims.
   that re-derived every dim vs spec, ZERO bugs), full suite 684 pass / 65 skip.
   One parity bug caught pre-commit (BRD-11 op order). obs_adapter generalized
   to prefix-slice any width in [991, OBS_DIM).
-- **Chunk B (5 engine dims): NEXT — plumbing pattern mapped.** Each needs:
+- **Chunk B (5 engine dims): IMPLEMENTED 2026-07-12 — verification in flight.**
+  Rust: hand_eval.rs gains boat_plus_outs / improve_outs / best_pair_mask
+  (+ best_rank_using_added incremental enumeration + pair_best_cks shared
+  core; 8 hand-computed unit tests); engine.rs gains GameState::hero_board_v3
+  (NLH/no-actor/short-board guarded) and outcome_features_mc N_OUT 20→22
+  (k=2 g_min/g_max share trackers — no new evals/RNG; P1 pin updated: dims
+  0..20 still byte-identical vs the frozen reference, quarter-grid check on
+  20/21); bindings.rs: acted_this_street + hero_board_v3 + share_bounds
+  through PackedObservation, the unsafe pack loop, the [f32;22] outcome
+  cache, all 5 dict sites, and the serial observation_dict ([12..20] slice
+  fix). Python: STK-1/BRD-7/BRD-12/DUAL-2/DUAL-4 filled in BOTH encoders
+  (None-guarded kwargs). Gates green so far: cargo 153/153, parity sweep
+  50/50 (engine values flow byte-identical), batch-2 semantics 10/10
+  (two-bits-per-board, quarter grid, DUAL-3↔DUAL-4 consistency, dict-vs-
+  encoder recompute). Build gotcha hit + handled: maturin can't replace
+  _engine.pyd while the UI holds it — stop :8765 first, rebuild, restart.
+  In flight: full pytest suite + a single adversarial reviewer over the
+  Chunk B diff; commit follows both.
+  Original plumbing map (for reference): Each needs:
   a `PackedObservation` field (bindings.rs:1866), a fill in the parallel
   raw-pointer packing loop (~bindings.rs:2116), dict entries in ~5 batched
   bundle variants (observation_arrays + encoded variants) AND the scalar

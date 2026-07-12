@@ -922,13 +922,45 @@ def _encode_stack_v3(
     hero_stack: float,
     inv_bb: float,
     street_idx: int,
+    acted=None,
 ) -> None:
-    """Stack/pot/price geometry, dims 1020..1061. STK-1 (1020..1024) is
-    [ENGINE] — left zero until acted_this_street is exposed."""
+    """Stack/pot/price geometry, dims 1020..1061. `acted` is the engine's
+    per-seat acted_this_street bits (None on pre-v7 fixtures → STK-1 zero)."""
     # Shared hero-frame scalars.
     hero_sc = float(street_commit[hero])
     hero_commit = float(total_commit[hero])
     pot_denom = max(pot, 1.0)
+
+    # ---- STK-1: money / raise-exposure still behind (4) @ _STK1_OFF ----
+    # Pending set (engine pending rule) over OPPONENTS: alive, not all-in,
+    # and (not yet acted this street OR street commit below the live bet
+    # level). Aggregates the effective money that can still punish a bluff
+    # / pay off a value bet. All-zero when the pending set is empty (hero
+    # closes / betting dead).
+    if acted is not None:
+        max_cap = 0.0
+        sum_cap = 0.0
+        max_eff = 0.0
+        any_pending = False
+        for s in range(num_seats):
+            if s == hero or folded[s] or all_in[s]:
+                continue
+            if acted[s] and float(street_commit[s]) >= btc:
+                continue
+            any_pending = True
+            eff_s = eff_per_seat[s]
+            owed = min(max(btc - float(street_commit[s]), 0.0), eff_s)
+            cap = max(0.0, eff_s - owed)
+            if cap > max_cap:
+                max_cap = cap
+            sum_cap = sum_cap + cap
+            if eff_s > max_eff:
+                max_eff = eff_s
+        if any_pending:
+            out[_STK1_OFF + 0] = np.log1p(max_cap / pot_denom)
+            out[_STK1_OFF + 1] = np.log1p(sum_cap / pot_denom)
+            out[_STK1_OFF + 2] = np.log1p(max_eff * inv_bb)
+            out[_STK1_OFF + 3] = 1.0 if max_eff >= hero_stack else 0.0
 
     # ---- STK-2: raise-ladder envelope (6) @ _STK2_OFF ----
     # min_d/max_d are the raise DELTAS (additional chips) recovered from the
@@ -1041,9 +1073,13 @@ def _encode_board_v3(
     board_b_list,
     visible_count,
     street_idx: int,
+    hero_board_v3=None,
 ) -> None:
-    """Board texture + hand-board combinatorics, dims 1061..1139. BRD-7
-    (1099..1101) and BRD-12 (1131..1135) are [ENGINE] — left zero."""
+    """Board texture + hand-board combinatorics, dims 1061..1139.
+    `hero_board_v3` is the engine's 8-int block [boat_a, boat_b, improve_a,
+    improve_b, combos_a, combos_b, mask_a, mask_b] (None on pre-v7
+    fixtures → BRD-7/BRD-12 stay zero; masks are consumed by the DUAL
+    helper, not here)."""
     # ---- Shared hero-side aggregates (board-agnostic) ----
     hole_rank_counts = [0] * 13
     hole_suit_counts = [0] * 4
@@ -1060,6 +1096,22 @@ def _encode_board_v3(
     vct = visible_count.sum(axis=1)              # (13,) global visible copies per rank
     visible_per_suit = visible_count.sum(axis=0)  # (4,) global visible per suit
     unseen_deck = 52 - int(visible_count.sum())
+
+    # ---- BRD-7 / BRD-12: engine-emitted hero/board dims ----
+    # Raw counts from GameState::hero_board_v3 (engine handles the FH+ gate,
+    # the river-zeroing of out counts, and the global-unseen convention);
+    # the encoder applies the spec normalizations: BRD-7 raw, BRD-12 outs
+    # / actual unseen-deck size, combo redundancy / 10.
+    if hero_board_v3 is not None:
+        out[_BRD7_OFF + 0] = float(hero_board_v3[0])
+        out[_BRD7_OFF + 1] = float(hero_board_v3[1])
+        out[_BRD12_OFF + 0] = float(hero_board_v3[2]) / unseen_deck
+        out[_BRD12_OFF + 1] = float(hero_board_v3[3]) / unseen_deck
+        # /10 is pinned to PLO5's C(5,2) pairs. PLO4 tops out at 0.6 and
+        # PLO6 can exceed 1.0 (15 pairs) — both variants are untrained;
+        # revisit the divisor before ever training them at this layout.
+        out[_BRD12_OFF + 2] = float(hero_board_v3[4]) / 10.0
+        out[_BRD12_OFF + 3] = float(hero_board_v3[5]) / 10.0
 
     # Cross-board presence (BRD-10 key-card scan spans BOTH boards) + hero holdings.
     board_present_all = [[False] * 4 for _ in range(13)]
@@ -1315,9 +1367,13 @@ def _encode_dual_v3(
     eff_to_call: float,
     hero_stack: float,
     config: GameConfig,
+    hero_board_v3=None,
+    share_bounds=None,
 ) -> None:
-    """Double-board structure, dims 1139..1171. DUAL-2 (1141..1151) and
-    DUAL-4 (1157..1162) are [ENGINE] — left zero."""
+    """Double-board structure, dims 1139..1171. `hero_board_v3` carries the
+    engine best-holding masks at [6]/[7] (DUAL-2); `share_bounds` is the
+    fused pass's [g_min, g_max] (DUAL-4). None → those blocks stay zero
+    (pre-v7 fixtures)."""
     # ---- DUAL-1 (1139..1141): split-adjusted price ladder ----
     # Pot odds re-denominated to the win-one (0.5*pot) and quartered
     # (0.25*pot) split outcomes, stack-capped (eff_to_call already =
@@ -1331,13 +1387,15 @@ def _encode_dual_v3(
     # layout [aheadA,tieA,behindA,aheadB,tieB,behindB,win-one,tie-both]).
     # Guarded by the activity gate (per-board fractions sum ~1 when the pass
     # ran, 0 preflop/terminal) so terminal all-zeros never read as "nuts".
+    active = False
     if per_board_outcome is not None:
         ahead_a = float(per_board_outcome[0])
         tie_a = float(per_board_outcome[1])
         behind_a = float(per_board_outcome[2])
         tie_b = float(per_board_outcome[4])
         behind_b = float(per_board_outcome[5])
-        if (ahead_a + tie_a + behind_a) > 0.5:
+        active = (ahead_a + tie_a + behind_a) > 0.5
+        if active:
             nut_or_chop_a = behind_a == 0.0
             nut_or_chop_b = behind_b == 0.0
             out[_DUAL3_OFF + 0] = 1.0 if (nut_or_chop_a and tie_a == 0.0) else 0.0
@@ -1346,6 +1404,38 @@ def _encode_dual_v3(
             out[_DUAL3_OFF + 3] = 1.0 if nut_or_chop_b else 0.0
             out[_DUAL3_OFF + 4] = 1.0 if (nut_or_chop_a and nut_or_chop_b) else 0.0
             out[_DUAL3_OFF + 5] = 1.0 if (nut_or_chop_a or nut_or_chop_b) else 0.0
+
+    # ---- DUAL-4 (1157..1162): guaranteed pot share (k=2 g_min/g_max) ----
+    # From the fused pass's appended trackers. [3] prices the CONTESTED
+    # slice only (pot·(g_max−g_min)); [4] is the stack-vs-contested-pot
+    # log ratio; both use the g_max==g_min sentinel (a fully-decided pot
+    # has no contested slice — the [2] flag + DUAL-3 disambiguate).
+    if share_bounds is not None and active:
+        g_min = float(share_bounds[0])
+        g_max = float(share_bounds[1])
+        out[_DUAL4_OFF + 0] = g_min
+        out[_DUAL4_OFF + 1] = g_max
+        out[_DUAL4_OFF + 2] = 1.0 if g_min >= 0.5 else 0.0
+        rng = g_max - g_min
+        if rng > 0.0:
+            if eff_to_call > 0.0:
+                out[_DUAL4_OFF + 3] = eff_to_call / (pot * rng + eff_to_call)
+            # max(pot, 1): identical for every reachable pot >= 1 chip, but
+            # keeps the degenerate ante=0 UI config (pot 0 at the flop) from
+            # dividing by zero (serial crash / batched inf divergence).
+            out[_DUAL4_OFF + 4] = np.log1p(hero_stack / (max(pot, 1.0) * rng))
+
+    # ---- DUAL-2 (1141..1151): best-holding card usage / coverage ----
+    # Engine masks: bit i = the i-th hole card sorted by card index
+    # DESCENDING is one of the exactly-2 cards of hero's best holding.
+    if hero_board_v3 is not None:
+        mask_a = int(hero_board_v3[6])
+        mask_b = int(hero_board_v3[7])
+        for i in range(5):
+            if (mask_a >> i) & 1:
+                out[_DUAL2_OFF + i] = 1.0
+            if (mask_b >> i) & 1:
+                out[_DUAL2_OFF + 5 + i] = 1.0
 
     # ---- DUAL-5 (1162..1171): villain cross-board coverage (board-only) ----
     # Hero-independent (villain scoop geometry). Per-suit both-boards>=2 (4),
@@ -1610,6 +1700,7 @@ def encode_observation(obs: Mapping[str, Any], config: GameConfig) -> np.ndarray
         out[_SPR_LOG_OFF + k] = np.log1p(eff_per_seat[seat] / pot_safe)
 
     # ---- obs v3 batch-2 tail (stack + board + dual) ---------------------
+    hero_board_v3 = obs.get("hero_board_v3")
     _encode_stack_v3(
         out,
         config=config,
@@ -1629,6 +1720,7 @@ def encode_observation(obs: Mapping[str, Any], config: GameConfig) -> np.ndarray
         hero_stack=hero_stack,
         inv_bb=inv_bb,
         street_idx=int(obs["street"]),
+        acted=obs.get("acted_this_street"),
     )
     _encode_board_v3(
         out,
@@ -1637,6 +1729,7 @@ def encode_observation(obs: Mapping[str, Any], config: GameConfig) -> np.ndarray
         board_b_list=board_b_list,
         visible_count=visible_count,
         street_idx=int(obs["street"]),
+        hero_board_v3=hero_board_v3,
     )
     _encode_dual_v3(
         out,
@@ -1650,6 +1743,8 @@ def encode_observation(obs: Mapping[str, Any], config: GameConfig) -> np.ndarray
         eff_to_call=eff_to_call,
         hero_stack=hero_stack,
         config=config,
+        hero_board_v3=hero_board_v3,
+        share_bounds=obs.get("share_bounds"),
     )
 
     return out
@@ -2382,7 +2477,9 @@ def encode_observation_batch(
         to_call=to_call,
         inv_bb=inv_bb,
         street=street,
+        acted=obs_arrays.get("acted_this_street"),
     )
+    _hb_v3 = obs_arrays.get("hero_board_v3")
     _encode_board_v3_batch(
         out,
         live_mask=live_mask,
@@ -2390,6 +2487,7 @@ def encode_observation_batch(
         board_a=ba,
         board_b=bb,
         street=street,
+        hero_board_v3=_hb_v3,
     )
     _encode_dual_v3_batch(
         out,
@@ -2403,6 +2501,8 @@ def encode_observation_batch(
         to_call=to_call,
         effective=effective,
         config=config,
+        hero_board_v3=_hb_v3,
+        share_bounds=obs_arrays.get("share_bounds"),
     )
 
     return out
@@ -2433,8 +2533,10 @@ def _encode_stack_v3_batch(
     to_call: np.ndarray,
     inv_bb: float,
     street: np.ndarray,
+    acted=None,
 ) -> None:
-    """Batched twin of _encode_stack_v3, dims 1020..1061. STK-1 [ENGINE]."""
+    """Batched twin of _encode_stack_v3, dims 1020..1061. `acted` is the
+    (N, S) engine acted_this_street array (None → STK-1 stays zero)."""
     n = out.shape[0]
     seats = np.arange(num_seats, dtype=np.int64)
     rot = (hero_idx[:, None] + seats[None, :]) % num_seats  # (n, num_seats)
@@ -2447,6 +2549,36 @@ def _encode_stack_v3_batch(
     hero_commit = tc_rot[:, 0]
     eff_to_call = np.minimum(to_call, hero_stack)
     pot_denom = np.maximum(pot, 1.0)
+
+    # ---- STK-1: money / raise-exposure still behind (4) ----
+    # Same seat-index accumulation order as the serial loop (max is
+    # order-free; the sum adds +0.0 for non-pending seats).
+    if acted is not None:
+        max_cap = np.zeros(n, dtype=np.float64)
+        sum_cap = np.zeros(n, dtype=np.float64)
+        max_eff = np.zeros(n, dtype=np.float64)
+        any_pending = np.zeros(n, dtype=bool)
+        for s in range(num_seats):
+            pending = (
+                (hero_idx != s)
+                & ~folded[:, s]
+                & ~all_in[:, s]
+                & (~acted[:, s] | (street_commit[:, s] < bet_to_call))
+            )
+            eff_s = effective[:, s]
+            owed = np.minimum(
+                np.maximum(bet_to_call - street_commit[:, s], 0.0), eff_s
+            )
+            cap = np.maximum(0.0, eff_s - owed)
+            max_cap = np.where(pending, np.maximum(max_cap, cap), max_cap)
+            sum_cap = sum_cap + np.where(pending, cap, 0.0)
+            max_eff = np.where(pending, np.maximum(max_eff, eff_s), max_eff)
+            any_pending |= pending
+        wl1 = live_mask & any_pending
+        out[wl1, _STK1_OFF + 0] = np.log1p(max_cap / pot_denom)[wl1]
+        out[wl1, _STK1_OFF + 1] = np.log1p(sum_cap / pot_denom)[wl1]
+        out[wl1, _STK1_OFF + 2] = np.log1p(max_eff * inv_bb)[wl1]
+        out[wl1, _STK1_OFF + 3] = (max_eff >= hero_stack).astype(np.float64)[wl1]
 
     # ---- STK-2: raise-ladder envelope (6) ----
     min_d = min_bet - hero_sc
@@ -2560,9 +2692,10 @@ def _encode_board_v3_batch(
     board_a: np.ndarray,
     board_b: np.ndarray,
     street: np.ndarray,
+    hero_board_v3=None,
 ) -> None:
-    """Batched twin of _encode_board_v3, dims 1061..1139. BRD-7/BRD-12
-    [ENGINE]."""
+    """Batched twin of _encode_board_v3, dims 1061..1139. `hero_board_v3`
+    is the (N, 8) engine block (None → BRD-7/BRD-12 stay zero)."""
     n = hole.shape[0]
     live = live_mask
     ranks13 = np.arange(13)
@@ -2619,6 +2752,18 @@ def _encode_board_v3_batch(
     denom = unseen_deck.astype(np.float64)       # (N,) always > 0 for live rows
     not_river = street != 3
     is_flop = street == 1
+
+    # ---- BRD-7 / BRD-12: engine-emitted hero/board dims ----
+    # Same normalizations as the serial helper: BRD-7 raw counts, BRD-12
+    # outs / actual unseen-deck size, combo redundancy / 10.
+    if hero_board_v3 is not None:
+        hb = hero_board_v3.astype(np.float64)
+        out[live, _BRD7_OFF + 0] = hb[live, 0]
+        out[live, _BRD7_OFF + 1] = hb[live, 1]
+        out[live, _BRD12_OFF + 0] = (hb[:, 2] / denom)[live]
+        out[live, _BRD12_OFF + 1] = (hb[:, 3] / denom)[live]
+        out[live, _BRD12_OFF + 2] = (hb[:, 4] / 10.0)[live]
+        out[live, _BRD12_OFF + 3] = (hb[:, 5] / 10.0)[live]
 
     def _board_block(board, bi):
         bv = board < 52
@@ -2826,9 +2971,12 @@ def _encode_dual_v3_batch(
     to_call: np.ndarray,
     effective: np.ndarray,
     config: GameConfig,
+    hero_board_v3=None,
+    share_bounds=None,
 ) -> None:
-    """Batched twin of _encode_dual_v3, dims 1139..1171. DUAL-2/DUAL-4
-    [ENGINE]."""
+    """Batched twin of _encode_dual_v3, dims 1139..1171. `hero_board_v3`
+    (N, 8) carries the best-holding masks at cols 6/7 (DUAL-2);
+    `share_bounds` (N, 2) is the fused pass's [g_min, g_max] (DUAL-4)."""
     n = hole.shape[0]
     rows = np.arange(n)
 
@@ -2846,6 +2994,7 @@ def _encode_dual_v3_batch(
     out[live_mask, _DUAL1_OFF + 1] = quarter[live_mask]
 
     # ---- DUAL-3 (1151..1157): nut-lock / freeroll flags ----
+    active = None
     if per_board_outcome is not None:
         pbo = np.asarray(per_board_outcome, dtype=np.float64)
         ahead_a = pbo[:, 0]
@@ -2865,6 +3014,46 @@ def _encode_dual_v3_batch(
             axis=1,
         ).astype(np.float64)
         out[live_mask, _DUAL3_OFF : _DUAL3_OFF + 6] = dual3[live_mask]
+
+    # ---- DUAL-4 (1157..1162): guaranteed pot share (k=2 g_min/g_max) ----
+    # Mirrors the serial helper: gated on the outcome block being active;
+    # [3]/[4] use the g_max==g_min sentinel (no contested slice).
+    if share_bounds is not None and active is not None:
+        shb = np.asarray(share_bounds, dtype=np.float64)
+        g_min = shb[:, 0]
+        g_max = shb[:, 1]
+        wl4 = live_mask & active
+        out[wl4, _DUAL4_OFF + 0] = g_min[wl4]
+        out[wl4, _DUAL4_OFF + 1] = g_max[wl4]
+        out[wl4, _DUAL4_OFF + 2] = (g_min >= 0.5).astype(np.float64)[wl4]
+        rng = g_max - g_min
+        has_rng = rng > 0.0
+        denom4 = pot * rng + eff_to_call
+        price = np.where(
+            has_rng & (eff_to_call > 0.0),
+            eff_to_call / np.where(denom4 > 0.0, denom4, 1.0),
+            0.0,
+        )
+        out[wl4, _DUAL4_OFF + 3] = price[wl4]
+        # max(pot, 1): mirrors the serial guard — ante=0 (pot 0) states
+        # would otherwise emit inf here while the scalar path crashes.
+        pot_safe4 = np.maximum(pot, 1.0)
+        ratio = np.where(
+            has_rng,
+            hero_stack / np.where(has_rng, pot_safe4 * rng, 1.0),
+            0.0,
+        )
+        out[wl4, _DUAL4_OFF + 4] = np.log1p(ratio)[wl4]
+
+    # ---- DUAL-2 (1141..1151): best-holding card usage / coverage ----
+    if hero_board_v3 is not None:
+        bits = np.arange(5)
+        mask_a = hero_board_v3[:, 6].astype(np.int64)
+        mask_b = hero_board_v3[:, 7].astype(np.int64)
+        d2a = ((mask_a[:, None] >> bits[None, :]) & 1).astype(np.float64)
+        d2b = ((mask_b[:, None] >> bits[None, :]) & 1).astype(np.float64)
+        out[live_mask, _DUAL2_OFF : _DUAL2_OFF + 5] = d2a[live_mask]
+        out[live_mask, _DUAL2_OFF + 5 : _DUAL2_OFF + 10] = d2b[live_mask]
 
     # ---- DUAL-5 (1162..1171): villain cross-board coverage (board-only) ----
     ba_valid = board_a < 52

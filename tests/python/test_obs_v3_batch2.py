@@ -46,27 +46,154 @@ def test_tail_ends_at_obs_dim():
     assert _DUAL5_OFF + 9 == OBS_DIM
 
 
-def test_reserved_engine_columns_zero_on_real_encode():
-    """STK-1/BRD-7/BRD-12/DUAL-2/DUAL-4 are Chunk-B [ENGINE] dims — they
-    MUST read exactly 0.0 in a real encoded obs until their plumbing lands."""
+def test_engine_dims_live_and_semantically_sane():
+    """Chunk-B engine dims (STK-1/BRD-7/BRD-12/DUAL-2/DUAL-4) over real
+    deals: cross-checked against the raw observation_dict values and each
+    other. Parity (serial == batched) is test_encoding_batch.py's job;
+    these are the semantics parity can't see."""
     from plo5bp.env import BombPotEnv
 
     cfg = GameConfig(num_seats=6, starting_stack=150 * 10000, ante=3 * 10000, bb=10000)
     env = BombPotEnv(cfg)
-    hit = 0
-    for seed in range(40):
+    saw_nonzero = {"stk1": False, "brd7": False, "dual2": False, "dual4": False}
+    for seed in range(60):
         obs, info = env.reset(seed=seed, button=seed % cfg.num_seats)
         if info.actor is None:
             continue
-        # advance a few random-ish legal steps to reach varied streets
         vec = env._last_obs_vec
-        for off, n in (
-            (_STK1_OFF, 4), (_BRD7_OFF, 2), (_BRD12_OFF, 4),
-            (_DUAL2_OFF, 10), (_DUAL4_OFF, 5),
-        ):
-            assert np.all(vec[off : off + n] == 0.0), f"reserved @{off} nonzero"
-        hit += 1
-    assert hit > 0
+        raw = dict(env._rs.observation_dict())
+        hb = raw["hero_board_v3"]
+        shb = raw["share_bounds"]
+
+        # DUAL-2: exactly two hole cards form the best holding, per board.
+        for base in (_DUAL2_OFF, _DUAL2_OFF + 5):
+            bits = vec[base : base + 5]
+            assert set(np.unique(bits)) <= {0.0, 1.0}
+            assert bits.sum() == 2.0, f"seed {seed}: DUAL-2 bits {bits}"
+        saw_nonzero["dual2"] = True
+
+        # BRD-7 raw counts land verbatim; BRD-12 = raw/unseen and raw/10.
+        assert vec[_BRD7_OFF + 0] == np.float32(float(hb[0]))
+        assert vec[_BRD7_OFF + 1] == np.float32(float(hb[1]))
+        unseen = 52 - 5 - len(raw["board_a"]) - len(raw["board_b"])
+        assert vec[_BRD12_OFF + 0] == np.float32(float(hb[2]) / unseen)
+        assert vec[_BRD12_OFF + 2] == np.float32(float(hb[4]) / 10.0)
+        # Boat-or-better outs are a subset of strict-category improves
+        # whenever hero is below a full house (raw-count comparison).
+        if hb[0] > 0:
+            assert hb[2] >= hb[0], f"seed {seed}: boat {hb[0]} > improve {hb[2]}"
+            saw_nonzero["brd7"] = True
+        # Combo redundancy: at least one pair achieves the best category.
+        assert 1 <= hb[4] <= 10 and 1 <= hb[5] <= 10
+
+        # DUAL-4: quarter grid, ordered, DUAL-3-consistent.
+        g_min, g_max = float(shb[0]), float(shb[1])
+        assert g_min in (0.0, 0.25, 0.5, 0.75, 1.0)
+        assert g_max in (0.0, 0.25, 0.5, 0.75, 1.0)
+        assert g_min <= g_max
+        assert vec[_DUAL4_OFF + 0] == np.float32(g_min)
+        assert vec[_DUAL4_OFF + 1] == np.float32(g_max)
+        if g_max > 0.0:
+            saw_nonzero["dual4"] = True
+        if vec[_DUAL3_OFF + 4] == 1.0:  # locked both -> worst case >= half
+            assert g_min >= 0.5
+        if vec[_DUAL3_OFF + 0] == 1.0 and vec[_DUAL3_OFF + 2] == 1.0:
+            assert g_min == 1.0  # pure nuts on both -> guaranteed scoop
+
+        # STK-1: at the first flop decision all 5 opponents are pending
+        # with money behind -> every dim positive and the covered flag is
+        # well-defined; log1p(max_eff/bb) must match a direct recompute.
+        acted = raw["acted_this_street"]
+        pending_eff = [
+            float(raw["stacks"][s])
+            for s in range(cfg.num_seats)
+            if s != raw["actor"]
+            and not raw["folded"][s]
+            and not raw["all_in"][s]
+            and (not acted[s] or raw["street_commit"][s] < raw["bet_to_call"])
+        ]
+        if pending_eff:
+            assert vec[_STK1_OFF + 1] > 0.0
+            saw_nonzero["stk1"] = True
+        else:
+            assert np.all(vec[_STK1_OFF : _STK1_OFF + 4] == 0.0)
+    assert all(saw_nonzero.values()), saw_nonzero
+
+
+def test_stk1_bit_exact_recompute_mid_hand():
+    """STK-1 against a from-scratch spec recompute on MID-HAND states
+    (live bets, partial folds, owed>0) — the reviewer's sweep, pinned."""
+    from plo5bp.env import BombPotEnv
+
+    cfg = GameConfig(num_seats=6, starting_stack=150 * 10000, ante=3 * 10000, bb=10000)
+    env = BombPotEnv(cfg)
+    rng = np.random.default_rng(11)
+    checked = 0
+    for seed in range(30):
+        obs, info = env.reset(seed=seed, button=seed % cfg.num_seats)
+        for _step in range(6):
+            if info.actor is None:
+                break
+            raw = dict(env._rs.observation_dict())
+            vec = env._last_obs_vec
+            hero = raw["actor"]
+            n = cfg.num_seats
+            starting = cfg.resolved_stacks
+            eff = [
+                max(0.0, float(raw["stacks"][s]) - max(0, int(starting[s]) - int(raw["eff_stack_cap"][s])))
+                for s in range(n)
+            ]
+            btc = float(raw["bet_to_call"])
+            acted = raw["acted_this_street"]
+            max_cap = sum_cap = max_eff = 0.0
+            any_pending = False
+            for s in range(n):
+                if s == hero or raw["folded"][s] or raw["all_in"][s]:
+                    continue
+                if acted[s] and float(raw["street_commit"][s]) >= btc:
+                    continue
+                any_pending = True
+                owed = min(max(btc - float(raw["street_commit"][s]), 0.0), eff[s])
+                cap = max(0.0, eff[s] - owed)
+                max_cap = max(max_cap, cap)
+                sum_cap += cap
+                max_eff = max(max_eff, eff[s])
+            pot_denom = max(float(raw["pot"]), 1.0)
+            if any_pending:
+                exp = [
+                    np.float32(np.log1p(max_cap / pot_denom)),
+                    np.float32(np.log1p(sum_cap / pot_denom)),
+                    np.float32(np.log1p(max_eff / cfg.bb)),
+                    np.float32(1.0 if max_eff >= eff[hero] else 0.0),
+                ]
+            else:
+                exp = [np.float32(0.0)] * 4
+            got = list(vec[_STK1_OFF : _STK1_OFF + 4])
+            assert got == exp, f"seed {seed} step {_step}: {got} vs {exp}"
+            checked += 1
+            # random legal gate action to reach genuine mid-hand nodes
+            legal = [g for g in range(3) if info.gate_mask[g]]
+            gate = int(rng.choice(legal))
+            chips = int(info.min_raise_chips or 0) if gate == 2 else 0
+            obs, _r, done, info = env.step_hybrid(gate, chips)
+            if done:
+                break
+    assert checked > 60
+
+
+def test_dual4_ante_zero_pot_guard():
+    """Regression: ante=0 (pot 0 at the flop) must encode cleanly — the
+    unguarded DUAL-4[4] crashed serial and emitted inf batched."""
+    from plo5bp.env import BombPotEnv
+
+    cfg = GameConfig(num_seats=3, starting_stack=200000, ante=0, bb=10000)
+    env = BombPotEnv(cfg)
+    for seed in range(4):
+        obs, info = env.reset(seed=seed, button=0)
+        if info.actor is None:
+            continue
+        vec = env._last_obs_vec
+        assert np.all(np.isfinite(vec)), "non-finite dims at pot==0"
 
 
 # ---- STACK -----------------------------------------------------------------

@@ -479,6 +479,213 @@ pub fn evaluate_plo5_k_partial(hole: &[Card], board: &[Card]) -> HandRank {
     ck_to_hand_rank(safe_ck)
 }
 
+// ---------- v7 obs batch-2 engine dims (V7_OBS_CANDIDATES.md) ----------
+//
+// BRD-7 (boat_plus_outs), BRD-12 (improve_outs), DUAL-2 (best_pair_mask).
+// All follow evaluate_plo5_partial's conventions: exactly-2-hole + 3-board,
+// lower ck = stronger, degenerate duplicate-card combos (ck == 0) skipped,
+// hole widths 4..=6 supported via the PAIRS_* tables.
+
+/// Best 5-card rank over the combos that USE an added board card `c`:
+/// exactly-2-hole pairs × (2 existing board cards + `c`). Combos NOT using
+/// `c` are exactly the no-`c` baseline, so the caller combines this with
+/// the baseline category instead of re-enumerating the full board+c.
+fn best_rank_using_added(hole: &[Card], board: &[Card], c: Card) -> HandRank {
+    let t = tables();
+    let mut h = [0u32; 6];
+    for (i, hc) in hole.iter().enumerate() {
+        h[i] = card_to_ck(*hc);
+    }
+    let pairs: &[(usize, usize)] = match hole.len() {
+        4 => &PAIRS_4,
+        5 => &PAIRS_5,
+        _ => &PAIRS_6,
+    };
+    let ck_c = card_to_ck(c);
+    let bn = board.len();
+    let mut best_ck: u16 = u16::MAX;
+    for i0 in 0..bn {
+        let b0 = card_to_ck(board[i0]);
+        for i1 in (i0 + 1)..bn {
+            let b1 = card_to_ck(board[i1]);
+            for &(hi0, hi1) in pairs {
+                let cards = [h[hi0], h[hi1], b0, b1, ck_c];
+                let ck = ck_eval_inline(cards, t);
+                if ck != 0 && ck < best_ck {
+                    best_ck = ck;
+                }
+            }
+        }
+    }
+    let safe_ck = if best_ck == u16::MAX { 7462 } else { best_ck };
+    ck_to_hand_rank(safe_ck)
+}
+
+/// Per-hole-pair best ck over all board triples. Returns (pair table, count);
+/// entries left at u16::MAX mean every triple for that pair was degenerate.
+/// Shared by improve_outs (combo-redundancy count) and best_pair_mask.
+fn pair_best_cks(hole: &[Card], board: &[Card]) -> ([u16; 15], usize) {
+    let t = tables();
+    let mut h = [0u32; 6];
+    for (i, hc) in hole.iter().enumerate() {
+        h[i] = card_to_ck(*hc);
+    }
+    let pairs: &[(usize, usize)] = match hole.len() {
+        4 => &PAIRS_4,
+        5 => &PAIRS_5,
+        _ => &PAIRS_6,
+    };
+    let bn = board.len();
+    let mut b = [0u32; 5];
+    for i in 0..bn {
+        b[i] = card_to_ck(board[i]);
+    }
+    let mut best = [u16::MAX; 15];
+    for i0 in 0..bn {
+        for i1 in (i0 + 1)..bn {
+            for i2 in (i1 + 1)..bn {
+                for (pi, &(hi0, hi1)) in pairs.iter().enumerate() {
+                    let cards = [h[hi0], h[hi1], b[i0], b[i1], b[i2]];
+                    let ck = ck_eval_inline(cards, t);
+                    if ck != 0 && ck < best[pi] {
+                        best[pi] = ck;
+                    }
+                }
+            }
+        }
+    }
+    (best, pairs.len())
+}
+
+/// BRD-7: count of unseen next cards that promote hero's best category on
+/// `board` to full-house-or-better (quads and straight flushes included).
+/// `used` marks every visible card anywhere (hole + BOTH boards) — the
+/// unseen deck is global, matching the encoder's cross-board convention.
+/// 0 when hero already holds FH+ on this board, and 0 at the river (a
+/// 5-card board has no next card).
+pub fn boat_plus_outs(hole: &[Card], board: &[Card], used: &[bool; 52]) -> u8 {
+    if board.len() < 3 || board.len() >= 5 {
+        return 0;
+    }
+    let cat0 = category(evaluate_plo5_partial(hole, board));
+    if cat0 >= CAT_FULL_HOUSE {
+        return 0;
+    }
+    let mut n = 0u8;
+    for idx in 0..52u8 {
+        if used[idx as usize] {
+            continue;
+        }
+        let r = best_rank_using_added(hole, board, Card::from_index(idx));
+        if category(r) >= CAT_FULL_HOUSE {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// BRD-12: `(improve_outs, best_cat_combo_count)`.
+/// - improve_outs: count of DISTINCT unseen next cards whose arrival
+///   STRICTLY improves hero's best hand CATEGORY on this board (union
+///   across all improvement types — trips→boat, set→quads, draw→flush, …).
+///   0 at the river (no next card). Raw count; the encoder normalizes by
+///   the actual unseen-deck size.
+/// - best_cat_combo_count: how many of hero's exactly-2-hole pairs achieve
+///   his CURRENT best category on this board (counterfeit redundancy;
+///   well-defined at every street including the river). Raw count; the
+///   encoder divides by 10.
+pub fn improve_outs(hole: &[Card], board: &[Card], used: &[bool; 52]) -> (u8, u8) {
+    if board.len() < 3 {
+        return (0, 0);
+    }
+    let (pair_best, n_pairs) = pair_best_cks(hole, board);
+    let mut best_ck: u16 = u16::MAX;
+    for &pb in pair_best[..n_pairs].iter() {
+        if pb < best_ck {
+            best_ck = pb;
+        }
+    }
+    let cat0 = category(ck_to_hand_rank(if best_ck == u16::MAX {
+        7462
+    } else {
+        best_ck
+    }));
+    let combos = pair_best[..n_pairs]
+        .iter()
+        .filter(|&&pb| pb != u16::MAX && category(ck_to_hand_rank(pb)) == cat0)
+        .count() as u8;
+    if board.len() >= 5 {
+        return (0, combos);
+    }
+    let mut outs = 0u8;
+    for idx in 0..52u8 {
+        if used[idx as usize] {
+            continue;
+        }
+        let r = best_rank_using_added(hole, board, Card::from_index(idx));
+        if category(r) > cat0 {
+            outs += 1;
+        }
+    }
+    (outs, combos)
+}
+
+/// DUAL-2: 5-bit mask (bit i = slot i) over hero's hole cards SORTED BY
+/// CARD INDEX DESCENDING (the project's canonical multiset order) marking
+/// the exactly-2 cards of hero's best holding on this board. Rank ties
+/// break to the lexicographically smallest (min_card_idx, max_card_idx)
+/// pair — deterministic and independent of hole storage order. Returns 0
+/// for hole widths > 5 (PLO6 doesn't fit 5 slots), short boards, and
+/// all-degenerate study states.
+pub fn best_pair_mask(hole: &[Card], board: &[Card]) -> u8 {
+    if board.len() < 3 || hole.len() > 5 {
+        return 0;
+    }
+    let (pair_best, n_pairs) = pair_best_cks(hole, board);
+    let pairs: &[(usize, usize)] = match hole.len() {
+        4 => &PAIRS_4,
+        5 => &PAIRS_5,
+        _ => &PAIRS_6,
+    };
+    let mut best: Option<(u16, (u8, u8), (usize, usize))> = None;
+    for (pi, &pb) in pair_best[..n_pairs].iter().enumerate() {
+        if pb == u16::MAX {
+            continue;
+        }
+        let (hi0, hi1) = pairs[pi];
+        let (i0, i1) = (hole[hi0].index(), hole[hi1].index());
+        let key = (i0.min(i1), i0.max(i1));
+        let better = match &best {
+            None => true,
+            Some((bck, bkey, _)) => pb < *bck || (pb == *bck && key < *bkey),
+        };
+        if better {
+            best = Some((pb, key, (hi0, hi1)));
+        }
+    }
+    let (_, _, (hi0, hi1)) = match best {
+        Some(b) => b,
+        None => return 0,
+    };
+    // Map the winning positions to sorted-desc slots, consuming duplicates
+    // (degenerate study states can hold equal card indices).
+    let mut order: Vec<usize> = (0..hole.len()).collect();
+    order.sort_by(|&a, &b| hole[b].index().cmp(&hole[a].index()));
+    let mut mask = 0u8;
+    for win_pos in [hi0, hi1] {
+        for (slot, &pos) in order.iter().enumerate() {
+            if mask & (1 << slot) != 0 {
+                continue;
+            }
+            if hole[pos].index() == hole[win_pos].index() {
+                mask |= 1 << slot;
+                break;
+            }
+        }
+    }
+    mask
+}
+
 /// NLH evaluator: best 5-card hand from ANY combination of hole + board
 /// cards (0, 1, or 2 hole cards may play — "play the board" included).
 /// `hole` must have exactly 2 cards; `board` 3..=5 (partial boards give
@@ -1159,5 +1366,128 @@ mod plo4_tests {
         let board = [c(12, 2), c(11, 3), c(4, 1)];
         let r = evaluate_plo5_partial(&hole, &board);
         assert_eq!(category(r), CAT_TWO_PAIR);
+    }
+}
+
+#[cfg(test)]
+mod v7_dim_tests {
+    //! v7 obs batch-2 engine dims (BRD-7 / BRD-12 / DUAL-2) — hand-computed
+    //! cases. Card index = rank*4 + suit (rank 0=deuce..12=ace).
+    use super::*;
+
+    fn c(rank: u8, suit: u8) -> Card {
+        Card::new(rank, suit)
+    }
+
+    fn used_mask(hole: &[Card], boards: &[&[Card]]) -> [bool; 52] {
+        let mut used = [false; 52];
+        for card in hole {
+            used[card.index() as usize] = true;
+        }
+        for b in boards {
+            for card in b.iter() {
+                used[card.index() as usize] = true;
+            }
+        }
+        used
+    }
+
+    // Shared fixture: hole AA KK 2 (suits 0,1/2,3/0) on board A-7-3
+    // (suits 2,0,1) — hero has top set
+    // (trips). FH+ outs by hand: three 7s (AA+A77 boat), three 3s (AA+A33
+    // boat), one A (AAAA quads) = 7. No flush/SF is reachable with one
+    // card (rainbow board), so improve == boat here; only the AA pair
+    // achieves the trips category.
+    fn fixture() -> ([Card; 5], [Card; 3]) {
+        (
+            [c(12, 0), c(12, 1), c(11, 2), c(11, 3), c(0, 0)],
+            [c(12, 2), c(5, 0), c(1, 1)],
+        )
+    }
+
+    #[test]
+    fn boat_plus_outs_top_set() {
+        let (hole, board) = fixture();
+        let used = used_mask(&hole, &[&board]);
+        assert_eq!(boat_plus_outs(&hole, &board, &used), 7);
+    }
+
+    #[test]
+    fn boat_plus_outs_zero_when_already_boat_or_river() {
+        // Hero already FH+: hole AA332 on board A33 → 33 + (3,3,x) = quad
+        // threes (even stronger than the aces-full read of AA + A33) —
+        // either way cat0 >= FULL_HOUSE, which is the gate under test.
+        let hole = [c(12, 0), c(12, 1), c(1, 2), c(1, 3), c(0, 0)];
+        let board = [c(12, 2), c(1, 1), c(1, 0)];
+        let used = used_mask(&hole, &[&board]);
+        assert!(category(evaluate_plo5_partial(&hole, &board)) >= CAT_FULL_HOUSE);
+        assert_eq!(boat_plus_outs(&hole, &board, &used), 0);
+        // River board (5 cards): no next card → 0 by construction.
+        let (hole2, b3) = fixture();
+        let board5 = [b3[0], b3[1], b3[2], c(8, 2), c(3, 3)];
+        let used5 = used_mask(&hole2, &[&board5]);
+        assert_eq!(boat_plus_outs(&hole2, &board5, &used5), 0);
+    }
+
+    #[test]
+    fn improve_outs_top_set() {
+        let (hole, board) = fixture();
+        let used = used_mask(&hole, &[&board]);
+        let (outs, combos) = improve_outs(&hole, &board, &used);
+        assert_eq!(outs, 7, "improve == boat outs on this rainbow board");
+        assert_eq!(combos, 1, "only the AA pair achieves trips");
+    }
+
+    #[test]
+    fn improve_outs_river_keeps_combos() {
+        let (hole, b3) = fixture();
+        let board5 = [b3[0], b3[1], b3[2], c(8, 2), c(3, 3)];
+        let used = used_mask(&hole, &[&board5]);
+        let (outs, combos) = improve_outs(&hole, &board5, &used);
+        assert_eq!(outs, 0, "no next card at the river");
+        assert_eq!(combos, 1, "combo redundancy stays defined at the river");
+    }
+
+    #[test]
+    fn improve_outs_cross_board_used_mask_excludes_other_board() {
+        // The unseen deck is GLOBAL: a 7 sitting on the OTHER board must
+        // not count as an out. Same fixture, but a 7 visible on board B.
+        let (hole, board) = fixture();
+        let board_b = [c(5, 1), c(9, 2), c(2, 3)];
+        let used = used_mask(&hole, &[&board, &board_b]);
+        assert_eq!(boat_plus_outs(&hole, &board, &used), 6);
+        let (outs, _) = improve_outs(&hole, &board, &used);
+        assert_eq!(outs, 6);
+    }
+
+    #[test]
+    fn best_pair_mask_top_set() {
+        let (hole, board) = fixture();
+        // Winning holding = the two aces, card indices 48 + 49. Hole
+        // sorted by index DESC: [49, 48, 47, 46, 0] → slots 0/1 → mask 0b11.
+        assert_eq!(best_pair_mask(&hole, &board), 0b0000_0011);
+    }
+
+    #[test]
+    fn best_pair_mask_tie_break_lexicographic() {
+        // Hole AAAA2 on K72: every AA pair ties at pair-of-aces (identical
+        // 5-card hand). Tie-break → lexicographically smallest card-index
+        // pair = card indices (48, 49). Sorted desc: [51, 50, 49, 48, 0] →
+        // slots 2 and 3 → mask 0b1100.
+        let hole = [c(12, 0), c(12, 1), c(12, 2), c(12, 3), c(0, 0)];
+        let board = [c(11, 0), c(5, 1), c(0, 2)];
+        assert_eq!(best_pair_mask(&hole, &board), 0b0000_1100);
+    }
+
+    #[test]
+    fn best_pair_mask_exactly_two_bits() {
+        // Property over a spread of deals: exactly 2 bits set whenever the
+        // board exists (5-card PLO hole, non-degenerate).
+        let hole = [c(3, 0), c(7, 1), c(9, 2), c(11, 3), c(0, 1)];
+        for r in 0..10u8 {
+            let board = [c(r, 3), c((r + 2) % 13, 0), c((r + 5) % 13, 1)];
+            let mask = best_pair_mask(&hole, &board);
+            assert_eq!(mask.count_ones(), 2, "board seed {r}: mask {mask:#b}");
+        }
     }
 }
