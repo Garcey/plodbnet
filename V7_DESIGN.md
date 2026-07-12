@@ -175,11 +175,22 @@ eval stack (duplicate-deal + probes), not by training-loss aesthetics.
 Promotion rule: a size wins only if it beats the incumbent on eval at
 equal wall-clock budget (not equal updates — bigger nets get fewer).
 
-### 2.4 Obs v3 / architecture candidates `[collecting]`
+### 2.4 Obs v3 / architecture candidates `[drafted — V7_OBS_CANDIDATES.md]`
 
 Standing note: every obs candidate must name the decision it should
 change and the existing dims that fail to carry it (the obs-v2 tail set
 the bar).
+
+**2026-07-12: the obs-v3 candidate list exists** — see
+`V7_OBS_CANDIDATES.md`: 63 reviewed ideas across 6 lenses (position /
+history / stack geometry / board texture / double-board / MC-equity),
+each with a panel-final architecture; 8 carry removal recommendations.
+Sums to +682 dims as proposed (+562 sans removal-recs; obs 1020 → ~1580
+if everything shipped). Includes the 4 user-seeded ideas (button
+distances, live-player position, players-behind-if-call-vs-raise,
+per-player histories — the last upgraded to engine-maintained counters
+because the batched history window is truncation-lossy). Status: awaiting
+the keep/modify/drop go-through; survivors graduate into this section.
 
 1. **Input-block pre-norm** (from the 2.1 dry-run): the v6 LayerNorm sits
    only inside the residual blocks; the 1020→2048 input projection is
