@@ -363,6 +363,7 @@ impl PyGameState {
         // v7 batch-2 engine dims (STK-1 / BRD-7 / BRD-12 / DUAL-2).
         d.set_item("acted_this_street", g.acted_this_street.clone())?;
         d.set_item("hero_board_v3", g.hero_board_v3().to_vec())?;
+        d.set_item("board_draw_v3", g.board_draw_v3().to_vec())?;
         // NLH 3-dim [opp_ahead, tied, opp_behind]; cheap zeros for other
         // variants (the method's variant guard returns before any eval).
         d.set_item("nlh_opp_outcome", g.nlh_opp_outcome_fractions())?;
@@ -550,6 +551,7 @@ impl PyGameState {
                 share_bounds: Array2::<f32>::zeros((n, 2)),
                 acted_this_street,
                 hero_board_v3: Array2::<u8>::zeros((n, 8)),
+                board_draw_v3: Array2::<u8>::zeros((n, 7)),
                 sb_seat,
                 bb_seat,
                 nlh_opp_outcome,
@@ -598,6 +600,7 @@ impl PyGameState {
             packed.acted_this_street.into_pyarray(py),
         )?;
         d.set_item("hero_board_v3", packed.hero_board_v3.into_pyarray(py))?;
+        d.set_item("board_draw_v3", packed.board_draw_v3.into_pyarray(py))?;
         d.set_item("sb_seat", packed.sb_seat.into_pyarray(py))?;
         d.set_item("bb_seat", packed.bb_seat.into_pyarray(py))?;
         d.set_item("nlh_opp_outcome", packed.nlh_opp_outcome.into_pyarray(py))?;
@@ -1685,6 +1688,7 @@ impl PyBatchedEngine {
             packed.acted_this_street.into_pyarray(py),
         )?;
         d.set_item("hero_board_v3", packed.hero_board_v3.into_pyarray(py))?;
+        d.set_item("board_draw_v3", packed.board_draw_v3.into_pyarray(py))?;
         Ok(d)
     }
 
@@ -1773,6 +1777,7 @@ impl PyBatchedEngine {
             packed.acted_this_street.into_pyarray(py),
         )?;
         d.set_item("hero_board_v3", packed.hero_board_v3.into_pyarray(py))?;
+        d.set_item("board_draw_v3", packed.board_draw_v3.into_pyarray(py))?;
         d.set_item("sb_seat", packed.sb_seat.into_pyarray(py))?;
         d.set_item("bb_seat", packed.bb_seat.into_pyarray(py))?;
         d.set_item("nlh_opp_outcome", packed.nlh_opp_outcome.into_pyarray(py))?;
@@ -1863,6 +1868,7 @@ impl PyBatchedEngine {
             packed.acted_this_street.into_pyarray(py),
         )?;
         d.set_item("hero_board_v3", packed.hero_board_v3.into_pyarray(py))?;
+        d.set_item("board_draw_v3", packed.board_draw_v3.into_pyarray(py))?;
         d.set_item("sb_seat", packed.sb_seat.into_pyarray(py))?;
         d.set_item("bb_seat", packed.bb_seat.into_pyarray(py))?;
         d.set_item("nlh_opp_outcome", packed.nlh_opp_outcome.into_pyarray(py))?;
@@ -1936,6 +1942,9 @@ struct PackedObservation {
     /// improve_b, combos_a, combos_b, mask_a, mask_b] (BRD-7 / BRD-12 /
     /// DUAL-2; see GameState::hero_board_v3). All-zero for NLH.
     hero_board_v3: Array2<u8>,
+    /// (n, 7) v7 BRD-5/BRD-6/DUAL-5 hot counts:
+    /// [ds_a, ds_b, u_a, n_a, u_b, n_b, scoop]. All-zero for NLH.
+    board_draw_v3: Array2<u8>,
     /// Blind seats (-1 when the variant has none). NLH batch encoder input.
     sb_seat: Array1<i8>,
     bb_seat: Array1<i8>,
@@ -1993,6 +2002,7 @@ impl PyBatchedEngine {
         let mut share_bounds = Array2::<f32>::zeros((n, 2));
         let mut acted_this_street = Array2::<bool>::default((n, s));
         let mut hero_board_v3 = Array2::<u8>::zeros((n, 8));
+        let mut board_draw_v3 = Array2::<u8>::zeros((n, 7));
         let mut sb_seat = Array1::<i8>::from_elem(n, -1i8);
         let mut bb_seat = Array1::<i8>::from_elem(n, -1i8);
         let mut nlh_opp_outcome = Array2::<f32>::zeros((n, 3));
@@ -2128,6 +2138,7 @@ impl PyBatchedEngine {
             bb_seat: *mut i8,
             acted_this_street: *mut bool,
             hero_board_v3: *mut u8,
+            board_draw_v3: *mut u8,
         }
         unsafe impl Send for OutPtrs {}
         unsafe impl Sync for OutPtrs {}
@@ -2163,6 +2174,7 @@ impl PyBatchedEngine {
             bb_seat: bb_seat.as_mut_ptr(),
             acted_this_street: acted_this_street.as_mut_ptr(),
             hero_board_v3: hero_board_v3.as_mut_ptr(),
+            board_draw_v3: board_draw_v3.as_mut_ptr(),
         };
 
         (0..n).into_par_iter().for_each(|i| {
@@ -2237,6 +2249,11 @@ impl PyBatchedEngine {
                 for (j, v) in hbv.iter().enumerate() {
                     *ptrs.hero_board_v3.add(hb_base + j) = *v;
                 }
+                let bdv = state.board_draw_v3();
+                let bd_base = i * 7;
+                for (j, v) in bdv.iter().enumerate() {
+                    *ptrs.board_draw_v3.add(bd_base + j) = *v;
+                }
 
                 let hist_len = state.history.len();
                 let start = hist_len.saturating_sub(hist_cap);
@@ -2284,6 +2301,7 @@ impl PyBatchedEngine {
             share_bounds,
             acted_this_street,
             hero_board_v3,
+            board_draw_v3,
             sb_seat,
             bb_seat,
             nlh_opp_outcome,

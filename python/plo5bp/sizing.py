@@ -223,6 +223,56 @@ def anchor_grid_np(
     return AnchorGrid(chips=chips, legal=legal, lo=lo, hi=hi, refine_ok=refine_ok)
 
 
+def n_legal_anchors_np(
+    min_raise: np.ndarray | int,
+    max_raise: np.ndarray | int,
+    pot: np.ndarray | int,
+    to_call: np.ndarray | int,
+    spec: AnchorSpec = PLO_ANCHOR_SPEC,
+) -> np.ndarray:
+    """Count of legal anchors only — same legality as :func:`anchor_grid_np`
+    but skips bracket / refine_ok construction. Used by the obs STK-2
+    legal-fraction dim (which only needs ``legal.sum() / count``).
+
+    Returns an int64 array with the broadcast shape of the inputs (scalar
+    inputs → 0-d array). Bit-identical to ``anchor_grid_np(...).legal.sum(-1)``.
+    """
+    mn = np.asarray(min_raise, dtype=np.int64)
+    mx = np.asarray(max_raise, dtype=np.int64)
+    pot_a = np.asarray(pot, dtype=np.int64)
+    tc = np.asarray(to_call, dtype=np.int64)
+    mn, mx, pot_a, tc = np.broadcast_arrays(mn, mx, pot_a, tc)
+
+    mr = np.minimum(mn, mx)
+    base = pot_a + tc
+    count = spec.count
+    nf = len(spec.fracs_pm)
+    fr = np.asarray(spec.fracs_pm, dtype=np.int64)
+    fshape = mn.shape + (nf,)
+
+    base_f = np.broadcast_to(base[..., None], fshape)
+    tc_f = np.broadcast_to(tc[..., None], fshape)
+    mr_f = np.broadcast_to(mr[..., None], fshape)
+    mx_f = np.broadcast_to(mx[..., None], fshape)
+
+    chips = np.clip(tc_f + (fr * base_f + 500) // 1000, mr_f, mx_f)
+    if spec.allin_atom:
+        chips = np.concatenate([chips, mx[..., None]], axis=-1)
+
+    shape = mn.shape + (count,)
+    legal = np.ones(shape, dtype=bool)
+    legal[..., 1:] = chips[..., 1:] > chips[..., :-1]
+
+    ss = (mn == 0) & (mx > 0)
+    if np.any(ss):
+        ss_b = np.broadcast_to(ss[..., None], shape)
+        k = np.arange(count, dtype=np.int64)
+        is_top = np.broadcast_to(k == count - 1, shape)
+        legal = np.where(ss_b, is_top, legal)
+
+    return legal.sum(axis=-1).astype(np.int64)
+
+
 def anchor_grid_torch(
     sizing: torch.Tensor,
     spec: AnchorSpec = PLO_ANCHOR_SPEC,

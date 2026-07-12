@@ -105,7 +105,10 @@ from plo5bp._engine import (  # type: ignore[attr-defined]
 )
 from plo5bp.actions import CHECK_CALL, FOLD
 from plo5bp.config import GameConfig
-from plo5bp.sizing import anchor_grid_np  # v7 STK-2 raise-ladder envelope
+from plo5bp.sizing import (  # v7 STK-2 raise-ladder envelope
+    ANCHOR_COUNT,
+    n_legal_anchors_np,
+)
 
 OBS_DIM: int = 1171  # v7 batch-2 tail (stack+board+dual) appended after 1019
 
@@ -309,6 +312,123 @@ for _wi, _w in enumerate(_STRAIGHT_WINDOWS):
     for _r in _w:
         _WINDOW_MATRIX[_wi, _r] = True
 del _wi, _w, _r
+
+# Python-int window bitmasks (same order as _STRAIGHT_WINDOWS). Used by the
+# serial BRD-5/6 / DUAL-5 hot paths so they avoid frozenset allocs while
+# staying bit-exact with the set formulation (popcount == set length).
+_WINDOW_BITS_PY: tuple[int, ...] = tuple(
+    sum(1 << r for r in W) for W in _STRAIGHT_WINDOWS
+)
+_PAIR_BITS_PY: tuple[int, ...] = tuple(
+    (1 << r1) | (1 << r2) for r1 in range(13) for r2 in range(r1 + 1, 13)
+)
+_MASK13 = 0x1FFF  # low 13 rank bits
+
+
+def _ranks_mask(cards) -> int:
+    """13-bit presence mask of ranks in an iterable of card indices."""
+    m = 0
+    for c in cards:
+        m |= 1 << (int(c) // 4)
+    return m
+
+
+def _danger_straight_outs(
+    board_mask: int, hole_mask: int, unseen_per_rank
+) -> int:
+    """BRD-5 danger_straight: count of unseen rank-copies that open a
+    field straight hero does not currently make. Bit-exact with the
+    frozenset formulation (popcount ≡ set size)."""
+    danger = 0
+    for r in range(13):
+        ur = int(unseen_per_rank[r])
+        if ur <= 0:
+            continue
+        new_board = board_mask | (1 << r)
+        field = False
+        for W in _WINDOW_BITS_PY:
+            if (W & new_board).bit_count() >= 3:
+                field = True
+                break
+        if not field:
+            continue
+        hero_makes = False
+        for W in _WINDOW_BITS_PY:
+            L = W & ~new_board
+            nL = L.bit_count()
+            nH = (W & hole_mask).bit_count()
+            if nH >= 2 and nL <= 2 and (L & ~hole_mask) == 0:
+                hero_makes = True
+                break
+        if not hero_makes:
+            danger += ur
+    return danger
+
+
+def _straight_out_union(
+    board_mask: int, hole_mask: int, unseen_per_rank
+) -> tuple[int, int]:
+    """BRD-6 (union_outs, nut_outs). Bit-exact with the frozenset path."""
+    union_mask = 0
+    for W in _WINDOW_BITS_PY:
+        L = W & ~board_mask
+        nL = L.bit_count()
+        nH = (W & hole_mask).bit_count()
+        makes = (L & ~hole_mask) == 0 and nH >= 2 and nL <= 2
+        if makes or nH < 2:
+            continue
+        M = L & ~hole_mask
+        nM = M.bit_count()
+        if nL == 3 and nM == 0:
+            union_mask |= L
+        elif nM == 1 and 1 <= nL <= 3:
+            union_mask |= M
+    union_outs = 0
+    nut_outs = 0
+    for r in range(13):
+        if not (union_mask >> r) & 1:
+            continue
+        ur = int(unseen_per_rank[r])
+        union_outs += ur
+        new_board = board_mask | (1 << r)
+        h_max = -1
+        for wi, W in enumerate(_WINDOW_BITS_PY):
+            L = W & ~new_board
+            nL = L.bit_count()
+            nH = (W & hole_mask).bit_count()
+            if (L & ~hole_mask) == 0 and nH >= 2 and nL <= 2:
+                if wi > h_max:
+                    h_max = wi
+        if h_max < 0:
+            continue
+        nut_dist = 0
+        for wi in range(h_max + 1, 10):
+            if (_WINDOW_BITS_PY[wi] & new_board).bit_count() >= 3:
+                nut_dist += 1
+        if nut_dist == 0:
+            nut_outs += ur
+    return union_outs, nut_outs
+
+
+def _scoop_pair_count(ba_mask: int, bb_mask: int) -> int:
+    """DUAL-5 scoop-pair count: # of 2-rank pairs that complete a straight
+    on BOTH boards. Bit-exact with the frozenset double-loop."""
+    scoop = 0
+    for pair in _PAIR_BITS_PY:
+        made_a = False
+        made_b = False
+        for W in _WINDOW_BITS_PY:
+            if (pair & W) != pair:
+                continue
+            if (pair | (ba_mask & W)).bit_count() >= 5:
+                made_a = True
+            if (pair | (bb_mask & W)).bit_count() >= 5:
+                made_b = True
+            if made_a and made_b:
+                break
+        if made_a and made_b:
+            scoop += 1
+    return scoop
 
 
 def _blocker_features(hole_idx: list[int], board_idx: list[int]) -> np.ndarray:
@@ -977,8 +1097,12 @@ def _encode_stack_v3(
         out[_STK2_OFF + 2] = min(max(min_d / eff_denom, 0.0), 1.0)
         out[_STK2_OFF + 3] = min(max(max_d / eff_denom, 0.0), 1.0)
         out[_STK2_OFF + 4] = 1.0 if max_d < to_call + base else 0.0
-        grid = anchor_grid_np(min_d, max_d, pot, to_call)
-        out[_STK2_OFF + 5] = float(grid.legal.sum()) / 11.0
+        # Legal-anchor count only (no brackets) — bit-identical to
+        # anchor_grid_np(...).legal.sum() / ANCHOR_COUNT.
+        out[_STK2_OFF + 5] = (
+            float(n_legal_anchors_np(min_d, max_d, pot, to_call))
+            / float(ANCHOR_COUNT)
+        )
 
     # ---- STK-4: per-seat commitment ratio (8) @ _STK4_OFF, hero-rotated ----
     # RAW commit / EFFECTIVE stack, matching dim-1009's exact recipe; folded
@@ -1074,12 +1198,15 @@ def _encode_board_v3(
     visible_count,
     street_idx: int,
     hero_board_v3=None,
+    board_draw_v3=None,
 ) -> None:
     """Board texture + hand-board combinatorics, dims 1061..1139.
     `hero_board_v3` is the engine's 8-int block [boat_a, boat_b, improve_a,
     improve_b, combos_a, combos_b, mask_a, mask_b] (None on pre-v7
     fixtures → BRD-7/BRD-12 stay zero; masks are consumed by the DUAL
-    helper, not here)."""
+    helper, not here).
+    `board_draw_v3` is the engine's 7-int hot block
+    [ds_a, ds_b, u_a, n_a, u_b, n_b, scoop] (None → Python BRD-5/6)."""
     # ---- Shared hero-side aggregates (board-agnostic) ----
     hole_rank_counts = [0] * 13
     hole_suit_counts = [0] * 4
@@ -1177,6 +1304,8 @@ def _encode_board_v3(
             out[o4 + 2] = straight_adv / unseen_deck
 
         # ---- BRD-5: hero vulnerability outs (3), river-zeroed ----
+        # danger_flush / danger_pair stay pure-Python (cheap); danger_straight
+        # uses the engine board_draw_v3 block when present (Rust hot path).
         o5 = _BRD5_OFF + bi * 3
         if not is_river:
             danger_flush = sum(
@@ -1189,24 +1318,19 @@ def _encode_board_v3(
                 for r in board_ranks_set
                 if hole_rank_counts[r] == 0
             )
-            danger_straight = 0
-            for r in range(13):
-                unseen_r = 4 - int(vct[r])
-                if unseen_r <= 0:
-                    continue
-                new_board = board_ranks_set | {r}
-                field = any(len(W & new_board) >= 3 for W in _STRAIGHT_WINDOWS)
-                if not field:
-                    continue
-                hero_makes = False
-                for W in _STRAIGHT_WINDOWS:
-                    H_W = W & hole_ranks_set
-                    L = W - new_board
-                    if L <= H_W and len(H_W) >= 2 and len(L) <= 2:
-                        hero_makes = True
-                        break
-                if not hero_makes:
-                    danger_straight += unseen_r
+            if board_draw_v3 is not None:
+                danger_straight = float(board_draw_v3[bi])  # ds_a / ds_b
+            else:
+                board_mask = 0
+                for r in board_ranks_set:
+                    board_mask |= 1 << r
+                hole_mask = 0
+                for r in hole_ranks_set:
+                    hole_mask |= 1 << r
+                unseen_per_rank = [4 - int(vct[r]) for r in range(13)]
+                danger_straight = _danger_straight_outs(
+                    board_mask, hole_mask, unseen_per_rank
+                )
             out[o5 + 0] = danger_flush / unseen_deck
             out[o5 + 1] = danger_pair / unseen_deck
             out[o5 + 2] = danger_straight / unseen_deck
@@ -1214,43 +1338,21 @@ def _encode_board_v3(
         # ---- BRD-6: straight out union (2), river-zeroed ----
         o6 = _BRD6_OFF + bi * 2
         if not is_river:
-            union: set[int] = set()
-            for W in _STRAIGHT_WINDOWS:
-                B_W = W & board_ranks_set
-                H_W = W & hole_ranks_set
-                L = W - B_W
-                nL, nH = len(L), len(H_W)
-                makes = (L <= H_W) and (nH >= 2) and (nL <= 2)
-                if makes or nH < 2:
-                    continue
-                M = L - H_W
-                nM = len(M)
-                if nL == 3 and nM == 0:
-                    union |= L
-                elif nM == 1 and 1 <= nL <= 3:
-                    union |= M
-            union_outs = sum(4 - int(vct[r]) for r in union)
-            nut_outs = 0
-            for r in union:
-                unseen_r = 4 - int(vct[r])
-                new_board = board_ranks_set | {r}
-                makes_idx = [
-                    wi
-                    for wi, W in enumerate(_STRAIGHT_WINDOWS)
-                    if (W - new_board) <= (W & hole_ranks_set)
-                    and len(W & hole_ranks_set) >= 2
-                    and len(W - new_board) <= 2
-                ]
-                if not makes_idx:
-                    continue
-                h_max = max(makes_idx)
-                nut_dist = sum(
-                    1
-                    for wi in range(h_max + 1, 10)
-                    if len(_STRAIGHT_WINDOWS[wi] & new_board) >= 3
+            if board_draw_v3 is not None:
+                # layout: [ds_a, ds_b, u_a, n_a, u_b, n_b, scoop]
+                union_outs = float(board_draw_v3[2 + bi * 2])
+                nut_outs = float(board_draw_v3[3 + bi * 2])
+            else:
+                board_mask = 0
+                for r in board_ranks_set:
+                    board_mask |= 1 << r
+                hole_mask = 0
+                for r in hole_ranks_set:
+                    hole_mask |= 1 << r
+                unseen_per_rank = [4 - int(vct[r]) for r in range(13)]
+                union_outs, nut_outs = _straight_out_union(
+                    board_mask, hole_mask, unseen_per_rank
                 )
-                if nut_dist == 0:
-                    nut_outs += unseen_r
             out[o6 + 0] = float(union_outs)
             out[o6 + 1] = float(nut_outs)
 
@@ -1369,11 +1471,13 @@ def _encode_dual_v3(
     config: GameConfig,
     hero_board_v3=None,
     share_bounds=None,
+    board_draw_v3=None,
 ) -> None:
     """Double-board structure, dims 1139..1171. `hero_board_v3` carries the
     engine best-holding masks at [6]/[7] (DUAL-2); `share_bounds` is the
-    fused pass's [g_min, g_max] (DUAL-4). None → those blocks stay zero
-    (pre-v7 fixtures)."""
+    fused pass's [g_min, g_max] (DUAL-4). `board_draw_v3` supplies the
+    DUAL-5 scoop raw count at [6] when present. None → those blocks stay
+    zero / Python fallback (pre-v7 fixtures)."""
     # ---- DUAL-1 (1139..1141): split-adjusted price ladder ----
     # Pot odds re-denominated to the win-one (0.5*pot) and quartered
     # (0.25*pot) split outcomes, stack-capped (eff_to_call already =
@@ -1452,23 +1556,12 @@ def _encode_dual_v3(
             out[_DUAL5_OFF + s] = 1.0
         if ba_suit[s] >= 3 and bb_suit[s] >= 3:
             out[_DUAL5_OFF + 4 + s] = 1.0
-    ba_ranks = {c // 4 for c in board_a_list}
-    bb_ranks = {c // 4 for c in board_b_list}
-    scoop_pairs = 0
-    for r1 in range(13):
-        for r2 in range(r1 + 1, 13):
-            pair = {r1, r2}
-            made_a = False
-            made_b = False
-            for W in _STRAIGHT_WINDOWS:
-                if not (pair <= W):
-                    continue
-                if len(pair | (ba_ranks & W)) >= 5:
-                    made_a = True
-                if len(pair | (bb_ranks & W)) >= 5:
-                    made_b = True
-            if made_a and made_b:
-                scoop_pairs += 1
+    if board_draw_v3 is not None:
+        scoop_pairs = float(board_draw_v3[6])
+    else:
+        ba_mask = _ranks_mask(board_a_list)
+        bb_mask = _ranks_mask(board_b_list)
+        scoop_pairs = float(_scoop_pair_count(ba_mask, bb_mask))
     out[_DUAL5_OFF + 8] = scoop_pairs / 78.0
 
 
@@ -1701,6 +1794,7 @@ def encode_observation(obs: Mapping[str, Any], config: GameConfig) -> np.ndarray
 
     # ---- obs v3 batch-2 tail (stack + board + dual) ---------------------
     hero_board_v3 = obs.get("hero_board_v3")
+    board_draw_v3 = obs.get("board_draw_v3")
     _encode_stack_v3(
         out,
         config=config,
@@ -1730,6 +1824,7 @@ def encode_observation(obs: Mapping[str, Any], config: GameConfig) -> np.ndarray
         visible_count=visible_count,
         street_idx=int(obs["street"]),
         hero_board_v3=hero_board_v3,
+        board_draw_v3=board_draw_v3,
     )
     _encode_dual_v3(
         out,
@@ -1745,6 +1840,7 @@ def encode_observation(obs: Mapping[str, Any], config: GameConfig) -> np.ndarray
         config=config,
         hero_board_v3=hero_board_v3,
         share_bounds=obs.get("share_bounds"),
+        board_draw_v3=board_draw_v3,
     )
 
     return out
@@ -2480,6 +2576,7 @@ def encode_observation_batch(
         acted=obs_arrays.get("acted_this_street"),
     )
     _hb_v3 = obs_arrays.get("hero_board_v3")
+    _bd_v3 = obs_arrays.get("board_draw_v3")
     _encode_board_v3_batch(
         out,
         live_mask=live_mask,
@@ -2488,6 +2585,7 @@ def encode_observation_batch(
         board_b=bb,
         street=street,
         hero_board_v3=_hb_v3,
+        board_draw_v3=_bd_v3,
     )
     _encode_dual_v3_batch(
         out,
@@ -2503,6 +2601,7 @@ def encode_observation_batch(
         config=config,
         hero_board_v3=_hb_v3,
         share_bounds=obs_arrays.get("share_bounds"),
+        board_draw_v3=_bd_v3,
     )
 
     return out
@@ -2587,8 +2686,12 @@ def _encode_stack_v3_batch(
     raise_legal = max_d > to_call
     base_safe = np.maximum(base, 1.0)
     eff_denom = np.maximum(hero_stack, 1.0)
-    grid = anchor_grid_np(min_d, max_d, pot, to_call)
-    n_legal = grid.legal.sum(axis=-1).astype(np.float64) / 11.0
+    # Legal-anchor count only (no brackets) — bit-identical to
+    # anchor_grid_np(...).legal.sum(-1) / ANCHOR_COUNT.
+    n_legal = (
+        n_legal_anchors_np(min_d, max_d, pot, to_call).astype(np.float64)
+        / float(ANCHOR_COUNT)
+    )
     wl2 = live_mask & raise_legal
     out[wl2, _STK2_OFF + 0] = np.clip((min_d - to_call) / base_safe, 0.0, 1.0)[wl2]
     out[wl2, _STK2_OFF + 1] = np.clip((max_d - to_call) / base_safe, 0.0, 1.0)[wl2]
@@ -2693,14 +2796,19 @@ def _encode_board_v3_batch(
     board_b: np.ndarray,
     street: np.ndarray,
     hero_board_v3=None,
+    board_draw_v3=None,
 ) -> None:
     """Batched twin of _encode_board_v3, dims 1061..1139. `hero_board_v3`
-    is the (N, 8) engine block (None → BRD-7/BRD-12 stay zero)."""
+    is the (N, 8) engine block (None → BRD-7/BRD-12 stay zero).
+    `board_draw_v3` is the (N, 7) engine hot block
+    [ds_a, ds_b, u_a, n_a, u_b, n_b, scoop] (None → Python BRD-5/6)."""
     n = hole.shape[0]
     live = live_mask
     ranks13 = np.arange(13)
     wmat = _WINDOW_MATRIX                 # (10, 13) bool
     wmat_i = wmat.astype(np.int64)        # (10, 13)
+    # Prefer engine hot path when present (training pack always supplies it).
+    _bd = None if board_draw_v3 is None else np.asarray(board_draw_v3)
 
     # ---- Global visibility (hole + both boards), (N, 13, 4) 0/1 ----
     visible = np.zeros((n, 13, 4), dtype=np.int64)
@@ -2813,24 +2921,42 @@ def _encode_board_v3_batch(
         out[live, o4 : o4 + 3] = b4[live]
 
         # ---- BRD-5: hero vulnerability outs (3), river-zeroed ----
+        # Integer bitmask path: (N,) u16 board/hole masks + rank/window
+        # loops over scalar ints. Bit-exact with the serial frozenset path
+        # (and ~10× faster than the prior (N,13) bool-matrix formulation).
         o5 = _BRD5_OFF + bi * 3
         danger_flush = (((bsc == 2) & (hsc < 2)) * unseen_s).sum(axis=1)
         danger_pair = ((brm & (hrc == 0)) * unseen_r).sum(axis=1)
-        danger_straight = np.zeros(n, dtype=np.int64)
-        for rc in range(13):
-            aug = brm.copy()
-            aug[:, rc] = True
-            field = ((aug.astype(np.int64) @ wmat_i.T) >= 3).any(axis=1)
-            makes_any = np.zeros(n, dtype=bool)
-            for w in range(10):
-                Wm = wmat[w]
-                L = Wm[None, :] & ~aug
-                nL = L.sum(axis=1)
-                nH = (Wm[None, :] & hrm).sum(axis=1)
-                subset = ~((L & ~hrm).any(axis=1))
-                makes_any |= subset & (nH >= 2) & (nL <= 2)
-            danger = field & ~makes_any
-            danger_straight += np.where(danger, unseen_r[:, rc], 0)
+        if _bd is not None:
+            # Engine hot path: raw danger_straight counts at cols 0/1.
+            danger_straight = _bd[:, bi].astype(np.int64)
+        else:
+            board_bits = (brm.astype(np.uint16) * _RANK_WEIGHTS_13).sum(axis=1).astype(
+                np.uint16
+            )
+            hole_bits = (hrm.astype(np.uint16) * _RANK_WEIGHTS_13).sum(axis=1).astype(
+                np.uint16
+            )
+            danger_straight = np.zeros(n, dtype=np.int64)
+            for rc in range(13):
+                bit = np.uint16(1 << rc)
+                new_board = board_bits | bit
+                field = np.zeros(n, dtype=bool)
+                makes_any = np.zeros(n, dtype=bool)
+                for W in _WINDOW_BITS_13:
+                    cov = np.bitwise_count((new_board & W).astype(np.uint16))
+                    field |= cov >= 3
+                    L = (W & ~new_board.astype(np.uint32)).astype(np.uint16) & np.uint16(
+                        _MASK13
+                    )
+                    miss = (
+                        L & ~hole_bits.astype(np.uint32)
+                    ).astype(np.uint16) & np.uint16(_MASK13)
+                    nL = np.bitwise_count(L)
+                    nH = np.bitwise_count((W & hole_bits).astype(np.uint16))
+                    makes_any |= (miss == 0) & (nH >= 2) & (nL <= 2)
+                danger = field & ~makes_any
+                danger_straight += np.where(danger, unseen_r[:, rc], 0)
         b5 = np.stack(
             [danger_flush, danger_pair, danger_straight], axis=1
         ).astype(np.float64)
@@ -2839,43 +2965,63 @@ def _encode_board_v3_batch(
 
         # ---- BRD-6: straight out union (2), river-zeroed ----
         o6 = _BRD6_OFF + bi * 2
-        out_cand = np.zeros((n, 13), dtype=bool)
-        for w in range(10):
-            Wm = wmat[w]
-            inW = Wm[None, :]
-            L = inW & ~brm
-            M = L & ~hrm
-            nL = L.sum(axis=1)
-            nH = (inW & hrm).sum(axis=1)
-            nM = M.sum(axis=1)
-            makes = (nM == 0) & (nH >= 2) & (nL <= 2)
-            gate = (~makes) & (nH >= 2)
-            cond1 = (nL == 3) & (nM == 0) & gate
-            cond2 = (nM == 1) & (nL >= 1) & (nL <= 3) & gate
-            out_cand |= L & cond1[:, None]
-            out_cand |= M & cond2[:, None]
-        union_outs = (out_cand * unseen_r).sum(axis=1)
-        nut_outs = np.zeros(n, dtype=np.int64)
-        widx = np.arange(10)
-        for rc in range(13):
-            aug = brm.copy()
-            aug[:, rc] = True
-            makes_w = np.zeros((n, 10), dtype=bool)
-            poss_w = np.zeros((n, 10), dtype=bool)
-            for w in range(10):
-                Wm = wmat[w]
-                L = Wm[None, :] & ~aug
-                nL = L.sum(axis=1)
-                nH = (Wm[None, :] & hrm).sum(axis=1)
-                subset = ~((L & ~hrm).any(axis=1))
-                makes_w[:, w] = subset & (nH >= 2) & (nL <= 2)
-                poss_w[:, w] = (Wm[None, :] & aug).sum(axis=1) >= 3
-            any_make = makes_w.any(axis=1)
-            hmaxw = np.where(makes_w, widx[None, :], -1).max(axis=1)
-            higher = widx[None, :] > hmaxw[:, None]
-            nutdist = (poss_w & higher).sum(axis=1)
-            is_nut = any_make & (nutdist == 0) & out_cand[:, rc]
-            nut_outs += np.where(is_nut, unseen_r[:, rc], 0)
+        if _bd is not None:
+            # layout: [ds_a, ds_b, u_a, n_a, u_b, n_b, scoop]
+            union_outs = _bd[:, 2 + bi * 2].astype(np.int64)
+            nut_outs = _bd[:, 3 + bi * 2].astype(np.int64)
+        else:
+            board_bits = (brm.astype(np.uint16) * _RANK_WEIGHTS_13).sum(axis=1).astype(
+                np.uint16
+            )
+            hole_bits = (hrm.astype(np.uint16) * _RANK_WEIGHTS_13).sum(axis=1).astype(
+                np.uint16
+            )
+            union_mask = np.zeros(n, dtype=np.uint16)
+            for W in _WINDOW_BITS_13:
+                L = (W & ~board_bits.astype(np.uint32)).astype(np.uint16) & np.uint16(
+                    _MASK13
+                )
+                M = (L & ~hole_bits.astype(np.uint32)).astype(np.uint16) & np.uint16(
+                    _MASK13
+                )
+                nL = np.bitwise_count(L)
+                nH = np.bitwise_count((W & hole_bits).astype(np.uint16))
+                nM = np.bitwise_count(M)
+                makes = (nM == 0) & (nH >= 2) & (nL <= 2)
+                gate = (~makes) & (nH >= 2)
+                cond1 = (nL == 3) & (nM == 0) & gate
+                cond2 = (nM == 1) & (nL >= 1) & (nL <= 3) & gate
+                union_mask = union_mask | np.where(cond1, L, np.uint16(0))
+                union_mask = union_mask | np.where(cond2, M, np.uint16(0))
+            union_outs = np.zeros(n, dtype=np.int64)
+            for rc in range(13):
+                in_u = (union_mask & np.uint16(1 << rc)) != 0
+                union_outs += np.where(in_u, unseen_r[:, rc], 0)
+            nut_outs = np.zeros(n, dtype=np.int64)
+            for rc in range(13):
+                in_u = (union_mask & np.uint16(1 << rc)) != 0
+                if not in_u.any():
+                    continue
+                new_board = board_bits | np.uint16(1 << rc)
+                h_max = np.full(n, -1, dtype=np.int64)
+                for wi, W in enumerate(_WINDOW_BITS_13):
+                    L = (
+                        W & ~new_board.astype(np.uint32)
+                    ).astype(np.uint16) & np.uint16(_MASK13)
+                    miss = (
+                        L & ~hole_bits.astype(np.uint32)
+                    ).astype(np.uint16) & np.uint16(_MASK13)
+                    nL = np.bitwise_count(L)
+                    nH = np.bitwise_count((W & hole_bits).astype(np.uint16))
+                    makes = (miss == 0) & (nH >= 2) & (nL <= 2)
+                    h_max = np.where(makes & (wi > h_max), wi, h_max)
+                any_make = h_max >= 0
+                nut_dist = np.zeros(n, dtype=np.int64)
+                for wi, W in enumerate(_WINDOW_BITS_13):
+                    poss = np.bitwise_count((W & new_board).astype(np.uint16)) >= 3
+                    nut_dist += (poss & (wi > h_max)).astype(np.int64)
+                is_nut = any_make & (nut_dist == 0) & in_u
+                nut_outs += np.where(is_nut, unseen_r[:, rc], 0)
         b6 = np.stack([union_outs, nut_outs], axis=1).astype(np.float64)
         b6 = np.where(not_river[:, None], b6, 0.0)
         out[live, o6 : o6 + 2] = b6[live]
@@ -2973,10 +3119,12 @@ def _encode_dual_v3_batch(
     config: GameConfig,
     hero_board_v3=None,
     share_bounds=None,
+    board_draw_v3=None,
 ) -> None:
     """Batched twin of _encode_dual_v3, dims 1139..1171. `hero_board_v3`
     (N, 8) carries the best-holding masks at cols 6/7 (DUAL-2);
-    `share_bounds` (N, 2) is the fused pass's [g_min, g_max] (DUAL-4)."""
+    `share_bounds` (N, 2) is the fused pass's [g_min, g_max] (DUAL-4);
+    `board_draw_v3` (N, 7) supplies DUAL-5 scoop raw count at col 6."""
     n = hole.shape[0]
     rows = np.arange(n)
 
@@ -3072,33 +3220,40 @@ def _encode_dual_v3_batch(
     suit_ge2_both = (ba_suit >= 2) & (bb_suit >= 2)
     suit_ge3_both = (ba_suit >= 3) & (bb_suit >= 3)
 
-    ba_rank_mask = np.zeros((n, 13), dtype=bool)
-    bb_rank_mask = np.zeros((n, 13), dtype=bool)
-    for arr, valid, dest in (
-        (board_a, ba_valid, ba_rank_mask),
-        (board_b, bb_valid, bb_rank_mask),
-    ):
-        ranks = (arr >> 2).astype(np.int64)
-        for k in range(arr.shape[1]):
-            vk = valid[:, k]
-            if vk.any():
-                dest[np.nonzero(vk)[0], ranks[vk, k]] = True
-    ba_bits = (ba_rank_mask.astype(np.uint16) * _RANK_WEIGHTS_13).sum(axis=1).astype(np.uint16)
-    bb_bits = (bb_rank_mask.astype(np.uint16) * _RANK_WEIGHTS_13).sum(axis=1).astype(np.uint16)
-    made_a = np.zeros((n, _PAIR_BITS_13.shape[0]), dtype=bool)
-    made_b = np.zeros((n, _PAIR_BITS_13.shape[0]), dtype=bool)
-    for w_idx in range(_WINDOW_BITS_13.shape[0]):
-        W = _WINDOW_BITS_13[w_idx]
-        pair_in_W = (_PAIR_BITS_13 & W) == _PAIR_BITS_13
-        if not pair_in_W.any():
-            continue
-        ba_W = (ba_bits & W).astype(np.uint16)
-        bb_W = (bb_bits & W).astype(np.uint16)
-        cov_a = np.bitwise_count(ba_W[:, None] | _PAIR_BITS_13[None, :])
-        cov_b = np.bitwise_count(bb_W[:, None] | _PAIR_BITS_13[None, :])
-        made_a |= (cov_a >= 5) & pair_in_W[None, :]
-        made_b |= (cov_b >= 5) & pair_in_W[None, :]
-    scoop_pairs = (made_a & made_b).sum(axis=1).astype(np.float64)
+    if board_draw_v3 is not None:
+        scoop_pairs = np.asarray(board_draw_v3)[:, 6].astype(np.float64)
+    else:
+        ba_rank_mask = np.zeros((n, 13), dtype=bool)
+        bb_rank_mask = np.zeros((n, 13), dtype=bool)
+        for arr, valid, dest in (
+            (board_a, ba_valid, ba_rank_mask),
+            (board_b, bb_valid, bb_rank_mask),
+        ):
+            ranks = (arr >> 2).astype(np.int64)
+            for k in range(arr.shape[1]):
+                vk = valid[:, k]
+                if vk.any():
+                    dest[np.nonzero(vk)[0], ranks[vk, k]] = True
+        ba_bits = (ba_rank_mask.astype(np.uint16) * _RANK_WEIGHTS_13).sum(
+            axis=1
+        ).astype(np.uint16)
+        bb_bits = (bb_rank_mask.astype(np.uint16) * _RANK_WEIGHTS_13).sum(
+            axis=1
+        ).astype(np.uint16)
+        made_a = np.zeros((n, _PAIR_BITS_13.shape[0]), dtype=bool)
+        made_b = np.zeros((n, _PAIR_BITS_13.shape[0]), dtype=bool)
+        for w_idx in range(_WINDOW_BITS_13.shape[0]):
+            W = _WINDOW_BITS_13[w_idx]
+            pair_in_W = (_PAIR_BITS_13 & W) == _PAIR_BITS_13
+            if not pair_in_W.any():
+                continue
+            ba_W = (ba_bits & W).astype(np.uint16)
+            bb_W = (bb_bits & W).astype(np.uint16)
+            cov_a = np.bitwise_count(ba_W[:, None] | _PAIR_BITS_13[None, :])
+            cov_b = np.bitwise_count(bb_W[:, None] | _PAIR_BITS_13[None, :])
+            made_a |= (cov_a >= 5) & pair_in_W[None, :]
+            made_b |= (cov_b >= 5) & pair_in_W[None, :]
+        scoop_pairs = (made_a & made_b).sum(axis=1).astype(np.float64)
 
     dual5 = np.zeros((n, 9), dtype=np.float64)
     dual5[:, 0:4] = suit_ge2_both.astype(np.float64)

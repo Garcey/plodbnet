@@ -1272,17 +1272,48 @@ impl GameState {
         {
             used[c.index() as usize] = true;
         }
-        out[0] = crate::hand_eval::boat_plus_outs(hole, &self.board_a, &used);
-        out[1] = crate::hand_eval::boat_plus_outs(hole, &self.board_b, &used);
-        let (ia, ca) = crate::hand_eval::improve_outs(hole, &self.board_a, &used);
-        let (ib, cb) = crate::hand_eval::improve_outs(hole, &self.board_b, &used);
+        // Fused per-board: one pair_best_cks + one unseen scan each
+        // (byte-identical to the three free fns called separately).
+        let (ba, ia, ca, ma) =
+            crate::hand_eval::hero_board_one(hole, &self.board_a, &used);
+        let (bb, ib, cb, mb) =
+            crate::hand_eval::hero_board_one(hole, &self.board_b, &used);
+        out[0] = ba;
+        out[1] = bb;
         out[2] = ia;
         out[3] = ib;
         out[4] = ca;
         out[5] = cb;
-        out[6] = crate::hand_eval::best_pair_mask(hole, &self.board_a);
-        out[7] = crate::hand_eval::best_pair_mask(hole, &self.board_b);
+        out[6] = ma;
+        out[7] = mb;
         out
+    }
+
+    /// v7 BRD-5/BRD-6/DUAL-5 hot block:
+    /// [ds_a, ds_b, u_a, n_a, u_b, n_b, scoop] raw counts; encoder
+    /// normalizes. All-zero for NLH / no-actor / short boards.
+    pub fn board_draw_v3(&self) -> [u8; 7] {
+        let zero = [0u8; 7];
+        if self.config.variant == Variant::NlhSingle {
+            return zero;
+        }
+        let hero = match self.actor {
+            Some(s) => s,
+            None => return zero,
+        };
+        if self.board_a.len() < 3 || self.board_b.len() < 3 {
+            return zero;
+        }
+        let hole = &self.hole_cards[hero];
+        let mut used = [false; 52];
+        for c in hole
+            .iter()
+            .chain(self.board_a.iter())
+            .chain(self.board_b.iter())
+        {
+            used[c.index() as usize] = true;
+        }
+        crate::hand_eval::board_draw_v3(hole, &self.board_a, &self.board_b, &used)
     }
 
     /// Fraction of unseen-deck k-card opponent hands that produce each of
