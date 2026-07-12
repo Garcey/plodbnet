@@ -157,6 +157,25 @@ class TrainingConfig:
     # MSE inside the q_aux term; 0 = off.
     q_fold_sup_coef: float = 0.0
 
+    # v7 WS1.1 (V7_DESIGN.md): pin Q[FOLD] ≡ 0 by construction instead of
+    # learning it toward the supervision target. Kills the fold-subsidy
+    # class outright, at the cost of an init-era transient: until the
+    # sibling columns specialize away from V, E_π[Q(s')] under-reads
+    # V^π(s') by ~π_fold(s')·V(s') — mild pessimism on bootstrapped
+    # continues. Fresh-stem / deliberate-experiment flag; warm-starts
+    # across a flip are refused (the whole Q surface reinterprets).
+    q_fold_zero: bool = False
+
+    # v7 WS1.2 (V7_DESIGN.md): compose the dueling base in RAW-return
+    # space — base = Σ p_i·symexp(c_i) from the same HL-Gauss categorical —
+    # instead of the display V = symexp(Σ p_i·c_i). The legacy base
+    # straddles value spaces (symlog-space mean vs raw-space Q targets),
+    # a Jensen-type gap the adv rows absorbed as the July family offsets
+    # (−3/−16bb by tier, width-scaled). Raw base puts base and target in
+    # the same units; zero new parameters. Requires value_bins>0;
+    # warm-starts across a flip are refused.
+    q_base_raw: bool = False
+
     # Advantage estimator (V5_DESIGN.md W2.5; VRPO, Fan & Farina 2026).
     #   "gae"  = V-based GAE(λ) (default; the pre-VRPO path, unchanged).
     #   "vrpo" = Expected-SARSA(λ) off the centralized dueling Q head:

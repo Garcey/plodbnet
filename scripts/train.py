@@ -636,6 +636,27 @@ def main() -> None:
         "row — free perfect labels, ~3x the fold-column data. 0 = off.",
     )
     parser.add_argument(
+        "--q-fold-zero",
+        action=argparse.BooleanOptionalAction,
+        default=False,  # v7 candidate (V7_DESIGN.md WS1.1) — NOT in --v6
+        help="Pin Q[FOLD] to its known truth (exactly 0) by construction "
+        "instead of supervising it there. Kills the terminal fold-subsidy "
+        "class outright; costs an init-era transient (E_pi[Q(s')] under-"
+        "reads V^pi by ~pi_fold*V until the sibling columns specialize). "
+        "Fresh stems / deliberate experiments only; warm-starts across a "
+        "flip are refused.",
+    )
+    parser.add_argument(
+        "--q-base-raw",
+        action=argparse.BooleanOptionalAction,
+        default=False,  # v7 candidate (V7_DESIGN.md WS1.2) — NOT in --v6
+        help="Compose the dueling base in RAW-return space (sum p_i*"
+        "symexp(c_i) over the HL-Gauss bins) instead of the display V "
+        "(symexp of the symlog-space mean). Removes the estimator-space "
+        "Jensen gap that surfaced as the July family offsets. Requires "
+        "--value-bins>0; warm-starts across a flip are refused.",
+    )
+    parser.add_argument(
         "--advantage-estimator",
         choices=["gae", "vrpo"],
         default=None,  # C2 sentinel — resolved by _apply_v6_preset (legacy "gae")
@@ -1388,6 +1409,8 @@ def main() -> None:
         q_aux_coef=args.q_aux_coef,
         q_pooled=args.q_pooled,
         q_fold_sup_coef=args.q_fold_sup_coef,
+        q_fold_zero=args.q_fold_zero,
+        q_base_raw=args.q_base_raw,
         advantage_estimator=args.advantage_estimator,
         torso_layernorm=args.torso_norm,
         l2_init_coef=args.l2_init_coef,
@@ -1465,6 +1488,8 @@ def main() -> None:
         value_bins=train_cfg.value_bins,
         value_support=train_cfg.value_support,
         hlgauss_sigma=train_cfg.value_hlgauss_sigma,
+        q_fold_zero=train_cfg.q_fold_zero,
+        q_base_raw=train_cfg.q_base_raw,
     )
     critic.to(train_cfg.device)
     print(f"[device] learner on {train_cfg.device}")
@@ -1535,6 +1560,20 @@ def main() -> None:
                 f"gate_count mismatch: checkpoint={ckpt_gate_count} vs current={GATE_ACTIONS}. "
                 "This checkpoint was trained with a different gate-head width and cannot be warm-started."
             )
+        # v7 Q-surface semantics guards (V7_DESIGN.md WS1): q_fold_zero /
+        # q_base_raw leave no trace in the state dict, but flipping either
+        # reinterprets the whole learned Q surface (the adv rows absorbed
+        # the old base), so a silent warm-start across a flip would train
+        # against shifted targets. Old checkpoints lack the keys -> False.
+        for _qk in ("q_fold_zero", "q_base_raw"):
+            if bool(ckpt_cfg.get(_qk, False)) != bool(getattr(train_cfg, _qk)):
+                raise SystemExit(
+                    f"{_qk} mismatch: checkpoint="
+                    f"{bool(ckpt_cfg.get(_qk, False))} vs current="
+                    f"{bool(getattr(train_cfg, _qk))}. These flags change the "
+                    "Q surface's meaning; warm-starting across a flip is "
+                    "refused — start a fresh stem (or deliberately convert)."
+                )
         model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt)
         crit_sd = ckpt["critic"]
         ck_adv = crit_sd.get("adv_head.weight")
@@ -2057,6 +2096,12 @@ def main() -> None:
                 # fold-LEGAL rows. Ground truth is exactly 0 — sustained
                 # drift = the Q surface acquiring a systematic offset.
                 + (f"qF={stats.q_fold_err:+.2f}  " if args.q_aux_coef > 0 else "")
+                # Terminal-boundary canary (V7_DESIGN.md WS1.3): mean
+                # (return − Q) over non-fold TERMINAL rows — the exact δ at
+                # hand boundaries, where bias can't cancel against a next
+                # state. Persistent positive = hand-ending actions collect
+                # fake advantage (the July fold-subsidy mechanism).
+                + (f"qT={stats.q_term_err:+.2f}  " if args.q_aux_coef > 0 else "")
                 + (
                     (
                         f"KLROLLBACK@mb{stats.kl_stopped_at}"

@@ -37,7 +37,9 @@ EXPECTED_PRESET = {
     "advantage_estimator": ("gae", "vrpo"),
     "q_aux_coef": (0.0, 0.5),
     "q_pooled": (False, True),
-    "q_fold_sup_coef": (0.0, 1.0),
+    # 15.0 since 2026-07-11 (audit #2): coef 1.0 was drowned at ~4% of the
+    # q gradient against the raw-bb² taken-action MSE.
+    "q_fold_sup_coef": (0.0, 15.0),
     "torso_norm": (False, True),
     "l2_init_coef": (0.0, 1e-4),
     "agc_clip": (0.0, 0.1),

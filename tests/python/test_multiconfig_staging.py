@@ -68,6 +68,11 @@ def _assert_bit_identical(a: Batch, b: Batch) -> None:
     if ea is not None:
         assert ea.dtype == eb.dtype and ea.shape == eb.shape
         assert torch.equal(ea, eb), "ent_coef_rows values differ"
+    ta, tb = a.is_terminal, b.is_terminal
+    assert (ta is None) == (tb is None), "is_terminal presence differs"
+    if ta is not None:
+        assert ta.dtype == tb.dtype and ta.shape == tb.shape
+        assert torch.equal(ta, tb), "is_terminal values differ"
     assert getattr(a, "tier_ftr", None) == getattr(b, "tier_ftr", None)
 
 

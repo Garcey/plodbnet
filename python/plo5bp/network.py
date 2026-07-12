@@ -998,6 +998,8 @@ class CentralCritic(nn.Module):
         value_bins: int = 0,
         value_support: float = 1500.0,
         hlgauss_sigma: float = 0.75,
+        q_fold_zero: bool = False,
+        q_base_raw: bool = False,
     ):
         super().__init__()
         input_block = nn.Sequential(
@@ -1028,6 +1030,13 @@ class CentralCritic(nn.Module):
             ])
             self.register_buffer("_value_centers", centers)
             self.register_buffer("_value_edges", edges)
+            # Raw-space bin centers for the q_base_raw dueling base
+            # (v7 WS1.2). Derived from _value_centers, so NOT persisted —
+            # state dicts stay interchangeable with pre-flag checkpoints
+            # in both directions.
+            self.register_buffer(
+                "_raw_value_centers", _symexp(centers), persistent=False
+            )
             self.hlgauss_sigma = float(hlgauss_sigma) * step
         else:
             self.value_head = nn.Linear(hidden_dim, 1)
@@ -1046,6 +1055,17 @@ class CentralCritic(nn.Module):
             with torch.no_grad():
                 self.adv_head.weight.zero_()
                 self.adv_head.bias.zero_()
+        # v7 Q-surface semantics flags (V7_DESIGN.md WS1.1/WS1.2). Neither
+        # leaves a trace in the state dict — like the mixture ε floor, the
+        # SERVING/TRAINING construction must match; train.py stamps them
+        # into the checkpoint config and refuses warm-starts across a flip.
+        self.q_fold_zero = bool(q_fold_zero)
+        self.q_base_raw = bool(q_base_raw)
+        if self.q_base_raw and self.value_bins <= 0:
+            raise ValueError(
+                "q_base_raw needs the distributional value head "
+                "(value_bins > 0) — the raw base is a readout of its bins"
+            )
 
     def _value_from_z(self, z: torch.Tensor) -> torch.Tensor:
         """Scalar V from torso features: squeeze for the scalar head, or
@@ -1055,6 +1075,35 @@ class CentralCritic(nn.Module):
             probs = F.softmax(self.value_head(z), dim=-1)
             return _symexp((probs * self._value_centers).sum(-1))
         return self.value_head(z).squeeze(-1)
+
+    def _q_from_z(
+        self,
+        z: torch.Tensor,
+        v: torch.Tensor,
+        probs: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Dueling compose Q = base.detach() + A(s, a), with the v7 WS1
+        semantics flags applied.
+
+        Legacy base = the display V (symexp of the symlog-space bin mean) —
+        which straddles value spaces against the RAW-return q targets; that
+        Jensen-type gap is what the adv rows absorbed as the July family
+        offsets. `q_base_raw` swaps in Σ p_i·symexp(c_i): the raw-space mean
+        of the SAME categorical, so base and target share units (residual:
+        the HL-Gauss label smear symexps to a small width-scaled skew — the
+        qF/qT canaries measure what's left). `q_fold_zero` then pins the
+        fold column to its known truth (identity, not estimate); the fold
+        params get zero gradient and stay at zero-init."""
+        if self.q_actions <= 0:
+            return None
+        if self.q_base_raw:
+            base = (probs * self._raw_value_centers).sum(-1)
+        else:
+            base = v
+        q = base.detach()[..., None] + self.adv_head(z)
+        if self.q_fold_zero:
+            q = torch.cat([torch.zeros_like(q[..., :1]), q[..., 1:]], dim=-1)
+        return q
 
     def forward(
         self, obs: torch.Tensor, opp_multihot: torch.Tensor
@@ -1071,8 +1120,13 @@ class CentralCritic(nn.Module):
         trunk still receives the aux gradient through A. Q stays SCALAR under
         the distributional head (uses the symexp-mean V)."""
         z = _maybe_checkpoint(self.torso, torch.cat([obs, opp_multihot], dim=-1), getattr(self, "_grad_checkpoint", False))
-        v = self._value_from_z(z)
-        q = v.detach()[..., None] + self.adv_head(z)
+        if self.value_bins > 0:
+            probs = F.softmax(self.value_head(z), dim=-1)
+            v = _symexp((probs * self._value_centers).sum(-1))
+        else:
+            probs = None
+            v = self.value_head(z).squeeze(-1)
+        q = self._q_from_z(z, v, probs)
         return v, q
 
     def train_outputs(self, obs: torch.Tensor, opp_multihot: torch.Tensor):
@@ -1083,11 +1137,13 @@ class CentralCritic(nn.Module):
         z = _maybe_checkpoint(self.torso, torch.cat([obs, opp_multihot], dim=-1), getattr(self, "_grad_checkpoint", False))
         if self.value_bins > 0:
             logits = self.value_head(z)
-            v = _symexp((F.softmax(logits, dim=-1) * self._value_centers).sum(-1))
+            probs = F.softmax(logits, dim=-1)
+            v = _symexp((probs * self._value_centers).sum(-1))
         else:
             logits = None
+            probs = None
             v = self.value_head(z).squeeze(-1)
-        q = (v.detach()[..., None] + self.adv_head(z)) if self.q_actions > 0 else None
+        q = self._q_from_z(z, v, probs)
         return v, logits, q
 
     def hlgauss_value_loss(
@@ -1108,11 +1164,21 @@ class CentralCritic(nn.Module):
         return self.torso[0][0].in_features - 5 * 52
 
 
-def build_critic_from_state_dict(state_dict: dict) -> CentralCritic:
+def build_critic_from_state_dict(
+    state_dict: dict,
+    q_fold_zero: bool = False,
+    q_base_raw: bool = False,
+) -> CentralCritic:
     """Build the CentralCritic a checkpoint's ``critic`` block was saved
     from: obs width, hidden width, and residual depth are sniffed from the
     state dict (constructing at the PLO OBS_DIM default would shape-fail
-    on NLH's 995-wide critics), then the weights load strictly."""
+    on NLH's 995-wide critics), then the weights load strictly.
+
+    ``q_fold_zero`` / ``q_base_raw`` are NOT sniffable (pure forward-path
+    semantics, no parameters — same class as the mixture ε floor): callers
+    that consume Q must pass the values the run trained with (stamped in
+    ``ckpt["config"]``). V-only consumers (UI review EV) can ignore them —
+    the V readout is identical either way."""
     w = state_dict["torso.0.0.weight"]
     hidden_dim = int(w.shape[0])
     obs_dim = int(w.shape[1]) - 5 * 52
@@ -1131,6 +1197,8 @@ def build_critic_from_state_dict(state_dict: dict) -> CentralCritic:
         q_actions=q_actions,
         torso_layernorm=_torso_has_norm(state_dict),
         value_bins=value_bins,
+        q_fold_zero=q_fold_zero,
+        q_base_raw=q_base_raw,
     )
     critic.load_state_dict(state_dict)
     return critic

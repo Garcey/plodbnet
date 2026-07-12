@@ -73,6 +73,13 @@ class Batch:
     # v1). beta_kl is derived as total_kl - gate_kl - anchor_kl.
     old_gate_logp: torch.Tensor    # (T,) f32
     old_anchor_logp: torch.Tensor  # (T,) f32
+    # Terminal-row flag: True where this row is the seat's LAST decision of
+    # the hand. At those rows `returns` equals the raw realized reward
+    # exactly (the trace has no future term), so they carry free ground-truth
+    # Q labels — the qT boundary-residual canary (V7_DESIGN.md WS1.3) reads
+    # them. Populated by the BATCHED collector only; None on serial paths
+    # (VRPO/Q-aux runs are batched-only, and the canary skips when None).
+    is_terminal: torch.Tensor | None = None  # (T,) bool
     # Aggression-bonus diagnostics (set by the rollout collector).
     # `aggr_bonus_total_bb` is the sum of pot-fraction bonus added to
     # learner-step rewards; `aggr_steps_total` is the count of learner
@@ -469,6 +476,7 @@ def _finalize_batch_arr(
     aggr_steps_total_by_street: tuple[int, int, int] = (0, 0, 0),
     aggr_bonus_steps_by_street: tuple[int, int, int] = (0, 0, 0),
     adv_clip: float = 0.0,
+    all_last_arr: np.ndarray | None = None,
 ) -> Batch:
     """Slab-based finalize: each `all_*_arr` is preallocated and written
     contiguously. Slice to `[:wcursor]` and copy once to `device` per
@@ -492,6 +500,11 @@ def _finalize_batch_arr(
         v_t = torch.from_numpy(all_v_arr[:wcursor]).to(device, non_blocking=True)
         ret_t = torch.from_numpy(all_ret_arr[:wcursor]).to(device, non_blocking=True)
         adv_t = torch.from_numpy(all_adv_arr[:wcursor]).to(device, non_blocking=True)
+        last_t = (
+            torch.from_numpy(all_last_arr[:wcursor]).to(device, non_blocking=True)
+            if all_last_arr is not None
+            else None
+        )
 
         adv_mean = adv_t.mean()
         adv_std = adv_t.std().clamp(min=1e-8)
@@ -515,6 +528,7 @@ def _finalize_batch_arr(
         advantages=adv_t,
         old_gate_logp=glp_t,
         old_anchor_logp=alp_t,
+        is_terminal=last_t,
         aggr_bonus_total_bb=float(aggr_bonus_total_bb),
         aggr_steps_total=int(aggr_steps_total),
         aggr_bonus_steps=int(aggr_bonus_steps),
@@ -1100,6 +1114,7 @@ def collect_rollout_batched(
         all_v_arr = out_slabs["v"]
         all_ret_arr = out_slabs["ret"]
         all_adv_arr = out_slabs["adv"]
+        all_last_arr = out_slabs["last"]
         assert all_obs_arr.shape[0] == out_cap, (
             f"out_slabs capacity {all_obs_arr.shape[0]} != expected {out_cap}"
         )
@@ -1150,6 +1165,7 @@ def collect_rollout_batched(
         all_v_arr = _alloc_slab(out_cap, np.float32, torch.float32)
         all_ret_arr = _alloc_slab(out_cap, np.float32, torch.float32)
         all_adv_arr = _alloc_slab(out_cap, np.float32, torch.float32)
+        all_last_arr = _alloc_slab(out_cap, bool, torch.bool)
     wcursor = 0
 
     aggression_bonus_c = float(train_config.aggression_bonus_c)
@@ -1671,6 +1687,12 @@ def collect_rollout_batched(
                         all_v_arr[wcursor:end] = vals_t.ravel()[sel]
                         all_ret_arr[wcursor:end] = rets_t.ravel()[sel]
                         all_adv_arr[wcursor:end] = adv_out_t.ravel()[sel]
+                        # Terminal flag: the seat's last decision of the hand
+                        # (same (T, S, L) ravel space as every slab above; sel
+                        # rows are active ⊂ flush, so no extra masking).
+                        all_last_arr[wcursor:end] = (
+                            t_idx[None, None, :] == last_t_arr[..., None]
+                        ).ravel()[sel]
                         wcursor = end
 
                 with record_function("step9e/pool_mix"):
@@ -1728,6 +1750,7 @@ def collect_rollout_batched(
             advantages=torch.from_numpy(adv_view),
             old_gate_logp=torch.from_numpy(all_glp_arr[:wcursor]),
             old_anchor_logp=torch.from_numpy(all_alp_arr[:wcursor]),
+            is_terminal=torch.from_numpy(all_last_arr[:wcursor]),
             aggr_bonus_total_bb=float(aggr_bonus_total_bb),
             aggr_steps_total=int(aggr_steps_total),
             aggr_bonus_steps=int(aggr_bonus_steps),
@@ -1762,6 +1785,7 @@ def collect_rollout_batched(
         aggr_steps_total_by_street=tuple(aggr_steps_total_by_street),
         aggr_bonus_steps_by_street=tuple(aggr_bonus_steps_by_street),
         adv_clip=float(getattr(train_config, "adv_clip", 0.0)),
+        all_last_arr=all_last_arr,
     )
 
 
@@ -1777,6 +1801,9 @@ _BATCH_TENSOR_FIELDS = (
     "anchor_actions", "refine_u", "opp_holes", "log_probs", "values",
     "returns", "advantages", "old_gate_logp", "old_anchor_logp",
 )
+# is_terminal is OPTIONAL (None on serial paths and hand-built test
+# batches), so it is handled like ent_coef_rows — explicitly, not via the
+# always-present tuple above.
 
 
 def _batch_to_device(batch: Batch, device: torch.device) -> Batch:
@@ -1786,6 +1813,8 @@ def _batch_to_device(batch: Batch, device: torch.device) -> Batch:
     moved = {f: getattr(batch, f).to(device) for f in _BATCH_TENSOR_FIELDS}
     if batch.ent_coef_rows is not None:
         moved["ent_coef_rows"] = batch.ent_coef_rows.to(device)
+    if batch.is_terminal is not None:
+        moved["is_terminal"] = batch.is_terminal.to(device)
     return replace(batch, **moved)
 
 
@@ -1816,6 +1845,10 @@ def _concat_batches(batches: list[Batch], adv_clip: float) -> Batch:
 
     merged = {f: _cat(f) for f in _BATCH_TENSOR_FIELDS}
     merged["advantages"] = adv
+    # Optional field: concatenate only when every sub carries it (batched
+    # collectors always do; hand-built test batches may not).
+    if all(b.is_terminal is not None for b in batches):
+        merged["is_terminal"] = _cat("is_terminal")
     return Batch(
         **merged,
         aggr_bonus_total_bb=float(sum(b.aggr_bonus_total_bb for b in batches)),
@@ -1945,6 +1978,7 @@ def collect_rollout_multiconfig(
             "v": _alloc(total_cap, np.float32, torch.float32),
             "ret": _alloc(total_cap, np.float32, torch.float32),
             "adv": _alloc(total_cap, np.float32, torch.float32),
+            "last": _alloc(total_cap, bool, torch.bool),
         }
         subs = []
         base = 0
@@ -1997,6 +2031,7 @@ def collect_rollout_multiconfig(
             advantages=adv,
             old_gate_logp=_t("glp"),
             old_anchor_logp=_t("alp"),
+            is_terminal=_t("last"),
             aggr_bonus_total_bb=float(sum(b.aggr_bonus_total_bb for b in subs)),
             aggr_steps_total=int(sum(b.aggr_steps_total for b in subs)),
             aggr_bonus_steps=int(sum(b.aggr_bonus_steps for b in subs)),
@@ -2050,6 +2085,11 @@ def iter_minibatches(
             advantages=batch.advantages[sel],
             old_gate_logp=batch.old_gate_logp[sel],
             old_anchor_logp=batch.old_anchor_logp[sel],
+            is_terminal=(
+                batch.is_terminal[sel]
+                if batch.is_terminal is not None
+                else None
+            ),
             ent_coef_rows=(
                 batch.ent_coef_rows[sel]
                 if batch.ent_coef_rows is not None

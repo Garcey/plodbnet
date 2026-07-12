@@ -51,6 +51,14 @@ class PPOStats:
     # sunk chips excluded), so sustained drift = a systematic Q-surface
     # offset. 0.0 when the run has no dueling head.
     q_fold_err: float = 0.0
+    # Terminal-boundary canary (V7_DESIGN.md WS1.3): mean(return − Q(s,a))
+    # over NON-FOLD terminal rows — the exact δ at trajectory boundaries,
+    # where estimator bias has no next-state term to cancel against (the
+    # mechanism behind the July fold subsidy). Persistent positive = hand-
+    # ending actions (showdown calls, steals) collect fake advantage;
+    # negative = they are taxed. 0.0 when the head is off or the batch
+    # carries no terminal flags (serial collectors).
+    q_term_err: float = 0.0
     gate_entropy: float = 0.0
     anchor_entropy: float = 0.0
     beta_entropy: float = 0.0
@@ -411,6 +419,8 @@ class PPOTrainer:
         total_q = torch.zeros((), device=device)
         total_qf = torch.zeros((), device=device)
         total_qf_n = torch.zeros((), device=device)
+        total_qt = torch.zeros((), device=device)
+        total_qt_n = torch.zeros((), device=device)
         total_gate_h = torch.zeros((), device=device)
         total_anchor_h = torch.zeros((), device=device)
         total_beta_h = torch.zeros((), device=device)
@@ -556,6 +566,31 @@ class PPOTrainer:
                                         q_all[..., GATE_FOLD].float() * fold_ok_c
                                     ).sum()
                                     total_qf_n += fold_ok_c.sum()
+                                    # Terminal-boundary canary (V7_DESIGN.md
+                                    # WS1.3): qT = mean(return − Q(s,a)) over
+                                    # NON-FOLD terminal rows. At a terminal
+                                    # row the stored return IS the raw reward
+                                    # (no future term), so this is the exact
+                                    # boundary residual δ_terminal — the term
+                                    # that paid the July fold subsidy.
+                                    # Positive = terminal actions subsidized,
+                                    # negative = taxed. Fold rows are the qF
+                                    # canary's job (truth 0), so they are
+                                    # excluded here.
+                                    if mb.is_terminal is not None:
+                                        term_ok = (
+                                            mb.is_terminal
+                                            & (mb.gate_actions != GATE_FOLD)
+                                        ).float()
+                                        q_sel = q_all.gather(
+                                            -1,
+                                            self._q_index(mb, q_all)[..., None],
+                                        ).squeeze(-1)
+                                        total_qt += (
+                                            (mb.returns - q_sel).float()
+                                            * term_ok
+                                        ).sum()
+                                        total_qt_n += term_ok.sum()
 
                             # Display head: plain regression (no clipping —
                             # buffer values belong to the critic), small
@@ -737,6 +772,9 @@ class PPOTrainer:
                 q_loss=float(total_q.item()) / denom,
                 q_fold_err=float(
                     (total_qf / total_qf_n.clamp_min(1.0)).item()
+                ),
+                q_term_err=float(
+                    (total_qt / total_qt_n.clamp_min(1.0)).item()
                 ),
                 gate_entropy=float(total_gate_h.item()) / denom,
                 anchor_entropy=float(total_anchor_h.item()) / denom,
