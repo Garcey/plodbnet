@@ -106,7 +106,7 @@ from plo5bp._engine import (  # type: ignore[attr-defined]
 from plo5bp.actions import CHECK_CALL, FOLD
 from plo5bp.config import GameConfig
 
-OBS_DIM: int = 1020
+OBS_DIM: int = 1171  # v7 batch-2 tail (stack+board+dual) appended after 1019
 
 # v1 (pre-anchor-head era) observation layout: 17-dim history slots, no
 # pot-fraction dim, tail blocks 32 lower. v1 checkpoints can keep
@@ -211,6 +211,45 @@ _EFF_PRICE_OFF = 1007  # 5 dims; stack-capped price + commitment + log1p money
 _SPR_LOG_OFF = 1012    # 8 dims; log1p(effective SPR) per seat, UNCLIPPED —
 #                        the [0,4]-clipped _SPR_OFF block saturates for the
 #                        entire deep tier at the flop (true SPR 5.4-13.9)
+
+# ---- obs v3 batch-2 tail (stack + board + dual; 2026-07-12) -----------------
+# Pure tail append after 1019 (V7_OBS_IMPL_PLAN.md). Everything 0..1020 is
+# byte-identical to the obs-v2 layout, so downgrade_obs_to_v2/v1 stay exact
+# tail slices and old checkpoints keep serving. Blocks marked [ENGINE] need
+# Rust plumbing (Chunk B) and stay 0.0 until then; both encoders write zeros
+# there, so serial/batched parity holds through Chunk A.
+_OBS_V2_5_TAIL_OFF = 1020  # first v7 batch-2 dim
+# Stack geometry 1020..1061 (41)
+_STK1_OFF = 1020   # 4  money / raise-exposure behind        [ENGINE: acted_this_street]
+_STK2_OFF = 1024   # 6  raise-ladder envelope
+_STK4_OFF = 1030   # 8  per-seat commitment ratio
+_STK5_OFF = 1038   # 4  spr-after-action
+_STK6_OFF = 1042   # 2  geometric jam plan
+_STK7_OFF = 1044   # 2  pot-ceiling implied odds
+_STK8_OFF = 1046   # 3  side-pot eligibility (winnable pot)
+_STK9_OFF = 1049   # 2  call-risk fraction
+_STK10_OFF = 1051  # 2  ante-pot bloat
+_STK11_OFF = 1053  # 8  per-seat price-to-continue
+# Board texture 1061..1139 (78)
+_BRD1_OFF = 1061   # 10 board rank ladder
+_BRD2_OFF = 1071   # 12 board suit census (==2 per suit, ==4, ==5) per board
+_BRD4_OFF = 1083   # 6  arrival volatility census
+_BRD5_OFF = 1089   # 6  hero vulnerability outs
+_BRD6_OFF = 1095   # 4  straight out union
+_BRD7_OFF = 1099   # 2  boat+ outs                            [ENGINE: Rust fn]
+_BRD8_OFF = 1101   # 4  flush-draw rank quality
+_BRD9_OFF = 1105   # 4  backdoor draw census (flop-gated)
+_BRD10_OFF = 1109  # 2  future nut-flush blocker
+_BRD11_OFF = 1111  # 20 turn/river card identity (deal order)
+_BRD12_OFF = 1131  # 4  hero improve outs                     [ENGINE: Rust fn]
+_BRD13_OFF = 1135  # 4  board nut ceiling class
+# Double-board 1139..1171 (32)
+_DUAL1_OFF = 1139  # 2  split-adjusted price ladder
+_DUAL2_OFF = 1141  # 10 best-hand card usage / coverage       [ENGINE: winning pair]
+_DUAL3_OFF = 1151  # 6  nut-lock / freeroll flags
+_DUAL4_OFF = 1157  # 5  guaranteed pot share                  [ENGINE: k=2 g_min/max]
+_DUAL5_OFF = 1162  # 9  villain cross-board coverage
+assert _DUAL5_OFF + 9 == OBS_DIM, "v7 batch-2 tail must end exactly at OBS_DIM"
 
 # Index map projecting the v2 (991) layout onto the exact v1 (959)
 # layout: pre-history block verbatim, first 17 of each 18-dim history
@@ -854,6 +893,73 @@ def _straight_flush_features(
     return out
 
 
+# ---- obs v3 batch-2 tail helpers (serial) ----------------------------------
+# Each writes ONLY its own tail columns into the pre-zeroed `out`. Kept as
+# isolated functions so the batched twins can be verified block-by-block and
+# so the three categories don't collide. [ENGINE] sub-blocks stay 0.0 until
+# Chunk B. Every dim's spec is V7_OBS_CANDIDATES.md; parity twin is the
+# `_..._batch` function below. Bodies filled 2026-07-12.
+
+
+def _encode_stack_v3(
+    out: np.ndarray,
+    *,
+    config: GameConfig,
+    hero: int,
+    num_seats: int,
+    folded,
+    all_in,
+    eff_per_seat,
+    total_commit,
+    street_commit,
+    pot: float,
+    btc: float,
+    min_bet: float,
+    max_bet: float,
+    to_call: float,
+    eff_to_call: float,
+    hero_stack: float,
+    inv_bb: float,
+    street_idx: int,
+) -> None:
+    """Stack/pot/price geometry, dims 1020..1061. STK-1 (1020..1024) is
+    [ENGINE] — left zero until acted_this_street is exposed."""
+    return None
+
+
+def _encode_board_v3(
+    out: np.ndarray,
+    *,
+    hole_list,
+    board_a_list,
+    board_b_list,
+    visible_count,
+    street_idx: int,
+) -> None:
+    """Board texture + hand-board combinatorics, dims 1061..1139. BRD-7
+    (1099..1101) and BRD-12 (1131..1135) are [ENGINE] — left zero."""
+    return None
+
+
+def _encode_dual_v3(
+    out: np.ndarray,
+    *,
+    hole_list,
+    board_a_list,
+    board_b_list,
+    visible_count,
+    per_board_outcome,
+    pot: float,
+    to_call: float,
+    eff_to_call: float,
+    hero_stack: float,
+    config: GameConfig,
+) -> None:
+    """Double-board structure, dims 1139..1171. DUAL-2 (1141..1151) and
+    DUAL-4 (1157..1162) are [ENGINE] — left zero."""
+    return None
+
+
 def encode_observation(obs: Mapping[str, Any], config: GameConfig) -> np.ndarray:
     """Encode a single observation dict into a (OBS_DIM,) float32 array."""
     out = np.zeros(OBS_DIM, dtype=np.float32)
@@ -1080,6 +1186,49 @@ def encode_observation(obs: Mapping[str, Any], config: GameConfig) -> np.ndarray
     for k in range(num_seats):
         seat = (hero + k) % num_seats
         out[_SPR_LOG_OFF + k] = np.log1p(eff_per_seat[seat] / pot_safe)
+
+    # ---- obs v3 batch-2 tail (stack + board + dual) ---------------------
+    _encode_stack_v3(
+        out,
+        config=config,
+        hero=hero,
+        num_seats=num_seats,
+        folded=folded,
+        all_in=all_in,
+        eff_per_seat=eff_per_seat,
+        total_commit=total_commit,
+        street_commit=street_commit,
+        pot=pot,
+        btc=btc,
+        min_bet=float(obs["min_bet"]),
+        max_bet=float(obs["max_bet"]),
+        to_call=to_call,
+        eff_to_call=eff_to_call,
+        hero_stack=hero_stack,
+        inv_bb=inv_bb,
+        street_idx=int(obs["street"]),
+    )
+    _encode_board_v3(
+        out,
+        hole_list=hole_list,
+        board_a_list=board_a_list,
+        board_b_list=board_b_list,
+        visible_count=visible_count,
+        street_idx=int(obs["street"]),
+    )
+    _encode_dual_v3(
+        out,
+        hole_list=hole_list,
+        board_a_list=board_a_list,
+        board_b_list=board_b_list,
+        visible_count=visible_count,
+        per_board_outcome=pb,
+        pot=pot,
+        to_call=to_call,
+        eff_to_call=eff_to_call,
+        hero_stack=hero_stack,
+        config=config,
+    )
 
     return out
 
@@ -1788,4 +1937,113 @@ def encode_observation_batch(
         effective_rot / pot_safe[:, None]
     )[live_mask]
 
+    # ---- obs v3 batch-2 tail (stack + board + dual) ---------------------
+    # Twins of the serial helpers. All scalar arithmetic in f64, cast on
+    # assignment (parity). effective (unrotated, f64, by seat), total_commit
+    # (f64, by seat), street_commit_f64, pot/bet_to_call/to_call (f64) are
+    # already built above. `street` (int64, by env) is the true obs street.
+    _encode_stack_v3_batch(
+        out,
+        config=config,
+        num_seats=num_seats,
+        live_mask=live_mask,
+        hero_idx=hero_idx,
+        folded=folded,
+        all_in=all_in,
+        effective=effective,
+        total_commit=total_commit,
+        street_commit=street_commit_f64,
+        pot=pot,
+        bet_to_call=bet_to_call,
+        min_bet=min_bet,
+        max_bet=max_bet,
+        to_call=to_call,
+        inv_bb=inv_bb,
+        street=street,
+    )
+    _encode_board_v3_batch(
+        out,
+        live_mask=live_mask,
+        hole=hole,
+        board_a=ba,
+        board_b=bb,
+        street=street,
+    )
+    _encode_dual_v3_batch(
+        out,
+        live_mask=live_mask,
+        hero_idx=hero_idx,
+        hole=hole,
+        board_a=ba,
+        board_b=bb,
+        per_board_outcome=obs_arrays.get("per_board_outcome"),
+        pot=pot,
+        to_call=to_call,
+        effective=effective,
+        config=config,
+    )
+
     return out
+
+
+# ---- obs v3 batch-2 tail helpers (batched twins) ---------------------------
+# Bit-exact twins of the serial _encode_*_v3 helpers. Same f64 arithmetic,
+# cast-on-assignment. Write ONLY live_mask rows (terminal rows stay zero).
+# [ENGINE] sub-blocks stay 0.0 until Chunk B. Bodies filled 2026-07-12.
+
+
+def _encode_stack_v3_batch(
+    out: np.ndarray,
+    *,
+    config: GameConfig,
+    num_seats: int,
+    live_mask: np.ndarray,
+    hero_idx: np.ndarray,
+    folded: np.ndarray,
+    all_in: np.ndarray,
+    effective: np.ndarray,
+    total_commit: np.ndarray,
+    street_commit: np.ndarray,
+    pot: np.ndarray,
+    bet_to_call: np.ndarray,
+    min_bet: np.ndarray,
+    max_bet: np.ndarray,
+    to_call: np.ndarray,
+    inv_bb: float,
+    street: np.ndarray,
+) -> None:
+    """Batched twin of _encode_stack_v3, dims 1020..1061. STK-1 [ENGINE]."""
+    return None
+
+
+def _encode_board_v3_batch(
+    out: np.ndarray,
+    *,
+    live_mask: np.ndarray,
+    hole: np.ndarray,
+    board_a: np.ndarray,
+    board_b: np.ndarray,
+    street: np.ndarray,
+) -> None:
+    """Batched twin of _encode_board_v3, dims 1061..1139. BRD-7/BRD-12
+    [ENGINE]."""
+    return None
+
+
+def _encode_dual_v3_batch(
+    out: np.ndarray,
+    *,
+    live_mask: np.ndarray,
+    hero_idx: np.ndarray,
+    hole: np.ndarray,
+    board_a: np.ndarray,
+    board_b: np.ndarray,
+    per_board_outcome,
+    pot: np.ndarray,
+    to_call: np.ndarray,
+    effective: np.ndarray,
+    config: GameConfig,
+) -> None:
+    """Batched twin of _encode_dual_v3, dims 1139..1171. DUAL-2/DUAL-4
+    [ENGINE]."""
+    return None

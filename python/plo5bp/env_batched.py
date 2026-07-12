@@ -36,6 +36,11 @@ from plo5bp.actions import (
 )
 from plo5bp.config import GameConfig, VARIANT_NLH
 from plo5bp.encoding import OBS_DIM, encode_observation_batch
+
+# Width the Rust obs encoder (observation_encoded_batch) emits. The Rust
+# encoder is force-disabled whenever OBS_DIM has moved past this (see
+# _use_rust_encoder below) until the new tail blocks are ported to it.
+_RUST_ENCODER_OBS_DIM = 1020
 from plo5bp.encoding_nlh import OBS_DIM_NLH, encode_observation_batch_nlh
 
 
@@ -73,17 +78,19 @@ class BatchedBombPotEnv:
         # passes a lower count for speed. See rollout.TRAIN_OPP_OUTCOME_MC.
         # NLH ignores it (its 3-dim opp-outcome block is exhaustive).
         self._opp_outcome_mc = int(opp_outcome_mc)
-        # The Rust observation encoder (PLO5_RUST_ENCODER, default-off) now
-        # implements the full obs-v2 1020-dim PLO layout (per-board outcome,
-        # blockers, effective price, log1p SPR — ported 2026-07-08; bit-exact
-        # 3-way parity vs numpy+scalar pinned in test_encoding_rust.py). It is
-        # env-gated and DEFAULT-OFF so the numpy encoder stays the fallback;
-        # opt a run in via PLO5_RUST_ENCODER=1 (the rollout then skips the
-        # numpy assembly, ~its 22% of update CPU). NLH keeps numpy — the Rust
-        # encoder path is PLO-only.
+        # The Rust observation encoder (PLO5_RUST_ENCODER, default-off)
+        # implements the obs-v2 1020-dim PLO layout (ported 2026-07-08). The
+        # v7 batch-2 tail (OBS_DIM 1171, 2026-07-12) is NOT ported to it yet,
+        # so the encoder is WIDTH-GATED: it can only run while the numpy
+        # layout equals the width the Rust encoder emits. When OBS_DIM has
+        # moved past it (as now), force numpy — a silently truncated obs is
+        # exactly the bug this gate prevents. Re-port the tail blocks + flip
+        # _RUST_ENCODER_OBS_DIM to re-enable (V7_OBS_IMPL_PLAN.md). NLH keeps
+        # numpy — the Rust encoder path is PLO-only.
         self._use_rust_encoder = (
             bool(int(os.environ.get("PLO5_RUST_ENCODER", "0")))
             and not self._is_nlh
+            and OBS_DIM == _RUST_ENCODER_OBS_DIM
         )
         stacks = np.asarray(self.config.resolved_stacks, dtype=np.uint64)
         self._be = BatchedEngine(

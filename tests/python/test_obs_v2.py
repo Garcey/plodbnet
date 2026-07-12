@@ -38,10 +38,13 @@ from plo5bp.env import BombPotEnv
 # ---- layout invariants ------------------------------------------------------
 
 def test_obs_v2_layout_is_pure_tail_append() -> None:
-    assert OBS_DIM == 1020
+    # OBS_DIM moved to 1171 with the v7 batch-2 tail (2026-07-12); the obs-v2
+    # blocks stay at their original offsets, so downgrade_obs_to_v2 is still an
+    # exact tail slice and old checkpoints keep serving.
+    assert OBS_DIM == 1171
     assert OBS_DIM_V2 == 991
-    assert _PER_BOARD_OUTCOME_OFF == OBS_DIM_V2  # first appended dim
-    assert _SPR_LOG_OFF + 8 == OBS_DIM           # last appended block
+    assert _PER_BOARD_OUTCOME_OFF == OBS_DIM_V2  # first v2-appended dim
+    assert _SPR_LOG_OFF + 8 == 1020              # last obs-v2 block ends at 1020
     v = np.arange(OBS_DIM, dtype=np.float32)
     sliced = downgrade_obs_to_v2(v)
     assert sliced.shape == (OBS_DIM_V2,)
