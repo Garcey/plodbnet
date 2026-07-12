@@ -86,6 +86,28 @@ scalar path's f64-intermediate-then-cast-to-f32 arithmetic bit-exactly
 Reserved-for-Chunk-B (zero in Chunk A): STK-1, BRD-7, BRD-12, DUAL-2,
 DUAL-4 = 25 dims. Pure-encoder Chunk A = 126 dims.
 
+## Status (2026-07-12)
+
+- **Scaffolding: DONE, green (commit b70024f).** OBS_DIM 1171, all tail
+  constants, 6 no-op helper stubs wired into both encoders, Rust obs-encoder
+  width-gated off, test pins updated. Reserved columns zero → parity holds.
+- **Chunk A (126 pure-encoder dims): IN PROGRESS.** Fill workflow deriving
+  the 3 category helper bodies (serial+batched); integrate → parity gate
+  (test_encoding_batch.py drives full serial-vs-batched sweep) → sanity
+  tests → commit.
+- **Chunk B (5 engine dims): SCOPED, specs locked.** Recon done:
+  - STK-1: `acted_this_street` already a `GameState` field (state.rs:245) —
+    expose in observation_dict + batched packer (`observation_arrays` and the
+    3 bundle variants in bindings.rs) + Rust encoder input.
+  - BRD-7: Rust free fn `boat_plus_outs(hole, board)->u8` per board.
+  - BRD-12: Rust free fn `improve_outs(hole, board)->(u8,u8)` per board
+    (distinct improve cards / actual unseen size; best-cat combo count /10).
+  - DUAL-2: `evaluate_plo5_partial` records the argmax hole-pair (tie-break =
+    lexicographically smallest (lo,hi)); expose per-board 5-bit mask.
+  - DUAL-4: append g_min/g_max to the fused pass output (N_OUT 20→22, existing
+    dims byte-identical); expose; encoder derives 5 dims.
+  - One maturin rebuild covers all five.
+
 ## Test strategy
 
 - `tests/python/test_obs_v3_batch2.py`: serial vs batched bit-exact parity

@@ -105,6 +105,7 @@ from plo5bp._engine import (  # type: ignore[attr-defined]
 )
 from plo5bp.actions import CHECK_CALL, FOLD
 from plo5bp.config import GameConfig
+from plo5bp.sizing import anchor_grid_np  # v7 STK-2 raise-ladder envelope
 
 OBS_DIM: int = 1171  # v7 batch-2 tail (stack+board+dual) appended after 1019
 
@@ -924,7 +925,112 @@ def _encode_stack_v3(
 ) -> None:
     """Stack/pot/price geometry, dims 1020..1061. STK-1 (1020..1024) is
     [ENGINE] — left zero until acted_this_street is exposed."""
-    return None
+    # Shared hero-frame scalars.
+    hero_sc = float(street_commit[hero])
+    hero_commit = float(total_commit[hero])
+    pot_denom = max(pot, 1.0)
+
+    # ---- STK-2: raise-ladder envelope (6) @ _STK2_OFF ----
+    # min_d/max_d are the raise DELTAS (additional chips) recovered from the
+    # already-packed totals; identical to sizing_from_info's min/max_raise_chips.
+    min_d = min_bet - hero_sc
+    max_d = max_bet - hero_sc
+    base = pot + to_call
+    raise_legal = max_d > to_call
+    if raise_legal:
+        base_safe = max(base, 1.0)
+        eff_denom = max(hero_stack, 1.0)
+        out[_STK2_OFF + 0] = min(max((min_d - to_call) / base_safe, 0.0), 1.0)
+        out[_STK2_OFF + 1] = min(max((max_d - to_call) / base_safe, 0.0), 1.0)
+        out[_STK2_OFF + 2] = min(max(min_d / eff_denom, 0.0), 1.0)
+        out[_STK2_OFF + 3] = min(max(max_d / eff_denom, 0.0), 1.0)
+        out[_STK2_OFF + 4] = 1.0 if max_d < to_call + base else 0.0
+        grid = anchor_grid_np(min_d, max_d, pot, to_call)
+        out[_STK2_OFF + 5] = float(grid.legal.sum()) / 11.0
+
+    # ---- STK-4: per-seat commitment ratio (8) @ _STK4_OFF, hero-rotated ----
+    # RAW commit / EFFECTIVE stack, matching dim-1009's exact recipe; folded
+    # and padded slots read 0, all-in live seats read 1.0 (eff==0).
+    for k in range(num_seats):
+        seat = (hero + k) % num_seats
+        if folded[seat]:
+            continue
+        commit_s = float(total_commit[seat])
+        denom4 = commit_s + eff_per_seat[seat]
+        if denom4 > 0.0:
+            out[_STK4_OFF + k] = commit_s / denom4
+
+    # ---- STK-5: spr-after-action (4) @ _STK5_OFF ----
+    out[_STK5_OFF + 0] = np.log1p(
+        (hero_stack - eff_to_call) / max(pot + eff_to_call, 1.0)
+    )
+    out[_STK5_OFF + 1] = np.log1p((pot + eff_to_call) * inv_bb)
+    if raise_legal:  # D == max_d (max-raise delta); same predicate as STK-2
+        tot2 = pot + 2.0 * max_d - to_call
+        out[_STK5_OFF + 2] = np.log1p((hero_stack - max_d) / max(tot2, 1.0))
+        out[_STK5_OFF + 3] = np.log1p(tot2 * inv_bb)
+
+    # ---- STK-6: geometric jam plan (2) @ _STK6_OFF ----
+    # r = streets remaining incl. current (flop 3 / turn 2 / river 1);
+    # preflop (only terminal, masked) would give r=4 — pinned identically.
+    spr_e = hero_stack / pot_denom
+    r = 4 - street_idx
+    x6 = 1.0 + 2.0 * spr_e
+    out[_STK6_OFF + 0] = min(max(np.ceil(np.log(x6) / np.log(3.0)), 0.0), 6.0)
+    out[_STK6_OFF + 1] = min(max((np.power(x6, 1.0 / r) - 1.0) / 2.0, 0.0), 2.0)
+
+    # ---- STK-7: pot-ceiling implied odds (2) @ _STK7_OFF ----
+    # ceiling = pot + sum over live (non-folded) opponents of min(eff_opp,
+    # eff_hero); all-in opponents contribute 0 (their eff==0). Seat-index
+    # accumulation order matches the batched twin exactly.
+    ceiling = pot
+    for s in range(num_seats):
+        if s == hero or folded[s]:
+            continue
+        ceiling = ceiling + min(eff_per_seat[s], hero_stack)
+    out[_STK7_OFF + 0] = np.log1p(ceiling / pot_denom)
+    if eff_to_call > 0.0:
+        out[_STK7_OFF + 1] = eff_to_call / (ceiling + eff_to_call)
+
+    # ---- STK-8: side-pot eligibility (3) @ _STK8_OFF ----
+    # RAW commits throughout (side-pot math is about chips actually in pot).
+    hero_after = hero_commit + eff_to_call
+    sum_now = 0.0
+    sum_after = 0.0
+    dead = 0.0
+    for s in range(num_seats):
+        cs = float(total_commit[s])
+        sum_now = sum_now + min(cs, hero_commit)
+        sum_after = sum_after + min(cs, hero_after)
+        if folded[s]:
+            dead = dead + cs
+    out[_STK8_OFF + 0] = sum_now / pot_denom
+    out[_STK8_OFF + 1] = sum_after / pot_denom
+    out[_STK8_OFF + 2] = dead / pot_denom
+
+    # ---- STK-9: call-risk fraction (2) @ _STK9_OFF ----
+    out[_STK9_OFF + 0] = eff_to_call / max(hero_stack, 1.0)
+    out[_STK9_OFF + 1] = eff_to_call / max(hero_commit + hero_stack, 1.0)
+
+    # ---- STK-10: ante-pot bloat (2) @ _STK10_OFF ----
+    # pure config arithmetic; frozen, history-independent (truncation-immune).
+    ante_i = int(config.ante)
+    pot_at_flop = 0
+    for s in range(num_seats):
+        pot_at_flop += min(ante_i, int(config.resolved_stacks[s]))
+    paf = float(pot_at_flop)
+    out[_STK10_OFF + 0] = ante_i * inv_bb
+    out[_STK10_OFF + 1] = np.log1p(max(pot - paf, 0.0) / max(paf, 1.0))
+
+    # ---- STK-11: per-seat price-to-continue (8) @ _STK11_OFF, hero-rotated ----
+    # slot k = owed_k / (max(pot,1) + owed_k); hero (slot 0), folded, all-in
+    # (eff==0 -> owed 0), and no-outstanding-bet all read 0.
+    for k in range(1, num_seats):
+        seat = (hero + k) % num_seats
+        if folded[seat]:
+            continue
+        owed = min(max(btc - float(street_commit[seat]), 0.0), eff_per_seat[seat])
+        out[_STK11_OFF + k] = owed / (pot_denom + owed)
 
 
 def _encode_board_v3(
@@ -938,7 +1044,262 @@ def _encode_board_v3(
 ) -> None:
     """Board texture + hand-board combinatorics, dims 1061..1139. BRD-7
     (1099..1101) and BRD-12 (1131..1135) are [ENGINE] — left zero."""
-    return None
+    # ---- Shared hero-side aggregates (board-agnostic) ----
+    hole_rank_counts = [0] * 13
+    hole_suit_counts = [0] * 4
+    hole_ranks_set: set[int] = set()
+    hole_max_per_suit = [-1, -1, -1, -1]
+    for c in hole_list:
+        r, s = c // 4, c % 4
+        hole_rank_counts[r] += 1
+        hole_suit_counts[s] += 1
+        hole_ranks_set.add(r)
+        if r > hole_max_per_suit[s]:
+            hole_max_per_suit[s] = r
+
+    vct = visible_count.sum(axis=1)              # (13,) global visible copies per rank
+    visible_per_suit = visible_count.sum(axis=0)  # (4,) global visible per suit
+    unseen_deck = 52 - int(visible_count.sum())
+
+    # Cross-board presence (BRD-10 key-card scan spans BOTH boards) + hero holdings.
+    board_present_all = [[False] * 4 for _ in range(13)]
+    for c in board_a_list + board_b_list:
+        board_present_all[c // 4][c % 4] = True
+    hero_present = [[False] * 4 for _ in range(13)]
+    for c in hole_list:
+        hero_present[c // 4][c % 4] = True
+
+    is_river = street_idx == 3
+    is_flop = street_idx == 1
+
+    def _one_board(board_list, bi):
+        board_rank_counts = [0] * 13
+        board_suit_counts = [0] * 4
+        board_ranks_per_suit = [set(), set(), set(), set()]
+        for c in board_list:
+            r, s = c // 4, c % 4
+            board_rank_counts[r] += 1
+            board_suit_counts[s] += 1
+            board_ranks_per_suit[s].add(r)
+        board_ranks_set = {r for r in range(13) if board_rank_counts[r] > 0}
+        has_board = len(board_list) > 0
+
+        # ---- BRD-1: rank ladder (5) ----
+        o1 = _BRD1_OFF + bi * 5
+        sorted_ranks = sorted((c // 4 for c in board_list), reverse=True)
+        for i, rank in enumerate(sorted_ranks[:5]):
+            out[o1 + i] = (rank + 1) / 13.0
+
+        # ---- BRD-2: suit census (6) ----
+        o2 = _BRD2_OFF + bi * 6
+        for s in range(4):
+            if board_suit_counts[s] == 2:
+                out[o2 + s] = 1.0
+        if any(bc == 4 for bc in board_suit_counts):
+            out[o2 + 4] = 1.0
+        if any(bc == 5 for bc in board_suit_counts):
+            out[o2 + 5] = 1.0
+
+        # ---- BRD-4: arrival volatility census (3), river-zeroed ----
+        o4 = _BRD4_OFF + bi * 3
+        if not is_river:
+            pair_outs = sum(4 - int(vct[r]) for r in board_ranks_set)
+            flush_adv = sum(
+                13 - int(visible_per_suit[s])
+                for s in range(4)
+                if board_suit_counts[s] in (2, 3)
+            )
+            straight_adv = 0
+            for r in range(13):
+                if r in board_ranks_set:
+                    continue
+                unseen_r = 4 - int(vct[r])
+                if unseen_r <= 0:
+                    continue
+                for W in _STRAIGHT_WINDOWS:
+                    if r in W and len(W & board_ranks_set) == 2:
+                        straight_adv += unseen_r
+                        break
+            out[o4 + 0] = pair_outs / unseen_deck
+            out[o4 + 1] = flush_adv / unseen_deck
+            out[o4 + 2] = straight_adv / unseen_deck
+
+        # ---- BRD-5: hero vulnerability outs (3), river-zeroed ----
+        o5 = _BRD5_OFF + bi * 3
+        if not is_river:
+            danger_flush = sum(
+                13 - int(visible_per_suit[s])
+                for s in range(4)
+                if board_suit_counts[s] == 2 and hole_suit_counts[s] < 2
+            )
+            danger_pair = sum(
+                4 - int(vct[r])
+                for r in board_ranks_set
+                if hole_rank_counts[r] == 0
+            )
+            danger_straight = 0
+            for r in range(13):
+                unseen_r = 4 - int(vct[r])
+                if unseen_r <= 0:
+                    continue
+                new_board = board_ranks_set | {r}
+                field = any(len(W & new_board) >= 3 for W in _STRAIGHT_WINDOWS)
+                if not field:
+                    continue
+                hero_makes = False
+                for W in _STRAIGHT_WINDOWS:
+                    H_W = W & hole_ranks_set
+                    L = W - new_board
+                    if L <= H_W and len(H_W) >= 2 and len(L) <= 2:
+                        hero_makes = True
+                        break
+                if not hero_makes:
+                    danger_straight += unseen_r
+            out[o5 + 0] = danger_flush / unseen_deck
+            out[o5 + 1] = danger_pair / unseen_deck
+            out[o5 + 2] = danger_straight / unseen_deck
+
+        # ---- BRD-6: straight out union (2), river-zeroed ----
+        o6 = _BRD6_OFF + bi * 2
+        if not is_river:
+            union: set[int] = set()
+            for W in _STRAIGHT_WINDOWS:
+                B_W = W & board_ranks_set
+                H_W = W & hole_ranks_set
+                L = W - B_W
+                nL, nH = len(L), len(H_W)
+                makes = (L <= H_W) and (nH >= 2) and (nL <= 2)
+                if makes or nH < 2:
+                    continue
+                M = L - H_W
+                nM = len(M)
+                if nL == 3 and nM == 0:
+                    union |= L
+                elif nM == 1 and 1 <= nL <= 3:
+                    union |= M
+            union_outs = sum(4 - int(vct[r]) for r in union)
+            nut_outs = 0
+            for r in union:
+                unseen_r = 4 - int(vct[r])
+                new_board = board_ranks_set | {r}
+                makes_idx = [
+                    wi
+                    for wi, W in enumerate(_STRAIGHT_WINDOWS)
+                    if (W - new_board) <= (W & hole_ranks_set)
+                    and len(W & hole_ranks_set) >= 2
+                    and len(W - new_board) <= 2
+                ]
+                if not makes_idx:
+                    continue
+                h_max = max(makes_idx)
+                nut_dist = sum(
+                    1
+                    for wi in range(h_max + 1, 10)
+                    if len(_STRAIGHT_WINDOWS[wi] & new_board) >= 3
+                )
+                if nut_dist == 0:
+                    nut_outs += unseen_r
+            out[o6 + 0] = float(union_outs)
+            out[o6 + 1] = float(nut_outs)
+
+        # ---- BRD-8: fd rank quality (2) ----
+        o8 = _BRD8_OFF + bi * 2
+        draw_suit = -1
+        best_max = -1
+        for s in range(4):
+            if hole_suit_counts[s] >= 2 and board_suit_counts[s] == 2:
+                if hole_max_per_suit[s] > best_max:
+                    best_max = hole_max_per_suit[s]
+                    draw_suit = s
+        if draw_suit >= 0:
+            h1 = hole_max_per_suit[draw_suit]
+            out[o8 + 0] = (h1 + 1) / 13.0
+            out[o8 + 1] = float(
+                sum(
+                    1
+                    for r in range(h1 + 1, 13)
+                    if int(visible_count[r, draw_suit]) == 0
+                )
+            )
+
+        # ---- BRD-9: backdoor draw census (2), flop-only ----
+        o9 = _BRD9_OFF + bi * 2
+        if is_flop:
+            bdfd = sum(
+                1
+                for s in range(4)
+                if hole_suit_counts[s] >= 2 and board_suit_counts[s] == 1
+            )
+            bdstr = 0
+            for W in _STRAIGHT_WINDOWS:
+                nH = len(W & hole_ranks_set)
+                nL = len(W - board_ranks_set)
+                missing_both = len(W - board_ranks_set - hole_ranks_set)
+                if missing_both == 2 and nH >= 2 and nL <= 4:
+                    bdstr += 1
+            out[o9 + 0] = float(bdfd)
+            out[o9 + 1] = float(bdstr)
+
+        # ---- BRD-10: future nut-flush blocker (1), river-zeroed ----
+        o10 = _BRD10_OFF + bi * 1
+        if not is_river:
+            cnt = 0
+            for s in range(4):
+                if board_suit_counts[s] != 2:
+                    continue
+                for r in range(12, -1, -1):
+                    if board_present_all[r][s]:
+                        continue
+                    if hero_present[r][s]:
+                        cnt += 1
+                    break
+            out[o10] = float(cnt)
+
+        # ---- BRD-11: turn/river card identity (5 per slot; A-turn,A-river) ----
+        o11t = _BRD11_OFF + bi * 10 + 0
+        o11r = _BRD11_OFF + bi * 10 + 5
+        if len(board_list) >= 4:
+            c = board_list[3]
+            out[o11t + 0] = (c // 4 + 1) / 13.0
+            out[o11t + 1 + (c % 4)] = 1.0
+        if len(board_list) >= 5:
+            c = board_list[4]
+            out[o11r + 0] = (c // 4 + 1) / 13.0
+            out[o11r + 1 + (c % 4)] = 1.0
+
+        # ---- BRD-13: board nut ceiling class (2) ----
+        o13 = _BRD13_OFF + bi * 2
+        if has_board:
+            sf_possible = False
+            for s in range(4):
+                ranks_s = board_ranks_per_suit[s]
+                if len(ranks_s) >= 3:
+                    for W in _STRAIGHT_WINDOWS:
+                        if len(W & ranks_s) >= 3:
+                            sf_possible = True
+                            break
+                if sf_possible:
+                    break
+            paired = any(bc >= 2 for bc in board_rank_counts)
+            flush_poss = any(bc >= 3 for bc in board_suit_counts)
+            straight_poss = any(
+                len(W & board_ranks_set) >= 3 for W in _STRAIGHT_WINDOWS
+            )
+            if sf_possible:
+                ceil = 8
+            elif paired:
+                ceil = 7
+            elif flush_poss:
+                ceil = 5
+            elif straight_poss:
+                ceil = 4
+            else:
+                ceil = 3
+            out[o13 + 0] = 1.0 if sf_possible else 0.0
+            out[o13 + 1] = ceil / 8.0
+
+    _one_board(board_a_list, 0)
+    _one_board(board_b_list, 1)
 
 
 def _encode_dual_v3(
@@ -957,7 +1318,68 @@ def _encode_dual_v3(
 ) -> None:
     """Double-board structure, dims 1139..1171. DUAL-2 (1141..1151) and
     DUAL-4 (1157..1162) are [ENGINE] — left zero."""
-    return None
+    # ---- DUAL-1 (1139..1141): split-adjusted price ladder ----
+    # Pot odds re-denominated to the win-one (0.5*pot) and quartered
+    # (0.25*pot) split outcomes, stack-capped (eff_to_call already =
+    # min(to_call, hero effective stack)). Both 0 when eff_to_call == 0.
+    if eff_to_call > 0.0:
+        out[_DUAL1_OFF + 0] = eff_to_call / (0.5 * pot + eff_to_call)
+        out[_DUAL1_OFF + 1] = eff_to_call / (0.25 * pot + eff_to_call)
+
+    # ---- DUAL-3 (1151..1157): nut-lock / freeroll flags ----
+    # Exact ==0.0 thresholds of the k=2 per-board counters (per_board_outcome
+    # layout [aheadA,tieA,behindA,aheadB,tieB,behindB,win-one,tie-both]).
+    # Guarded by the activity gate (per-board fractions sum ~1 when the pass
+    # ran, 0 preflop/terminal) so terminal all-zeros never read as "nuts".
+    if per_board_outcome is not None:
+        ahead_a = float(per_board_outcome[0])
+        tie_a = float(per_board_outcome[1])
+        behind_a = float(per_board_outcome[2])
+        tie_b = float(per_board_outcome[4])
+        behind_b = float(per_board_outcome[5])
+        if (ahead_a + tie_a + behind_a) > 0.5:
+            nut_or_chop_a = behind_a == 0.0
+            nut_or_chop_b = behind_b == 0.0
+            out[_DUAL3_OFF + 0] = 1.0 if (nut_or_chop_a and tie_a == 0.0) else 0.0
+            out[_DUAL3_OFF + 1] = 1.0 if nut_or_chop_a else 0.0
+            out[_DUAL3_OFF + 2] = 1.0 if (nut_or_chop_b and tie_b == 0.0) else 0.0
+            out[_DUAL3_OFF + 3] = 1.0 if nut_or_chop_b else 0.0
+            out[_DUAL3_OFF + 4] = 1.0 if (nut_or_chop_a and nut_or_chop_b) else 0.0
+            out[_DUAL3_OFF + 5] = 1.0 if (nut_or_chop_a or nut_or_chop_b) else 0.0
+
+    # ---- DUAL-5 (1162..1171): villain cross-board coverage (board-only) ----
+    # Hero-independent (villain scoop geometry). Per-suit both-boards>=2 (4),
+    # both-boards>=3 (4), plus the count of 2-rank pairs completing a straight
+    # on BOTH boards / 78. Empty boards yield zeros naturally.
+    ba_suit = [0, 0, 0, 0]
+    bb_suit = [0, 0, 0, 0]
+    for c in board_a_list:
+        ba_suit[c % 4] += 1
+    for c in board_b_list:
+        bb_suit[c % 4] += 1
+    for s in range(4):
+        if ba_suit[s] >= 2 and bb_suit[s] >= 2:
+            out[_DUAL5_OFF + s] = 1.0
+        if ba_suit[s] >= 3 and bb_suit[s] >= 3:
+            out[_DUAL5_OFF + 4 + s] = 1.0
+    ba_ranks = {c // 4 for c in board_a_list}
+    bb_ranks = {c // 4 for c in board_b_list}
+    scoop_pairs = 0
+    for r1 in range(13):
+        for r2 in range(r1 + 1, 13):
+            pair = {r1, r2}
+            made_a = False
+            made_b = False
+            for W in _STRAIGHT_WINDOWS:
+                if not (pair <= W):
+                    continue
+                if len(pair | (ba_ranks & W)) >= 5:
+                    made_a = True
+                if len(pair | (bb_ranks & W)) >= 5:
+                    made_b = True
+            if made_a and made_b:
+                scoop_pairs += 1
+    out[_DUAL5_OFF + 8] = scoop_pairs / 78.0
 
 
 def encode_observation(obs: Mapping[str, Any], config: GameConfig) -> np.ndarray:
@@ -2013,7 +2435,121 @@ def _encode_stack_v3_batch(
     street: np.ndarray,
 ) -> None:
     """Batched twin of _encode_stack_v3, dims 1020..1061. STK-1 [ENGINE]."""
-    return None
+    n = out.shape[0]
+    seats = np.arange(num_seats, dtype=np.int64)
+    rot = (hero_idx[:, None] + seats[None, :]) % num_seats  # (n, num_seats)
+    folded_rot = np.take_along_axis(folded, rot, axis=1)
+    sc_rot = np.take_along_axis(street_commit, rot, axis=1)
+    eff_rot = np.take_along_axis(effective, rot, axis=1)
+    tc_rot = np.take_along_axis(total_commit, rot, axis=1)
+    hero_sc = sc_rot[:, 0]
+    hero_stack = eff_rot[:, 0]
+    hero_commit = tc_rot[:, 0]
+    eff_to_call = np.minimum(to_call, hero_stack)
+    pot_denom = np.maximum(pot, 1.0)
+
+    # ---- STK-2: raise-ladder envelope (6) ----
+    min_d = min_bet - hero_sc
+    max_d = max_bet - hero_sc
+    base = pot + to_call
+    raise_legal = max_d > to_call
+    base_safe = np.maximum(base, 1.0)
+    eff_denom = np.maximum(hero_stack, 1.0)
+    grid = anchor_grid_np(min_d, max_d, pot, to_call)
+    n_legal = grid.legal.sum(axis=-1).astype(np.float64) / 11.0
+    wl2 = live_mask & raise_legal
+    out[wl2, _STK2_OFF + 0] = np.clip((min_d - to_call) / base_safe, 0.0, 1.0)[wl2]
+    out[wl2, _STK2_OFF + 1] = np.clip((max_d - to_call) / base_safe, 0.0, 1.0)[wl2]
+    out[wl2, _STK2_OFF + 2] = np.clip(min_d / eff_denom, 0.0, 1.0)[wl2]
+    out[wl2, _STK2_OFF + 3] = np.clip(max_d / eff_denom, 0.0, 1.0)[wl2]
+    out[wl2, _STK2_OFF + 4] = (max_d < to_call + base).astype(np.float64)[wl2]
+    out[wl2, _STK2_OFF + 5] = n_legal[wl2]
+
+    # ---- STK-4: per-seat commitment ratio (8), hero-rotated ----
+    denom4 = tc_rot + eff_rot
+    ratio4 = np.where(
+        denom4 > 0.0, tc_rot / np.where(denom4 > 0.0, denom4, 1.0), 0.0
+    )
+    ratio4 = np.where(folded_rot, 0.0, ratio4)
+    out[live_mask, _STK4_OFF : _STK4_OFF + num_seats] = ratio4[live_mask]
+
+    # ---- STK-5: spr-after-action (4) ----
+    out[live_mask, _STK5_OFF + 0] = np.log1p(
+        (hero_stack - eff_to_call) / np.maximum(pot + eff_to_call, 1.0)
+    )[live_mask]
+    out[live_mask, _STK5_OFF + 1] = np.log1p((pot + eff_to_call) * inv_bb)[live_mask]
+    tot2 = pot + 2.0 * max_d - to_call
+    den2 = np.maximum(tot2, 1.0)
+    arg2 = np.where(raise_legal, (hero_stack - max_d) / den2, 0.0)
+    tot2_safe = np.where(raise_legal, tot2, 0.0)
+    wl5 = live_mask & raise_legal
+    out[wl5, _STK5_OFF + 2] = np.log1p(arg2)[wl5]
+    out[wl5, _STK5_OFF + 3] = np.log1p(tot2_safe * inv_bb)[wl5]
+
+    # ---- STK-6: geometric jam plan (2) ----
+    spr_e = hero_stack / pot_denom
+    r = 4 - street
+    x6 = 1.0 + 2.0 * spr_e
+    with np.errstate(divide="ignore", invalid="ignore"):
+        btj = np.ceil(np.log(x6) / np.log(3.0))
+        gfrac = (np.power(x6, 1.0 / r) - 1.0) / 2.0
+    out[live_mask, _STK6_OFF + 0] = np.clip(btj, 0.0, 6.0)[live_mask]
+    out[live_mask, _STK6_OFF + 1] = np.clip(gfrac, 0.0, 2.0)[live_mask]
+
+    # ---- STK-7: pot-ceiling implied odds (2) ----
+    # Explicit seat-index accumulation to match the serial add order bit-exactly
+    # (skipped seats contribute +0.0, transparent).
+    ceiling = pot.copy()
+    opp_min = np.minimum(effective, hero_stack[:, None])
+    for s in range(num_seats):
+        contrib = np.where((s != hero_idx) & (~folded[:, s]), opp_min[:, s], 0.0)
+        ceiling = ceiling + contrib
+    out[live_mask, _STK7_OFF + 0] = np.log1p(ceiling / pot_denom)[live_mask]
+    den7 = ceiling + eff_to_call
+    price7 = np.where(
+        eff_to_call > 0.0, eff_to_call / np.where(den7 > 0.0, den7, 1.0), 0.0
+    )
+    out[live_mask, _STK7_OFF + 1] = price7[live_mask]
+
+    # ---- STK-8: side-pot eligibility (3) ----
+    hero_after = hero_commit + eff_to_call
+    sum_now = np.zeros(n, dtype=np.float64)
+    sum_after = np.zeros(n, dtype=np.float64)
+    dead = np.zeros(n, dtype=np.float64)
+    for s in range(num_seats):
+        cs = total_commit[:, s]
+        sum_now = sum_now + np.minimum(cs, hero_commit)
+        sum_after = sum_after + np.minimum(cs, hero_after)
+        dead = dead + np.where(folded[:, s], cs, 0.0)
+    out[live_mask, _STK8_OFF + 0] = (sum_now / pot_denom)[live_mask]
+    out[live_mask, _STK8_OFF + 1] = (sum_after / pot_denom)[live_mask]
+    out[live_mask, _STK8_OFF + 2] = (dead / pot_denom)[live_mask]
+
+    # ---- STK-9: call-risk fraction (2) ----
+    out[live_mask, _STK9_OFF + 0] = (
+        eff_to_call / np.maximum(hero_stack, 1.0)
+    )[live_mask]
+    out[live_mask, _STK9_OFF + 1] = (
+        eff_to_call / np.maximum(hero_commit + hero_stack, 1.0)
+    )[live_mask]
+
+    # ---- STK-10: ante-pot bloat (2) ----
+    ante_i = int(config.ante)
+    pot_at_flop = 0
+    for s in range(num_seats):
+        pot_at_flop += min(ante_i, int(config.resolved_stacks[s]))
+    paf = float(pot_at_flop)
+    out[live_mask, _STK10_OFF + 0] = ante_i * inv_bb
+    out[live_mask, _STK10_OFF + 1] = np.log1p(
+        np.maximum(pot - paf, 0.0) / max(paf, 1.0)
+    )[live_mask]
+
+    # ---- STK-11: per-seat price-to-continue (8), hero-rotated ----
+    owed = np.minimum(np.maximum(bet_to_call[:, None] - sc_rot, 0.0), eff_rot)
+    ratio11 = owed / (pot_denom[:, None] + owed)
+    ratio11 = np.where(folded_rot, 0.0, ratio11)
+    ratio11[:, 0] = 0.0  # hero slot
+    out[live_mask, _STK11_OFF : _STK11_OFF + num_seats] = ratio11[live_mask]
 
 
 def _encode_board_v3_batch(
@@ -2027,7 +2563,254 @@ def _encode_board_v3_batch(
 ) -> None:
     """Batched twin of _encode_board_v3, dims 1061..1139. BRD-7/BRD-12
     [ENGINE]."""
-    return None
+    n = hole.shape[0]
+    live = live_mask
+    ranks13 = np.arange(13)
+    wmat = _WINDOW_MATRIX                 # (10, 13) bool
+    wmat_i = wmat.astype(np.int64)        # (10, 13)
+
+    # ---- Global visibility (hole + both boards), (N, 13, 4) 0/1 ----
+    visible = np.zeros((n, 13, 4), dtype=np.int64)
+    board_all = np.zeros((n, 13, 4), dtype=bool)   # both boards only (BRD-10 scan)
+    hole_pres = np.zeros((n, 13, 4), dtype=bool)
+    for src in (hole, board_a, board_b):
+        sv = src < 52
+        if sv.any():
+            ei, si = np.nonzero(sv)
+            cards = src[ei, si].astype(np.int64)
+            visible[ei, cards >> 2, cards & 3] = 1
+    for src in (board_a, board_b):
+        sv = src < 52
+        if sv.any():
+            ei, si = np.nonzero(sv)
+            cards = src[ei, si].astype(np.int64)
+            board_all[ei, cards >> 2, cards & 3] = True
+    sv = hole < 52
+    if sv.any():
+        ei, si = np.nonzero(sv)
+        cards = hole[ei, si].astype(np.int64)
+        hole_pres[ei, cards >> 2, cards & 3] = True
+
+    vct = visible.sum(axis=2)                    # (N, 13) global copies visible per rank
+    vps = visible.sum(axis=1)                    # (N, 4) global cards visible per suit
+    unseen_deck = 52 - visible.sum(axis=(1, 2))  # (N,)
+    unseen_r = 4 - vct                           # (N, 13) unseen copies per rank
+    unseen_s = 13 - vps                          # (N, 4) unseen copies per suit
+    unseen_ce = visible == 0                     # (N, 13, 4) not-visible-anywhere
+
+    # ---- Hero-side aggregates ----
+    hv = hole < 52
+    hrc = np.zeros((n, 13), dtype=np.int64)      # hero rank counts
+    hsc = np.zeros((n, 4), dtype=np.int64)       # hero suit counts
+    hrm = np.zeros((n, 13), dtype=bool)          # hero rank presence
+    hmax = -np.ones((n, 4), dtype=np.int64)      # hero max rank per suit (-1 = none)
+    for k in range(hole.shape[1]):
+        vk = hv[:, k]
+        if vk.any():
+            idx = np.nonzero(vk)[0]
+            cards = hole[vk, k].astype(np.int64)
+            rk = cards >> 2
+            sk = cards & 3
+            np.add.at(hrc, (idx, rk), 1)
+            np.add.at(hsc, (idx, sk), 1)
+            hrm[idx, rk] = True
+            np.maximum.at(hmax, (idx, sk), rk)
+
+    denom = unseen_deck.astype(np.float64)       # (N,) always > 0 for live rows
+    not_river = street != 3
+    is_flop = street == 1
+
+    def _board_block(board, bi):
+        bv = board < 52
+        brc = np.zeros((n, 13), dtype=np.int64)  # board rank counts
+        bsc = np.zeros((n, 4), dtype=np.int64)   # board suit counts
+        brm = np.zeros((n, 13), dtype=bool)      # board rank presence
+        brs = np.zeros((n, 13, 4), dtype=bool)   # board (rank, suit) presence
+        for k in range(5):
+            vk = bv[:, k]
+            if vk.any():
+                idx = np.nonzero(vk)[0]
+                cards = board[vk, k].astype(np.int64)
+                rk = cards >> 2
+                sk = cards & 3
+                np.add.at(brc, (idx, rk), 1)
+                np.add.at(bsc, (idx, sk), 1)
+                brm[idx, rk] = True
+                brs[idx, rk, sk] = True
+        win_board_cnt = brm.astype(np.int64) @ wmat_i.T   # (N, 10) distinct board ranks per window
+
+        # ---- BRD-1: rank ladder (5) ----
+        o1 = _BRD1_OFF + bi * 5
+        sort_key = np.where(bv, board.astype(np.int64) >> 2, -1)
+        sorted_desc = -np.sort(-sort_key, axis=1)         # (N, 5) descending; -1 in tail
+        valid_slot = sorted_desc >= 0
+        ladder = np.where(
+            valid_slot, (sorted_desc.astype(np.float64) + 1.0) / 13.0, 0.0
+        )
+        out[live, o1 : o1 + 5] = ladder[live]
+
+        # ---- BRD-2: suit census (6) ----
+        o2 = _BRD2_OFF + bi * 6
+        out[live, o2 : o2 + 4] = (bsc[live] == 2).astype(np.float32)
+        out[live, o2 + 4] = (bsc == 4).any(axis=1)[live].astype(np.float32)
+        out[live, o2 + 5] = (bsc == 5).any(axis=1)[live].astype(np.float32)
+
+        # ---- BRD-4: arrival volatility census (3), river-zeroed ----
+        o4 = _BRD4_OFF + bi * 3
+        pair_outs = (brm * unseen_r).sum(axis=1)
+        adv_suit = (bsc == 2) | (bsc == 3)
+        flush_adv = (adv_suit * unseen_s).sum(axis=1)
+        window_has2 = win_board_cnt == 2                  # (N, 10)
+        rank_in2win = (window_has2[:, :, None] & wmat[None, :, :]).any(axis=1)  # (N, 13)
+        straight_adv = ((rank_in2win & ~brm) * unseen_r).sum(axis=1)
+        b4 = np.stack([pair_outs, flush_adv, straight_adv], axis=1).astype(np.float64)
+        b4 = np.where(not_river[:, None], b4 / denom[:, None], 0.0)
+        out[live, o4 : o4 + 3] = b4[live]
+
+        # ---- BRD-5: hero vulnerability outs (3), river-zeroed ----
+        o5 = _BRD5_OFF + bi * 3
+        danger_flush = (((bsc == 2) & (hsc < 2)) * unseen_s).sum(axis=1)
+        danger_pair = ((brm & (hrc == 0)) * unseen_r).sum(axis=1)
+        danger_straight = np.zeros(n, dtype=np.int64)
+        for rc in range(13):
+            aug = brm.copy()
+            aug[:, rc] = True
+            field = ((aug.astype(np.int64) @ wmat_i.T) >= 3).any(axis=1)
+            makes_any = np.zeros(n, dtype=bool)
+            for w in range(10):
+                Wm = wmat[w]
+                L = Wm[None, :] & ~aug
+                nL = L.sum(axis=1)
+                nH = (Wm[None, :] & hrm).sum(axis=1)
+                subset = ~((L & ~hrm).any(axis=1))
+                makes_any |= subset & (nH >= 2) & (nL <= 2)
+            danger = field & ~makes_any
+            danger_straight += np.where(danger, unseen_r[:, rc], 0)
+        b5 = np.stack(
+            [danger_flush, danger_pair, danger_straight], axis=1
+        ).astype(np.float64)
+        b5 = np.where(not_river[:, None], b5 / denom[:, None], 0.0)
+        out[live, o5 : o5 + 3] = b5[live]
+
+        # ---- BRD-6: straight out union (2), river-zeroed ----
+        o6 = _BRD6_OFF + bi * 2
+        out_cand = np.zeros((n, 13), dtype=bool)
+        for w in range(10):
+            Wm = wmat[w]
+            inW = Wm[None, :]
+            L = inW & ~brm
+            M = L & ~hrm
+            nL = L.sum(axis=1)
+            nH = (inW & hrm).sum(axis=1)
+            nM = M.sum(axis=1)
+            makes = (nM == 0) & (nH >= 2) & (nL <= 2)
+            gate = (~makes) & (nH >= 2)
+            cond1 = (nL == 3) & (nM == 0) & gate
+            cond2 = (nM == 1) & (nL >= 1) & (nL <= 3) & gate
+            out_cand |= L & cond1[:, None]
+            out_cand |= M & cond2[:, None]
+        union_outs = (out_cand * unseen_r).sum(axis=1)
+        nut_outs = np.zeros(n, dtype=np.int64)
+        widx = np.arange(10)
+        for rc in range(13):
+            aug = brm.copy()
+            aug[:, rc] = True
+            makes_w = np.zeros((n, 10), dtype=bool)
+            poss_w = np.zeros((n, 10), dtype=bool)
+            for w in range(10):
+                Wm = wmat[w]
+                L = Wm[None, :] & ~aug
+                nL = L.sum(axis=1)
+                nH = (Wm[None, :] & hrm).sum(axis=1)
+                subset = ~((L & ~hrm).any(axis=1))
+                makes_w[:, w] = subset & (nH >= 2) & (nL <= 2)
+                poss_w[:, w] = (Wm[None, :] & aug).sum(axis=1) >= 3
+            any_make = makes_w.any(axis=1)
+            hmaxw = np.where(makes_w, widx[None, :], -1).max(axis=1)
+            higher = widx[None, :] > hmaxw[:, None]
+            nutdist = (poss_w & higher).sum(axis=1)
+            is_nut = any_make & (nutdist == 0) & out_cand[:, rc]
+            nut_outs += np.where(is_nut, unseen_r[:, rc], 0)
+        b6 = np.stack([union_outs, nut_outs], axis=1).astype(np.float64)
+        b6 = np.where(not_river[:, None], b6, 0.0)
+        out[live, o6 : o6 + 2] = b6[live]
+
+        # ---- BRD-8: fd rank quality (2) ----
+        o8 = _BRD8_OFF + bi * 2
+        qual = (hsc >= 2) & (bsc == 2)                    # (N, 4)
+        any_qual = qual.any(axis=1)
+        hmax_masked = np.where(qual, hmax, -1)
+        draw_suit = np.argmax(hmax_masked, axis=1)        # (N,) first-max = lowest suit idx
+        h1 = hmax[np.arange(n), draw_suit]                # (N,)
+        b8_0 = np.where(any_qual, (h1.astype(np.float64) + 1.0) / 13.0, 0.0)
+        unseen_ds = unseen_ce[np.arange(n), :, draw_suit]  # (N, 13)
+        above = ranks13[None, :] > h1[:, None]
+        b8_1 = np.where(any_qual, (above & unseen_ds).sum(axis=1), 0)
+        out[live, o8 + 0] = b8_0[live]
+        out[live, o8 + 1] = b8_1[live].astype(np.float32)
+
+        # ---- BRD-9: backdoor draw census (2), flop-only ----
+        o9 = _BRD9_OFF + bi * 2
+        bdfd = ((hsc >= 2) & (bsc == 1)).sum(axis=1)
+        bdstr = np.zeros(n, dtype=np.int64)
+        for w in range(10):
+            Wm = wmat[w]
+            inW = Wm[None, :]
+            nH = (inW & hrm).sum(axis=1)
+            nL = (inW & ~brm).sum(axis=1)
+            missing_both = (inW & ~brm & ~hrm).sum(axis=1)
+            bdstr += ((missing_both == 2) & (nH >= 2) & (nL <= 4)).astype(np.int64)
+        b9 = np.stack([bdfd, bdstr], axis=1)
+        b9 = np.where(is_flop[:, None], b9, 0)
+        out[live, o9 : o9 + 2] = b9[live].astype(np.float32)
+
+        # ---- BRD-10: future nut-flush blocker (1), river-zeroed ----
+        o10 = _BRD10_OFF + bi * 1
+        cnt = np.zeros(n, dtype=np.int64)
+        for s in range(4):
+            notb_desc = (~board_all[:, :, s])[:, ::-1]    # index 0 = rank 12
+            key_rank = 12 - np.argmax(notb_desc, axis=1)
+            has_key = hole_pres[np.arange(n), key_rank, s]
+            cnt += ((bsc[:, s] == 2) & has_key).astype(np.int64)
+        b10 = np.where(not_river, cnt, 0)
+        out[live, o10] = b10[live].astype(np.float32)
+
+        # ---- BRD-11: turn/river card identity (5 per slot) ----
+        # (rank+1)/13 as ADD-then-DIVIDE to match the scalar path bit-exactly.
+        o11t = _BRD11_OFF + bi * 10 + 0
+        o11r = _BRD11_OFF + bi * 10 + 5
+        for base_off, col in ((o11t, 3), (o11r, 4)):
+            vcol = (board[:, col] < 52) & live
+            rows = np.nonzero(vcol)[0]
+            if rows.size:
+                cards = board[rows, col].astype(np.int64)
+                out[rows, base_off] = ((cards >> 2) + 1).astype(np.float64) / 13.0
+                out[rows, base_off + 1 + (cards & 3)] = 1.0
+
+        # ---- BRD-13: board nut ceiling class (2) ----
+        o13 = _BRD13_OFF + bi * 2
+        win_suit = np.tensordot(
+            brs.astype(np.int64), wmat_i.T, axes=([1], [0])
+        )  # (N, 4, 10)
+        sf_possible = (win_suit >= 3).any(axis=(1, 2))
+        paired = (brc >= 2).any(axis=1)
+        flush_poss = (bsc >= 3).any(axis=1)
+        straight_poss = (win_board_cnt >= 3).any(axis=1)
+        has_board = bv.any(axis=1)
+        ceil = np.full(n, 3, dtype=np.int64)
+        ceil = np.where(straight_poss, 4, ceil)
+        ceil = np.where(flush_poss, 5, ceil)
+        ceil = np.where(paired, 7, ceil)
+        ceil = np.where(sf_possible, 8, ceil)
+        out[live, o13 + 0] = np.where(has_board, sf_possible, False)[live].astype(
+            np.float32
+        )
+        out[live, o13 + 1] = np.where(has_board, ceil.astype(np.float64) / 8.0, 0.0)[
+            live
+        ]
+
+    _board_block(board_a, 0)
+    _board_block(board_b, 1)
 
 
 def _encode_dual_v3_batch(
@@ -2046,4 +2829,90 @@ def _encode_dual_v3_batch(
 ) -> None:
     """Batched twin of _encode_dual_v3, dims 1139..1171. DUAL-2/DUAL-4
     [ENGINE]."""
-    return None
+    n = hole.shape[0]
+    rows = np.arange(n)
+
+    # ---- DUAL-1 (1139..1141): split-adjusted price ladder ----
+    # eff_to_call = min(to_call, hero effective stack); f64 throughout,
+    # cast on assignment (parity with the scalar path).
+    hero_stack = effective[rows, hero_idx]
+    eff_to_call = np.minimum(to_call, hero_stack)
+    pos = eff_to_call > 0.0
+    half = np.zeros(n, dtype=np.float64)
+    quarter = np.zeros(n, dtype=np.float64)
+    half[pos] = eff_to_call[pos] / (0.5 * pot[pos] + eff_to_call[pos])
+    quarter[pos] = eff_to_call[pos] / (0.25 * pot[pos] + eff_to_call[pos])
+    out[live_mask, _DUAL1_OFF + 0] = half[live_mask]
+    out[live_mask, _DUAL1_OFF + 1] = quarter[live_mask]
+
+    # ---- DUAL-3 (1151..1157): nut-lock / freeroll flags ----
+    if per_board_outcome is not None:
+        pbo = np.asarray(per_board_outcome, dtype=np.float64)
+        ahead_a = pbo[:, 0]
+        tie_a = pbo[:, 1]
+        behind_a = pbo[:, 2]
+        tie_b = pbo[:, 4]
+        behind_b = pbo[:, 5]
+        active = (ahead_a + tie_a + behind_a) > 0.5
+        nut_or_chop_a = active & (behind_a == 0.0)
+        nut_or_chop_b = active & (behind_b == 0.0)
+        pure_nut_a = nut_or_chop_a & (tie_a == 0.0)
+        pure_nut_b = nut_or_chop_b & (tie_b == 0.0)
+        locked_both = nut_or_chop_a & nut_or_chop_b
+        locked_one = nut_or_chop_a | nut_or_chop_b
+        dual3 = np.stack(
+            [pure_nut_a, nut_or_chop_a, pure_nut_b, nut_or_chop_b, locked_both, locked_one],
+            axis=1,
+        ).astype(np.float64)
+        out[live_mask, _DUAL3_OFF : _DUAL3_OFF + 6] = dual3[live_mask]
+
+    # ---- DUAL-5 (1162..1171): villain cross-board coverage (board-only) ----
+    ba_valid = board_a < 52
+    bb_valid = board_b < 52
+    ba_suit = np.zeros((n, 4), dtype=np.int64)
+    bb_suit = np.zeros((n, 4), dtype=np.int64)
+    for arr, valid, dest in (
+        (board_a, ba_valid, ba_suit),
+        (board_b, bb_valid, bb_suit),
+    ):
+        suits = (arr & 3).astype(np.int64)
+        for k in range(arr.shape[1]):
+            vk = valid[:, k]
+            if vk.any():
+                np.add.at(dest, (np.nonzero(vk)[0], suits[vk, k]), 1)
+    suit_ge2_both = (ba_suit >= 2) & (bb_suit >= 2)
+    suit_ge3_both = (ba_suit >= 3) & (bb_suit >= 3)
+
+    ba_rank_mask = np.zeros((n, 13), dtype=bool)
+    bb_rank_mask = np.zeros((n, 13), dtype=bool)
+    for arr, valid, dest in (
+        (board_a, ba_valid, ba_rank_mask),
+        (board_b, bb_valid, bb_rank_mask),
+    ):
+        ranks = (arr >> 2).astype(np.int64)
+        for k in range(arr.shape[1]):
+            vk = valid[:, k]
+            if vk.any():
+                dest[np.nonzero(vk)[0], ranks[vk, k]] = True
+    ba_bits = (ba_rank_mask.astype(np.uint16) * _RANK_WEIGHTS_13).sum(axis=1).astype(np.uint16)
+    bb_bits = (bb_rank_mask.astype(np.uint16) * _RANK_WEIGHTS_13).sum(axis=1).astype(np.uint16)
+    made_a = np.zeros((n, _PAIR_BITS_13.shape[0]), dtype=bool)
+    made_b = np.zeros((n, _PAIR_BITS_13.shape[0]), dtype=bool)
+    for w_idx in range(_WINDOW_BITS_13.shape[0]):
+        W = _WINDOW_BITS_13[w_idx]
+        pair_in_W = (_PAIR_BITS_13 & W) == _PAIR_BITS_13
+        if not pair_in_W.any():
+            continue
+        ba_W = (ba_bits & W).astype(np.uint16)
+        bb_W = (bb_bits & W).astype(np.uint16)
+        cov_a = np.bitwise_count(ba_W[:, None] | _PAIR_BITS_13[None, :])
+        cov_b = np.bitwise_count(bb_W[:, None] | _PAIR_BITS_13[None, :])
+        made_a |= (cov_a >= 5) & pair_in_W[None, :]
+        made_b |= (cov_b >= 5) & pair_in_W[None, :]
+    scoop_pairs = (made_a & made_b).sum(axis=1).astype(np.float64)
+
+    dual5 = np.zeros((n, 9), dtype=np.float64)
+    dual5[:, 0:4] = suit_ge2_both.astype(np.float64)
+    dual5[:, 4:8] = suit_ge3_both.astype(np.float64)
+    dual5[:, 8] = scoop_pairs / 78.0
+    out[live_mask, _DUAL5_OFF : _DUAL5_OFF + 9] = dual5[live_mask]

@@ -868,25 +868,26 @@ def obs_adapter(model: nn.Module):
     """Return a numpy function mapping freshly-encoded (..., OBS_DIM)
     observations to the model's expected input width.
 
-    Three generations serve side by side: v1-era checkpoints (OBS_DIM_V1
-    = 959, pre-pot-fraction-history) get the exact `downgrade_obs_to_v1`
+    Generations serve side by side: v1-era checkpoints (OBS_DIM_V1 = 959,
+    pre-pot-fraction-history) get the exact `downgrade_obs_to_v1`
     projection (its index map only touches dims < 991, so it also drops
-    the obs-v2 tail); 991-era v2/v4 checkpoints (through vFour4) get the
-    `downgrade_obs_to_v2` tail slice; models whose first layer already
-    takes the current OBS_DIM get identity."""
-    from plo5bp.encoding import (
-        OBS_DIM_V1,
-        OBS_DIM_V2,
-        downgrade_obs_to_v1,
-        downgrade_obs_to_v2,
-    )
+    every later tail); models whose first layer already takes the current
+    OBS_DIM get identity. Everything from OBS_DIM_V2 (991) onward is a PURE
+    TAIL APPEND (obs-v2 tail 991..1020, v7 batch-2 tail 1020..1171, …), so
+    a checkpoint trained at any intermediate width W in [991, OBS_DIM) is
+    an exact prefix slice `obs[..., :W]` — this covers 991 (v2/v4), 1020
+    (v5/v6), and any future intermediate without a new named downgrade."""
+    import numpy as np
+
+    from plo5bp.encoding import OBS_DIM, OBS_DIM_V1, OBS_DIM_V2, downgrade_obs_to_v1
 
     first = model.torso[0]
     lin = first[0] if isinstance(first, nn.Sequential) else first
-    if int(lin.in_features) == OBS_DIM_V1:
+    w = int(lin.in_features)
+    if w == OBS_DIM_V1:
         return downgrade_obs_to_v1
-    if int(lin.in_features) == OBS_DIM_V2:
-        return downgrade_obs_to_v2
+    if OBS_DIM_V2 <= w < OBS_DIM:
+        return lambda obs: np.ascontiguousarray(obs[..., :w])
     return lambda obs: obs
 
 
@@ -912,8 +913,10 @@ def model_class_for_state_dict(state_dict: dict) -> type:
 
 
 def state_dict_obs_dim(state_dict: dict) -> int:
-    """Input width the checkpoint was trained at — 959 for pre-pot-
-    fraction-history (v1-era) checkpoints, 991 current."""
+    """Input width the checkpoint was trained at — 959 (v1-era), 991
+    (v2/v4), 1020 (v5/v6 obs-v2 tail), 1171 (v7 batch-2 tail), …. All
+    widths >= 991 are pure prefixes of the current OBS_DIM; obs_adapter
+    slices accordingly."""
     w = state_dict.get("torso.0.weight")
     if w is None:
         w = state_dict["torso.0.0.weight"]
