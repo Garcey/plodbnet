@@ -1072,6 +1072,40 @@ impl PyBatchedEngine {
         self.states.len()
     }
 
+    /// Update chip-level config (stacks / ante / bb / sb) without reallocating
+    /// the per-env state vector. `num_seats` and `variant` must match the
+    /// construction-time values (they size hole arrays and history). Used by
+    /// multiconfig rollout to reuse one `BatchedEngine` across stack samples
+    /// at the same seat count. Clears live hands + the outcome MC cache so
+    /// the next `reset_batch` starts clean under the new config.
+    #[pyo3(signature = (starting_stacks, ante, bb, sb=0))]
+    fn reconfigure(
+        &mut self,
+        starting_stacks: PyReadonlyArray1<'_, u64>,
+        ante: u64,
+        bb: u64,
+        sb: u64,
+    ) -> PyResult<()> {
+        let stacks = resolve_starting_stacks(
+            self.config.num_seats,
+            /*starting_stack=*/ 0,
+            Some(starting_stacks),
+        )?;
+        self.config.starting_stacks = stacks;
+        self.config.ante = ante;
+        self.config.bb = bb;
+        self.config.sb = sb;
+        // Drop live hands — caller must reset_batch before the next step.
+        for st in self.states.iter_mut() {
+            *st = None;
+        }
+        let mut cache = self.outcome_cache.lock().unwrap();
+        for slot in cache.iter_mut() {
+            *slot = None;
+        }
+        Ok(())
+    }
+
     fn num_seats(&self) -> usize {
         self.config.num_seats
     }
@@ -1093,6 +1127,40 @@ impl PyBatchedEngine {
                 for seat in 0..s {
                     for c in 0..hole_w {
                         arr[[i, seat, c]] = g.hole_cards[seat][c].index();
+                    }
+                }
+            }
+        }
+        Ok(arr.into_pyarray(py))
+    }
+
+    /// Subset variant of `all_hole_cards_batch`: returns compact
+    /// `(k, num_seats, hole_w)` rows for the envs in `indices` only.
+    /// Used by the rollout after `reset_terminal_batch` to refresh the
+    /// per-hand hole cache for re-dealt envs without re-walking every
+    /// table (holes are static within a hand).
+    fn all_hole_cards_subset_batch<'py>(
+        &self,
+        py: Python<'py>,
+        indices: PyReadonlyArray1<'_, i64>,
+    ) -> PyResult<Bound<'py, PyArray3<u8>>> {
+        let idx: Vec<usize> = indices.as_slice()?.iter().map(|&x| x as usize).collect();
+        let k = idx.len();
+        let s = self.config.num_seats;
+        let hole_w = self.config.variant.hole_count();
+        let mut arr = numpy::ndarray::Array3::<u8>::from_elem((k, s, hole_w), 255u8);
+        for (j, &ei) in idx.iter().enumerate() {
+            if ei >= self.states.len() {
+                return Err(PyValueError::new_err(format!(
+                    "all_hole_cards_subset_batch: index {} out of range (n={})",
+                    ei,
+                    self.states.len()
+                )));
+            }
+            if let Some(g) = self.states[ei].as_ref() {
+                for seat in 0..s {
+                    for c in 0..hole_w {
+                        arr[[j, seat, c]] = g.hole_cards[seat][c].index();
                     }
                 }
             }
@@ -2335,6 +2403,7 @@ impl PyBatchedEngine {
         let n = idx.len();
         let s = self.config.num_seats;
         let bb = self.config.bb;
+        let ante = self.config.ante;
         let starting = self.config.starting_stacks.clone();
 
         let (obs_vec, packed, legal_mask) = py.allow_threads(|| {
@@ -2369,7 +2438,7 @@ impl PyBatchedEngine {
                 .par_chunks_exact_mut(obs_layout::OBS_DIM)
                 .enumerate()
                 .for_each(|(j, row)| {
-                    encode_obs_row(&packed, j, s, cat_a[j], cat_b[j], inv_bb, &starting, row);
+                    encode_obs_row(&packed, j, s, cat_a[j], cat_b[j], inv_bb, ante, &starting, row);
                 });
 
             (obs_vec, packed, legal_mask)
@@ -2399,7 +2468,36 @@ impl PyBatchedEngine {
 // misplaces a whole feature block, so keep in lockstep with the Python side.
 // =============================================================================
 mod obs_layout {
-    pub const OBS_DIM: usize = 1020;
+    pub const OBS_DIM: usize = 1171;
+    // v7 batch-2 tail (V7_OBS_IMPL_PLAN.md, dims 1020..1171)
+    pub const STK1_OFF: usize = 1020;  // 4
+    pub const STK2_OFF: usize = 1024;  // 6
+    pub const STK4_OFF: usize = 1030;  // 8
+    pub const STK5_OFF: usize = 1038;  // 4
+    pub const STK6_OFF: usize = 1042;  // 2
+    pub const STK7_OFF: usize = 1044;  // 2
+    pub const STK8_OFF: usize = 1046;  // 3
+    pub const STK9_OFF: usize = 1049;  // 2
+    pub const STK10_OFF: usize = 1051; // 2
+    pub const STK11_OFF: usize = 1053; // 8
+    pub const BRD1_OFF: usize = 1061;  // 10
+    pub const BRD2_OFF: usize = 1071;  // 12
+    pub const BRD4_OFF: usize = 1083;  // 6
+    pub const BRD5_OFF: usize = 1089;  // 6
+    pub const BRD6_OFF: usize = 1095;  // 4
+    pub const BRD7_OFF: usize = 1099;  // 2
+    pub const BRD8_OFF: usize = 1101;  // 4
+    pub const BRD9_OFF: usize = 1105;  // 4
+    pub const BRD10_OFF: usize = 1109; // 2
+    pub const BRD11_OFF: usize = 1111; // 20
+    pub const BRD12_OFF: usize = 1131; // 4
+    pub const BRD13_OFF: usize = 1135; // 4
+    pub const DUAL1_OFF: usize = 1139; // 2
+    pub const DUAL2_OFF: usize = 1141; // 10
+    pub const DUAL3_OFF: usize = 1151; // 6
+    pub const DUAL4_OFF: usize = 1157; // 5
+    pub const DUAL5_OFF: usize = 1162; // 9
+    pub const ANCHOR_COUNT: usize = 11;
     pub const HOLE_OFF: usize = 0;
     pub const BOARD_A_OFF: usize = 52;
     pub const BOARD_B_OFF: usize = 104;
@@ -2457,6 +2555,9 @@ mod obs_layout {
     pub const SPR_LOG_OFF: usize = 1012; // 8: log1p effective SPR, unclipped
 }
 
+// v7 batch-2 tail encoder (dims 1020..1171)
+include!("obs_v7_inc.rs");
+
 /// Encode one env's observation into `out` (length OBS_DIM, pre-zeroed). A
 /// bit-exact per-env port of the scalar `encode_observation`
 /// (python/plo5bp/encoding.py:652) — the ground-truth reference the numpy
@@ -2476,6 +2577,7 @@ fn encode_obs_row(
     cat_a: u8,
     cat_b: u8,
     inv_bb: f64,
+    ante: u64,
     starting: &[u64],
     out: &mut [f32],
 ) {
@@ -2808,6 +2910,29 @@ fn encode_obs_row(
         let seat = (hero + k) % num_seats;
         out[SPR_LOG_OFF + k] = (eff_per_seat[seat] / pot_safe).ln_1p() as f32;
     }
+
+    // ===== v7 batch-2 tail (dims 1020..1171) =====
+    encode_v7_tail(
+        packed,
+        j,
+        num_seats,
+        hero,
+        inv_bb,
+        ante,
+        starting,
+        street,
+        &eff_per_seat,
+        pot,
+        btc,
+        to_call,
+        pot_safe,
+        hero_stack,
+        eff_to_call,
+        hole_slice,
+        ba_slice,
+        bb_slice,
+        out,
+    );
 }
 
 /// Unconditional blockers-to-nuts for ONE board (obs v2 P3, 4 dims). Bit-exact

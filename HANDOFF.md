@@ -14,7 +14,7 @@ open — see "Older open issue" at the bottom).
   seat (see below). A robustness fix is proposed but not built (awaiting user go).
 
 ## Training — optimized9 (automated F/T/R-gated entropy anneal)
-- **Pod:** `ssh -i ~/.ssh/id_ed25519 -p 11881 root@205.196.144.74`
+- **Pod:** `ssh root@205.196.144.42 -p 11231 -i ~/.ssh/id_ed25519`
   (network volume US-MO; persists across pod death). Training PID was **15713**.
 - **Check health (one-liner pattern):** `pgrep -f scripts/train`, tail
   `runs/optimized9.log`, `nvidia-smi`, latest `checkpoints/optimized9_<N>.pt`.

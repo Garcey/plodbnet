@@ -180,17 +180,14 @@ def test_encoder_batch_terminal_row_is_zero() -> None:
 
 
 def test_env_batched_rust_encoder_width_gated(monkeypatch):
-    """The Rust obs encoder emits the 1020-dim obs-v2 layout. With the v7
-    batch-2 tail (OBS_DIM 1171) NOT ported to Rust, the encoder is
-    width-gated OFF even when PLO5_RUST_ENCODER=1 — a silently truncated obs
-    is the exact bug the gate prevents. Re-port the tail + bump
-    _RUST_ENCODER_OBS_DIM to re-enable."""
+    """Rust encoder opt-in via PLO5_RUST_ENCODER; width-gated to
+    OBS_DIM == _RUST_ENCODER_OBS_DIM (1171 after v7 tail port)."""
     import plo5bp.env_batched as eb
     from plo5bp.config import GameConfig
 
     # Default (flag unset): numpy encoder.
     assert eb.BatchedBombPotEnv(2, GameConfig(num_seats=2))._use_rust_encoder is False
-    # Opt in: still numpy, because OBS_DIM (1171) != _RUST_ENCODER_OBS_DIM (1020).
+    # Opt in: enabled when widths match (1171).
     monkeypatch.setenv("PLO5_RUST_ENCODER", "1")
-    assert eb.OBS_DIM != eb._RUST_ENCODER_OBS_DIM
-    assert eb.BatchedBombPotEnv(2, GameConfig(num_seats=2))._use_rust_encoder is False
+    assert eb.OBS_DIM == eb._RUST_ENCODER_OBS_DIM
+    assert eb.BatchedBombPotEnv(2, GameConfig(num_seats=2))._use_rust_encoder is True

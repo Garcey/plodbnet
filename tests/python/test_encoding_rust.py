@@ -41,7 +41,7 @@ _HAS_RUST_ENCODER = hasattr(BatchedEngine, "observation_encoded_batch")
 # to the Rust encoder, which still emits 1020; env_batched width-gates it off.
 # The 3-way parity suite stays skipped until the tail blocks are ported and
 # _RUST_ENCODER_OBS_DIM is bumped. Do NOT compare only the first 1020 dims.
-_RUST_ENCODER_CURRENT = False
+_RUST_ENCODER_CURRENT = True
 pytestmark = pytest.mark.skipif(
     not (_HAS_RUST_ENCODER and _RUST_ENCODER_CURRENT),
     reason=(

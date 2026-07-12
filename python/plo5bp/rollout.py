@@ -51,7 +51,86 @@ from plo5bp.sizing import sizing_from_info
 # overshoot into a clean error. Module-level (P7+P8): collect_rollout_batched
 # AND collect_rollout_multiconfig's shared-staging allocation must derive the
 # per-sub capacity from the SAME formula.
+
 POOL_SLACK_PER_ENV = 32
+
+
+class _PinnedStepH2D:
+    """Long-lived pinned host staging for per-step act() H2D (CUDA only).
+
+    Capacity is ``num_envs`` (max group size). Each call copies the compact
+    batch into pinned host, then non_blocking DMA to device.
+
+    Non-overlap safety (single buffer, no races): every ``_forward`` ends
+    with blocking device-to-host reads (``.cpu().numpy()`` on the default
+    stream). That drains H2D + compute before the next fill of this staging
+    buffer. We never overwrite host staging while the GPU still needs it.
+    Callers use the returned ``o_t`` only until the next ``_forward``
+    (learner then critic same step; critic runs before any opp ``_forward``).
+
+    Distinct from ``PLO5BP_PIN_ROLLOUT`` (multi-GB finalize slabs — default
+    OFF). This path is always on for CUDA; pin cost is O(num_envs * obs_dim)
+    once per sub-rollout, not tens of GB.
+    """
+
+    __slots__ = ("enabled", "device", "cap", "obs_h", "gm_h", "sz_h")
+
+    def __init__(self, capacity: int, obs_dim: int, device: torch.device) -> None:
+        self.device = (
+            device if isinstance(device, torch.device) else torch.device(device)
+        )
+        self.cap = int(capacity)
+        self.enabled = self.device.type == "cuda" and self.cap > 0
+        if not self.enabled:
+            self.obs_h = self.gm_h = self.sz_h = None  # type: ignore[assignment]
+            return
+        self.obs_h = torch.empty(
+            (self.cap, obs_dim), dtype=torch.float32, pin_memory=True
+        )
+        self.gm_h = torch.empty(
+            (self.cap, GATE_ACTIONS), dtype=torch.bool, pin_memory=True
+        )
+        self.sz_h = torch.empty((self.cap, 4), dtype=torch.int64, pin_memory=True)
+
+    def upload(
+        self,
+        b_obs: np.ndarray,
+        b_gm: np.ndarray,
+        b_sizing: np.ndarray,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Host arrays (k, ...) -> device. Values match torch.from_numpy.to."""
+        k = int(b_obs.shape[0])
+        if k == 0:
+            return (
+                torch.empty(
+                    (0, b_obs.shape[1]), dtype=torch.float32, device=self.device
+                ),
+                torch.empty(
+                    (0, GATE_ACTIONS), dtype=torch.bool, device=self.device
+                ),
+                torch.empty((0, 4), dtype=torch.int64, device=self.device),
+            )
+        if (not self.enabled) or k > self.cap:
+            return (
+                torch.from_numpy(np.ascontiguousarray(b_obs)).to(self.device),
+                torch.from_numpy(np.ascontiguousarray(b_gm)).to(self.device),
+                torch.from_numpy(np.ascontiguousarray(b_sizing)).to(self.device),
+            )
+        # Fill pinned host via numpy views (one memcpy each; no per-step pin).
+        obs_np = np.ascontiguousarray(b_obs, dtype=np.float32)
+        gm_np = np.ascontiguousarray(b_gm, dtype=bool)
+        sz_np = np.ascontiguousarray(b_sizing, dtype=np.int64)
+        self.obs_h.numpy()[:k] = obs_np
+        self.gm_h.numpy()[:k] = gm_np
+        self.sz_h.numpy()[:k] = sz_np
+        # DMA to device (default stream). Safe to refill only after the
+        # caller's blocking D2H at the end of _forward.
+        o_t = self.obs_h[:k].to(self.device, non_blocking=True)
+        m_t = self.gm_h[:k].to(self.device, non_blocking=True)
+        b_t = self.sz_h[:k].to(self.device, non_blocking=True)
+        return o_t, m_t, b_t
+
+
 
 
 @dataclass
@@ -969,6 +1048,8 @@ def collect_rollout_batched(
     critic: CentralCritic | None = None,
     out_slabs: "dict[str, np.ndarray] | None" = None,
     snapshot_cache: "dict[int, ActorCritic] | None" = None,
+    env: "BatchedBombPotEnv | None" = None,
+    env_cache: "dict[tuple, BatchedBombPotEnv] | None" = None,
 ) -> Batch:
     """Batched rollout using `BatchedBombPotEnv` + snapshot-bucket
     opponent forwards. Drives all envs through `apply_hybrid_batch`.
@@ -1012,12 +1093,39 @@ def collect_rollout_batched(
             "Q head (q_actions>0)."
         )
 
-    env = BatchedBombPotEnv(
-        n_envs,
-        game_config,
-        ev_runout_samples=train_config.ev_runout_samples,
-        opp_outcome_mc=TRAIN_OPP_OUTCOME_MC,
-    )
+    # Env reuse (P3, 2026-07-12): multiconfig passes `env_cache` keyed by
+    # (n_envs, num_seats, variant). When a sub-rollout shares that key with a
+    # prior sub, reconfigure stacks/ante in place instead of reallocating
+    # ~N Rust GameStates + Python cache arrays. `env=` is a direct override
+    # for tests. Single-config callers leave both None → fresh env (unchanged).
+    if env is not None:
+        if env.n != n_envs:
+            raise ValueError(
+                f"env.n={env.n} != train_config.num_envs={n_envs}"
+            )
+        if not env.can_reconfigure(game_config):
+            raise ValueError(
+                "provided env cannot reconfigure to game_config "
+                f"(seats/variant mismatch)"
+            )
+        env.reconfigure(game_config)
+        # Keep EV / MC knobs aligned with this train_config.
+        env._ev_runout_samples = int(train_config.ev_runout_samples)
+    else:
+        cache_key = (n_envs, game_config.num_seats, game_config.variant)
+        if env_cache is not None and cache_key in env_cache:
+            env = env_cache[cache_key]
+            env.reconfigure(game_config)
+            env._ev_runout_samples = int(train_config.ev_runout_samples)
+        else:
+            env = BatchedBombPotEnv(
+                n_envs,
+                game_config,
+                ev_runout_samples=train_config.ev_runout_samples,
+                opp_outcome_mc=TRAIN_OPP_OUTCOME_MC,
+            )
+            if env_cache is not None:
+                env_cache[cache_key] = env
 
     # P5: reuse the caller's per-update cache when given (multiconfig), else a
     # local one (single-config callers — unchanged behavior).
@@ -1239,6 +1347,9 @@ def collect_rollout_batched(
     aggr_steps_total_by_street: list[int] = [0, 0, 0]
     aggr_bonus_steps_by_street: list[int] = [0, 0, 0]
 
+    # P5 step H2D: long-lived pinned staging (CUDA). See _PinnedStepH2D.
+    _step_h2d = _PinnedStepH2D(n_envs, env.obs_dim, device)
+
     def _forward(model: ActorCritic, group: np.ndarray, obs_arr: np.ndarray,
                  gate_mask_arr: np.ndarray, sizing_arr: np.ndarray,
                  want_marginal: bool) -> tuple[
@@ -1249,9 +1360,9 @@ def collect_rollout_batched(
         b_gm = gate_mask_arr[group]
         b_sizing = sizing_arr[group]
         with record_function("step2/learner_h2d"):
-            o_t = torch.from_numpy(b_obs).to(device)
-            m_t = torch.from_numpy(b_gm).to(device)
-            b_t = torch.from_numpy(b_sizing).to(device)
+            # Pinned staging + non_blocking H2D on CUDA; CPU path is
+            # from_numpy.to. Values bit-identical; see _PinnedStepH2D.
+            o_t, m_t, b_t = _step_h2d.upload(b_obs, b_gm, b_sizing)
         with record_function("step3/learner_forward"):
             with torch.inference_mode():
                 # P10: only the LEARNER's marginal is consumed (VRPO V^pi at the
@@ -1509,8 +1620,19 @@ def collect_rollout_batched(
             )
         # Refresh now to capture post-step total_commit (and everything
         # else) BEFORE reset_terminal_batch wipes terminal envs.
+        # Skip the expensive obs encode for newly-terminal rows: their
+        # post-apply obs is never read (reset + subset-refresh re-deal
+        # them before the next act). Pack still runs full-batch so
+        # total_commit / legal / actors stay correct for payouts and
+        # aggression bookkeeping. Bit-exact for non-terminal rows;
+        # terminal rows get zeros (same as a full encode of actor==-1).
         with record_function("step1a/refresh"):
-            env._refresh()
+            if newly_terminal.any() and not newly_terminal.all():
+                env._refresh(encode_mask=~newly_terminal)
+            elif newly_terminal.all():
+                env._refresh(encode_mask=np.zeros(n_envs, dtype=bool))
+            else:
+                env._refresh()
         post_total_commit = env._total_commit
 
         # Rust-parallel aggression bonus + per-step cost/pot/street
@@ -1751,10 +1873,14 @@ def collect_rollout_batched(
                 env._be.reset_terminal_batch(new_seeds, new_buttons, reset_mask)
                 env._reset_seeds = np.where(reset_mask, new_seeds, env._reset_seeds)
                 # Refresh the per-hand hole cache for the re-dealt envs
-                # (bulk refetch; unchanged envs return identical rows).
-                holes_cache = np.asarray(
-                    env._be.all_hole_cards_batch(), dtype=np.uint8
+                # only (holes are static within a hand; non-reset envs
+                # keep their prior rows). Subset fetch mirrors
+                # observation_and_features_subset_batch.
+                term_idx = term_envs.astype(np.int64)
+                holes_sub = np.asarray(
+                    env._be.all_hole_cards_subset_batch(term_idx), dtype=np.uint8
                 )
+                holes_cache[term_envs] = holes_sub
                 # Second refresh to pick up the post-reset state for the next
                 # iteration. `reset_terminal_batch` mutates ONLY the masked
                 # (terminal) envs, and nothing above mutated non-masked envs'
@@ -1968,6 +2094,11 @@ def collect_rollout_multiconfig(
     # NOT the reverted cross-update opponent cache (that one persisted
     # across updates and grew).
     snapshot_cache: dict[int, ActorCritic] = {}
+    # P3: reuse BatchedBombPotEnv across sub-rollouts that share
+    # (n_envs, num_seats, variant). Stack samples at the same seat count
+    # reconfigure in place; different seat counts get distinct engines.
+    # Dies with this call (same lifetime as snapshot_cache).
+    env_cache: dict[tuple, BatchedBombPotEnv] = {}
 
     if _legacy_staging:
         # Reference path (test-only): finalize each sub to the learner device,
@@ -1977,6 +2108,7 @@ def collect_rollout_multiconfig(
             sub = collect_rollout_batched(
                 learner, pool, cfg, sub_config, rng, critic=critic,
                 snapshot_cache=snapshot_cache,
+                env_cache=env_cache,
             )
             host_batches.append(_batch_to_device(sub, host))
             del sub
@@ -2035,6 +2167,7 @@ def collect_rollout_multiconfig(
                 learner, pool, cfg, sub_config, rng,
                 critic=critic, out_slabs=views,
                 snapshot_cache=snapshot_cache,
+                env_cache=env_cache,
             )
             rows = sub.obs.shape[0]
             # Chain the next sub's base to this sub's actual row count so the

@@ -720,7 +720,7 @@ fn best_pair_mask_from_pairs(
 // starting at rank 0..8 (broadway last). Rank bitmasks are 13-bit u16.
 
 /// 10 straight windows as 13-bit rank masks (wheel first → broadway last).
-const WINDOW_BITS: [u16; 10] = [
+pub const WINDOW_BITS: [u16; 10] = [
     (1 << 12) | (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3), // wheel
     (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4),
     (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5),

@@ -40,7 +40,7 @@ from plo5bp.encoding import OBS_DIM, encode_observation_batch
 # Width the Rust obs encoder (observation_encoded_batch) emits. The Rust
 # encoder is force-disabled whenever OBS_DIM has moved past this (see
 # _use_rust_encoder below) until the new tail blocks are ported to it.
-_RUST_ENCODER_OBS_DIM = 1020
+_RUST_ENCODER_OBS_DIM = 1171
 from plo5bp.encoding_nlh import OBS_DIM_NLH, encode_observation_batch_nlh
 
 
@@ -152,6 +152,54 @@ class BatchedBombPotEnv:
     @property
     def obs_dim(self) -> int:
         return self._obs_dim
+
+    def can_reconfigure(self, config: GameConfig) -> bool:
+        """True iff `reconfigure(config)` can reuse this env's Rust engine
+        (same N, seat count, variant — stacks/ante/bb/sb may differ)."""
+        return (
+            config.num_seats == self.config.num_seats
+            and config.variant == self.config.variant
+            and config.hole_count == self.config.hole_count
+        )
+
+    def reconfigure(self, config: GameConfig) -> None:
+        """Point this env at a new GameConfig without reallocating the
+        BatchedEngine state vector or the Python cache arrays.
+
+        Requires `can_reconfigure(config)`. Updates stacks/ante/bb/sb via
+        the engine's `reconfigure` (clears live hands + outcome MC cache);
+        caller must `reset_batch` before the next step. No-op-cheap when the
+        resolved chip config is already identical.
+        """
+        if not self.can_reconfigure(config):
+            raise ValueError(
+                f"cannot reconfigure: seats/variant/hole mismatch "
+                f"(have seats={self.config.num_seats} variant={self.config.variant}, "
+                f"want seats={config.num_seats} variant={config.variant})"
+            )
+        stacks = np.asarray(config.resolved_stacks, dtype=np.uint64)
+        # Skip the Rust call when chip config is already identical (common
+        # when multiconfig reuses the same sample twice).
+        same = (
+            config.ante == self.config.ante
+            and config.bb == self.config.bb
+            and config.sb == self.config.sb
+            and tuple(int(x) for x in stacks)
+            == tuple(int(x) for x in self.config.resolved_stacks)
+        )
+        self.config = config
+        if not same:
+            self._be.reconfigure(
+                stacks,
+                int(config.ante),
+                int(config.bb),
+                int(config.sb),
+            )
+        # Caches are stale until reset_batch; mark done so a stray step is safe.
+        self._dones.fill(True)
+        self._actors.fill(-1)
+        self._obs.fill(0.0)
+        self._reset_seeds.fill(0)
 
     def reset_batch(
         self, seeds: np.ndarray, buttons: np.ndarray
@@ -284,19 +332,57 @@ class BatchedBombPotEnv:
             actors=self._actors.copy(),
         )
 
-    def _refresh(self) -> None:
-        """Re-encode observations and refresh cached arrays from the engine."""
+    def _refresh(self, encode_mask: np.ndarray | None = None) -> None:
+        """Re-pack engine state and re-encode observations.
+
+        `encode_mask` (optional bool (n,)): when given, ONLY those rows are
+        passed through the obs encoder; other rows get a zeroed obs vector
+        (matches the terminal convention — actor == -1 already forces zeros
+        under a full encode). Engine-derived caches (commit / legal /
+        actors / …) always refresh for every env.
+
+        Used by the batched rollout after `apply_hybrid_batch` to skip the
+        expensive encode for newly-terminal envs that `reset_terminal_batch`
+        is about to re-deal (their post-apply obs is never consumed). Pack
+        still runs full-batch so `total_commit` etc. stay correct for
+        payouts / aggression bookkeeping. Bit-exact with a full encode
+        whenever the skipped rows are terminal (zeros).
+        """
+        # Rust path: finished obs in one FFI when encoding everyone. When
+        # encode_mask skips rows (post-apply newly-terminal), pack full-batch
+        # for commit/legal caches, encode only the kept rows via the subset
+        # encoder, and zero the rest (terminal convention).
         if self._use_rust_encoder:
-            with record_function("step1a_bundle/obs_features_batch"):
-                bundle = self._be.observation_encoded_batch()
-            self._obs = np.asarray(bundle["obs"], dtype=np.float32)
-        else:
+            if encode_mask is None or bool(np.all(encode_mask)):
+                with record_function("step1a_bundle/obs_features_batch"):
+                    bundle = self._be.observation_encoded_batch()
+                self._obs = np.asarray(bundle["obs"], dtype=np.float32)
+                with record_function("step1a_unpack/post"):
+                    self._unpack_post(bundle)
+                return
             with record_function("step1a_bundle/obs_features_batch"):
                 bundle = self._be.observation_and_features_batch()
-            with record_function("step1a_unpack/actor"):
-                cat_a = np.asarray(bundle["hero_cat_a"])
-                cat_b = np.asarray(bundle["hero_cat_b"])
-            with record_function("step1/encoder"):
+            if not bool(np.any(encode_mask)):
+                self._obs = np.zeros((self.n, self._obs_dim), dtype=np.float32)
+            else:
+                idx = np.nonzero(np.asarray(encode_mask, dtype=bool))[0]
+                with record_function("step1/encoder"):
+                    enc = self._be.observation_encoded_subset_batch(
+                        idx.astype(np.int64)
+                    )
+                self._obs = np.zeros((self.n, self._obs_dim), dtype=np.float32)
+                self._obs[idx] = np.asarray(enc["obs"], dtype=np.float32)
+            with record_function("step1a_unpack/post"):
+                self._unpack_post(bundle)
+            return
+
+        with record_function("step1a_bundle/obs_features_batch"):
+            bundle = self._be.observation_and_features_batch()
+        with record_function("step1a_unpack/actor"):
+            cat_a = np.asarray(bundle["hero_cat_a"])
+            cat_b = np.asarray(bundle["hero_cat_b"])
+        with record_function("step1/encoder"):
+            if encode_mask is None or bool(np.all(encode_mask)):
                 if self._is_nlh:
                     self._obs = encode_observation_batch_nlh(
                         bundle, cat_a, self.config
@@ -305,25 +391,55 @@ class BatchedBombPotEnv:
                     self._obs = encode_observation_batch(
                         bundle, cat_a, cat_b, self.config
                     )
+            elif not bool(np.any(encode_mask)):
+                # Every row skipped (e.g. all newly-terminal): zeros only.
+                self._obs = np.zeros((self.n, self._obs_dim), dtype=np.float32)
+            else:
+                # Encode the kept rows only, scatter into a zeroed full batch.
+                # Slice the already-fetched full bundle by row — no second pack.
+                idx = np.nonzero(np.asarray(encode_mask, dtype=bool))[0]
+                sub: dict = {}
+                for k, v in dict(bundle).items():
+                    arr = np.asarray(v)
+                    if arr.ndim >= 1 and arr.shape[0] == self.n:
+                        sub[k] = arr[idx]
+                    else:
+                        sub[k] = arr
+                cat_a_sub = cat_a[idx]
+                cat_b_sub = cat_b[idx]
+                if self._is_nlh:
+                    obs_sub = encode_observation_batch_nlh(
+                        sub, cat_a_sub, self.config
+                    )
+                else:
+                    obs_sub = encode_observation_batch(
+                        sub, cat_a_sub, cat_b_sub, self.config
+                    )
+                self._obs = np.zeros((self.n, self._obs_dim), dtype=np.float32)
+                self._obs[idx] = obs_sub
         with record_function("step1a_unpack/post"):
-            actors = np.asarray(bundle["actor"], dtype=np.int8)
-            dones = actors == -1
-            self._legal = np.asarray(bundle["legal_mask"], dtype=bool)
-            self._min_raise = np.asarray(bundle["min_raise"], dtype=np.uint64)
-            self._max_raise = np.asarray(bundle["max_raise"], dtype=np.uint64)
-            self._gate_mask = gate_mask_from_bounds(
-                self._legal, self._max_raise, self.config.bb
-            )
-            # Terminal envs: zero everything so downstream code can rely on
-            # "dones → no legal action".
-            self._gate_mask[dones] = False
-            self._actors = actors
-            self._dones = dones
-            self._total_commit = np.asarray(bundle["total_commit"], dtype=np.int64)
-            self._bet_to_call = np.asarray(bundle["bet_to_call"], dtype=np.uint64)
-            self._street_commit = np.asarray(bundle["street_commit"], dtype=np.uint64)
-            self._street = np.asarray(bundle["street"], dtype=np.uint8)
-            self._pot = np.asarray(bundle["pot"], dtype=np.uint64)
+            self._unpack_post(bundle)
+
+    def _unpack_post(self, bundle) -> None:
+        """Write engine-derived caches from a full-batch observation bundle."""
+        actors = np.asarray(bundle["actor"], dtype=np.int8)
+        dones = actors == -1
+        self._legal = np.asarray(bundle["legal_mask"], dtype=bool)
+        self._min_raise = np.asarray(bundle["min_raise"], dtype=np.uint64)
+        self._max_raise = np.asarray(bundle["max_raise"], dtype=np.uint64)
+        self._gate_mask = gate_mask_from_bounds(
+            self._legal, self._max_raise, self.config.bb
+        )
+        # Terminal envs: zero everything so downstream code can rely on
+        # "dones → no legal action".
+        self._gate_mask[dones] = False
+        self._actors = actors
+        self._dones = dones
+        self._total_commit = np.asarray(bundle["total_commit"], dtype=np.int64)
+        self._bet_to_call = np.asarray(bundle["bet_to_call"], dtype=np.uint64)
+        self._street_commit = np.asarray(bundle["street_commit"], dtype=np.uint64)
+        self._street = np.asarray(bundle["street"], dtype=np.uint8)
+        self._pot = np.asarray(bundle["pot"], dtype=np.uint64)
 
     def _refresh_subset(self, mask: np.ndarray) -> None:
         """Partial `_refresh`: re-pack + re-encode ONLY the envs selected by

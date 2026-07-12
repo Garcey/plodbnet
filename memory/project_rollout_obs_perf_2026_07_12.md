@@ -80,6 +80,45 @@ After R2 (same flop / N=128 bench):
 Build note: maturin can't replace `_engine.pyd` while UI holds it — stop
 :8765 first (`maturin develop --release` from repo root).
 
+## Implemented follow-ups (2026-07-12, after R2)
+
+### #1 Skip encode for newly-terminal on post-apply refresh
+- `BatchedBombPotEnv._refresh(encode_mask=...)`: pack always full-batch;
+  encode only masked rows (scatter into zeroed obs). Terminal convention =
+  zeros.
+- `collect_rollout_batched` passes `encode_mask=~newly_terminal` after apply.
+- Tests: `tests/python/test_refresh_encode_mask.py`.
+
+### #2 Subset hole-cache refresh
+- Rust `all_hole_cards_subset_batch(indices)` → compact `(k,S,hole_w)`.
+- Rollout after `reset_terminal_batch`: `holes_cache[term_envs] = subset`.
+- Parity covered in `test_all_hole_cards_subset_matches_full`.
+
+### #3 Reuse BatchedBombPotEnv across multiconfig sub-rollouts
+- Rust `BatchedEngine.reconfigure(stacks, ante, bb, sb)`: same N/seats/variant;
+  clears live hands + outcome cache (no state-vector realloc).
+- `BatchedBombPotEnv.can_reconfigure` / `reconfigure`.
+- `collect_rollout_batched(env_cache=...)` keys `(n_envs, num_seats, variant)`.
+- `collect_rollout_multiconfig` owns one `env_cache` per update.
+- Tests: `tests/python/test_env_reconfigure.py`.
+
+### #4 Full Rust obs encoder at OBS_DIM 1171
+- `obs_layout::OBS_DIM` 1020 → **1171** + v7 offset constants.
+- `include!("obs_v7_inc.rs")`: bit-exact STK/BRD/DUAL tail using
+  `hero_board_v3` + `board_draw_v3` engine blocks + pure stack/board math.
+- `_RUST_ENCODER_OBS_DIM = 1171`; `PLO5_RUST_ENCODER=1` re-enables.
+- `test_encoding_rust.py` `_RUST_ENCODER_CURRENT = True` (3-way parity live).
+
+### #5 Pinned per-step H2D (`_PinnedStepH2D`)
+- Long-lived pin once per sub-rollout: capacity `num_envs`, dims
+  (obs, gate_mask, sizing). **Not** the multi-GB finalize slab.
+- Fill via `tensor.numpy()[:k] = contiguous`; `non_blocking` H2D.
+- Safety: single buffer; `_forward` always ends with blocking
+  `.cpu().numpy()` so H2D+compute drain before next fill. No double-
+  buffer races; values bit-identical to `from_numpy.to`.
+- Always on for CUDA (CPU falls back to from_numpy). Tests:
+  `tests/python/test_pinned_step_h2d.py`.
+
 ## Remaining training-loop recommendations (not yet implemented)
 
 Rollout still ~95% of update wall-clock; PPO ~3–5% (already compile'd on CUDA).
