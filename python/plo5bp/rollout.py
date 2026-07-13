@@ -21,6 +21,7 @@ opponent seats do not store anything.
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass, replace
 from typing import Iterable
 
@@ -55,50 +56,167 @@ from plo5bp.sizing import sizing_from_info
 POOL_SLACK_PER_ENV = 32
 
 
+
+class _TimedRF:
+    """record_function + optional wall timer (when PLO5BP_STEP_TIMERS=1)."""
+
+    __slots__ = ("_name", "_rf", "_t0", "_enabled")
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._rf = record_function(name)
+        self._enabled = os.environ.get("PLO5BP_STEP_TIMERS", "").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+        self._t0 = 0.0
+
+    def __enter__(self):
+        self._rf.__enter__()
+        if self._enabled:
+            self._t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, *exc):
+        global _ACTIVE_STEP_TIMERS
+        if self._enabled and _ACTIVE_STEP_TIMERS is not None:
+            dt = time.perf_counter() - self._t0
+            t = _ACTIVE_STEP_TIMERS
+            t.totals[self._name] = t.totals.get(self._name, 0.0) + dt
+            t.counts[self._name] = t.counts.get(self._name, 0) + 1
+        return self._rf.__exit__(*exc)
+
+
+_ACTIVE_STEP_TIMERS: _StepTimers | None = None
+
+
+class _StepTimers:
+    """Cheap wall-clock accumulators for rollout sub-steps.
+
+    Enabled when env ``PLO5BP_STEP_TIMERS=1`` (or truthy). Uses perf_counter
+    around named regions; zero overhead when disabled. Safe under the
+    single-threaded rollout loop (no locks).
+    """
+
+    __slots__ = ("enabled", "totals", "counts", "_stack")
+
+    def __init__(self) -> None:
+        self.enabled = os.environ.get("PLO5BP_STEP_TIMERS", "").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+        self.totals: dict[str, float] = {}
+        self.counts: dict[str, int] = {}
+        self._stack: list[tuple[str, float]] = []
+
+    def begin(self, name: str) -> None:
+        if self.enabled:
+            self._stack.append((name, time.perf_counter()))
+
+    def end(self) -> None:
+        if not self.enabled or not self._stack:
+            return
+        name, t0 = self._stack.pop()
+        dt = time.perf_counter() - t0
+        self.totals[name] = self.totals.get(name, 0.0) + dt
+        self.counts[name] = self.counts.get(name, 0) + 1
+
+    def report(self, label: str = "rollout") -> None:
+        if not self.enabled or not self.totals:
+            return
+        grand = sum(self.totals.values())
+        print(f"\n===== step timers ({label}) total_accounted={grand:.1f}s =====")
+        rows = sorted(self.totals.items(), key=lambda kv: -kv[1])
+        print(f"  {'name':36s}  {'sec':>10s}  {'%':>6s}  {'n':>8s}  {'ms/call':>8s}")
+        for name, sec in rows:
+            n = self.counts.get(name, 0)
+            pct = 100.0 * sec / grand if grand > 0 else 0.0
+            mspc = 1000.0 * sec / n if n else 0.0
+            print(f"  {name:36s}  {sec:10.1f}  {pct:5.1f}%  {n:8d}  {mspc:8.2f}")
+        print(f"[step-timers] accounted={grand:.1f}s across {sum(self.counts.values())} calls")
+
+
+
+
 class _PinnedStepH2D:
     """Long-lived pinned host staging for per-step act() H2D (CUDA only).
 
-    Capacity is ``num_envs`` (max group size). Each call copies the compact
-    batch into pinned host, then non_blocking DMA to device.
+    Capacity is ``num_envs`` (max group size) per slot. Default ``n_slots=2``
+    double-buffers so consecutive opp groups can H2D into alternate slots
+    without waiting for the previous group's H2D (attack #1 double-pin).
 
-    Non-overlap safety (single buffer, no races): every ``_forward`` ends
-    with blocking device-to-host reads (``.cpu().numpy()`` on the default
-    stream). That drains H2D + compute before the next fill of this staging
-    buffer. We never overwrite host staging while the GPU still needs it.
-    Callers use the returned ``o_t`` only until the next ``_forward``
-    (learner then critic same step; critic runs before any opp ``_forward``).
+    Safety rules:
+    - **Learner path** uses slot 0 and ends with blocking D2H — that drains
+      the default stream before the next learner upload, so slot 0 is free.
+    - **Opp multi-group path** alternates slots 0/1. Before refilling a slot
+      the host calls ``wait_slot(s)`` which ``event.synchronize()``s only that
+      slot's prior H2D (not a full device sync). With 2 slots, group *i* only
+      waits on group *i-2*'s H2D — usually already done while *i-1* ran.
+    - Never overwrite a slot until its H2D event has completed on the host.
 
     Distinct from ``PLO5BP_PIN_ROLLOUT`` (multi-GB finalize slabs — default
-    OFF). This path is always on for CUDA; pin cost is O(num_envs * obs_dim)
-    once per sub-rollout, not tens of GB.
+    OFF). Pin cost is O(n_slots * num_envs * obs_dim) once per sub-rollout.
     """
 
-    __slots__ = ("enabled", "device", "cap", "obs_h", "gm_h", "sz_h")
+    __slots__ = (
+        "enabled", "device", "cap", "n_slots",
+        "obs_h", "gm_h", "sz_h", "_h2d_events",
+    )
 
-    def __init__(self, capacity: int, obs_dim: int, device: torch.device) -> None:
+    def __init__(
+        self,
+        capacity: int,
+        obs_dim: int,
+        device: torch.device,
+        n_slots: int = 2,
+    ) -> None:
         self.device = (
             device if isinstance(device, torch.device) else torch.device(device)
         )
         self.cap = int(capacity)
+        self.n_slots = max(1, int(n_slots))
         self.enabled = self.device.type == "cuda" and self.cap > 0
+        self._h2d_events: list = [None] * self.n_slots
         if not self.enabled:
             self.obs_h = self.gm_h = self.sz_h = None  # type: ignore[assignment]
             return
+        # Shape (n_slots, cap, ...) — one pin bank per slot.
         self.obs_h = torch.empty(
-            (self.cap, obs_dim), dtype=torch.float32, pin_memory=True
+            (self.n_slots, self.cap, obs_dim),
+            dtype=torch.float32,
+            pin_memory=True,
         )
         self.gm_h = torch.empty(
-            (self.cap, GATE_ACTIONS), dtype=torch.bool, pin_memory=True
+            (self.n_slots, self.cap, GATE_ACTIONS),
+            dtype=torch.bool,
+            pin_memory=True,
         )
-        self.sz_h = torch.empty((self.cap, 4), dtype=torch.int64, pin_memory=True)
+        self.sz_h = torch.empty(
+            (self.n_slots, self.cap, 4),
+            dtype=torch.int64,
+            pin_memory=True,
+        )
+
+    def wait_slot(self, slot: int = 0) -> None:
+        """Block host until this slot's last H2D has finished (safe to refill)."""
+        if not self.enabled:
+            return
+        s = int(slot) % self.n_slots
+        ev = self._h2d_events[s]
+        if ev is not None:
+            ev.synchronize()
 
     def upload(
         self,
         b_obs: np.ndarray,
         b_gm: np.ndarray,
         b_sizing: np.ndarray,
+        slot: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Host arrays (k, ...) -> device. Values match torch.from_numpy.to."""
+        """Host arrays (k, ...) -> device via pinned slot. Values match from_numpy.to.
+
+        Caller must ``wait_slot(slot)`` before refill if that slot may still
+        have an in-flight H2D (opp multi-group path). Learner path relies on
+        post-act blocking D2H instead.
+        """
         k = int(b_obs.shape[0])
         if k == 0:
             return (
@@ -116,18 +234,19 @@ class _PinnedStepH2D:
                 torch.from_numpy(np.ascontiguousarray(b_gm)).to(self.device),
                 torch.from_numpy(np.ascontiguousarray(b_sizing)).to(self.device),
             )
-        # Fill pinned host via numpy views (one memcpy each; no per-step pin).
+        s = int(slot) % self.n_slots
         obs_np = np.ascontiguousarray(b_obs, dtype=np.float32)
         gm_np = np.ascontiguousarray(b_gm, dtype=bool)
         sz_np = np.ascontiguousarray(b_sizing, dtype=np.int64)
-        self.obs_h.numpy()[:k] = obs_np
-        self.gm_h.numpy()[:k] = gm_np
-        self.sz_h.numpy()[:k] = sz_np
-        # DMA to device (default stream). Safe to refill only after the
-        # caller's blocking D2H at the end of _forward.
-        o_t = self.obs_h[:k].to(self.device, non_blocking=True)
-        m_t = self.gm_h[:k].to(self.device, non_blocking=True)
-        b_t = self.sz_h[:k].to(self.device, non_blocking=True)
+        self.obs_h[s].numpy()[:k] = obs_np
+        self.gm_h[s].numpy()[:k] = gm_np
+        self.sz_h[s].numpy()[:k] = sz_np
+        o_t = self.obs_h[s, :k].to(self.device, non_blocking=True)
+        m_t = self.gm_h[s, :k].to(self.device, non_blocking=True)
+        b_t = self.sz_h[s, :k].to(self.device, non_blocking=True)
+        if self._h2d_events[s] is None:
+            self._h2d_events[s] = torch.cuda.Event()
+        self._h2d_events[s].record()
         return o_t, m_t, b_t
 
 
@@ -625,7 +744,7 @@ def _finalize_batch_arr(
     # When the source slabs are pinned (CUDA path) `non_blocking=True`
     # lets the H2D copies queue against the default stream and overlap
     # downstream compute; on CPU device the flag is a no-op.
-    with record_function("step11/finalize_h2d"):
+    with _TimedRF("step11/finalize_h2d"):
         obs_t = torch.from_numpy(all_obs_arr[:wcursor]).to(device, non_blocking=True)
         gm_t = torch.from_numpy(all_gm_arr[:wcursor]).to(device, non_blocking=True)
         ga_t = torch.from_numpy(all_ga_arr[:wcursor]).to(device, non_blocking=True)
@@ -1074,6 +1193,12 @@ def collect_rollout_batched(
     for bit-exactness with the legacy path). Default None = the original
     self-allocating, finalize-to-device path, byte-identical to before."""
     n_envs = train_config.num_envs
+    global _ACTIVE_STEP_TIMERS
+    if _ACTIVE_STEP_TIMERS is not None:
+        step_timers = _ACTIVE_STEP_TIMERS
+    else:
+        step_timers = _StepTimers()
+        _ACTIVE_STEP_TIMERS = step_timers
     n_seats = game_config.num_seats
     reward_norm = 1.0 / float(game_config.bb)
     gamma = train_config.gamma
@@ -1176,6 +1301,13 @@ def collect_rollout_batched(
         row[opp_seats_arr] = False
         learner_seats_mask[env_idx] = row
 
+    # Eager-build every pool member once up front (cheap if snapshot_cache
+    # already warm from multiconfig). Avoids first-use build mid-hand when a
+    # late terminal re-mix draws a not-yet-seen index. Models stay on `device`
+    # for the whole sub-rollout / update (P5); no cross-update cache.
+    for _sd in range(len(pool.snapshots)):
+        _get_snapshot_model(_sd)
+
     for i in range(n_envs):
         _assign_pool_mix(i)
 
@@ -1189,6 +1321,29 @@ def collect_rollout_batched(
     # Per-hand hole cache (holes are static within a hand): one bulk
     # fetch per reset wave feeds the critic input + stored opp blocks.
     holes_cache = np.asarray(env._be.all_hole_cards_batch(), dtype=np.uint8)
+    # Attack #4 S2: hero-rotated opp-hole blocks per (env, seat), filled on
+    # deal/reset. Flush indexes this instead of rebuilding every terminal wave.
+    _hole_w = int(game_config.hole_count)
+    holes_rot_cache = np.full(
+        (n_envs, n_seats, 5, _hole_w), 255, dtype=np.uint8
+    )
+
+    def _fill_holes_rot(env_ids: np.ndarray) -> None:
+        if env_ids.size == 0:
+            return
+        hc = holes_cache[env_ids]
+        seat_ids = np.arange(n_seats, dtype=np.int64)
+        j5 = np.arange(5, dtype=np.int64)
+        rot_seats = (seat_ids[:, None] + 1 + j5[None, :]) % n_seats
+        block = hc[:, rot_seats]
+        invalid = (j5 + 1) >= n_seats
+        if invalid.any():
+            block = np.where(
+                invalid[None, None, :, None], np.uint8(255), block
+            )
+        holes_rot_cache[env_ids] = block
+
+    _fill_holes_rot(np.arange(n_envs, dtype=np.int64))
 
     # Array-backed per-(env, seat) trajectory storage. Every per-step
     # append is a vectorized fancy-index write. `MAX_STEPS_PER_SEAT`
@@ -1350,64 +1505,294 @@ def collect_rollout_batched(
     # P5 step H2D: long-lived pinned staging (CUDA). See _PinnedStepH2D.
     _step_h2d = _PinnedStepH2D(n_envs, env.obs_dim, device)
 
-    def _forward(model: ActorCritic, group: np.ndarray, obs_arr: np.ndarray,
-                 gate_mask_arr: np.ndarray, sizing_arr: np.ndarray,
-                 want_marginal: bool) -> tuple[
-        np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
-        np.ndarray, np.ndarray, np.ndarray | None, torch.Tensor,
-    ]:
+    def _act_to_host(_fw_out, o_t: torch.Tensor | None = None) -> tuple:
+        """Coalesce device ActOut -> host numpy (one CUDA sync for the stacks).
+
+        Bit-identical layout to the pre-#1 per-forward D2H. When ``o_t`` is
+        provided it is returned as the last element (learner/critic reuse).
+        """
+        ints = torch.stack(
+            (_fw_out.gate, _fw_out.chips, _fw_out.anchor), dim=0
+        ).cpu().numpy()
+        floats = torch.stack(
+            (_fw_out.log_prob, _fw_out.refine_u, _fw_out.value,
+             _fw_out.gate_log_prob, _fw_out.anchor_log_prob), dim=0
+        ).cpu().numpy()
+        marg_np = (
+            _fw_out.action_marginal.float().cpu().numpy()
+            if _fw_out.action_marginal is not None
+            else None
+        )
+        base = (
+            ints[0].astype(np.uint8),
+            ints[1].astype(np.int64),
+            ints[2].astype(np.int64),
+            floats[0],
+            floats[1],
+            floats[2],
+            floats[3],
+            floats[4],
+            marg_np,
+        )
+        if o_t is not None:
+            return base + (o_t,)
+        return base
+
+    def _learner_act_device(
+        group: np.ndarray,
+        obs_arr: np.ndarray,
+        gate_mask_arr: np.ndarray,
+        sizing_arr: np.ndarray,
+        want_marginal: bool,
+    ):
+        """Learner H2D + act; leave ActOut + o_t on device (no D2H).
+
+        Attack #2 Phase 1: defer host pull until after opp acts are queued so
+        the step has one coalesced learner D2H instead of sync-per-stage.
+        act() order unchanged (still before any opp act).
+        """
         b_obs = obs_arr[group]
         b_gm = gate_mask_arr[group]
         b_sizing = sizing_arr[group]
-        with record_function("step2/learner_h2d"):
-            # Pinned staging + non_blocking H2D on CUDA; CPU path is
-            # from_numpy.to. Values bit-identical; see _PinnedStepH2D.
-            o_t, m_t, b_t = _step_h2d.upload(b_obs, b_gm, b_sizing)
-        with record_function("step3/learner_forward"):
+        with _TimedRF("step2/learner_h2d"):
+            _step_h2d.wait_slot(0)
+            o_t, m_t, b_t = _step_h2d.upload(b_obs, b_gm, b_sizing, slot=0)
+        with _TimedRF("step3/learner_forward"):
             with torch.inference_mode():
-                # P10: only the LEARNER's marginal is consumed (VRPO V^pi at the
-                # call site); opponent-group forwards discard it. Gate the
-                # compute + its extra D2H sync on want_marginal rather than the
-                # collector-wide use_vrpo. Bit-exact: the marginal is a pure
-                # post-sampling readout — no extra network pass, no RNG draw
-                # (network.act docstring), so the sampled action is unchanged.
                 if want_marginal:
-                    _fw_out = model.act(o_t, m_t, b_t, return_marginal=True)
+                    _fw_out = learner.act(o_t, m_t, b_t, return_marginal=True)
                 else:
-                    _fw_out = model.act(o_t, m_t, b_t)
-        with record_function("step5/action_d2h"):
-            # Coalesce device->host copies (each forces a full CUDA sync)
-            # into two by stacking same-dtype outputs: one int64 transfer
-            # for (gate, chips, anchor) and one float32 transfer for
-            # (log_prob, refine_u, value, gate_log_prob, anchor_log_prob).
-            # Bit-identical to per-tensor copies — only the sync count changes.
-            ints = torch.stack(
-                (_fw_out.gate, _fw_out.chips, _fw_out.anchor), dim=0
-            ).cpu().numpy()
-            floats = torch.stack(
-                (_fw_out.log_prob, _fw_out.refine_u, _fw_out.value,
-                 _fw_out.gate_log_prob, _fw_out.anchor_log_prob), dim=0
-            ).cpu().numpy()
-            marg_np = (
-                _fw_out.action_marginal.float().cpu().numpy()
-                if _fw_out.action_marginal is not None
-                else None
+                    _fw_out = learner.act(o_t, m_t, b_t)
+        return _fw_out, o_t
+
+    # Double-pin opp path: alternate slots 0/1 so group i+1 H2D does not
+    # wait for group i's H2D (only waits when reusing a slot = group i-2).
+    _opp_pin_slot: list = [0]
+
+    def _opp_upload_act(
+        model: ActorCritic,
+        group: np.ndarray,
+        obs_arr: np.ndarray,
+        gate_mask_arr: np.ndarray,
+        sizing_arr: np.ndarray,
+    ):
+        """H2D + act for one opp group; leave results on device (no D2H).
+
+        Uses alternating ``_step_h2d`` pin slots. act() order is still
+        unique(sd) ascending (same CUDA RNG as pre-#1).
+        """
+        b_obs = obs_arr[group]
+        b_gm = gate_mask_arr[group]
+        b_sizing = sizing_arr[group]
+        slot = _opp_pin_slot[0]
+        _step_h2d.wait_slot(slot)
+        o_t, m_t, b_t = _step_h2d.upload(b_obs, b_gm, b_sizing, slot=slot)
+        _opp_pin_slot[0] = 1 - slot if _step_h2d.n_slots > 1 else 0
+        with torch.inference_mode():
+            return model.act(o_t, m_t, b_t)
+
+    # Attack #2 Phase 2: cross-iteration act prefetch under terminal host work.
+    # Default OFF — enable with PLO5BP_ROLLOUT_OVERLAP=1 after parity confidence.
+    _rollout_overlap = (
+        device.type == "cuda"
+        and os.environ.get("PLO5BP_ROLLOUT_OVERLAP", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
+    _act_prefetch: dict | None = None
+
+    def _queue_acts_for_mask(active_mask: np.ndarray) -> dict:
+        """Run learner+opp+critic acts for envs where active_mask is True.
+
+        Returns a dict of device-side outputs + host index arrays. Does NOT
+        D2H. Caller is responsible for coalesced host pull.
+        Empty active_mask → empty dict with zero-size indices.
+        """
+        active_mask = np.asarray(active_mask, dtype=bool)
+        if not active_mask.any():
+            return {
+                "learner_idx": np.zeros(0, dtype=np.int64),
+                "learner_fw": None,
+                "learner_o_t": None,
+                "critic_v_t": None,
+                "critic_q_t": None,
+                "opp_groups": [],
+                "safe_actors": np.where(
+                    env._actors >= 0, env._actors, 0
+                ).astype(np.intp),
+                "sizing_step": np.zeros((n_envs, 4), dtype=np.int64),
+                "obs": env._obs.copy(),
+                "gate_masks": env._gate_mask.copy(),
+                "live_mask": np.zeros(n_envs, dtype=bool),
+            }
+        actors_q = env._actors
+        dones_q = env._dones
+        safe_q = np.where(actors_q >= 0, actors_q, 0).astype(np.intp)
+        # Restrict to mask ∩ ~dones ∩ actor>=0
+        live = active_mask & (~dones_q) & (actors_q >= 0)
+        is_learn = live & learner_seats_mask[env_idx_range, safe_q]
+        is_opp = live & ~is_learn
+        l_idx = np.nonzero(is_learn)[0]
+        l_fw = None
+        l_o = None
+        c_v = None
+        c_q = None
+        # sizing for ALL envs (same formula as main loop) — only live rows used
+        pre_btc = env._bet_to_call
+        pre_sc = env._street_commit
+        to_call_q = np.maximum(
+            pre_btc.astype(np.int64) - pre_sc[env_idx_range, safe_q].astype(np.int64),
+            0,
+        )
+        sizing_q = np.stack(
+            [
+                env._min_raise.astype(np.int64),
+                env._max_raise.astype(np.int64),
+                env._pot.astype(np.int64),
+                to_call_q,
+            ],
+            axis=-1,
+        )
+        if l_idx.size:
+            l_fw, l_o = _learner_act_device(
+                l_idx, env._obs, env._gate_mask, sizing_q,
+                want_marginal=use_vrpo,
             )
-            return (
-                ints[0].astype(np.uint8),
-                ints[1].astype(np.int64),
-                ints[2].astype(np.int64),
-                floats[0],
-                floats[1],
-                floats[2],
-                floats[3],
-                floats[4],
-                marg_np,
-                # P9: the already-uploaded obs tensor — the critic forward for
-                # the learner group reuses it instead of re-fancy-indexing and
-                # re-uploading the identical rows (~45GB/update duplicated).
-                o_t,
-            )
+            if critic is not None:
+                opp_blk = _rotate_opp_holes_batch(
+                    holes_cache, l_idx, safe_q[l_idx]
+                )
+                h_t = torch.from_numpy(opp_blk).to(
+                    device, non_blocking=(device.type == "cuda")
+                )
+                with torch.inference_mode():
+                    if use_vrpo:
+                        c_v, c_q = critic.q_values(
+                            l_o, opp_holes_multihot(h_t)
+                        )
+                    else:
+                        c_v = critic(l_o, opp_holes_multihot(h_t))
+        o_groups: list[tuple[np.ndarray, object]] = []
+        if is_opp.any():
+            snap_col = np.where(is_opp, env_snapshot_idx_arr, -1)
+            for sd_idx in np.unique(snap_col[snap_col >= 0]):
+                group = np.nonzero(snap_col == sd_idx)[0]
+                m = _get_snapshot_model(int(sd_idx))
+                o_groups.append(
+                    (
+                        group,
+                        _opp_upload_act(
+                            m, group, env._obs, env._gate_mask, sizing_q
+                        ),
+                    )
+                )
+        return {
+            "learner_idx": l_idx,
+            "learner_fw": l_fw,
+            "learner_o_t": l_o,
+            "critic_v_t": c_v,
+            "critic_q_t": c_q,
+            "opp_groups": o_groups,
+            "safe_actors": safe_q,
+            "sizing_step": sizing_q,
+            "obs": env._obs.copy(),
+            "gate_masks": env._gate_mask.copy(),
+            "live_mask": live,
+        }
+
+    def _d2h_queued_acts(q: dict) -> dict:
+        """Coalesce D2H for a _queue_acts_for_mask result → host arrays."""
+        n = n_envs
+        gates = np.zeros(n, dtype=np.uint8)
+        chips = np.zeros(n, dtype=np.uint64)
+        anchors = np.full(n, -1, dtype=np.int64)
+        refine_u = np.zeros(n, dtype=np.float32)
+        log_probs = np.zeros(n, dtype=np.float32)
+        gate_logp = np.zeros(n, dtype=np.float32)
+        anchor_logp = np.zeros(n, dtype=np.float32)
+        values = np.zeros(n, dtype=np.float32)
+        q_taken = np.zeros(n, dtype=np.float32) if use_vrpo else None
+        vpi = np.zeros(n, dtype=np.float32) if use_vrpo else None
+        l_idx = q["learner_idx"]
+        with _TimedRF("step5/action_d2h"):
+            if q["learner_fw"] is not None and l_idx.size:
+                g_np, c_np, an_np, lp_np, ru_np, v_np, glp_np, alp_np, marg_np = (
+                    _act_to_host(q["learner_fw"])  # type: ignore[misc]
+                )
+                gates[l_idx] = g_np
+                chips[l_idx] = np.maximum(c_np, 0).astype(np.uint64)
+                anchors[l_idx] = an_np
+                refine_u[l_idx] = ru_np
+                log_probs[l_idx] = lp_np
+                gate_logp[l_idx] = glp_np
+                anchor_logp[l_idx] = alp_np
+                c_v = q["critic_v_t"]
+                c_q = q["critic_q_t"]
+                if c_v is not None:
+                    if use_vrpo and c_q is not None:
+                        vq = torch.cat(
+                            [c_v.float().unsqueeze(-1), c_q.float()], dim=-1
+                        ).cpu().numpy()
+                        v_l = vq[..., 0]
+                        q_l = vq[..., 1:]
+                        values[l_idx] = v_l
+                        if q_l.shape[-1] == 3:
+                            q_idx_l = g_np.astype(np.int64)
+                            marg_l = np.stack(
+                                [
+                                    marg_np[:, 0],
+                                    marg_np[:, 1],
+                                    marg_np[:, 2:].sum(-1),
+                                ],
+                                axis=-1,
+                            )
+                        else:
+                            q_idx_l = np.where(
+                                g_np == GATE_RAISE,
+                                2 + an_np,
+                                g_np.astype(np.int64),
+                            )
+                            marg_l = marg_np
+                        rows_l = np.arange(l_idx.size)
+                        q_taken[l_idx] = q_l[rows_l, q_idx_l]
+                        vpi[l_idx] = (marg_l * q_l).sum(-1)
+                    else:
+                        values[l_idx] = c_v.float().cpu().numpy()
+                else:
+                    values[l_idx] = v_np
+            o_groups = q["opp_groups"]
+            if o_groups:
+                g_parts = [out.gate for _, out in o_groups]
+                c_parts = [out.chips for _, out in o_groups]
+                g_cat = torch.cat(g_parts, dim=0)
+                c_cat = torch.cat(c_parts, dim=0)
+                gc = torch.stack(
+                    (g_cat.to(torch.int64), c_cat.to(torch.int64)), dim=0
+                ).cpu().numpy()
+                g_all = gc[0].astype(np.uint8)
+                c_all = np.maximum(gc[1], 0).astype(np.uint64)
+                cursor = 0
+                for group, _ in o_groups:
+                    n_g = int(group.size)
+                    gates[group] = g_all[cursor : cursor + n_g]
+                    chips[group] = c_all[cursor : cursor + n_g]
+                    cursor += n_g
+        return {
+            "gates_per_env": gates,
+            "chips_per_env": chips,
+            "anchors_per_env": anchors,
+            "refine_u_per_env": refine_u,
+            "log_probs_per_env": log_probs,
+            "gate_logp_per_env": gate_logp,
+            "anchor_logp_per_env": anchor_logp,
+            "values_per_env": values,
+            "q_taken_per_env": q_taken,
+            "vpi_per_env": vpi,
+            "learner_idx_np": l_idx,
+            "safe_actors": q["safe_actors"],
+            "sizing_step": q["sizing_step"],
+            "obs": q["obs"],
+            "gate_masks": q["gate_masks"],
+        }
 
     env_idx_range = np.arange(n_envs)
 
@@ -1463,79 +1848,149 @@ def collect_rollout_batched(
             axis=-1,
         )
 
-        if learner_idx_np.size:
-            g_np, c_np, an_np, lp_np, ru_np, v_np, glp_np, alp_np, marg_np, o_t_l = (
-                _forward(
-                    learner, learner_idx_np, obs, gate_masks, sizing_step,
+        # Attack #2 Phase 2: consume prefetched acts from prior iteration
+        # (queued under terminal host work). Skip device act this iter.
+        _used_prefetch = False
+        if _act_prefetch is not None:
+            with _TimedRF("step2x/consume_prefetch"):
+                pf = _act_prefetch
+                _act_prefetch = None
+                gates_per_env = pf["gates_per_env"]
+                chips_per_env = pf["chips_per_env"]
+                anchors_per_env = pf["anchors_per_env"]
+                refine_u_per_env = pf["refine_u_per_env"]
+                log_probs_per_env = pf["log_probs_per_env"]
+                gate_logp_per_env = pf["gate_logp_per_env"]
+                anchor_logp_per_env = pf["anchor_logp_per_env"]
+                values_per_env = pf["values_per_env"]
+                if use_vrpo:
+                    q_taken_per_env = pf["q_taken_per_env"]
+                    vpi_per_env = pf["vpi_per_env"]
+                learner_idx_np = pf["learner_idx_np"]
+                safe_actors = pf["safe_actors"]
+                sizing_step = pf["sizing_step"]
+                # Obs/masks at act time (may differ from current env if we
+                # only prefetched a subset — full-mask prefetch matches).
+                obs = pf["obs"]
+                gate_masks = pf["gate_masks"]
+                _used_prefetch = True
+
+        # Attack #2 Phase 1: learner act on device, then opp acts on device,
+        # then ONE coalesced D2H for learner (+ critic) and opp gates/chips.
+        # act() call order unchanged: full learner batch, then opp groups in
+        # unique(sd) order — bit-exact vs pre-#2 trajectories.
+        if not _used_prefetch:
+            _learner_fw = None
+            _learner_o_t = None
+            _critic_v_t = None
+            _critic_q_t = None
+            _opp_block_np = None
+            if learner_idx_np.size:
+                _learner_fw, _learner_o_t = _learner_act_device(
+                    learner_idx_np, obs, gate_masks, sizing_step,
                     want_marginal=use_vrpo,
                 )
-            )
-            gates_per_env[learner_idx_np] = g_np
-            chips_per_env[learner_idx_np] = np.maximum(c_np, 0).astype(np.uint64)
-            anchors_per_env[learner_idx_np] = an_np
-            refine_u_per_env[learner_idx_np] = ru_np
-            log_probs_per_env[learner_idx_np] = lp_np
-            gate_logp_per_env[learner_idx_np] = glp_np
-            anchor_logp_per_env[learner_idx_np] = alp_np
-            if critic is not None:
-                with record_function("step3b/critic_forward"):
-                    opp_block = _rotate_opp_holes_batch(
+                # Host prep that does not need D2H: opp-hole rotation for critic
+                # can run while learner kernels finish (and before/during opp acts).
+                if critic is not None:
+                    _opp_block_np = _rotate_opp_holes_batch(
                         holes_cache, learner_idx_np, safe_actors[learner_idx_np]
                     )
-                    if use_vrpo:
-                        # P9: o_t_l IS from_numpy(obs[learner_idx_np]).to(device)
-                        # — identical bytes, uploaded once by _forward.
-                        v_l, q_l = _critic_q_values(
-                            critic, device, o_t_l, opp_block
+                    with _TimedRF("step3b/critic_forward"):
+                        h_t = torch.from_numpy(_opp_block_np).to(
+                            device, non_blocking=(device.type == "cuda")
                         )
-                        values_per_env[learner_idx_np] = v_l
-                        if q_l.shape[-1] == 3:
-                            # Pooled raise column (q_pooled): the gate IS the
-                            # q index (GATE_RAISE == 2), and the 13-way act()
-                            # marginal collapses to gate probs exactly —
-                            # Σ_k p_raise·π(k) = p_raise.
-                            q_idx_l = g_np.astype(np.int64)
-                            marg_l = np.stack(
-                                [
-                                    marg_np[:, 0],
-                                    marg_np[:, 1],
-                                    marg_np[:, 2:].sum(-1),
-                                ],
-                                axis=-1,
-                            )
-                        else:
-                            # q index: Fold/CheckCall use the gate directly,
-                            # Raise uses 2+anchor (matches ppo.py q_idx and
-                            # the marginal layout).
-                            q_idx_l = np.where(
-                                g_np == GATE_RAISE, 2 + an_np, g_np.astype(np.int64)
-                            )
-                            marg_l = marg_np
-                        rows_l = np.arange(learner_idx_np.size)
-                        q_taken_per_env[learner_idx_np] = q_l[rows_l, q_idx_l]
-                        vpi_per_env[learner_idx_np] = (marg_l * q_l).sum(-1)
-                    else:
-                        # P9: same obs-tensor reuse as the VRPO branch.
-                        values_per_env[learner_idx_np] = _critic_values(
-                            critic, device, o_t_l, opp_block
-                        )
-            else:
-                values_per_env[learner_idx_np] = v_np
+                        with torch.inference_mode():
+                            if use_vrpo:
+                                _critic_v_t, _critic_q_t = critic.q_values(
+                                    _learner_o_t, opp_holes_multihot(h_t)
+                                )
+                            else:
+                                _critic_v_t = critic(
+                                    _learner_o_t, opp_holes_multihot(h_t)
+                                )
 
-        # Group active opponent envs by snapshot index. `np.unique` over
-        # the masked column replaces the per-env dict-build loop.
-        if is_opp_active.any():
-            with record_function("step4/opp_forwards"):
+            # Group active opponent envs by snapshot index. Attack #1: all opp
+            # act()s before any opp D2H; double-pin between groups.
+            opp_groups: list[tuple[np.ndarray, object]] = []
+            if is_opp_active.any():
                 opp_snap_col = np.where(is_opp_active, env_snapshot_idx_arr, -1)
-                for sd_idx in np.unique(opp_snap_col[opp_snap_col >= 0]):
-                    sd_idx_int = int(sd_idx)
-                    group = np.nonzero(opp_snap_col == sd_idx)[0]
-                    m = _get_snapshot_model(sd_idx_int)
-                    g_np, c_np, _, _, _, _, _, _, _, _ = _forward(
-                        m, group, obs, gate_masks, sizing_step, want_marginal=False
+                sd_ids = np.unique(opp_snap_col[opp_snap_col >= 0])
+                with _TimedRF("step4a/opp_h2d_act"):
+                    for sd_idx in sd_ids:
+                        sd_idx_int = int(sd_idx)
+                        group = np.nonzero(opp_snap_col == sd_idx)[0]
+                        m = _get_snapshot_model(sd_idx_int)
+                        _fw_out = _opp_upload_act(
+                            m, group, obs, gate_masks, sizing_step,
+                        )
+                        opp_groups.append((group, _fw_out))
+
+            # Coalesced host pull: learner ActOut (+ critic) and all opp gates/chips.
+            with _TimedRF("step5/action_d2h"):
+                if _learner_fw is not None:
+                    g_np, c_np, an_np, lp_np, ru_np, v_np, glp_np, alp_np, marg_np = (
+                        _act_to_host(_learner_fw)  # type: ignore[misc]
                     )
-                    gates_per_env[group] = g_np
-                    chips_per_env[group] = np.maximum(c_np, 0).astype(np.uint64)
+                    gates_per_env[learner_idx_np] = g_np
+                    chips_per_env[learner_idx_np] = np.maximum(c_np, 0).astype(np.uint64)
+                    anchors_per_env[learner_idx_np] = an_np
+                    refine_u_per_env[learner_idx_np] = ru_np
+                    log_probs_per_env[learner_idx_np] = lp_np
+                    gate_logp_per_env[learner_idx_np] = glp_np
+                    anchor_logp_per_env[learner_idx_np] = alp_np
+                    if _critic_v_t is not None:
+                        if use_vrpo and _critic_q_t is not None:
+                            # One D2H for V||Q (same as _critic_q_values coalesce).
+                            vq = torch.cat(
+                                [_critic_v_t.float().unsqueeze(-1), _critic_q_t.float()],
+                                dim=-1,
+                            ).cpu().numpy()
+                            v_l = vq[..., 0]
+                            q_l = vq[..., 1:]
+                            values_per_env[learner_idx_np] = v_l
+                            if q_l.shape[-1] == 3:
+                                q_idx_l = g_np.astype(np.int64)
+                                marg_l = np.stack(
+                                    [
+                                        marg_np[:, 0],
+                                        marg_np[:, 1],
+                                        marg_np[:, 2:].sum(-1),
+                                    ],
+                                    axis=-1,
+                                )
+                            else:
+                                q_idx_l = np.where(
+                                    g_np == GATE_RAISE, 2 + an_np, g_np.astype(np.int64)
+                                )
+                                marg_l = marg_np
+                            rows_l = np.arange(learner_idx_np.size)
+                            q_taken_per_env[learner_idx_np] = q_l[rows_l, q_idx_l]
+                            vpi_per_env[learner_idx_np] = (marg_l * q_l).sum(-1)
+                        else:
+                            values_per_env[learner_idx_np] = (
+                                _critic_v_t.float().cpu().numpy()
+                            )
+                    else:
+                        values_per_env[learner_idx_np] = v_np
+
+                if opp_groups:
+                    g_parts = [out.gate for _, out in opp_groups]
+                    c_parts = [out.chips for _, out in opp_groups]
+                    g_cat = torch.cat(g_parts, dim=0)
+                    c_cat = torch.cat(c_parts, dim=0)
+                    gc = torch.stack(
+                        (g_cat.to(torch.int64), c_cat.to(torch.int64)), dim=0
+                    ).cpu().numpy()
+                    g_all = gc[0].astype(np.uint8)
+                    c_all = np.maximum(gc[1], 0).astype(np.uint64)
+                    cursor = 0
+                    for group, _ in opp_groups:
+                        n_g = int(group.size)
+                        gates_per_env[group] = g_all[cursor : cursor + n_g]
+                        chips_per_env[group] = c_all[cursor : cursor + n_g]
+                        cursor += n_g
+                del opp_groups
 
         # Vectorized trajectory snapshot: one bulk obs/gm copy into the
         # flat pool, plus fancy-index writes into the per-(env, seat)
@@ -1614,7 +2069,7 @@ def collect_rollout_batched(
         if short_shove.any():
             gates_dispatch = gates_per_env.copy()
             gates_dispatch[short_shove] = 3
-        with record_function("step6+7/rust_apply"):
+        with _TimedRF("step6+7/rust_apply"):
             newly_terminal = np.asarray(
                 env._be.apply_hybrid_batch(gates_dispatch, chips_per_env), dtype=bool
             )
@@ -1626,7 +2081,7 @@ def collect_rollout_batched(
         # total_commit / legal / actors stay correct for payouts and
         # aggression bookkeeping. Bit-exact for non-terminal rows;
         # terminal rows get zeros (same as a full encode of actor==-1).
-        with record_function("step1a/refresh"):
+        with _TimedRF("step1a/refresh"):
             if newly_terminal.any() and not newly_terminal.all():
                 env._refresh(encode_mask=~newly_terminal)
             elif newly_terminal.all():
@@ -1637,7 +2092,7 @@ def collect_rollout_batched(
 
         # Rust-parallel aggression bonus + per-step cost/pot/street
         # bookkeeping. Replaces the per-env Python arithmetic loop.
-        with record_function("step8/aggression_bonus"):
+        with _TimedRF("step8/aggression_bonus"):
             agg = compute_aggression_bonus_batch(
                 actors,
                 dones,
@@ -1673,8 +2128,24 @@ def collect_rollout_batched(
                 aggr_steps_total_by_street[s] += int(sbs[s])
                 aggr_bonus_steps_by_street[s] += int(bbs[s])
 
+        # Attack #2 Phase 2: while terminal host runs, queue next-step acts
+        # for envs that are still live (not newly terminal). After reset,
+        # queue acts for re-dealt actives. D2H into _act_prefetch for the
+        # next loop iteration. Flag OFF → identical control flow to pre-#2.
+        _prefetch_queued = None
+        if (
+            _rollout_overlap
+            and newly_terminal.any()
+            and not newly_terminal.all()
+            and wcursor < rollout_target
+        ):
+            with _TimedRF("step2x/act_wave_active"):
+                # Live non-terminal envs already refreshed; act for them now.
+                _nt_mask = ~newly_terminal
+                _prefetch_queued = _queue_acts_for_mask(_nt_mask)
+
         if newly_terminal.any():
-            with record_function("step9a/payouts"):
+            with _TimedRF("step9a/payouts"):
                 if env._ev_runout_samples > 0:
                     ev_seeds = env._reset_seeds ^ np.uint64(0x9E3779B97F4A7C15)
                     payouts_f32 = np.asarray(
@@ -1721,7 +2192,7 @@ def collect_rollout_batched(
                 )  # (T, S, L)
 
                 # Retroactive bonus (vectorized over (T, S, L)).
-                with record_function("step9b/retroactive_bonus"):
+                with _TimedRF("step9b/retroactive_bonus"):
                     payout_chips = np.rint(won_f32[term_envs]).astype(np.int64)  # (T, S)
                     total_pot_chips = post_total_commit[term_envs].astype(np.int64).sum(axis=1)  # (T,)
                     two_pay = 2 * payout_chips
@@ -1760,7 +2231,7 @@ def collect_rollout_batched(
                         aggr_bonus_total_bb += float(bonus.sum())
 
                 # GAE backward scan vectorized over (T, S).
-                with record_function("step9c/gae_scan"):
+                with _TimedRF("step9c/gae_scan"):
                     vals_t = traj_value[term_envs, :, :L]                    # (T, S, L)
                     won_bb = won_f32[term_envs].astype(np.float32) * np.float32(reward_norm)
                     last_gae = np.zeros((T, S), dtype=np.float32)
@@ -1807,7 +2278,11 @@ def collect_rollout_batched(
 
                 # Gather the (T, S, L) → (n_new,) flat slab and copy
                 # into the preallocated output arrays at `wcursor`.
-                with record_function("step9d/slab_copies"):
+                with _TimedRF("step9d/slab_copies"):
+                    # Attack #4 S1: one flat plan (sel/obs_idx), slice traj once
+                    # to (T,S,L), gather with that plan. S2: opp-holes from
+                    # holes_rot_cache (filled on deal/reset). Same sel order
+                    # as pre-#4 (bit-exact row order).
                     flat = active_step.ravel()
                     n_new = int(flat.sum())
                     if n_new:
@@ -1819,57 +2294,65 @@ def collect_rollout_batched(
                                 f"{POOL_SLACK_PER_ENV} slack)"
                             )
                         sel = np.nonzero(flat)[0]
-                        obs_idx = traj_obs_idx[term_envs, :, :L].ravel()[sel]
                         end = wcursor + n_new
-                        np.take(step_obs_pool, obs_idx, axis=0, out=all_obs_arr[wcursor:end])
-                        np.take(step_gm_pool, obs_idx, axis=0, out=all_gm_arr[wcursor:end])
-                        all_ga_arr[wcursor:end] = traj_gate[term_envs, :, :L].ravel()[sel].astype(np.int64)
-                        all_rc_arr[wcursor:end] = traj_chips[term_envs, :, :L].ravel()[sel]
-                        all_sz_arr[wcursor:end] = (
-                            traj_sizing[term_envs, :, :L].reshape(-1, 4)[sel]
+                        # Single (T,S,L) window into traj storage.
+                        obs_idx_tsl = traj_obs_idx[term_envs, :, :L]
+                        gate_tsl = traj_gate[term_envs, :, :L]
+                        chips_tsl = traj_chips[term_envs, :, :L]
+                        sizing_tsl = traj_sizing[term_envs, :, :L]
+                        anchor_tsl = traj_anchor[term_envs, :, :L]
+                        u_tsl = traj_u[term_envs, :, :L]
+                        lp_tsl = traj_log_p[term_envs, :, :L]
+                        glp_tsl = traj_gate_lp[term_envs, :, :L]
+                        alp_tsl = traj_anchor_lp[term_envs, :, :L]
+                        obs_idx = obs_idx_tsl.ravel()[sel]
+                        np.take(
+                            step_obs_pool, obs_idx, axis=0,
+                            out=all_obs_arr[wcursor:end],
                         )
-                        all_an_arr[wcursor:end] = (
-                            traj_anchor[term_envs, :, :L].ravel()[sel].astype(np.int64)
+                        np.take(
+                            step_gm_pool, obs_idx, axis=0,
+                            out=all_gm_arr[wcursor:end],
                         )
-                        all_ru_arr[wcursor:end] = traj_u[term_envs, :, :L].ravel()[sel]
-                        # Rotated opp holes are constant per (env, seat) per
-                        # hand: build one (T, S, 5, 5) block from the hand's
-                        # hole cache and index it by sel // L.
-                        seat_ids = np.arange(S)
-                        j5 = np.arange(5)
-                        rot_seats = (seat_ids[:, None] + 1 + j5[None, :]) % S
-                        rot_block = holes_cache[term_envs][:, rot_seats]
-                        invalid = (j5 + 1) >= S
-                        if invalid.any():
-                            rot_block = np.where(
-                                invalid[None, None, :, None], np.uint8(255), rot_block
-                            )
+                        all_ga_arr[wcursor:end] = gate_tsl.ravel()[sel].astype(
+                            np.int64, copy=False
+                        )
+                        all_rc_arr[wcursor:end] = chips_tsl.ravel()[sel]
+                        all_sz_arr[wcursor:end] = sizing_tsl.reshape(-1, 4)[sel]
+                        all_an_arr[wcursor:end] = anchor_tsl.ravel()[sel].astype(
+                            np.int64, copy=False
+                        )
+                        all_ru_arr[wcursor:end] = u_tsl.ravel()[sel]
+                        # (T, S, 5, hole_w) already rotated; ts_idx = env*S+seat
                         ts_idx = sel // L
-                        all_oh_arr[wcursor:end] = (
-                            rot_block.reshape(
-                                T * S, 5, game_config.hole_count
-                            )[ts_idx]
-                        )
-                        all_lp_arr[wcursor:end] = traj_log_p[term_envs, :, :L].ravel()[sel]
-                        all_glp_arr[wcursor:end] = traj_gate_lp[term_envs, :, :L].ravel()[sel]
-                        all_alp_arr[wcursor:end] = traj_anchor_lp[term_envs, :, :L].ravel()[sel]
+                        all_oh_arr[wcursor:end] = holes_rot_cache[term_envs].reshape(
+                            T * S, 5, _hole_w
+                        )[ts_idx]
+                        all_lp_arr[wcursor:end] = lp_tsl.ravel()[sel]
+                        all_glp_arr[wcursor:end] = glp_tsl.ravel()[sel]
+                        all_alp_arr[wcursor:end] = alp_tsl.ravel()[sel]
                         all_v_arr[wcursor:end] = vals_t.ravel()[sel]
                         all_ret_arr[wcursor:end] = rets_t.ravel()[sel]
                         all_adv_arr[wcursor:end] = adv_out_t.ravel()[sel]
-                        # Terminal flag: the seat's last decision of the hand
-                        # (same (T, S, L) ravel space as every slab above; sel
-                        # rows are active ⊂ flush, so no extra masking).
                         all_last_arr[wcursor:end] = (
                             t_idx[None, None, :] == last_t_arr[..., None]
                         ).ravel()[sel]
                         wcursor = end
 
-                with record_function("step9e/pool_mix"):
+                with _TimedRF("step9e/pool_mix"):
                     traj_lengths[term_envs] = 0
-                    for i_int in term_envs.tolist():
-                        _assign_pool_mix(int(i_int))
+                    # Attack #4: fast path when pool mix is inactive; else
+                    # preserve sequential term_envs order for RNG bit-exactness.
+                    if len(pool) == 0 or pool_opp_seats == 0 or pool_mix_prob <= 0.0:
+                        for i_int in term_envs.tolist():
+                            learner_seats[i_int] = set(range(n_seats))
+                        learner_seats_mask[term_envs] = True
+                        env_snapshot_idx_arr[term_envs] = -1
+                    else:
+                        for i_int in term_envs.tolist():
+                            _assign_pool_mix(int(i_int))
 
-            with record_function("step9f/reset_terminal"):
+            with _TimedRF("step9f/reset_terminal"):
                 env._be.reset_terminal_batch(new_seeds, new_buttons, reset_mask)
                 env._reset_seeds = np.where(reset_mask, new_seeds, env._reset_seeds)
                 # Refresh the per-hand hole cache for the re-dealt envs
@@ -1881,6 +2364,7 @@ def collect_rollout_batched(
                     env._be.all_hole_cards_subset_batch(term_idx), dtype=np.uint8
                 )
                 holes_cache[term_envs] = holes_sub
+                _fill_holes_rot(term_envs.astype(np.int64))
                 # Second refresh to pick up the post-reset state for the next
                 # iteration. `reset_terminal_batch` mutates ONLY the masked
                 # (terminal) envs, and nothing above mutated non-masked envs'
@@ -1890,6 +2374,71 @@ def collect_rollout_batched(
                 # `_refresh_subset` docstring + test_refresh_subset_parity).
                 env._refresh_subset(reset_mask)
 
+            # Wave B: re-dealt envs may now need an action; queue after reset.
+            if _prefetch_queued is not None:
+                with _TimedRF("step2x/act_wave_redealt"):
+                    _rd_mask = newly_terminal.copy()
+                    _q_b = _queue_acts_for_mask(_rd_mask)
+                # Merge device queues then single D2H into host prefetch.
+                with _TimedRF("step2x/prefetch_d2h"):
+                    # Merge: start from wave A host pull, overlay wave B.
+                    host_a = _d2h_queued_acts(_prefetch_queued)
+                    host_b = _d2h_queued_acts(_q_b)
+                    # Combine learner indices and arrays.
+                    for key in (
+                        "gates_per_env",
+                        "chips_per_env",
+                        "anchors_per_env",
+                        "refine_u_per_env",
+                        "log_probs_per_env",
+                        "gate_logp_per_env",
+                        "anchor_logp_per_env",
+                        "values_per_env",
+                    ):
+                        # wave B only wrote re-dealt rows; copy those over A
+                        m = newly_terminal
+                        host_a[key][m] = host_b[key][m]
+                    if use_vrpo:
+                        host_a["q_taken_per_env"][newly_terminal] = host_b[
+                            "q_taken_per_env"
+                        ][newly_terminal]
+                        host_a["vpi_per_env"][newly_terminal] = host_b[
+                            "vpi_per_env"
+                        ][newly_terminal]
+                    # Learner idx = A then B (disjoint masks). Do NOT np.unique:
+                    # unique sorts and reorders rows vs act order.
+                    host_a["learner_idx_np"] = np.concatenate(
+                        [host_a["learner_idx_np"], host_b["learner_idx_np"]]
+                    )
+                    # Obs/masks at act time: Wave A used non-term rows; Wave B
+                    # re-dealt rows. Subset refresh only mutates terminal rows,
+                    # so env._obs now matches both waves' act-time observations.
+                    host_a["obs"] = env._obs.copy()
+                    host_a["gate_masks"] = env._gate_mask.copy()
+                    host_a["safe_actors"] = np.where(
+                        env._actors >= 0, env._actors, 0
+                    ).astype(np.intp)
+                    # sizing from current env for traj
+                    _sa = host_a["safe_actors"]
+                    _tc = np.maximum(
+                        env._bet_to_call.astype(np.int64)
+                        - env._street_commit[env_idx_range, _sa].astype(np.int64),
+                        0,
+                    )
+                    host_a["sizing_step"] = np.stack(
+                        [
+                            env._min_raise.astype(np.int64),
+                            env._max_raise.astype(np.int64),
+                            env._pot.astype(np.int64),
+                            _tc,
+                        ],
+                        axis=-1,
+                    )
+                    # Drop prefetch if terminal flush already filled the batch —
+                    # otherwise the next iter would apply extra steps past target.
+                    if wcursor < rollout_target:
+                        _act_prefetch = host_a
+
     if out_slabs is not None:
         # P7 shared-staging finalize: no full H2D — the rows already sit in the
         # caller's big host buffer. Only the per-sub advantage normalization
@@ -1897,7 +2446,7 @@ def collect_rollout_batched(
         # (_finalize_batch_arr), and a CPU reimplementation would drift f32
         # reduction order, so ship the tiny (wcursor,) vector up, run the
         # IDENTICAL op sequence, and write the result back into the slab.
-        with record_function("step11/shared_adv_norm"):
+        with _TimedRF("step11/shared_adv_norm"):
             adv_view = all_adv_arr[:wcursor]
             adv_t = torch.from_numpy(adv_view).to(device, non_blocking=True)
             adv_mean = adv_t.mean()
@@ -1935,6 +2484,11 @@ def collect_rollout_batched(
             ),
         )
 
+    # Report only when this call owns the timers (not multiconfig parent).
+    # Multiconfig sets a parent before the loop and reports once after.
+    if os.environ.get("PLO5BP_STEP_TIMERS_OWNED", "1").strip() != "0":
+        step_timers.report(label="collect_rollout_batched")
+        _ACTIVE_STEP_TIMERS = None
     return _finalize_batch_arr(
         all_obs_arr,
         all_gm_arr,
@@ -2071,6 +2625,12 @@ def collect_rollout_multiconfig(
     tier keeps its own coefficient inside the mixed update, and per-tier
     F/T/R counters (`tier_ftr`) so the aggression stop-loss telemetry
     survives the concat."""
+    # Aggregate step timers across all sub-rollouts (one report at end).
+    global _ACTIVE_STEP_TIMERS
+    _parent_timers = _StepTimers()
+    _ACTIVE_STEP_TIMERS = _parent_timers
+    _prev_owned = os.environ.get("PLO5BP_STEP_TIMERS_OWNED")
+    os.environ["PLO5BP_STEP_TIMERS_OWNED"] = "0"
     n = len(configs)
     if n == 0:
         raise ValueError("collect_rollout_multiconfig requires >= 1 config")
@@ -2238,6 +2798,12 @@ def collect_rollout_multiconfig(
         combined.tier_ftr = {
             t: (tuple(v[0]), tuple(v[1])) for t, v in ftr.items()
         }
+    os.environ.pop("PLO5BP_STEP_TIMERS_OWNED", None)
+    if _prev_owned is not None:
+        os.environ["PLO5BP_STEP_TIMERS_OWNED"] = _prev_owned
+    _parent_timers.report(label="collect_rollout_multiconfig")
+    _ACTIVE_STEP_TIMERS = None
+
     return _batch_to_device(combined, device)
 
 

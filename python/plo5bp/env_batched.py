@@ -37,9 +37,9 @@ from plo5bp.actions import (
 from plo5bp.config import GameConfig, VARIANT_NLH
 from plo5bp.encoding import OBS_DIM, encode_observation_batch
 
-# Width the Rust obs encoder (observation_encoded_batch) emits. The Rust
-# encoder is force-disabled whenever OBS_DIM has moved past this (see
-# _use_rust_encoder below) until the new tail blocks are ported to it.
+# Width the Rust obs encoder (observation_encoded_batch) emits. Width-gated
+# against OBS_DIM so a stale extension cannot silently truncate the obs.
+# Bump when porting new tail dims into rust_engine (obs_v7_inc / obs_layout).
 _RUST_ENCODER_OBS_DIM = 1171
 from plo5bp.encoding_nlh import OBS_DIM_NLH, encode_observation_batch_nlh
 
@@ -78,20 +78,25 @@ class BatchedBombPotEnv:
         # passes a lower count for speed. See rollout.TRAIN_OPP_OUTCOME_MC.
         # NLH ignores it (its 3-dim opp-outcome block is exhaustive).
         self._opp_outcome_mc = int(opp_outcome_mc)
-        # The Rust observation encoder (PLO5_RUST_ENCODER, default-off)
-        # implements the obs-v2 1020-dim PLO layout (ported 2026-07-08). The
-        # v7 batch-2 tail (OBS_DIM 1171, 2026-07-12) is NOT ported to it yet,
-        # so the encoder is WIDTH-GATED: it can only run while the numpy
-        # layout equals the width the Rust encoder emits. When OBS_DIM has
-        # moved past it (as now), force numpy — a silently truncated obs is
-        # exactly the bug this gate prevents. Re-port the tail blocks + flip
-        # _RUST_ENCODER_OBS_DIM to re-enable (V7_OBS_IMPL_PLAN.md). NLH keeps
-        # numpy — the Rust encoder path is PLO-only.
+        # Rust observation encoder (PLO5_RUST_ENCODER): one-FFI pack+encode
+        # (Rayon per row), bit-exact with numpy encode_observation_batch.
+        # WIDTH-GATED to _RUST_ENCODER_OBS_DIM so a stale binary cannot emit a
+        # silently truncated obs when OBS_DIM moves. v7 tail (1171) is ported
+        # in rust_engine/src/obs_v7_inc.rs. NLH stays on the numpy path.
         self._use_rust_encoder = (
             bool(int(os.environ.get("PLO5_RUST_ENCODER", "0")))
             and not self._is_nlh
             and OBS_DIM == _RUST_ENCODER_OBS_DIM
         )
+        if not getattr(BatchedBombPotEnv, "_encoder_log_once", False):
+            BatchedBombPotEnv._encoder_log_once = True
+            print(
+                f"[obs-encoder] rust={self._use_rust_encoder} "
+                f"OBS_DIM={self._obs_dim} "
+                f"PLO5_RUST_ENCODER={os.environ.get('PLO5_RUST_ENCODER', '0')!r} "
+                f"opp_mc={self._opp_outcome_mc} "
+                f"variant={self.config.variant}"
+            )
         stacks = np.asarray(self.config.resolved_stacks, dtype=np.uint64)
         self._be = BatchedEngine(
             self.n,
@@ -335,43 +340,57 @@ class BatchedBombPotEnv:
     def _refresh(self, encode_mask: np.ndarray | None = None) -> None:
         """Re-pack engine state and re-encode observations.
 
-        `encode_mask` (optional bool (n,)): when given, ONLY those rows are
-        passed through the obs encoder; other rows get a zeroed obs vector
-        (matches the terminal convention — actor == -1 already forces zeros
-        under a full encode). Engine-derived caches (commit / legal /
-        actors / …) always refresh for every env.
+        `encode_mask` (optional bool (n,)): skipped rows get zeroed obs
+        (terminal convention). Engine caches (commit / legal / actors / …)
+        always refresh for every env.
 
-        Used by the batched rollout after `apply_hybrid_batch` to skip the
-        expensive encode for newly-terminal envs that `reset_terminal_batch`
-        is about to re-deal (their post-apply obs is never consumed). Pack
-        still runs full-batch so `total_commit` etc. stay correct for
-        payouts / aggression bookkeeping. Bit-exact with a full encode
-        whenever the skipped rows are terminal (zeros).
+        Post-apply rollout uses encode_mask=~newly_terminal so finished
+        hands need not keep a meaningful obs before re-deal. Rust path:
+        one FFI observation_encoded_batch then zero ~mask (attack #3 —
+        no second pack). Numpy path: pack once, encode subset or full.
+        Kept rows bit-exact vs full encode; skipped rows zero.
         """
-        # Rust path: finished obs in one FFI when encoding everyone. When
-        # encode_mask skips rows (post-apply newly-terminal), pack full-batch
-        # for commit/legal caches, encode only the kept rows via the subset
-        # encoder, and zero the rest (terminal convention).
         if self._use_rust_encoder:
-            if encode_mask is None or bool(np.all(encode_mask)):
+            # Attack #3 (2026-07-13): avoid the old partial-mask double pack
+            # (features_batch full pack + encoded_subset pack+encode).
+            # - Full / mixed masks: one observation_encoded_batch, then zero
+            #   skipped rows in-place. Encoding actor==-1 is cheap (zero row).
+            # - All-skipped mask: pack+aux only (observation_and_features_batch),
+            #   zero obs — no encode pass at all.
+            em = None
+            if encode_mask is not None:
+                em = np.asarray(encode_mask, dtype=bool)
+                if em.shape != (self.n,):
+                    raise ValueError(
+                        f"encode_mask shape {em.shape} != ({self.n},)"
+                    )
+            if em is not None and not bool(em.any()):
                 with record_function("step1a_bundle/obs_features_batch"):
-                    bundle = self._be.observation_encoded_batch()
-                self._obs = np.asarray(bundle["obs"], dtype=np.float32)
+                    bundle = self._be.observation_and_features_batch()
+                with record_function("step1/encoder"):
+                    if self._obs.shape == (self.n, self._obs_dim):
+                        self._obs.fill(0.0)
+                    else:
+                        self._obs = np.zeros(
+                            (self.n, self._obs_dim), dtype=np.float32
+                        )
                 with record_function("step1a_unpack/post"):
                     self._unpack_post(bundle)
                 return
             with record_function("step1a_bundle/obs_features_batch"):
-                bundle = self._be.observation_and_features_batch()
-            if not bool(np.any(encode_mask)):
-                self._obs = np.zeros((self.n, self._obs_dim), dtype=np.float32)
-            else:
-                idx = np.nonzero(np.asarray(encode_mask, dtype=bool))[0]
-                with record_function("step1/encoder"):
-                    enc = self._be.observation_encoded_subset_batch(
-                        idx.astype(np.int64)
-                    )
-                self._obs = np.zeros((self.n, self._obs_dim), dtype=np.float32)
-                self._obs[idx] = np.asarray(enc["obs"], dtype=np.float32)
+                bundle = self._be.observation_encoded_batch()
+            with record_function("step1/encoder"):
+                obs = np.asarray(bundle["obs"], dtype=np.float32)
+                if (
+                    self._obs is not None
+                    and self._obs.shape == obs.shape
+                    and self._obs.dtype == obs.dtype
+                ):
+                    np.copyto(self._obs, obs)
+                else:
+                    self._obs = obs
+                if em is not None and not bool(em.all()):
+                    self._obs[~em] = 0.0
             with record_function("step1a_unpack/post"):
                 self._unpack_post(bundle)
             return
@@ -393,7 +412,10 @@ class BatchedBombPotEnv:
                     )
             elif not bool(np.any(encode_mask)):
                 # Every row skipped (e.g. all newly-terminal): zeros only.
-                self._obs = np.zeros((self.n, self._obs_dim), dtype=np.float32)
+                if self._obs.shape == (self.n, self._obs_dim):
+                    self._obs.fill(0.0)
+                else:
+                    self._obs = np.zeros((self.n, self._obs_dim), dtype=np.float32)
             else:
                 # Encode the kept rows only, scatter into a zeroed full batch.
                 # Slice the already-fetched full bundle by row — no second pack.
@@ -415,7 +437,10 @@ class BatchedBombPotEnv:
                     obs_sub = encode_observation_batch(
                         sub, cat_a_sub, cat_b_sub, self.config
                     )
-                self._obs = np.zeros((self.n, self._obs_dim), dtype=np.float32)
+                if self._obs.shape != (self.n, self._obs_dim):
+                    self._obs = np.zeros((self.n, self._obs_dim), dtype=np.float32)
+                else:
+                    self._obs.fill(0.0)
                 self._obs[idx] = obs_sub
         with record_function("step1a_unpack/post"):
             self._unpack_post(bundle)

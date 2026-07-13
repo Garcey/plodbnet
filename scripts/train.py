@@ -25,11 +25,228 @@ import json
 import os
 import re
 import signal
+import subprocess
+import threading
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
+
+class _ResourceSampler:
+    """Background 1 Hz samples of CPU / RAM / GPU util / VRAM during a run.
+
+    Writes JSONL to runs/profile_resources.jsonl. Phase labels via set_phase
+    so each sample is attributable to rollout vs optimize. Uses psutil when
+    available; falls back to /proc + nvidia-smi.
+    """
+
+    def __init__(
+        self,
+        out_path: str | Path = "runs/profile_resources.jsonl",
+        interval_s: float = 1.0,
+    ) -> None:
+        self.out_path = Path(out_path)
+        self.interval_s = float(interval_s)
+        self._phase = "init"
+        self._update = -1
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._psutil = None
+        self._proc = None
+        try:
+            import psutil  # type: ignore
+
+            self._psutil = psutil
+            self._proc = psutil.Process()
+            self._proc.cpu_percent(None)
+            psutil.cpu_percent(None)
+        except Exception:
+            self._psutil = None
+            self._proc = None
+        self._n_logical = os.cpu_count() or 1
+        self._cgroup_quota_cpus = self._read_cgroup_quota_cpus()
+        self.samples: list[dict] = []
+
+    @staticmethod
+    def _read_cgroup_quota_cpus() -> float | None:
+        for path in ("/sys/fs/cgroup/cpu.max",):
+            try:
+                raw = Path(path).read_text().strip().split()
+                if len(raw) >= 2 and raw[0] != "max":
+                    quota, period = float(raw[0]), float(raw[1])
+                    if period > 0:
+                        return quota / period
+            except (OSError, ValueError):
+                pass
+        try:
+            q = float(Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read_text())
+            p = float(Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text())
+            if q > 0 and p > 0:
+                return q / p
+        except (OSError, ValueError):
+            pass
+        return None
+
+    def set_phase(self, phase: str, update: int | None = None) -> None:
+        self._phase = phase
+        if update is not None:
+            self._update = int(update)
+
+    def start(self) -> None:
+        self.out_path.parent.mkdir(parents=True, exist_ok=True)
+        self.out_path.write_text("")
+        self._thread = threading.Thread(
+            target=self._loop, name="resource-sampler", daemon=True
+        )
+        self._thread.start()
+        print(
+            f"[profile-resources] sampling every {self.interval_s:.1f}s -> "
+            f"{self.out_path}  "
+            f"(cgroup_quota_cpus={self._cgroup_quota_cpus!s}, "
+            f"logical_cpus={self._n_logical})"
+        )
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self.interval_s + 2.0)
+            self._thread = None
+
+    def _sample_gpu(self) -> tuple[float | None, float | None, float | None]:
+        try:
+            out = subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=utilization.gpu,memory.used,memory.total",
+                    "--format=csv,noheader,nounits",
+                ],
+                text=True,
+                timeout=2.0,
+            ).strip().splitlines()
+            if not out:
+                return None, None, None
+            parts = [p.strip() for p in out[0].split(",")]
+            return float(parts[0]), float(parts[1]), float(parts[2])
+        except Exception:
+            return None, None, None
+
+    def _sample_cpu_ram(self) -> dict:
+        row: dict = {}
+        if self._psutil is not None and self._proc is not None:
+            proc_cpu_1core = float(self._proc.cpu_percent(None))
+            host_cpu = float(self._psutil.cpu_percent(None))
+            row["proc_cpu_pct_1core"] = round(proc_cpu_1core, 2)
+            row["proc_cpu_pct_of_logical"] = round(
+                proc_cpu_1core / max(1, self._n_logical), 2
+            )
+            if self._cgroup_quota_cpus and self._cgroup_quota_cpus > 0:
+                row["proc_cpu_pct_of_quota"] = round(
+                    proc_cpu_1core / self._cgroup_quota_cpus, 2
+                )
+            row["host_cpu_pct"] = round(host_cpu, 2)
+            mem = self._proc.memory_info()
+            row["proc_rss_gb"] = round(mem.rss / (1024 ** 3), 3)
+            vm = self._psutil.virtual_memory()
+            row["host_ram_used_gb"] = round(vm.used / (1024 ** 3), 3)
+            row["host_ram_total_gb"] = round(vm.total / (1024 ** 3), 3)
+            row["host_ram_pct"] = round(vm.percent, 2)
+        else:
+            try:
+                with open("/proc/self/status", encoding="utf-8") as f:
+                    for line in f:
+                        if line.startswith("VmRSS:"):
+                            kb = float(line.split()[1])
+                            row["proc_rss_gb"] = round(kb / (1024 ** 2), 3)
+                            break
+            except OSError:
+                pass
+        if self._cgroup_quota_cpus is not None:
+            row["cgroup_quota_cpus"] = round(self._cgroup_quota_cpus, 2)
+        row["logical_cpus"] = self._n_logical
+        return row
+
+    def _sample_torch_vram(self) -> dict:
+        row: dict = {}
+        if torch.cuda.is_available():
+            try:
+                row["torch_alloc_gb"] = round(
+                    torch.cuda.memory_allocated() / (1024 ** 3), 3
+                )
+                row["torch_reserved_gb"] = round(
+                    torch.cuda.memory_reserved() / (1024 ** 3), 3
+                )
+            except Exception:
+                pass
+        return row
+
+    def _loop(self) -> None:
+        t0 = time.time()
+        while not self._stop.is_set():
+            ts = time.time()
+            gpu_util, gpu_used, gpu_total = self._sample_gpu()
+            row = {
+                "t": round(ts - t0, 3),
+                "wall": ts,
+                "phase": self._phase,
+                "update": self._update,
+            }
+            row.update(self._sample_cpu_ram())
+            row.update(self._sample_torch_vram())
+            if gpu_util is not None:
+                row["gpu_util_pct"] = gpu_util
+            if gpu_used is not None:
+                row["gpu_mem_used_mib"] = gpu_used
+            if gpu_total is not None:
+                row["gpu_mem_total_mib"] = gpu_total
+            self.samples.append(row)
+            try:
+                with self.out_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(row) + "\n")
+            except OSError:
+                pass
+            self._stop.wait(self.interval_s)
+
+    def summarize(self) -> None:
+        if not self.samples:
+            print("[profile-resources] no samples collected")
+            return
+        by_phase: dict[str, list[dict]] = {}
+        for s in self.samples:
+            by_phase.setdefault(str(s.get("phase", "?")), []).append(s)
+
+        def _stats(vals: list[float]) -> str:
+            if not vals:
+                return "n/a"
+            vals = sorted(vals)
+            n = len(vals)
+            mean = sum(vals) / n
+            p50 = vals[n // 2]
+            p95 = vals[min(n - 1, int(n * 0.95))]
+            return f"mean={mean:5.1f}  p50={p50:5.1f}  p95={p95:5.1f}  n={n}"
+
+        print("\n===== resource sampler summary (per phase) =====")
+        for phase, rows in by_phase.items():
+            print(f"  phase={phase!r}  samples={len(rows)}")
+            for key, label in (
+                ("proc_cpu_pct_of_quota", "CPU % of cgroup quota"),
+                ("proc_cpu_pct_of_logical", "CPU % of logical cores"),
+                ("host_cpu_pct", "host CPU %"),
+                ("gpu_util_pct", "GPU util %"),
+                ("gpu_mem_used_mib", "GPU mem MiB"),
+                ("torch_alloc_gb", "torch alloc GiB"),
+                ("torch_reserved_gb", "torch reserved GiB"),
+                ("proc_rss_gb", "proc RSS GiB"),
+            ):
+                vals = [
+                    float(r[key])
+                    for r in rows
+                    if key in r and r[key] is not None
+                ]
+                if vals:
+                    print(f"    {label:28s}  {_stats(vals)}")
+        print(f"[profile-resources] raw JSONL -> {self.out_path}")
+
 
 from plo5bp.actions import GATE_ACTIONS
 from plo5bp.config import (
@@ -1868,6 +2085,25 @@ def main() -> None:
     if hasattr(signal, "SIGBREAK"):
         signal.signal(signal.SIGBREAK, _request_stop)
 
+    # Optional 1 Hz CPU/GPU/RAM/VRAM sampler (profile runs and always-on phase
+    # wall timers). Always log phase wall times; start the sampler whenever
+    # --profile-one-update is set so the under-saturation story is on disk.
+    resource_sampler: _ResourceSampler | None = None
+    # Resource sampler for --profile-one-update OR lightweight step-timer runs
+    # (PLO5BP_STEP_TIMERS=1): full torch.profiler at 9M rows OOMs/hangs on
+    # key_averages; step timers + 1Hz samples are the supported path.
+    _want_sampler = bool(args.profile_one_update) or (
+        os.environ.get("PLO5BP_STEP_TIMERS", "").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
+    if _want_sampler:
+        _samp_u = args.profile_at_update if args.profile_one_update else 0
+        resource_sampler = _ResourceSampler(
+            out_path=Path(f"runs/profile_resources_u{_samp_u}.jsonl"),
+            interval_s=1.0,
+        )
+        resource_sampler.start()
+
     while True:
         if stop_requested["flag"]:
             break
@@ -1973,7 +2209,14 @@ def main() -> None:
                 stack_dist=active_tier, seats_dist=args.seats_dist,
                 variant=args.variant, sb=args.sb,
             )
-        _profile_this = args.profile_one_update and update == args.profile_at_update
+        # Skip torch.profiler when using lightweight step timers — key_averages
+        # on a full 9M-step update allocates 100GB+ and never finishes.
+        _use_torch_prof = (
+            args.profile_one_update
+            and os.environ.get("PLO5BP_STEP_TIMERS", "").strip().lower()
+            not in ("1", "true", "yes", "on")
+        )
+        _profile_this = _use_torch_prof and update == args.profile_at_update
         _prof = None
         if _profile_this:
             _prof = torch.profiler.profile(
@@ -1986,6 +2229,9 @@ def main() -> None:
             )
             _prof.__enter__()
 
+        if resource_sampler is not None:
+            resource_sampler.set_phase("rollout", update=update)
+        _t_rollout0 = time.perf_counter()
         if args.mix_configs:
             # Per-tier coefs ride the batch as per-row ent_coef_rows
             # (V5_DESIGN.md B5): each tier's transitions are paid that
@@ -2009,6 +2255,7 @@ def main() -> None:
                 if sampled_eff_dist == "deep"
                 else live_entropy_coef
             )
+        _t_rollout1 = time.perf_counter()
         # Cold-start LR warmup: small early steps keep per-minibatch KL
         # inside the guard's trust region, so all minibatches apply and
         # the critic actually trains (a tripped update aborts the critic
@@ -2023,7 +2270,23 @@ def main() -> None:
         lr_scale = _lr_warmup_scale(update, args.lr_warmup_updates)
         for _pg in trainer.optimizer.param_groups:
             _pg["lr"] = live_lr * lr_scale
+        if resource_sampler is not None:
+            resource_sampler.set_phase("optimize", update=update)
+        _t_opt0 = time.perf_counter()
         stats = trainer.update(batch, rng, entropy_coef=update_entropy_coef)
+        _t_opt1 = time.perf_counter()
+        if resource_sampler is not None:
+            resource_sampler.set_phase("post", update=update)
+        _rollout_s = _t_rollout1 - _t_rollout0
+        _opt_s = _t_opt1 - _t_opt0
+        _total_s = _t_opt1 - _t_rollout0
+        print(
+            f"        [phase] update={update}  "
+            f"rollout={_rollout_s:.1f}s  optimize={_opt_s:.1f}s  "
+            f"total={_total_s:.1f}s  "
+            f"rollout%={100.0 * _rollout_s / max(1e-9, _total_s):.1f}  "
+            f"optimize%={100.0 * _opt_s / max(1e-9, _total_s):.1f}"
+        )
 
         # Accumulate this update's per-street aggression counts into the current
         # block's bucket (reset whenever a new tier's block begins).
@@ -2051,16 +2314,33 @@ def main() -> None:
 
         if _prof is not None:
             _prof.__exit__(None, None, None)
-            trace_path = Path(f"runs/profile_update{update}.json")
-            trace_path.parent.mkdir(parents=True, exist_ok=True)
-            _prof.export_chrome_trace(str(trace_path))
+            # Tables only by default: chrome traces at 9M-step scale grow to
+            # multi-GB and can hang for 30+ min writing profile_updateN.json.tmp
+            # before key_averages ever print. Set PLO5BP_CHROME_TRACE=1 to
+            # re-enable (not recommended on full rollouts).
             _ka = _prof.key_averages()
             _tag = "(post-compile)" if update > 0 else "(incl. one-time compile)"
             print(f"\n===== profiled update {update} {_tag} — SELF CUDA =====")
-            print(_ka.table(sort_by="self_cuda_time_total", row_limit=40))
+            print(_ka.table(sort_by="self_cuda_time_total", row_limit=50))
             print(f"\n===== profiled update {update} {_tag} — SELF CPU =====")
-            print(_ka.table(sort_by="self_cpu_time_total", row_limit=40))
-            print(f"[profile] chrome trace -> {trace_path}")
+            print(_ka.table(sort_by="self_cpu_time_total", row_limit=50))
+            # Rank record_function buckets (step1a/refresh, step3/forward, ...)
+            print(f"\n===== profiled update {update} {_tag} — CUDA total (incl. children) =====")
+            print(_ka.table(sort_by="cuda_time_total", row_limit=40))
+            print(f"\n===== profiled update {update} {_tag} — CPU total (incl. children) =====")
+            print(_ka.table(sort_by="cpu_time_total", row_limit=40))
+            if os.environ.get("PLO5BP_CHROME_TRACE", "").strip() in ("1", "true", "yes"):
+                trace_path = Path(f"runs/profile_update{update}.json")
+                trace_path.parent.mkdir(parents=True, exist_ok=True)
+                print(f"[profile] exporting chrome trace (PLO5BP_CHROME_TRACE=1) -> {trace_path}")
+                _prof.export_chrome_trace(str(trace_path))
+                print(f"[profile] chrome trace -> {trace_path}")
+            else:
+                print("[profile] chrome trace SKIPPED (set PLO5BP_CHROME_TRACE=1 to enable)")
+            if resource_sampler is not None:
+                resource_sampler.stop()
+                resource_sampler.summarize()
+                resource_sampler = None
             stop_requested["flag"] = True
 
         # Mid-run checkpoints: update-count + wall-clock variants.
@@ -2204,6 +2484,11 @@ def main() -> None:
         del batch
 
         update += 1
+
+    if resource_sampler is not None:
+        resource_sampler.stop()
+        resource_sampler.summarize()
+        resource_sampler = None
 
     args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
