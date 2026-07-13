@@ -411,3 +411,63 @@ rollout / 9d~45s / refresh~104s / opp~106s).
 4. If GPU util still soft and opp/overlap timers hot → #2 flag on + polish.
 5. If nothing dominates → stop optimizing; resume training.
 
+## Pod A/B results — 2026-07-13 (after deploy #1-#4)
+
+**Run:** 
+uns/vSix4_profile_ab.log  
+**Flags:** PLO5_RUST_ENCODER=1 PLO5BP_STEP_TIMERS=1 **PLO5BP_ROLLOUT_OVERLAP=1**  
+**Warm:** Six4.pt u90  
+**Commit:** afa6d8d (local) / sources scp to pod
+
+### Phase wall (trust update 1)
+
+| | Baseline (profile_steps, no overlap) | A/B (overlap ON) |
+|---|---|---|
+| Rollout | **425 s** | **599 s** |
+| Optimize | 19 s | 19 s |
+| Total | 444 s | 618 s |
+
+**Verdict: OVERLAP=1 regressed rollout wall ~+41%.** Keep default **OFF**.
+
+### Update-1 step timers (overlap ON) — top
+
+| Bucket | sec | % | note |
+|---|---|---|---|
+| step2x/act_wave_active | 172 | 28% | Phase 2 — dominates |
+| step2x/act_wave_redealt | 148 | 24% | Phase 2 — dominates |
+| step1a/refresh | 108 | 17% | ~flat vs ~104s baseline |
+| step3/learner_forward | 43 | 7% | main-path only (most act in 2x) |
+| step9f/reset_terminal | 33 | 5% | |
+| step9a/payouts | 30 | 5% | |
+| step9d/slab_copies | **26** | 4% | **was ~45s — #4 win** |
+| step2x/prefetch_d2h | 14 | 2% | |
+| step4a/opp_h2d_act | 2 | 0.4% | n=136 only (prefetch path) |
+
+### Resource sampler (rollout, full run)
+
+- CPU of 40.8 quota: mean **~19%** (was ~21–24%)
+- GPU util: mean **~13%** (was ~11%) — slight up, not meaningful vs wall regression
+- Optimize: GPU p50 ~97% as before
+
+### Interpretation
+
+1. **#2 Phase 2 (overlap) is a net loss** as implemented: wave A + terminal host + wave B are still largely **serial** (ct is sync); two act waves + prefetch overhead beat one full act. **Do not enable in production.**
+2. **#4 slab_copies** looks real: **45s → 26s** even under the slower overall run.
+3. **#3 refresh** ~flat (~104→108); double-pack fix may be small vs full Rayon encode, or noise.
+4. **#1** hard to read with overlap ON (opp acts mostly inside 2x waves). Re-profile with **OVERLAP=0** to isolate #1+#3+#4.
+
+### Recommended next profile
+
+Same recipe, **PLO5BP_ROLLOUT_OVERLAP unset/0**, STEP_TIMERS=1, RUST_ENCODER=1, 2 updates, compare u1 to baseline 425s / bucket table.
+
+### Production defaults after this A/B
+
+| Flag | Default |
+|---|---|
+| PLO5_RUST_ENCODER | 1 (on) |
+| PLO5BP_STEP_TIMERS | 0 (on only for profiles) |
+| PLO5BP_ROLLOUT_OVERLAP | **0 (OFF)** |
+| #1 dual pin / deferred opp D2H | always on in code |
+| #3 one-FFI refresh | always on in code |
+| #4 slab/rot cache | always on in code |
+
