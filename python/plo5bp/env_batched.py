@@ -35,7 +35,13 @@ from plo5bp.actions import (
     gate_mask_from_bounds,
 )
 from plo5bp.config import GameConfig, VARIANT_NLH
-from plo5bp.encoding import OBS_DIM, encode_observation_batch
+from plo5bp.encoding import (
+    OBS_DIM,
+    OBS_DIM_MINIMAL,
+    encode_observation_batch_minimal,
+    encode_observation_batch,
+    project_obs_minimal,
+)
 
 # Width the Rust obs encoder (observation_encoded_batch) emits. Width-gated
 # against OBS_DIM so a stale extension cannot silently truncate the obs.
@@ -66,36 +72,63 @@ class BatchedBombPotEnv:
         config: GameConfig | None = None,
         ev_runout_samples: int = 0,
         opp_outcome_mc: int = 1024,
+        obs_mode: str = "full",
     ):
         self.n = int(num_envs)
         self.config = config or GameConfig()
-        # Per-variant observation layout, mirroring the scalar env: the
-        # PLO double-bomb family shares the 991-dim layout; NLH is 995.
+        mode = str(obs_mode or "full").strip().lower()
+        if mode not in ("full", "minimal"):
+            raise ValueError(
+                f"obs_mode must be 'full' or 'minimal', got {obs_mode!r}"
+            )
         self._is_nlh = self.config.variant == VARIANT_NLH
-        self._obs_dim = OBS_DIM_NLH if self._is_nlh else OBS_DIM
+        if mode == "minimal" and self._is_nlh:
+            raise ValueError("obs_mode=minimal is PLO-only (not NLH)")
+        self._obs_mode = mode
+        # Per-variant observation layout: PLO full 1171 / minimal 796, NLH 995.
+        if self._is_nlh:
+            self._obs_dim = OBS_DIM_NLH
+        elif mode == "minimal":
+            self._obs_dim = OBS_DIM_MINIMAL
+        else:
+            self._obs_dim = OBS_DIM
         # k=3/k=4 Monte-Carlo budget for the opp-outcome obs feature.
         # 1024 (serial/UI/eval fidelity) by default; training rollout
         # passes a lower count for speed. See rollout.TRAIN_OPP_OUTCOME_MC.
         # NLH ignores it (its 3-dim opp-outcome block is exhaustive).
+        # Minimal obs never consumes opp-outcome / per-board MC features —
+        # force 0 so Rust skips the fused outcome_features_mc pass entirely.
+        if mode == "minimal":
+            opp_outcome_mc = 0
         self._opp_outcome_mc = int(opp_outcome_mc)
         # Rust observation encoder (PLO5_RUST_ENCODER): one-FFI pack+encode
-        # (Rayon per row), bit-exact with numpy encode_observation_batch.
-        # WIDTH-GATED to _RUST_ENCODER_OBS_DIM so a stale binary cannot emit a
-        # silently truncated obs when OBS_DIM moves. v7 tail (1171) is ported
-        # in rust_engine/src/obs_v7_inc.rs. NLH stays on the numpy path.
-        self._use_rust_encoder = (
-            bool(int(os.environ.get("PLO5_RUST_ENCODER", "0")))
-            and not self._is_nlh
-            and OBS_DIM == _RUST_ENCODER_OBS_DIM
+        # (Rayon per row). Full mode is width-gated to _RUST_ENCODER_OBS_DIM
+        # (1171). Minimal mode uses observation_encoded_minimal_batch which
+        # emits 796 directly (no engineered tails / MC / v7 pack scans).
+        # NLH stays on the numpy path. Capability-gated so a stale binary
+        # without the minimal methods falls back to numpy safely.
+        rust_flag = bool(int(os.environ.get("PLO5_RUST_ENCODER", "0")))
+        has_minimal_rust = hasattr(
+            BatchedEngine, "observation_encoded_minimal_batch"
         )
+        if self._is_nlh or not rust_flag:
+            self._use_rust_encoder = False
+            self._rust_minimal = False
+        elif mode == "minimal":
+            self._use_rust_encoder = has_minimal_rust
+            self._rust_minimal = has_minimal_rust
+        else:
+            self._use_rust_encoder = OBS_DIM == _RUST_ENCODER_OBS_DIM
+            self._rust_minimal = False
         if not getattr(BatchedBombPotEnv, "_encoder_log_once", False):
             BatchedBombPotEnv._encoder_log_once = True
             print(
                 f"[obs-encoder] rust={self._use_rust_encoder} "
+                f"rust_minimal={getattr(self, '_rust_minimal', False)} "
                 f"OBS_DIM={self._obs_dim} "
                 f"PLO5_RUST_ENCODER={os.environ.get('PLO5_RUST_ENCODER', '0')!r} "
                 f"opp_mc={self._opp_outcome_mc} "
-                f"variant={self.config.variant}"
+                f"variant={self.config.variant} obs_mode={self._obs_mode}"
             )
         stacks = np.asarray(self.config.resolved_stacks, dtype=np.uint64)
         self._be = BatchedEngine(
@@ -353,10 +386,12 @@ class BatchedBombPotEnv:
         if self._use_rust_encoder:
             # Attack #3 (2026-07-13): avoid the old partial-mask double pack
             # (features_batch full pack + encoded_subset pack+encode).
-            # - Full / mixed masks: one observation_encoded_batch, then zero
-            #   skipped rows in-place. Encoding actor==-1 is cheap (zero row).
+            # - Full / mixed masks: one observation_encoded[_minimal]_batch,
+            #   then zero skipped rows in-place. Encoding actor==-1 is cheap
+            #   (zero row).
             # - All-skipped mask: pack+aux only (observation_and_features_batch),
             #   zero obs — no encode pass at all.
+            # Minimal path emits 796 directly (no project step).
             em = None
             if encode_mask is not None:
                 em = np.asarray(encode_mask, dtype=bool)
@@ -378,7 +413,10 @@ class BatchedBombPotEnv:
                     self._unpack_post(bundle)
                 return
             with record_function("step1a_bundle/obs_features_batch"):
-                bundle = self._be.observation_encoded_batch()
+                if getattr(self, "_rust_minimal", False):
+                    bundle = self._be.observation_encoded_minimal_batch()
+                else:
+                    bundle = self._be.observation_encoded_batch()
             with record_function("step1/encoder"):
                 obs = np.asarray(bundle["obs"], dtype=np.float32)
                 if (
@@ -391,6 +429,7 @@ class BatchedBombPotEnv:
                     self._obs = obs
                 if em is not None and not bool(em.all()):
                     self._obs[~em] = 0.0
+            self._maybe_project_obs()
             with record_function("step1a_unpack/post"):
                 self._unpack_post(bundle)
             return
@@ -405,6 +444,10 @@ class BatchedBombPotEnv:
                 if self._is_nlh:
                     self._obs = encode_observation_batch_nlh(
                         bundle, cat_a, self.config
+                    )
+                elif getattr(self, "_obs_mode", "full") == "minimal":
+                    self._obs = encode_observation_batch_minimal(
+                        bundle, self.config
                     )
                 else:
                     self._obs = encode_observation_batch(
@@ -433,6 +476,8 @@ class BatchedBombPotEnv:
                     obs_sub = encode_observation_batch_nlh(
                         sub, cat_a_sub, self.config
                     )
+                elif getattr(self, "_obs_mode", "full") == "minimal":
+                    obs_sub = encode_observation_batch_minimal(sub, self.config)
                 else:
                     obs_sub = encode_observation_batch(
                         sub, cat_a_sub, cat_b_sub, self.config
@@ -442,8 +487,31 @@ class BatchedBombPotEnv:
                 else:
                     self._obs.fill(0.0)
                 self._obs[idx] = obs_sub
+        self._maybe_project_obs()
         with record_function("step1a_unpack/post"):
             self._unpack_post(bundle)
+
+
+    def _maybe_project_obs(self) -> None:
+        """Legacy no-op: minimal mode encodes 796-d directly.
+
+        Kept so call sites stay stable. If a full-width buffer ever lands
+        here (e.g. stale rust encoder path), gather via project_obs_minimal.
+        """
+        if getattr(self, "_obs_mode", "full") != "minimal":
+            return
+        full = self._obs
+        if full is None or full.shape[-1] == self._obs_dim:
+            return
+        proj = project_obs_minimal(full)
+        if (
+            self._obs is not None
+            and self._obs.shape == proj.shape
+            and self._obs.dtype == proj.dtype
+        ):
+            np.copyto(self._obs, proj)
+        else:
+            self._obs = proj
 
     def _unpack_post(self, bundle) -> None:
         """Write engine-derived caches from a full-batch observation bundle."""
@@ -490,8 +558,20 @@ class BatchedBombPotEnv:
         idx_i64 = idx.astype(np.int64)
         if self._use_rust_encoder:
             with record_function("step1a_bundle/obs_features_subset"):
-                bundle = self._be.observation_encoded_subset_batch(idx_i64)
+                if getattr(self, "_rust_minimal", False):
+                    bundle = self._be.observation_encoded_minimal_subset_batch(
+                        idx_i64
+                    )
+                else:
+                    bundle = self._be.observation_encoded_subset_batch(idx_i64)
             obs_sub = np.asarray(bundle["obs"], dtype=np.float32)
+            # Legacy safety: if a full-width buffer somehow arrives under
+            # minimal mode (stale binary), project. True minimal rust emits 796.
+            if (
+                getattr(self, "_obs_mode", "full") == "minimal"
+                and obs_sub.shape[-1] != self._obs_dim
+            ):
+                obs_sub = project_obs_minimal(obs_sub)
             actors_sub = np.asarray(bundle["actor"], dtype=np.int8)
         else:
             with record_function("step1a_bundle/obs_features_subset"):
@@ -505,6 +585,8 @@ class BatchedBombPotEnv:
                     obs_sub = encode_observation_batch_nlh(
                         bundle, cat_a, self.config
                     )
+                elif getattr(self, "_obs_mode", "full") == "minimal":
+                    obs_sub = encode_observation_batch_minimal(bundle, self.config)
                 else:
                     obs_sub = encode_observation_batch(
                         bundle, cat_a, cat_b, self.config

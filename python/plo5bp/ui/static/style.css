@@ -1242,6 +1242,37 @@ body.trainer-mode.trainer-pick #card-grid-panel {
   border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
 }
 .l-top-cta:hover { background: var(--panel-3); }
+
+/* Version release callout on the public landing page (between top bar and hero). */
+.l-announce {
+  margin: 18px 0 0;
+  max-width: 780px;
+  padding: 18px 20px 16px;
+  background: var(--panel);
+  border: 1px solid var(--border-strong);
+  border-left: 3px solid var(--brand-accent);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-1);
+}
+.l-announce .l-kicker { margin-bottom: 8px; color: var(--accent); }
+.l-announce-title {
+  margin: 0 0 12px;
+  font-size: clamp(18px, 2.6vw, 22px);
+  line-height: 1.25;
+  font-weight: 700;
+  color: var(--text-bright);
+  letter-spacing: -0.2px;
+}
+.l-announce-body {
+  margin: 0 0 10px;
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text);
+}
+.l-announce-body:last-child { margin-bottom: 0; }
+.l-announce-body b { color: var(--text-bright); font-weight: 600; }
+/* Hero sits closer under the announce card than under a bare top bar. */
+.l-announce + .l-hero { padding-top: 36px; }
 .l-kicker {
   margin: 0 0 10px; font-family: var(--mono); font-size: 11px; font-weight: 500;
   color: var(--muted); text-transform: uppercase; letter-spacing: 0.18em;

@@ -260,11 +260,16 @@ def create_ranges_router(
     formats: dict[str, dict[str, Any]],
     device: torch.device,
     nlh_ckpt_name: str = "",
+    gto_model: Any | None = None,
 ) -> APIRouter:
+    """Ranges grid. When ``gto_model`` is set (PolicyNet), use it for
+    NLH range queries so Study/Trainer/Ranges share one backend."""
     router = APIRouter()
     cache = _NodeCache()
 
     def _model():
+        if gto_model is not None:
+            return gto_model, True
         entry = formats[VARIANT_NLH]
         return entry["model"], bool(entry.get("loaded"))
 

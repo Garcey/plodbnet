@@ -19,7 +19,7 @@ Verdict split: 43 agree / 7 pick / 13 better-arch. Current obs = 1020 dims; ship
 
 ### POS-1 · Button distance (U1) — 4 dims  ★ USER SEED
 
-**Decision:** ☐ keep ☐ modify ☐ drop
+**Decision:** ☒ KEEP (ruled 2026-07-12)
 
 **What:** Hero's structural distance from the button both ways: seats after the button clockwise (first-to-act=0) and seats before it (button=0), plus table-size-normalized fractions. Counts over STRUCTURAL seats (folds ignored).
 
@@ -34,7 +34,7 @@ Verdict split: 43 agree / 7 pick / 13 better-arch. Current obs = 1020 dims; ship
 
 ### POS-2 · Live-player position (U2) — 5 dims  ★ USER SEED
 
-**Decision:** ☐ keep ☐ modify ☐ drop
+**Decision:** ☒ KEEP (ruled 2026-07-12)
 
 **What:** Hero's rank in this street's ACTUAL acting order among live acting players (non-folded, non-all-in, hero included): players before hero, players after, normalized fraction, and first/last-to-act flags. Postflop order is street-invariant, so this is also hero's future-street position modulo pending folds.
 
@@ -49,7 +49,7 @@ Verdict split: 43 agree / 7 pick / 13 better-arch. Current obs = 1020 dims; ship
 
 ### POS-3 · Players behind if call vs raise (U3) — 5 dims  ★ USER SEED
 
-**Decision:** ☐ keep ☐ modify ☐ drop
+**Decision:** ☒ KEEP (ruled 2026-07-12)
 
 **What:** Count of opponents guaranteed still to act this street if hero calls/checks (engine pending set: alive, non-all-in, not-yet-acted OR street_commit<bet_to_call) versus if hero raises (ALL alive non-all-in opponents must respond).
 
@@ -64,7 +64,7 @@ Verdict split: 43 agree / 7 pick / 13 better-arch. Current obs = 1020 dims; ship
 
 ### POS-4 · Per-seat acts-after-hero mask — 8 dims
 
-**Decision:** ☐ keep ☐ modify ☐ drop
+**Decision:** ☒ KEEP (ruled 2026-07-12)
 
 **What:** Hero-rotated 8-dim binary block: slot k=1 iff seat (hero+k) is a live acting opponent positioned AFTER hero in the static street order (button+1 clockwise) — i.e. that specific opponent has position on hero this street and every future street.
 
@@ -79,7 +79,7 @@ Verdict split: 43 agree / 7 pick / 13 better-arch. Current obs = 1020 dims; ship
 
 ### POS-5 · Per-seat acting-order field — 8 dims
 
-**Decision:** ☐ keep ☐ modify ☐ drop
+**Decision:** ☒ KEEP (ruled 2026-07-12)
 
 **What:** Hero-rotated 8-dim scalar field of the full acting order: slot k=(rank+1)/L for live acting seats (rank 0=first to act, L=acting count), 0.0 sentinel for folded/all-in/padded. Carries opponent-vs-opponent adjacency, not just each seat vs hero.
 
@@ -94,7 +94,7 @@ Verdict split: 43 agree / 7 pick / 13 better-arch. Current obs = 1020 dims; ship
 
 ### POS-6 · Next-to-respond one-hot — 8 dims
 
-**Decision:** ☐ keep ☐ modify ☐ drop
+**Decision:** ☒ KEEP (ruled 2026-07-12)
 
 **What:** Hero-rotated one-hot (8) of the first live acting opponent CLOCKWISE FROM HERO — the seat that must respond first to a hero bet/raise. Distinct from static-order features (walk continues clockwise from hero mid-street, not from the button).
 
@@ -109,7 +109,7 @@ Verdict split: 43 agree / 7 pick / 13 better-arch. Current obs = 1020 dims; ship
 
 ### POS-7 · Aggressor geometry — 4 dims
 
-**Decision:** ☐ keep ☐ modify ☐ drop
+**Decision:** ☒ KEEP (ruled 2026-07-12)
 
 **What:** Hero's relation to the current street's aggressor: in-position flag vs the bettor, acting-order gap between them, count of players who already called the current bet, and whether the aggressor is all-in.
 
@@ -125,9 +125,11 @@ Verdict split: 43 agree / 7 pick / 13 better-arch. Current obs = 1020 dims; ship
 
 ## Action history
 
+**BASE-LAYOUT MODIFICATION (ruled 2026-07-12):** the action-history window widens 32 → 50 records (+18 records × 18 dims = +324 base dims; HIST-14's aligned tail scales 64 → 100). Rationale: 50 covers every realistic hand (a violent multiway 3-street hand runs ~40-45 actions; ≥50 requires policy-pathological min-raise spam with vanishing sample probability), which retires HIST-9 entirely. Touch-points at implementation: encoding history depth constant, batched packer history_cap (PLO 32→50 — MUST equal encoder depth or every history feature shifts), Rust encoder layout, NLH's separate 40-cap untouched (its own v7 pass later). Residual: a truncated hand still silently drops oldest records — accepted at ~never frequency.
+
 ### HIST-1 · Per-player histories (U4) — 80 dims  ★ USER SEED
 
-**Decision:** ☐ keep ☐ modify ☐ drop
+**Decision:** ☒ KEEP (ruled 2026-07-12)
 
 **What:** Hero-rotated per-seat block summarizing each seat's whole-hand betting record over the FULL engine history: action counts, voluntary money in, commitment fraction, last raise size, and per-street final-aggressor flags — the per-seat marginal of the action history.
 
@@ -142,7 +144,7 @@ Verdict split: 43 agree / 7 pick / 13 better-arch. Current obs = 1020 dims; ship
 
 ### HIST-2 · Prior-street aggressor trail — 16 dims  ⚠ REMOVE-REC
 
-**Decision:** ☐ keep ☐ modify ☐ drop
+**Decision:** ☒ DROP (ruled 2026-07-12; contingency SATISFIED — HIST-1 confirmed keep 2026-07-12.)
 
 **What:** Hero-rotated one-hot (8) of the FLOP's final aggressor plus one-hot (8) of the TURN's, frozen when each street closes; all-zero for checked-through/unreached streets and the current street.
 
@@ -159,11 +161,11 @@ Verdict split: 43 agree / 7 pick / 13 better-arch. Current obs = 1020 dims; ship
 
 ### HIST-3 · Street-intensity counters — 5 dims
 
-**Decision:** ☐ keep ☐ modify ☐ drop
+**Decision:** ☒ KEEP (ruled 2026-07-12; 'why' reworded — raise-LADDER framing, not 3-bet-pot NLH shorthand)
 
 **What:** How contested the street/hand are plus hero's own role: aggressive-action count this street and hand, whether hero already acted this street, whether hero was an aggressor this street (which + facing a bet = being check-raised/3-bet).
 
-**Why:** 3-bet-pot vs single-raised vs unopened streets shift value/bluff thresholds sharply, and 'my own bet just got raised' is a different node family; today both live only in history scanning that is deep, truncation-lossy, and gate-mislabeled (all-in CALLS marked as Raise overcount aggression).
+**Why:** The raise LADDER is a nut-density statement in pot-limit (each raise multiplies the pot — the 3rd raise of a street is a different world from the 1st), and 'my own bet just got raised' is a different node family; today both live only in history scanning that is deep, truncation-lossy, and gate-mislabeled (all-in CALLS marked as Raise overcount aggression).
 
 **Final architecture** (verdict: agree): Obs-v3 tail, 5 float32. ENGINE counters exposed via observation_dict + batched arrays + Rust encoder: u16 aggression counts (street + hand) where aggression = bet_to_call strictly increased (mislabel-immune), plus per-seat aggressed_this_street bools; hero_acted reads the existing acted_this_street vec (shares POS-3's exposure). [0] log1p(aggressions_this_street); [1] log1p(aggressions_this_hand); [2] hero_acted_this_street binary; [3] hero_aggressed_this_street binary; [4] facing_checkraise = [3] AND (to_call > 0). Street counters reset at advance; empty history zeros; HU well-defined.
 
@@ -174,11 +176,11 @@ Verdict split: 43 agree / 7 pick / 13 better-arch. Current obs = 1020 dims; ship
 
 ### HIST-4 · Per-street betting digest — 20 dims
 
-**Decision:** ☐ keep ☐ modify ☐ drop
+**Decision:** ☒ KEEP (ruled 2026-07-12; 'why' reworded — pot-genealogy framing; NLH polarization language dropped)
 
 **What:** Global per-street summary for each of 4 streets: raise count, call count, check count, pot at street start (log1p /bb), and pot growth across the street (log1p pot_end_or_now/pot_start).
 
-**Why:** River decisions need 'how did the pot get built': a 3-bet flop reaching the river means polarized ranges, a checked-through flop means capped ranges — currently a 32-slot aggregation keyed on street one-hots. Raise-count 0 prior street is the checked-through stab trigger.
+**Why:** River decisions need 'how did the pot get built': a multi-raise flop reaching the river means nut-dense ranges (in DB bomb pots often one board locked), a checked-through flop means capped/board-missed ranges — currently a 32-slot aggregation keyed on street one-hots. Raise-count 0 prior street is the checked-through stab trigger.
 
 **Final architecture** (verdict: agree): Obs-v3 tail, 5 dims x 4 streets = 20 float32, street-major (preflop row structurally zero in bomb pots — kept for layout regularity, same precedent as the dead preflop slot in 156-160). Per street: aggression count raw (bet-level-increase definition; all-in calls count as calls), call count raw, check count raw, log1p(pot_at_street_start/bb), pot growth = log1p(max(pot_end_or_now - pot_start, 0)/max(pot_start, 1)) — NOT log1p(ratio), so a checked-through street reads exactly 0 (the proposed log1p(pot_end/pot_start) reads 0.69 for an unchanged pot, a normalization bug). ENGINE: four u64 pot checkpoints captured at street advance + per-street action counters; current street's growth uses pot_now. Truncation-proof by construction; encoder-only aggregation rejected for the batched-window parity reason.
 
@@ -189,7 +191,7 @@ Verdict split: 43 agree / 7 pick / 13 better-arch. Current obs = 1020 dims; ship
 
 ### HIST-5 · Last-aggression context — 9 dims
 
-**Decision:** ☐ keep ☐ modify ☐ drop
+**Decision:** ☒ KEEP (ruled 2026-07-12)
 
 **What:** Global block describing the most recent raise in the hand regardless of street: its size (pot-frac-when-made and log1p chips/bb), the street, callers-so-far, whether it was a check-raise, and how many actions ago.
 
@@ -204,7 +206,7 @@ Verdict split: 43 agree / 7 pick / 13 better-arch. Current obs = 1020 dims; ship
 
 ### HIST-6 · Per-seat current-street stance — 32 dims  ⚠ REMOVE-REC
 
-**Decision:** ☐ keep ☐ modify ☐ drop
+**Decision:** ☒ DROP (ruled 2026-07-12; contingency SATISFIED — HIST-13 confirmed keep 2026-07-12.)
 
 **What:** Per seat, a 4-way one-hot of the seat's most recent action THIS street: {none-yet, checked, called/matched, raised}; all-zero for folded-out seats.
 
@@ -221,7 +223,7 @@ Verdict split: 43 agree / 7 pick / 13 better-arch. Current obs = 1020 dims; ship
 
 ### HIST-7 · Line-pattern flags per seat — 24 dims
 
-**Decision:** ☐ keep ☐ modify ☐ drop
+**Decision:** ☒ KEEP (ruled 2026-07-12)
 
 **What:** Per seat, three whole-hand line-shape booleans: check-raised (checked then raised within a street), donk-led (made a street's first raise while not the prior street's final aggressor, acting before it), and re-raised (3-bet+: raised over a raise).
 
@@ -236,7 +238,7 @@ Verdict split: 43 agree / 7 pick / 13 better-arch. Current obs = 1020 dims; ship
 
 ### HIST-8 · Raise-size ladder — 9 dims
 
-**Decision:** ☐ keep ☐ modify ☐ drop
+**Decision:** ☒ KEEP (ruled 2026-07-12)
 
 **What:** The raises-only subsequence of the hand compressed: the last 4 raises newest-first, each as (pot-frac-when-made, log1p chips/bb), plus a flag for strictly escalating pot-fractions.
 
@@ -251,7 +253,7 @@ Verdict split: 43 agree / 7 pick / 13 better-arch. Current obs = 1020 dims; ship
 
 ### HIST-9 · Hand-shape counters + truncation repair — 4 dims
 
-**Decision:** ☐ keep ☐ modify ☐ drop
+**Decision:** ☒ DROP — SUPERSEDED (ruled 2026-07-12): the base history window widens 32→50 records instead (+324 dims; see 'Base-layout modifications' note at top of the History section). Truncation becomes astronomically rare, [0]/[1] counts are linearly derivable from an untruncated window, and [3] ante-pot ≡ HIST-4's flop pot-checkpoint. Nothing left to carry.
 
 **What:** Global scalars: total actions this hand, actions this street, raises this hand, raises this street, an explicit history-truncated flag (full length>32), and the ante pot (live seats x ante, /bb).
 
@@ -266,7 +268,7 @@ Verdict split: 43 agree / 7 pick / 13 better-arch. Current obs = 1020 dims; ship
 
 ### HIST-10 · Decayed aggression per seat — 16 dims  ⚠ REMOVE-REC
 
-**Decision:** ☐ keep ☐ modify ☐ drop
+**Decision:** ☒ DROP (ruled 2026-07-12; contingency SATISFIED — HIST-1 + HIST-13 both confirmed keep 2026-07-12.)
 
 **What:** Per seat, two exponentially street-decayed scalars: aggression score = sum over that seat's raises of 0.5^(streets ago) (current street weight 1), and the same-decay call score. Fixed decay constant.
 
@@ -283,7 +285,7 @@ Verdict split: 43 agree / 7 pick / 13 better-arch. Current obs = 1020 dims; ship
 
 ### HIST-11 · Current-bet response map — 9 dims
 
-**Decision:** ☐ keep ☐ modify ☐ drop
+**Decision:** ☒ KEEP (ruled 2026-07-12)
 
 **What:** Per seat, a live flag 'has matched the current outstanding bet this street', plus a global count of callers of the live bet, plus a hero-was-raised flag (hero has chips in this street AND faces a bet — being check-raised/3-bet right now).
 
@@ -298,7 +300,7 @@ Verdict split: 43 agree / 7 pick / 13 better-arch. Current obs = 1020 dims; ship
 
 ### HIST-12 · Dead-money & fold-timing — 34 dims  ⚠ REMOVE-REC
 
-**Decision:** ☐ keep ☐ modify ☐ drop
+**Decision:** ☒ DROP (ruled 2026-07-12 — user + panel: fold-street placement lives in HIST-13's Fold cells, dead-money scalars in STK-8's merged arch. For the record: folded seats' antes/bets do stay in the pot, but that value is already inside the pot scalar — nothing informational is lost.)
 
 **What:** Per folded seat, WHICH street it folded on (4-way one-hot, all-zero while live), plus two global scalars: dead-money fraction of pot (chips from now-folded seats / pot) and log1p dead money /bb.
 
@@ -315,7 +317,7 @@ Verdict split: 43 agree / 7 pick / 13 better-arch. Current obs = 1020 dims; ship
 
 ### HIST-13 · Seat-street last-gate matrix — 96 dims
 
-**Decision:** ☐ keep ☐ modify ☐ drop
+**Decision:** ☒ KEEP (ruled 2026-07-12)
 
 **What:** The full 'who did what when' table: for every seat and street, a 4-way one-hot {checked, called, raised, folded} of that seat's LAST action on that street (all-zero = no action). The maximalist linear-readable line summary of every player.
 
@@ -330,7 +332,7 @@ Verdict split: 43 agree / 7 pick / 13 better-arch. Current obs = 1020 dims; ship
 
 ### HIST-14 · History record enrichment: all-in + stack-after — 64 dims
 
-**Decision:** ☐ keep ☐ modify ☐ drop
+**Decision:** ☒ KEEP (ruled 2026-07-12) — SCALES with the widened window: 2 dims × 50 records = 100 dims (was 64).
 
 **What:** Widen each of the 32 history records by 2 dims: a flag that the action left the actor all-in, and the actor's remaining stack AFTER the action (log1p /bb) — per-record stack context.
 
@@ -383,7 +385,7 @@ Verdict split: 43 agree / 7 pick / 13 better-arch. Current obs = 1020 dims; ship
 
 ### STK-3 · pairwise_eff_spr — 8 dims  ⚠ REMOVE-REC
 
-**Decision:** ☐ keep ☐ modify ☐ drop
+**Decision:** ☒ DROP (ruled 2026-07-12 — one ReLU recovers the elementwise min from the existing per-seat SPR block; STK-7 covers the implied-odds use in 2 dims.)
 
 **What:** Per-seat money hero can actually play for against THAT specific opponent: log1p(min(eff_hero, eff_seat)/pot), hero-rotated, folded/non-exist seats 0.
 
@@ -400,7 +402,7 @@ Verdict split: 43 agree / 7 pick / 13 better-arch. Current obs = 1020 dims; ship
 
 ### STK-4 · seat_commitment_ratio — 8 dims
 
-**Decision:** ☐ keep ☐ modify ☐ drop
+**Decision:** ☒ KEEP at 8 dims — ratio block only (revised ruling 2026-07-12): the requested absolute-committed companion must EXCLUDE antes (voluntary chips only), which makes it an EXACT duplicate of HIST-1's column [4] (log1p voluntary-invested/bb, per seat, antes never recorded). Since HIST-1 ships, the absolute column already exists once; no third copy. The ratio-vs-absolute story the user wants (same 50bb committed = 50% of a 100bb start but 25% of 200bb) is carried by the STK-4 ratio + HIST-1[4] pair. (Note: STK-4's ratio uses total_commit INCLUDING antes — dim-1009 recipe — while HIST-1[4] is voluntary-only; that asymmetry is documented and intentional.)
 
 **What:** Per-seat commitment fraction commit_s/(commit_s+eff_stack_s) in [0,1] — how pot-stuck each player is (1.0=all-in), hero-rotated.
 
@@ -430,7 +432,7 @@ Verdict split: 43 agree / 7 pick / 13 better-arch. Current obs = 1020 dims; ship
 
 ### STK-6 · geometric_jam_plan — 2 dims
 
-**Decision:** ☐ keep ☐ modify ☐ drop
+**Decision:** ☒ KEEP (ruled 2026-07-12 — user: the geometric plan is exactly the streets×SPR interaction wanted.)
 
 **What:** Two planning scalars: bets_to_jam = ceil(log3(1+2*SPR_eff)) (successive pot-bet-and-call rounds until all-in, HU) and geometric_frac = ((1+2*SPR_eff)^(1/r)-1)/2 with r = streets remaining incl current — the per-street pot fraction that exactly jams by the river.
 
@@ -543,7 +545,7 @@ Verdict split: 43 agree / 7 pick / 13 better-arch. Current obs = 1020 dims; ship
 
 ### BRD-2 · board_suit_census — 10 dims
 
-**Decision:** ☐ keep ☐ modify ☐ drop
+**Decision:** ☒ KEEP, MODIFIED (ruled 2026-07-12 — user): split the ≥4 flag into ==4 and ==5 flags per board → 12 dims total. Rationale: under the exactly-2-hole rule a 4th/5th board suit card never changes WHO can flush — only blocker combinatorics (36→28 unseen suit pairs) and which board triple plays — so the count deserves full granularity.)
 
 **What:** Board-only suit texture between existing thresholds: per-suit 'exactly 2 of this suit on board' flags (flush-draw-possible for anyone) plus a 'four-plus flush cards on board' flag, per board.
 
@@ -558,7 +560,7 @@ Verdict split: 43 agree / 7 pick / 13 better-arch. Current obs = 1020 dims; ship
 
 ### BRD-3 · straight_pair_wetness — 2 dims
 
-**Decision:** ☐ keep ☐ modify ☐ drop
+**Decision:** ☒ DROP (ruled 2026-07-12 — user: redundant with window flags/BRD-6, and the MC behind-fractions already price completing-combo multiplicity dynamically; in PLO5 non-nut straights are near-dead, so per-combo wetness overweights them.)
 
 **What:** Count of DISTINCT 2-rank combinations that complete a straight on this board (over all windows, deduped), per board — the canonical 'how many two-card hands just made a straight' wetness scalar.
 
@@ -638,7 +640,7 @@ Verdict split: 43 agree / 7 pick / 13 better-arch. Current obs = 1020 dims; ship
 
 ### BRD-8 · fd_rank_quality — 4 dims
 
-**Decision:** ☐ keep ☐ modify ☐ drop
+**Decision:** ☒ KEEP (ruled 2026-07-12 — user confirmed after fact-check: made-flush nut distance + nut-draw-outs exist, but non-nut draw grading does not).
 
 **What:** Per board, for hero's live flush draw (hero >=2 of a suit with exactly 2 on board): the high card rank of hero's draw suit /12, and the count of unseen higher cards of that suit (draw-suit nut distance) — zero when no draw.
 
@@ -827,6 +829,8 @@ Verdict split: 43 agree / 7 pick / 13 better-arch. Current obs = 1020 dims; ship
 
 
 ## Monte-Carlo / equity extensions
+
+**CATEGORY PARKED (2026-07-12):** user deferred the entire EQ section — the NLH-flavored semi-bluff framing needs a DB-bomb-pot rethink, and these carry real Rust MC cost. Revisit after the other categories are settled. (Removal recs EQ-2/EQ-11/EQ-13 stand provisionally.)
 
 ### EQ-1 · nut_combo_density — 2 dims
 

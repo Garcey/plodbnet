@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CFR Solver — NLH</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <header id="topbar">
+      <div class="brand">
+        <span class="brand-mark">♠</span>
+        <span class="brand-name">CFR<span class="accent">Solver</span></span>
+        <span class="brand-sub">NLH native</span>
+      </div>
+      <nav id="tabs">
+        <button type="button" class="tab active" data-panel="builder">Solve</button>
+        <button type="button" class="tab" data-panel="viewer">Strategy</button>
+        <button type="button" class="tab" data-panel="library">Library</button>
+      </nav>
+      <div class="top-status">
+        <span id="rust-badge" class="badge badge-unknown">CFR …</span>
+        <span id="job-badge" class="badge badge-idle">idle</span>
+      </div>
+    </header>
+
+    <main id="app">
+      <!-- ============== SOLVE / TREE BUILDER ============== -->
+      <section id="panel-builder" class="panel active">
+        <div class="layout-solve">
+          <aside class="card side-col">
+            <h2>Presets</h2>
+            <div id="preset-list" class="preset-list"></div>
+            <div class="divider"></div>
+            <button type="button" id="btn-kuhn" class="btn btn-ghost btn-block">Solve Kuhn (NE gate)</button>
+            <p class="hint">Correctness check — value ≈ −1/18. Result stays here, not in Strategy.</p>
+          </aside>
+
+          <div class="card grow">
+            <div class="street-bar">
+              <label class="inline-lab">Street
+                <select id="f-street">
+                  <option value="0">Preflop</option>
+                  <option value="1">Flop</option>
+                  <option value="2">Turn</option>
+                  <option value="3" selected>River</option>
+                </select>
+              </label>
+              <label class="inline-lab">Seats
+                <input id="f-seats" type="number" min="2" max="6" value="2" />
+              </label>
+              <label class="inline-lab">Pot (bb)
+                <input id="f-pot" type="number" step="0.1" min="0.1" value="10" />
+              </label>
+              <label class="inline-lab">Stack (bb)
+                <input id="f-stack" type="number" step="0.5" min="0.5" value="50" />
+              </label>
+            </div>
+
+            <h3>Board</h3>
+            <div class="board-row">
+              <div id="board-slots" class="board-slots"></div>
+              <button type="button" id="btn-clear-board" class="btn btn-ghost btn-sm">Clear</button>
+              <button type="button" id="btn-random-board" class="btn btn-ghost btn-sm">Random</button>
+            </div>
+            <div id="card-picker" class="card-picker"></div>
+
+            <div class="two-col-config">
+              <div>
+                <h3>Sizing</h3>
+                <div class="form-grid">
+                  <label>Size preset
+                    <select id="f-size-preset">
+                      <option value="micro">micro</option>
+                      <option value="coarse">coarse</option>
+                      <option value="standard" selected>standard</option>
+                      <option value="fine">fine</option>
+                      <option value="custom">custom / push-fold</option>
+                    </select>
+                  </label>
+                  <label>Raise sizes (‰ pot)
+                    <input id="f-sizes" type="text" value="330,500,750,1000,1500" />
+                  </label>
+                  <label>Algorithm
+                    <select id="f-algo">
+                      <option value="dcfr" selected>dcfr</option>
+                      <option value="mccfr_es">mccfr_es</option>
+                    </select>
+                  </label>
+                  <label>Card abstraction
+                    <select id="f-abs">
+                      <option value="none" selected>none</option>
+                      <option value="ochs">ochs (flop)</option>
+                    </select>
+                  </label>
+                  <label class="check"><input id="f-allin" type="checkbox" checked /> All-in atom</label>
+                </div>
+              </div>
+              <div>
+                <h3>Stakes <span class="muted">(chips)</span></h3>
+                <div class="form-grid">
+                  <label>BB
+                    <input id="f-bb" type="number" value="10000" />
+                  </label>
+                  <label>SB
+                    <input id="f-sb" type="number" value="5000" />
+                  </label>
+                  <label>Ante
+                    <input id="f-ante" type="number" value="5000" />
+                  </label>
+                  <label>Multiway stacks (bb)
+                    <input id="f-stacks" type="text" placeholder="100,100,80" />
+                  </label>
+                </div>
+              </div>
+            </div>
+
+            <h3>Ranges</h3>
+            <p class="hint">Empty = 100% random. Click the grid or type labels (<code>AA,KK,AKs</code>).</p>
+            <div class="range-editor">
+              <div class="range-tabs">
+                <button type="button" class="btn btn-ghost btn-sm active" id="btn-range-oop-tab" data-which="oop">OOP</button>
+                <button type="button" class="btn btn-ghost btn-sm" id="btn-range-ip-tab" data-which="ip">IP</button>
+                <button type="button" id="btn-range-aa" class="btn btn-ghost btn-sm">AA,KK</button>
+                <button type="button" id="btn-range-clear" class="btn btn-ghost btn-sm">Clear (100%)</button>
+              </div>
+              <div id="range-grid" class="range-grid"></div>
+              <div class="form-grid">
+                <label>OOP range
+                  <textarea id="f-range-oop" rows="2" placeholder="empty = 100%"></textarea>
+                </label>
+                <label>IP range
+                  <textarea id="f-range-ip" rows="2" placeholder="empty = 100%"></textarea>
+                </label>
+              </div>
+            </div>
+
+            <div class="btn-row">
+              <button type="button" id="btn-tree-preview" class="btn btn-ghost btn-sm">Preview tree</button>
+            </div>
+            <div id="tree-preview" class="tree-preview muted">Preview the abstract action tree for this root.</div>
+          </div>
+
+          <aside class="card solve-col">
+            <h2>Solve</h2>
+            <div class="form-grid form-grid-1">
+              <label class="check"><input id="c-unlimited" type="checkbox" /> Unlimited (until Stop)</label>
+              <label>Max iterations
+                <input id="c-iters" type="number" min="0" value="200" />
+              </label>
+              <p class="hint" id="c-iters-hint">0 or Unlimited = run until Pause/Stop.</p>
+              <label>Threads
+                <input id="c-threads" type="number" min="1" value="4" />
+              </label>
+              <label>Target expl (bb, 0=off)
+                <input id="c-expl" type="number" step="0.01" value="0" />
+              </label>
+              <label>Time budget (s, 0=off)
+                <input id="c-time" type="number" step="1" min="0" value="0" />
+              </label>
+              <label>Progress every N iters
+                <input id="c-poll" type="number" min="1" value="50" />
+              </label>
+              <label>Seed
+                <input id="c-seed" type="number" value="0" />
+              </label>
+              <label class="check"><input id="c-iso" type="checkbox" checked /> Suit isomorphism</label>
+            </div>
+            <div class="btn-row solve-transport">
+              <button type="button" id="btn-solve" class="btn btn-primary" title="Start">▶ Play</button>
+              <button type="button" id="btn-pause" class="btn btn-ghost" disabled title="Pause">⏸ Pause</button>
+              <button type="button" id="btn-resume" class="btn btn-ghost" disabled title="Resume">▶ Resume</button>
+              <button type="button" id="btn-stop" class="btn btn-danger" disabled title="Stop">■ Stop</button>
+            </div>
+            <div class="btn-row">
+              <button type="button" id="btn-validate" class="btn btn-ghost">Validate</button>
+              <button type="button" id="btn-view-job" class="btn btn-ghost" disabled>Open strategy</button>
+            </div>
+            <div id="solve-status" class="solve-status">
+              <div class="status-line"><span class="k">Status</span><span id="st-status">idle</span></div>
+              <div class="status-line"><span class="k">Job</span><span id="st-job">—</span></div>
+              <div class="status-line"><span class="k">Elapsed</span><span id="st-elapsed">—</span></div>
+              <div class="status-line"><span class="k">Iters</span><span id="st-iters">—</span></div>
+              <div class="status-line"><span class="k">Expl</span><span id="st-expl">—</span></div>
+              <div class="status-line"><span class="k">Infosets</span><span id="st-ninfo">—</span></div>
+              <div class="progress-track"><div id="st-progress-bar" class="progress-bar"></div></div>
+              <pre id="st-notes" class="notes"></pre>
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <!-- ============== STRATEGY VIEWER ============== -->
+      <section id="panel-viewer" class="panel">
+        <div class="viewer-gtow">
+          <div class="viewer-topbar card">
+            <div class="viewer-topbar-left">
+              <h2 id="view-title" class="view-title-inline">Strategy</h2>
+              <span id="view-meta-chips" class="view-meta-chips muted">No solution loaded</span>
+            </div>
+            <div class="viewer-topbar-right">
+              <input type="file" id="upload-file" accept=".json,application/json" class="hidden" />
+              <button type="button" id="btn-upload" class="btn btn-primary btn-sm">Open solution…</button>
+              <button type="button" id="btn-export" class="btn btn-ghost btn-sm" disabled>Export copy</button>
+              <div class="mode-toggle">
+                <button type="button" id="btn-show-matrix" class="btn btn-ghost btn-sm active">Matrix</button>
+                <button type="button" id="btn-show-table" class="btn btn-ghost btn-sm">Table</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="card tree-strip-card line-nav-card">
+            <div class="tree-strip-head">
+              <span class="tree-strip-label">Line</span>
+              <span id="line-actor" class="line-actor muted">—</span>
+            </div>
+            <div id="line-breadcrumb" class="line-breadcrumb muted">Load a solution, then play an action to walk the tree.</div>
+            <div id="action-tree-strip" class="line-actions">
+              <div class="muted tree-empty">Action buttons appear here once a node is loaded.</div>
+            </div>
+            <div id="node-agg" class="node-agg hidden"></div>
+            <span id="tree-breadcrumb" class="hidden"></span>
+          </div>
+
+          <div class="viewer-main">
+            <div class="card grow matrix-card">
+              <div id="matrix-wrap" class="matrix-wrap">
+                <div id="matrix" class="matrix"></div>
+                <div id="matrix-legend" class="matrix-legend"></div>
+              </div>
+              <div id="table-wrap" class="table-wrap hidden">
+                <div class="table-filters">
+                  <label>Seat
+                    <select id="v-seat"><option value="">all</option></select>
+                  </label>
+                  <label>Hand / id
+                    <input id="v-hand" type="text" placeholder="AKs, AA, AsKh…" />
+                  </label>
+                  <button type="button" id="btn-filter" class="btn btn-ghost btn-sm">Apply</button>
+                </div>
+                <table id="hand-table">
+                  <thead>
+                    <tr>
+                      <th>Hand</th>
+                      <th>Seat</th>
+                      <th>Path</th>
+                      <th>Strategy</th>
+                      <th>Primary</th>
+                    </tr>
+                  </thead>
+                  <tbody></tbody>
+                </table>
+                <div class="pager">
+                  <button type="button" id="btn-prev" class="btn btn-ghost btn-sm">Prev</button>
+                  <span id="page-info">—</span>
+                  <button type="button" id="btn-next" class="btn btn-ghost btn-sm">Next</button>
+                </div>
+              </div>
+            </div>
+
+            <aside class="card detail-pane">
+              <h2>Hand detail</h2>
+              <div id="hand-detail" class="hand-detail muted">Select a cell or row.</div>
+              <div class="divider"></div>
+              <h2>Nodes</h2>
+              <div id="node-list" class="node-list"></div>
+              <div class="divider"></div>
+              <div id="view-summary" class="view-summary muted">No strategy loaded.</div>
+              <div class="divider"></div>
+              <div id="quality-panel" class="quality-panel muted">Quality metrics appear after load.</div>
+              <div class="divider"></div>
+              <h2>Compare</h2>
+              <p class="hint">L1 vs another library file (same hands).</p>
+              <label>Path B
+                <input id="cmp-path" type="text" placeholder="data/cfr/…" />
+              </label>
+              <button type="button" id="btn-compare" class="btn btn-ghost btn-block">Compare</button>
+              <pre id="cmp-out" class="notes"></pre>
+              <div id="line-tree" class="hidden"></div>
+            </aside>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============== LIBRARY ============== -->
+      <section id="panel-library" class="panel">
+        <div class="card">
+          <div class="viewer-toolbar">
+            <h2>Strategy library</h2>
+            <div class="btn-row" style="margin-top:0">
+              <input id="lib-filter" type="text" placeholder="Filter name / path…" />
+              <button type="button" id="btn-upload-lib" class="btn btn-primary btn-sm">Upload solution…</button>
+              <button type="button" id="btn-refresh-lib" class="btn btn-ghost btn-sm">Refresh</button>
+            </div>
+          </div>
+          <p class="hint">Scans <code>data/cfr/**</code>. Click a row to open in Strategy.</p>
+          <table id="lib-table">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Kind</th>
+                <th>Street</th>
+                <th>Expl</th>
+                <th>Infosets</th>
+                <th>Size</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <div id="toast" class="toast hidden"></div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

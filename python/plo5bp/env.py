@@ -33,7 +33,12 @@ from plo5bp.actions import (
     gate_mask_from_bounds,
 )
 from plo5bp.config import VARIANT_NLH, GameConfig
-from plo5bp.encoding import OBS_DIM, encode_observation
+from plo5bp.encoding import (
+    OBS_DIM,
+    OBS_DIM_MINIMAL,
+    encode_observation_minimal,
+    encode_observation,
+)
 from plo5bp.encoding_nlh import OBS_DIM_NLH, encode_observation_nlh
 
 
@@ -73,8 +78,17 @@ class BombPotEnv:
         self,
         config: GameConfig | None = None,
         ev_runout_samples: int = 0,
+        obs_mode: str = "full",
     ):
         self.config = config or GameConfig()
+        mode = str(obs_mode or "full").strip().lower()
+        if mode not in ("full", "minimal"):
+            raise ValueError(
+                f"obs_mode must be 'full' or 'minimal', got {obs_mode!r}"
+            )
+        if mode == "minimal" and self.config.variant == VARIANT_NLH:
+            raise ValueError("obs_mode=minimal is PLO-only (not NLH)")
+        self._obs_mode = mode
         stacks = np.asarray(self.config.resolved_stacks, dtype=np.uint64)
         self._rs = _RustGameState(
             num_seats=self.config.num_seats,
@@ -85,10 +99,13 @@ class BombPotEnv:
             variant=self.config.variant,
             sb=self.config.sb,
         )
-        # Per-variant observation layout: PLO5 991 dims, NLH 995.
+        # Per-variant observation layout: PLO full 1171 / minimal 796, NLH 995.
         if self.config.variant == VARIANT_NLH:
             self._obs_dim = OBS_DIM_NLH
             self._encode = encode_observation_nlh
+        elif mode == "minimal":
+            self._obs_dim = OBS_DIM_MINIMAL
+            self._encode = encode_observation_minimal
         else:
             self._obs_dim = OBS_DIM
             self._encode = encode_observation
@@ -292,7 +309,8 @@ class BombPotEnv:
         return np.asarray(self._rs.legal_action_mask(), dtype=bool)
 
     def _pack_obs(self) -> tuple[np.ndarray, StepInfo]:
-        raw = dict(self._rs.observation_dict())
+        skip_mc = getattr(self, "_obs_mode", "full") == "minimal"
+        raw = dict(self._rs.observation_dict(skip_outcome_mc=skip_mc))
         mask = np.asarray(self._rs.legal_action_mask(), dtype=bool)
         min_raise = int(raw.get("min_raise", 0))
         max_raise = int(raw.get("max_raise", 0))

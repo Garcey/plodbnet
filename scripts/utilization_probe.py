@@ -66,14 +66,23 @@ _SCHEMA_KEYS = (
 # --------------------------------------------------------------------------
 # Probe batch: real decision nodes (ported from q_head_audit_pooled.py)
 # --------------------------------------------------------------------------
-def gen_nodes(cfg, n_seeds, street="flop", bet="pot", seed0=0, max_nodes=None):
+def gen_nodes(
+    cfg,
+    n_seeds,
+    street="flop",
+    bet="pot",
+    seed0=0,
+    max_nodes=None,
+    obs_mode="full",
+):
     """Deal `n_seeds` hands, advance to a chosen street, apply ONE pot/min
     raise, and keep the resulting node when the next actor exists and can
     fold. Returns (obs (N, OBS) f32, opp (N, 5, hole_w) u8, masks (N, 3) bool).
 
     Per-seed logic is identical to the q-head audit's `gen_nodes`; `max_nodes`
-    only lets the caller stop early once it has enough nodes."""
-    env = BombPotEnv(cfg)
+    only lets the caller stop early once it has enough nodes.
+    `obs_mode` must match the checkpoint (full=1171, minimal=796)."""
+    env = BombPotEnv(cfg, obs_mode=obs_mode)
     obs_rows, opp_rows, mask_rows = [], [], []
     for seed in range(seed0, seed0 + n_seeds):
         if max_nodes is not None and len(obs_rows) >= max_nodes:
@@ -107,10 +116,10 @@ def gen_nodes(cfg, n_seeds, street="flop", bet="pot", seed0=0, max_nodes=None):
     )
 
 
-def build_probe_batch(rows):
+def build_probe_batch(rows, obs_mode="full"):
     """Assemble ~rows/3 fold-legal flop nodes from each of three tables:
     default 20bb 6-max, deep (150bb) 6-max, and deep (150bb) heads-up.
-    Total is capped at `rows`."""
+    Total is capped at `rows`. `obs_mode` must match the checkpoint."""
     per = max(1, rows // 3)
     specs = [
         (GameConfig(), 0),
@@ -123,7 +132,7 @@ def build_probe_batch(rows):
     for cfg, seed0 in specs:
         o, h, m = gen_nodes(
             cfg, n_seeds=per * 2 + 1000, street="flop", bet="pot",
-            seed0=seed0, max_nodes=per,
+            seed0=seed0, max_nodes=per, obs_mode=obs_mode,
         )
         o, h, m = o[:per], h[:per], m[:per]
         obs_list.append(o)
@@ -357,7 +366,10 @@ def load_ckpt(path):
         p.requires_grad_(False)
     for p in critic.parameters():
         p.requires_grad_(False)
-    return actor, critic
+    obs_mode = str(cfgb.get("obs_mode", "full") or "full").strip().lower()
+    if obs_mode not in ("full", "minimal"):
+        obs_mode = "full"
+    return actor, critic, obs_mode
 
 
 def main(argv=None):
@@ -373,16 +385,17 @@ def main(argv=None):
 
     t0 = time.time()
     print(f"loading {args.ckpt} ...")
-    actor, critic = load_ckpt(args.ckpt)
+    actor, critic, obs_mode = load_ckpt(args.ckpt)
     print(f"actor: {type(actor).__name__}  hidden={actor.torso[0][0].out_features}"
-          f"  torso-linears={len(_torso_linear_names(actor))}")
+          f"  torso-linears={len(_torso_linear_names(actor))}"
+          f"  obs_mode={obs_mode}")
     print(f"critic: {type(critic).__name__}  "
           f"hidden={critic.torso[0][0].out_features}  "
           f"q_actions={getattr(critic, 'q_actions', 0)}  "
           f"value_bins={getattr(critic, 'value_bins', 0)}")
 
-    print(f"building probe batch (target {args.rows} rows) ...")
-    obs, opp, masks = build_probe_batch(args.rows)
+    print(f"building probe batch (target {args.rows} rows, obs_mode={obs_mode}) ...")
+    obs, opp, masks = build_probe_batch(args.rows, obs_mode=obs_mode)
     n_rows = int(obs.shape[0])
     print(f"probe rows: {n_rows}")
 

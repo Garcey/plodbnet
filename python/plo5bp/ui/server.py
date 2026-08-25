@@ -35,12 +35,17 @@ from plo5bp.actions import (
     GATE_RAISE,
 )
 from plo5bp.config import GameConfig, VARIANT_NLH, VARIANT_PLO5
+
+# UI-only format id: same engine rules as PLO5 double-board bomb pot, but
+# serves the minimal-obs ablation stem (vMin1). Not a GameConfig.variant.
+FORMAT_EXPERIMENTAL = "experimental"
 from plo5bp.encoding import encode_observation
 from plo5bp.env import BombPotEnv
-from plo5bp.encoding import OBS_DIM
+from plo5bp.encoding import OBS_DIM, OBS_DIM_MINIMAL
 from plo5bp.network import (
     ActorCritic,
     ActorCriticV4,
+    ActorCriticV5,
     CentralCritic,
     build_actor_from_state_dict,
     build_critic_from_state_dict,
@@ -104,16 +109,42 @@ def _resolve_device() -> str:
 
 #: Per-format checkpoint resolution. The PLO5 arm keeps the historical
 #: env var + stub path; NLH gets its own pair so `cp checkpoints/nlh1_X.pt
-#: checkpoints/nlh_stub.pt` is the NLH promote flow.
+#: checkpoints/nlh_stub.pt` is the NLH promote flow. Experimental resolves
+#: the newest `checkpoints/vMin1_*.pt` (or stem `vMin1.pt`) unless
+#: PLO5BP_CHECKPOINT_EXPERIMENTAL overrides.
 _FORMAT_CKPTS = {
     VARIANT_PLO5: ("PLO5BP_CHECKPOINT", "checkpoints/stub.pt"),
     VARIANT_NLH: ("PLO5BP_CHECKPOINT_NLH", "checkpoints/nlh_stub.pt"),
+    FORMAT_EXPERIMENTAL: ("PLO5BP_CHECKPOINT_EXPERIMENTAL", ""),
 }
+
+
+def _latest_vmin1_ckpt(ckpt_dir: Path | None = None) -> Path | None:
+    """Newest numbered vMin1 snapshot, else the stem file, else None."""
+    d = ckpt_dir if ckpt_dir is not None else Path("checkpoints")
+    numbered = sorted(
+        d.glob("vMin1_*.pt"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if numbered:
+        return numbered[0]
+    stem = d / "vMin1.pt"
+    return stem if stem.exists() else None
 
 
 def _format_ckpt_path(variant: str) -> Path:
     env_key, default = _FORMAT_CKPTS[variant]
-    return Path(os.environ.get(env_key, default))
+    override = os.environ.get(env_key, "").strip()
+    if override:
+        return Path(override)
+    if variant == FORMAT_EXPERIMENTAL:
+        latest = _latest_vmin1_ckpt()
+        if latest is not None:
+            return latest
+        # Missing file → _load_model falls back to random-init placeholder.
+        return Path("checkpoints/vMin1.pt")
+    return Path(default)
 
 
 def _random_init_model(variant: str) -> ActorCritic:
@@ -121,13 +152,21 @@ def _random_init_model(variant: str) -> ActorCritic:
     PLO fallback keeps the historical v1 128×2 shape; NLH needs a
     correctly-shaped v4 (995-dim obs, 12-anchor ladder) so the format is
     still explorable before the first promote — flagged un-loaded so the
-    UI can badge the recommendations as untrained."""
+    UI can badge the recommendations as untrained. Experimental mirrors
+    the vMin1 ablation (796-d minimal obs, mixture head)."""
     if variant == VARIANT_NLH:
         return ActorCriticV4(
             hidden_dim=128,
             obs_dim=OBS_DIM_NLH,
             num_layers=2,
             anchor_spec=NLH_ANCHOR_SPEC,
+        )
+    if variant == FORMAT_EXPERIMENTAL:
+        return ActorCriticV5(
+            hidden_dim=128,
+            obs_dim=OBS_DIM_MINIMAL,
+            num_layers=2,
+            anchor_spec=PLO_ANCHOR_SPEC,
         )
     return ActorCritic(hidden_dim=128, num_layers=2)
 
@@ -232,7 +271,12 @@ def _load_critic(device: torch.device, variant: str = VARIANT_PLO5) -> CentralCr
             ckpt_path, e,
         )
         return None
-    serve_obs_dim = OBS_DIM_NLH if variant == VARIANT_NLH else OBS_DIM
+    if variant == VARIANT_NLH:
+        serve_obs_dim = OBS_DIM_NLH
+    elif variant == FORMAT_EXPERIMENTAL:
+        serve_obs_dim = OBS_DIM_MINIMAL
+    else:
+        serve_obs_dim = OBS_DIM
     if critic.obs_dim != serve_obs_dim:
         logger.warning(
             "checkpoint %s critic obs width %d != %s serve width %d — "
@@ -266,6 +310,9 @@ NLH_CRITIC = _load_critic(MODEL_DEVICE, VARIANT_NLH)
 #: untrained. Promote flows: PLO5 `cp checkpoints/<run>.pt
 #: checkpoints/stub.pt`; NLH `cp checkpoints/nlh<N>_<u>.pt
 #: checkpoints/nlh_stub.pt` — restart to pick up.
+EXP_MODEL, EXP_MODEL_LOADED = _load_model(FORMAT_EXPERIMENTAL)
+EXP_CRITIC = _load_critic(MODEL_DEVICE, FORMAT_EXPERIMENTAL)
+
 FORMATS: dict[str, dict[str, Any]] = {
     VARIANT_PLO5: {
         "label": "PLO5 Double Board Bomb Pot",
@@ -273,6 +320,7 @@ FORMATS: dict[str, dict[str, Any]] = {
         "critic": MODEL_CRITIC,
         "adapter": OBS_ADAPT,
         "loaded": MODEL_LOADED,
+        "engine_variant": VARIANT_PLO5,
     },
     VARIANT_NLH: {
         "label": "NLH 5/10 ($5 ante)",
@@ -280,8 +328,45 @@ FORMATS: dict[str, dict[str, Any]] = {
         "critic": NLH_CRITIC,
         "adapter": obs_adapter(NLH_MODEL),
         "loaded": NLH_MODEL_LOADED,
+        "engine_variant": VARIANT_NLH,
+    },
+    FORMAT_EXPERIMENTAL: {
+        "label": "experimental",
+        "model": EXP_MODEL,
+        "critic": EXP_CRITIC,
+        "adapter": obs_adapter(EXP_MODEL),
+        "loaded": EXP_MODEL_LOADED,
+        # Same table rules as PLO5; only the policy/obs differ.
+        "engine_variant": VARIANT_PLO5,
+        "_ckpt_path": str(_format_ckpt_path(FORMAT_EXPERIMENTAL)),
     },
 }
+
+
+def _maybe_reload_experimental() -> None:
+    """If a newer vMin1 snapshot appeared on disk since boot (or last
+    switch), hot-swap the experimental format's model/critic/adapter.
+    No-op when PLO5BP_CHECKPOINT_EXPERIMENTAL pins a path, or when the
+    resolved path is unchanged / unloadable."""
+    if os.environ.get("PLO5BP_CHECKPOINT_EXPERIMENTAL", "").strip():
+        return
+    entry = FORMATS.get(FORMAT_EXPERIMENTAL)
+    if entry is None:
+        return
+    path = _format_ckpt_path(FORMAT_EXPERIMENTAL)
+    if not path.exists():
+        return
+    prev = entry.get("_ckpt_path")
+    if prev is not None and Path(prev) == path and entry.get("loaded"):
+        return
+    model, loaded = _load_model(FORMAT_EXPERIMENTAL)
+    critic = _load_critic(MODEL_DEVICE, FORMAT_EXPERIMENTAL)
+    entry["model"] = model
+    entry["critic"] = critic
+    entry["adapter"] = obs_adapter(model)
+    entry["loaded"] = loaded
+    entry["_ckpt_path"] = str(path)
+    logger.info("experimental format now serving %s (loaded=%s)", path, loaded)
 
 
 def _fmt() -> dict[str, Any]:
@@ -544,8 +629,17 @@ _CARD_SPEC_BY_VARIANT: dict[str, tuple[tuple[str, int], ...]] = {
 }
 
 
+def _engine_variant(fmt_id: str | None = None) -> str:
+    """Map a UI format id to the engine GameConfig.variant string."""
+    fid = session.variant if fmt_id is None else fmt_id
+    entry = FORMATS.get(fid)
+    if entry is not None:
+        return str(entry.get("engine_variant", fid))
+    return fid
+
+
 def _card_spec_attrs() -> tuple[tuple[str, int], ...]:
-    return _CARD_SPEC_BY_VARIANT[session.variant]
+    return _CARD_SPEC_BY_VARIANT[_engine_variant()]
 
 
 def _blank_card_pending() -> dict[str, list[tuple[int, int] | None]]:
@@ -730,7 +824,7 @@ def _rebuild_env() -> None:
     else:
         in_hand_mask = None
 
-    is_nlh = session.variant == VARIANT_NLH
+    is_nlh = _engine_variant() == VARIANT_NLH
     env = BombPotEnv(cfg)
     try:
         if is_nlh:
@@ -929,7 +1023,7 @@ class ConfigRequest(BaseModel):
 
 
 class FormatRequest(BaseModel):
-    format: str = Field(..., pattern=r"^(plo5_double_bomb|nlh_single)$")
+    format: str = Field(..., pattern=r"^(plo5_double_bomb|nlh_single|experimental)$")
 
 
 # --- Helpers ----------------------------------------------------------------
@@ -1236,6 +1330,39 @@ def _network_obs() -> np.ndarray | None:
     return encode_observation(proj, compressed_cfg)
 
 
+
+def _recommendation_from_nodedist(nd, info) -> dict[str, Any]:
+    """Build study recommendation payload from StrategyBackend NodeDist."""
+    d = nd.as_dict()
+    gate = int(d["rec_gate"])
+    chips = int(d["rec_chips"]) if gate == GATE_RAISE else None
+    chips_bb = round(_chips_to_bb(chips), 4) if chips is not None else None
+    gate_slug = (
+        "fold" if gate == GATE_FOLD else
+        "check_call" if gate == GATE_CHECK_CALL else
+        "raise"
+    )
+    out: dict[str, Any] = {
+        "gate": gate_slug,
+        "gate_name": GATE_NAMES[gate],
+        "chips": chips,
+        "chips_bb": chips_bb,
+        "value_bb": round(float(d["value_bb"]), 4),
+        "gate_distribution": [round(p, 4) for p in d["gate_probs"]],
+        "backend": d.get("backend_name", "policy_net"),
+        "mode": d.get("mode", "policy_net"),
+        "is_gto": True,
+    }
+    if d.get("head_version", 1) >= 2 and d.get("anchor_probs"):
+        out["head_version"] = 2
+        out["rec_anchor"] = d.get("rec_anchor")
+        out["anchor_probs"] = [round(float(p), 4) for p in d["anchor_probs"]]
+        out["anchor_chips"] = list(d.get("anchor_chips") or [])
+        out["anchor_legal"] = list(d.get("anchor_legal") or [])
+        out["pot_ref_chips"] = d.get("pot_ref_chips")
+    return out
+
+
 def _compute_recommendation() -> dict[str, Any] | None:
     """Single deterministic recommendation: argmax gate + Beta-mean chips.
 
@@ -1257,6 +1384,14 @@ def _compute_recommendation() -> dict[str, Any] | None:
     if obs_np is None:
         return None
     fmt = _fmt()
+    # NLH + GTO host: serve PolicyNet (Mode 0) instead of PPO placeholder.
+    if (
+        _engine_variant() == VARIANT_NLH
+        and GTO_HOST is not None
+        and info is not None
+    ):
+        nd = GTO_HOST.node_distribution(obs_np, info)
+        return _recommendation_from_nodedist(nd, info)
     model = fmt["model"]
     obs_t = torch.from_numpy(fmt["adapter"](obs_np)).unsqueeze(0).to(MODEL_DEVICE)
     gm_t = torch.from_numpy(info.gate_mask).unsqueeze(0).to(MODEL_DEVICE)
@@ -1609,9 +1744,26 @@ app = FastAPI(title="PLO5 Bomb-Pot Study Tool")
 # (not at top) so trainer.py never needs to import server.py back.
 from plo5bp.ui.trainer import create_trainer_router  # noqa: E402
 
+
+# Optional NLH GTO PolicyNet (Phase 2a). When set, Study recommendations
+# and Trainer (via create_trainer_router) share the same PolicyNetHost.
+# Env: PLO5BP_GTO_CHECKPOINT=checkpoints/gto_policy.pt
+from plo5bp.gto.policy_host import try_load_gto_host  # noqa: E402
+
+_GTO_CKPT = os.environ.get("PLO5BP_GTO_CHECKPOINT", "").strip() or None
+GTO_HOST = try_load_gto_host(_GTO_CKPT, device=MODEL_DEVICE) if _GTO_CKPT else None
+if GTO_HOST is not None:
+    logger.info("GTO PolicyNet loaded from %s (Study+Trainer T1)", _GTO_CKPT)
+else:
+    logger.info(
+        "No PLO5BP_GTO_CHECKPOINT — NLH Study uses PPO/random placeholder"
+    )
+
 trainer_router = create_trainer_router(
-    MODEL, MODEL_DEVICE, critic=MODEL_CRITIC, formats=FORMATS
+    MODEL, MODEL_DEVICE, critic=MODEL_CRITIC, formats=FORMATS,
+    gto_checkpoint=_GTO_CKPT,
 )
+
 app.include_router(trainer_router)
 
 # NLH range grid (/ranges/*) — LOCAL BUILD ONLY for now: the public build
@@ -1624,6 +1776,7 @@ app.include_router(
         FORMATS,
         MODEL_DEVICE,
         nlh_ckpt_name=_format_ckpt_path(VARIANT_NLH).name,
+        gto_model=(GTO_HOST.model if GTO_HOST is not None else None),
     )
 )
 
@@ -1794,7 +1947,7 @@ def formats() -> dict[str, Any]:
                 # Betting cap class: pot-limit formats cap raises at pot
                 # (the client's b100 preset is "pot" and nothing larger
                 # exists); no-limit formats allow overbets + all-in.
-                "pot_limit": vid != VARIANT_NLH,
+                "pot_limit": _engine_variant(vid) != VARIANT_NLH,
             }
             for vid, f in FORMATS.items()
         ],
@@ -1814,11 +1967,17 @@ def set_format(req: FormatRequest) -> dict[str, Any]:
             detail="This format isn't available on your account yet — coming soon!",
         )
     if req.format != session.variant:
+        if req.format not in FORMATS:
+            raise HTTPException(status_code=400, detail=f"unknown format {req.format!r}")
         session.variant = req.format
-        if req.format == VARIANT_NLH:
+        if req.format == FORMAT_EXPERIMENTAL:
+            _maybe_reload_experimental()
+        eng = _engine_variant(req.format)
+        if eng == VARIANT_NLH:
             session.game_config = GameConfig.nlh_default()
             session.dollars_per_bb = 10.0
         else:
+            # PLO5 + experimental: same bomb-pot table defaults.
             session.game_config = GameConfig(starting_stack=400000)
             session.dollars_per_bb = 2.0
         session.num_seats = session.game_config.num_seats

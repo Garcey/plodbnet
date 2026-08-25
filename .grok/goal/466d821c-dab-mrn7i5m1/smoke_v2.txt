@@ -1,0 +1,16 @@
+GAPS CLOSED (skeptic round 1)
+1. Range editor: f-range-oop / f-range-ip in UI + collectRoot + RootSpec
+2. Abstract game tree preview: POST /api/tree/preview + build_abstract_tree
+3. Hierarchical action-line browser: solution_tree forest + line-tree UI
+4. Quality metrics: entropy, fold/call/raise/allin, pure frac, expl, node aggregates
+5. Compare strategies L1 + export to data/cfr/app_export
+6. Desktop window: scripts/cfr_app.py --desktop (pywebview)
+7. Progress: /api/jobs/{id}/progress with elapsed/iters/expl bar
+8. E2E: test_e2e_solve_with_ranges_then_inspect_quality (real Rust, ranges, view quality)
+
+SMOKE2
+preflop_tree_nodes 367
+validate ranges AA,KK / random
+chart quality mean_allin=0.3401 pure=42%
+solve 100 iters expl~6.6 range root view 2189 infosets
+pytest 28 passed

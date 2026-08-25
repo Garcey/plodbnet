@@ -30,9 +30,11 @@ def client(tmp_path):
 
     ts = srv.trainer_router.trainer_session
     ts.stats_path = tmp_path / "trainer_stats.json"
+    from plo5bp.ui.trainer import FORMAT_EXPERIMENTAL
     ts.settings_by_variant = {
         VARIANT_PLO5: _default_settings(VARIANT_PLO5),
         VARIANT_NLH: _default_settings(VARIANT_NLH),
+        FORMAT_EXPERIMENTAL: _default_settings(FORMAT_EXPERIMENTAL),
     }
     ts.variant = VARIANT_PLO5
     ts.settings = ts.settings_by_variant[VARIANT_PLO5]
@@ -47,7 +49,7 @@ def test_formats_registry(client):
     assert r.status_code == 200
     body = r.json()
     ids = {f["id"] for f in body["formats"]}
-    assert ids == {"plo5_double_bomb", "nlh_single"}
+    assert ids == {"plo5_double_bomb", "nlh_single", "experimental"}
     assert body["active"] in ids
 
 

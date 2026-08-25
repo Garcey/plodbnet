@@ -20,6 +20,24 @@ STUDY_STATE_KEYS = {
 }
 
 
+
+def _install_scripted_policy(ts, policy_fn):
+    """Route opp acts through policy_fn while keeping PPO node_distribution."""
+    from plo5bp.gto.backend import PpoSolverHost
+
+    base = ts.backend
+    assert isinstance(base, PpoSolverHost)
+
+    class _Scripted(PpoSolverHost):
+        def act(self, obs, info, *, deterministic=False, rng_seed=None):
+            actor = int(info.actor) if info.actor is not None else 0
+            return policy_fn(obs, actor, info)
+
+    host = _Scripted(model=base.model, device=base.device)
+    ts.set_backend(host)
+    return host
+
+
 def test_state_shape_superset_of_study(trainer_factory):
     ts = trainer_factory(seats_mode="fixed", seats_fixed=4, mc_rollouts=0)
     ts.new_hand()
@@ -360,7 +378,7 @@ def test_allin_hand_runs_out_without_hero_moot_nodes(trainer_factory):
                 return GATE_RAISE, int(info.max_raise_chips)
             return GATE_CHECK_CALL, 0
 
-        ts._policy = shover
+        _install_scripted_policy(ts, shover)
         ts.new_hand()
         steps = 0
         while ts.hand is not None and not ts.hand.terminal and steps < 40:
@@ -409,7 +427,9 @@ def test_dust_caller_runs_out_without_hero_nodes(trainer_factory):
                              seats_mode="fixed", seats_fixed=2, mc_rollouts=0,
                              stacks_mode="per_seat",
                              stacks_per_seat_bb=per_seat)
-        ts._policy = lambda obs, actor, info: (GATE_CHECK_CALL, 0)
+        _install_scripted_policy(
+            ts, lambda obs, actor, info: (GATE_CHECK_CALL, 0)
+        )
         ts.new_hand()
         h = ts.hand
         if h.hero_seat != 0:

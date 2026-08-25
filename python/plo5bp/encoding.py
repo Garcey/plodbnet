@@ -288,6 +288,281 @@ def downgrade_obs_to_v2(vec: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(vec[..., :OBS_DIM_V2])
 
 
+
+# ---- bare-visibility / "minimal" obs mode (experiment stem) ----------------
+# Table-visible state only: cards, street, who's in / all-in, stacks, pot
+# pricing scalars, commits, seat structure, button, action history.
+# NO SPR/odds/categories/draws/blockers/opp-outcome MC/v2-v7 engineered tails.
+# Used by `--obs-mode minimal` (cold-start only). Gather is exact.
+_MINIMAL_RANGES: tuple[tuple[int, int], ...] = (
+    (_HOLE_OFF, _BOARD_B_OFF + 52),          # hole + board A + board B (156)
+    (_STREET_OFF, _STREET_OFF + 4),          # street one-hot (4)
+    (_ACTIVE_OFF, _ACTIVE_OFF + 8),          # active mask (8)
+    (_ALLIN_OFF, _ALLIN_OFF + 8),            # all-in mask (8)
+    (_STACKS_OFF, _STACKS_OFF + 8),          # stacks/bb (8)
+    (_SCALARS_OFF, _SCALARS_OFF + 4),        # pot, to_call, min_bet, max_bet (4)
+    (_HISTORY_OFF, _HISTORY_OFF + _HISTORY_DEPTH * _HISTORY_SLOT_DIM),  # 576
+    (_SEAT_EXISTS_OFF, _SEAT_EXISTS_OFF + 8),       # seat-exists (8)
+    (_TOTAL_COMMIT_OFF, _TOTAL_COMMIT_OFF + 8),     # hand total commit (8)
+    (_STREET_COMMIT_OFF, _STREET_COMMIT_OFF + 8),   # street commit (8)
+    (_HERO_BTN_DIST_OFF, _HERO_BTN_DIST_OFF + 8),   # button vs hero (8)
+)
+_MINIMAL_INDEX: np.ndarray = np.concatenate(
+    [np.arange(a, b, dtype=np.int64) for a, b in _MINIMAL_RANGES]
+)
+OBS_DIM_MINIMAL: int = int(_MINIMAL_INDEX.shape[0])
+assert OBS_DIM_MINIMAL == 796, f"unexpected minimal width {_MINIMAL_INDEX.shape[0]}"
+
+
+def project_obs_minimal(vec: np.ndarray) -> np.ndarray:
+    """Project full-layout obs `(..., OBS_DIM)` -> bare-visibility `(..., 796)`.
+
+    Exact gather of table-visible dims only. Safe on vectors and batches.
+    Prefer `encode_observation_minimal` / `encode_observation_batch_minimal`
+    when encoding fresh state — those never compute the dropped tails.
+    """
+    return np.ascontiguousarray(vec[..., _MINIMAL_INDEX])
+
+
+# Compact offsets for the 796-d bare-visibility layout (same content as
+# gather(_MINIMAL_INDEX) on a full vector, contiguous).
+_M_HOLE = 0
+_M_BOARD_A = 52
+_M_BOARD_B = 104
+_M_STREET = 156
+_M_ACTIVE = 160
+_M_ALLIN = 168
+_M_STACKS = 176
+_M_SCALARS = 184
+_M_HISTORY = 188  # 32 * 18 = 576; full layout history starts at 196
+_M_SEAT_EXISTS = 764
+_M_TOTAL_COMMIT = 772
+_M_STREET_COMMIT = 780
+_M_HERO_BTN = 788
+assert _M_HERO_BTN + 8 == OBS_DIM_MINIMAL
+
+
+def encode_observation_minimal(
+    obs: Mapping[str, Any], config: GameConfig
+) -> np.ndarray:
+    """Encode table-visible dims only into `(OBS_DIM_MINIMAL,)` float32.
+
+    Bit-exact with `project_obs_minimal(encode_observation(...))` but never
+    computes SPR/odds/categories/draws/blockers/opp-MC/v2-v7 tails.
+    """
+    out = np.zeros(OBS_DIM_MINIMAL, dtype=np.float32)
+    num_seats = config.num_seats
+    hero = obs["actor"]
+    if hero is None:
+        return out
+
+    for idx in obs["hero_hole"]:
+        out[_M_HOLE + int(idx)] = 1.0
+    for idx in obs["board_a"]:
+        out[_M_BOARD_A + int(idx)] = 1.0
+    for idx in obs["board_b"]:
+        out[_M_BOARD_B + int(idx)] = 1.0
+
+    street_idx = int(obs["street"])
+    if 0 <= street_idx < _NUM_STREET_ONEHOT:
+        out[_M_STREET + street_idx] = 1.0
+
+    folded = obs["folded"]
+    all_in = obs["all_in"]
+    stacks = obs["stacks"]
+    eff_cap = obs["eff_stack_cap"]
+    starting = config.resolved_stacks
+    inv_bb = 1.0 / float(config.bb)
+    dead_chips = [
+        max(0, int(starting[s]) - int(eff_cap[s])) for s in range(num_seats)
+    ]
+    eff_per_seat = [
+        max(0.0, float(stacks[s]) - float(dead_chips[s])) for s in range(num_seats)
+    ]
+    for k in range(num_seats):
+        seat = (hero + k) % num_seats
+        if not folded[seat]:
+            out[_M_ACTIVE + k] = 1.0
+        if all_in[seat]:
+            out[_M_ALLIN + k] = 1.0
+        out[_M_STACKS + k] = eff_per_seat[seat] * inv_bb
+
+    pot = float(obs["pot"])
+    btc = float(obs["bet_to_call"])
+    out[_M_SCALARS + 0] = pot * inv_bb
+    out[_M_SCALARS + 1] = btc * inv_bb
+    out[_M_SCALARS + 2] = float(obs["min_bet"]) * inv_bb
+    out[_M_SCALARS + 3] = float(obs["max_bet"]) * inv_bb
+
+    history = obs["history"]
+    if len(history) > _HISTORY_DEPTH:
+        history = history[-_HISTORY_DEPTH:]
+    pot_now_chips = int(obs["pot"])
+    pot_before = [0] * len(history)
+    suffix = 0
+    for j in range(len(history) - 1, -1, -1):
+        suffix += int(history[j][2])
+        pot_before[j] = pot_now_chips - suffix
+    for slot, (seat, action, chips, street_h) in enumerate(history):
+        base = _M_HISTORY + slot * _HISTORY_SLOT_DIM
+        rel_seat = (seat - hero) % num_seats
+        out[base + _HISTORY_SEAT_OFF_REL + rel_seat] = 1.0
+        gate = _gate_from_action(int(action), int(chips))
+        out[base + _HISTORY_GATE_OFF_REL + gate] = 1.0
+        s_idx = int(street_h)
+        if 0 <= s_idx < _NUM_STREET_ONEHOT:
+            out[base + _HISTORY_STREET_OFF_REL + s_idx] = 1.0
+        out[base + _HISTORY_CHIPS_OFF_REL] = float(chips) * inv_bb
+        frac = float(chips) / float(max(pot_before[slot], 1))
+        out[base + _HISTORY_FRAC_OFF_REL] = min(max(frac, 0.0), 2.0)
+
+    for k in range(num_seats):
+        out[_M_SEAT_EXISTS + k] = 1.0
+
+    street_commit = obs.get("street_commit", [0] * num_seats)
+    total_commit = obs["total_commit"]
+    for k in range(num_seats):
+        seat = (hero + k) % num_seats
+        out[_M_TOTAL_COMMIT + k] = float(total_commit[seat]) * inv_bb
+        out[_M_STREET_COMMIT + k] = float(street_commit[seat]) * inv_bb
+
+    button = int(obs["button"])
+    out[_M_HERO_BTN + (button - hero) % num_seats] = 1.0
+    return out
+
+
+def encode_observation_batch_minimal(
+    obs_arrays: "Mapping[str, np.ndarray]",
+    config: GameConfig,
+) -> np.ndarray:
+    """Vectorized bare-visibility encoder. Returns `(N, OBS_DIM_MINIMAL)`.
+
+    Bit-exact with `project_obs_minimal(encode_observation_batch(...))`.
+    Does not read categories, draws, opp-outcome, or any engineered tail.
+    """
+    actor = obs_arrays["actor"]
+    n = actor.shape[0]
+    num_seats = config.num_seats
+    inv_bb = 1.0 / float(config.bb)
+    out = np.zeros((n, OBS_DIM_MINIMAL), dtype=np.float32)
+
+    live_mask = actor != -1
+    if not live_mask.any():
+        return out
+
+    hero_idx = np.where(live_mask, actor, 0).astype(np.int64)
+
+    hole = obs_arrays["hero_hole"]
+    ba = obs_arrays["board_a"]
+    bb = obs_arrays["board_b"]
+    for src, offset in ((hole, _M_HOLE), (ba, _M_BOARD_A), (bb, _M_BOARD_B)):
+        valid = (src < 52) & live_mask[:, None]
+        if valid.any():
+            rows = np.broadcast_to(np.arange(n)[:, None], src.shape)[valid]
+            cols = src[valid].astype(np.int64) + offset
+            out[rows, cols] = 1.0
+
+    street = obs_arrays["street"].astype(np.int64)
+    street_valid = (street < _NUM_STREET_ONEHOT) & live_mask
+    if street_valid.any():
+        rows = np.nonzero(street_valid)[0]
+        out[rows, _M_STREET + street[rows]] = 1.0
+
+    rot = (hero_idx[:, None] + np.arange(num_seats, dtype=np.int64)[None, :]) % num_seats
+    folded = obs_arrays["folded"]
+    all_in = obs_arrays["all_in"]
+    stacks = obs_arrays["stacks"]
+    folded_rot = np.take_along_axis(folded, rot, axis=1)
+    all_in_rot = np.take_along_axis(all_in, rot, axis=1)
+    active_rot = (~folded_rot).astype(np.float32)
+    out[live_mask, _M_ACTIVE : _M_ACTIVE + num_seats] = active_rot[live_mask]
+    out[live_mask, _M_ALLIN : _M_ALLIN + num_seats] = all_in_rot[live_mask].astype(
+        np.float32
+    )
+
+    stacks_f64 = stacks.astype(np.float64)
+    eff_cap = obs_arrays["eff_stack_cap"].astype(np.float64)
+    starting = np.asarray(config.resolved_stacks, dtype=np.float64)
+    dead = np.maximum(0.0, starting[None, :] - eff_cap)
+    effective = np.maximum(0.0, stacks_f64 - dead)
+    effective_rot = np.take_along_axis(effective, rot, axis=1)
+    out[live_mask, _M_STACKS : _M_STACKS + num_seats] = (
+        effective_rot[live_mask] * inv_bb
+    )
+
+    pot = obs_arrays["pot"].astype(np.float64)
+    bet_to_call = obs_arrays["bet_to_call"].astype(np.float64)
+    min_bet = obs_arrays["min_bet"].astype(np.float64)
+    max_bet = obs_arrays["max_bet"].astype(np.float64)
+    out[live_mask, _M_SCALARS + 0] = pot[live_mask] * inv_bb
+    out[live_mask, _M_SCALARS + 1] = bet_to_call[live_mask] * inv_bb
+    out[live_mask, _M_SCALARS + 2] = min_bet[live_mask] * inv_bb
+    out[live_mask, _M_SCALARS + 3] = max_bet[live_mask] * inv_bb
+
+    history_seat = obs_arrays["history_seat"].astype(np.int64)
+    history_action = obs_arrays["history_action"].astype(np.int64)
+    history_chips = obs_arrays["history_chips"].astype(np.int64)
+    history_street = obs_arrays["history_street"].astype(np.int64)
+    history_len = obs_arrays["history_len"].astype(np.int64)
+    slot_idx = np.arange(_HISTORY_DEPTH, dtype=np.int64)[None, :]
+    valid_slots = (slot_idx < history_len[:, None]) & live_mask[:, None]
+    if valid_slots.any():
+        rows = np.broadcast_to(np.arange(n)[:, None], (n, _HISTORY_DEPTH))[valid_slots]
+        slots = np.broadcast_to(slot_idx, (n, _HISTORY_DEPTH))[valid_slots]
+        rel_seats = (history_seat[valid_slots] - hero_idx[rows]) % num_seats
+        actions_flat = history_action[valid_slots]
+        chips_flat = history_chips[valid_slots]
+        street_flat = history_street[valid_slots]
+        base = _M_HISTORY + slots * _HISTORY_SLOT_DIM
+        out[rows, base + _HISTORY_SEAT_OFF_REL + rel_seats] = 1.0
+
+        is_fold = actions_flat == FOLD
+        is_cc = actions_flat == CHECK_CALL
+        is_check = is_cc & (chips_flat == 0)
+        is_call = is_cc & (chips_flat > 0)
+        gate = np.where(
+            is_fold,
+            _GATE_FOLD,
+            np.where(is_check, _GATE_CHECK, np.where(is_call, _GATE_CALL, _GATE_RAISE)),
+        )
+        out[rows, base + _HISTORY_GATE_OFF_REL + gate] = 1.0
+
+        street_ok = (street_flat >= 0) & (street_flat < _NUM_STREET_ONEHOT)
+        if street_ok.any():
+            out[
+                rows[street_ok],
+                base[street_ok] + _HISTORY_STREET_OFF_REL + street_flat[street_ok],
+            ] = 1.0
+
+        out[rows, base + _HISTORY_CHIPS_OFF_REL] = chips_flat.astype(np.float64) * inv_bb
+        pot_chips_i64 = obs_arrays["pot"].astype(np.int64)
+        suffix = np.cumsum(history_chips[:, ::-1], axis=1)[:, ::-1]
+        pot_before = pot_chips_i64[:, None] - suffix
+        pot_before_flat = pot_before[valid_slots]
+        frac = chips_flat.astype(np.float64) / np.maximum(
+            pot_before_flat, 1
+        ).astype(np.float64)
+        out[rows, base + _HISTORY_FRAC_OFF_REL] = np.clip(frac, 0.0, 2.0)
+
+    out[live_mask, _M_SEAT_EXISTS : _M_SEAT_EXISTS + num_seats] = 1.0
+
+    total_commit = obs_arrays["total_commit"].astype(np.float64)
+    street_commit = obs_arrays["street_commit"].astype(np.float64)
+    tc_rot = np.take_along_axis(total_commit, rot, axis=1)
+    sc_rot = np.take_along_axis(street_commit, rot, axis=1)
+    out[live_mask, _M_TOTAL_COMMIT : _M_TOTAL_COMMIT + num_seats] = (
+        tc_rot[live_mask] * inv_bb
+    )
+    out[live_mask, _M_STREET_COMMIT : _M_STREET_COMMIT + num_seats] = (
+        sc_rot[live_mask] * inv_bb
+    )
+
+    button = obs_arrays["button"].astype(np.int64)
+    btn_rel = (button - hero_idx) % num_seats
+    out[live_mask, _M_HERO_BTN + btn_rel[live_mask]] = 1.0
+    return out
+
+
 # 10 straight windows: slot 0 = wheel (A,2,3,4,5); slots 1..9 = consecutive
 # 5-rank windows starting at rank 0..8. Slot 9 = broadway (T,J,Q,K,A).
 _STRAIGHT_WINDOWS: tuple[frozenset[int], ...] = (

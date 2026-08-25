@@ -47,3 +47,5 @@ Thumbs.db
 # Public-build secrets + user data (never commit)
 .env.public
 data/
+
+

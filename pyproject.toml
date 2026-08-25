@@ -21,6 +21,8 @@ dev = [
 ui = [
   "fastapi>=0.110",
   "uvicorn[standard]>=0.27",
+  "python-multipart>=0.0.9",  # CFR app solution upload
+  "pywebview>=5.0",           # native desktop window
 ]
 # Public build only (PLO5BP_PUBLIC=1): Google sign-in, cookie sessions, Stripe.
 public = [

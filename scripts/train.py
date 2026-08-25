@@ -257,7 +257,7 @@ from plo5bp.config import (
     GameConfig,
     TrainingConfig,
 )
-from plo5bp.encoding import OBS_DIM
+from plo5bp.encoding import OBS_DIM, OBS_DIM_MINIMAL
 from plo5bp.encoding_nlh import OBS_DIM_NLH
 from plo5bp.network import (
     ActorCriticV2,
@@ -797,6 +797,12 @@ def main() -> None:
     )
     parser.add_argument("--hidden-dim", type=int, default=2048)
     parser.add_argument("--num-layers", type=int, default=4)
+    parser.add_argument(
+        "--obs-mode",
+        choices=["full", "minimal"],
+        default="full",
+        help="Observation layout. full=OBS_DIM 1171 (default). minimal=bare table-visible 796 (cards, street, active/all-in, stacks, pot/to_call/min/max, commits, seat-exists, button, history). Cold-start only; no warm-start from full-obs checkpoints. Skips opp-outcome MC for speed.",
+    )
     parser.add_argument(
         "--sizing-head",
         choices=["anchor", "logistic", "mixture"],
@@ -1602,6 +1608,7 @@ def main() -> None:
         num_updates=args.num_updates,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
+        obs_mode=args.obs_mode,
         num_envs=args.num_envs,
         rollout_length=args.rollout_length,
         batch_size=args.batch_size,
@@ -1645,7 +1652,14 @@ def main() -> None:
         device=args.device,
     )
 
-    obs_dim = OBS_DIM_NLH if is_nlh else OBS_DIM
+    if is_nlh and args.obs_mode == "minimal":
+        raise SystemExit("error: --obs-mode minimal is PLO-only")
+    if is_nlh:
+        obs_dim = OBS_DIM_NLH
+    elif args.obs_mode == "minimal":
+        obs_dim = OBS_DIM_MINIMAL
+    else:
+        obs_dim = OBS_DIM
     anchor_spec = NLH_ANCHOR_SPEC if is_nlh else PLO_ANCHOR_SPEC
     head_kwargs: dict = {}
     if args.sizing_head == "mixture":
@@ -1666,7 +1680,7 @@ def main() -> None:
     print(
         f"[head] sizing-head={args.sizing_head} "
         f"(head_version={model.head_version}) variant={args.variant} "
-        f"obs_dim={obs_dim} anchors={anchor_spec.count} ({anchor_spec.name})"
+        f"obs_dim={obs_dim} obs_mode={args.obs_mode} anchors={anchor_spec.count} ({anchor_spec.name})"
     )
     model.to(train_cfg.device)
     # v5 stems build the critic WITH the dueling Q head from day one
@@ -1730,6 +1744,17 @@ def main() -> None:
                 f"variant mismatch: checkpoint={ckpt_variant} vs "
                 f"--variant={args.variant}. Cross-variant warm-starts are "
                 "refused: each variant trains from scratch."
+            )
+        ckpt_obs_mode = str(
+            (ckpt.get("config") or {}).get("obs_mode", "full")
+            if isinstance(ckpt.get("config"), dict)
+            else ckpt.get("obs_mode", "full")
+        )
+        if ckpt_obs_mode != args.obs_mode:
+            raise SystemExit(
+                f"obs_mode mismatch: checkpoint={ckpt_obs_mode!r} vs "
+                f"--obs-mode={args.obs_mode!r}. Minimal/full layouts are not "
+                "warm-start compatible (different obs width + features)."
             )
         ckpt_head = int(ckpt.get("head_version", 1))
         if ckpt_head != model.head_version:

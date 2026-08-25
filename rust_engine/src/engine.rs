@@ -1399,6 +1399,11 @@ impl GameState {
         // them against the frozen reference; the share trackers add no
         // evals, no RNG draws, and no reordering.
         const N_OUT: usize = 22;
+        // mc_samples == 0: caller does not need outcome features (e.g.
+        // obs_mode=minimal). Skip all evals / deck work and return zeros.
+        if mc_samples == 0 {
+            return vec![0.0; N_OUT];
+        }
         const SCOOP_OPP: usize = 0;
         const QUARTER_OPP: usize = 1;
         const SCOOP_HERO: usize = 2;

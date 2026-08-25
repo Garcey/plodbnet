@@ -54,6 +54,8 @@ from plo5bp.actions import (
 from plo5bp.config import GameConfig, VARIANT_NLH, VARIANT_PLO5
 from plo5bp.env import BombPotEnv, StepInfo
 from plo5bp.eval import model_policy
+from plo5bp.gto.backend import PpoSolverHost, StrategyBackend, make_ppo_host
+from plo5bp.gto.policy_host import PolicyNetHost, try_load_gto_host
 from plo5bp.network import ActorCritic, CentralCritic, obs_adapter
 from plo5bp.rollout import _critic_values, _rotate_opp_holes
 from plo5bp.sizing import (
@@ -73,6 +75,18 @@ from plo5bp.ui.common import (
     validate_card_list,
 )
 from plo5bp.ui.hand_describe import describe_made_hand, describe_made_hand_nlh
+
+# UI format id (mirrors server.FORMAT_EXPERIMENTAL). Same PLO5 engine rules;
+# only the served checkpoint / obs projection differ.
+FORMAT_EXPERIMENTAL = "experimental"
+
+
+def _engine_variant(fmt_id: str) -> str:
+    """Map a UI format id onto the engine GameConfig.variant string."""
+    if fmt_id == FORMAT_EXPERIMENTAL:
+        return VARIANT_PLO5
+    return fmt_id
+
 
 logger = logging.getLogger("plo5bp.ui.trainer")
 
@@ -618,6 +632,7 @@ class TrainerSession:
         device: torch.device,
         stats_path: Path | None = None,
         critic: CentralCritic | None = None,
+        backend: StrategyBackend | None = None,
     ):
         self.model = model
         self.device = device
@@ -625,6 +640,9 @@ class TrainerSession:
         # "true EV" readout. None on v1 / when the checkpoint lacks one
         # → review shows only the actor's own (blind) value estimate.
         self.critic = critic
+        # StrategyBackend: T0 = PpoSolverHost (default). T1 swaps in
+        # PolicyNetHost without rewriting act / score / advance.
+        self.backend: StrategyBackend = backend or make_ppo_host(model, device)
         # Active game format. `set_format` swaps model/critic to the new
         # format's pair and points `self.settings` at that format's OWN
         # settings object (see settings_by_variant).
@@ -633,6 +651,7 @@ class TrainerSession:
         self.settings_by_variant: dict[str, TrainerSettings] = {
             VARIANT_PLO5: _default_settings(VARIANT_PLO5),
             VARIANT_NLH: _default_settings(VARIANT_NLH),
+            FORMAT_EXPERIMENTAL: _default_settings(FORMAT_EXPERIMENTAL),
         }
         self.settings = self.settings_by_variant[self.variant]
         self.hand: HandRecord | None = None
@@ -651,11 +670,21 @@ class TrainerSession:
         )
         self._load_persisted()
 
+    def set_backend(self, backend: StrategyBackend) -> None:
+        """Hot-swap the strategy host (T0 PPO ↔ T1 PolicyNet)."""
+        self.backend = backend
+        if isinstance(backend, (PpoSolverHost, PolicyNetHost)):
+            self.model = backend.model
+            self.device = backend.device
+            self._policy = model_policy(backend.model, deterministic=False)
+            self._obs_adapt = obs_adapter(backend.model)
+
     def set_format(
         self,
         variant: str,
         model: ActorCritic,
         critic: CentralCritic | None,
+        backend: StrategyBackend | None = None,
     ) -> None:
         """Switch the trainer's game format: swap the served model/critic
         pair, drop the live hand (it belongs to the other game), and
@@ -663,13 +692,21 @@ class TrainerSession:
         Formats never share or overwrite each other's settings; each
         keeps whatever the user last configured for it. Session/lifetime
         stats keep accumulating across formats."""
-        if variant == self.variant:
+        if variant == self.variant and backend is None:
             return
         self.variant = variant
         self.model = model
         self.critic = critic
         self._policy = model_policy(model, deterministic=False)
         self._obs_adapt = obs_adapter(model)
+        if backend is not None:
+            self.backend = backend
+        elif isinstance(self.backend, PpoSolverHost):
+            self.backend.rebind(model, self.device)
+        else:
+            # Non-PPO host cannot serve a different format's PPO weights —
+            # fall back to a fresh PPO host for this format.
+            self.backend = make_ppo_host(model, self.device)
         self.hand = None
         self.settings = self.settings_by_variant[variant]
 
@@ -767,6 +804,7 @@ class TrainerSession:
                 button = (hero_seat - k) % n
             else:
                 button = int(self.rng.integers(0, n))
+            eng = _engine_variant(self.variant)
             config = GameConfig(
                 num_seats=n,
                 starting_stack=int(round(s.stack_bb * BB_CHIPS)),
@@ -774,8 +812,8 @@ class TrainerSession:
                 bb=BB_CHIPS,
                 starting_stacks=self._draw_stacks(n),
                 # NLH: the 5/10 structure — sb = bb/2, live preflop.
-                sb=BB_CHIPS // 2 if self.variant == VARIANT_NLH else 0,
-                variant=self.variant,
+                sb=BB_CHIPS // 2 if eng == VARIANT_NLH else 0,
+                variant=eng,
             )
             seed = int(self.rng.integers(0, 2**63 - 1))
 
@@ -843,10 +881,15 @@ class TrainerSession:
                 gate, chips = GATE_CHECK_CALL, 0
             else:
                 # Re-seed per node: opponent behavior is a pure function
-                # of the action prefix (see module docstring).
+                # of the action prefix (see module docstring). Goes
+                # through StrategyBackend so T1 PolicyNet swaps cleanly.
                 with _TORCH_RNG_LOCK:
-                    torch.manual_seed(self._opp_seed(h))
-                    gate, chips = self._policy(h.last_obs, info.actor, info)
+                    gate, chips = self.backend.act(
+                        h.last_obs,
+                        info,
+                        deterministic=False,
+                        rng_seed=self._opp_seed(h),
+                    )
             obs, rewards, done, info2 = h.env.step_hybrid(gate, chips)
             entry = {"seat": actor, "gate": int(gate), "chips": int(chips),
                      "street": street}
@@ -907,7 +950,7 @@ class TrainerSession:
                     detail=f"chips {chips} out of raise range [{lo}, {hi}]",
                 )
 
-        dist = compute_node_distribution(self.model, self.device, h.last_obs, info)
+        dist = self.backend.node_distribution(h.last_obs, info).as_dict()
         if dist["head_version"] >= 2:
             sc = score_move_v2(dist, gate_idx, chips)
             rec_alpha, rec_beta = _rec_refine_params(dist)
@@ -1188,7 +1231,7 @@ class TrainerSession:
         actor = int(info.actor) if info.actor is not None else int(a["seat"])
         raw = info.raw_obs
         to_call = _to_call_chips(raw, actor)
-        dist = compute_node_distribution(self.model, self.device, obs_np, info)
+        dist = self.backend.node_distribution(obs_np, info).as_dict()
 
         # own EV = the actor's observation-only value head (blind to
         # opponents' cards); true EV = the centralized critic (sees all
@@ -1198,9 +1241,13 @@ class TrainerSession:
         if self.critic is not None and dist["head_version"] >= 2:
             holes = np.asarray(h.all_holes_dealt, dtype=np.uint8)  # (S, 5)
             opp = _rotate_opp_holes(holes, actor)[None]            # (1, 5, 5)
+            # Match the critic's trained obs width (full / prefix / minimal).
+            # Env always emits full OBS_DIM; without the adapter a 796-d
+            # experimental critic gets 1171+opp and matmul-crashes (500).
+            crit_obs = np.asarray(self._obs_adapt(obs_np), dtype=np.float32)
             value_true_bb = round(float(_critic_values(
                 self.critic, self.device,
-                obs_np[None].astype(np.float32), opp,
+                crit_obs[None], opp,
             )[0]), 4)
 
         actual_gate = int(a["gate"])
@@ -1404,7 +1451,7 @@ class TrainerSession:
         ba = [int(c) for c in raw["board_a"]]
         bb_ = [int(c) for c in raw["board_b"]]
         street = d.street
-        if self.variant == VARIANT_NLH:
+        if _engine_variant(self.variant) == VARIANT_NLH:
             return {
                 # Dealt order, not display order: an unmodified what-if
                 # must reproduce the original observation bit-exactly.
@@ -1439,7 +1486,7 @@ class TrainerSession:
         assert h is not None
         spec = self._original_card_spec(d)
 
-        is_nlh = self.variant == VARIANT_NLH
+        is_nlh = _engine_variant(self.variant) == VARIANT_NLH
         overrides = {
             "hero_hole": (req.hero_hole, 2 if is_nlh else 5),
             "flop_a": (req.flop_a, 3),
@@ -1477,14 +1524,14 @@ class TrainerSession:
         env = BombPotEnv(h.config)
         obs, info = _study_replay(
             env, h.button, h.hero_seat, spec, h.action_log[: d.action_log_idx],
-            variant=self.variant,
+            variant=_engine_variant(self.variant),
         )
         if info.actor != h.hero_seat:
             raise HTTPException(
                 status_code=500,
                 detail="what-if replay did not reach hero's decision node",
             )
-        dist = compute_node_distribution(self.model, self.device, obs, info)
+        dist = self.backend.node_distribution(obs, info).as_dict()
         if dist["head_version"] >= 2:
             rescored = score_move_v2(dist, d.user_gate, d.user_chips)
         else:
@@ -1655,7 +1702,7 @@ class TrainerSession:
                             "min_bb": 0.0, "max_bb": 0.0}
             to_call = 0
 
-        is_nlh = self.variant == VARIANT_NLH
+        is_nlh = _engine_variant(self.variant) == VARIANT_NLH
         if card_spec_override is not None:
             card_spec = {k: list(v) for k, v in card_spec_override.items()}
         else:
@@ -1764,6 +1811,7 @@ class TrainerSession:
                 "hand_active": not h.terminal,
                 "rewards_bb": h.rewards_bb,
                 "feedback": h.feedback,
+                "backend": self.backend.coverage_badge(),
                 "opp_actions": [
                     {
                         "seat": a["seat"],
@@ -1922,8 +1970,14 @@ def create_trainer_router(
     device: torch.device,
     critic: CentralCritic | None = None,
     formats: dict[str, dict[str, Any]] | None = None,
+    gto_checkpoint: str | Path | None = None,
 ) -> APIRouter:
+    # Optional T1 host: env PLO5BP_GTO_CHECKPOINT or explicit path.
+    gto_path = gto_checkpoint or os.environ.get("PLO5BP_GTO_CHECKPOINT", "").strip() or None
+    gto_host = try_load_gto_host(gto_path, device=device) if gto_path else None
     default_ts = TrainerSession(model, device, critic=critic)
+    if gto_host is not None and default_ts.variant == VARIANT_NLH:
+        default_ts.set_backend(gto_host)
     router = APIRouter(prefix="/trainer")
     router.trainer_session = default_ts  # type: ignore[attr-defined]  # test hook
     # Per-format (model, critic) registry mirroring server.FORMATS; used
@@ -1945,7 +1999,11 @@ def create_trainer_router(
             raise ValueError(f"no model registered for format {variant!r}")
         ts = _ts()
         with ts.lock:
-            ts.set_format(variant, entry["model"], entry["critic"])
+            # T1: NLH + GTO checkpoint → PolicyNetHost; else PPO host for format.
+            be = None
+            if variant == VARIANT_NLH and gto_host is not None:
+                be = gto_host
+            ts.set_format(variant, entry["model"], entry["critic"], backend=be)
 
     router.set_format = set_format  # type: ignore[attr-defined]
 

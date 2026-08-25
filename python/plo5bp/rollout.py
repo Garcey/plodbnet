@@ -32,7 +32,7 @@ from torch.profiler import record_function
 from plo5bp._engine import compute_aggression_bonus_batch  # type: ignore[attr-defined]
 from plo5bp.actions import ALL_IN, GATE_ACTIONS, GATE_CHECK_CALL, GATE_RAISE
 from plo5bp.config import GameConfig, TrainingConfig
-from plo5bp.encoding import OBS_DIM
+from plo5bp.encoding import OBS_DIM, OBS_DIM_MINIMAL
 from plo5bp.encoding_nlh import OBS_DIM_NLH
 from plo5bp.env import BombPotEnv
 from plo5bp.env_batched import BatchedBombPotEnv
@@ -832,7 +832,11 @@ def collect_rollout(
             "collect_rollout_batched; the serial collect_rollout uses GAE."
         )
 
-    envs = [BombPotEnv(game_config, ev_runout_samples=train_config.ev_runout_samples)
+    envs = [BombPotEnv(
+                game_config,
+                ev_runout_samples=train_config.ev_runout_samples,
+                obs_mode=str(getattr(train_config, "obs_mode", "full")),
+            )
             for _ in range(n_envs)]
     obs_vecs: list[np.ndarray] = []
     infos = []
@@ -1237,17 +1241,24 @@ def collect_rollout_batched(
         # Keep EV / MC knobs aligned with this train_config.
         env._ev_runout_samples = int(train_config.ev_runout_samples)
     else:
-        cache_key = (n_envs, game_config.num_seats, game_config.variant)
+        cache_key = (
+            n_envs, game_config.num_seats, game_config.variant,
+            str(getattr(train_config, "obs_mode", "full")),
+        )
         if env_cache is not None and cache_key in env_cache:
             env = env_cache[cache_key]
             env.reconfigure(game_config)
             env._ev_runout_samples = int(train_config.ev_runout_samples)
         else:
+            _obs_mode = str(getattr(train_config, "obs_mode", "full"))
+            # Minimal obs drops opp-outcome features; opp_mc=0 skips MC entirely.
+            _opp_mc = 0 if _obs_mode == "minimal" else TRAIN_OPP_OUTCOME_MC
             env = BatchedBombPotEnv(
                 n_envs,
                 game_config,
                 ev_runout_samples=train_config.ev_runout_samples,
-                opp_outcome_mc=TRAIN_OPP_OUTCOME_MC,
+                opp_outcome_mc=_opp_mc,
+                obs_mode=_obs_mode,
             )
             if env_cache is not None:
                 env_cache[cache_key] = env
@@ -2685,7 +2696,12 @@ def collect_rollout_multiconfig(
         assert all(c.hole_count == hole_count for c in configs), (
             "mixed hole widths across mix-configs are unsupported"
         )
-        obs_dim = OBS_DIM_NLH if configs[0].variant == "nlh_single" else OBS_DIM
+        if configs[0].variant == "nlh_single":
+            obs_dim = OBS_DIM_NLH
+        elif str(getattr(train_config, "obs_mode", "full")) == "minimal":
+            obs_dim = OBS_DIM_MINIMAL
+        else:
+            obs_dim = OBS_DIM
         # Same pin gate as the collector's own slabs (default OFF — see the
         # pinning-tax comment there); pinning one big buffer instead of N
         # small ones is otherwise equivalent.

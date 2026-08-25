@@ -876,14 +876,27 @@ def obs_adapter(model: nn.Module):
     TAIL APPEND (obs-v2 tail 991..1020, v7 batch-2 tail 1020..1171, …), so
     a checkpoint trained at any intermediate width W in [991, OBS_DIM) is
     an exact prefix slice `obs[..., :W]` — this covers 991 (v2/v4), 1020
-    (v5/v6), and any future intermediate without a new named downgrade."""
+    (v5/v6), and any future intermediate without a new named downgrade.
+
+    Minimal-obs ablation models (OBS_DIM_MINIMAL = 796) are NOT a prefix —
+    they gather non-contiguous table-visible dims via `project_obs_minimal`.
+    """
     import numpy as np
 
-    from plo5bp.encoding import OBS_DIM, OBS_DIM_V1, OBS_DIM_V2, downgrade_obs_to_v1
+    from plo5bp.encoding import (
+        OBS_DIM,
+        OBS_DIM_MINIMAL,
+        OBS_DIM_V1,
+        OBS_DIM_V2,
+        downgrade_obs_to_v1,
+        project_obs_minimal,
+    )
 
     first = model.torso[0]
     lin = first[0] if isinstance(first, nn.Sequential) else first
     w = int(lin.in_features)
+    if w == OBS_DIM_MINIMAL:
+        return project_obs_minimal
     if w == OBS_DIM_V1:
         return downgrade_obs_to_v1
     if OBS_DIM_V2 <= w < OBS_DIM:

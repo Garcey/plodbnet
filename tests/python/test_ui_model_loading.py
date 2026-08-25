@@ -12,11 +12,12 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from plo5bp.encoding import OBS_DIM, OBS_DIM_V1
+from plo5bp.encoding import OBS_DIM, OBS_DIM_MINIMAL, OBS_DIM_V1, project_obs_minimal
 from plo5bp.encoding_nlh import OBS_DIM_NLH
 from plo5bp.network import (
     ActorCritic,
     ActorCriticV2,
+    ActorCriticV5,
     CentralCritic,
     build_critic_from_state_dict,
     model_class_for_state_dict,
@@ -146,3 +147,117 @@ def test_server_load_critic_variant_widths(tmp_path, monkeypatch):
     # The same file served as the PLO format trips the serve-width guard.
     monkeypatch.setenv("PLO5BP_CHECKPOINT", str(p))
     assert server._load_critic(torch.device("cpu"), server.VARIANT_PLO5) is None
+
+
+def test_obs_adapter_minimal_width():
+    """vMin1-style 796-d models get project_obs_minimal, not a prefix slice."""
+    obs = np.arange(OBS_DIM, dtype=np.float32)
+    m = ActorCriticV5(hidden_dim=8, obs_dim=OBS_DIM_MINIMAL, num_layers=2)
+    out = obs_adapter(m)(obs)
+    assert out.shape == (OBS_DIM_MINIMAL,)
+    np.testing.assert_array_equal(out, project_obs_minimal(obs))
+    batch = np.zeros((3, OBS_DIM), dtype=np.float32)
+    assert obs_adapter(m)(batch).shape == (3, OBS_DIM_MINIMAL)
+
+
+def test_latest_vmin1_ckpt_resolution(tmp_path, monkeypatch):
+    import plo5bp.ui.server as server
+
+    # Empty dir → fallback path that does not exist.
+    monkeypatch.delenv("PLO5BP_CHECKPOINT_EXPERIMENTAL", raising=False)
+    assert server._latest_vmin1_ckpt(tmp_path) is None
+
+    stem = tmp_path / "vMin1.pt"
+    stem.write_bytes(b"x")
+    assert server._latest_vmin1_ckpt(tmp_path) == stem
+
+    older = tmp_path / "vMin1_10.pt"
+    newer = tmp_path / "vMin1_20.pt"
+    older.write_bytes(b"a")
+    newer.write_bytes(b"b")
+    # mtime: touch newer later
+    import time
+    time.sleep(0.05)
+    newer.write_bytes(b"bb")
+    assert server._latest_vmin1_ckpt(tmp_path) == newer
+
+    # Env override wins.
+    monkeypatch.setenv("PLO5BP_CHECKPOINT_EXPERIMENTAL", str(stem))
+    assert server._format_ckpt_path(server.FORMAT_EXPERIMENTAL) == stem
+
+
+def test_experimental_format_switch(tmp_path, monkeypatch):
+    """POST /format experimental uses PLO5 card spec + pot-limit bomb pot."""
+    import plo5bp.ui.server as server
+    from starlette.testclient import TestClient
+    from plo5bp.ui.trainer import _default_settings, VARIANT_NLH, VARIANT_PLO5, FORMAT_EXPERIMENTAL
+
+    ts = server.trainer_router.trainer_session
+    ts.stats_path = tmp_path / "trainer_stats.json"
+    ts.settings_by_variant = {
+        VARIANT_PLO5: _default_settings(VARIANT_PLO5),
+        VARIANT_NLH: _default_settings(VARIANT_NLH),
+        FORMAT_EXPERIMENTAL: _default_settings(FORMAT_EXPERIMENTAL),
+    }
+    ts.variant = VARIANT_PLO5
+    ts.settings = ts.settings_by_variant[VARIANT_PLO5]
+
+    c = TestClient(server.app)
+    body = c.get("/formats").json()
+    exp = next(f for f in body["formats"] if f["id"] == "experimental")
+    assert exp["label"] == "experimental"
+    assert exp["pot_limit"] is True
+
+    s = c.post("/format", json={"format": "experimental"}).json()["state"]
+    assert s["format"] == "experimental"
+    assert s["format_label"] == "experimental"
+    assert len(s["card_spec"]["hero_hole"]) == 5
+    assert len(s["card_spec"]["flop_b"]) == 3
+    assert s["street"] == "flop"
+    c.post("/format", json={"format": "plo5_double_bomb"})
+
+
+def test_experimental_trainer_act_with_minimal_critic(tmp_path):
+    """vMin1-shaped actor+critic: trainer fold must not 500 on critic true-EV.
+
+    Env emits full OBS_DIM; both actor and critic need the minimal adapter.
+    Regression for the experimental-format trainer matmul crash.
+    """
+    import torch
+    from plo5bp.encoding import OBS_DIM_MINIMAL
+    from plo5bp.network import ActorCriticV5, CentralCritic
+    from plo5bp.sizing import PLO_ANCHOR_SPEC
+    from plo5bp.ui.trainer import (
+        FORMAT_EXPERIMENTAL,
+        TrainerSession,
+        VARIANT_NLH,
+        VARIANT_PLO5,
+        _default_settings,
+    )
+
+    actor = ActorCriticV5(
+        hidden_dim=32, obs_dim=OBS_DIM_MINIMAL, num_layers=2,
+        anchor_spec=PLO_ANCHOR_SPEC,
+    )
+    critic = CentralCritic(obs_dim=OBS_DIM_MINIMAL, hidden_dim=32, num_blocks=1)
+    ts = TrainerSession(actor, torch.device("cpu"), critic=critic)
+    ts.stats_path = tmp_path / "stats.json"
+    ts.settings_by_variant = {
+        VARIANT_PLO5: _default_settings(VARIANT_PLO5),
+        VARIANT_NLH: _default_settings(VARIANT_NLH),
+        FORMAT_EXPERIMENTAL: _default_settings(FORMAT_EXPERIMENTAL),
+    }
+    ts.set_format(FORMAT_EXPERIMENTAL, actor, critic)
+    ts.new_hand()
+    assert ts.hand is not None and not ts.hand.terminal
+    # Drive until hero can act, then fold/check until terminal.
+    for _ in range(30):
+        if ts.hand.terminal:
+            break
+        info = ts.hand.last_info
+        assert info is not None
+        if info.actor != ts.hand.hero_seat:
+            break
+        gate = "fold" if bool(info.gate_mask[0]) else "check_call"
+        ts.act(gate, None)
+    assert ts.hand.terminal

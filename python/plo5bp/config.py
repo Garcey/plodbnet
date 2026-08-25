@@ -103,6 +103,9 @@ class TrainingConfig:
     entropy_coef: float = 0.1
     value_clip: float = 0.2
     hidden_dim: int = 128
+    # Observation layout: 'full' = OBS_DIM 1171; 'minimal' = bare
+    # table-visible 796 (cards/history/stacks/commits/...). Cold-start only.
+    obs_mode: str = "full"
     num_layers: int = 2
     num_updates: int = 1000
     opponent_pool_size: int = 8

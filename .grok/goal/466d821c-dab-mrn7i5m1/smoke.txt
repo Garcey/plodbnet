@@ -1,0 +1,8 @@
+SMOKE
+health rust_cfr=True
+index 200
+library_count 24
+chart matrix 169 hands
+river 1260 infosets
+presets 6 ok
+pytest 21 passed
