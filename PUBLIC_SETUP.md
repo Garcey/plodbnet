@@ -33,6 +33,27 @@ ssh root@87.99.132.209 systemctl restart wrapgto
   `reset_with_deck`; without it the site still runs and the tables deal the
   old way, shown as "Unverified shuffle" (`SKIP_ENGINE=1` skips the rebuild).
   Kill switch: `PLO5BP_HOMEGAME_FAIR=0` in `/etc/wrapgto/env`.
+- **Deploying from a new machine** (one-time, ~10 min). Every machine gets its
+  OWN key — never copy a private key between machines; a lost PC is then one
+  line to revoke.
+  1. On the new machine (PowerShell): `ssh-keygen -t ed25519 -C "wrapgto-<machine>"
+     -f "$env:USERPROFILE\.ssh\wrapgto_<machine>"` — give it a passphrase.
+  2. Once, in an ADMIN PowerShell: `Get-Service ssh-agent | Set-Service
+     -StartupType Automatic; Start-Service ssh-agent`, then (normal shell)
+     `ssh-add "$env:USERPROFILE\.ssh\wrapgto_<machine>"`. Windows keeps the
+     unlocked key for your account, so the passphrase is typed this once.
+  3. From a machine that already has access, append the new `.pub` line to the
+     server's `/root/.ssh/authorized_keys`.
+  4. `~/.ssh/config` on the new machine: `Host wrapgto-prod` / `HostName <the
+     address above>` / `User root` / `IdentityFile ~/.ssh/wrapgto_<machine>` /
+     `IdentitiesOnly yes`.
+  5. `scripts/deploy_prod.sh check` (read-only) must say "connected", "app
+     service: active" and cargo/maturin "ok". The script uses Windows' own
+     `ssh.exe` when it exists (that is the one that talks to the agent) and ships
+     through a temp archive — PowerShell 5.1 pipes are not binary-safe, so never
+     `tar | ssh` from PowerShell. `scripts/deploy_prod.sh pack` shows, offline,
+     exactly what would ship.
+  To revoke a machine: delete its line from `authorized_keys`.
 - Scale-up path: Hetzner console → resize to CCX23 (4 vCPU/16GB), ~1 min
   downtime, nothing else changes.
 
