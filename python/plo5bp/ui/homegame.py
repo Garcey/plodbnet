@@ -1,0 +1,4059 @@
+"""Private PLO5 double-board bomb-pot home games (PokerNow-style).
+
+Installed only from ``public.install`` (public build). Access is the
+admin-granted ``homegame_access`` flag, independent of subscription;
+the HTTP middleware 404s the whole ``/games`` tree for everyone else.
+
+Stakes: small/big blind set the chip unit and the dollar ledger.
+Gameplay is ClubGG-style bomb pots — every in-hand seat posts the ante,
+no blinds are posted, the hand starts on the flop.
+
+Money rules (review 2026-09-20 G10) — the ledger is exactly zero-sum:
+
+- All game math is in engine CHIPS (``BB_CHIPS`` per big blind). Cents exist
+  only at the boundary: money in (buy-in / rebuy / auto-stack top-up) and
+  money out (cash-out), always whole cents, and display.
+- The money on a table is ``M = sum(buyin_cents) - sum(leftover_cents)``
+  over everyone who ever played it. Chips are finer than cents (pots split
+  across two boards and between tied hands), so stacks pick up sub-cent
+  remainders. The cents value of the seated stacks is therefore the
+  LARGEST-REMAINDER APPORTIONMENT of ``M`` in proportion to chips
+  (``apportion_cents``; ties go to the lower seat). With whole-cent stacks
+  that is simply "the value of my chips"; otherwise each odd cent goes to
+  the largest fractional part. Ledger rows and cash-outs both use it — a
+  player who leaves is paid exactly the stack value their ledger row showed
+  — so ``sum(net_cents) == 0`` at every moment, and the last player to cash
+  out receives exactly what is left.
+- Play, buy-ins, rebuys and auto-stack never create or destroy a chip: the
+  table's chips are worth exactly ``M``. A cash-out pays whole cents for a
+  stack that may hold a fraction of one; that fraction (< 1 cent per
+  cash-out) stays with the remaining stacks through the apportionment.
+- Raise sizes are snapped to whole-cent chip multiples when the stake
+  allows (``BB_CHIPS % bb_cents == 0``); auto-stack moves whole cents and
+  carries a stack's sub-cent remainder instead of erasing it.
+
+Game flow (2026-09-21 — the "premium tables" pass):
+
+- The SERVER deals the next hand (``deal_delay_secs`` after a hand — and its
+  runout — is over; 0 = manual). It used to be a timer in the host's browser,
+  so a host who switched tabs stalled the table for everyone.
+- Time bank: once the base shot clock runs out the actor burns their own
+  ``time_bank_left`` before being auto-acted; only the seconds actually used
+  are deducted, and a little comes back every hand played.
+- Hand history is persisted per hand (``homegame_hands``) with EVERY dealt
+  hand's cards; the API filters per viewer with the same rule as the live
+  table — your own cards, plus hands tabled at a real showdown or shown
+  voluntarily (``/show``). Nothing about a hand is served while its runout is
+  still revealing.
+- ``events`` (joins, rebuys, timeouts, wins …) and ``reactions`` are small
+  in-memory feeds the client turns into dealer lines, toasts and emotes.
+
+Chips in (2026-09-22):
+
+- **Host approval** (``approve_buyins``): a buy-in / top-up by anyone but the
+  host or a TRUSTED player becomes a pending request the host approves or
+  declines; a pending sit request holds its seat. Trust is per player per
+  table (``homegame_players.trusted``) — trusted players never wait.
+- **Auto top-up** (``topup_mode``): when a stack has dropped below its
+  threshold it is topped back UP to the target at the next deal. Never trims
+  — no ratholing. **Set stack** (``auto_stack_mode``, the older feature): the
+  stack is reset to the target before EVERY deal, up or down — ratholing is
+  the point. Each is off / host-set / player's-choice; set-stack wins when a
+  seat has both. While approval is on, neither runs for an untrusted player
+  (an automatic buy-in is still a buy-in nobody approved).
+- A top-up asked for while holding cards is QUEUED (``queue: true``) and lands
+  when the hand is over; without the flag it is refused as before.
+- ``GET …/stream`` pushes the viewer's state over SSE whenever it changes; the
+  450 ms poll stays as the client's fallback.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import math
+import os
+import secrets
+import threading
+import time
+import zlib
+from collections import deque
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Any, Iterator
+
+from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from starlette.concurrency import run_in_threadpool
+
+from plo5bp.actions import FOLD, GATE_CHECK_CALL, GATE_FOLD, GATE_RAISE
+from plo5bp.config import VARIANT_PLO5, GameConfig
+from plo5bp.env import BombPotEnv, StepInfo
+from plo5bp.ui.common import STREET_NAMES, position_name
+from plo5bp.ui.hand_describe import describe_made_hand
+from plo5bp.ui.runout import AWARD_SECS, board_equities, build_awards
+from plo5bp.ui import public as pub
+
+logger = logging.getLogger("plo5bp.ui.homegame")
+
+BB_CHIPS = 10_000
+TABLE_SEATS = 8
+
+# Hard limits (review 2026-09-20 G4/G13). Every money field is capped far
+# below what sqlite (i64) / the engine (u64) can hold, so a value that made
+# it into memory can ALWAYS be persisted.
+MAX_CENTS = 1_000_000_000  # $10M — per amount, and per player's total buy-in
+MAX_NAME_LEN = 60
+MAX_OPEN_TABLES_PER_USER = int(os.environ.get("PLO5BP_HOMEGAME_MAX_TABLES", "5"))
+CHAT_MAX_LEN = 240
+CHAT_RATE_MAX = 6  # messages ...
+CHAT_RATE_WINDOW_S = 10.0  # ... per user per table per window
+# New tables ship WITH a shot clock (review G6: clock-less tables wedge on an
+# AFK actor). 0 = unlimited stays selectable by the host.
+DEFAULT_DECISION_SECS = 30
+# Time bank: per-seat reserve burned after the base clock; +TIME_BANK_REFILL_S
+# back per hand dealt in, never above the table's ``time_bank_secs``.
+MAX_TIME_BANK_SECS = 300
+TIME_BANK_REFILL_S = 2.0
+# Server-driven dealing: seconds after a hand (and its runout) is over.
+# 0 = manual. A request that does not name it gets MANUAL — scripted callers
+# (tests) stay deterministic; the create dialog always sends a value.
+MAX_DEAL_DELAY_SECS = 30.0
+# The server only deals to a table somebody is actually AT: a player counts as
+# present while their browser has polled within this window (a hidden tab still
+# polls every ~2 s; a closed one does not). Without it a table left running
+# overnight kept posting antes and moving money between absent players.
+PRESENCE_WINDOW_S = 20.0
+# Timing out this many decisions in a row sits the player out (they come back
+# with "I'm back"); an absent player then costs the table no more clock.
+TIMEOUTS_BEFORE_SIT_OUT = 2
+# A pending sit request holds its seat; it lapses when the requester's browser
+# has been gone this long.
+REQUEST_TTL_ABSENT_S = 90.0
+MAX_REQUESTS = 24
+# SSE: how often the stream looks for a change, and the longest it stays quiet
+# (keep-alive + presence; Cloudflare drops idle streams after ~100 s).
+STREAM_TICK_S = 0.12
+STREAM_HEARTBEAT_S = 2.5
+MIN_SEATS = 2
+EVENT_FEED_MAX = 60
+REACTION_TTL_S = 6.0
+REACTIONS = (
+    "gg", "nh", "ty", "gl", "lol", "wow", "cry", "angry", "fire", "clap",
+    "think", "ship",
+)
+HANDS_PAGE_MAX = 50
+#: The home-games client, served ONLY through the gated `/games/static/{name}`
+#: route. Every name here must also be "deny" in server.py's
+#: `_PUBLIC_STATIC_POLICY` (the public /static mount must never serve them).
+GAMES_ASSETS: dict[str, str] = {
+    "games.js": "text/javascript; charset=utf-8",
+    "games.table.js": "text/javascript; charset=utf-8",
+    "games.ui.js": "text/javascript; charset=utf-8",
+    "games.play.js": "text/javascript; charset=utf-8",
+    "games.sound.js": "text/javascript; charset=utf-8",
+    "games.css": "text/css; charset=utf-8",
+}
+# Hub eviction: nobody polling for this long => drop the in-memory table
+# (it reloads from the DB on the next request).
+HUB_CLOSED_EVICT_S = 60.0
+HUB_IDLE_EVICT_S = 30 * 60.0
+HUB_ABANDONED_EVICT_S = 6 * 3600.0  # even mid-hand: the hand is void
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS homegames (
+  id TEXT PRIMARY KEY,
+  host_user_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  num_seats INTEGER NOT NULL,
+  sb_cents INTEGER NOT NULL,
+  bb_cents INTEGER NOT NULL,
+  ante_cents INTEGER NOT NULL,
+  default_buyin_cents INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open',
+  running INTEGER NOT NULL DEFAULT 0,
+  auto_stack_mode TEXT NOT NULL DEFAULT 'off',
+  auto_stack_all_cents INTEGER NOT NULL DEFAULT 0,
+  decision_secs INTEGER NOT NULL DEFAULT 0,
+  street_pause_ms INTEGER NOT NULL DEFAULT 1500,
+  button INTEGER NOT NULL DEFAULT 0,
+  hand_no INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  closed_at TEXT,
+  deal_delay_ms INTEGER NOT NULL DEFAULT 5000,
+  time_bank_secs INTEGER NOT NULL DEFAULT 0,
+  min_buyin_cents INTEGER NOT NULL DEFAULT 0,
+  max_buyin_cents INTEGER NOT NULL DEFAULT 0,
+  listed INTEGER NOT NULL DEFAULT 1,
+  allow_rabbit INTEGER NOT NULL DEFAULT 1,
+  approve_buyins INTEGER NOT NULL DEFAULT 0,
+  topup_mode TEXT NOT NULL DEFAULT 'off',
+  topup_target_cents INTEGER NOT NULL DEFAULT 0,
+  topup_below_cents INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS homegame_hands (
+  game_id TEXT NOT NULL,
+  hand_no INTEGER NOT NULL,
+  ended_at TEXT NOT NULL,
+  pot_cents INTEGER NOT NULL DEFAULT 0,
+  summary TEXT NOT NULL,
+  PRIMARY KEY (game_id, hand_no)
+);
+CREATE TABLE IF NOT EXISTS homegame_hand_results (
+  game_id TEXT NOT NULL,
+  hand_no INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  delta_cents INTEGER NOT NULL,
+  showdown INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (game_id, hand_no, user_id)
+);
+CREATE TABLE IF NOT EXISTS homegame_players (
+  game_id TEXT NOT NULL,
+  user_id INTEGER NOT NULL,
+  seat INTEGER,
+  stack_chips INTEGER NOT NULL DEFAULT 0,
+  sitting_out INTEGER NOT NULL DEFAULT 0,
+  buyin_cents INTEGER NOT NULL DEFAULT 0,
+  leftover_cents INTEGER NOT NULL DEFAULT 0,
+  auto_stack_cents INTEGER NOT NULL DEFAULT 0,
+  trusted INTEGER NOT NULL DEFAULT 0,
+  topup_target_cents INTEGER NOT NULL DEFAULT 0,
+  topup_below_cents INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (game_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS homegame_ledger (
+  id INTEGER PRIMARY KEY,
+  game_id TEXT NOT NULL,
+  user_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  amount_cents INTEGER NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS homegame_chat (
+  id INTEGER PRIMARY KEY,
+  game_id TEXT NOT NULL,
+  user_id INTEGER NOT NULL,
+  body TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+"""
+
+
+def _ensure_schema() -> None:
+    with pub.DB._lock:
+        pub.DB._conn.executescript(_SCHEMA)
+        cols = {
+            r[1] for r in pub.DB._conn.execute("PRAGMA table_info(homegames)").fetchall()
+        }
+        if "running" not in cols:
+            pub.DB._conn.execute(
+                "ALTER TABLE homegames ADD COLUMN running INTEGER NOT NULL DEFAULT 0"
+            )
+        if "auto_stack_mode" not in cols:
+            pub.DB._conn.execute(
+                "ALTER TABLE homegames ADD COLUMN auto_stack_mode "
+                "TEXT NOT NULL DEFAULT 'off'"
+            )
+        if "auto_stack_all_cents" not in cols:
+            pub.DB._conn.execute(
+                "ALTER TABLE homegames ADD COLUMN auto_stack_all_cents "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+        if "decision_secs" not in cols:
+            pub.DB._conn.execute(
+                "ALTER TABLE homegames ADD COLUMN decision_secs "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+        if "street_pause_ms" not in cols:
+            pub.DB._conn.execute(
+                "ALTER TABLE homegames ADD COLUMN street_pause_ms "
+                "INTEGER NOT NULL DEFAULT 1500"
+            )
+        # 2026-09-21. Tables that predate server-side dealing were auto-dealt
+        # by the host's browser, so they migrate to a 5 s delay (not manual).
+        for col, ddl in (
+            ("deal_delay_ms", "INTEGER NOT NULL DEFAULT 5000"),
+            ("time_bank_secs", "INTEGER NOT NULL DEFAULT 0"),
+            ("min_buyin_cents", "INTEGER NOT NULL DEFAULT 0"),
+            ("max_buyin_cents", "INTEGER NOT NULL DEFAULT 0"),
+            ("listed", "INTEGER NOT NULL DEFAULT 1"),
+            ("allow_rabbit", "INTEGER NOT NULL DEFAULT 1"),
+            ("approve_buyins", "INTEGER NOT NULL DEFAULT 0"),
+            ("topup_mode", "TEXT NOT NULL DEFAULT 'off'"),
+            ("topup_target_cents", "INTEGER NOT NULL DEFAULT 0"),
+            ("topup_below_cents", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if col not in cols:
+                pub.DB._conn.execute(f"ALTER TABLE homegames ADD COLUMN {col} {ddl}")
+        pcols = {
+            r[1]
+            for r in pub.DB._conn.execute(
+                "PRAGMA table_info(homegame_players)"
+            ).fetchall()
+        }
+        if "auto_stack_cents" not in pcols:
+            pub.DB._conn.execute(
+                "ALTER TABLE homegame_players ADD COLUMN auto_stack_cents "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+        for col in ("trusted", "topup_target_cents", "topup_below_cents"):
+            if col not in pcols:
+                pub.DB._conn.execute(
+                    f"ALTER TABLE homegame_players ADD COLUMN {col} "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+        pub.DB._conn.commit()
+
+
+def _make_env(cfg: GameConfig) -> BombPotEnv:
+    """Prod's env.py may predate ``obs_mode``; fall back to the 2-arg ctor."""
+    try:
+        return BombPotEnv(cfg, ev_runout_samples=0, obs_mode="minimal")
+    except TypeError:
+        return BombPotEnv(cfg, ev_runout_samples=0)
+
+
+def _obs_dict(env: BombPotEnv) -> dict[str, Any]:
+    fn = env._rs.observation_dict
+    try:
+        return dict(fn(skip_outcome_mc=True))
+    except TypeError:
+        return dict(fn())
+
+
+def _div_half_up(num: int, den: int) -> int:
+    """round(num/den), half away from zero, in exact integer arithmetic
+    (``round()`` is banker's and ``/`` goes through a float)."""
+    sign = -1 if num < 0 else 1
+    return sign * ((abs(num) * 2 + den) // (2 * den))
+
+
+def cents_to_chips(cents: int, bb_cents: int) -> int:
+    if bb_cents <= 0:
+        raise HTTPException(status_code=400, detail="big blind must be positive")
+    return _div_half_up(int(cents) * BB_CHIPS, int(bb_cents))
+
+
+def chips_to_cents(chips: int, bb_cents: int) -> int:
+    """DISPLAY rounding of one chip amount. Never sum these for accounting —
+    the ledger uses ``apportion_cents`` (see the module docstring)."""
+    if bb_cents <= 0:
+        return 0
+    return _div_half_up(int(chips) * int(bb_cents), BB_CHIPS)
+
+
+def chips_per_cent(bb_cents: int) -> int:
+    """Whole chips in one cent, or 0 when the stake does not divide evenly
+    (e.g. a 3c big blind) and whole-cent chip multiples do not exist."""
+    bb = int(bb_cents)
+    return BB_CHIPS // bb if bb > 0 and BB_CHIPS % bb == 0 else 0
+
+
+def apportion_cents(total_cents: int, chips: list[int]) -> list[int]:
+    """Split ``total_cents`` across stacks in proportion to ``chips`` by the
+    largest-remainder method; ``sum(result) == max(0, total_cents)``.
+
+    Deterministic: each odd cent goes to the largest fractional remainder,
+    ties to the lower index; seats without chips only receive money when
+    nobody has any (the residue then goes to the first seat)."""
+    n = len(chips)
+    total = max(0, int(total_cents))
+    if n == 0:
+        return []
+    weights = [max(0, int(c)) for c in chips]
+    pool = sum(weights)
+    if pool <= 0:
+        return [total] + [0] * (n - 1)
+    out = [(total * w) // pool for w in weights]
+    rems = [(total * w) % pool for w in weights]
+    left = total - sum(out)
+    for i in sorted(range(n), key=lambda k: (-rems[k], k)):
+        if left <= 0:
+            break
+        if weights[i] > 0:
+            out[i] += 1
+            left -= 1
+    return out
+
+
+def _sorted_hole(cards: list[int] | None) -> list[int] | None:
+    """Highest-to-lowest by card index (rank-major), matching trainer display."""
+    if cards is None:
+        return None
+    return sorted((int(c) for c in cards), reverse=True)
+
+
+def _fmt_cents(cents: int) -> str:
+    sign = "-" if cents < 0 else ""
+    v = abs(int(cents))
+    return f"{sign}${v / 100:.2f}"
+
+
+AUTO_STACK_MODES = ("off", "host", "player")
+
+
+def _norm_auto_mode(v: Any) -> str:
+    s = str(v or "off").strip().lower()
+    return s if s in AUTO_STACK_MODES else "off"
+
+
+def _display_name(user: Any) -> str:
+    name = (user["name"] or "").strip()
+    if name:
+        return name
+    email = (user["email"] or "").strip()
+    return email.split("@")[0] if email else f"player-{user['id']}"
+
+
+def _gate_key(gate: int | str) -> int:
+    if gate in (GATE_FOLD, GATE_CHECK_CALL, GATE_RAISE):
+        return int(gate)
+    s = str(gate).strip().lower().replace("-", "_")
+    if s in ("fold", "0"):
+        return GATE_FOLD
+    if s in ("check", "call", "check_call", "checkcall", "1"):
+        return GATE_CHECK_CALL
+    if s in ("raise", "bet", "allin", "all_in", "2"):
+        return GATE_RAISE
+    raise HTTPException(status_code=400, detail=f"unknown gate {gate!r}")
+
+
+@dataclass
+class Seat:
+    user_id: int
+    name: str
+    email: str
+    stack_chips: int
+    sitting_out: bool
+    buyin_cents: int
+    leftover_cents: int
+    auto_stack_cents: int = 0
+    # In-memory only (a reloaded table comes back paused with full banks).
+    time_bank_left: float = 0.0
+    sit_out_next: bool = False
+    timeouts: int = 0  # consecutive decisions the clock made for them
+    trusted: bool = False  # buys in without the host's approval
+    topup_target_cents: int = 0  # auto top-up: back up to this ...
+    topup_below_cents: int = 0  # ... once the stack is below this (0 = target)
+    queued_topup_cents: int = 0  # asked for mid-hand; lands when the hand ends
+
+
+@dataclass
+class LiveTable:
+    game_id: str
+    host_user_id: int
+    name: str
+    num_seats: int
+    sb_cents: int
+    bb_cents: int
+    ante_cents: int
+    default_buyin_cents: int
+    status: str
+    button: int
+    hand_no: int
+    seats: list[Seat | None]
+    running: bool = False
+    auto_stack_mode: str = "off"  # off | host | player
+    auto_stack_all_cents: int = 0
+    decision_secs: int = 0  # 0 = unlimited
+    street_pause_secs: float = 1.5
+    turn_started_mono: float | None = None
+    # The decision the running shot clock belongs to: (hand_no, action_seq).
+    # The clock restarts only when this changes (review 2026-09-20 G5).
+    turn_key: tuple[int, int] | None = None
+    # Players leaving / being removed mid-hand: folded-or-checked by the
+    # away logic, cashed out once the hand (and its runout) is over.
+    pending_kicks: set[int] = field(default_factory=set)
+    runout_active: bool = False
+    runout_start_len: int = 3
+    runout_started_mono: float | None = None
+    leftover_stacks: list[int] = field(default_factory=list)
+    terminal_pot: int = 0
+    terminal_commit: list[int] = field(default_factory=list)
+    pot_awards: list[dict[str, Any]] = field(default_factory=list)
+    # (len_a, len_b) -> {seat: {"a": share, "b": share}}, computed ONCE per
+    # all-in hand from the alive seats' holes (review 2026-09-20 G3).
+    equity_by_len: dict[tuple[int, int], dict[int, dict[str, float]]] = field(
+        default_factory=dict
+    )
+    env: BombPotEnv | None = None
+    info: StepInfo | None = None
+    phase: str = "waiting"  # waiting | in_hand | showdown
+    hand_start_stacks: list[int] = field(default_factory=list)
+    in_hand_mask: list[bool] = field(default_factory=list)
+    # user id DEALT INTO each seat this hand (None = seat not dealt in). Own
+    # cards are shown against this, never against who sits there now (G2).
+    dealt_user_ids: list[int | None] = field(default_factory=list)
+    # Terminal with >= 2 live hands = a real showdown; a fold-out is not (G1).
+    showdown_reveal: bool = False
+    # Actions applied this hand. With hand_no it names a decision: clients
+    # echo both on /act and get 409 when they are stale (G8).
+    action_seq: int = 0
+    # Bumped on every state change; `epoch` is unique per in-memory load.
+    # Clients drop responses older than the one they already applied (G8).
+    rev: int = 0
+    epoch: str = field(default_factory=lambda: secrets.token_hex(4))
+    # A persist failed after memory had already advanced (engine paths);
+    # the watchdog retries (review 2026-09-20 G4).
+    persist_dirty: bool = False
+    persist_retry_mono: float = 0.0
+    last_access_mono: float = field(default_factory=time.monotonic)
+    chat_times: dict[int, deque] = field(default_factory=dict)
+    last_deltas: list[int] = field(default_factory=list)
+    last_holes: list[list[int] | None] = field(default_factory=list)
+    rabbit_available: bool = False
+    rabbit_shown: bool = False
+    rabbit_played_len: int = 3
+    rabbit_full_a: list[int] = field(default_factory=list)
+    rabbit_full_b: list[int] = field(default_factory=list)
+    # --- 2026-09-21 -------------------------------------------------------
+    deal_delay_secs: float = 0.0  # 0 = manual dealing
+    time_bank_secs: int = 0  # per-seat reserve; 0 = off
+    min_buyin_cents: int = 0  # 0 = no limit
+    max_buyin_cents: int = 0
+    listed: bool = True  # shown in every granted user's lobby
+    allow_rabbit: bool = True
+    # When the server will deal the next hand (monotonic), or None.
+    next_deal_mono: float | None = None
+    # The decision whose base clock has run out and is burning the bank.
+    bank_key: tuple[int, int] | None = None
+    bank_started_mono: float | None = None
+    # Seats that chose to table their cards after the hand (phase showdown).
+    shown_seats: set[int] = field(default_factory=set)
+    events: deque = field(default_factory=lambda: deque(maxlen=EVENT_FEED_MAX))
+    event_seq: int = 0
+    reactions: deque = field(default_factory=lambda: deque(maxlen=40))
+    reaction_seq: int = 0
+    # The finished hand's one-line result, held back while its runout reveals.
+    pending_result: dict | None = None
+    # user id -> monotonic time of their last poll (presence, see above)
+    seen: dict[int, float] = field(default_factory=dict)
+    names: dict[int, str] = field(default_factory=dict)  # display names of `seen`
+    approve_buyins: bool = False
+    topup_mode: str = "off"  # off | host | player
+    topup_all_target_cents: int = 0
+    topup_all_below_cents: int = 0
+    # Pending buy-in / top-up requests (approval mode). In memory: a restart
+    # simply asks the player to request again.
+    requests: list = field(default_factory=list)
+    request_seq: int = 0
+    lock: threading.RLock = field(default_factory=threading.RLock)
+
+    @property
+    def ante_chips(self) -> int:
+        return cents_to_chips(self.ante_cents, self.bb_cents)
+
+    def occupied(self) -> list[int]:
+        return [i for i, s in enumerate(self.seats) if s is not None]
+
+    def seat_of(self, uid: int) -> int | None:
+        for i, s in enumerate(self.seats):
+            if s is not None and s.user_id == uid:
+                return i
+        return None
+
+    def player(self, uid: int) -> Seat | None:
+        i = self.seat_of(uid)
+        return self.seats[i] if i is not None else None
+
+
+class Hub:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._tables: dict[str, LiveTable] = {}
+
+    def get(self, game_id: str) -> LiveTable:
+        with self._lock:
+            t = self._tables.get(game_id)
+            if t is None:
+                t = _load_table(game_id)
+                self._tables[game_id] = t
+            t.last_access_mono = time.monotonic()
+            return t
+
+    def put(self, table: LiveTable) -> None:
+        with self._lock:
+            self._tables[table.game_id] = table
+
+    def drop(self, game_id: str) -> None:
+        with self._lock:
+            self._tables.pop(game_id, None)
+
+    def evict_idle(self, now: float | None = None) -> list[str]:
+        """Forget tables nobody is looking at (review 2026-09-20 G13 — the
+        hub used to grow forever). Clients poll every ~0.5 s, so "idle"
+        means no browser has the table open. Everything that matters is in
+        the DB; the next request reloads it (paused, between hands)."""
+        now = time.monotonic() if now is None else now
+        gone: list[str] = []
+        with self._lock:
+            for gid, t in list(self._tables.items()):
+                if t.persist_dirty:
+                    continue  # unsaved state: keep it until a write succeeds
+                idle = now - t.last_access_mono
+                if t.status != "open":
+                    evict = idle > HUB_CLOSED_EVICT_S
+                elif t.phase == "in_hand":
+                    evict = idle > HUB_ABANDONED_EVICT_S
+                else:
+                    evict = idle > HUB_IDLE_EVICT_S
+                if evict:
+                    if t.phase == "in_hand":
+                        logger.warning(
+                            "evicting abandoned table %s mid-hand (hand void)", gid
+                        )
+                    del self._tables[gid]
+                    gone.append(gid)
+        return gone
+
+
+HUB = Hub()
+
+_WATCHDOG_STOP = threading.Event()
+_WATCHDOG_STARTED = False
+_WATCHDOG_THREAD: threading.Thread | None = None
+_EVICT_EVERY_S = 30.0
+
+
+def _watchdog_loop() -> None:
+    next_evict = time.monotonic() + _EVICT_EVERY_S
+    while not _WATCHDOG_STOP.wait(0.25):
+        try:
+            with HUB._lock:
+                tables = list(HUB._tables.values())
+            for t in tables:
+                with t.lock:
+                    _timeout_tick_locked(t)
+                    _settle_locked(t)
+                    _flush_result_locked(t)
+                    _apply_queued_topups_locked(t)
+                    _expire_requests_locked(t)
+                    _auto_deal_tick_locked(t)
+                    _retry_persist_locked(t)
+            if time.monotonic() >= next_evict:
+                next_evict = time.monotonic() + _EVICT_EVERY_S
+                HUB.evict_idle()
+        except Exception:  # noqa: BLE001 — never kill the clock thread
+            logger.exception("homegame shot-clock watchdog")
+
+
+def _start_watchdog() -> None:
+    global _WATCHDOG_STARTED, _WATCHDOG_THREAD
+    if _WATCHDOG_STARTED:
+        return
+    _WATCHDOG_STARTED = True
+    _WATCHDOG_STOP.clear()
+    _WATCHDOG_THREAD = threading.Thread(
+        target=_watchdog_loop, name="homegame-clock", daemon=True
+    )
+    _WATCHDOG_THREAD.start()
+
+
+def shutdown(timeout: float = 2.0) -> None:
+    """Stop the clock thread (tests purge + reimport this module)."""
+    global _WATCHDOG_STARTED
+    _WATCHDOG_STOP.set()
+    th = _WATCHDOG_THREAD
+    if th is not None and th.is_alive() and th is not threading.current_thread():
+        th.join(timeout)
+    _WATCHDOG_STARTED = False
+
+
+def _load_table(game_id: str) -> LiveTable:
+    row = pub.DB.one("SELECT * FROM homegames WHERE id=?", (game_id,))
+    if row is None:
+        raise HTTPException(status_code=404, detail="Not Found")
+    n = int(row["num_seats"])
+    seats: list[Seat | None] = [None] * n
+    for p in pub.DB.q(
+        "SELECT * FROM homegame_players WHERE game_id=? AND seat IS NOT NULL",
+        (game_id,),
+    ):
+        seat = p["seat"]
+        if seat is None or seat < 0 or seat >= n:
+            continue
+        user = pub._user_by_id(int(p["user_id"]))
+        if user is None:
+            continue
+        seats[int(seat)] = Seat(
+            user_id=int(p["user_id"]),
+            name=_display_name(user),
+            email=user["email"],
+            stack_chips=int(p["stack_chips"]),
+            sitting_out=bool(p["sitting_out"]),
+            buyin_cents=int(p["buyin_cents"]),
+            leftover_cents=int(p["leftover_cents"]),
+            auto_stack_cents=int(
+                p["auto_stack_cents"] if "auto_stack_cents" in p.keys() else 0
+            ),
+            time_bank_left=float(_row_int(row, "time_bank_secs", 0)),
+            trusted=bool(_row_int(p, "trusted", 0)),
+            topup_target_cents=_row_int(p, "topup_target_cents", 0),
+            topup_below_cents=_row_int(p, "topup_below_cents", 0),
+        )
+    # (review 2026-09-20 G14) A table loaded from the DB has no hand in
+    # memory (phase "waiting"), but `running=1` used to survive the restart:
+    # the host saw only "Pause", nobody saw a deal button, and the game
+    # looked dead. A reload always comes back PAUSED — the host presses
+    # Start, which deals. (An interrupted hand is void: stacks were last
+    # persisted at the previous hand's end.)
+    was_running = bool(int(row["running"] if "running" in row.keys() else 0))
+    if was_running:
+        pub.DB.q("UPDATE homegames SET running=0 WHERE id=?", (game_id,))
+    return LiveTable(
+        game_id=row["id"],
+        host_user_id=int(row["host_user_id"]),
+        name=row["name"],
+        num_seats=n,
+        sb_cents=int(row["sb_cents"]),
+        bb_cents=int(row["bb_cents"]),
+        ante_cents=int(row["ante_cents"]),
+        default_buyin_cents=int(row["default_buyin_cents"]),
+        status=row["status"],
+        button=int(row["button"]),
+        hand_no=int(row["hand_no"]),
+        seats=seats,
+        running=False,
+        auto_stack_mode=_norm_auto_mode(
+            row["auto_stack_mode"] if "auto_stack_mode" in row.keys() else "off"
+        ),
+        auto_stack_all_cents=int(
+            row["auto_stack_all_cents"]
+            if "auto_stack_all_cents" in row.keys()
+            else 0
+        ),
+        decision_secs=int(
+            row["decision_secs"] if "decision_secs" in row.keys() else 0
+        ),
+        street_pause_secs=max(
+            0.3,
+            (
+                int(row["street_pause_ms"] if "street_pause_ms" in row.keys() else 1500)
+                / 1000.0
+            ),
+        ),
+        phase="waiting",
+        deal_delay_secs=max(0.0, _row_int(row, "deal_delay_ms", 5000) / 1000.0),
+        time_bank_secs=_row_int(row, "time_bank_secs", 0),
+        min_buyin_cents=_row_int(row, "min_buyin_cents", 0),
+        max_buyin_cents=_row_int(row, "max_buyin_cents", 0),
+        listed=bool(_row_int(row, "listed", 1)),
+        allow_rabbit=bool(_row_int(row, "allow_rabbit", 1)),
+        approve_buyins=bool(_row_int(row, "approve_buyins", 0)),
+        topup_mode=_norm_auto_mode(row["topup_mode"] if "topup_mode" in row.keys() else "off"),
+        topup_all_target_cents=_row_int(row, "topup_target_cents", 0),
+        topup_all_below_cents=_row_int(row, "topup_below_cents", 0),
+    )
+
+
+def _row_int(row: Any, key: str, default: int) -> int:
+    """A column that older databases may not have yet."""
+    try:
+        v = row[key] if key in row.keys() else default
+    except (IndexError, KeyError):
+        v = default
+    return int(default if v is None else v)
+
+
+def _persist_meta(t: LiveTable) -> None:
+    pub.DB.q(
+        "UPDATE homegames SET host_user_id=?, status=?, running=?, "
+        "auto_stack_mode=?, auto_stack_all_cents=?, decision_secs=?, "
+        "street_pause_ms=?, "
+        "button=?, hand_no=?, "
+        "name=?, num_seats=?, ante_cents=?, default_buyin_cents=?, "
+        "deal_delay_ms=?, time_bank_secs=?, min_buyin_cents=?, "
+        "max_buyin_cents=?, listed=?, allow_rabbit=?, "
+        "approve_buyins=?, topup_mode=?, topup_target_cents=?, topup_below_cents=?, "
+        "closed_at=CASE WHEN ?= 'closed' THEN COALESCE(closed_at, ?) ELSE closed_at END "
+        "WHERE id=?",
+        (
+            t.host_user_id,
+            t.status,
+            1 if t.running else 0,
+            t.auto_stack_mode,
+            int(t.auto_stack_all_cents or 0),
+            int(t.decision_secs or 0),
+            int(round(float(t.street_pause_secs or 1.5) * 1000)),
+            t.button,
+            t.hand_no,
+            t.name,
+            int(t.num_seats),
+            int(t.ante_cents),
+            int(t.default_buyin_cents),
+            int(round(float(t.deal_delay_secs or 0.0) * 1000)),
+            int(t.time_bank_secs or 0),
+            int(t.min_buyin_cents or 0),
+            int(t.max_buyin_cents or 0),
+            1 if t.listed else 0,
+            1 if t.allow_rabbit else 0,
+            1 if t.approve_buyins else 0,
+            _norm_auto_mode(t.topup_mode),
+            int(t.topup_all_target_cents or 0),
+            int(t.topup_all_below_cents or 0),
+            t.status,
+            pub._now(),
+            t.game_id,
+        ),
+    )
+
+
+def _persist_player(t: LiveTable, seat_i: int | None, p: Seat, seated: bool) -> None:
+    pub.DB.q(
+        "INSERT INTO homegame_players(game_id,user_id,seat,stack_chips,sitting_out,"
+        "buyin_cents,leftover_cents,auto_stack_cents,trusted,topup_target_cents,"
+        "topup_below_cents) VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(game_id,user_id) DO UPDATE SET seat=excluded.seat,"
+        " stack_chips=excluded.stack_chips, sitting_out=excluded.sitting_out,"
+        " buyin_cents=excluded.buyin_cents, leftover_cents=excluded.leftover_cents,"
+        " auto_stack_cents=excluded.auto_stack_cents, trusted=excluded.trusted,"
+        " topup_target_cents=excluded.topup_target_cents,"
+        " topup_below_cents=excluded.topup_below_cents",
+        (
+            t.game_id,
+            p.user_id,
+            seat_i if seated else None,
+            p.stack_chips,
+            1 if p.sitting_out else 0,
+            p.buyin_cents,
+            p.leftover_cents,
+            int(p.auto_stack_cents or 0),
+            1 if p.trusted else 0,
+            int(p.topup_target_cents or 0),
+            int(p.topup_below_cents or 0),
+        ),
+    )
+
+
+def _persist_seats(t: LiveTable) -> None:
+    with pub.DB.transaction():  # one commit, not one per row
+        _persist_meta(t)
+        for i, p in enumerate(t.seats):
+            if p is not None:
+                _persist_player(t, i, p, True)
+
+
+def _persist_safe(t: LiveTable) -> None:
+    """Persist meta + seats on an ENGINE path; never raises.
+
+    (review 2026-09-20 G4) Once the engine has stepped, memory cannot be
+    rolled back — the env has no undo — so a failed write must not surface
+    as a half-applied action. Memory stays the truth, ``persist_dirty`` is
+    set, and the watchdog retries. (Inputs are capped, so every in-memory
+    value IS persistable; only transient DB errors land here.)"""
+    try:
+        _persist_seats(t)
+        t.persist_dirty = False
+    except Exception:  # noqa: BLE001
+        logger.exception("homegame persist failed for %s; will retry", t.game_id)
+        t.persist_dirty = True
+        t.persist_retry_mono = time.monotonic() + 2.0
+
+
+def _retry_persist_locked(t: LiveTable) -> None:
+    if t.persist_dirty and time.monotonic() >= t.persist_retry_mono:
+        _persist_safe(t)
+
+
+_SNAPSHOT_FIELDS = (
+    "host_user_id", "status", "running", "auto_stack_mode",
+    "auto_stack_all_cents", "decision_secs", "street_pause_secs", "button",
+    "hand_no", "turn_started_mono", "turn_key", "phase",
+    "name", "num_seats", "ante_cents", "default_buyin_cents", "deal_delay_secs",
+    "time_bank_secs", "min_buyin_cents", "max_buyin_cents", "listed",
+    "allow_rabbit", "approve_buyins", "topup_mode", "topup_all_target_cents",
+    "topup_all_below_cents",
+)
+
+
+@contextmanager
+def _mutation(t: LiveTable) -> Iterator[None]:
+    """All-or-nothing seat/settings change (caller holds ``t.lock``).
+
+    (review 2026-09-20 G4) Handlers used to mutate memory first and persist
+    second: a failed write (``rebuy 1e30`` -> sqlite OverflowError) left RAM
+    holding a value that could never be saved, and every later
+    deal/kick/leave/close 500'd until a restart. Inside this block the DB
+    writes form ONE transaction, and on any exception both the transaction
+    and the in-memory table (seats + settings) roll back together.
+
+    Never step the engine inside it — an env cannot be restored; engine
+    paths use ``_persist_safe`` instead."""
+    snap = {f: getattr(t, f) for f in _SNAPSHOT_FIELDS}
+    seats = [replace(p) if p is not None else None for p in t.seats]
+    kicks = set(t.pending_kicks)
+    try:
+        with pub.DB.transaction():
+            yield
+    except BaseException:
+        for f, v in snap.items():
+            setattr(t, f, v)
+        t.seats = seats
+        t.pending_kicks = kicks
+        raise
+    t.rev += 1
+
+
+def _ledger_add(t: LiveTable, uid: int, kind: str, amount_cents: int) -> None:
+    pub.DB.q(
+        "INSERT INTO homegame_ledger(game_id,user_id,kind,amount_cents,created_at)"
+        " VALUES(?,?,?,?,?)",
+        (t.game_id, uid, kind, int(amount_cents), pub._now()),
+    )
+
+
+def _emit(t: LiveTable, kind: str, text: str, **extra: Any) -> None:
+    """Append one line to the table's in-memory event feed (dealer messages,
+    toasts). Cosmetic: never raises, never persisted, capped."""
+    try:
+        t.event_seq += 1
+        ev = {"id": t.event_seq, "kind": kind, "text": str(text)[:200], "ts": time.time()}
+        ev.update(extra)
+        t.events.append(ev)
+    except Exception:  # noqa: BLE001
+        logger.exception("homegame event feed")
+
+
+def _seat_name(t: LiveTable, i: int | None) -> str:
+    p = t.seats[i] if i is not None and 0 <= i < len(t.seats) else None
+    return p.name if p is not None else (f"Seat {i + 1}" if i is not None else "?")
+
+
+def _eligible_mask(t: LiveTable, stacks: list[int] | None = None) -> list[bool]:
+    """Seats that would be dealt in. ``stacks`` overrides the seats' own
+    chips (the view passes hand-start stacks while a runout is revealing)."""
+    ante = t.ante_chips
+    out = []
+    for i, s in enumerate(t.seats):
+        chips = s.stack_chips if s is not None else 0
+        if stacks is not None and i < len(stacks):
+            chips = int(stacks[i])
+        out.append(s is not None and (not s.sitting_out) and chips > ante)
+    return out
+
+
+def _validate_auto_stack_cents(t: LiveTable, cents: int) -> int:
+    n = int(cents)
+    if n < 0:
+        raise HTTPException(status_code=400, detail="auto-stack must be >= 0")
+    if n == 0:
+        return 0
+    if n <= int(t.ante_cents) or cents_to_chips(n, t.bb_cents) <= t.ante_chips:
+        raise HTTPException(
+            status_code=400,
+            detail="auto-stack must be more than the ante",
+        )
+    hi = int(t.max_buyin_cents or 0)
+    if hi and n > hi:
+        raise HTTPException(
+            status_code=400, detail=f"the table maximum is {_fmt_cents(hi)}"
+        )
+    return n
+
+
+def _validate_topup(t: LiveTable, target: int, below: int) -> tuple[int, int]:
+    """(target, below) for auto top-up. target 0 = off. below 0 = "whenever the
+    stack is under the target"; otherwise 0 < below <= target."""
+    target = _validate_auto_stack_cents(t, target)
+    below = int(below)
+    if target == 0:
+        return 0, 0
+    if below < 0 or below > target:
+        raise HTTPException(
+            status_code=400,
+            detail="the top-up threshold must be between 0 and the target",
+        )
+    return target, below
+
+
+def _auto_chips_allowed(t: LiveTable, p: Seat) -> bool:
+    """An automatic buy-in is still a buy-in: while the host approves buy-ins
+    it only runs for the host and the players the host trusts."""
+    return (not t.approve_buyins) or p.trusted or p.user_id == t.host_user_id
+
+
+def _auto_target_chips(t: LiveTable, p: Seat) -> int:
+    """The chips seat ``p`` will hold once the deal's auto set-stack / auto
+    top-up has run (its current chips when neither applies)."""
+    chips = int(p.stack_chips) + cents_to_chips(int(p.queued_topup_cents or 0), t.bb_cents)
+    if not _auto_chips_allowed(t, p):
+        return chips
+    if _norm_auto_mode(t.auto_stack_mode) != "off" and int(p.auto_stack_cents or 0) > 0:
+        return cents_to_chips(int(p.auto_stack_cents), t.bb_cents)
+    if _norm_auto_mode(t.topup_mode) != "off" and int(p.topup_target_cents or 0) > 0:
+        below = int(p.topup_below_cents or 0) or int(p.topup_target_cents)
+        if chips_to_cents(chips, t.bb_cents) < below:
+            return max(chips, cents_to_chips(int(p.topup_target_cents), t.bb_cents))
+    return chips
+
+
+def _apply_auto_stacks_locked(t: LiveTable) -> None:
+    """Reset opted-in stacks to their target, then the engine posts ante.
+
+    Surplus chips cash out to leftover; a shortfall is a rebuy. Net is
+    unchanged. Sitting-out seats are left alone until they sit back in.
+
+    (review 2026-09-20 G10) Money only moves in whole cents, and the chips
+    that move are exactly those cents' worth: a stack's sub-cent remainder
+    (pots split across boards / ties) is CARRIED, so the stack lands within
+    a cent of the target. It used to be set to the target outright, which
+    created or destroyed the remainder while the ledger moved a rounded
+    amount.
+    """
+    set_on = _norm_auto_mode(t.auto_stack_mode) in ("host", "player")
+    top_on = _norm_auto_mode(t.topup_mode) in ("host", "player")
+    if not (set_on or top_on):
+        return
+    with _mutation(t):
+        for p in t.seats:
+            if p is None or p.sitting_out or not _auto_chips_allowed(t, p):
+                continue
+            target_cents = int(p.auto_stack_cents or 0) if set_on else 0
+            if target_cents <= 0:
+                # AUTO TOP-UP (2026-09-22): only ever UP, and only once the
+                # stack has dropped below the player's threshold — winnings
+                # stay on the table, so this is not a rathole.
+                tgt = int(p.topup_target_cents or 0) if top_on else 0
+                if tgt <= 0:
+                    continue
+                have = chips_to_cents(int(p.stack_chips), t.bb_cents)
+                if have >= (int(p.topup_below_cents or 0) or tgt):
+                    continue
+                add_cents = tgt - have
+                if add_cents <= 0 or p.buyin_cents + add_cents > MAX_CENTS:
+                    continue
+                p.buyin_cents += add_cents
+                p.stack_chips += cents_to_chips(add_cents, t.bb_cents)
+                _ledger_add(t, p.user_id, "rebuy", add_cents)
+                _emit(t, "rebuy", f"{p.name} auto topped up {_fmt_cents(add_cents)}")
+                continue
+            target_chips = cents_to_chips(target_cents, t.bb_cents)
+            if target_chips <= t.ante_chips:
+                continue
+            delta_chips = target_chips - int(p.stack_chips)
+            delta_cents = chips_to_cents(abs(delta_chips), t.bb_cents)
+            if delta_cents <= 0:
+                continue  # within a cent of the target already
+            moved = cents_to_chips(delta_cents, t.bb_cents)
+            if delta_chips > 0:
+                if p.buyin_cents + delta_cents > MAX_CENTS:
+                    continue  # total buy-in cap — leave the stack alone
+                p.buyin_cents += delta_cents
+                p.stack_chips += moved
+                _ledger_add(t, p.user_id, "rebuy", delta_cents)
+            else:
+                moved = min(moved, int(p.stack_chips))
+                p.leftover_cents += delta_cents
+                p.stack_chips -= moved
+                _ledger_add(t, p.user_id, "cashout", delta_cents)
+        _persist_seats(t)
+
+
+def _auto_stack_host_locked(t: LiveTable, uid: int, body: dict) -> None:
+    _require_open(t)
+    if uid != t.host_user_id:
+        raise HTTPException(
+            status_code=400, detail="only the host can change auto-stack settings"
+        )
+    body = body or {}
+    with _mutation(t):
+        if "mode" in body and body["mode"] is not None:
+            mode = str(body["mode"]).strip().lower()
+            if mode not in AUTO_STACK_MODES:
+                raise HTTPException(
+                    status_code=400, detail="mode must be off, host, or player"
+                )
+            t.auto_stack_mode = mode
+        if "all_cents" in body and body["all_cents"] is not None:
+            cents = _validate_auto_stack_cents(t, _parse_cents(body, "all_cents", 0))
+            t.auto_stack_all_cents = cents
+            if t.auto_stack_mode == "host":
+                for p in t.seats:
+                    if p is not None:
+                        p.auto_stack_cents = cents
+        players = body.get("players")
+        if players:
+            if t.auto_stack_mode != "host":
+                raise HTTPException(
+                    status_code=400,
+                    detail="per-player auto-stack is only available when the host sets stacks",
+                )
+            if not isinstance(players, list) or len(players) > TABLE_SEATS:
+                raise HTTPException(status_code=400, detail="players must be a list")
+            for item in players:
+                if not isinstance(item, dict):
+                    raise HTTPException(status_code=400, detail="invalid player entry")
+                puid = pub.body_int(item, "user_id")
+                pcents = _validate_auto_stack_cents(t, _parse_cents(item, "cents", 0))
+                p = t.player(puid)
+                if p is None:
+                    raise HTTPException(status_code=400, detail="player not seated")
+                p.auto_stack_cents = pcents
+        _persist_seats(t)
+
+
+def _auto_topup_host_locked(t: LiveTable, uid: int, body: dict) -> None:
+    """Host side of auto top-up: the mode (off / host / player), the values for
+    everyone in host mode, and per-player overrides."""
+    _require_open(t)
+    if uid != t.host_user_id:
+        raise HTTPException(
+            status_code=400, detail="only the host can change auto top-up settings"
+        )
+    body = body or {}
+    with _mutation(t):
+        if body.get("mode") is not None:
+            mode = str(body["mode"]).strip().lower()
+            if mode not in AUTO_STACK_MODES:
+                raise HTTPException(
+                    status_code=400, detail="mode must be off, host, or player"
+                )
+            t.topup_mode = mode
+        if body.get("all_target_cents") is not None:
+            target, below = _validate_topup(
+                t, _parse_cents(body, "all_target_cents", 0),
+                _parse_cents(body, "all_below_cents", 0),
+            )
+            t.topup_all_target_cents, t.topup_all_below_cents = target, below
+            if t.topup_mode == "host":
+                for p in t.seats:
+                    if p is not None:
+                        p.topup_target_cents, p.topup_below_cents = target, below
+        players = body.get("players")
+        if players:
+            if t.topup_mode != "host":
+                raise HTTPException(
+                    status_code=400,
+                    detail="per-player top-up is only available when the host sets it",
+                )
+            if not isinstance(players, list) or len(players) > TABLE_SEATS:
+                raise HTTPException(status_code=400, detail="players must be a list")
+            for item in players:
+                if not isinstance(item, dict):
+                    raise HTTPException(status_code=400, detail="invalid player entry")
+                p = t.player(pub.body_int(item, "user_id"))
+                if p is None:
+                    raise HTTPException(status_code=400, detail="player not seated")
+                p.topup_target_cents, p.topup_below_cents = _validate_topup(
+                    t, _parse_cents(item, "target_cents", 0),
+                    _parse_cents(item, "below_cents", 0),
+                )
+        _persist_seats(t)
+
+
+def _auto_chips_self_locked(t: LiveTable, uid: int, body: dict) -> None:
+    """A player picks their own automatic chips — when the host left the
+    choice to the players: ``kind`` = off | topup | set."""
+    _require_open(t)
+    p = t.player(uid)
+    if p is None:
+        raise HTTPException(status_code=400, detail="not seated")
+    kind = str((body or {}).get("kind") or "off").strip().lower()
+    if kind not in ("off", "topup", "set"):
+        raise HTTPException(status_code=400, detail="kind must be off, topup or set")
+    if kind == "topup" and t.topup_mode != "player":
+        raise HTTPException(
+            status_code=400, detail="players cannot set auto top-up at this table"
+        )
+    if kind == "set" and t.auto_stack_mode != "player":
+        raise HTTPException(
+            status_code=400, detail="players cannot set their stack at this table"
+        )
+    target = _parse_cents(body or {}, "target_cents", 0)
+    below = _parse_cents(body or {}, "below_cents", 0)
+    with _mutation(t):
+        # Only the knobs the PLAYER owns are touched: a host-set value stays.
+        if t.topup_mode == "player":
+            p.topup_target_cents, p.topup_below_cents = (
+                _validate_topup(t, target, below) if kind == "topup" else (0, 0)
+            )
+        if t.auto_stack_mode == "player":
+            p.auto_stack_cents = (
+                _validate_auto_stack_cents(t, target) if kind == "set" else 0
+            )
+        _persist_player(t, t.seat_of(uid), p, True)
+
+
+def _auto_stack_self_locked(t: LiveTable, uid: int, cents: int) -> None:
+    _require_open(t)
+    if t.auto_stack_mode != "player":
+        raise HTTPException(
+            status_code=400, detail="players cannot set auto-stack in this mode"
+        )
+    if t.player(uid) is None:
+        raise HTTPException(status_code=400, detail="not seated")
+    target = _validate_auto_stack_cents(t, cents)
+    with _mutation(t):
+        p = t.player(uid)
+        assert p is not None
+        p.auto_stack_cents = target
+        _persist_player(t, t.seat_of(uid), p, True)
+
+
+def _next_button(t: LiveTable, mask: list[bool]) -> int:
+    n = t.num_seats
+    start = t.button
+    if t.hand_no == 0:
+        # First hand: first eligible seat at or after 0.
+        for i in range(n):
+            if mask[i]:
+                return i
+        return 0
+    for off in range(1, n + 1):
+        i = (start + off) % n
+        if mask[i]:
+            return i
+    return start
+
+
+def _split_board(cards: list[int]) -> dict[str, list[int | None]]:
+    c = [int(x) for x in cards]
+    flop = (c[:3] + [None, None, None])[:3]
+    turn = c[3] if len(c) > 3 else None
+    river = c[4] if len(c) > 4 else None
+    return {"flop": flop, "turn": turn, "river": river}
+
+
+def _history_entries(raw: dict[str, Any], bb_cents: int) -> list[dict[str, Any]]:
+    street_commit = [0] * 16
+    cur_street: int | None = None
+    out: list[dict[str, Any]] = []
+    for rec in raw.get("history") or []:
+        seat, action, chips, street = int(rec[0]), int(rec[1]), int(rec[2]), int(rec[3])
+        if street != cur_street:
+            # (review 2026-09-20 G9) "Raise to" is a PER-STREET total: the
+            # accumulator used to run across streets, so a $5 turn bet after
+            # $10 of flop action read "Raise to $15".
+            street_commit = [0] * 16
+            cur_street = street
+        street_commit[seat] += chips
+        if action == FOLD:
+            label = "Fold"
+        elif action == 1:  # CHECK_CALL
+            label = "Check" if chips == 0 else f"Call {_fmt_cents(chips_to_cents(chips, bb_cents))}"
+        else:
+            label = f"Raise to {_fmt_cents(chips_to_cents(street_commit[seat], bb_cents))}"
+            if action == 7:
+                label = f"All-in {_fmt_cents(chips_to_cents(chips, bb_cents))}"
+        out.append({
+            "seat": seat,
+            "street": STREET_NAMES.get(street, str(street)),
+            "action": action,
+            "chips": chips,
+            "cents": chips_to_cents(chips, bb_cents),
+            "to_cents": chips_to_cents(street_commit[seat], bb_cents),
+            "label": label,
+        })
+    return out
+
+
+def _ledger_state(
+    t: LiveTable, stacks: list[int] | None = None
+) -> tuple[list[dict[str, Any]], dict[int, int]]:
+    """(ledger rows, {seat: stack cents}) under the zero-sum money rule.
+
+    ``stacks`` overrides the seated players' chips (hand-start stacks while a
+    runout is still revealing, so the rows cannot spoil it — review G11).
+    The seated stacks' cents are the largest-remainder apportionment of the
+    money on the table (module docstring, review G10): ``sum(net_cents)`` over
+    the returned rows is exactly 0.
+
+    (review 2026-09-20 G12) No emails: every flagged user can open every
+    table, and the row used to hand each of them everyone's address."""
+    rows = pub.DB.q(
+        "SELECT p.user_id, p.buyin_cents, p.leftover_cents, u.email, u.name "
+        "FROM homegame_players p JOIN users u ON u.id=p.user_id "
+        "WHERE p.game_id=? ORDER BY p.user_id",
+        (t.game_id,),
+    )
+    seated = {s.user_id: (i, s) for i, s in enumerate(t.seats) if s is not None}
+    entries: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for r in rows:
+        uid = int(r["user_id"])
+        seen.add(uid)
+        live = seated.get(uid)
+        entries.append({
+            "user_id": uid,
+            "name": live[1].name if live else _display_name(r),
+            "seat": live[0] if live else None,
+            "buyin": live[1].buyin_cents if live else int(r["buyin_cents"]),
+            "leftover": live[1].leftover_cents if live else int(r["leftover_cents"]),
+        })
+    for uid, (i, s) in seated.items():  # seated but not persisted yet
+        if uid not in seen:
+            entries.append({
+                "user_id": uid, "name": s.name, "seat": i,
+                "buyin": s.buyin_cents, "leftover": s.leftover_cents,
+            })
+    money = sum(e["buyin"] - e["leftover"] for e in entries)
+    live_entries = [e for e in entries if e["seat"] is not None]
+    live_entries.sort(key=lambda e: e["seat"])
+    chips = []
+    for e in live_entries:
+        i = e["seat"]
+        if stacks is not None and i < len(stacks):
+            chips.append(int(stacks[i]))
+        else:
+            chips.append(int(t.seats[i].stack_chips))
+    cents = apportion_cents(money, chips)
+    seat_cents = {e["seat"]: c for e, c in zip(live_entries, cents)}
+    out = []
+    for e in entries:
+        stack_cents = seat_cents.get(e["seat"], 0) if e["seat"] is not None else 0
+        out.append({
+            "user_id": e["user_id"],
+            "name": e["name"],
+            "seated": e["seat"] is not None,
+            "seat": e["seat"],
+            "buyin_cents": e["buyin"],
+            "stack_cents": stack_cents,
+            "leftover_cents": e["leftover"],
+            "net_cents": e["leftover"] + stack_cents - e["buyin"],
+        })
+    out.sort(key=lambda x: (not x["seated"], x["seat"] is None, x["seat"] or 0))
+    return out, seat_cents
+
+
+def _ledger_rows(t: LiveTable) -> list[dict[str, Any]]:
+    return _ledger_state(t)[0]
+
+
+def _turn_remaining_secs(t: LiveTable) -> float | None:
+    if t.phase != "in_hand" or int(t.decision_secs or 0) <= 0:
+        return None
+    if t.turn_started_mono is None:
+        return None
+    left = float(t.decision_secs) - (time.monotonic() - t.turn_started_mono)
+    return max(0.0, round(left, 2))
+
+
+def _passive_choice(t: LiveTable) -> tuple[int, int]:
+    """Check if free, otherwise fold. Used for the shot clock and away."""
+    if t.env is None or t.info is None:
+        raise HTTPException(status_code=400, detail="no hand in progress")
+    gm = t.info.gate_mask
+    raw = _obs_dict(t.env)
+    actor = raw.get("actor")
+    if actor is None:
+        raise HTTPException(status_code=400, detail="no actor")
+    actor = int(actor)
+    to_call = min(
+        max(0, int(raw["bet_to_call"]) - int(raw["street_commit"][actor])),
+        int(raw["stacks"][actor]),
+    )
+    if to_call <= 0 and bool(gm[GATE_CHECK_CALL]):
+        return GATE_CHECK_CALL, 0
+    if bool(gm[GATE_FOLD]):
+        return GATE_FOLD, 0
+    if bool(gm[GATE_CHECK_CALL]):
+        return GATE_CHECK_CALL, 0
+    raise HTTPException(status_code=400, detail="no legal auto-action")
+
+
+def _actor_is_away(t: LiveTable, actor: int) -> bool:
+    """The seat to act has nobody who will act: sitting out (Away, or
+    leaving / being removed), or vacated."""
+    p = t.seats[actor] if 0 <= actor < len(t.seats) else None
+    return p is None or bool(p.sitting_out)
+
+
+def _start_clock_locked(t: LiveTable, *, restart: bool = False) -> None:
+    """Run the shot clock for the CURRENT decision.
+
+    (review 2026-09-20 G5) A decision is ``(hand_no, action_seq)``. The clock
+    restarts only when that changes — it used to restart on every call, and
+    any seated player toggling Away (or a kick) called it, handing the actor
+    a fresh clock as often as a friend cared to click."""
+    key = (t.hand_no, t.action_seq)
+    if int(t.decision_secs or 0) <= 0:
+        t.turn_started_mono = None
+        t.turn_key = key
+        return
+    if not restart and t.turn_key == key and t.turn_started_mono is not None:
+        return
+    t.turn_key = key
+    t.turn_started_mono = time.monotonic()
+
+
+def _resume_turn_locked(t: LiveTable) -> None:
+    """Start the shot clock, or immediately auto-act an away actor.
+
+    Passive play is at most one action per seat per street, so the bound
+    below always drains a hand full of away players (review 2026-09-20 G6:
+    the old ``num_seats + 4`` cap ran out with six of them, leaving an away
+    actor that nothing would ever move)."""
+    for _ in range(3 * (t.num_seats or TABLE_SEATS) + 8):
+        if t.phase != "in_hand" or t.env is None or t.info is None:
+            t.turn_started_mono = None
+            return
+        actor = t.env.current_actor()
+        if actor is None:
+            t.turn_started_mono = None
+            return
+        if _actor_is_away(t, int(actor)):
+            gate, chips = _passive_choice(t)
+            _apply_action_locked(t, gate, chips, _resume=False)
+            continue
+        _start_clock_locked(t)
+        return
+    # Not drained (cannot happen with passive play): the watchdog's away
+    # check picks it up on its next tick.
+    t.turn_started_mono = None
+
+
+def _bank_state(t: LiveTable) -> tuple[bool, float]:
+    """(burning the time bank right now?, seconds of bank left for the actor)."""
+    if t.phase != "in_hand" or t.env is None:
+        return False, 0.0
+    actor = t.env.current_actor()
+    p = t.seats[int(actor)] if actor is not None and int(actor) < len(t.seats) else None
+    if p is None:
+        return False, 0.0
+    left = max(0.0, float(p.time_bank_left or 0.0))
+    key = (t.hand_no, t.action_seq)
+    if t.bank_key == key and t.bank_started_mono is not None:
+        used = max(0.0, time.monotonic() - t.bank_started_mono)
+        return True, max(0.0, left - used)
+    return False, left
+
+
+def _settle_bank_locked(t: LiveTable, actor: int | None) -> None:
+    """The decision is over: charge the actor the bank seconds they used."""
+    if t.bank_started_mono is not None and t.bank_key == (t.hand_no, t.action_seq):
+        p = t.seats[actor] if actor is not None and 0 <= actor < len(t.seats) else None
+        if p is not None:
+            used = max(0.0, time.monotonic() - t.bank_started_mono)
+            p.time_bank_left = max(0.0, float(p.time_bank_left or 0.0) - used)
+    t.bank_key = None
+    t.bank_started_mono = None
+
+
+def _timeout_tick_locked(t: LiveTable) -> None:
+    if t.phase != "in_hand" or t.env is None or t.info is None:
+        return
+    actor = t.env.current_actor()
+    if actor is None:
+        return
+    actor = int(actor)
+    timed_out = False
+    # (review 2026-09-20 G6) An away actor is auto-acted even on a clock-less
+    # table — the watchdog used to return early when decision_secs == 0.
+    if not _actor_is_away(t, actor):
+        if int(t.decision_secs or 0) <= 0 or t.turn_started_mono is None:
+            return
+        now = time.monotonic()
+        base_end = t.turn_started_mono + float(t.decision_secs)
+        if now < base_end:
+            return
+        # Base clock is out: burn the actor's time bank before acting for them.
+        p = t.seats[actor]
+        bank = max(0.0, float(p.time_bank_left or 0.0)) if p is not None else 0.0
+        key = (t.hand_no, t.action_seq)
+        if bank > 0.0:
+            if t.bank_key != key or t.bank_started_mono is None:
+                t.bank_key = key
+                t.bank_started_mono = base_end
+                t.rev += 1
+            if now - t.bank_started_mono < bank:
+                return
+        timed_out = True
+    name = _seat_name(t, actor)
+    who = t.seats[actor]
+    gate, chips = _passive_choice(t)
+    _apply_action_locked(t, gate, chips)
+    if timed_out:
+        _emit(
+            t, "timeout",
+            f"{name} timed out — {'folded' if gate == GATE_FOLD else 'checked'}",
+            seat=actor,
+        )
+        if who is not None and t.seats[actor] is who:
+            who.timeouts += 1
+            if who.timeouts >= TIMEOUTS_BEFORE_SIT_OUT and not who.sitting_out:
+                who.timeouts = 0
+                who.sitting_out = True
+                who.sit_out_next = False
+                t.rev += 1
+                _persist_safe(t)
+                _emit(t, "away", f"{name} is sitting out (timed out twice)", seat=actor)
+                if t.phase == "in_hand":
+                    _resume_turn_locked(t)
+
+
+def _deal_ready(t: LiveTable, *, present_only: bool = False) -> bool:
+    """Could a hand be dealt right now (2+ seats that would be dealt in)?
+    Counts a busted seat whose auto-stack tops it up at the deal.
+    ``present_only``: count only players whose browser is at the table."""
+    if t.status != "open" or not t.running or _hand_busy(t):
+        return False
+    ante = t.ante_chips
+    now = time.monotonic()
+    n = 0
+    for p in t.seats:
+        if p is None or p.sitting_out or p.sit_out_next or p.user_id in t.pending_kicks:
+            continue
+        if present_only and now - t.seen.get(p.user_id, -1e9) > PRESENCE_WINDOW_S:
+            continue
+        if _auto_target_chips(t, p) > ante:
+            n += 1
+    return n >= 2
+
+
+def _auto_deal_tick_locked(t: LiveTable) -> None:
+    """Server-driven dealing (watchdog). The next hand used to be dealt by a
+    timer in the HOST'S browser — a host who switched tabs or locked their
+    phone stalled the table for everyone."""
+    delay = float(t.deal_delay_secs or 0.0)
+    if delay <= 0.0 or not _deal_ready(t, present_only=True):
+        t.next_deal_mono = None
+        return
+    now = time.monotonic()
+    if t.next_deal_mono is None:
+        t.next_deal_mono = now + delay
+        return
+    if now < t.next_deal_mono:
+        return
+    t.next_deal_mono = None
+    try:
+        _deal_locked(t)
+    except HTTPException:
+        pass  # not dealable after all (e.g. auto-stack could not top up)
+
+
+def _runout_shown_len(t: LiveTable) -> int:
+    if not t.runout_active:
+        return 5
+    start = max(3, int(t.runout_start_len or 3))
+    pause = float(t.street_pause_secs if t.street_pause_secs is not None else 1.5)
+    if not (pause > 0) or not math.isfinite(pause):
+        return 5
+    started = t.runout_started_mono if t.runout_started_mono is not None else time.monotonic()
+    extra = int((time.monotonic() - started) / pause)
+    return min(5, start + extra)
+
+
+def _runout_award_index(t: LiveTable) -> int:
+    n = len(t.pot_awards or [])
+    if not t.runout_active:
+        return n
+    if _runout_shown_len(t) < 5:
+        return -1
+    pause = float(t.street_pause_secs if t.street_pause_secs is not None else 1.5)
+    if not math.isfinite(pause):
+        pause = 0.0
+    start = max(3, int(t.runout_start_len or 3))
+    river_at = (5 - start) * max(pause, 0.0)
+    elapsed = time.monotonic() - (t.runout_started_mono or time.monotonic())
+    into = elapsed - river_at
+    if into < 0:
+        return -1
+    return min(n, int(into / AWARD_SECS))
+
+
+def _runout_blocking(t: LiveTable) -> bool:
+    if not t.runout_active:
+        return False
+    n = len(t.pot_awards or [])
+    return _runout_shown_len(t) < 5 or _runout_award_index(t) < n
+
+
+def _hand_busy(t: LiveTable) -> bool:
+    """A hand is being played OR its all-in runout is still revealing —
+    either way the hand is not over for the people watching it."""
+    return t.phase == "in_hand" or _runout_blocking(t)
+
+
+def _settle_locked(t: LiveTable) -> None:
+    """Deferred end-of-hand work: cash out players who left / were removed
+    mid-hand. Waits for the runout to finish revealing — a cashed-out row in
+    the ledger would announce the result early (review 2026-09-20 G11).
+    Called from the watchdog, every view, and before a deal; a failed
+    cash-out stays pending and is retried."""
+    if not t.pending_kicks or _hand_busy(t):
+        return
+    for uid in list(t.pending_kicks):
+        i = t.seat_of(uid)
+        try:
+            if i is not None:
+                _cash_out_seat(t, i)
+            t.pending_kicks.discard(uid)
+        except Exception:  # noqa: BLE001 — rolled back; retry next tick
+            logger.exception("deferred cash-out failed (table %s)", t.game_id)
+
+
+def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
+    t.seen[int(viewer_id)] = time.monotonic()  # presence (server-side dealing)
+    if int(viewer_id) not in t.names:
+        u = pub._user_by_id(int(viewer_id))
+        t.names[int(viewer_id)] = _display_name(u) if u is not None else f"player-{viewer_id}"
+    _timeout_tick_locked(t)
+    _settle_locked(t)
+    _flush_result_locked(t)
+    raw: dict[str, Any] = {}
+    actor = None
+    info = t.info
+    holes: list[list[int] | None] = [None] * t.num_seats
+    in_hand = list(t.in_hand_mask or [])
+    in_hand += [False] * (t.num_seats - len(in_hand))
+    dealt = list(t.dealt_user_ids or [])
+    dealt += [None] * (t.num_seats - len(dealt))
+    # (review 2026-09-20 G1) Cards are tabled only at a REAL showdown: two or
+    # more live hands at terminal. "phase == showdown" alone also covers a
+    # fold-out, where the winner's hand used to be shown to the whole table
+    # (and to unseated viewers) — every successful bluff was exposed.
+    reveal = t.phase == "showdown" and bool(t.showdown_reveal)
+    if t.env is not None and t.phase in ("in_hand", "showdown"):
+        raw = _obs_dict(t.env)
+        actor_raw = raw.get("actor")
+        actor = int(actor_raw) if actor_raw is not None else None
+        all_holes = t.env.all_hole_cards()
+        folded = [bool(x) for x in raw.get("folded", [])]
+        folded += [True] * (t.num_seats - len(folded))
+        for i in range(t.num_seats):
+            if i >= len(all_holes) or not in_hand[i]:
+                # The engine deals EVERY seat, dealt-in or not; a masked-out
+                # seat's five cards are live-deck information.
+                continue
+            # (review 2026-09-20 G2) "Own" = the user who was DEALT this hand,
+            # not whoever sits in the seat now: a seated-but-not-dealt player
+            # used to see five dead cards mid-hand, and a newcomer taking the
+            # seat after the hand saw the previous occupant's mucked cards.
+            own = dealt[i] is not None and dealt[i] == viewer_id
+            occupant = t.seats[i].user_id if t.seats[i] is not None else None
+            if occupant is not None and occupant != dealt[i]:
+                # Someone else has taken the seat since: the old hand is
+                # not theirs to show (or to sit behind), face-down included.
+                continue
+            # Tabled voluntarily after the hand ("show cards") — the player's
+            # own choice, so it also covers a fold-out winner and a folded hand.
+            shown = t.phase == "showdown" and i in t.shown_seats
+            if own or shown or (reveal and not folded[i]):
+                holes[i] = _sorted_hole([int(c) for c in all_holes[i]])
+            else:
+                holes[i] = [-1] * len(all_holes[i])  # facedown
+    elif reveal and t.last_holes:
+        holes = [_sorted_hole(h) if h and h[0] >= 0 else h for h in t.last_holes]
+
+    ba_src = list(raw.get("board_a") or t.rabbit_full_a or [])
+    bb_src = list(raw.get("board_b") or t.rabbit_full_b or [])
+    if t.phase == "showdown" and t.rabbit_full_a:
+        ba_src = list(t.rabbit_full_a)
+        bb_src = list(t.rabbit_full_b)
+        if t.runout_active:
+            n = max(3, _runout_shown_len(t))
+            ba_src, bb_src = ba_src[:n], bb_src[:n]
+        elif not t.rabbit_shown:
+            n = max(3, int(t.rabbit_played_len or 3))
+            ba_src, bb_src = ba_src[:n], bb_src[:n]
+    ba_src = [int(c) for c in ba_src]
+    bb_src = [int(c) for c in bb_src]
+    ba = _split_board(ba_src)
+    bb = _split_board(bb_src)
+    street = STREET_NAMES.get(int(raw["street"]), "flop") if raw else None
+    if t.runout_active:
+        street = {3: "flop", 4: "turn", 5: "river"}.get(len(ba_src), street)
+
+    viewer_seat = t.seat_of(viewer_id)
+    hero_seat = viewer_seat if viewer_seat is not None else 0
+
+    # --- all-in runout: what has been revealed SO FAR -----------------------
+    # (review 2026-09-20 G11) While the streets/awards are still animating,
+    # nothing in the payload may run ahead of them: no final deltas, no
+    # final ledger, no award list, no unrevealed board card.
+    runout_live = bool(t.runout_active and _runout_blocking(t))
+    award_idx = _runout_award_index(t) if t.runout_active else -1
+    n_awards = len(t.pot_awards or [])
+    start_stacks = list(t.hand_start_stacks or [])
+    start_stacks += [0] * (t.num_seats - len(start_stacks))
+    display_stacks = [0] * t.num_seats
+    if runout_live:
+        base = list(t.leftover_stacks or [])
+        base += [0] * (t.num_seats - len(base))
+        display_stacks = base[: t.num_seats]
+        for step in (t.pot_awards or [])[: max(0, award_idx)]:
+            for k, v in (step.get("shares") or {}).items():
+                si = int(k)
+                if 0 <= si < t.num_seats:
+                    display_stacks[si] += int(v)
+
+    # Ledger + settled stack cents. During the reveal the ledger stays on the
+    # hand-START stacks (exactly as it does while a hand is being played).
+    ledger, seat_cents = _ledger_state(t, start_stacks if runout_live else None)
+    settled = t.phase != "in_hand" and not runout_live
+
+    seats_out: list[dict[str, Any]] = []
+    now_seen = time.monotonic()
+    for i in range(t.num_seats):
+        p = t.seats[i]
+        if p is not None and not in_hand[i]:
+            stack_chips = p.stack_chips  # not in this hand (sat / reloaded mid-hand)
+        elif runout_live:
+            stack_chips = display_stacks[i]
+        elif t.phase == "showdown" and p is not None:
+            stack_chips = p.stack_chips
+        elif raw and t.phase == "in_hand":
+            stack_chips = int(raw["stacks"][i])
+        else:
+            stack_chips = p.stack_chips if p else 0
+        street_commit = int(raw["street_commit"][i]) if raw else 0
+        hole = holes[i]
+        made = None
+        if hole and hole[0] >= 0:
+            made = [
+                describe_made_hand(hole, ba_src),
+                describe_made_hand(hole, bb_src),
+            ]
+        if settled and p is not None and i in seat_cents:
+            stack_cents = seat_cents[i]  # agrees with the ledger to the cent
+        else:
+            stack_cents = chips_to_cents(stack_chips, t.bb_cents)
+        seats_out.append({
+            "seat": i,
+            "empty": p is None,
+            "user_id": p.user_id if p else None,
+            "name": p.name if p else None,
+            "sitting_out": bool(p.sitting_out) if p else False,
+            "stack_chips": stack_chips,
+            "stack_cents": stack_cents,
+            "committed_this_street_chips": street_commit,
+            "committed_this_street_cents": chips_to_cents(street_commit, t.bb_cents),
+            "folded": bool(raw["folded"][i]) if raw else False,
+            "all_in": bool(raw["all_in"][i]) if raw else False,
+            "in_hand": bool(in_hand[i]),
+            "is_actor": actor is not None and i == actor,
+            "is_hero": viewer_seat is not None and i == viewer_seat,
+            "is_host": p is not None and p.user_id == t.host_user_id,
+            "position": position_name(
+                i, t.button, t.num_seats,
+                {j for j, m in enumerate(in_hand) if m} if any(in_hand) else None,
+            ),
+            "hole": hole,
+            "hand_desc": made,
+            "auto_stack_cents": int(p.auto_stack_cents or 0) if p else 0,
+            "pending_remove": bool(p and p.user_id in t.pending_kicks),
+            "equity_a": None,
+            "equity_b": None,
+            "trusted": bool(p.trusted) if p else False,
+            "topup_target_cents": int(p.topup_target_cents or 0) if p else 0,
+            "topup_below_cents": int(p.topup_below_cents or 0) if p else 0,
+            # your own queued chips only — nobody else needs to see them
+            "queued_topup_cents": (
+                int(p.queued_topup_cents or 0) if p and p.user_id == viewer_id else 0
+            ),
+            "present": bool(p and now_seen - t.seen.get(p.user_id, -1e9) <= PRESENCE_WINDOW_S),
+            "reserved_by": next(
+                (r["name"] for r in t.requests if r["kind"] == "sit" and r["seat"] == i), None
+            ) if p is None else None,
+            "sit_out_next": bool(p.sit_out_next) if p else False,
+            "bank_left_secs": round(float(p.time_bank_left or 0.0), 1) if p else 0.0,
+            "shown": bool(t.phase == "showdown" and i in t.shown_seats),
+        })
+
+    if t.runout_active:
+        # (review 2026-09-20 G3) Computed once per hand in `_capture_rabbit`
+        # from the ALIVE holes — the same numbers for every viewer.
+        eq_map = t.equity_by_len.get((len(ba_src), len(bb_src))) or {}
+        for i, eq in eq_map.items():
+            if 0 <= i < len(seats_out):
+                seats_out[i]["equity_a"] = eq["a"]
+                seats_out[i]["equity_b"] = eq["b"]
+
+    legal = {"fold": False, "check_call": False, "raise": False}
+    raise_bounds = {"min_chips": 0, "max_chips": 0, "min_cents": 0, "max_cents": 0}
+    to_call_chips = 0
+    my_turn = (
+        t.phase == "in_hand"
+        and actor is not None
+        and viewer_seat is not None
+        and actor == viewer_seat
+        and info is not None
+    )
+    if my_turn and info is not None:
+        gm = info.gate_mask
+        legal = {
+            "fold": bool(gm[GATE_FOLD]),
+            "check_call": bool(gm[GATE_CHECK_CALL]),
+            "raise": bool(gm[GATE_RAISE]),
+        }
+        min_c = int(info.min_raise_chips)
+        max_c = int(info.max_raise_chips)
+        if legal["raise"] and min_c == 0 and max_c > 0:
+            min_c = max_c
+        raise_bounds = {
+            "min_chips": min_c,
+            "max_chips": max_c,
+            "min_cents": chips_to_cents(min_c, t.bb_cents),
+            "max_cents": chips_to_cents(max_c, t.bb_cents),
+        }
+        street_commit = int(raw["street_commit"][actor])
+        stack = int(raw["stacks"][actor])
+        bet_to_call = int(raw["bet_to_call"])
+        to_call_chips = min(max(0, bet_to_call - street_commit), stack)
+
+    if runout_live:
+        # Public so far: what each dealt-in seat put in, plus awards shown.
+        deltas_cents = [
+            chips_to_cents(display_stacks[i] - start_stacks[i], t.bb_cents)
+            if in_hand[i] else 0
+            for i in range(t.num_seats)
+        ]
+    else:
+        deltas_cents = [chips_to_cents(d, t.bb_cents) for d in (t.last_deltas or [])]
+
+    if runout_live:
+        awarded = sum(
+            int(st.get("chips") or 0)
+            for st in (t.pot_awards or [])[: max(0, award_idx)]
+        )
+        pot_chips = max(0, int(t.terminal_pot) - awarded)
+    elif t.phase == "showdown":
+        pot_chips = 0
+    else:
+        pot_chips = int(raw["pot"]) if raw else 0
+
+    award_step = None
+    if t.runout_active and 0 <= award_idx < n_awards:
+        award_step = t.pot_awards[award_idx]
+    if not t.runout_active:
+        shown_awards: list[dict[str, Any]] = []
+    elif runout_live:
+        # Award steps only start once all five cards are out, so a released
+        # step can never name an unrevealed board card.
+        shown_awards = list(t.pot_awards[: max(0, award_idx + 1)])
+    else:
+        shown_awards = list(t.pot_awards or [])
+    pause = float(t.street_pause_secs if t.street_pause_secs is not None else 1.5)
+    shown_len = _runout_shown_len(t) if t.runout_active else 0
+    start_len = max(3, int(t.runout_start_len or 3))
+    elapsed = (
+        time.monotonic() - t.runout_started_mono
+        if t.runout_active and t.runout_started_mono is not None
+        else 0.0
+    )
+    if t.runout_active and shown_len < 5 and pause > 0:
+        next_in = pause - (elapsed % pause)
+    else:
+        next_in = 0.0
+
+    eligible = sum(_eligible_mask(t, start_stacks if runout_live else None))
+    blocking = _runout_blocking(t)
+    can_show = False
+    if t.phase == "showdown" and t.env is not None and raw:
+        for i in range(t.num_seats):
+            if dealt[i] is None or dealt[i] != viewer_id or not in_hand[i]:
+                continue
+            occupant = t.seats[i].user_id if t.seats[i] is not None else None
+            if occupant is not None and occupant != dealt[i]:
+                continue
+            tabled = i in t.shown_seats or (reveal and not bool(raw["folded"][i]))
+            can_show = not tabled
+    bank_active, bank_left = _bank_state(t)
+    now_mono = time.monotonic()
+    now_wall = time.time()
+    last_hand_no = t.hand_no if (t.phase != "in_hand" and not blocking) else t.hand_no - 1
+    return {
+        "id": t.game_id,
+        "name": t.name,
+        "status": t.status,
+        "phase": t.phase,
+        "hand_no": t.hand_no,
+        "action_seq": t.action_seq,
+        "rev": t.rev,
+        "epoch": t.epoch,
+        "num_seats": t.num_seats,
+        "button_seat": t.button,
+        "hero_seat": hero_seat,
+        "actor": actor,
+        "my_user_id": viewer_id,
+        "my_seat": viewer_seat,
+        "is_host": viewer_id == t.host_user_id,
+        "is_member": any(row["user_id"] == viewer_id for row in ledger),
+        "stakes": {
+            "sb_cents": t.sb_cents,
+            "bb_cents": t.bb_cents,
+            "ante_cents": t.ante_cents,
+            "default_buyin_cents": t.default_buyin_cents,
+            "bb_chips": BB_CHIPS,
+        },
+        "seats": seats_out,
+        "board": {"a": ba, "b": bb},
+        "pot_chips": pot_chips,
+        "pot_cents": chips_to_cents(pot_chips, t.bb_cents),
+        "settled_pot_chips": (
+            int(raw["pot"]) - sum(int(x) for x in raw["street_commit"]) if raw else 0
+        ),
+        "street": street,
+        "history": _history_entries(raw, t.bb_cents) if raw else [],
+        "legal": legal,
+        "raise_bounds": raise_bounds,
+        "to_call_chips": to_call_chips,
+        "to_call_cents": chips_to_cents(to_call_chips, t.bb_cents),
+        "street_commit_chips": (
+            int(raw["street_commit"][actor]) if raw and actor is not None else 0
+        ),
+        "hand_deltas_cents": deltas_cents,
+        "ledger": ledger,
+        "running": bool(t.running),
+        "can_deal": (
+            t.status == "open"
+            and t.running
+            and t.phase != "in_hand"
+            and not blocking
+            and viewer_seat is not None
+            and eligible >= 2
+        ),
+        "eligible_count": eligible,
+        "chat": _chat_messages(t.game_id),
+        "can_rabbit": bool(
+            t.phase == "showdown" and t.rabbit_available and not t.rabbit_shown
+        ),
+        "rabbit_shown": bool(t.rabbit_shown),
+        "auto_stack": {
+            "mode": _norm_auto_mode(t.auto_stack_mode),
+            "all_cents": int(t.auto_stack_all_cents or 0),
+        },
+        "decision_secs": int(t.decision_secs or 0),
+        "turn_remaining_secs": _turn_remaining_secs(t),
+        "street_pause_secs": pause,
+        "runout": {
+            "active": bool(t.runout_active),
+            "start_len": start_len,
+            "shown_len": shown_len if t.runout_active else 0,
+            "pause_secs": pause,
+            "next_in_secs": round(next_in, 2),
+            "award_index": award_idx,
+            "award_count": n_awards,
+            "award_step": award_step,
+            "blocking": blocking,
+        },
+        "pot_awards": shown_awards,
+        # --- 2026-09-21 ----------------------------------------------------
+        "host_user_id": t.host_user_id,
+        "settings": {
+            "deal_delay_secs": float(t.deal_delay_secs or 0.0),
+            "time_bank_secs": int(t.time_bank_secs or 0),
+            "min_buyin_cents": int(t.min_buyin_cents or 0),
+            "max_buyin_cents": int(t.max_buyin_cents or 0),
+            "listed": bool(t.listed),
+            "allow_rabbit": bool(t.allow_rabbit),
+            "approve_buyins": bool(t.approve_buyins),
+        },
+        "auto_topup": {
+            "mode": _norm_auto_mode(t.topup_mode),
+            "all_target_cents": int(t.topup_all_target_cents or 0),
+            "all_below_cents": int(t.topup_all_below_cents or 0),
+        },
+        # buy-in approval: the host sees the queue, a player their own request
+        "needs_approval": bool(t.approve_buyins) and not _is_trusted_cached(t, viewer_id),
+        "requests": (
+            [{k: r[k] for k in ("id", "user_id", "name", "kind", "seat", "amount_cents")}
+             for r in t.requests]
+            if viewer_id == t.host_user_id else []
+        ),
+        "my_request": next(
+            ({k: r[k] for k in ("id", "kind", "seat", "amount_cents")}
+             for r in t.requests if r["user_id"] == viewer_id), None,
+        ),
+        "spectators": sorted(
+            t.names.get(uid, "?") for uid, last in t.seen.items()
+            if now_mono - last <= PRESENCE_WINDOW_S and t.seat_of(uid) is None
+        ),
+        "next_deal_in_secs": (
+            round(max(0.0, t.next_deal_mono - now_mono), 2)
+            if t.next_deal_mono is not None
+            else None
+        ),
+        "time_bank": {
+            "secs": int(t.time_bank_secs or 0),
+            "active": bool(bank_active),
+            "remaining_secs": round(bank_left, 1),
+        },
+        "can_show": bool(can_show),
+        "last_hand_no": last_hand_no if last_hand_no >= 1 else None,
+        "events": list(t.events),
+        "reactions": [
+            {"id": r["id"], "seat": r["seat"], "emote": r["emote"]}
+            for r in t.reactions
+            if now_wall - float(r["ts"]) <= REACTION_TTL_S
+        ],
+    }
+
+
+def _is_trusted_cached(t: LiveTable, uid: int) -> bool:
+    """`_is_trusted` without a DB hit on every poll: only an UNSEATED viewer
+    needs the lookup, and only while approval is on."""
+    if not t.approve_buyins:
+        return True
+    return _is_trusted(t, uid)
+
+
+def _require_open(t: LiveTable) -> None:
+    if t.status != "open":
+        raise HTTPException(status_code=400, detail="table is closed")
+
+
+def _is_member(t: LiveTable, uid: int) -> bool:
+    """Seated now, or sat at this table before (has a ledger row)."""
+    if t.seat_of(uid) is not None:
+        return True
+    row = pub.DB.one(
+        "SELECT 1 FROM homegame_players WHERE game_id=? AND user_id=?",
+        (t.game_id, int(uid)),
+    )
+    return row is not None
+
+
+def _require_member(t: LiveTable, uid: int) -> None:
+    """(review 2026-09-20 G12) Every flagged user can OPEN every table, but
+    only people who play (or played) at it may write to it."""
+    if not _is_member(t, uid):
+        raise HTTPException(status_code=403, detail="take a seat first")
+
+
+def _cash_out_seat(t: LiveTable, i: int) -> None:
+    """Seat ``i`` leaves with its share of the money on the table.
+
+    The amount is the seat's entry in the largest-remainder apportionment of
+    the table's money over ALL seated stacks (module docstring, review
+    2026-09-20 G10) — whole cents, zero-sum; it used to be an independent
+    ``round()`` of the stack. All-or-nothing via ``_mutation``."""
+    p = t.seats[i]
+    if p is None:
+        return
+    with _mutation(t):
+        leftover = _ledger_state(t)[1].get(i, 0)
+        if leftover:
+            p.leftover_cents += leftover
+            _ledger_add(t, p.user_id, "cashout", leftover)
+        p.stack_chips = 0
+        _persist_player(t, None, p, False)
+        t.seats[i] = None
+        new_host = None
+        if t.host_user_id == p.user_id:
+            occ = t.occupied()
+            t.host_user_id = t.seats[occ[0]].user_id if occ else t.host_user_id
+            new_host = t.seats[occ[0]].name if occ else None
+            _persist_meta(t)
+    _emit(t, "leave", f"{p.name} left with {_fmt_cents(leftover)}", seat=i)
+    if new_host:
+        _emit(t, "host", f"{new_host} is now the host")
+
+
+def _set_running_locked(t: LiveTable, uid: int, running: bool) -> None:
+    _require_open(t)
+    if uid != t.host_user_id:
+        raise HTTPException(status_code=400, detail="only the host can start or pause")
+    was = bool(t.running)
+    with _mutation(t):
+        t.running = bool(running)
+        _persist_meta(t)
+    t.next_deal_mono = None
+    if was != bool(running):
+        _emit(t, "run", "Game started" if running else (
+            "Game pauses after this hand" if t.phase == "in_hand" else "Game paused"))
+    if t.running and not _hand_busy(t) and sum(_eligible_mask(t)) >= 2:
+        _deal_locked(t)
+
+
+def _deal_locked(t: LiveTable) -> None:
+    _require_open(t)
+    if not t.running:
+        raise HTTPException(status_code=400, detail="game is paused")
+    if t.phase == "in_hand":
+        raise HTTPException(status_code=400, detail="hand already in progress")
+    if _runout_blocking(t):
+        # (review 2026-09-20 G7) `can_deal` was only a hint in the payload:
+        # POST /deal itself never checked, so any seated player could cut
+        # everyone's river and pot awards short.
+        raise HTTPException(status_code=400, detail="wait for the runout to finish")
+    _settle_locked(t)
+    _apply_sit_out_next_locked(t)
+    _apply_queued_topups_locked(t, force=True)
+    _apply_auto_stacks_locked(t)
+    mask = _eligible_mask(t)
+    if sum(mask) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="need at least 2 players with more than the ante",
+        )
+    button = _next_button(t, mask)
+    stacks = tuple(s.stack_chips if s is not None else 0 for s in t.seats)
+    cfg = GameConfig(
+        num_seats=t.num_seats,
+        starting_stack=0,
+        starting_stacks=stacks,
+        ante=t.ante_chips,
+        bb=BB_CHIPS,
+        variant=VARIANT_PLO5,
+    )
+    env = _make_env(cfg)
+    seed = secrets.randbits(63)
+    _, info = env.reset(seed, button, in_hand_mask=mask)
+    # The engine accepted the hand — commit it to the table.
+    t.button = button
+    t.env = env
+    t.info = info
+    t.phase = "showdown" if env.is_terminal() else "in_hand"
+    t.hand_no += 1
+    t.action_seq = 0
+    t.rev += 1
+    t.turn_key = None
+    t.turn_started_mono = None
+    t.hand_start_stacks = list(stacks)
+    t.in_hand_mask = mask
+    # (review 2026-09-20 G2) WHO was dealt each seat — own-card visibility is
+    # checked against this, never against the seat's current occupant.
+    t.dealt_user_ids = [
+        s.user_id if (s is not None and mask[i]) else None
+        for i, s in enumerate(t.seats)
+    ]
+    t.showdown_reveal = False
+    t.last_deltas = []
+    t.last_holes = [None] * t.num_seats
+    t.rabbit_available = False
+    t.rabbit_shown = False
+    t.rabbit_played_len = 3
+    t.rabbit_full_a = []
+    t.rabbit_full_b = []
+    t.runout_active = False
+    t.runout_start_len = 3
+    t.runout_started_mono = None
+    t.leftover_stacks = []
+    t.terminal_pot = 0
+    t.terminal_commit = []
+    t.pot_awards = []
+    t.equity_by_len = {}
+    t.shown_seats = set()
+    t.next_deal_mono = None
+    t.bank_key = None
+    t.bank_started_mono = None
+    cap = float(max(0, int(t.time_bank_secs or 0)))
+    for i, p in enumerate(t.seats):
+        if p is not None and mask[i]:
+            # A little bank comes back every hand played, never above the cap.
+            p.time_bank_left = min(cap, float(p.time_bank_left or 0.0) + TIME_BANK_REFILL_S)
+    if t.phase == "showdown":
+        _finish_hand_locked(t)
+    else:
+        _persist_safe(t)
+        _resume_turn_locked(t)
+
+
+def _apply_sit_out_next_locked(t: LiveTable) -> None:
+    """"Sit out next hand" takes effect between hands."""
+    flagged = [p for p in t.seats if p is not None and p.sit_out_next]
+    if not flagged:
+        return
+    with _mutation(t):
+        for i, p in enumerate(t.seats):
+            if p is not None and p.sit_out_next:
+                p.sit_out_next = False
+                p.sitting_out = True
+                _persist_player(t, i, p, True)
+
+
+def _finish_hand_locked(t: LiveTable) -> None:
+    assert t.env is not None
+    raw = _obs_dict(t.env)
+    # Engine stacks at terminal are leftover chips AFTER commits; the pot
+    # is not credited back. ``payouts()`` is the chip delta vs hand start
+    # (won − total_commit), zero-sum, which is what we persist.
+    payouts = [int(x) for x in t.env._rs.payouts()]
+    t.last_deltas = list(payouts)
+    folded = [bool(x) for x in raw["folded"]]
+    alive = [
+        i
+        for i in range(t.num_seats)
+        if t.in_hand_mask and i < len(t.in_hand_mask) and t.in_hand_mask[i]
+        and i < len(folded) and not folded[i]
+    ]
+    # (review 2026-09-20 G1) Two or more live hands = showdown, cards are
+    # tabled. One = everyone else folded: the winner stays face-down.
+    t.showdown_reveal = len(alive) >= 2
+    holes: list[list[int] | None] = [None] * t.num_seats
+    if t.showdown_reveal:
+        all_holes = t.env.all_hole_cards()
+        for i in alive:
+            holes[i] = _sorted_hole([int(c) for c in all_holes[i]])
+    t.last_holes = holes
+    for i, p in enumerate(t.seats):
+        if p is not None:
+            dealt = bool(t.in_hand_mask and i < len(t.in_hand_mask) and t.in_hand_mask[i])
+            if dealt:
+                start = t.hand_start_stacks[i] if i < len(t.hand_start_stacks) else p.stack_chips
+                p.stack_chips = max(0, int(start) + (payouts[i] if i < len(payouts) else 0))
+            if p.sit_out_next:  # "sit out next hand" takes effect now
+                p.sit_out_next = False
+                p.sitting_out = True
+    t.phase = "showdown"
+    t.info = None
+    t.turn_started_mono = None
+    t.turn_key = None
+    t.bank_key = None
+    t.bank_started_mono = None
+    t.next_deal_mono = None
+    t.rev += 1
+    _persist_safe(t)
+    _record_hand_locked(t, raw, payouts, folded)
+    _settle_locked(t)  # no-op while an all-in runout is still revealing
+    _flush_result_locked(t)
+
+
+def _record_hand_locked(
+    t: LiveTable, raw: dict[str, Any], payouts: list[int], folded: list[bool]
+) -> None:
+    """Persist the finished hand (history + per-player results) and queue its
+    one-line result for the event feed. Cosmetic: a failure here must never
+    stop the hand from finishing.
+
+    The record holds EVERY dealt hand's cards; ``_hand_for_viewer`` filters
+    them per viewer with the live table's rule (own cards + tabled hands)."""
+    try:
+        mask = list(t.in_hand_mask or [])
+        mask += [False] * (t.num_seats - len(mask))
+        dealt = list(t.dealt_user_ids or [])
+        dealt += [None] * (t.num_seats - len(dealt))
+        all_holes = t.env.all_hole_cards() if t.env is not None else []
+        full_a = [int(c) for c in (raw.get("board_a") or [])]
+        full_b = [int(c) for c in (raw.get("board_b") or [])]
+        n_board = len(full_a) if t.showdown_reveal else max(3, int(t.rabbit_played_len or 3))
+        commit = [int(x) for x in (raw.get("total_commit") or [])]
+        seats = []
+        winners: list[tuple[str, int]] = []
+        for i in range(t.num_seats):
+            if not mask[i] or dealt[i] is None:
+                continue
+            p = t.seats[i]
+            name = p.name if (p is not None and p.user_id == dealt[i]) else None
+            if name is None:
+                u = pub._user_by_id(int(dealt[i]))
+                name = _display_name(u) if u is not None else f"player-{dealt[i]}"
+            delta = int(payouts[i]) if i < len(payouts) else 0
+            start = int(t.hand_start_stacks[i]) if i < len(t.hand_start_stacks) else 0
+            is_folded = bool(folded[i]) if i < len(folded) else True
+            seats.append({
+                "seat": i,
+                "user_id": int(dealt[i]),
+                "name": name,
+                "start_cents": chips_to_cents(start, t.bb_cents),
+                "delta_cents": chips_to_cents(delta, t.bb_cents),
+                "folded": is_folded,
+                "shown": bool(t.showdown_reveal and not is_folded),
+                "hole": _sorted_hole([int(c) for c in all_holes[i]]) if i < len(all_holes) else [],
+            })
+            if delta > 0:
+                winners.append((name, chips_to_cents(delta, t.bb_cents)))
+        pot_cents = chips_to_cents(sum(commit), t.bb_cents)
+        record = {
+            "hand_no": int(t.hand_no),
+            "ended_at": pub._now(),
+            "button": int(t.button),
+            "num_seats": int(t.num_seats),
+            "bb_cents": int(t.bb_cents),
+            "ante_cents": int(t.ante_cents),
+            "pot_cents": pot_cents,
+            "showdown": bool(t.showdown_reveal),
+            "board_a": full_a[:n_board],
+            "board_b": full_b[:n_board],
+            "actions": _history_entries(raw, t.bb_cents),
+            "awards": [
+                {
+                    "board": a.get("board"),
+                    "winners": [int(w) for w in (a.get("winners") or [])],
+                    "cents": chips_to_cents(int(a.get("chips") or 0), t.bb_cents),
+                    "uncontested": bool(a.get("uncontested")),
+                    "labels": {
+                        str(k): (v or {}).get("label")
+                        for k, v in (a.get("combos") or {}).items()
+                    },
+                }
+                for a in (t.pot_awards or [])
+            ],
+            "seats": seats,
+        }
+        with pub.DB.transaction():
+            pub.DB.q(
+                "INSERT OR REPLACE INTO homegame_hands(game_id,hand_no,ended_at,"
+                "pot_cents,summary) VALUES(?,?,?,?,?)",
+                (t.game_id, int(t.hand_no), record["ended_at"], pot_cents,
+                 json.dumps(record, separators=(",", ":"))),
+            )
+            for s in seats:
+                pub.DB.q(
+                    "INSERT OR REPLACE INTO homegame_hand_results(game_id,hand_no,"
+                    "user_id,delta_cents,showdown) VALUES(?,?,?,?,?)",
+                    (t.game_id, int(t.hand_no), s["user_id"], s["delta_cents"],
+                     1 if s["shown"] else 0),
+                )
+        t.pending_result = {
+            "hand_no": int(t.hand_no),
+            # Net winners; a hand where everyone got their money back (one
+            # board each) has none.
+            "text": " · ".join(f"{n} wins {_fmt_cents(c)}" for n, c in winners)
+            or f"pot of {_fmt_cents(pot_cents)} split evenly",
+        }
+    except Exception:  # noqa: BLE001
+        logger.exception("homegame hand record failed (table %s)", t.game_id)
+
+
+def _flush_result_locked(t: LiveTable) -> None:
+    """Release the finished hand's result line — only once its runout has
+    finished revealing (review 2026-09-20 G11: nothing runs ahead of it)."""
+    pending = getattr(t, "pending_result", None)
+    if not pending or _runout_blocking(t):
+        return
+    t.pending_result = None
+    _emit(t, "win", f"Hand #{pending['hand_no']}: {pending['text']}")
+    t.rev += 1
+
+
+def _capture_rabbit(t: LiveTable, played_len: int) -> None:
+    """Fold-out rabbit OR multiway all-in runout (delayed streets + awards)."""
+    raw = _obs_dict(t.env)
+    folded = [bool(x) for x in raw.get("folded", [])]
+    alive: list[int] = []
+    for i, f in enumerate(folded):
+        if f:
+            continue
+        if t.in_hand_mask and i < len(t.in_hand_mask) and not t.in_hand_mask[i]:
+            continue
+        alive.append(i)
+    full_a = [int(c) for c in (raw.get("board_a") or [])]
+    full_b = [int(c) for c in (raw.get("board_b") or [])]
+    t.rabbit_full_a = full_a
+    t.rabbit_full_b = full_b
+    t.leftover_stacks = [int(x) for x in (raw.get("stacks") or [])]
+    t.terminal_pot = int(raw.get("pot") or 0)
+    t.terminal_commit = [int(x) for x in (raw.get("total_commit") or [])]
+    t.pot_awards = []
+    t.equity_by_len = {}
+    t.runout_active = False
+    if len(alive) <= 1:
+        if len(alive) == 1 and len(full_a) > played_len:
+            # Host can switch rabbit hunting off: the undealt streets then
+            # simply stay hidden (``rabbit_shown`` never becomes True).
+            t.rabbit_available = bool(t.allow_rabbit)
+            t.rabbit_shown = False
+            t.rabbit_played_len = int(played_len)
+        else:
+            t.rabbit_available = False
+            t.rabbit_shown = True
+            t.rabbit_played_len = len(full_a)
+        return
+    t.rabbit_available = False
+    t.rabbit_shown = True
+    t.runout_active = True
+    t.runout_start_len = max(3, min(int(played_len), len(full_a) or 5))
+    t.runout_started_mono = time.monotonic()
+    all_holes = t.env.all_hole_cards() if t.env is not None else []
+    holes: list[list[int] | None] = [None] * t.num_seats
+    for i in alive:
+        if i < len(all_holes):
+            holes[i] = [int(c) for c in all_holes[i]]
+    folded_full = [True] * t.num_seats
+    for i in alive:
+        folded_full[i] = False
+    commit = list(t.terminal_commit)
+    if len(commit) < t.num_seats:
+        commit.extend([0] * (t.num_seats - len(commit)))
+    t.pot_awards = build_awards(
+        holes,
+        folded_full,
+        commit[: t.num_seats],
+        full_a if len(full_a) >= 3 else full_a,
+        full_b if len(full_b) >= 3 else full_b,
+        t.button,
+    )
+    _compute_runout_equities(t, {i: holes[i] for i in alive if holes[i]}, full_a, full_b)
+
+
+def _compute_runout_equities(
+    t: LiveTable, alive_holes: dict[int, list[int]], full_a: list[int], full_b: list[int]
+) -> None:
+    """Per-board equities for every street the runout will show.
+
+    (review 2026-09-20 G3) ONCE per all-in hand, here, from the ALIVE seats'
+    holes. It used to run inside every poll under the table lock, from the
+    holes visible to that viewer — so a folded viewer's own cards entered as
+    a contender (wrong numbers) and the per-viewer cache key made
+    alternating polls recompute 0.5-2.9 s of pure Python each time. With the
+    per-board marginal enumeration in runout.py the whole thing is ~0.1 s
+    worst case (a flop all-in), a few ms from the turn. Cosmetic: a failure
+    here must never stop the hand from finishing."""
+    t.equity_by_len = {}
+    if len(alive_holes) < 2:
+        return
+    try:
+        for n in range(max(3, int(t.runout_start_len or 3)), 6):
+            ba, bb = full_a[:n], full_b[:n]
+            seed = zlib.crc32(f"{t.game_id}:{t.hand_no}:{n}".encode())
+            t.equity_by_len[(len(ba), len(bb))] = board_equities(
+                alive_holes, ba, bb, seed=seed
+            )
+    except Exception:  # noqa: BLE001
+        logger.exception("runout equities failed (table %s)", t.game_id)
+        t.equity_by_len = {}
+
+
+def _rabbit_locked(t: LiveTable, uid: int) -> None:
+    _require_member(t, uid)
+    if t.phase != "showdown" or not t.rabbit_available or t.rabbit_shown:
+        raise HTTPException(status_code=400, detail="no rabbit hunt available")
+    t.rabbit_shown = True
+    t.rev += 1
+
+
+def _quantize_raise(t: LiveTable, chips: int, committed: int, lo: int, hi: int) -> int:
+    """Snap a raise so the street total lands on a whole cent when the stake
+    allows and the legal window has room (review 2026-09-20 G10). The window
+    ends stay exact — an all-in is the whole stack, sub-cent dust included."""
+    cpc = chips_per_cent(t.bb_cents)
+    if cpc <= 1 or not (lo < chips < hi):
+        return chips
+    to = committed + chips
+    snapped = ((to + cpc // 2) // cpc) * cpc
+    if snapped - committed < lo:
+        snapped += cpc
+    if snapped - committed > hi:
+        snapped -= cpc
+    by = snapped - committed
+    return by if lo <= by <= hi else chips
+
+
+def _apply_action_locked(
+    t: LiveTable, gate: int, raise_chips: int, *, _resume: bool = True
+) -> None:
+    """Apply one action for the CURRENT actor (turn ownership is the
+    caller's business: `_act_locked` for players, the away/clock paths for
+    auto-actions)."""
+    if t.phase != "in_hand" or t.env is None or t.info is None:
+        raise HTTPException(status_code=400, detail="no hand in progress")
+    gm = t.info.gate_mask
+    if not bool(gm[gate]):
+        raise HTTPException(status_code=400, detail="illegal action")
+    chips = int(raise_chips) if gate == GATE_RAISE else 0
+    raw = _obs_dict(t.env)
+    if gate == GATE_RAISE:
+        min_c = int(t.info.min_raise_chips)
+        max_c = int(t.info.max_raise_chips)
+        if min_c == 0 and max_c > 0:
+            chips = max_c
+        else:
+            chips = max(min_c, min(max_c, chips))
+            actor = raw.get("actor")
+            if actor is not None:
+                committed = int(raw["street_commit"][int(actor)])
+                chips = _quantize_raise(t, chips, committed, min_c, max_c)
+    pre_len = len(list(raw.get("board_a") or []))
+    actor_raw = raw.get("actor")
+    try:
+        _, _, done, info = t.env.step_hybrid(gate, chips)
+    except Exception as e:  # noqa: BLE001 — engine rejects illegal amounts
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    # Charge the time bank for THIS decision before the decision id moves on.
+    _settle_bank_locked(t, int(actor_raw) if actor_raw is not None else None)
+    t.info = info
+    t.action_seq += 1
+    t.rev += 1
+    if done:
+        _capture_rabbit(t, pre_len)
+        _finish_hand_locked(t)
+    else:
+        t.phase = "in_hand"
+        if _resume:
+            _resume_turn_locked(t)
+
+
+def _act_locked(t: LiveTable, uid: int, gate: int, raise_chips: int) -> None:
+    _require_open(t)
+    if t.phase != "in_hand" or t.env is None or t.info is None:
+        raise HTTPException(status_code=400, detail="no hand in progress")
+    actor = t.env.current_actor()
+    seat = t.seat_of(uid)
+    if actor is None or seat is None or actor != seat:
+        raise HTTPException(status_code=400, detail="not your turn")
+    me = t.seats[seat]
+    _apply_action_locked(t, gate, raise_chips)
+    if me is not None:
+        me.timeouts = 0  # acted for themselves: the timeout streak is over
+
+
+def _dealt_in(t: LiveTable, i: int | None) -> bool:
+    """Seat ``i`` holds cards in the hand on the table (played or still
+    revealing)."""
+    return bool(
+        i is not None
+        and _hand_busy(t)
+        and t.in_hand_mask
+        and i < len(t.in_hand_mask)
+        and t.in_hand_mask[i]
+    )
+
+
+def _sync_idle_stack(t: LiveTable, i: int | None) -> None:
+    """A seat that is NOT in the current hand changed its chips mid-hand (sat
+    down, topped up): the hand-start snapshot must follow, because the hand's
+    end writes ``start + payout`` and the runout-time ledger reads it."""
+    if i is None or not _hand_busy(t):
+        return
+    p = t.seats[i]
+    while len(t.hand_start_stacks) <= i:
+        t.hand_start_stacks.append(0)
+    t.hand_start_stacks[i] = int(p.stack_chips) if p is not None else 0
+
+
+def _sit_locked(
+    t: LiveTable, user: Any, seat: int, buyin_cents: int, *, trust: bool = False
+) -> None:
+    _require_open(t)
+    # (2026-09-21) Sitting down no longer waits for the hand to end: with the
+    # server dealing every few seconds the between-hands window was too short
+    # to buy in. An empty seat is never part of the hand in progress, so the
+    # newcomer just waits for the next deal.
+    if seat < 0 or seat >= t.num_seats:
+        raise HTTPException(status_code=400, detail="invalid seat")
+    if t.seats[seat] is not None:
+        raise HTTPException(status_code=400, detail="seat taken")
+    existing = t.seat_of(int(user["id"]))
+    if existing is not None:
+        raise HTTPException(status_code=400, detail="already seated")
+    if buyin_cents < t.bb_cents:
+        raise HTTPException(status_code=400, detail="buy-in must be at least 1 bb")
+    _check_buyin_limits(t, buyin_cents, 0)
+    chips = cents_to_chips(buyin_cents, t.bb_cents)
+    prev = pub.DB.one(
+        "SELECT * FROM homegame_players WHERE game_id=? AND user_id=?",
+        (t.game_id, int(user["id"])),
+    )
+    leftover = int(prev["leftover_cents"]) if prev else 0
+    prev_buyin = int(prev["buyin_cents"]) if prev else 0
+    if prev_buyin + buyin_cents > MAX_CENTS:
+        raise HTTPException(status_code=400, detail="buy-in limit reached")
+    holder = next(
+        (r for r in t.requests if r["kind"] == "sit" and r["seat"] == seat
+         and r["user_id"] != int(user["id"])), None,
+    )
+    if holder is not None:
+        raise HTTPException(
+            status_code=400, detail=f"that seat is reserved for {holder['name']}"
+        )
+    prev_auto = 0
+    if prev is not None:
+        try:
+            prev_auto = int(prev["auto_stack_cents"] or 0)
+        except (KeyError, IndexError, TypeError):
+            prev_auto = 0
+    if t.auto_stack_mode == "host":
+        auto = int(t.auto_stack_all_cents or 0)
+    else:
+        auto = prev_auto
+    if t.topup_mode == "host":
+        top = (int(t.topup_all_target_cents or 0), int(t.topup_all_below_cents or 0))
+    else:
+        top = (
+            _row_int(prev, "topup_target_cents", 0) if prev is not None else 0,
+            _row_int(prev, "topup_below_cents", 0) if prev is not None else 0,
+        )
+    p = Seat(
+        user_id=int(user["id"]),
+        name=_display_name(user),
+        email=user["email"],
+        stack_chips=chips,
+        sitting_out=False,
+        buyin_cents=prev_buyin + buyin_cents,
+        leftover_cents=leftover,
+        auto_stack_cents=auto,
+        time_bank_left=float(max(0, int(t.time_bank_secs or 0))),
+        trusted=bool(trust) or (bool(_row_int(prev, "trusted", 0)) if prev is not None else False),
+        topup_target_cents=top[0],
+        topup_below_cents=top[1],
+    )
+    if _dealt_in(t, seat):
+        # (cannot happen: a dealt seat stays occupied until its hand is over)
+        raise HTTPException(status_code=400, detail="wait for the hand to finish")
+    with _mutation(t):
+        t.seats[seat] = p
+        _ledger_add(t, p.user_id, "buyin" if not prev else "rebuy", buyin_cents)
+        _persist_player(t, seat, p, True)
+    _sync_idle_stack(t, seat)
+    _emit(t, "join", f"{p.name} sat down with {_fmt_cents(buyin_cents)}", seat=seat)
+
+
+def _check_buyin_limits(
+    t: LiveTable, amount_cents: int, stack_cents: int, *, fresh: bool = True
+) -> None:
+    """Host-set buy-in window (0 = no limit). A top-up may not take the stack
+    past the maximum; the minimum applies to a fresh seat only."""
+    lo, hi = int(t.min_buyin_cents or 0), int(t.max_buyin_cents or 0)
+    if fresh and lo > 0 and amount_cents < lo:
+        raise HTTPException(
+            status_code=400, detail=f"minimum buy-in is {_fmt_cents(lo)}"
+        )
+    if hi > 0 and stack_cents + amount_cents > hi:
+        if not fresh:
+            raise HTTPException(
+                status_code=400,
+                detail=f"you can top up to {_fmt_cents(hi)} at most",
+            )
+        raise HTTPException(
+            status_code=400, detail=f"maximum buy-in is {_fmt_cents(hi)}"
+        )
+
+
+# --- host approval of buy-ins ------------------------------------------------
+
+
+def _is_trusted(t: LiveTable, uid: int) -> bool:
+    if int(uid) == int(t.host_user_id):
+        return True
+    p = t.player(int(uid))
+    if p is not None:
+        return bool(p.trusted)
+    row = pub.DB.one(
+        "SELECT trusted FROM homegame_players WHERE game_id=? AND user_id=?",
+        (t.game_id, int(uid)),
+    )
+    return bool(row is not None and int(row["trusted"] or 0))
+
+
+def _needs_approval(t: LiveTable, uid: int) -> bool:
+    return bool(t.approve_buyins) and not _is_trusted(t, uid)
+
+
+def _request_locked(t: LiveTable, user: Any, kind: str, seat: int | None, cents: int) -> None:
+    """Queue a buy-in (``sit``) or top-up (``rebuy``) for the host. Validated
+    like the real thing so an approval rarely bounces; one request per player
+    (a new one replaces it); a sit request holds its seat."""
+    _require_open(t)
+    uid = int(user["id"])
+    if cents < t.bb_cents:
+        raise HTTPException(status_code=400, detail="buy-in must be at least 1 bb")
+    if kind == "sit":
+        if seat is None or seat < 0 or seat >= t.num_seats:
+            raise HTTPException(status_code=400, detail="invalid seat")
+        if t.seats[seat] is not None:
+            raise HTTPException(status_code=400, detail="seat taken")
+        if t.seat_of(uid) is not None:
+            raise HTTPException(status_code=400, detail="already seated")
+        if any(r["kind"] == "sit" and r["seat"] == seat and r["user_id"] != uid for r in t.requests):
+            raise HTTPException(status_code=400, detail="that seat is reserved")
+        _check_buyin_limits(t, cents, 0)
+    else:
+        p = t.player(uid)
+        if p is None:
+            raise HTTPException(status_code=400, detail="not seated")
+        seat = t.seat_of(uid)
+        have = chips_to_cents(p.stack_chips, t.bb_cents) + int(p.queued_topup_cents or 0)
+        _check_buyin_limits(t, cents, have, fresh=False)
+    t.requests = [r for r in t.requests if r["user_id"] != uid]
+    if len(t.requests) >= MAX_REQUESTS:
+        raise HTTPException(status_code=429, detail="too many pending requests")
+    t.request_seq += 1
+    name = _display_name(user)
+    t.requests.append({
+        "id": t.request_seq, "user_id": uid, "name": name, "kind": kind,
+        "seat": seat, "amount_cents": int(cents), "ts": time.time(),
+    })
+    t.rev += 1
+    _emit(
+        t, "request",
+        f"{name} asks to {'buy in for' if kind == 'sit' else 'add'} {_fmt_cents(cents)}",
+    )
+
+
+def _cancel_request_locked(t: LiveTable, uid: int) -> None:
+    n = len(t.requests)
+    t.requests = [r for r in t.requests if r["user_id"] != int(uid)]
+    if len(t.requests) != n:
+        t.rev += 1
+
+
+def _expire_requests_locked(t: LiveTable) -> None:
+    """A request whose player has left the page lapses (and frees its seat);
+    so does one the table no longer needs (approval off / player now trusted)."""
+    if not t.requests:
+        return
+    now = time.monotonic()
+    keep = []
+    for r in t.requests:
+        gone = now - t.seen.get(r["user_id"], now) > REQUEST_TTL_ABSENT_S
+        if gone or t.status != "open":
+            continue
+        keep.append(r)
+    if len(keep) != len(t.requests):
+        t.requests = keep
+        t.rev += 1
+
+
+def _resolve_request_locked(
+    t: LiveTable, uid: int, req_id: int, approve: bool, trust: bool
+) -> None:
+    _require_open(t)
+    if uid != t.host_user_id:
+        raise HTTPException(status_code=400, detail="only the host can approve buy-ins")
+    req = next((r for r in t.requests if r["id"] == int(req_id)), None)
+    if req is None:
+        raise HTTPException(status_code=404, detail="that request is gone")
+    t.requests = [r for r in t.requests if r["id"] != req["id"]]
+    t.rev += 1
+    if not approve:
+        _emit(t, "request", f"Host declined {req['name']}'s request")
+        return
+    user = pub._user_by_id(int(req["user_id"]))
+    if user is None:
+        raise HTTPException(status_code=404, detail="that player no longer exists")
+    if req["kind"] == "sit":
+        _sit_locked(t, user, int(req["seat"]), int(req["amount_cents"]), trust=trust)
+    else:
+        if trust:
+            _set_trust_locked(t, uid, int(req["user_id"]), True)
+        _topup_locked(t, int(req["user_id"]), int(req["amount_cents"]), queue_ok=True)
+
+
+def _set_trust_locked(t: LiveTable, uid: int, target_uid: int, on: bool) -> None:
+    """Trusted players buy in, top up and auto top-up without asking."""
+    _require_open(t)
+    if uid != t.host_user_id:
+        raise HTTPException(status_code=400, detail="only the host can trust a player")
+    target_uid = int(target_uid)
+    p = t.player(target_uid)
+    with _mutation(t):
+        if p is not None:
+            p.trusted = bool(on)
+            _persist_player(t, t.seat_of(target_uid), p, True)
+        else:
+            row = pub.DB.one(
+                "SELECT 1 FROM homegame_players WHERE game_id=? AND user_id=?",
+                (t.game_id, target_uid),
+            )
+            if row is None:
+                raise HTTPException(status_code=400, detail="that player has not played here")
+            pub.DB.q(
+                "UPDATE homegame_players SET trusted=? WHERE game_id=? AND user_id=?",
+                (1 if on else 0, t.game_id, target_uid),
+            )
+    if on:
+        # whatever they were waiting for goes through now
+        for r in [r for r in t.requests if r["user_id"] == target_uid]:
+            try:
+                _resolve_request_locked(t, uid, r["id"], True, False)
+            except HTTPException:
+                pass
+
+
+def _topup_locked(t: LiveTable, uid: int, amount_cents: int, *, queue_ok: bool) -> None:
+    """Add chips now — or, while the player holds cards, queue them for the end
+    of the hand (``queue_ok``; chips behind never change mid-hand)."""
+    p = t.player(uid)
+    if p is None:
+        raise HTTPException(status_code=400, detail="not seated")
+    if not (queue_ok and _dealt_in(t, t.seat_of(uid))):
+        _rebuy_locked(t, uid, amount_cents)
+        return
+    _require_open(t)
+    if amount_cents < t.bb_cents:
+        raise HTTPException(status_code=400, detail="rebuy must be at least 1 bb")
+    have = chips_to_cents(p.stack_chips, t.bb_cents) + int(p.queued_topup_cents or 0)
+    _check_buyin_limits(t, amount_cents, have, fresh=False)
+    if p.buyin_cents + p.queued_topup_cents + amount_cents > MAX_CENTS:
+        raise HTTPException(status_code=400, detail="buy-in limit reached")
+    p.queued_topup_cents += int(amount_cents)
+    t.rev += 1
+    _emit(t, "rebuy", f"{p.name} adds {_fmt_cents(amount_cents)} after this hand")
+
+
+def _apply_queued_topups_locked(t: LiveTable, *, force: bool = False) -> None:
+    """Land the top-ups that were asked for mid-hand, once the hand (and its
+    runout) is over."""
+    if not any(p is not None and p.queued_topup_cents for p in t.seats):
+        return
+    if _hand_busy(t) and not force:
+        return
+    for p in t.seats:
+        if p is None or not p.queued_topup_cents:
+            continue
+        cents, p.queued_topup_cents = int(p.queued_topup_cents), 0
+        hi = int(t.max_buyin_cents or 0)
+        if hi:
+            cents = min(cents, max(0, hi - chips_to_cents(p.stack_chips, t.bb_cents)))
+        if cents < 1:
+            continue
+        try:
+            with _mutation(t):
+                p.stack_chips += cents_to_chips(cents, t.bb_cents)
+                p.buyin_cents += cents
+                _ledger_add(t, p.user_id, "rebuy", cents)
+                _persist_player(t, t.seat_of(p.user_id), p, True)
+            _emit(t, "rebuy", f"{p.name} added {_fmt_cents(cents)}")
+        except Exception:  # noqa: BLE001 — rolled back; the chips were never added
+            logger.exception("queued top-up failed (table %s)", t.game_id)
+
+
+def _defer_removal_locked(t: LiveTable, i: int) -> None:
+    """Seat ``i`` is out of the game but a hand (or its runout) is still
+    live: mark it away + pending. The away logic folds it when it faces a
+    bet (checks when that is free — the engine has no fold-for-free), and
+    ``_settle_locked`` cashes it out once the hand is over."""
+    p = t.seats[i]
+    assert p is not None
+    with _mutation(t):
+        p.sitting_out = True
+        t.pending_kicks.add(p.user_id)
+        _persist_player(t, i, p, True)
+    if t.phase == "in_hand" and t.env is not None and t.env.current_actor() == i:
+        _resume_turn_locked(t)
+
+
+def _leave_locked(t: LiveTable, uid: int) -> None:
+    i = t.seat_of(uid)
+    if i is None:
+        raise HTTPException(status_code=400, detail="not seated")
+    dealt_in = bool(t.in_hand_mask and i < len(t.in_hand_mask) and t.in_hand_mask[i])
+    if (t.phase == "in_hand" and dealt_in) or _runout_blocking(t):
+        # (review 2026-09-20 G6) Leaving mid-hand used to be refused
+        # outright; with an AFK opponent and no clock the only way out of
+        # the table was the host. Now: out of the hand immediately (away =
+        # fold when facing a bet), cashed out when the hand ends.
+        _defer_removal_locked(t, i)
+        return
+    _cash_out_seat(t, i)
+
+
+def _rebuy_locked(t: LiveTable, uid: int, amount_cents: int) -> None:
+    _require_open(t)
+    p = t.player(uid)
+    if p is None:
+        raise HTTPException(status_code=400, detail="not seated")
+    if _dealt_in(t, t.seat_of(uid)):
+        # Chips behind cannot change while you hold cards (table stakes). A
+        # busted / sitting-out player is not in the hand and may reload now.
+        raise HTTPException(status_code=400, detail="wait for the hand to finish")
+    if amount_cents < t.bb_cents:
+        raise HTTPException(status_code=400, detail="rebuy must be at least 1 bb")
+    if p.buyin_cents + amount_cents > MAX_CENTS:
+        raise HTTPException(status_code=400, detail="buy-in limit reached")
+    _check_buyin_limits(
+        t, amount_cents, chips_to_cents(p.stack_chips, t.bb_cents), fresh=False
+    )
+    with _mutation(t):
+        p = t.player(uid)
+        assert p is not None
+        p.stack_chips += cents_to_chips(amount_cents, t.bb_cents)
+        p.buyin_cents += amount_cents
+        _ledger_add(t, uid, "rebuy", amount_cents)
+        _persist_player(t, t.seat_of(uid), p, True)
+    _sync_idle_stack(t, t.seat_of(uid))
+    _emit(t, "rebuy", f"{p.name} added {_fmt_cents(amount_cents)}", seat=t.seat_of(uid))
+
+
+def _sit_out_locked(
+    t: LiveTable, uid: int, on: bool, *, target_uid: int | None = None,
+    next_hand: bool = False,
+) -> None:
+    _require_open(t)
+    who = int(target_uid) if target_uid is not None else int(uid)
+    if target_uid is not None and uid != t.host_user_id:
+        raise HTTPException(
+            status_code=400, detail="only the host can sit another player out"
+        )
+    if t.player(who) is None:
+        raise HTTPException(status_code=400, detail="not seated")
+    if (not on) and who in t.pending_kicks:
+        raise HTTPException(
+            status_code=400, detail="player is being removed from the table"
+        )
+    i = t.seat_of(who)
+    if on and next_hand:
+        # "Sit out next hand": finish the hand you are in, then go away. Only
+        # meaningful while dealt into a live hand — otherwise it is immediate.
+        live = (
+            t.phase == "in_hand"
+            and i is not None
+            and bool(t.in_hand_mask and i < len(t.in_hand_mask) and t.in_hand_mask[i])
+        )
+        if live:
+            p = t.player(who)
+            assert p is not None
+            if not p.sit_out_next:
+                p.sit_out_next = True
+                t.rev += 1
+            return
+    with _mutation(t):
+        p = t.player(who)
+        assert p is not None
+        was = bool(p.sitting_out)
+        p.sitting_out = bool(on)
+        p.sit_out_next = False
+        _persist_player(t, i, p, True)
+    if was != bool(on):
+        _emit(t, "away" if on else "back",
+              f"{p.name} is sitting out" if on else f"{p.name} is back", seat=i)
+    # (review 2026-09-20 G5) Only when the player who just went away IS the
+    # actor does anything about the turn change (they get auto-acted and the
+    # next actor's clock starts). Anyone else toggling Away used to restart
+    # the actor's shot clock.
+    if (
+        p.sitting_out
+        and t.phase == "in_hand"
+        and t.env is not None
+        and t.env.current_actor() == i
+    ):
+        _resume_turn_locked(t)
+
+
+def _kick_locked(t: LiveTable, uid: int, target_uid: int) -> None:
+    _require_open(t)
+    if uid != t.host_user_id:
+        raise HTTPException(
+            status_code=400, detail="only the host can remove a player"
+        )
+    target_uid = int(target_uid)
+    if target_uid == uid:
+        raise HTTPException(
+            status_code=400, detail="host cannot remove themselves — leave or close"
+        )
+    i = t.seat_of(target_uid)
+    if i is None:
+        raise HTTPException(status_code=400, detail="player not seated")
+    if _hand_busy(t):
+        _defer_removal_locked(t, i)
+        return
+    _cash_out_seat(t, i)
+
+
+def _set_decision_secs_locked(t: LiveTable, uid: int, secs: int) -> None:
+    _require_open(t)
+    if uid != t.host_user_id:
+        raise HTTPException(
+            status_code=400, detail="only the host can set decision time"
+        )
+    n = _valid_decision_secs(secs)
+    with _mutation(t):
+        t.decision_secs = n
+        _persist_meta(t)
+    if t.phase == "in_hand":
+        _start_clock_locked(t, restart=True)  # the host changed the rules
+    else:
+        t.turn_started_mono = None
+
+
+def _valid_decision_secs(secs: int) -> int:
+    n = int(secs)
+    if n < 0:
+        raise HTTPException(status_code=400, detail="decision time must be >= 0")
+    if n != 0 and (n < 5 or n > 180):
+        raise HTTPException(
+            status_code=400,
+            detail="decision time must be 0 (off) or 5–180 seconds",
+        )
+    return n
+
+
+def _set_street_pause_locked(t: LiveTable, uid: int, secs: float) -> None:
+    _require_open(t)
+    if uid != t.host_user_id:
+        raise HTTPException(
+            status_code=400, detail="only the host can set runout speed"
+        )
+    n = float(secs)
+    # `not (a <= n <= b)` also rejects NaN, which sails through `n < a or
+    # n > b` and then 500'd every GET of the table (review 2026-09-20 G4).
+    if not math.isfinite(n) or not (0.3 <= n <= 5.0):
+        raise HTTPException(
+            status_code=400, detail="runout pause must be between 0.3 and 5 seconds"
+        )
+    with _mutation(t):
+        t.street_pause_secs = n
+        _persist_meta(t)
+
+
+def _close_locked(t: LiveTable, uid: int) -> None:
+    if uid != t.host_user_id:
+        raise HTTPException(status_code=400, detail="only the host can close the table")
+    if _hand_busy(t):
+        raise HTTPException(status_code=400, detail="wait for the hand to finish")
+    with _mutation(t):
+        for i in list(t.occupied()):
+            _cash_out_seat(t, i)
+        t.pending_kicks.clear()
+        t.status = "closed"
+        t.running = False
+        t.phase = "waiting"
+        _persist_meta(t)
+    t.env = None
+    t.info = None
+    t.runout_active = False
+
+
+def _host_fold_locked(t: LiveTable, uid: int) -> None:
+    if uid != t.host_user_id:
+        raise HTTPException(status_code=400, detail="only the host can fold a player")
+    if t.phase != "in_hand" or t.env is None or t.info is None:
+        raise HTTPException(status_code=400, detail="no hand in progress")
+    if t.env.current_actor() is None:
+        raise HTTPException(status_code=400, detail="no actor")
+    # The engine has no fold-for-free: when the stalled player faces no bet
+    # the host's button checks them instead, so it ALWAYS moves the hand on
+    # (review 2026-09-20 G6 — it used to 400 "illegal action" there).
+    if bool(t.info.gate_mask[GATE_FOLD]):
+        _apply_action_locked(t, GATE_FOLD, 0)
+    else:
+        gate, chips = _passive_choice(t)
+        _apply_action_locked(t, gate, chips)
+
+
+def _show_locked(t: LiveTable, uid: int) -> None:
+    """Table your own cards after the hand ("show"): a fold-out winner's
+    bluff, or a folded hand. Your choice only — nobody can show for you —
+    and only for the hand that just ended."""
+    if t.phase != "showdown" or t.env is None:
+        raise HTTPException(status_code=400, detail="nothing to show right now")
+    dealt = list(t.dealt_user_ids or [])
+    seat = next((i for i, d in enumerate(dealt) if d is not None and d == uid), None)
+    if seat is None or not (t.in_hand_mask and seat < len(t.in_hand_mask) and t.in_hand_mask[seat]):
+        raise HTTPException(status_code=400, detail="you were not dealt into this hand")
+    occupant = t.seats[seat].user_id if t.seats[seat] is not None else None
+    if occupant is not None and occupant != uid:
+        raise HTTPException(status_code=400, detail="you were not dealt into this hand")
+    if seat in t.shown_seats:
+        return
+    t.shown_seats.add(seat)
+    t.rev += 1
+    _emit(t, "show", f"{_seat_name(t, seat)} shows", seat=seat)
+    # Keep the stored hand in step, so history shows what the table saw.
+    try:
+        row = pub.DB.one(
+            "SELECT summary FROM homegame_hands WHERE game_id=? AND hand_no=?",
+            (t.game_id, int(t.hand_no)),
+        )
+        if row is not None:
+            rec = json.loads(row["summary"])
+            for s in rec.get("seats") or []:
+                if int(s.get("seat", -1)) == seat:
+                    s["shown"] = True
+            pub.DB.q(
+                "UPDATE homegame_hands SET summary=? WHERE game_id=? AND hand_no=?",
+                (json.dumps(rec, separators=(",", ":")), t.game_id, int(t.hand_no)),
+            )
+    except Exception:  # noqa: BLE001 — cosmetic
+        logger.exception("homegame show: history update failed (%s)", t.game_id)
+
+
+def _react_locked(t: LiveTable, uid: int, emote: Any) -> None:
+    """A quick emote over your seat. Whitelisted keys only (the client maps
+    them to glyphs); shares the chat rate limit."""
+    seat = t.seat_of(uid)
+    if seat is None:
+        raise HTTPException(status_code=400, detail="take a seat first")
+    key = str(emote or "").strip().lower()
+    if key not in REACTIONS:
+        raise HTTPException(status_code=400, detail="unknown reaction")
+    now = time.monotonic()
+    times = t.chat_times.setdefault(uid, deque())
+    while times and now - times[0] > CHAT_RATE_WINDOW_S:
+        times.popleft()
+    if len(times) >= CHAT_RATE_MAX:
+        raise HTTPException(status_code=429, detail="slow down")
+    times.append(now)
+    t.reaction_seq += 1
+    t.reactions.append(
+        {"id": t.reaction_seq, "seat": seat, "emote": key, "ts": time.time()}
+    )
+    t.rev += 1
+
+
+def _transfer_host_locked(t: LiveTable, uid: int, target_uid: int) -> None:
+    _require_open(t)
+    if uid != t.host_user_id:
+        raise HTTPException(status_code=400, detail="only the host can hand over the table")
+    target_uid = int(target_uid)
+    p = t.player(target_uid)
+    if p is None:
+        raise HTTPException(status_code=400, detail="the new host must be seated")
+    if target_uid == uid:
+        return
+    with _mutation(t):
+        t.host_user_id = target_uid
+        _persist_meta(t)
+    _emit(t, "host", f"{p.name} is now the host")
+
+
+def _settings_locked(t: LiveTable, uid: int, body: dict) -> None:
+    """Host edits the table. Everything here is safe between AND during hands:
+    the hand in progress keeps the config it was dealt with (the engine owns
+    it), so stakes/pace changes simply apply from the next deal. Seat count
+    is the exception — it reshapes the table, so it waits for the hand."""
+    _require_open(t)
+    if uid != t.host_user_id:
+        raise HTTPException(status_code=400, detail="only the host can change table settings")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="invalid settings")
+    changed: list[str] = []
+    with _mutation(t):
+        if body.get("name") is not None:
+            name = " ".join(str(body["name"]).split())
+            if not name:
+                raise HTTPException(status_code=400, detail="table name cannot be empty")
+            if len(name) > MAX_NAME_LEN:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"table name is limited to {MAX_NAME_LEN} characters",
+                )
+            if name != t.name:
+                t.name = name
+                changed.append(f"table renamed to “{name}”")
+        if body.get("ante_cents") is not None:
+            ante = _parse_cents(body, "ante_cents")
+            if ante <= 0 or cents_to_chips(ante, t.bb_cents) <= 0:
+                raise HTTPException(status_code=400, detail="ante must be positive")
+            if ante != t.ante_cents:
+                t.ante_cents = ante
+                changed.append(f"ante is now {_fmt_cents(ante)} (next hand)")
+        lo = _parse_cents(body, "min_buyin_cents", t.min_buyin_cents)
+        hi = _parse_cents(body, "max_buyin_cents", t.max_buyin_cents)
+        dflt = _parse_cents(body, "default_buyin_cents", t.default_buyin_cents)
+        _validate_buyin_window(t.bb_cents, lo, hi, dflt)
+        if (lo, hi, dflt) != (t.min_buyin_cents, t.max_buyin_cents, t.default_buyin_cents):
+            t.min_buyin_cents, t.max_buyin_cents, t.default_buyin_cents = lo, hi, dflt
+            changed.append("buy-in limits changed")
+        if body.get("decision_secs") is not None:
+            secs = _valid_decision_secs(pub.body_int(body, "decision_secs"))
+            if secs != t.decision_secs:
+                t.decision_secs = secs
+                changed.append(
+                    "shot clock off" if secs == 0 else f"shot clock {secs}s"
+                )
+        if body.get("time_bank_secs") is not None:
+            bank = _valid_time_bank(pub.body_int(body, "time_bank_secs"))
+            if bank != t.time_bank_secs:
+                t.time_bank_secs = bank
+                for p in t.seats:
+                    if p is not None:
+                        p.time_bank_left = float(bank)
+                changed.append("time bank off" if bank == 0 else f"time bank {bank}s")
+        if body.get("deal_delay_secs") is not None:
+            delay = _valid_deal_delay(_parse_secs(body, "deal_delay_secs", 0.0))
+            if delay != t.deal_delay_secs:
+                t.deal_delay_secs = delay
+                t.next_deal_mono = None
+                changed.append(
+                    "manual dealing" if delay == 0 else f"next hand after {delay:g}s"
+                )
+        if body.get("street_pause_secs") is not None:
+            pause = _parse_secs(body, "street_pause_secs", 1.5)
+            if not (0.3 <= pause <= 5.0):
+                raise HTTPException(
+                    status_code=400,
+                    detail="runout pause must be between 0.3 and 5 seconds",
+                )
+            t.street_pause_secs = pause
+        if body.get("listed") is not None:
+            t.listed = _parse_bool(body, "listed", t.listed)
+        if body.get("allow_rabbit") is not None:
+            t.allow_rabbit = _parse_bool(body, "allow_rabbit", t.allow_rabbit)
+        if body.get("approve_buyins") is not None:
+            on = _parse_bool(body, "approve_buyins", t.approve_buyins)
+            if on != t.approve_buyins:
+                t.approve_buyins = on
+                changed.append(
+                    "buy-ins now need the host's approval" if on
+                    else "buy-ins no longer need approval"
+                )
+        if body.get("num_seats") is not None:
+            n = pub.body_int(body, "num_seats")
+            if n != t.num_seats:
+                _resize_locked(t, n)
+                changed.append(f"table is now {n}-max")
+        _persist_meta(t)
+    if body.get("decision_secs") is not None:
+        if t.phase == "in_hand":
+            _start_clock_locked(t, restart=True)  # the host changed the rules
+        else:
+            t.turn_started_mono = None
+    if not t.approve_buyins and t.requests:
+        # approval was switched off: everything that was waiting goes through
+        for r in list(t.requests):
+            try:
+                _resolve_request_locked(t, uid, r["id"], True, False)
+            except HTTPException:
+                pass
+    for line in changed:
+        _emit(t, "settings", f"Host: {line}")
+
+
+def _validate_buyin_window(bb_cents: int, lo: int, hi: int, dflt: int) -> None:
+    if dflt < bb_cents:
+        raise HTTPException(status_code=400, detail="default buy-in must be at least 1 bb")
+    if lo and lo < bb_cents:
+        raise HTTPException(status_code=400, detail="minimum buy-in must be at least 1 bb")
+    if lo and hi and hi < lo:
+        raise HTTPException(status_code=400, detail="maximum buy-in is below the minimum")
+    if lo and dflt < lo:
+        raise HTTPException(status_code=400, detail="default buy-in is below the minimum")
+    if hi and dflt > hi:
+        raise HTTPException(status_code=400, detail="default buy-in is above the maximum")
+
+
+def _valid_time_bank(secs: int) -> int:
+    n = int(secs)
+    if not (0 <= n <= MAX_TIME_BANK_SECS):
+        raise HTTPException(
+            status_code=400,
+            detail=f"time bank must be 0–{MAX_TIME_BANK_SECS} seconds",
+        )
+    return n
+
+
+def _valid_deal_delay(secs: float) -> float:
+    if not (secs == 0 or 1.0 <= secs <= MAX_DEAL_DELAY_SECS):
+        raise HTTPException(
+            status_code=400,
+            detail=f"next-hand delay must be 0 (manual) or 1–{MAX_DEAL_DELAY_SECS:g} seconds",
+        )
+    return float(secs)
+
+
+def _valid_num_seats(n: int) -> int:
+    n = int(n)
+    if not (MIN_SEATS <= n <= TABLE_SEATS):
+        raise HTTPException(
+            status_code=400, detail=f"seats must be {MIN_SEATS}–{TABLE_SEATS}"
+        )
+    return n
+
+
+def _resize_locked(t: LiveTable, n: int) -> None:
+    """Change the seat count (caller is inside ``_mutation``). Between hands
+    only; shrinking needs the removed seats empty. The button stays on a seat
+    that still exists."""
+    n = _valid_num_seats(n)
+    if _hand_busy(t):
+        raise HTTPException(status_code=400, detail="wait for the hand to finish")
+    if n < t.num_seats and any(s is not None for s in t.seats[n:]):
+        raise HTTPException(
+            status_code=400,
+            detail="move or remove the players in the higher seats first",
+        )
+    seats = list(t.seats[:n])
+    seats += [None] * (n - len(seats))
+    t.seats = seats
+    t.num_seats = n
+    t.button = int(t.button) % n
+    # Per-hand arrays are sized to the table that played them: drop them, the
+    # finished hand is no longer drawn after a reshape.
+    t.env = None
+    t.info = None
+    t.phase = "waiting"
+    t.in_hand_mask = []
+    t.dealt_user_ids = []
+    t.hand_start_stacks = []
+    t.last_deltas = []
+    t.last_holes = []
+    t.shown_seats = set()
+    t.runout_active = False
+    t.pot_awards = []
+    t.rabbit_available = False
+    t.rabbit_full_a = []
+    t.rabbit_full_b = []
+
+
+def _hand_for_viewer(rec: dict[str, Any], viewer_id: int) -> dict[str, Any]:
+    """A stored hand as THIS viewer may see it: own cards, plus hands tabled
+    at showdown or shown voluntarily. Everything else is face-down — same
+    rule as the live table (review 2026-09-20 G1/G2)."""
+    out = dict(rec)
+    seats = []
+    for s in rec.get("seats") or []:
+        s2 = dict(s)
+        mine = int(s.get("user_id") or -1) == int(viewer_id)
+        if not (mine or s.get("shown")):
+            s2["hole"] = None
+        s2["is_me"] = mine
+        s2.pop("user_id", None)
+        seats.append(s2)
+    out["seats"] = seats
+    return out
+
+
+def _hands_visible_upto(t: LiveTable) -> int:
+    """Newest hand number whose result may be served: never the hand being
+    played, never one whose runout is still revealing (G11)."""
+    if t.phase == "in_hand" or _runout_blocking(t):
+        return int(t.hand_no) - 1
+    return int(t.hand_no)
+
+
+def _hands_list(t: LiveTable, viewer_id: int, before: int | None, limit: int) -> dict[str, Any]:
+    upto = _hands_visible_upto(t)
+    if before is not None:
+        upto = min(upto, int(before) - 1)
+    limit = max(1, min(HANDS_PAGE_MAX, int(limit)))
+    rows = pub.DB.q(
+        "SELECT hand_no, ended_at, pot_cents, summary FROM homegame_hands "
+        "WHERE game_id=? AND hand_no<=? ORDER BY hand_no DESC LIMIT ?",
+        (t.game_id, upto, limit),
+    )
+    hands = []
+    for r in rows:
+        try:
+            rec = _hand_for_viewer(json.loads(r["summary"]), viewer_id)
+        except Exception:  # noqa: BLE001
+            continue
+        me = next((s for s in rec["seats"] if s.get("is_me")), None)
+        hands.append({
+            "hand_no": int(r["hand_no"]),
+            "ended_at": r["ended_at"],
+            "pot_cents": int(r["pot_cents"]),
+            "showdown": bool(rec.get("showdown")),
+            "board_a": rec.get("board_a") or [],
+            "board_b": rec.get("board_b") or [],
+            "winners": [
+                {"name": s["name"], "delta_cents": s["delta_cents"]}
+                for s in rec["seats"] if int(s.get("delta_cents") or 0) > 0
+            ],
+            "my_delta_cents": int(me["delta_cents"]) if me else None,
+            "my_hole": me.get("hole") if me else None,
+        })
+    stats = pub.DB.q(
+        "SELECT r.user_id, COUNT(*) hands, SUM(CASE WHEN r.delta_cents>0 THEN 1 ELSE 0 END) wins, "
+        "SUM(r.showdown) showdowns, MAX(r.delta_cents) biggest, u.name, u.email "
+        "FROM homegame_hand_results r JOIN users u ON u.id=r.user_id "
+        "WHERE r.game_id=? AND r.hand_no<=? GROUP BY r.user_id ORDER BY hands DESC",
+        (t.game_id, _hands_visible_upto(t)),
+    )
+    return {
+        "hands": hands,
+        "more": bool(hands) and hands[-1]["hand_no"] > 1 and len(hands) == limit,
+        "stats": [
+            {
+                "name": _display_name(r),
+                "is_me": int(r["user_id"]) == int(viewer_id),
+                "hands": int(r["hands"] or 0),
+                "wins": int(r["wins"] or 0),
+                "showdowns": int(r["showdowns"] or 0),
+                "biggest_win_cents": max(0, int(r["biggest"] or 0)),
+            }
+            for r in stats
+        ],
+    }
+
+
+def _hand_detail(t: LiveTable, viewer_id: int, hand_no: int) -> dict[str, Any]:
+    if int(hand_no) > _hands_visible_upto(t):
+        raise HTTPException(status_code=404, detail="Not Found")
+    row = pub.DB.one(
+        "SELECT summary FROM homegame_hands WHERE game_id=? AND hand_no=?",
+        (t.game_id, int(hand_no)),
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Not Found")
+    return _hand_for_viewer(json.loads(row["summary"]), viewer_id)
+
+
+def _parse_cents(body: dict, key: str, default: int | None = None) -> int:
+    """A money field in whole cents: finite, >= 0, <= MAX_CENTS — else 400.
+
+    (review 2026-09-20 G4) ``int(round(float(v)))`` accepted ``1e30`` (sqlite
+    OverflowError AFTER memory had been mutated — the table was bricked until
+    a restart), and raised on ``1e999`` / NaN (500)."""
+    if not isinstance(body, dict) or key not in body or body[key] is None:
+        if default is None:
+            raise HTTPException(status_code=400, detail=f"missing {key}")
+        return int(default)
+    v = body[key]
+    if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+        raise HTTPException(status_code=400, detail=f"invalid {key}")
+    try:
+        f = float(v)
+    except (TypeError, ValueError, OverflowError) as e:
+        raise HTTPException(status_code=400, detail=f"invalid {key}") from e
+    if not math.isfinite(f):
+        raise HTTPException(status_code=400, detail=f"invalid {key}")
+    if f < 0:
+        raise HTTPException(status_code=400, detail=f"{key} must be >= 0")
+    if f > MAX_CENTS:
+        raise HTTPException(status_code=400, detail=f"{key} is too large")
+    return int(round(f))
+
+
+def _parse_secs(body: dict, key: str, default: float) -> float:
+    """A finite float field (seconds), or 400."""
+    v = body.get(key, default) if isinstance(body, dict) else default
+    if v is None:
+        v = default
+    if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+        raise HTTPException(status_code=400, detail=f"invalid {key}")
+    try:
+        f = float(v)
+    except (TypeError, ValueError, OverflowError) as e:
+        raise HTTPException(status_code=400, detail=f"invalid {key}") from e
+    if not math.isfinite(f):
+        raise HTTPException(status_code=400, detail=f"invalid {key}")
+    return f
+
+
+def _parse_bool(body: dict, key: str, default: bool) -> bool:
+    v = body.get(key, default) if isinstance(body, dict) else default
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)) and v in (0, 1):
+        return bool(v)
+    raise HTTPException(status_code=400, detail=f"{key} must be true or false")
+
+
+def _create_table(user: Any, body: dict) -> LiveTable:
+    name = " ".join(str(body.get("name") or "").split()) or "Table 1"
+    if len(name) > MAX_NAME_LEN:
+        raise HTTPException(
+            status_code=400, detail=f"table name is limited to {MAX_NAME_LEN} characters"
+        )
+    n = (
+        _valid_num_seats(pub.body_int(body, "num_seats"))
+        if body.get("num_seats") is not None
+        else TABLE_SEATS
+    )
+    sb = _parse_cents(body, "sb_cents", 50)
+    bb = _parse_cents(body, "bb_cents", 100)
+    ante = _parse_cents(body, "ante_cents", 300)
+    buyin = _parse_cents(body, "default_buyin_cents", 4000)
+    secs = _valid_decision_secs(
+        pub.body_int(body, "decision_secs", DEFAULT_DECISION_SECS)
+    )
+    if bb <= 0:
+        raise HTTPException(status_code=400, detail="big blind must be positive")
+    if ante <= 0 or cents_to_chips(ante, bb) <= 0:
+        raise HTTPException(status_code=400, detail="ante must be positive")
+    if buyin < bb:
+        raise HTTPException(status_code=400, detail="default buy-in must be at least 1 bb")
+    lo = _parse_cents(body, "min_buyin_cents", 0)
+    hi = _parse_cents(body, "max_buyin_cents", 0)
+    _validate_buyin_window(bb, lo, hi, buyin)
+    bank = _valid_time_bank(pub.body_int(body, "time_bank_secs", 0))
+    # Absent = MANUAL dealing (see MAX_DEAL_DELAY_SECS); the dialog sends 5.
+    delay = _valid_deal_delay(_parse_secs(body, "deal_delay_secs", 0.0))
+    listed = _parse_bool(body, "listed", True)
+    approve = _parse_bool(body, "approve_buyins", False)
+    # (review 2026-09-20 G13) 50 tables in 0.32 s, none ever evicted.
+    open_n = pub.DB.one(
+        "SELECT COUNT(*) c FROM homegames WHERE host_user_id=? AND status='open'",
+        (int(user["id"]),),
+    )["c"]
+    if int(open_n) >= MAX_OPEN_TABLES_PER_USER:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"you already host {MAX_OPEN_TABLES_PER_USER} open tables —"
+                " close one first"
+            ),
+        )
+    gid = secrets.token_urlsafe(6)
+    t = LiveTable(
+        game_id=gid,
+        host_user_id=int(user["id"]),
+        name=name,
+        num_seats=n,
+        sb_cents=sb,
+        bb_cents=bb,
+        ante_cents=ante,
+        default_buyin_cents=buyin,
+        status="open",
+        button=0,
+        hand_no=0,
+        seats=[None] * n,
+        running=False,
+        decision_secs=secs,
+        deal_delay_secs=delay,
+        time_bank_secs=bank,
+        min_buyin_cents=lo,
+        max_buyin_cents=hi,
+        listed=listed,
+        approve_buyins=approve,
+    )
+    # The table row and the host's seat land together or not at all.
+    with pub.DB.transaction():
+        pub.DB.q(
+            "INSERT INTO homegames(id,host_user_id,name,num_seats,sb_cents,bb_cents,"
+            "ante_cents,default_buyin_cents,status,running,decision_secs,button,"
+            "hand_no,created_at,deal_delay_ms,time_bank_secs,min_buyin_cents,"
+            "max_buyin_cents,listed,approve_buyins) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (gid, int(user["id"]), name, n, sb, bb, ante, buyin, "open", 0, secs,
+             0, 0, pub._now(), int(round(delay * 1000)), bank, lo, hi,
+             1 if listed else 0, 1 if approve else 0),
+        )
+        # Host sits seat 0 with the default buy-in so they can deal once a
+        # second player sits.
+        _sit_locked(t, user, 0, buyin)
+    HUB.put(t)
+    return t
+
+
+def _lobby_row(row: Any, viewer_id: int | None = None) -> dict[str, Any]:
+    players = pub.DB.q(
+        "SELECT p.user_id, p.seat, u.name, u.email FROM homegame_players p "
+        "JOIN users u ON u.id=p.user_id WHERE p.game_id=? AND p.seat IS NOT NULL "
+        "ORDER BY p.seat",
+        (row["id"],),
+    )
+    host = pub._user_by_id(int(row["host_user_id"]))
+    member = False
+    if viewer_id is not None:
+        member = pub.DB.one(
+            "SELECT 1 FROM homegame_players WHERE game_id=? AND user_id=?",
+            (row["id"], int(viewer_id)),
+        ) is not None
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "num_seats": row["num_seats"],
+        "seated": len(players),
+        "sb_cents": row["sb_cents"],
+        "bb_cents": row["bb_cents"],
+        "ante_cents": row["ante_cents"],
+        "default_buyin_cents": row["default_buyin_cents"],
+        "hand_no": row["hand_no"],
+        "running": bool(int(row["running"] if "running" in row.keys() else 0)),
+        "host_name": _display_name(host) if host else "?",
+        "created_at": row["created_at"],
+        # No emails, no user ids of other people (review 2026-09-20 G12).
+        "players": [
+            {"seat": int(p["seat"]), "name": _display_name(p),
+             "is_me": viewer_id is not None and int(p["user_id"]) == int(viewer_id)}
+            for p in players
+        ],
+        "is_host": viewer_id is not None and int(row["host_user_id"]) == int(viewer_id),
+        "is_seated": any(
+            viewer_id is not None and int(p["user_id"]) == int(viewer_id) for p in players
+        ),
+        "is_member": bool(member),
+        "listed": bool(_row_int(row, "listed", 1)),
+    }
+
+
+def _lobby_visible(row: Any, viewer_id: int | None) -> bool:
+    """Unlisted tables are link-only: they show up in the lobby of the host
+    and of anyone who has played at them, and nobody else's."""
+    if bool(_row_int(row, "listed", 1)):
+        return True
+    if viewer_id is None:
+        return False
+    if int(row["host_user_id"]) == int(viewer_id):
+        return True
+    return pub.DB.one(
+        "SELECT 1 FROM homegame_players WHERE game_id=? AND user_id=?",
+        (row["id"], int(viewer_id)),
+    ) is not None
+
+
+def _my_sessions(viewer_id: int, limit: int = 12) -> list[dict[str, Any]]:
+    """The viewer's finished sessions (closed tables they played at)."""
+    rows = pub.DB.q(
+        "SELECT g.id, g.name, g.sb_cents, g.bb_cents, g.ante_cents, g.hand_no, "
+        "g.closed_at, p.buyin_cents, p.leftover_cents FROM homegame_players p "
+        "JOIN homegames g ON g.id=p.game_id "
+        "WHERE p.user_id=? AND g.status='closed' AND p.buyin_cents>0 "
+        "ORDER BY g.closed_at DESC LIMIT ?",
+        (int(viewer_id), int(limit)),
+    )
+    out = []
+    for r in rows:
+        hands = pub.DB.one(
+            "SELECT COUNT(*) c FROM homegame_hand_results WHERE game_id=? AND user_id=?",
+            (r["id"], int(viewer_id)),
+        )["c"]
+        out.append({
+            "id": r["id"],
+            "name": r["name"],
+            "sb_cents": int(r["sb_cents"]),
+            "bb_cents": int(r["bb_cents"]),
+            "ante_cents": int(r["ante_cents"]),
+            "closed_at": r["closed_at"],
+            "hands": int(hands or 0),
+            "buyin_cents": int(r["buyin_cents"]),
+            "net_cents": int(r["leftover_cents"]) - int(r["buyin_cents"]),
+        })
+    return out
+
+
+def _chat_messages(game_id: str) -> list[dict[str, Any]]:
+    rows = pub.DB.q(
+        "SELECT c.id, c.body, c.created_at, u.name, u.email "
+        "FROM homegame_chat c JOIN users u ON u.id=c.user_id "
+        "WHERE c.game_id=? ORDER BY c.id DESC LIMIT 80",
+        (game_id,),
+    )
+    out = []
+    for r in reversed(list(rows)):
+        out.append({
+            "id": int(r["id"]),
+            "name": _display_name(r),
+            "text": r["body"],
+            "created_at": r["created_at"],
+        })
+    return out
+
+
+def _chat_add(t: LiveTable, user: Any, text: Any) -> None:
+    uid = int(user["id"])
+    _require_member(t, uid)  # review 2026-09-20 G12
+    if not isinstance(text, str):
+        raise HTTPException(status_code=400, detail="invalid message")
+    body = " ".join(text[: CHAT_MAX_LEN * 8].split())
+    if not body:
+        raise HTTPException(status_code=400, detail="empty message")
+    if len(body) > CHAT_MAX_LEN:
+        body = body[:CHAT_MAX_LEN]
+    # (review 2026-09-20 G13) Per-user, per-table sliding-window rate limit.
+    now = time.monotonic()
+    times = t.chat_times.setdefault(uid, deque())
+    while times and now - times[0] > CHAT_RATE_WINDOW_S:
+        times.popleft()
+    if len(times) >= CHAT_RATE_MAX:
+        raise HTTPException(status_code=429, detail="slow down — too many messages")
+    pub.DB.q(
+        "INSERT INTO homegame_chat(game_id,user_id,body,created_at) VALUES(?,?,?,?)",
+        (t.game_id, uid, body, pub._now()),
+    )
+    times.append(now)
+    t.rev += 1
+
+
+def _page_html(static_dir: Path) -> str:
+    return (static_dir / "games.html").read_text(encoding="utf-8")
+
+
+def _require_sync(t: LiveTable, body: dict, *, with_seq: bool) -> None:
+    """Reject a request composed against a state the table has left.
+
+    (review 2026-09-20 G8) `/act` carried no hand or decision identity, so a
+    click that arrived late landed on the NEXT decision — "Call $1" could
+    call a different bet, and an armed pre-fold folded the next hand. The
+    client echoes the ``hand_no`` (and for `/act` the ``action_seq``) of the
+    state it was looking at; a mismatch is 409 and the client just re-renders.
+    Optional so scripted callers keep working."""
+    if not isinstance(body, dict):
+        return
+    if body.get("hand_no") is not None:
+        if pub.body_int(body, "hand_no") != t.hand_no:
+            raise HTTPException(status_code=409, detail="stale: the hand has moved on")
+    if with_seq and body.get("action_seq") is not None:
+        if pub.body_int(body, "action_seq") != t.action_seq:
+            raise HTTPException(status_code=409, detail="stale: the action has moved on")
+
+
+def _stream_sig(t: LiveTable) -> tuple:
+    """Everything that can change what a viewer sees WITHOUT bumping ``rev``
+    (the runout reveals itself by the clock). Cheap, lock-free reads."""
+    return (
+        t.epoch, t.rev, t.phase, t.hand_no, t.action_seq, len(t.requests),
+        _runout_shown_len(t) if t.runout_active else 0,
+        _runout_award_index(t) if t.runout_active else 0,
+        t.next_deal_mono is not None, t.bank_key,
+    )
+
+
+def install(app: FastAPI, *, static_dir: Path) -> None:
+    _ensure_schema()
+
+    def _html() -> HTMLResponse:
+        return HTMLResponse(
+            _page_html(static_dir),
+            headers={"Cache-Control": "no-store, must-revalidate"},
+        )
+
+    @app.get("/games")
+    def games_index():
+        return _html()
+
+    @app.get("/games/t/{game_id}")
+    def games_table_page(game_id: str):
+        row = pub.DB.one("SELECT id FROM homegames WHERE id=?", (game_id,))
+        if row is None:
+            raise HTTPException(status_code=404, detail="Not Found")
+        return _html()
+
+    @app.get("/games/static/{name}")
+    def games_asset(name: str):
+        """Gated, no-store copies of the lobby JS/CSS.
+
+        Served under /games/ (not /static/) so a previously cached 404 on
+        /static/games.js cannot keep the create button dead.
+        """
+        allowed = {name: media for name, media in GAMES_ASSETS.items()}
+        media = allowed.get(name)
+        if media is None:
+            raise HTTPException(status_code=404, detail="Not Found")
+        path = static_dir / name
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="Not Found")
+        return Response(
+            path.read_text(encoding="utf-8"),
+            media_type=media,
+            headers={"Cache-Control": "no-store, must-revalidate"},
+        )
+
+    @app.get("/games/api/tables")
+    def api_list():
+        uid = pub._CURRENT_USER_ID.get()
+        viewer = int(uid) if uid is not None else None
+        rows = pub.DB.q(
+            "SELECT * FROM homegames WHERE status='open' ORDER BY created_at DESC"
+        )
+        return {
+            "tables": [
+                _lobby_row(r, viewer) for r in rows if _lobby_visible(r, viewer)
+            ],
+            "sessions": _my_sessions(viewer) if viewer is not None else [],
+        }
+
+    @app.post("/games/api/tables")
+    def api_create(body: dict = Body({})):
+        uid = pub._CURRENT_USER_ID.get()
+        user = pub._user_by_id(int(uid)) if uid is not None else None
+        if user is None:
+            raise HTTPException(status_code=404, detail="Not Found")
+        t = _create_table(user, body or {})
+        with t.lock:
+            return _view(t, int(user["id"]))
+
+    def _table_for(game_id: str) -> LiveTable:
+        return HUB.get(game_id)
+
+    def _uid() -> int:
+        uid = pub._CURRENT_USER_ID.get()
+        if uid is None:
+            raise HTTPException(status_code=404, detail="Not Found")
+        return int(uid)
+
+    @app.get("/games/api/tables/{game_id}")
+    def api_get(game_id: str):
+        t = _table_for(game_id)
+        with t.lock:
+            return _view(t, _uid())
+
+    @app.post("/games/api/tables/{game_id}/sit")
+    def api_sit(game_id: str, body: dict = Body({})):
+        t = _table_for(game_id)
+        uid = _uid()
+        user = pub._user_by_id(uid)
+        if user is None:
+            raise HTTPException(status_code=404, detail="Not Found")
+        seat = pub.body_int(body, "seat", -1)
+        buyin = _parse_cents(body, "buyin_cents", t.default_buyin_cents)
+        with t.lock:
+            if _needs_approval(t, uid):
+                _request_locked(t, user, "sit", seat, buyin)
+            else:
+                _sit_locked(t, user, seat, buyin)
+            return _view(t, uid)
+
+    @app.post("/games/api/tables/{game_id}/leave")
+    def api_leave(game_id: str):
+        t = _table_for(game_id)
+        uid = _uid()
+        with t.lock:
+            _leave_locked(t, uid)
+            return _view(t, uid)
+
+    @app.post("/games/api/tables/{game_id}/sit_out")
+    def api_sit_out(game_id: str, body: dict = Body({})):
+        t = _table_for(game_id)
+        uid = _uid()
+        on = _parse_bool(body, "on", True)
+        next_hand = _parse_bool(body, "next_hand", False)
+        with t.lock:
+            _sit_out_locked(t, uid, on, next_hand=next_hand)
+            return _view(t, uid)
+
+    @app.post("/games/api/tables/{game_id}/settings")
+    def api_settings(game_id: str, body: dict = Body({})):
+        t = _table_for(game_id)
+        uid = _uid()
+        with t.lock:
+            _settings_locked(t, uid, body or {})
+            return _view(t, uid)
+
+    @app.post("/games/api/tables/{game_id}/transfer_host")
+    def api_transfer_host(game_id: str, body: dict = Body({})):
+        t = _table_for(game_id)
+        uid = _uid()
+        target = pub.body_int(body, "user_id")
+        with t.lock:
+            _transfer_host_locked(t, uid, target)
+            return _view(t, uid)
+
+    @app.post("/games/api/tables/{game_id}/show")
+    def api_show(game_id: str, body: dict = Body({})):
+        t = _table_for(game_id)
+        uid = _uid()
+        with t.lock:
+            _require_sync(t, body, with_seq=False)
+            _show_locked(t, uid)
+            return _view(t, uid)
+
+    @app.post("/games/api/tables/{game_id}/react")
+    def api_react(game_id: str, body: dict = Body({})):
+        t = _table_for(game_id)
+        uid = _uid()
+        with t.lock:
+            _react_locked(t, uid, (body or {}).get("emote"))
+            return _view(t, uid)
+
+    @app.get("/games/api/tables/{game_id}/hands")
+    def api_hands(game_id: str, before: int | None = None, limit: int = 30):
+        t = _table_for(game_id)
+        uid = _uid()
+        with t.lock:
+            _require_member(t, uid)
+            return _hands_list(t, uid, before, limit)
+
+    @app.get("/games/api/tables/{game_id}/hands/{hand_no}")
+    def api_hand(game_id: str, hand_no: int):
+        t = _table_for(game_id)
+        uid = _uid()
+        with t.lock:
+            _require_member(t, uid)
+            return _hand_detail(t, uid, hand_no)
+
+    @app.post("/games/api/tables/{game_id}/sit_out_player")
+    def api_sit_out_player(game_id: str, body: dict = Body({})):
+        t = _table_for(game_id)
+        uid = _uid()
+        target = pub.body_int(body, "user_id")
+        on = _parse_bool(body, "on", True)
+        with t.lock:
+            _sit_out_locked(t, uid, on, target_uid=target)
+            return _view(t, uid)
+
+    @app.post("/games/api/tables/{game_id}/kick")
+    def api_kick(game_id: str, body: dict = Body({})):
+        t = _table_for(game_id)
+        uid = _uid()
+        target = pub.body_int(body, "user_id")
+        with t.lock:
+            _kick_locked(t, uid, target)
+            return _view(t, uid)
+
+    @app.post("/games/api/tables/{game_id}/decision_time")
+    def api_decision_time(game_id: str, body: dict = Body({})):
+        t = _table_for(game_id)
+        uid = _uid()
+        secs = pub.body_int(body, "secs", 0)
+        with t.lock:
+            _set_decision_secs_locked(t, uid, secs)
+            return _view(t, uid)
+
+    @app.post("/games/api/tables/{game_id}/street_pause")
+    def api_street_pause(game_id: str, body: dict = Body({})):
+        t = _table_for(game_id)
+        uid = _uid()
+        secs = _parse_secs(body, "secs", 1.5)
+        with t.lock:
+            _set_street_pause_locked(t, uid, secs)
+            return _view(t, uid)
+
+    @app.post("/games/api/tables/{game_id}/rebuy")
+    def api_rebuy(game_id: str, body: dict = Body({})):
+        t = _table_for(game_id)
+        uid = _uid()
+        amount = _parse_cents(body, "amount_cents")
+        queue = _parse_bool(body, "queue", False)
+        with t.lock:
+            if _needs_approval(t, uid):
+                user = pub._user_by_id(uid)
+                if user is None:
+                    raise HTTPException(status_code=404, detail="Not Found")
+                _request_locked(t, user, "rebuy", None, amount)
+            else:
+                _topup_locked(t, uid, amount, queue_ok=queue)
+            return _view(t, uid)
+
+    @app.post("/games/api/tables/{game_id}/request")
+    def api_request(game_id: str, body: dict = Body({})):
+        """Host: approve / decline a pending buy-in. Requester: cancel their own."""
+        t = _table_for(game_id)
+        uid = _uid()
+        action = str((body or {}).get("action") or "").strip().lower()
+        with t.lock:
+            if action == "cancel":
+                _cancel_request_locked(t, uid)
+            elif action in ("approve", "deny"):
+                _resolve_request_locked(
+                    t, uid, pub.body_int(body, "id"), action == "approve",
+                    _parse_bool(body, "trust", False),
+                )
+            else:
+                raise HTTPException(status_code=400, detail="action must be approve, deny or cancel")
+            return _view(t, uid)
+
+    @app.post("/games/api/tables/{game_id}/trust")
+    def api_trust(game_id: str, body: dict = Body({})):
+        t = _table_for(game_id)
+        uid = _uid()
+        target = pub.body_int(body, "user_id")
+        on = _parse_bool(body, "on", True)
+        with t.lock:
+            _set_trust_locked(t, uid, target, on)
+            return _view(t, uid)
+
+    @app.post("/games/api/tables/{game_id}/auto_topup")
+    def api_auto_topup(game_id: str, body: dict = Body({})):
+        t = _table_for(game_id)
+        uid = _uid()
+        with t.lock:
+            _auto_topup_host_locked(t, uid, body or {})
+            return _view(t, uid)
+
+    @app.post("/games/api/tables/{game_id}/auto_chips_self")
+    def api_auto_chips_self(game_id: str, body: dict = Body({})):
+        t = _table_for(game_id)
+        uid = _uid()
+        with t.lock:
+            _auto_chips_self_locked(t, uid, body or {})
+            return _view(t, uid)
+
+    @app.get("/games/api/tables/{game_id}/stream")
+    async def api_stream(game_id: str, max_events: int = 0):
+        """Live push (SSE): the viewer's state whenever it changes, plus a
+        heartbeat. Replaces the 450 ms poll (which stays as the fallback)."""
+        t = _table_for(game_id)
+        uid = _uid()
+
+        def snapshot() -> tuple[tuple, str]:
+            with t.lock:
+                view = _view(t, uid)
+                return _stream_sig(t), json.dumps(view, separators=(",", ":"))
+
+        async def gen():
+            sent = 0
+            last_sig: tuple | None = None
+            last_push = 0.0
+            yield "retry: 1500\n\n"
+            while not _WATCHDOG_STOP.is_set():
+                now = time.monotonic()
+                if _stream_sig(t) != last_sig or now - last_push >= STREAM_HEARTBEAT_S:
+                    last_sig, payload = await run_in_threadpool(snapshot)
+                    last_push = now
+                    yield f"data: {payload}\n\n"
+                    sent += 1
+                    if max_events and sent >= max_events:
+                        return
+                await asyncio.sleep(STREAM_TICK_S)
+
+        return StreamingResponse(
+            gen(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            },
+        )
+
+    @app.post("/games/api/tables/{game_id}/run")
+    def api_run(game_id: str, body: dict = Body({})):
+        t = _table_for(game_id)
+        uid = _uid()
+        running = _parse_bool(body, "running", True)
+        with t.lock:
+            _set_running_locked(t, uid, running)
+            return _view(t, uid)
+
+    @app.post("/games/api/tables/{game_id}/deal")
+    def api_deal(game_id: str, body: dict = Body({})):
+        t = _table_for(game_id)
+        uid = _uid()
+        with t.lock:
+            if t.seat_of(uid) is None:
+                raise HTTPException(status_code=400, detail="sit to deal")
+            # `hand_no` = the finished hand the client saw; 409 if another
+            # player (or the host's auto-deal) already dealt the next one.
+            _require_sync(t, body, with_seq=False)
+            _deal_locked(t)
+            return _view(t, uid)
+
+    @app.post("/games/api/tables/{game_id}/act")
+    def api_act(game_id: str, body: dict = Body({})):
+        t = _table_for(game_id)
+        uid = _uid()
+        gate = _gate_key(body.get("gate"))
+        chips = pub.body_int(body, "chips", 0)
+        raise_to = (
+            pub.body_int(body, "raise_to_chips")
+            if gate == GATE_RAISE and body.get("raise_to_chips") is not None
+            else None
+        )
+        # (review 2026-09-20 G8) ONE lock acquisition: the raise-TO -> raise-BY
+        # conversion used to read the actor's street commit under one `with
+        # t.lock`, release, and act under a second — another action could
+        # land in between and the conversion applied to the wrong node.
+        with t.lock:
+            _require_sync(t, body, with_seq=True)
+            if raise_to is not None:
+                if t.env is None or t.env.current_actor() is None:
+                    raise HTTPException(status_code=400, detail="no hand in progress")
+                raw = _obs_dict(t.env)
+                actor = int(raw["actor"])
+                # Optional raise-TO total in chips -> the engine's raise-BY.
+                chips = raise_to - int(raw["street_commit"][actor])
+            _act_locked(t, uid, gate, chips)
+            return _view(t, uid)
+
+    @app.post("/games/api/tables/{game_id}/host_fold")
+    def api_host_fold(game_id: str):
+        t = _table_for(game_id)
+        uid = _uid()
+        with t.lock:
+            _host_fold_locked(t, uid)
+            return _view(t, uid)
+
+    @app.post("/games/api/tables/{game_id}/rabbit")
+    def api_rabbit(game_id: str):
+        t = _table_for(game_id)
+        uid = _uid()
+        with t.lock:
+            _rabbit_locked(t, uid)
+            return _view(t, uid)
+
+    @app.post("/games/api/tables/{game_id}/auto_stack")
+    def api_auto_stack(game_id: str, body: dict = Body({})):
+        t = _table_for(game_id)
+        uid = _uid()
+        with t.lock:
+            _auto_stack_host_locked(t, uid, body or {})
+            return _view(t, uid)
+
+    @app.post("/games/api/tables/{game_id}/auto_stack_self")
+    def api_auto_stack_self(game_id: str, body: dict = Body({})):
+        t = _table_for(game_id)
+        uid = _uid()
+        cents = _parse_cents(body or {}, "cents", 0)
+        with t.lock:
+            _auto_stack_self_locked(t, uid, cents)
+            return _view(t, uid)
+
+    @app.post("/games/api/tables/{game_id}/chat")
+    def api_chat(game_id: str, body: dict = Body({})):
+        t = _table_for(game_id)
+        uid = _uid()
+        user = pub._user_by_id(uid)
+        if user is None:
+            raise HTTPException(status_code=404, detail="Not Found")
+        with t.lock:
+            _chat_add(t, user, body.get("text", ""))
+            return _view(t, uid)
+
+    @app.post("/games/api/tables/{game_id}/close")
+    def api_close(game_id: str):
+        t = _table_for(game_id)
+        uid = _uid()
+        with t.lock:
+            _close_locked(t, uid)
+            return _view(t, uid)
+
+    _start_watchdog()
+    logger.info("homegame routes installed")

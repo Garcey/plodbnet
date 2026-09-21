@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en" data-felt="emerald" data-cards="bold" data-deck="4c" data-back="blue" data-anim="full">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#05080d" />
+    <title>Home games</title>
+    <link rel="icon" type="image/svg+xml" href="/static/brand/wrap-app-icon-dark.svg" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/static/brand/favicon-32.png" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400..800&family=Geist+Mono:wght@400..700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/games/static/games.css" />
+  </head>
+  <body>
+    <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+      <symbol id="i-back" viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7" /></symbol>
+      <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 14a4 4 0 0 0 5.7 0l3-3A4 4 0 0 0 13 5.3l-1 1" /><path d="M14 10a4 4 0 0 0-5.7 0l-3 3A4 4 0 0 0 11 18.7l1-1" /></symbol>
+      <symbol id="i-vol" viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9H4z" /><path d="M16.5 9a4.2 4.2 0 0 1 0 6" /><path d="M19 6.5a8 8 0 0 1 0 11" /></symbol>
+      <symbol id="i-mute" viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9H4z" /><path d="M17 9.5l5 5M22 9.5l-5 5" /></symbol>
+      <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 6h9M19 6h1M4 12h3M13 12h7M4 18h11M21 18h-1" /><circle cx="16" cy="6" r="2.2" /><circle cx="10" cy="12" r="2.2" /><circle cx="18" cy="18" r="2.2" /></symbol>
+      <symbol id="i-crown" viewBox="0 0 24 24"><path d="M4 18h16l1.2-10-5.2 4-4-7-4 7-5.2-4L4 18z" /></symbol>
+      <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4" /><path d="M4 21a8 8 0 0 1 16 0" /></symbol>
+      <symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.5" /><path d="M2.5 20a6.5 6.5 0 0 1 13 0" /><path d="M16 4.8a3.5 3.5 0 0 1 0 6.4M18 14.5a6.5 6.5 0 0 1 3.5 5.5" /></symbol>
+      <symbol id="i-chat" viewBox="0 0 24 24"><path d="M4 5h16v11H9.5L4 20V5z" /></symbol>
+      <symbol id="i-list" viewBox="0 0 24 24"><path d="M9 6h11M9 12h11M9 18h11" /><path d="M4.5 6h.01M4.5 12h.01M4.5 18h.01" stroke-width="2.6" /></symbol>
+      <symbol id="i-wallet" viewBox="0 0 24 24"><path d="M3 7.5h15.5A2.5 2.5 0 0 1 21 10v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7.5z" /><path d="M3 7.5L15 4v3.5" /><path d="M17 14h.01" stroke-width="2.6" /></symbol>
+      <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3.2 2" /></symbol>
+      <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" /></symbol>
+      <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></symbol>
+      <symbol id="i-pluscircle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" /><path d="M12 8v8M8 12h8" /></symbol>
+      <symbol id="i-pause" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14" /></symbol>
+      <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 5l12 7-12 7V5z" /></symbol>
+      <symbol id="i-door" viewBox="0 0 24 24"><path d="M15 4h4v16h-4" /><path d="M11 12H3m4-4l-4 4 4 4" /></symbol>
+      <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.8-7 10-7 10 7 10 7-3.8 7-10 7S2 12 2 12z" /><circle cx="12" cy="12" r="3" /></symbol>
+      <symbol id="i-cards" viewBox="0 0 24 24"><path d="M4 8l8.5-2.2 3.3 12.4L7.3 20.4 4 8z" /><path d="M14 5.5l5.5 1.6-3.2 11" /></symbol>
+      <symbol id="i-copy" viewBox="0 0 24 24"><path d="M9 9h11v11H9z" /><path d="M5 15H4V4h11v1" /></symbol>
+      <symbol id="i-coffee" viewBox="0 0 24 24"><path d="M4 9h13v5a5 5 0 0 1-5 5H9a5 5 0 0 1-5-5V9z" /><path d="M17 11h1.5a2.5 2.5 0 0 1 0 5H17" /><path d="M8 3v2.5M12 3v2.5" /></symbol>
+      <symbol id="i-smile" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" /><path d="M8.3 14.3a4.6 4.6 0 0 0 7.4 0" /><path d="M9 9.7h.01M15 9.7h.01" stroke-width="2.6" /></symbol>
+      <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16" /></symbol>
+      <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 3L5 14h6l-1 7 8-11h-6l1-7z" /></symbol>
+      <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" /><path d="M12 11v6" /><path d="M12 7.6h.01" stroke-width="2.6" /></symbol>
+      <symbol id="i-panel" viewBox="0 0 24 24"><path d="M4 5h16v14H4z" /><path d="M15 5v14" /></symbol>
+      <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7" /></symbol>
+      <symbol id="i-chart" viewBox="0 0 24 24"><path d="M5 19v-8M12 19V5M19 19v-6" /></symbol>
+      <symbol id="i-lock" viewBox="0 0 24 24"><path d="M6 11h12v9H6z" /><path d="M9 11V8a3 3 0 0 1 6 0v3" /></symbol>
+      <symbol id="i-swap" viewBox="0 0 24 24"><path d="M7 8h12l-3-3M17 16H5l3 3" /></symbol>
+      <symbol id="i-send" viewBox="0 0 24 24"><path d="M4 12l16-8-6 16-3-7-7-1z" /></symbol>
+      <symbol id="i-mark" viewBox="0 0 96 96"><path d="M28 12H68Q84 12 84 28V68Q84 84 68 84H28Q12 84 12 68V44Q12 30 26 30H44Q56 30 56 42V46Q56 56 46 56" stroke-width="11" /></symbol>
+    </svg>
+
+    <!-- ===================== LOBBY ===================== -->
+    <div id="lobby" class="view" hidden>
+      <header class="lb-top">
+        <a class="brand" href="/games" id="brand-link">
+          <svg class="ico brand-logo"><use href="#i-mark" /></svg>
+          <span>WrapGTO</span><small>Home games</small>
+        </a>
+        <span class="spacer"></span>
+        <a class="btn ghost sm" href="/">Study &amp; Trainer</a>
+        <span class="userchip" id="userchip"></span>
+        <form class="bar-form" method="post" action="/auth/logout">
+          <button class="btn ghost sm" type="submit">Sign out</button>
+        </form>
+      </header>
+      <main class="lb-main">
+        <section class="lb-hero">
+          <div>
+            <h1>Your private <em>bomb-pot</em> room</h1>
+            <p>PLO5 double-board bomb pots with your friends. Everyone antes, the hand starts on the flop, and the ledger keeps the money straight.</p>
+          </div>
+          <span class="spacer"></span>
+          <div class="lb-actions">
+            <form class="lb-join" id="join-form">
+              <input class="input" id="join-input" placeholder="Paste a table link or code" autocomplete="off" />
+              <button class="btn" type="submit">Join</button>
+            </form>
+            <button class="btn gold lg" id="c-open" type="button"><svg class="ico"><use href="#i-plus" /></svg>Host a table</button>
+          </div>
+        </section>
+        <section class="lb-sec" id="lb-mine-sec" hidden>
+          <div class="lb-sec-h"><h2>Your tables</h2><span>Hosting or seated</span></div>
+          <div class="lb-grid" id="lb-mine"></div>
+        </section>
+        <section class="lb-sec">
+          <div class="lb-sec-h"><h2>Open tables</h2><span id="lb-open-count"></span></div>
+          <div class="lb-grid" id="lb-open"></div>
+        </section>
+        <section class="lb-sec" id="lb-sess-sec" hidden>
+          <div class="lb-sec-h"><h2>Recent sessions</h2><span>Finished tables you played</span></div>
+          <div id="lb-sessions"></div>
+        </section>
+      </main>
+    </div>
+
+    <!-- ===================== TABLE ===================== -->
+    <div id="table-view" class="view" hidden>
+      <header id="tbar">
+        <button class="icon-btn" id="tb-back" title="Back to lobby" aria-label="Back to lobby"><svg class="ico lg"><use href="#i-back" /></svg></button>
+        <div class="ttl">
+          <span id="table-title">Table</span>
+          <span id="table-sub"></span>
+        </div>
+        <div class="pills">
+          <span class="pill" id="tb-status">Paused</span>
+          <span class="pill opt num" id="tb-hand"></span>
+          <span class="pill host opt" id="tb-hostpill" hidden><svg class="ico sm"><use href="#i-crown" /></svg>Host</span>
+          <button class="pill opt" id="tb-watch" type="button" title="Who is watching" hidden><svg class="ico sm"><use href="#i-eye" /></svg><span id="tb-watch-n">0</span></button>
+        </div>
+        <span class="spacer"></span>
+        <span class="conn" id="conn" title="Connection"><i></i><span>Live</span></span>
+        <button class="btn sm" id="tb-invite" title="Copy the invite link"><svg class="ico sm"><use href="#i-link" /></svg><span>Invite</span></button>
+        <button class="btn sm gold" id="tb-manage" hidden title="Manage table"><svg class="ico sm"><use href="#i-crown" /></svg><span>Manage</span><i id="tb-req" hidden>0</i></button>
+        <button class="icon-btn" id="tb-info" title="Table info" aria-label="Table info"><svg class="ico"><use href="#i-info" /></svg></button>
+        <button class="icon-btn" id="tb-sound" title="Sound" aria-label="Sound"><svg class="ico"><use href="#i-vol" /></svg></button>
+        <button class="icon-btn" id="tb-prefs" title="Preferences" aria-label="Preferences"><svg class="ico"><use href="#i-sliders" /></svg></button>
+        <button class="icon-btn" id="tb-more" title="More" aria-label="More"><svg class="ico"><use href="#i-menu" /></svg></button>
+        <button class="icon-btn" id="tb-seat" title="My seat" aria-label="My seat"><svg class="ico"><use href="#i-user" /></svg></button>
+        <button class="icon-btn on" id="tb-rail" title="Chat, log and ledger" aria-label="Toggle side panel"><svg class="ico"><use href="#i-panel" /></svg><i class="dot" id="rail-dot" hidden></i></button>
+      </header>
+
+      <div id="tmain">
+        <div id="stage-wrap">
+          <div id="stage-box">
+            <div id="stage">
+              <div id="felt"><svg class="ico felt-mark"><use href="#i-mark" /></svg></div>
+              <div id="center">
+                <div id="award-caption" class="award-caption" hidden></div>
+                <div id="pot"><span class="chips" id="pot-chips"></span><small>Pot</small><span id="pot-amt">$0.00</span></div>
+                <div id="pot-total" hidden></div>
+                <div id="boards">
+                  <div class="board" id="board-a"><span class="board-tag">1</span></div>
+                  <div class="board" id="board-b"><span class="board-tag">2</span></div>
+                </div>
+                <div id="street-tag"></div>
+              </div>
+              <div id="seats"></div>
+              <div id="bets"></div>
+              <div id="dealer-btn" hidden>D</div>
+              <div id="hero-zone" hidden>
+                <div id="hero-hole"></div>
+              </div>
+              <div id="banner" hidden></div>
+              <div id="fx"></div>
+            </div>
+          </div>
+          <div id="hero-hand-labels"></div>
+          <div id="dock">
+            <div class="dock-side" id="dock-left"></div>
+            <div id="actbar"></div>
+            <div class="dock-side right" id="dock-right"></div>
+          </div>
+        </div>
+
+        <aside id="rail">
+          <div id="rail-tabs">
+            <button data-tab="chat" class="on"><svg class="ico sm"><use href="#i-chat" /></svg>Chat<span class="badge" id="chat-badge" hidden></span></button>
+            <button data-tab="log"><svg class="ico sm"><use href="#i-list" /></svg>Hand</button>
+            <button data-tab="ledger"><svg class="ico sm"><use href="#i-wallet" /></svg>Ledger</button>
+            <button data-tab="hands"><svg class="ico sm"><use href="#i-clock" /></svg>History</button>
+          </div>
+          <div class="rpanel" id="panel-chat">
+            <div class="rscroll"><div id="chat-log"></div></div>
+            <div class="emote-tray" id="emote-tray" hidden></div>
+            <form id="chat-form" autocomplete="off">
+              <button class="icon-btn" type="button" id="emote-btn" title="Reactions" aria-label="Reactions"><svg class="ico"><use href="#i-smile" /></svg></button>
+              <input class="input" id="chat-input" maxlength="240" placeholder="Message the table" />
+              <button class="icon-btn on" type="submit" title="Send" aria-label="Send"><svg class="ico"><use href="#i-send" /></svg></button>
+            </form>
+          </div>
+          <div class="rpanel" id="panel-log" hidden><div class="rscroll" id="log-body"></div></div>
+          <div class="rpanel" id="panel-ledger" hidden><div class="rscroll" id="ledger-body"></div></div>
+          <div class="rpanel" id="panel-hands" hidden><div class="rscroll" id="hands-body"></div></div>
+        </aside>
+      </div>
+    </div>
+
+    <div id="drawer-root"></div>
+    <div id="modal-root"></div>
+    <div id="toast-root"></div>
+    <div id="err" hidden></div>
+
+    <script src="/games/static/games.sound.js"></script>
+    <script src="/games/static/games.table.js"></script>
+    <script src="/games/static/games.ui.js"></script>
+    <script src="/games/static/games.play.js"></script>
+    <script src="/games/static/games.js"></script>
+  </body>
+</html>
