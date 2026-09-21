@@ -612,6 +612,14 @@ Two drivers in `python/plo5bp/rollout.py`:
   982-989 are invariant to card order / table rotation and stable across
   toolchains. Study placeholder deals use the same mixer.
 
+- Explicit-deck deal (`GameState::new_hand_from_deck`, `reset_with_deck`,
+  `BombPotEnv.reset_with_deck`): the seeded deal IS this with
+  `Deck::new_shuffled(seed)` — bit-identical observations and payouts, pinned
+  by `tests/python/test_reset_with_deck.py` and a Rust test. Deal order is a
+  public contract the home games' verifiable shuffle depends on: `hole_count`
+  cards per seat INDEX (dealt in or not), seat 0 first, then full board A,
+  then full board B. Do not reorder it.
+
 ## Config surface
 
 `GameConfig(num_seats, starting_stack, ante, bb)`. Default is 6-seat,
@@ -1111,6 +1119,104 @@ Premium tables pass (2026-09-21 — `tests/python/test_homegame_premium.py`):
   side, hero plate beside the hero cards, no seats along the bottom edge) plus
   the `(max-height: 480px) and (orientation: landscape)` block in `games.css`
   that floats the dock over the felt's bottom corners — keep the two in step.
+- **Tracking (2026-09-23 — `tests/python/test_homegame_tracking.py`)**: every
+  hand record (`homegame_hands.summary`) is REPLAYABLE (`actions` carry the
+  engine action id + chips + `auto` = the clock decided; seats carry
+  `start_chips`; `ante_chips`, `flows`, `grades`). The client replayer is a
+  click-through (`openHand` in `games.ui.js`: position k = k actions played;
+  `replayState` rebuilds stacks / bets / pot / boards) and `openInStudy` copies
+  any position into Study by driving Study's own API (`/reset`, `/config`,
+  `/seats` with `stacks_are_starting`, `/cards`, `/action` x k; hero = the
+  actor when their cards are visible to the viewer; Study caps at 6 players).
+  **Who paid whom** = `runout.money_flows`: per pot LAYER, each contributor's
+  chips go to that layer's winners in proportion to what each took (self-flows
+  dropped) — fold-outs, scoops, chops, quartering, side pots and dead money all
+  follow; checked against the engine's payouts in a randomized sweep. Stored net
+  per hand in `homegame_flows` (user ids, chips). **AI grading**: a background
+  thread (`_grader_loop`, `PLO5BP_HOMEGAME_GRADING`, OFF in the test session)
+  replays each finished hand in a FULL-observation env from an in-memory job
+  (deal seed + exact engine inputs — the seed is NEVER persisted or served) and
+  scores every PLAYER decision with the Trainer's `compute_node_distribution` +
+  `score_move(_v2)` from the actor's own seat; clock/away/host actions are not
+  graded. Grades land in the record and as `acc_sum`/`acc_n` in
+  `homegame_hand_results` (session + lifetime accuracy are SQL sums). Table
+  setting `show_grades` (default on) = marks on everyone's actions; off = own
+  actions only (a mark on a mucked hand leaks a little about it). Lifetime:
+  `GET /games/api/my/hands` (sort time|pot|net|accuracy, filter by table,
+  paged) and `/games/api/my/stats` (net, accuracy, sessions, head-to-head in
+  cents across tables); neither serves a hand its table is still revealing.
+  `openInStudy` opens Study in a NEW TAB: the tab is opened synchronously
+  inside the click (after the awaits a browser blocks it as a pop-up) and
+  pointed at `/?mode=study` once the spot is loaded; blocked pop-ups fall back
+  to a modal with a plain `target=_blank` link — the replayer never navigates.
+- **The club (2026-09-24)**: home games are a private circle, so stats are OPEN
+  inside it — `GET /games/api/community` (every player's hands / net / accuracy,
+  the pairwise `pairs` = "`to` is up `cents` on `from`", all sessions),
+  `/games/api/players/{id}/stats|hands` (= the `my/*` pair for any player;
+  `_my_hands(viewer, …, player_id=)`). What stays PRIVATE is unchanged: hole
+  cards follow the table's reveal rule for the VIEWER (own + tabled/shown) even
+  when browsing someone else's history, and no email is ever served. The lobby's
+  Players section (`renderClub` in `games.ui.js`) = podium of the top three by
+  accuracy (needs `MIN_RANKED` = 20 graded decisions, else "provisional"), a
+  card per player, the head-to-head matrix (`openMatrix`) and All sessions.
+  **Excluded sessions**: `homegames.excluded` is a SOFT, reversible flag set by
+  the SITE ADMIN only (`POST …/exclude {on}`, not the host — a host must not be
+  able to erase a losing night); an open table is closed first (cash-out), a
+  busy hand is a 400. Every stats query joins `homegames` and filters
+  `excluded=0` (`_my_hands`, `_my_stats`, `_community`, lobby sessions) — a new
+  aggregate MUST do the same. Nothing is deleted; the table still opens by link.
+- **Bet spots (`placeBetSpots` in `games.table.js`)**: a bet sits on the rail's
+  inward NORMAL at its seat (`railNormal`: flat edges straight across, round
+  ends toward their own circle's centre), just clear of the seat's own box —
+  NOT "toward the table centre" (that put a corner seat's chips, and the
+  hero's, in front of the neighbour on a wide table). Blocked spots swing round
+  the seat 8° at a time (toward the centre first) and take the first place free
+  of the pot row, boards, hero cards, other seats and already-placed bets; dead
+  ahead wins whenever it physically fits. The hero's bet goes out from the hero's
+  CARDS in every layout. `layout()` slides the pot+boards block (bounded) so one
+  bet's height of felt stays clear under the far seat and over the hero's cards;
+  desktop compacts the block (`.board` 5.3u, `#hero-hole` 6.3u = `g.heroCw` —
+  keep JS and CSS in step). The street TOTAL and the street tag live on the
+  pot's ROW (`#pot-row` grid flanks), not on a line of their own: that line
+  appeared with the first bet and shoved both boards down. Sizes that have font
+  floors are modelled (`seatBottom`) or measured (`pillSize`) per layout — a
+  pure `u` constant is wrong on a small phone. The measuring harness used to
+  tune this is `.claude/tools/games_preview/measure_bets.js`.
+- **Verified shuffle (2026-09-25 — `ui/fairdeal.py` is the SPEC, `static/games.fair.js`
+  the player's half; `tests/python/test_homegame_fair*.py`)**: the operator also
+  PLAYS in these games, so the threat model is "server + one player together".
+  Per hand: the server SEALS a shuffled deck (52 salted per-position SHA-256
+  commitments -> `seal`) before anyone contributes; each seated browser commits
+  to a 32-byte random number bound to `hand_id|seal|seat`; at the deal the list
+  is LOCKED (dealt-in, PRESENT devices only) and published; a browser reveals
+  ONLY after it has seen its own commitment in that list under the seal it
+  committed to; `cut` = hash of the reveals drives a Fisher-Yates permutation
+  (SHA-256 counter stream, rejection sampling) and the engine deals
+  `F[slot] = D[perm[slot]]`. Every card a viewer is shown carries
+  `{slot, pos, salt}` in `fair.hand.open` — built FROM the viewer's visible
+  cards, so it can never open a card the reveal rule hides; mucked hands stay
+  sealed. Guarantee: if YOUR device contributed, the deal was uniform and
+  unaltered whatever everybody else did. It does NOT stop the operator from
+  looking at cards server-side (only mental poker can), and deck COMPOSITION is
+  proven only for opened cards — say so, never oversell it. Invariants:
+  the slot map is public and mask-independent (seat s hole k = `5s+k` for EVERY
+  seat index, board A `5n..`, board B `5n+5..`; pinned in Rust + Python tests);
+  a committed device that does not reveal within `FAIR_REVEAL_S` VOIDS the
+  attempt — new deck, new seal, the absentee barred for that hand, ALWAYS
+  announced (`fair` event + `voids` in the transcript + `void_counts`): a
+  withheld number is a visible re-roll, never a silent one (two in a row =
+  `FAIR_PENALTY_HANDS` out of the shuffle). A sealed deck whose cut may be known
+  is never dealt later (pause / close / resize void it). Tables nobody's browser
+  takes part in (scripts, tests, bots) deal AT ONCE, exactly as before: the wait
+  exists only for users in `fair_capable`. Transcripts persist compactly in
+  `homegame_fair` (key + deck; commitments are recomputed) — the key and deck
+  are secrets at rest, like the hole cards already in `homegame_hands`. The
+  grader replays `hand_deck` (memory only), not a seed. Kill switch
+  `PLO5BP_HOMEGAME_FAIR=0`; an engine built before `reset_with_deck` turns
+  `FAIR_ON` off by itself (old dealing, client shows "unverified") — so a
+  production ship MUST rebuild the engine (`scripts/deploy_prod.sh`). The spec
+  is pinned by a known-answer permutation and a Node run of the browser verifier
+  against Python transcripts; changing either side is a PUBLIC spec change.
 - Preview harness (gitignored): `.claude/tools/games_preview/` — launch
   entry `games_preview` (public build + dev login + temp DB on :8772) and
   `bot.py` (scripted guests).

@@ -168,6 +168,7 @@
       if (s.is_host) { msg = s.eligible_count >= 2 ? "<b>Everyone's ready.</b>" : "Waiting for a second player — send the invite link."; btns.push(s.eligible_count >= 2 ? ["start", "Start game", "gold"] : ["invite", "Copy invite link", ""]); }
       else msg = "Waiting for the host to start the game.";
     } else if (s.eligible_count < 2) msg = "Waiting for another player with chips…";
+    else if (s.fair && s.fair.next && s.fair.next.pending) msg = s.fair.next.attempt > 1 ? "<b>Reshuffling…</b> a device did not confirm the last shuffle." : "<b>Shuffling…</b> the players' devices are cutting the deck.";
     else if (s.next_deal_in_secs != null) msg = `Next hand in <b class="num" id="deal-count">${Math.max(1, Math.ceil(s.next_deal_in_secs))}s</b>`;
     else if (s.can_deal) { msg = "Ready for the next hand."; btns.push(["deal", "Deal next hand", "primary"]); }
     if (s.can_show) btns.push(["show", "Show my cards", ""]);

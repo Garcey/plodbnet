@@ -28,6 +28,22 @@ impl GameState {
         button: usize,
         in_hand_mask: Option<Vec<bool>>,
     ) -> Self {
+        Self::new_hand_from_deck(config, Deck::new_shuffled(seed), button, in_hand_mask)
+    }
+
+    /// [`Self::new_hand_with_mask`] from an EXPLICIT deck order instead of a
+    /// seed (the home games' verifiable shuffle: the deck is sealed, re-permuted
+    /// by the players' devices and dealt exactly as it lies). The deal order is
+    /// the same public contract: `hole_count` cards per seat index — EVERY
+    /// seat index, dealt in or not, so a card's slot never depends on who sat
+    /// out — seat 0 first, then full board A, then full board B.
+    /// `new_hand_with_mask(seed)` is exactly this with `Deck::new_shuffled(seed)`.
+    pub fn new_hand_from_deck(
+        config: GameConfig,
+        mut deck: Deck,
+        button: usize,
+        in_hand_mask: Option<Vec<bool>>,
+    ) -> Self {
         let n = config.num_seats;
         assert!(n >= 2, "need at least 2 seats");
         // Named failure instead of the deck's index-out-of-bounds (PLO5 at
@@ -47,7 +63,6 @@ impl GameState {
             );
         }
 
-        let mut deck = Deck::new_shuffled(seed);
         let hole_count = config.variant.hole_count();
         let num_boards = config.variant.num_boards();
 
@@ -2256,6 +2271,36 @@ mod tests {
 
     fn default_config() -> GameConfig {
         GameConfig::default_6max_20bb()
+    }
+
+    /// The verifiable-shuffle entry point is the SAME deal as the seeded one:
+    /// dealing from `Deck::new_shuffled(seed)`'s order reproduces the seeded
+    /// hand card for card, and a card's slot is `5*seat + k` / `5n + m` /
+    /// `5n + 5 + m` whoever is sitting out.
+    #[test]
+    fn hand_from_explicit_deck_matches_the_seeded_deal() {
+        for seed in [0u64, 7, 2026, u64::MAX >> 1] {
+            let mask = Some(vec![true, false, true, true, false, true]);
+            let a = GameState::new_hand_with_mask(default_config(), seed, 2, mask.clone());
+            let order = Deck::new_shuffled(seed).order();
+            let deck = Deck::from_order(&order).unwrap();
+            let b = GameState::new_hand_from_deck(default_config(), deck, 2, mask);
+            assert_eq!(a.hole_cards, b.hole_cards);
+            assert_eq!(a.full_board_a, b.full_board_a);
+            assert_eq!(a.full_board_b, b.full_board_b);
+            assert_eq!(a.stacks, b.stacks);
+            assert_eq!(a.actor, b.actor);
+            let n = a.config.num_seats;
+            for s in 0..n {
+                for k in 0..5 {
+                    assert_eq!(b.hole_cards[s][k].index(), order[5 * s + k]);
+                }
+            }
+            for m in 0..5 {
+                assert_eq!(b.full_board_a[m].index(), order[5 * n + m]);
+                assert_eq!(b.full_board_b[m].index(), order[5 * n + 5 + m]);
+            }
+        }
     }
 
     #[test]

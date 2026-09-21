@@ -312,7 +312,7 @@ def test_games_assets_are_hidden(players):
     page = a.get("/games")
     assert page.status_code == 200
     # 2026-09-21: the client is split into modules, every one of them gated.
-    modules = ("games.sound.js", "games.table.js", "games.ui.js", "games.play.js", "games.js")
+    modules = ("games.sound.js", "games.table.js", "games.ui.js", "games.play.js", "games.fair.js", "games.js")
     for name in modules:
         assert f"/games/static/{name}" in page.text
         assert a.get(f"/games/static/{name}").status_code == 200

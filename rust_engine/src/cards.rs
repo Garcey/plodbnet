@@ -95,6 +95,38 @@ impl Deck {
         Deck { cards, next: 0 }
     }
 
+    /// A deck in a CALLER-SUPPLIED order (index 0 is dealt first): the home
+    /// games' verifiable shuffle seals a deck, lets the players' devices
+    /// re-permute it, and deals exactly that order. Must be a permutation of
+    /// all 52 cards — anything else is an error, never a panic.
+    pub fn from_order(order: &[u8]) -> Result<Self, String> {
+        if order.len() != DECK_SIZE {
+            return Err(format!("deck must list {DECK_SIZE} cards, got {}", order.len()));
+        }
+        let mut seen = [false; DECK_SIZE];
+        let mut cards = [Card(0); DECK_SIZE];
+        for (slot, &i) in order.iter().enumerate() {
+            if (i as usize) >= DECK_SIZE {
+                return Err(format!("card index {i} out of range at position {slot}"));
+            }
+            if seen[i as usize] {
+                return Err(format!("card index {i} appears twice in the deck"));
+            }
+            seen[i as usize] = true;
+            cards[slot] = Card(i);
+        }
+        Ok(Deck { cards, next: 0 })
+    }
+
+    /// The full order, first-dealt card first (tests / parity checks).
+    pub fn order(&self) -> [u8; DECK_SIZE] {
+        let mut out = [0u8; DECK_SIZE];
+        for (o, c) in out.iter_mut().zip(self.cards.iter()) {
+            *o = c.index();
+        }
+        out
+    }
+
     /// Deal one card. Panics if the deck is exhausted.
     #[inline]
     pub fn deal_one(&mut self) -> Card {
@@ -169,6 +201,23 @@ mod tests {
             seen[i] = true;
         }
         assert!(seen.iter().all(|&x| x));
+    }
+
+    #[test]
+    fn from_order_round_trips_and_rejects_bad_decks() {
+        let shuffled = Deck::new_shuffled(11);
+        let order = shuffled.order();
+        let mut d = Deck::from_order(&order).expect("a real permutation");
+        assert_eq!(d.order(), order);
+        assert_eq!(d.deal_one().index(), order[0]);
+        assert_eq!(d.deal_one().index(), order[1]);
+        assert!(Deck::from_order(&order[..51]).is_err(), "51 cards");
+        let mut dup = order;
+        dup[7] = dup[3];
+        assert!(Deck::from_order(&dup).is_err(), "a duplicate card");
+        let mut oob = order;
+        oob[0] = 52;
+        assert!(Deck::from_order(&oob).is_err(), "index out of range");
     }
 
     #[test]

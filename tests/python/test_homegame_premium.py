@@ -144,7 +144,7 @@ def test_create_options_land_in_the_view(cast):
     assert s["settings"] == {
         "deal_delay_secs": 5.0, "time_bank_secs": 30, "min_buyin_cents": 2000,
         "max_buyin_cents": 10000, "listed": False, "allow_rabbit": True,
-        "approve_buyins": False,
+        "approve_buyins": False, "show_grades": True,
     }
     assert s["seats"][0]["bank_left_secs"] == 30.0  # the host is seated with a full bank
 
@@ -223,7 +223,7 @@ def test_settings_survive_a_reload(cast, hg):
     assert s["settings"] == {
         "deal_delay_secs": 7.0, "time_bank_secs": 20, "min_buyin_cents": 500,
         "max_buyin_cents": 90000, "listed": False, "allow_rabbit": False,
-        "approve_buyins": False,
+        "approve_buyins": False, "show_grades": True,
     }
     assert all(x["bank_left_secs"] == 20.0 for x in s["seats"] if not x["empty"])
 
@@ -578,7 +578,7 @@ def test_rabbit_can_be_switched_off(cast):
 def test_new_assets_are_gated(cast, server):
     unsigned = TestClient(server.app)
     for name in ("games.js", "games.table.js", "games.ui.js", "games.play.js",
-                 "games.sound.js", "games.css"):
+                 "games.sound.js", "games.fair.js", "games.css"):
         assert unsigned.get(f"/games/static/{name}").status_code == 404
         assert unsigned.get(f"/static/{name}").status_code == 404
         assert cast["p"][0].get(f"/static/{name}").status_code == 404

@@ -197,6 +197,9 @@ function render(s) {
     G.raiseTouched = false;
   }
   G.state = s;
+  // the verifiable shuffle: this device takes part in cutting the next deck and
+  // checks every card it is shown (games.fair.js)
+  if (HG.fair && HG.fair.onState) HG.fair.onState(s);
   if (G.preAction && !myTurn(s)) {
     // The price moved under an armed "check" / "call $x": it no longer means
     // what the player agreed to.
@@ -463,6 +466,7 @@ async function init() {
   globalThis.addEventListener("popstate", () => { route(); });
   document.addEventListener("visibilitychange", () => { if (!document.hidden && G.gameId) refreshNow(); });
   if (HG.ui) HG.ui.init();
+  if (HG.fair) HG.fair.init();
   await route();
 }
 

@@ -248,6 +248,50 @@ impl PyGameState {
         Ok(())
     }
 
+    /// [`Self::reset`] from an EXPLICIT deck order (52 distinct indices,
+    /// first-dealt first) instead of a seed — the home games' verifiable
+    /// shuffle deals the deck the players' devices helped permute. Same deal
+    /// contract as `reset`: 5 cards per seat index (every index, dealt in or
+    /// not), seat 0 first, then full board A, then full board B.
+    #[pyo3(signature = (deck, button, in_hand_mask=None))]
+    fn reset_with_deck(
+        &mut self,
+        deck: Vec<u8>,
+        button: usize,
+        in_hand_mask: Option<Vec<bool>>,
+    ) -> PyResult<()> {
+        if button >= self.config.num_seats {
+            return Err(PyValueError::new_err("button out of range"));
+        }
+        if let Some(ref m) = in_hand_mask {
+            if m.len() != self.config.num_seats {
+                return Err(PyValueError::new_err(
+                    "in_hand_mask length must equal num_seats",
+                ));
+            }
+            if m.iter().filter(|&&b| b).count() < 2 {
+                return Err(PyValueError::new_err(
+                    "in_hand_mask must include at least 2 seats",
+                ));
+            }
+        }
+        let deck = crate::cards::Deck::from_order(&deck).map_err(PyValueError::new_err)?;
+        self.inner = Some(GameState::new_hand_from_deck(
+            self.config.clone(),
+            deck,
+            button,
+            in_hand_mask,
+        ));
+        Ok(())
+    }
+
+    /// The deck order `reset(seed, ..)` deals from (parity tests: a hand dealt
+    /// from `shuffled_deck(seed)` is bit-identical to one dealt from `seed`).
+    #[staticmethod]
+    fn shuffled_deck(seed: u64) -> Vec<u8> {
+        crate::cards::Deck::new_shuffled(seed).order().to_vec()
+    }
+
     /// Deal a study-mode hand at the flop with user-supplied cards.
     /// Card inputs are raw indices in `0..=51`.
     /// `in_hand_mask` (optional, length `num_seats`) restricts the hand to

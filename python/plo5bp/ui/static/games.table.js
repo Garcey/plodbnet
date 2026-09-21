@@ -113,6 +113,131 @@
     return 2 * (Math.max(W, H) - 2 * r) + 2 * Math.PI * r;
   }
 
+  // Inward normal of the rail at a perimeter point (relative to the table centre):
+  // "straight in front of the player". Flat edges point straight across, the
+  // round ends point at their own circle's centre.
+  function railNormal(px, py, W, H) {
+    if (W >= H) {
+      const r = H / 2, L = W - 2 * r;
+      if (Math.abs(px) <= L / 2) return [0, py > 0 ? -1 : 1];
+      const c = px > 0 ? L / 2 : -L / 2, d = Math.hypot(px - c, py) || 1;
+      return [-(px - c) / d, -py / d];
+    }
+    const r = W / 2, L = H - 2 * r;
+    if (Math.abs(py) <= L / 2) return [px > 0 ? -1 : 1, 0];
+    const c = py > 0 ? L / 2 : -L / 2, d = Math.hypot(px, py - c) || 1;
+    return [-px / d, -(py - c) / d];
+  }
+  const rOver = (a, b, m) => Math.max(0, Math.min(a[2], b[2] + m) - Math.max(a[0], b[0] - m)) * Math.max(0, Math.min(a[3], b[3] + m) - Math.max(a[1], b[1] - m));
+  // A bet pill's real size at this scale (font floors make it relatively bigger
+  // on a small phone), measured once per layout on a throwaway twin.
+  function pillSize(g) {
+    const probe = el("div", "bet on", '<span class="chips"><i class="c-red"></i><i class="c-red"></i></span><span class="amt">$188.50</span>');
+    probe.style.visibility = "hidden";
+    $("bets").appendChild(probe);
+    const r = probe.getBoundingClientRect();
+    probe.remove();
+    return { hw: Math.max(r.width, g.u * 8) / 2, hh: Math.max(r.height, g.u * 2.2) / 2 };
+  }
+  // how far a seat reaches below its anchor: the plate, plus the action badge
+  // ("Bet $6") that hangs under it exactly when a bet is out
+  // (the name + stack lines stop shrinking at their font floors, hence the second term)
+  const seatBottom = (u) => Math.max(u * 7.04, u * 3.81 + 25.8) - u * 0.75 + Math.max(9.5, u * 1.08) * 1.45 + u * 0.36 + 2;
+  const OWN_GAP = 0.25, OBS_GAP = 0.3; // units of air: bet <-> its own seat, bet <-> anything else
+
+  // Where each seat's bet (and the dealer button) goes. A bet belongs in FRONT
+  // of its player: on the rail's normal, just clear of the seat's own box. When
+  // something is in the way — the boards on a narrow phone, the hero's cards,
+  // a neighbour's bet — the spot swings round the seat a few degrees at a time
+  // and takes the first free place, so it always stays nearest its own seat.
+  // (It used to aim at the table CENTRE, which on a wide table put a corner
+  // seat's chips — and the hero's — in front of the player next door.)
+  function placeBetSpots(g, pill) {
+    const u = g.u, n = T.n, sr = $("stage").getBoundingClientRect();
+    const rectOf = (node) => { const r = node.getBoundingClientRect(); return [r.left - sr.left, r.top - sr.top, r.right - sr.left, r.bottom - sr.top]; };
+    const bottom = seatBottom(u);
+    // what a bet must never cover
+    const fixed = [];
+    const pot = rectOf($("pot")), boards = rectOf($("boards"));
+    const potHalf = Math.max((pot[2] - pot[0]) / 2, u * 8);
+    fixed.push([g.cx - potHalf, pot[1], g.cx + potHalf, pot[3]]);
+    fixed.push([g.cx - potHalf - u * 8.4, pot[1], g.cx - potHalf, pot[3]]); // the street total, left of the pot
+    if (!g.portrait && !g.wide) fixed.push([g.cx + potHalf, pot[1], g.cx + potHalf + u * 9, pot[3]]); // the street tag, right of it
+    fixed.push(boards);
+    if (g.portrait) fixed.push([g.cx - u * 5, boards[3] + u * 0.5, g.cx + u * 5, boards[3] + u * 2.6]); // street tag
+    const heroV = T.seated ? T.seats[T.hero] : null;
+    let heroCards = null;
+    if (heroV) {
+      const cw = u * g.heroCw, half = (cw * 4.04) / 2, hx = g.wide ? g.cx - u * 5.5 : g.cx;
+      const top = g.wide ? g.h - u * (1 + g.heroCw * 1.38) : heroV.y - u * (3.5 + g.heroCw * 1.38);
+      heroCards = [hx - half, top, hx + half, top + cw * 1.38];
+      fixed.push(heroCards);
+    }
+    const boxes = T.seats.map((sv) => [sv.x - u * 5.9, sv.y - u * (sv === heroV ? 3 : 5.1), sv.x + u * 5.9, sv.y + bottom]);
+    const inStage = (r) => r[0] >= u * 0.4 && r[1] >= u * 0.4 && r[2] <= g.w - u * 0.4 && r[3] <= g.h - u * 0.4;
+    // distance along (dx, dy) at which a (hw x hh) box is just clear of `own`
+    const reach = (ox, oy, own, dx, dy, half, gap) => Math.min(
+      Math.abs(dx) > 1e-6 ? ((dx > 0 ? own[2] - ox : ox - own[0]) + half.hw + gap) / Math.abs(dx) : Infinity,
+      Math.abs(dy) > 1e-6 ? ((dy > 0 ? own[3] - oy : oy - own[1]) + half.hh + gap) / Math.abs(dy) : Infinity);
+    const placed = [];
+    const order = [];
+    for (let i = 0; i < n; i++) order.push(i);
+    // the hero first (the big hero cards leave the fewest options), then the seat
+    // across the table (it shares the centre line with the pot), then the rest
+    const rank = (i) => { const rel = T.seats[i].rel; return rel === 0 ? 0 : n % 2 === 0 && rel === n / 2 ? 1 : 2 + rel; };
+    order.sort((a, b) => rank(a) - rank(b));
+    for (const i of order) {
+      const sv = T.seats[i];
+      // The hero's bet goes out from the hero's CARDS. Upright and desktop they sit
+      // over the hero's plate (one box); on a phone on its side they sit beside it.
+      const bigHero = sv === heroV;
+      const own = !bigHero ? boxes[i] : g.wide ? heroCards
+        : [Math.min(boxes[i][0], heroCards[0]), heroCards[1], Math.max(boxes[i][2], heroCards[2]), boxes[i][3]];
+      const ox = bigHero ? (heroCards[0] + heroCards[2]) / 2 : sv.x, oy = bigHero && g.wide ? (heroCards[1] + heroCards[3]) / 2 : sv.y;
+      const others = fixed.filter((r) => !(bigHero && r === heroCards)).concat(boxes.filter((_, k) => k !== i || (bigHero && g.wide)), placed);
+      const base = Math.atan2(sv.normal[1], sv.normal[0]);
+      const lean = Math.sin(Math.atan2(g.cy - sv.y, g.cx - sv.x) - base);
+      const turn = Math.abs(lean) < 0.02 ? (sv.normal[0] > 0 ? -1 : 1) : lean > 0 ? 1 : -1; // toward the table centre first (dead ahead: up-screen)
+      const cands = [];
+      for (let a = 0; a <= 96; a += 8) for (const sgn of a ? [turn, -turn] : [1]) for (const extra of [0, 1.6, 3.2]) {
+        const th = base + (sgn * a * Math.PI) / 180, dx = Math.cos(th), dy = Math.sin(th);
+        const r = reach(ox, oy, own, dx, dy, pill, u * OWN_GAP) + extra * u;
+        cands.push({ cost: a + extra * 5 + (sgn === turn ? 0 : 0.5), x: ox + dx * r, y: oy + dy * r });
+      }
+      cands.sort((p, q) => p.cost - q.cost);
+      let best = cands[0], bestOver = Infinity;
+      for (const c of cands) {
+        const r = [c.x - pill.hw, c.y - pill.hh, c.x + pill.hw, c.y + pill.hh];
+        let over = inStage(r) ? 0 : 1e6;
+        // (dead ahead wins whenever it fits at all; only a swing insists on the full air gap)
+        for (const o of others) over += rOver(r, o, u * (c.cost === 0 ? 0.06 : OBS_GAP));
+        if (over < bestOver) { bestOver = over; best = c; }
+        if (over === 0) break;
+      }
+      sv.bx = best.x; sv.by = best.y;
+      placed.push([best.x - pill.hw, best.y - pill.hh, best.x + pill.hw, best.y + pill.hh]);
+    }
+    // dealer button: beside the seat, on whichever side of its bet is free
+    const disc = { hw: u * 1.35, hh: u * 1.35 };
+    for (let i = 0; i < n; i++) {
+      const sv = T.seats[i];
+      const others = fixed.concat(boxes.filter((_, k) => k !== i), placed);
+      // (the hero's bet leaves from the hero's CARDS — the button stays by the hero's plate)
+      const ang = sv === heroV ? Math.atan2(sv.normal[1], sv.normal[0]) : Math.atan2(sv.by - sv.y, sv.bx - sv.x);
+      let pick = [sv.x, sv.y], pickOver = Infinity;
+      for (const off of sv === heroV || (n % 2 === 0 && sv.rel === n / 2) ? [-90, 90, -66, 66, -112, 112] : [48, -48, 66, -66, 90, -90, 112, -112]) {
+        const th = ang + (off * Math.PI) / 180, dx = Math.cos(th), dy = Math.sin(th);
+        const r = reach(sv.x, sv.y, boxes[i], dx, dy, disc, u * 0.2), x = sv.x + dx * r, y = sv.y + dy * r;
+        const rc = [x - disc.hw, y - disc.hh, x + disc.hw, y + disc.hh];
+        let over = inStage(rc) ? 0 : 1e6;
+        for (const o of others) over += rOver(rc, o, u * 0.2);
+        if (over < pickOver) { pickOver = over; pick = [x, y]; }
+        if (over === 0) break;
+      }
+      sv.dx = pick[0]; sv.dy = pick[1];
+    }
+  }
+
   function computeGeom() {
     const box = $("stage-box").getBoundingClientRect();
     const bw = Math.max(240, box.width), bh = Math.max(200, box.height);
@@ -138,7 +263,9 @@
     ins.t = Math.max(ins.t, (u * 9.3) / h);
     if (wide) { ins.t = (u * 7) / h; ins.b = (u * 3) / h; ins.l = ins.r = 0.07; }
     const fx = w * ins.l, fy = h * ins.t, fw = w * (1 - ins.l - ins.r), fh = h * (1 - ins.t - ins.b);
-    return { w, h, u, portrait, wide, fx, fy, fw, fh, cx: fx + fw / 2, cy: fy + fh / 2 };
+    // hero card width in units — keep in step with #hero-hole in games.css
+    const heroCw = wide ? 6 : portrait ? 6.6 : 6.3;
+    return { w, h, u, portrait, wide, heroCw, fx, fy, fw, fh, cx: fx + fw / 2, cy: fy + fh / 2 };
   }
 
   function layout() {
@@ -152,12 +279,26 @@
     stage.classList.toggle("wide", g.wide);
     const felt = $("felt");
     felt.style.inset = `${(g.fy / g.h) * 100}% ${(1 - (g.fx + g.fw) / g.w) * 100}% ${(1 - (g.fy + g.fh) / g.h) * 100}% ${(g.fx / g.w) * 100}%`;
-    $("center").style.top = ((g.fy + g.fh * (g.portrait ? 0.43 : g.wide ? 0.47 : 0.465)) / g.h) * 100 + "%";
-    $("banner").style.top = $("center").style.top;
     const n = T.n;
-    if (!n) return;
     const pad = g.u * 0.4;
     const W = g.fw + 2 * pad, H = g.fh + 2 * pad;
+    // The pot + boards block keeps a bet's height of felt clear on both sides
+    // of it: under the seat across the table, and (seated) over the hero's
+    // cards — so both of those bets sit dead ahead of their player.
+    const pill = pillSize(g);
+    let centerY = g.fy + g.fh * (g.portrait ? 0.43 : g.wide ? 0.47 : 0.465);
+    if (n) {
+      const ch = $("center").offsetHeight || g.u * 21.5;
+      const betRoom = 2 * pill.hh + g.u * (OWN_GAP + OBS_GAP);
+      // (a phone on its side seats every opponent along the top, whatever the count)
+      const lo = (n % 2 === 0 || g.wide ? g.cy - H / 2 + seatBottom(g.u) + betRoom : g.fy + g.u * 2) + ch / 2;
+      const cardsTop = g.wide ? g.h - g.u * (1 + g.heroCw * 1.38) : g.cy + H / 2 - g.u * (3.5 + g.heroCw * 1.38);
+      const hi = (T.seated ? cardsTop - betRoom : g.fy + g.fh - g.u * 2) - ch / 2;
+      centerY = lo <= hi ? Math.max(lo, Math.min(hi, centerY)) : (lo + hi) / 2;
+    }
+    $("center").style.top = (centerY / g.h) * 100 + "%";
+    $("banner").style.top = $("center").style.top;
+    if (!n) return;
     const P = perimeter(W, H);
     for (let i = 0; i < n; i++) {
       const rel = (i - T.hero + n) % n;
@@ -173,35 +314,7 @@
       sv.x = x; sv.y = y; sv.rel = rel;
       sv.el.style.left = (x / g.w) * 100 + "%";
       sv.el.style.top = (y / g.h) * 100 + "%";
-      // bet spot: toward the centre, clear of the pot / boards / hero cards
-      const dx = g.cx - x, dy = g.cy - y;
-      const dist = Math.hypot(dx, dy) || 1;
-      // far enough along the line to the centre to clear this seat's own box
-      // (fan above the avatar, plate + badge below it, half a pill of margin)
-      const ux = dx / dist, uy = dy / dist;
-      const rx = Math.abs(ux) > 0.05 ? 10.4 / Math.abs(ux) : 99;
-      const ry = Math.abs(uy) > 0.05 ? (uy > 0 ? 10.3 : 7.4) / Math.abs(uy) : 99;
-      const r = Math.max(9, Math.min(16, Math.min(rx, ry)));
-      let bx = x + ux * g.u * r, by = y + uy * g.u * r;
-      const central = Math.abs(dx) < g.u * 9;
-      sv.central = central;
-      if (central && dy > 0) { bx = g.cx; by = y + g.u * 9.6; } // straight under the top seat's badge, above the pot
-      if (central && dy < 0) { bx = g.cx + g.u * (g.portrait ? 17.5 : 20.5); by = y - g.u * 8; }
-      if (g.wide) {
-        const potY = g.fy + g.fh * 0.47 - g.u * 4;
-        if (rel === 0) { bx = g.cx - g.u * 22; by = g.h - g.u * 12.6; }
-        else if (central) { bx = g.cx + g.u * 13; by = potY; }
-      }
-      sv.bx = bx; sv.by = by;
-      // dealer button: beside the bet line; next to the avatar for the seats
-      // on the centre line (the hero's cards / the pot sit on that line)
-      if (g.wide && rel === 0) { sv.dx = x - g.u * 7.6; sv.dy = y + g.u * 0.4; }
-      else if (central) { sv.dx = x + (dy > 0 ? 8.2 : -8.2) * g.u; sv.dy = y + (dy > 0 ? 0.6 : -0.6) * g.u; }
-      else {
-        const ang = Math.atan2(dy, dx) + 0.5;
-        sv.dx = x + Math.cos(ang) * g.u * 10.4;
-        sv.dy = y + Math.sin(ang) * g.u * 10.4;
-      }
+      sv.normal = g.wide && rel === 0 ? [0, -1] : railNormal(px, py, W, H);
       // opened (face-up) cards sit above the avatar; keep the row on the stage
       const half = g.u * 7.2;
       let shift = 0;
@@ -210,13 +323,7 @@
       sv.openShift = shift;
       placeCards(sv);
     }
-    // two bet spots must never sit on top of each other (corner seat vs the
-    // seat on the centre line): slide the centre one toward the pot
-    for (let i = 0; i < n; i++) for (let k = 0; k < n; k++) {
-      const a = T.seats[i], b = T.seats[k];
-      if (i === k || !a.central || b.central) continue;
-      if (Math.abs(a.bx - b.bx) < g.u * 9.5 && Math.abs(a.by - b.by) < g.u * 3.4) a.by += (a.y < g.cy ? 1 : -1) * g.u * 3.8;
-    }
+    placeBetSpots(g, pill);
     for (let i = 0; i < n; i++) {
       const sv = T.seats[i], b = T.bets[i];
       b.el.style.left = (sv.bx / g.w) * 100 + "%";
@@ -224,7 +331,7 @@
     }
     const heroV = T.seats[T.hero];
     const hz = $("hero-zone");
-    if (heroV) hz.style.top = ((g.wide ? g.h - g.u * (1 + 6 * 1.38) : heroV.y - g.u * (3.5 + 6.6 * 1.38)) / g.h) * 100 + "%";
+    if (heroV) hz.style.top = ((g.wide ? g.h - g.u * (1 + g.heroCw * 1.38) : heroV.y - g.u * (3.5 + g.heroCw * 1.38)) / g.h) * 100 + "%";
     // wide: the hero's cards sit left of centre so the action buttons fit beside them
     hz.style.left = g.wide ? ((g.cx - g.u * 5.5) / g.w) * 100 + "%" : "50%";
     placeDealer(T.lastButton);
@@ -670,9 +777,12 @@
       if (shown > 0) chipStack($("pot-chips"), shown, s); else { $("pot-chips").innerHTML = ""; $("pot-chips").dataset.k = ""; }
     }
     potEl.style.visibility = s.phase === "waiting" || (s.phase === "showdown" && !shown) ? "hidden" : "visible";
-    const totalTxt = inHand && streetSum > 0 ? "Total " + fmt(s.pot_cents, s) : "";
+    // (beside the pot, not under it: a line of its own used to appear with the
+    // first bet and push both boards down)
+    const totalTxt = inHand && streetSum > 0 ? fmt(s.pot_cents, s) : "";
     total.hidden = !totalTxt;
-    if (total.textContent !== totalTxt) total.textContent = totalTxt;
+    const totalAmt = $("pot-total-amt");
+    if (totalAmt.textContent !== totalTxt) totalAmt.textContent = totalTxt;
     if (collected && ctx.animate) play("pot");
     return collected;
   }

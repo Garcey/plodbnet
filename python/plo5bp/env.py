@@ -142,6 +142,34 @@ class BombPotEnv:
         self._reset_seed = int(seed)
         return self._pack_obs()
 
+    def reset_with_deck(
+        self,
+        deck: "list[int] | bytes",
+        button: int,
+        in_hand_mask: list[bool] | None = None,
+    ) -> tuple[np.ndarray, StepInfo]:
+        """:meth:`reset` from an EXPLICIT deck order (52 distinct card indices,
+        first-dealt first) instead of a seed. Same public deal contract: five
+        cards per seat index (every index, dealt in or not), seat 0 first, then
+        full board A, then full board B. The home games deal this way so the
+        deck can be sealed and re-permuted by the players' devices
+        (``plo5bp.ui.fairdeal``). Actual payouts only — there is no seed for the
+        training-time EV runout (``ev_runout_samples`` must be 0)."""
+        if self._ev_runout_samples > 0:
+            raise ValueError("reset_with_deck has no seed for ev_runout_samples > 0")
+        order = [int(c) for c in deck]
+        if in_hand_mask is None:
+            self._rs.reset_with_deck(order, button)
+        else:
+            self._rs.reset_with_deck(order, button, list(in_hand_mask))
+        self._reset_seed = 0
+        return self._pack_obs()
+
+    @staticmethod
+    def shuffled_deck(seed: int) -> list[int]:
+        """The deck order :meth:`reset` deals from for ``seed`` (parity tests)."""
+        return [int(c) for c in _RustGameState.shuffled_deck(int(seed))]
+
     def reset_study(
         self,
         button: int,

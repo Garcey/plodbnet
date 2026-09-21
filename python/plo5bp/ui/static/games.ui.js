@@ -202,9 +202,14 @@
     const sess = data.sessions || [];
     $("lb-sess-sec").hidden = !sess.length;
     $("lb-sessions").innerHTML = sess.map((x) =>
-      `<div class="sess"><div><b>${esc(x.name)}</b><br><small>${d2(x.sb_cents)}/${d2(x.bb_cents)} · ante ${d2(x.ante_cents)}</small></div>` +
+      `<div class="sess" data-id="${esc(x.id)}" role="button" tabindex="0" title="Open this session: final ledger and every hand"><div><b>${esc(x.name)}</b><br><small>${d2(x.sb_cents)}/${d2(x.bb_cents)} · ante ${d2(x.ante_cents)}</small></div>` +
       `<small class="opt">${x.hands} hand${x.hands === 1 ? "" : "s"}</small><small class="opt">in for ${d2(x.buyin_cents)}</small>` +
       `<b class="num ${x.net_cents >= 0 ? "pos" : "neg"}">${x.net_cents >= 0 ? "+" : ""}${d2(x.net_cents)}</b></div>`).join("");
+    wireSessions();
+    loadClub(false); // (rides the lobby poll, at most every 30 s)
+  }
+  function wireSessions() {
+    document.querySelectorAll("#lb-sessions .sess[data-id]").forEach((row) => row.addEventListener("click", () => C().openTable(row.dataset.id, true).catch((e) => toast(e.message, "err"))));
   }
   async function copyInvite(id) {
     const url = `${location.origin}/games/t/${id}`;
@@ -549,8 +554,13 @@
       `<div class="muted" style="font-size:11.5px;margin-top:8px">Stacks settle at the end of each hand. Players who left show what they cashed out.</div>` +
       `<div class="rsec"><h4>Settle up</h4>${pays.length ? pays.map((p) => `<div class="settle-row"><span>${esc(p.from)} pays ${esc(p.to)}</span><b>${d2(p.cents)}</b></div>`).join("") : '<div class="muted">Everyone is even.</div>'}` +
       (pays.length ? `<button class="btn sm block" id="settle-copy" style="margin-top:10px">${icon("i-copy", "sm")}Copy summary</button>` : "") + `</div>` +
-      (stats.length ? `<div class="rsec"><h4>Session stats</h4><table class="ledger"><thead><tr><th>Player</th><th>Hands</th><th>Won</th><th>Best</th></tr></thead><tbody>` +
-        stats.map((r) => `<tr class="${r.is_me ? "me" : ""}"><td>${esc(r.name)}</td><td>${r.hands}</td><td>${r.wins}</td><td>${d2(r.biggest_win_cents)}</td></tr>`).join("") + `</tbody></table></div>` : "");
+      (stats.length ? `<div class="rsec"><h4>Session stats</h4><table class="ledger"><thead><tr><th>Player</th><th>Hands</th><th>Won</th><th>Best</th><th title="Average score of their decisions against the network (0-100)">Acc.</th></tr></thead><tbody>` +
+        stats.map((r) => `<tr class="${r.is_me ? "me" : ""}"><td>${esc(r.name)}</td><td>${r.hands}</td><td>${r.wins}</td><td>${d2(r.biggest_win_cents)}</td><td>${r.accuracy == null ? "–" : Math.round(r.accuracy) + "%"}</td></tr>`).join("") + `</tbody></table>` +
+        `<div class="muted" style="font-size:11.5px;margin-top:6px">Accuracy = how closely each decision matched the network, graded in the background after every hand.</div></div>` : "") +
+      (((U.hands && U.hands.h2h) || []).length ? `<div class="rsec"><h4>Head to head — this table</h4>` + U.hands.h2h.map((x) => `<div class="settle-row"><span>${esc(x.to)} is up on ${esc(x.from)}</span><b>${d2(x.cents)}</b></div>`).join("") + `</div>` : "") +
+      `<button class="btn sm block" id="ledger-myhands" style="margin-top:14px">${icon("i-chart", "sm")}My hands &amp; lifetime stats</button>`;
+    const mh = $("ledger-myhands");
+    if (mh) mh.addEventListener("click", () => openMyHands(""));
     const cp = $("settle-copy");
     if (cp) cp.addEventListener("click", async () => {
       const text = `${s.name} — settle up\n` + led.map((r) => `${r.name}: ${r.net_cents >= 0 ? "+" : ""}${d2(r.net_cents)}`).join("\n") + "\n\n" + pays.map((p) => `${p.from} pays ${p.to} ${d2(p.cents)}`).join("\n");
@@ -564,7 +574,7 @@
     U.handsLoading = true;
     try {
       const data = await C().j(`/games/api/tables/${s.id}/hands?limit=40`);
-      data.statsSig = JSON.stringify(data.stats || []);
+      data.statsSig = JSON.stringify([data.stats || [], data.h2h || []]);
       U.hands = data; U.handsFor = `${s.id}:${s.last_hand_no}`;
     } catch (_) { U.hands = { hands: [], stats: [], statsSig: "", denied: true }; U.handsFor = `${s.id}:${s.last_hand_no}`; }
     U.handsLoading = false;
@@ -594,40 +604,401 @@
       const row = h("button", { class: "hand-row", type: "button" },
         `<span class="no">#${x.hand_no}</span><span style="display:flex;align-items:center;min-width:0">${x.my_hole ? miniCards(x.my_hole) : ""}${miniCards(x.board_a, "gap")}</span>` +
         `<span class="net ${net > 0 ? "pos" : net < 0 ? "neg" : "muted"}">${net == null ? "—" : (net > 0 ? "+" : "") + d2(net)}</span>` +
-        `<span></span><span class="who">${esc((x.winners || []).map((w) => w.name).join(", ") || "Split pot")} · pot ${d2(x.pot_cents)}</span><span class="muted" style="font-size:11px">${x.showdown ? "Showdown" : ""}</span>`);
+        `<span></span><span class="who">${esc((x.winners || []).map((w) => w.name).join(", ") || "Split pot")} · pot ${d2(x.pot_cents)}</span><span class="muted num" style="font-size:11px">${x.my_accuracy == null ? (x.showdown ? "Showdown" : "") : Math.round(x.my_accuracy) + "%"}</span>`);
       row.addEventListener("click", () => openHand(s.id, x.hand_no));
       body.appendChild(row);
     });
     fillMiniCards(body);
+    const all = h("button", { class: "btn sm block", type: "button", style: "margin-top:10px" }, icon("i-chart", "sm") + "All my hands (every table)");
+    all.addEventListener("click", () => openMyHands(""));
+    body.appendChild(all);
   }
+  // ------------------------------------------------------------ hand replayer
+  // A CLICK-THROUGH, not a video: the hand opens on the flop with the first
+  // player to act; forward plays one action, back takes one away. Every player
+  // decision carries the network's verdict (same marks as the Trainer), and any
+  // position can be sent to the Study tab as a spot.
+  const MARKS = { best: "✓✓", correct: "✓", inaccuracy: "~", wrong: "✗", blunder: "✗✗" };
+  const MARK_LABEL = { best: "Best move", correct: "Correct", inaccuracy: "Inaccuracy", wrong: "Wrong move", blunder: "Blunder" };
+  const kindOfAction = (x) => (x.action === 0 ? "fold" : x.action === 1 ? (x.chips > 0 ? "call" : "check") : x.action === 7 ? "allin" : "raise");
+  function gradeChip(g, small) {
+    if (!g) return "";
+    return `<span class="grade g-${g.cat}${small ? " sm" : ""}" title="${MARK_LABEL[g.cat] || g.cat} · ${Math.round(g.score)}/100 vs the network">${MARKS[g.cat] || "?"}${small ? "" : ` <em>${MARK_LABEL[g.cat] || g.cat}</em> <b>${Math.round(g.score)}</b>`}</span>`;
+  }
+
+  function replayState(rec, k) {
+    const seats = {};
+    rec.seats.forEach((x) => { seats[x.seat] = { stack: x.start_cents - rec.ante_cents, bet: 0, folded: false }; });
+    let pot = rec.ante_cents * rec.seats.length, street = "flop";
+    const clearBets = () => Object.values(seats).forEach((p) => { p.bet = 0; });
+    for (let i = 0; i < k; i++) {
+      const a = rec.actions[i];
+      if (String(a.street).toLowerCase() !== street) { street = String(a.street).toLowerCase(); clearBets(); }
+      const p = seats[a.seat];
+      if (!p) continue;
+      if (a.action === 0) p.folded = true;
+      else { p.stack -= a.cents; p.bet += a.cents; pot += a.cents; }
+    }
+    const next = rec.actions[k] || null;
+    if (next && String(next.street).toLowerCase() !== street) { street = String(next.street).toLowerCase(); clearBets(); }
+    const over = !next;
+    if (over) clearBets();
+    const boardN = over ? Math.max(3, (rec.board_a || []).length) : street === "river" ? 5 : street === "turn" ? 4 : 3;
+    return { seats, pot, street, next, over, boardN, last: k > 0 ? rec.actions[k - 1] : null };
+  }
+
   async function openHand(gid, no) {
     let rec;
     try { rec = await C().j(`/games/api/tables/${gid}/hands/${no}`); } catch (e) { return toast(e.message, "err"); }
+    const N = (rec.actions || []).length;
+    const gradeAt = {};
+    (rec.grades || []).forEach((g) => { gradeAt[g.i] = g; });
     const names = {};
-    rec.seats.forEach((x) => (names[x.seat] = x.name));
-    let acts = "", street = null;
-    (rec.actions || []).forEach((a) => {
-      if (a.street !== street) { street = a.street; acts += `<div class="log-street">${esc(street)}</div>`; }
-      const k = a.action === 0 ? "fold" : a.action === 1 ? (a.chips > 0 ? "call" : "check") : a.action === 7 ? "allin" : "raise";
-      acts += `<div class="log-row k-${k}"><span class="nm">${esc(names[a.seat] || "?")}</span><span class="lb">${esc(a.label)}</span></div>`;
-    });
-    const awards = (rec.awards || []).map((a) => {
-      const who = a.winners.map((w) => names[w] || "?").join(" & ");
-      const lab = a.winners.length === 1 && a.labels && a.labels[String(a.winners[0])] ? ` with ${a.labels[String(a.winners[0])]}` : "";
-      return `<div class="settle-row"><span>${a.uncontested ? "Uncontested" : "Board " + (a.board === "b" ? 2 : 1)} · ${esc(who)}${esc(lab)}</span><b>${d2(a.cents)}</b></div>`;
-    }).join("");
-    const seats = rec.seats.map((x) =>
-      `<div class="hd-seat">${avatar(x.name, x.name, "sm")}<div style="min-width:0"><b style="font-size:13px">${esc(x.name)}${x.is_me ? " (you)" : ""}${x.seat === rec.button ? ' <span class="pill" style="height:18px;font-size:10px">BTN</span>' : ""}</b>` +
-      `<div style="margin-top:4px">${x.hole ? miniCards(x.hole) : `<span class="muted" style="font-size:12px">${x.folded ? "Folded" : "Not shown"}</span>`}</div></div>` +
-      `<b class="num ${x.delta_cents > 0 ? "pos" : x.delta_cents < 0 ? "neg" : "muted"}">${x.delta_cents > 0 ? "+" : ""}${d2(x.delta_cents)}</b></div>`).join("");
-    const body = h("div", {});
+    rec.seats.forEach((x) => (names[x.seat] = x.is_me ? "You" : x.name));
+    const hero = (rec.seats.find((x) => x.is_me) || rec.seats[0] || {}).seat || 0;
+    const order = rec.seats.map((x) => x.seat);
+    const n = rec.num_seats || 8;
+    let k = 0;
+    const body = h("div", { class: "rp" });
     body.innerHTML =
-      `<div class="hd-boards">${miniCards(rec.board_a)}${miniCards(rec.board_b)}</div>` +
-      `<div class="hd-cols" style="margin-top:16px"><div><div class="rsec" style="margin-top:0"><h4>Players</h4>${seats}</div>` +
-      (awards ? `<div class="rsec"><h4>Pots</h4>${awards}</div>` : "") + `</div>` +
-      `<div><div class="rsec" style="margin-top:0"><h4>Action</h4>${acts || '<div class="muted">No betting — checked down or all-in from the ante.</div>'}</div></div></div>`;
-    fillMiniCards(body);
-    openModal({ title: `Hand #${rec.hand_no}`, sub: `Pot ${d2(rec.pot_cents)} · ante ${d2(rec.ante_cents)} · ${rec.showdown ? "showdown" : "won without showdown"}`, body, wide: true, buttons: [{ label: "Close", cls: "primary" }], autofocus: false });
+      `<div class="rp-main"><div class="rp-felt" id="rp-felt"></div>` +
+      `<div class="rp-banner" id="rp-banner"></div>` +
+      `<div class="rp-ctl"><button class="btn sm" id="rp-first" title="Start of the hand (Home)">⏮</button><button class="btn" id="rp-prev" title="Back one action (←)">◀</button>` +
+      `<span class="rp-step num" id="rp-step"></span><button class="btn primary" id="rp-next" title="Play the next action (→)">▶</button><button class="btn sm" id="rp-last" title="End of the hand (End)">⏭</button>` +
+      `<span class="spacer"></span>${rec.fair && HG.fair ? `<button class="btn sm" id="rp-fair" title="Re-check this hand's sealed deck, its cut and every card you can see">${icon("i-shield", "sm")}<span>Check shuffle</span></button>` : ""}` +
+      `<button class="btn gold sm" id="rp-study" title="Send this exact spot to the Study tab">${icon("i-chart", "sm")}Open in Study</button></div></div>` +
+      `<div class="rp-side"><div class="rsec" style="margin-top:0"><h4>Action</h4><div id="rp-list" class="rp-list"></div></div><div id="rp-result"></div></div>`;
+    const q = (id) => body.querySelector("#" + id);
+
+    function paint() {
+      const st = replayState(rec, k);
+      // seats around the felt, hero at the bottom
+      let html = "";
+      rec.seats.forEach((x) => {
+        const rel = (x.seat - hero + n) % n;
+        const th = Math.PI / 2 + (rel * 2 * Math.PI) / n;
+        const px = 50 + 44 * Math.cos(th), py = 50 + 40 * Math.sin(th);
+        const p = st.seats[x.seat];
+        const acting = st.next && st.next.seat === x.seat;
+        const known = x.hole && x.hole.length && x.hole[0] >= 0;
+        const cards = p.folded && !known ? "" : `<span class="mini-cards" data-cards="${known ? x.hole.join(",") : "x,x,x,x,x"}"></span>`;
+        const res = st.over ? `<b class="num ${x.delta_cents > 0 ? "pos" : x.delta_cents < 0 ? "neg" : "muted"}">${x.delta_cents > 0 ? "+" : ""}${d2(x.delta_cents)}</b>` : "";
+        html += `<div class="rp-seat ${p.folded ? "folded" : ""} ${acting ? "acting" : ""}" style="left:${px}%;top:${py}%">${cards}` +
+          `<div class="rp-plate">${avatar(x.name, x.name, "sm")}<div><b>${esc(names[x.seat])}${x.seat === rec.button ? ' <i class="rp-d">D</i>' : ""}</b><span class="num">${d2(Math.max(0, p.stack))}</span></div></div>` +
+          (p.bet > 0 ? `<span class="rp-bet num">${d2(p.bet)}</span>` : "") + res + `</div>`;
+      });
+      html += `<div class="rp-center"><span class="rp-pot num">Pot ${d2(st.pot)}</span>` +
+        `<span class="mini-cards" data-cards="${(rec.board_a || []).slice(0, st.boardN).join(",")}"></span>` +
+        `<span class="mini-cards" data-cards="${(rec.board_b || []).slice(0, st.boardN).join(",")}"></span></div>`;
+      const felt = q("rp-felt");
+      felt.innerHTML = html;
+      fillMiniCards(felt);
+      // banner: the action just played (with its verdict) and who is up
+      const last = st.last, g = last ? gradeAt[k - 1] : null;
+      q("rp-banner").innerHTML =
+        (last ? `<span class="rp-act k-${kindOfAction(last)}"><b>${esc(names[last.seat] || "?")}</b> ${esc(last.label)}${last.auto ? ' <small class="muted">(clock)</small>' : ""}</span>${gradeChip(g)}` : `<span class="muted">Flop dealt — everyone anted ${d2(rec.ante_cents)}.</span>`) +
+        `<span class="spacer"></span>` +
+        (st.next ? `<span class="muted">${esc(String(st.street).toUpperCase())} · <b style="color:var(--tx)">${esc(names[st.next.seat] || "?")}</b> to act</span>` : `<span class="pill gold">Hand over</span>`);
+      q("rp-step").textContent = `${k} / ${N}`;
+      q("rp-prev").disabled = q("rp-first").disabled = k === 0;
+      q("rp-next").disabled = q("rp-last").disabled = k === N;
+      body.querySelectorAll("#rp-list .log-row").forEach((r) => r.classList.toggle("on", Number(r.dataset.i) === k - 1));
+      const cur = body.querySelector("#rp-list .log-row.on");
+      if (cur) cur.scrollIntoView({ block: "nearest" });
+      q("rp-result").hidden = !st.over;
+    }
+    function go(to) { k = Math.max(0, Math.min(N, to)); paint(); }
+
+    // action list (click = jump to just after that action)
+    let list = "", street = null;
+    (rec.actions || []).forEach((a2, i) => {
+      if (a2.street !== street) { street = a2.street; list += `<div class="log-street">${esc(street)}</div>`; }
+      list += `<button type="button" class="log-row k-${kindOfAction(a2)}" data-i="${i}"><span class="nm">${esc(names[a2.seat] || "?")}</span><span class="lb">${esc(a2.label)}</span>${gradeChip(gradeAt[i], true)}</button>`;
+    });
+    q("rp-list").innerHTML = list || `<div class="muted">No betting — everyone was all-in from the ante.</div>`;
+    q("rp-list").addEventListener("click", (e) => { const r = e.target.closest(".log-row"); if (r) go(Number(r.dataset.i) + 1); });
+    const awards = (rec.awards || []).map((w) => {
+      const who = w.winners.map((x) => names[x] || "?").join(" & ");
+      const lab = w.winners.length === 1 && w.labels && w.labels[String(w.winners[0])] ? ` with ${w.labels[String(w.winners[0])]}` : "";
+      return `<div class="settle-row"><span>${w.uncontested ? "Uncontested" : "Board " + (w.board === "b" ? 2 : 1)} · ${esc(who)}${esc(lab)}</span><b>${d2(w.cents)}</b></div>`;
+    }).join("");
+    const flows = (rec.flows || []).map((f) => `<div class="settle-row"><span>${esc(names[f.from] || "?")} → ${esc(names[f.to] || "?")}</span><b>${d2(f.cents)}</b></div>`).join("");
+    q("rp-result").innerHTML = (awards ? `<div class="rsec"><h4>Pots</h4>${awards}</div>` : "") + (flows ? `<div class="rsec"><h4>Who paid whom</h4>${flows}</div>` : "");
+    q("rp-first").addEventListener("click", () => go(0));
+    q("rp-prev").addEventListener("click", () => go(k - 1));
+    q("rp-next").addEventListener("click", () => go(k + 1));
+    q("rp-last").addEventListener("click", () => go(N));
+    q("rp-study").addEventListener("click", () => openInStudy(rec, k));
+    const fairBtn = q("rp-fair");
+    if (fairBtn) fairBtn.addEventListener("click", async () => {
+      fairBtn.disabled = true;
+      try {
+        const r = await HG.fair.checkPast(gid, no);
+        fairBtn.classList.add("ok");
+        fairBtn.lastElementChild.textContent = r.contributors ? `Verified · cut by ${r.contributors} device${r.contributors === 1 ? "" : "s"}${r.mine ? " (yours too)" : ""}` : "Sealed · nobody's device cut it";
+        toast(`Sealed deck, cut and ${r.cards} card${r.cards === 1 ? "" : "s"} check out`, "ok");
+      } catch (e) {
+        fairBtn.classList.add("bad");
+        fairBtn.lastElementChild.textContent = "CHECK FAILED";
+        toast("This hand's shuffle does not check out: " + e.message, "err", 9000);
+      }
+      fairBtn.disabled = false;
+    });
+    const onKey = (e) => {
+      if (U.modals[U.modals.length - 1] !== api) return;
+      if (e.key === "ArrowRight") { e.preventDefault(); go(k + 1); }
+      else if (e.key === "ArrowLeft") { e.preventDefault(); go(k - 1); }
+      else if (e.key === "Home") { e.preventDefault(); go(0); }
+      else if (e.key === "End") { e.preventDefault(); go(N); }
+    };
+    document.addEventListener("keydown", onKey);
+    const graded = (rec.grades || []).length;
+    const api = openModal({
+      title: `Hand #${rec.hand_no}${rec.table_name ? " · " + rec.table_name : ""}`,
+      sub: `Pot ${d2(rec.pot_cents)} · ante ${d2(rec.ante_cents)} · ${rec.showdown ? "showdown" : "won without showdown"}` +
+        (rec.grades == null ? " · accuracy is still being worked out" : graded ? "" : " · no graded decisions") + " · use ← → to step",
+      body, wide: true, autofocus: false, buttons: [{ label: "Close", cls: "primary" }],
+      onClose: () => document.removeEventListener("keydown", onKey),
+    });
+    api.modal.classList.add("xwide");
+    paint();
+  }
+
+  // The Study tab works on the signed-in user's own server-side session, so a
+  // spot is "copied" by driving Study's normal API: reset, stakes, seats + stacks
+  // (hero = seat 0, clockwise), cards dealt so far, then the actions up to here.
+  async function openInStudy(rec, k) {
+    const dealt = rec.seats.map((x) => x.seat);
+    if (dealt.length > 6) return toast(`Study handles up to 6 players — this hand had ${dealt.length}`, "err");
+    const N = rec.actions.length;
+    const known = (seat) => { const x = rec.seats.find((y) => y.seat === seat); return x && x.hole && x.hole[0] >= 0 ? x : null; };
+    const actor = (rec.actions[Math.min(k, N - 1)] || {}).seat;
+    const me = rec.seats.find((x) => x.is_me);
+    const heroSeat = actor != null && known(actor) ? actor : me && known(me.seat) ? me.seat : (rec.seats.find((x) => known(x.seat)) || { seat: actor != null ? actor : dealt[0] }).seat;
+    const n = rec.num_seats || 8;
+    const order = dealt.slice().sort((x, y) => ((x - heroSeat + n) % n) - ((y - heroSeat + n) % n));
+    const st = replayState(rec, k);
+    const heroRec = known(heroSeat);
+    const pad = (arr, len) => { const out = arr.slice(0, len); while (out.length < len) out.push(null); return out; };
+    const cards = {
+      hero_hole: heroRec ? heroRec.hole.slice(0, 5) : [null, null, null, null, null],
+      flop_a: pad(rec.board_a || [], 3), flop_b: pad(rec.board_b || [], 3),
+      turn: st.boardN >= 4 ? [(rec.board_a || [])[3] ?? null, (rec.board_b || [])[3] ?? null] : [null, null],
+      river: st.boardN >= 5 ? [(rec.board_a || [])[4] ?? null, (rec.board_b || [])[4] ?? null] : [null, null],
+    };
+    const post = (url, b) => C().j(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b || {}) });
+    const btn = document.getElementById("rp-study");
+    if (btn) btn.disabled = true;
+    // Study opens in a NEW TAB so the replayer keeps its place. The tab has to be
+    // opened right here, inside the click — after the awaits below a browser
+    // treats window.open as a pop-up and blocks it.
+    let tab = null;
+    try {
+      tab = globalThis.open("", "_blank");
+      if (tab) {
+        tab.document.title = "Opening in Study…";
+        tab.document.body.style.cssText = "margin:0;height:100vh;display:grid;place-items:center;background:#070b11;color:#8794a6;font:14px system-ui,sans-serif";
+        tab.document.body.textContent = "Copying the spot into Study…";
+      }
+    } catch (_) { /* a blocked or cross-origin handle: fall through to the link below */ }
+    try {
+      await post("/format", { format: "plo5_double_bomb" }).catch(() => null);
+      await post("/reset");
+      // (hands recorded before 2026-09-23 carry cents only)
+      const bbChips = rec.bb_chips || 10000;
+      const toChips = (cents) => Math.round((cents * bbChips) / (rec.bb_cents || 100));
+      await post("/config", { bb_chips: bbChips, ante_chips: rec.ante_chips != null ? rec.ante_chips : toChips(rec.ante_cents), dollars_per_bb: rec.bb_cents / 100 });
+      await post("/seats", {
+        num_seats: order.length, button_seat: Math.max(0, order.indexOf(rec.button)),
+        starting_stacks: order.map((seat) => { const x = rec.seats.find((y) => y.seat === seat); return x.start_chips != null ? x.start_chips : toChips(x.start_cents); }), stacks_are_starting: true,
+      });
+      await post("/cards", cards);
+      for (let i = 0; i < k; i++) {
+        const a2 = rec.actions[i];
+        const gate = a2.action === 0 ? "fold" : a2.action === 1 ? "check_call" : "raise";
+        await post("/action", gate === "raise" ? { gate, chips: a2.chips } : { gate });
+      }
+      if (btn) btn.disabled = false;
+      if (tab && !tab.closed) { try { tab.opener = null; } catch (_) { /* fine */ } tab.location.replace("/?mode=study"); toast("Opened in Study (new tab)", "ok"); }
+      else {
+        // pop-ups blocked: the spot IS loaded — a plain link click is always allowed
+        openModal({ title: "Spot copied to Study", sub: "Your browser blocked the new tab. The spot is loaded — open Study with this link.", body: `<a class="btn gold block" href="/?mode=study" target="_blank" rel="noopener">Open Study in a new tab</a>`, buttons: [{ label: "Done", cls: "primary" }] });
+      }
+    } catch (e) {
+      if (btn) btn.disabled = false;
+      if (tab && !tab.closed) tab.close();
+      toast(e.status === 402 ? "Study needs a subscription on this account" : "Couldn't copy the spot: " + e.message, "err");
+    }
+  }
+
+  // --------------------------------------------------- lifetime hand database
+  // `player` = {user_id, name} opens somebody else's database (the club is private:
+  // everyone may browse everyone — cards still follow the table's reveal rule).
+  async function openMyHands(gameId, player) {
+    const other = player && !player.is_me ? player : null;
+    const base = other ? `/games/api/players/${other.user_id}` : "/games/api/my";
+    let stats;
+    try { stats = await C().j(base + "/stats"); } catch (e) { return toast(e.message, "err"); }
+    const F = { sort: "time", dir: "desc", game: gameId || "", offset: 0, rows: [], total: 0 };
+    const acc = (v) => (v == null ? "–" : Math.round(v) + "%");
+    const body = h("div", { class: "db" });
+    body.innerHTML =
+      `<div class="pcard-stats"><div><b>${stats.hands}</b><small>Hands</small></div><div><b class="${stats.net_cents > 0 ? "pos" : stats.net_cents < 0 ? "neg" : ""}">${stats.net_cents > 0 ? "+" : ""}${d2(stats.net_cents)}</b><small>Lifetime net</small></div>` +
+      `<div><b>${acc(stats.accuracy)}</b><small>Accuracy (${stats.graded} decisions)</small></div><div><b>${stats.hands ? Math.round((100 * stats.wins) / stats.hands) + "%" : "–"}</b><small>Hands won</small></div></div>` +
+      ((stats.versus || []).length ? `<div class="rsec"><h4>Head to head — lifetime</h4><div class="vs">${stats.versus.map((v) => `<span class="vs-chip"><span>${esc(v.name)}</span><b class="num ${v.net_cents > 0 ? "pos" : v.net_cents < 0 ? "neg" : ""}">${v.net_cents > 0 ? "+" : ""}${d2(v.net_cents)}</b></span>`).join("")}</div></div>` : "") +
+      `<div class="db-bar"><select class="input" id="db-game"><option value="">All sessions (${(stats.sessions || []).length})</option>${(stats.sessions || []).map((x) => `<option value="${esc(x.id)}" ${x.id === F.game ? "selected" : ""}>${esc(x.name)} · ${x.hands} hands · ${x.net_cents >= 0 ? "+" : ""}${d2(x.net_cents)}${x.accuracy == null ? "" : " · " + acc(x.accuracy)}</option>`).join("")}</select>` +
+      `<div class="seg" id="db-sort">${[["time", "Date"], ["pot", "Pot size"], ["net", "Profit / loss"], ["accuracy", "Accuracy"]].map(([v, l]) => `<button type="button" data-v="${v}" class="${v === "time" ? "on" : ""}">${l}</button>`).join("")}</div>` +
+      `<button class="btn sm" id="db-dir" title="Reverse the order">↓ High to low</button></div>` +
+      `<div id="db-list"></div><button class="btn block" id="db-more" hidden>Load more</button>`;
+    const q = (id) => body.querySelector("#" + id);
+    const draw = () => {
+      const host = q("db-list");
+      host.innerHTML = F.rows.length ? "" : `<div class="muted" style="text-align:center;padding:26px">${other ? "No hands here yet." : "No hands yet. Every hand you play at any table lands here."}</div>`;
+      F.rows.forEach((x) => {
+        const net = x.net_cents;
+        const row = h("button", { class: "hand-row db-row", type: "button" },
+          `<span class="no">#${x.hand_no}</span><span style="display:flex;align-items:center;min-width:0">${x.my_hole ? miniCards(x.my_hole) : ""}${miniCards(x.board_a, "gap")}${miniCards(x.board_b, "gap")}</span>` +
+          `<span class="net ${net > 0 ? "pos" : net < 0 ? "neg" : "muted"}">${net > 0 ? "+" : ""}${d2(net)}</span>` +
+          `<span></span><span class="who">${esc(x.table_name)} · ${esc(String(x.ended_at || "").slice(0, 10))} · pot ${d2(x.pot_cents)}${x.showdown ? " · showdown" : ""}</span><span class="muted num" style="font-size:11.5px">${x.accuracy == null ? "" : acc(x.accuracy)}</span>`);
+        row.addEventListener("click", () => openHand(x.game_id, x.hand_no));
+        host.appendChild(row);
+      });
+      fillMiniCards(host);
+      q("db-more").hidden = F.rows.length >= F.total;
+      q("db-dir").textContent = F.dir === "desc" ? "↓ High to low" : "↑ Low to high";
+    };
+    const load = async (reset) => {
+      if (reset) { F.offset = 0; F.rows = []; }
+      try {
+        const d = await C().j(`${base}/hands?sort=${F.sort}&dir=${F.dir}&limit=40&offset=${F.offset}` + (F.game ? `&game=${encodeURIComponent(F.game)}` : ""));
+        F.rows = F.rows.concat(d.hands); F.total = d.total; F.offset += d.limit;
+      } catch (e) { toast(e.message, "err"); }
+      draw();
+    };
+    segWire(body);
+    q("db-sort").addEventListener("pick", (e) => { F.sort = e.detail; load(true); });
+    q("db-dir").addEventListener("click", () => { F.dir = F.dir === "desc" ? "asc" : "desc"; load(true); });
+    q("db-game").addEventListener("change", (e) => { F.game = e.target.value; load(true); });
+    q("db-more").addEventListener("click", () => load(false));
+    const api = openModal({
+      title: other ? `${other.name} — hands & stats` : "My hands",
+      sub: other ? "Every hand they have played. You see the cards you saw at the table: your own, and hands that were shown." : "Every hand you have played at any table, with the network's accuracy rating.",
+      body, wide: true, autofocus: false, buttons: [{ label: "Close", cls: "primary" }],
+    });
+    api.modal.classList.add("xwide");
+    load(true);
+  }
+
+  // ------------------------------------------------------------ the club: everyone
+  const MIN_RANKED = 20; // graded decisions before an accuracy counts for the podium
+  const accTxt = (v) => (v == null ? "–" : Math.round(v) + "%");
+  const signed = (c) => (c > 0 ? "+" : c < 0 ? "−" : "") + d2(Math.abs(c));
+  const tone = (c) => (c > 0 ? "pos" : c < 0 ? "neg" : "");
+
+  async function loadClub(force) {
+    if (!force && U.clubAt && Date.now() - U.clubAt < 30000) return;
+    U.clubAt = Date.now();
+    try { renderClub(await C().j("/games/api/community")); } catch (_) { /* the lobby works without it */ }
+  }
+  function renderClub(data) {
+    U.club = data;
+    const players = data.players || [];
+    $("lb-club-sec").hidden = !players.length;
+    if (!players.length) return;
+    // podium: accuracy, among players with enough graded decisions to mean something
+    const rated = players.filter((p) => p.accuracy != null);
+    const ranked = rated.filter((p) => p.graded >= MIN_RANKED).sort((a, b) => b.accuracy - a.accuracy || b.graded - a.graded);
+    const early = rated.filter((p) => p.graded < MIN_RANKED).sort((a, b) => b.accuracy - a.accuracy || b.graded - a.graded);
+    const top = ranked.concat(early).slice(0, 3);
+    const pod = $("lb-podium");
+    pod.hidden = !top.length;
+    const step = (p, place) => !p ? `<div class="pod-col p${place} empty"><div class="pod-step"><b>${place}</b></div></div>` :
+      `<button type="button" class="pod-col p${place}" data-uid="${p.user_id}" title="Open ${esc(p.name)}'s hands">` +
+      `${place === 1 ? `<span class="pod-crown">${icon("i-crown")}</span>` : ""}${avatar(p.name, p.name, "lg")}` +
+      `<span class="pod-name">${esc(p.name)}${p.is_me ? " <i>you</i>" : ""}</span>` +
+      `<span class="pod-acc num">${accTxt(p.accuracy)}</span>` +
+      `<span class="pod-sub">${p.graded} decision${p.graded === 1 ? "" : "s"}${p.graded < MIN_RANKED ? " · provisional" : ""}</span>` +
+      `<span class="pod-step"><b>${place}</b></span></button>`;
+    pod.innerHTML = step(top[1], 2) + step(top[0], 1) + step(top[2], 3);
+    // one card per player, biggest winner first
+    $("lb-players").innerHTML = players.map((p) => {
+      const pct = p.accuracy == null ? 0 : Math.max(0, Math.min(100, p.accuracy));
+      return `<button type="button" class="plcard ${p.is_me ? "me" : ""}" data-uid="${p.user_id}">` +
+        `<span class="plcard-top">${avatar(p.name, p.name)}<span class="plcard-name"><b>${esc(p.name)}</b><small>${p.hands} hand${p.hands === 1 ? "" : "s"} · ${p.sessions} session${p.sessions === 1 ? "" : "s"}</small></span>` +
+        `<b class="num plcard-net ${tone(p.net_cents)}">${signed(p.net_cents)}</b></span>` +
+        `<span class="plcard-acc"><span class="plcard-meter"><i style="width:${pct}%"></i></span><b class="num">${accTxt(p.accuracy)}</b></span>` +
+        `<span class="plcard-foot"><span>Accuracy${p.graded ? ` · ${p.graded} decisions` : " · not rated yet"}</span><span>Won ${p.hands ? Math.round((100 * p.wins) / p.hands) : 0}% · best ${d2(p.best_cents)}</span></span></button>`;
+    }).join("");
+    $("lb-club-sub").textContent = `${players.length} player${players.length === 1 ? "" : "s"} · accuracy is the network's rating of every decision`;
+    document.querySelectorAll("#lb-podium [data-uid], #lb-players [data-uid]").forEach((b) => b.addEventListener("click", () => {
+      const p = players.find((x) => String(x.user_id) === b.dataset.uid);
+      if (p) openMyHands("", { user_id: p.user_id, name: p.name, is_me: p.is_me });
+    }));
+  }
+
+  // who is up on whom: row = the player, column = the opponent, cell = what the
+  // row player has won from (+) or lost to (−) that opponent, all sessions
+  function openMatrix() {
+    const data = U.club;
+    if (!data || !(data.players || []).length) return toast("No hands played yet", "");
+    const ps = data.players.filter((p) => (data.pairs || []).some((x) => x.from === p.user_id || x.to === p.user_id));
+    if (ps.length < 2) return toast("No money has changed hands yet", "");
+    const net = {};
+    (data.pairs || []).forEach((x) => { net[x.to + ":" + x.from] = x.cents; net[x.from + ":" + x.to] = -x.cents; });
+    const peak = Math.max(1, ...Object.values(net).map(Math.abs));
+    const cell = (v) => {
+      if (!v) return `<td class="mx-zero">·</td>`;
+      const a = 0.1 + 0.34 * Math.min(1, Math.abs(v) / peak);
+      return `<td class="num ${tone(v)}" style="background:rgba(${v > 0 ? "53,200,120" : "242,86,106"},${a.toFixed(2)})">${signed(v)}</td>`;
+    };
+    const body = h("div", { class: "mx-wrap" });
+    body.innerHTML = `<table class="mx"><thead><tr><th class="mx-corner">won from →</th>${ps.map((p) => `<th title="${esc(p.name)}">${avatar(p.name, p.name, "sm")}<span>${esc(p.name)}</span></th>`).join("")}<th class="mx-total">Total</th></tr></thead><tbody>` +
+      ps.map((r) => {
+        const total = ps.reduce((acc, c) => acc + (net[r.user_id + ":" + c.user_id] || 0), 0);
+        return `<tr><th data-uid="${r.user_id}" title="Open ${esc(r.name)}'s hands">${avatar(r.name, r.name, "sm")}<span>${esc(r.name)}${r.is_me ? " (you)" : ""}</span></th>` +
+          ps.map((c) => (c.user_id === r.user_id ? `<td class="mx-self"></td>` : cell(net[r.user_id + ":" + c.user_id] || 0))).join("") +
+          `<td class="num mx-total ${tone(total)}">${signed(total)}</td></tr>`;
+      }).join("") + `</tbody></table>` +
+      `<p class="muted" style="font-size:12px;margin:12px 0 0">Read across: a green cell is what that player has won from the player in the column. Every pot is traced layer by layer — side pots, split boards and quartered pots each go to who really paid for them.</p>`;
+    body.querySelectorAll("th[data-uid]").forEach((th) => th.addEventListener("click", () => {
+      const p = ps.find((x) => String(x.user_id) === th.dataset.uid);
+      if (p) openMyHands("", { user_id: p.user_id, name: p.name, is_me: p.is_me });
+    }));
+    const api = openModal({ title: "Head to head", sub: "Who has won what from whom, across every recorded session.", body, wide: true, autofocus: false, buttons: [{ label: "Close", cls: "primary" }] });
+    api.modal.classList.add("xwide");
+  }
+
+  // every session on record; the site admin can take test tables out of the stats
+  function openSessions() {
+    const body = h("div", { class: "db" });
+    const paint = () => {
+      const data = U.club || {}, rows = data.sessions || [];
+      body.innerHTML = (data.is_admin ? `<p class="muted" style="font-size:12.5px;margin:0 0 12px">Excluding a session takes it out of everyone's stats, hand lists and head-to-head. Nothing is deleted — you can restore it here any time. An open table is closed first.</p>` : "") +
+        (rows.length ? rows.map((x) =>
+          `<div class="sess ${x.excluded ? "excluded" : ""}" data-id="${esc(x.id)}"><div><b>${esc(x.name)}</b>${x.open ? ` <span class="pill live">Open</span>` : ""}${x.excluded ? ` <span class="pill">Excluded</span>` : ""}<br>` +
+          `<small>${esc(String(x.created_at || "").slice(0, 10))} · ${d2(x.sb_cents)}/${d2(x.bb_cents)} · ante ${d2(x.ante_cents)}</small></div>` +
+          `<small class="opt">${x.hands} hand${x.hands === 1 ? "" : "s"}</small><small class="opt">${x.players} player${x.players === 1 ? "" : "s"}</small>` +
+          `<span class="sess-act"><button class="btn sm" data-open="${esc(x.id)}" type="button">Open</button>` +
+          (data.is_admin ? `<button class="btn sm ${x.excluded ? "" : "danger"}" data-ex="${esc(x.id)}" data-on="${x.excluded ? "0" : "1"}" type="button">${x.excluded ? "Restore" : "Exclude"}</button>` : "") + `</span></div>`).join("")
+          : `<div class="muted" style="text-align:center;padding:26px">No sessions yet.</div>`);
+      body.querySelectorAll("[data-open]").forEach((b) => b.addEventListener("click", () => { api.close(null); C().openTable(b.dataset.open, true).catch((e) => toast(e.message, "err")); }));
+      body.querySelectorAll("[data-ex]").forEach((b) => b.addEventListener("click", async () => {
+        const on = b.dataset.on === "1", row = rows.find((x) => x.id === b.dataset.ex);
+        if (on) {
+          const ok = await confirmDialog({ title: `Exclude “${row.name}”?`, text: `Its ${row.hands} hand${row.hands === 1 ? "" : "s"} stop counting toward anyone's profit, accuracy and head-to-head${row.open ? ", and the table is closed (everyone is cashed out)" : ""}. You can restore it later.`, okLabel: "Exclude from stats", danger: true });
+          if (!ok) return;
+        }
+        b.disabled = true;
+        try {
+          await C().j(`/games/api/tables/${encodeURIComponent(b.dataset.ex)}/exclude`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ on }) });
+          toast(on ? "Session excluded from the stats" : "Session restored", "ok");
+          await loadClub(true); U.lobbySig = ""; C().loadLobby().catch(() => {});
+          paint();
+        } catch (e) { b.disabled = false; toast(e.message, "err"); }
+      }));
+    };
+    const api = openModal({ title: "All sessions", sub: "Every table on record, newest first.", body, wide: true, autofocus: false, buttons: [{ label: "Close", cls: "primary" }] });
+    paint();
   }
 
   // --------------------------------------------------------- manage drawer
@@ -680,6 +1051,7 @@
         `<div class="field"><span>Seats</span>${segHtml("m-seats", [2, 3, 4, 5, 6, 7, 8].map((n) => [n, String(n)]), s.num_seats)}<small>Between hands only — the higher seats must be empty to shrink</small></div></div>` +
         `<div class="grp"><h4>Buy-ins</h4><div class="row3"><label class="field"><span>Minimum</span>${moneyInput("m-min", set.min_buyin_cents)}</label><label class="field"><span>Default</span>${moneyInput("m-dflt", st.default_buyin_cents)}</label><label class="field"><span>Maximum</span>${moneyInput("m-max", set.max_buyin_cents)}</label></div><p>0 = no limit. The maximum also caps top-ups.</p></div>` +
         `<div class="grp"><h4>Privacy &amp; extras</h4><div class="setrow"><div><b>List in the lobby</b><small>Off = link only</small></div><label class="switch"><input type="checkbox" id="m-listed" ${set.listed ? "checked" : ""}/><i></i></label></div>` +
+        `<div class="setrow"><div><b>Accuracy marks on everyone's actions</b><small>The replayer rates every decision against the network. Off = players only see marks on their own</small></div><label class="switch"><input type="checkbox" id="m-grades" ${set.show_grades ? "checked" : ""}/><i></i></label></div>` +
         `<div class="setrow"><div><b>Rabbit hunting</b><small>Let players peek at the undealt streets after a fold-out</small></div><label class="switch"><input type="checkbox" id="m-rabbit" ${set.allow_rabbit ? "checked" : ""}/><i></i></label></div></div>`;
     } else if (U.drawerTab === "chips") {
       const modeSeg = (id, cur) => `<div class="seg as-modes" id="${id}">${[["off", "Off"], ["host", "Host sets"], ["player", "Players choose"]].map(([v, l]) => `<button type="button" data-v="${v}" class="${cur === v ? "on" : ""}">${l}</button>`).join("")}</div>`;
@@ -739,6 +1111,7 @@
           name: q("m-name").value, ante_cents: C().toCents(q("m-ante").value),
           min_buyin_cents: C().toCents(q("m-min").value) || 0, default_buyin_cents: C().toCents(q("m-dflt").value),
           max_buyin_cents: C().toCents(q("m-max").value) || 0, listed: q("m-listed").checked, allow_rabbit: q("m-rabbit").checked,
+          show_grades: q("m-grades").checked,
         };
         const seats = segVal(root, "m-seats");
         if (seats !== s.num_seats) patch.num_seats = seats;
@@ -915,6 +1288,9 @@
     const me = C().G.me || {};
     $("userchip").innerHTML = `${avatar(me.name || me.email, me.name || me.email, "sm")}<span>${esc(me.name || me.email || "")}</span>`;
     $("c-open").addEventListener("click", openCreate);
+    $("lb-myhands").addEventListener("click", () => openMyHands(""));
+    $("lb-h2h").addEventListener("click", openMatrix);
+    $("lb-allsess").addEventListener("click", openSessions);
     $("join-form").addEventListener("submit", (e) => {
       e.preventDefault();
       const raw = $("join-input").value.trim();
@@ -967,7 +1343,7 @@
     if (HG.play) HG.play.init();
   }
 
-  function showLobby() { $("lobby").hidden = false; $("table-view").hidden = true; closeDrawer(); U.lobbySig = ""; }
+  function showLobby() { $("lobby").hidden = false; $("table-view").hidden = true; closeDrawer(); U.lobbySig = ""; loadClub(true); }
   function showTable() {
     $("lobby").hidden = true; $("table-view").hidden = false;
     U.eventSeen = null; U.chatSig = ""; U.logSig = ""; U.ledgerSig = ""; U.hands = null; U.handsFor = null; U.unread = 0;
@@ -1004,6 +1380,7 @@
       evs.filter((e) => e.id > U.eventSeen).slice(-3).forEach((e) => {
         if (e.kind === "timeout" && e.seat === s.my_seat) { toast("You ran out of time — " + (e.text.includes("folded") ? "your hand was folded" : "you were checked"), "err", 5000); return; }
         if (e.kind === "request") { if (s.is_host && /asks to/.test(e.text)) { toast(e.text + " — open Manage › Chips", "gold", 6000); HG.sound && HG.sound.play("msg"); } return; }
+        if (e.kind === "fair") { toast(e.text, "gold", 6000); return; } // a redone shuffle is always said out loud
         if (["join", "leave", "rebuy", "host", "settings", "run"].includes(e.kind)) toast(e.text, e.kind === "join" ? "ok" : "");
         if (e.kind === "join") HG.sound && HG.sound.play("sit");
       });
@@ -1023,7 +1400,7 @@
 
   HG.ui = {
     init, render, renderLobby, showLobby, showTable, renderConn, toast, openModal, confirmDialog, openMenu, closeTop,
-    openSit, openTopUp, openAutoChips, openPlayer, noteFor, TAGS, openDrawer, openInfo, openPrefs, openHand, copyInvite, setRail, renderDock: (s) => HG.play && HG.play.render(s, s),
+    openSit, openTopUp, openAutoChips, openPlayer, openMyHands, noteFor, TAGS, openDrawer, openInfo, openPrefs, openHand, copyInvite, setRail, renderDock: (s) => HG.play && HG.play.render(s, s),
     onClock: (left, tm) => HG.play && HG.play.onClock(left, tm),
   };
 })();

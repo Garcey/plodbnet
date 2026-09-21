@@ -4647,6 +4647,7 @@ _PUBLIC_STATIC_POLICY: dict[str, str] = {
     "games.ui.js": "deny",
     "games.play.js": "deny",
     "games.sound.js": "deny",
+    "games.fair.js": "deny",
     "games.css": "deny",
     "games.html": "deny",
     "admin.html": "deny",

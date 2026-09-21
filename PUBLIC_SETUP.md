@@ -24,8 +24,15 @@ scp checkpoints/stub.pt root@87.99.132.209:/opt/wrapgto/app/checkpoints/stub.pt
 ssh root@87.99.132.209 systemctl restart wrapgto
 ```
 
-- Deploy code changes: re-run the tar-over-ssh ship (excl. .git/.venv/
-  checkpoints/data), then `systemctl restart wrapgto`.
+- Deploy code changes: **`scripts/deploy_prod.sh`** (from the laptop — the
+  only key the server accepts). It is the tar-over-ssh ship (excl. .git/.venv/
+  checkpoints/data/secrets), then it REBUILDS THE RUST ENGINE on the server
+  (`.venv/bin/maturin develop --release` as user `wrapgto`), restarts
+  `wrapgto` and checks `/health`. The engine rebuild matters since
+  2026-09-25: the home games' verifiable shuffle needs the engine's
+  `reset_with_deck`; without it the site still runs and the tables deal the
+  old way, shown as "Unverified shuffle" (`SKIP_ENGINE=1` skips the rebuild).
+  Kill switch: `PLO5BP_HOMEGAME_FAIR=0` in `/etc/wrapgto/env`.
 - Scale-up path: Hetzner console → resize to CCX23 (4 vCPU/16GB), ~1 min
   downtime, nothing else changes.
 
@@ -132,6 +139,8 @@ base URL is https. A real deploy (Docker etc.) is the next slice.
 | `PLO5BP_DB` | `data/public.db` | SQLite path |
 | `PLO5BP_ADMIN_EMAILS` | `themilesgarcia@icloud.com` | Comma-separated admin allowlist |
 | `PLO5BP_FREE_FOR_ALL` | `1` | **1 = the whole site is free** for every signed-in user while the models are in development (no quota, Study unlocked, checkout closed). Set `0` to bring the paywall back |
+| `PLO5BP_HOMEGAME_FAIR` | `1` | Home games' verifiable shuffle (sealed deck + the players' cut). `0` = deal the old way. Also off by itself when the engine on this machine predates `reset_with_deck` — rebuild it (`scripts/deploy_prod.sh`) |
+| `PLO5BP_HOMEGAME_GRADING` | `1` | Background network grading of every home-game action (`0` = off) |
 | `PLO5BP_FREE_HANDS` | `5` | Free trainer hands per UTC day (only when `PLO5BP_FREE_FOR_ALL=0`) |
 | `PLO5BP_PRICE_CENTS` | `1000` | Monthly price (before first checkout) |
 | `PLO5BP_DEV_LOGIN` | unset | 1 = loopback fake sign-in (testing only). The route is only registered when `PLO5BP_BASE_URL`'s host is loopback, and it rejects any request carrying a forwarding header (XFF, CF-Connecting-IP, Forwarded, …) |

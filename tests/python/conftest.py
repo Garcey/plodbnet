@@ -70,6 +70,10 @@ PUBLIC_TEST_ADMIN = "themilesgarcia@icloud.com"
 # test session runs with the paywall ON unless a test opts into free mode
 # (tests/python/test_public_free_mode.py).
 os.environ.setdefault("PLO5BP_FREE_FOR_ALL", "0")
+# Home-game hands are graded by a background thread (one model forward per
+# decision). Off for the test session so hundreds of scripted hands do not
+# queue work behind the tests; test_homegame_tracking.py turns it on.
+os.environ.setdefault("PLO5BP_HOMEGAME_GRADING", "0")
 
 _PUBLIC_TEST_ENV = {
     "PLO5BP_PUBLIC": "1",

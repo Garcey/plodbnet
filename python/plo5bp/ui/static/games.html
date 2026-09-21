@@ -43,6 +43,7 @@
       <symbol id="i-panel" viewBox="0 0 24 24"><path d="M4 5h16v14H4z" /><path d="M15 5v14" /></symbol>
       <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7" /></symbol>
       <symbol id="i-chart" viewBox="0 0 24 24"><path d="M5 19v-8M12 19V5M19 19v-6" /></symbol>
+      <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l7 3v5.5c0 4.3-2.9 7.9-7 9.5-4.1-1.6-7-5.2-7-9.5V6z" /><path d="M9 12l2.2 2.2L15.2 10" /></symbol>
       <symbol id="i-lock" viewBox="0 0 24 24"><path d="M6 11h12v9H6z" /><path d="M9 11V8a3 3 0 0 1 6 0v3" /></symbol>
       <symbol id="i-swap" viewBox="0 0 24 24"><path d="M7 8h12l-3-3M17 16H5l3 3" /></symbol>
       <symbol id="i-send" viewBox="0 0 24 24"><path d="M4 12l16-8-6 16-3-7-7-1z" /></symbol>
@@ -75,6 +76,7 @@
               <input class="input" id="join-input" placeholder="Paste a table link or code" autocomplete="off" />
               <button class="btn" type="submit">Join</button>
             </form>
+            <button class="btn lg" id="lb-myhands" type="button"><svg class="ico"><use href="#i-chart" /></svg>My hands &amp; stats</button>
             <button class="btn gold lg" id="c-open" type="button"><svg class="ico"><use href="#i-plus" /></svg>Host a table</button>
           </div>
         </section>
@@ -85,6 +87,14 @@
         <section class="lb-sec">
           <div class="lb-sec-h"><h2>Open tables</h2><span id="lb-open-count"></span></div>
           <div class="lb-grid" id="lb-open"></div>
+        </section>
+        <section class="lb-sec" id="lb-club-sec" hidden>
+          <div class="lb-sec-h"><h2>Players</h2><span id="lb-club-sub"></span><span class="spacer"></span>
+            <button class="btn sm" id="lb-h2h" type="button">Head to head</button>
+            <button class="btn sm" id="lb-allsess" type="button">All sessions</button>
+          </div>
+          <div class="podium" id="lb-podium" hidden></div>
+          <div class="pl-grid" id="lb-players"></div>
         </section>
         <section class="lb-sec" id="lb-sess-sec" hidden>
           <div class="lb-sec-h"><h2>Recent sessions</h2><span>Finished tables you played</span></div>
@@ -105,6 +115,7 @@
           <span class="pill" id="tb-status">Paused</span>
           <span class="pill opt num" id="tb-hand"></span>
           <span class="pill host opt" id="tb-hostpill" hidden><svg class="ico sm"><use href="#i-crown" /></svg>Host</span>
+          <button class="pill fair off" id="tb-fair" type="button" hidden><svg class="ico sm"><use href="#i-shield" /></svg><span>Verified shuffle</span></button>
           <button class="pill opt" id="tb-watch" type="button" title="Who is watching" hidden><svg class="ico sm"><use href="#i-eye" /></svg><span id="tb-watch-n">0</span></button>
         </div>
         <span class="spacer"></span>
@@ -126,13 +137,15 @@
               <div id="felt"><svg class="ico felt-mark"><use href="#i-mark" /></svg></div>
               <div id="center">
                 <div id="award-caption" class="award-caption" hidden></div>
-                <div id="pot"><span class="chips" id="pot-chips"></span><small>Pot</small><span id="pot-amt">$0.00</span></div>
-                <div id="pot-total" hidden></div>
+                <div id="pot-row">
+                  <div id="pot-total" hidden><small>Total</small><span id="pot-total-amt"></span></div>
+                  <div id="pot"><span class="chips" id="pot-chips"></span><small>Pot</small><span id="pot-amt">$0.00</span></div>
+                  <div id="street-tag"></div>
+                </div>
                 <div id="boards">
                   <div class="board" id="board-a"><span class="board-tag">1</span></div>
                   <div class="board" id="board-b"><span class="board-tag">2</span></div>
                 </div>
-                <div id="street-tag"></div>
               </div>
               <div id="seats"></div>
               <div id="bets"></div>
@@ -184,6 +197,7 @@
     <script src="/games/static/games.table.js"></script>
     <script src="/games/static/games.ui.js"></script>
     <script src="/games/static/games.play.js"></script>
+    <script src="/games/static/games.fair.js"></script>
     <script src="/games/static/games.js"></script>
   </body>
 </html>

@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import queue
 import logging
 import math
 import os
@@ -93,7 +94,8 @@ from plo5bp.config import VARIANT_PLO5, GameConfig
 from plo5bp.env import BombPotEnv, StepInfo
 from plo5bp.ui.common import STREET_NAMES, position_name
 from plo5bp.ui.hand_describe import describe_made_hand
-from plo5bp.ui.runout import AWARD_SECS, board_equities, build_awards
+from plo5bp.ui.runout import AWARD_SECS, board_equities, build_awards, money_flows
+from plo5bp.ui import fairdeal
 from plo5bp.ui import public as pub
 
 logger = logging.getLogger("plo5bp.ui.homegame")
@@ -145,6 +147,33 @@ REACTIONS = (
     "think", "ship",
 )
 HANDS_PAGE_MAX = 50
+# Every action of every hand is graded against the network in the background
+# (never on the request path, never during the hand): the same node distribution
+# and the same scorer as the Trainer tab, from the ACTOR's own point of view.
+GRADING_ON = os.environ.get("PLO5BP_HOMEGAME_GRADING", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+# The verifiable shuffle (``fairdeal``): the deck is sealed before the players'
+# devices contribute, their numbers re-permute it, and every card a player is
+# shown comes with its proof. Needs the engine's deal-from-an-explicit-deck entry
+# point; an older engine build (or PLO5BP_HOMEGAME_FAIR=0) deals the old way and
+# the client says "unverified" — never an error at the table.
+FAIR_ON = (
+    os.environ.get("PLO5BP_HOMEGAME_FAIR", "1").strip().lower() not in ("0", "false", "no", "off")
+    and hasattr(BombPotEnv, "reset_with_deck")
+)
+try:  # the binding itself (an old _engine build lacks it)
+    from plo5bp import env as _env_mod
+    FAIR_ON = FAIR_ON and hasattr(_env_mod._RustGameState, "reset_with_deck")
+except Exception:  # noqa: BLE001
+    FAIR_ON = False
+FAIR_REVEAL_S = 3.0        # a locked device has this long to reveal its number
+FAIR_RECOMMIT_S = 1.5      # after a voided attempt: window to commit to the new seal
+FAIR_COMMIT_GRACE_S = 0.6  # at the deal: wait this long for a known device's commit
+FAIR_PRESENT_S = 8.0       # "its browser is here" for the purposes of that wait
+FAIR_MAX_ATTEMPTS = 4      # then the hand is dealt with whoever confirmed
+FAIR_STRIKES = 2           # missed confirmations in a row before a time-out …
+FAIR_PENALTY_HANDS = 20    # … of this many hands from contributing
 #: The home-games client, served ONLY through the gated `/games/static/{name}`
 #: route. Every name here must also be "deny" in server.py's
 #: `_PUBLIC_STATIC_POLICY` (the public /static mount must never serve them).
@@ -154,6 +183,7 @@ GAMES_ASSETS: dict[str, str] = {
     "games.ui.js": "text/javascript; charset=utf-8",
     "games.play.js": "text/javascript; charset=utf-8",
     "games.sound.js": "text/javascript; charset=utf-8",
+    "games.fair.js": "text/javascript; charset=utf-8",
     "games.css": "text/css; charset=utf-8",
 }
 # Hub eviction: nobody polling for this long => drop the in-memory table
@@ -190,7 +220,9 @@ CREATE TABLE IF NOT EXISTS homegames (
   approve_buyins INTEGER NOT NULL DEFAULT 0,
   topup_mode TEXT NOT NULL DEFAULT 'off',
   topup_target_cents INTEGER NOT NULL DEFAULT 0,
-  topup_below_cents INTEGER NOT NULL DEFAULT 0
+  topup_below_cents INTEGER NOT NULL DEFAULT 0,
+  show_grades INTEGER NOT NULL DEFAULT 1,
+  excluded INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS homegame_hands (
   game_id TEXT NOT NULL,
@@ -206,8 +238,27 @@ CREATE TABLE IF NOT EXISTS homegame_hand_results (
   user_id INTEGER NOT NULL,
   delta_cents INTEGER NOT NULL,
   showdown INTEGER NOT NULL DEFAULT 0,
+  acc_sum REAL NOT NULL DEFAULT 0,
+  acc_n INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (game_id, hand_no, user_id)
 );
+CREATE TABLE IF NOT EXISTS homegame_flows (
+  game_id TEXT NOT NULL,
+  hand_no INTEGER NOT NULL,
+  payer INTEGER NOT NULL,
+  payee INTEGER NOT NULL,
+  chips INTEGER NOT NULL,
+  PRIMARY KEY (game_id, hand_no, payer, payee)
+);
+CREATE TABLE IF NOT EXISTS homegame_fair (
+  game_id TEXT NOT NULL,
+  hand_no INTEGER NOT NULL,
+  data TEXT NOT NULL,
+  PRIMARY KEY (game_id, hand_no)
+);
+CREATE INDEX IF NOT EXISTS homegame_results_user ON homegame_hand_results(user_id);
+CREATE INDEX IF NOT EXISTS homegame_flows_payer ON homegame_flows(payer);
+CREATE INDEX IF NOT EXISTS homegame_flows_payee ON homegame_flows(payee);
 CREATE TABLE IF NOT EXISTS homegame_players (
   game_id TEXT NOT NULL,
   user_id INTEGER NOT NULL,
@@ -283,6 +334,8 @@ def _ensure_schema() -> None:
             ("topup_mode", "TEXT NOT NULL DEFAULT 'off'"),
             ("topup_target_cents", "INTEGER NOT NULL DEFAULT 0"),
             ("topup_below_cents", "INTEGER NOT NULL DEFAULT 0"),
+            ("show_grades", "INTEGER NOT NULL DEFAULT 1"),
+            ("excluded", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if col not in cols:
                 pub.DB._conn.execute(f"ALTER TABLE homegames ADD COLUMN {col} {ddl}")
@@ -296,6 +349,19 @@ def _ensure_schema() -> None:
             pub.DB._conn.execute(
                 "ALTER TABLE homegame_players ADD COLUMN auto_stack_cents "
                 "INTEGER NOT NULL DEFAULT 0"
+            )
+        rcols = {
+            r[1]
+            for r in pub.DB._conn.execute(
+                "PRAGMA table_info(homegame_hand_results)"
+            ).fetchall()
+        }
+        if "acc_sum" not in rcols:
+            pub.DB._conn.execute(
+                "ALTER TABLE homegame_hand_results ADD COLUMN acc_sum REAL NOT NULL DEFAULT 0"
+            )
+            pub.DB._conn.execute(
+                "ALTER TABLE homegame_hand_results ADD COLUMN acc_n INTEGER NOT NULL DEFAULT 0"
             )
         for col in ("trusted", "topup_target_cents", "topup_below_cents"):
             if col not in pcols:
@@ -538,6 +604,25 @@ class LiveTable:
     # simply asks the player to request again.
     requests: list = field(default_factory=list)
     request_seq: int = 0
+    # Accuracy marks on EVERYONE's actions in the replayer (a mark on a mucked
+    # hand says a little about it). Off = players see marks on their own only.
+    show_grades: bool = True
+    # What the background grader needs to replay the hand being played: the
+    # deal seed and the exact engine inputs. In MEMORY only — the seed would
+    # reveal every card, so it is never persisted and never served.
+    hand_seed: int = 0
+    hand_actions: list = field(default_factory=list)
+    # Verifiable shuffle. ``hand_deck`` = the 52 cards as dealt (memory only, like
+    # the seed it replaces); ``fair_next`` = the sealed deck of the UPCOMING hand
+    # and where its confirmation stands; ``fair_hand`` = the hand on the table.
+    hand_deck: list = field(default_factory=list)
+    fair_next: Any = None
+    fair_hand: Any = None
+    fair_hand_meta: dict = field(default_factory=dict)
+    fair_capable: set = field(default_factory=set)       # user ids whose browser takes part
+    fair_strikes: dict = field(default_factory=dict)     # user id -> missed reveals in a row
+    fair_penalty_until: dict = field(default_factory=dict)  # user id -> hand_no
+    fair_void_counts: dict = field(default_factory=dict)  # name -> voided shuffles this session
     lock: threading.RLock = field(default_factory=threading.RLock)
 
     @property
@@ -556,6 +641,23 @@ class LiveTable:
     def player(self, uid: int) -> Seat | None:
         i = self.seat_of(uid)
         return self.seats[i] if i is not None else None
+
+
+@dataclass
+class FairPending:
+    """The shuffle of the upcoming hand: a sealed deck and its confirmation."""
+
+    sealed: Any                 # fairdeal.SealedDeck
+    hand_no: int
+    attempt: int = 1
+    stage: str = "commit"       # commit -> reveal (-> dealt: becomes LiveTable.fair_hand)
+    commits: dict = field(default_factory=dict)       # seat -> commitment
+    commit_users: dict = field(default_factory=dict)  # seat -> user id
+    reveals: dict = field(default_factory=dict)       # seat -> number
+    pending: bool = False       # a deal is waiting on this shuffle
+    deadline_mono: float | None = None
+    barred: set = field(default_factory=set)          # user ids that voided an attempt of this hand
+    voids: list = field(default_factory=list)         # earlier attempts of this hand
 
 
 class Hub:
@@ -629,6 +731,7 @@ def _watchdog_loop() -> None:
                     _flush_result_locked(t)
                     _apply_queued_topups_locked(t)
                     _expire_requests_locked(t)
+                    _fair_tick_locked(t)
                     _auto_deal_tick_locked(t)
                     _retry_persist_locked(t)
             if time.monotonic() >= next_evict:
@@ -744,6 +847,7 @@ def _load_table(game_id: str) -> LiveTable:
         topup_mode=_norm_auto_mode(row["topup_mode"] if "topup_mode" in row.keys() else "off"),
         topup_all_target_cents=_row_int(row, "topup_target_cents", 0),
         topup_all_below_cents=_row_int(row, "topup_below_cents", 0),
+        show_grades=bool(_row_int(row, "show_grades", 1)),
     )
 
 
@@ -766,6 +870,7 @@ def _persist_meta(t: LiveTable) -> None:
         "deal_delay_ms=?, time_bank_secs=?, min_buyin_cents=?, "
         "max_buyin_cents=?, listed=?, allow_rabbit=?, "
         "approve_buyins=?, topup_mode=?, topup_target_cents=?, topup_below_cents=?, "
+        "show_grades=?, "
         "closed_at=CASE WHEN ?= 'closed' THEN COALESCE(closed_at, ?) ELSE closed_at END "
         "WHERE id=?",
         (
@@ -792,6 +897,7 @@ def _persist_meta(t: LiveTable) -> None:
             _norm_auto_mode(t.topup_mode),
             int(t.topup_all_target_cents or 0),
             int(t.topup_all_below_cents or 0),
+            1 if t.show_grades else 0,
             t.status,
             pub._now(),
             t.game_id,
@@ -863,7 +969,7 @@ _SNAPSHOT_FIELDS = (
     "name", "num_seats", "ante_cents", "default_buyin_cents", "deal_delay_secs",
     "time_bank_secs", "min_buyin_cents", "max_buyin_cents", "listed",
     "allow_rabbit", "approve_buyins", "topup_mode", "topup_all_target_cents",
-    "topup_all_below_cents",
+    "topup_all_below_cents", "show_grades",
 )
 
 
@@ -1482,6 +1588,290 @@ def _timeout_tick_locked(t: LiveTable) -> None:
                     _resume_turn_locked(t)
 
 
+# --- verifiable shuffle: seal -> commit -> lock -> reveal -> cut -> deal ----------------
+
+
+def _fair_hand_id(t: LiveTable, hand_no: int, attempt: int) -> str:
+    """Names ONE sealed deck. ``epoch`` (per in-memory load of the table) keeps an
+    id from ever naming two different seals across a restart or an eviction."""
+    return f"{t.game_id}:{int(hand_no)}:{int(attempt)}:{t.epoch}"
+
+
+def _fair_prepare_locked(t: LiveTable) -> None:
+    """Seal the deck of the upcoming hand as soon as there is an upcoming hand."""
+    if not FAIR_ON or t.status != "open" or t.phase == "in_hand":
+        return
+    nxt = t.fair_next
+    if nxt is not None and nxt.hand_no == t.hand_no + 1:
+        if nxt.sealed.num_seats != t.num_seats:  # the slot map depends on the seat count
+            _fair_void_locked(t, "the table was resized")
+        return
+    t.fair_next = FairPending(
+        sealed=fairdeal.SealedDeck.create(_fair_hand_id(t, t.hand_no + 1, 1), t.num_seats),
+        hand_no=t.hand_no + 1,
+    )
+    t.rev += 1
+
+
+def _fair_penalized(t: LiveTable, uid: int) -> bool:
+    return int(t.fair_penalty_until.get(int(uid), 0)) > int(t.hand_no)
+
+
+def _fair_commit_locked(t: LiveTable, uid: int, hand_id: str, commit: str) -> None:
+    _require_open(t)
+    nxt = t.fair_next
+    seat = t.seat_of(uid)
+    if not FAIR_ON or nxt is None or seat is None:
+        raise HTTPException(status_code=409, detail="no shuffle to take part in")
+    if nxt.sealed.hand_id != str(hand_id) or nxt.stage != "commit":
+        raise HTTPException(status_code=409, detail="that shuffle is closed")
+    if not fairdeal.is_hex64(commit):
+        raise HTTPException(status_code=400, detail="a commitment is 64 hex characters")
+    if int(uid) in nxt.barred or _fair_penalized(t, uid):
+        raise HTTPException(status_code=409, detail="this device sits this shuffle out")
+    # Until the list is LOCKED a seat may replace its commitment: a reopened tab
+    # (or a second device) no longer has the old number, and a commitment nobody
+    # can open would void the shuffle and blame the player. Nothing has been
+    # revealed at this point, so the newest commitment is as good as the first.
+    nxt.commits[seat] = str(commit)
+    nxt.commit_users[seat] = int(uid)
+    t.fair_capable.add(int(uid))
+    if nxt.pending:
+        _fair_tick_locked(t)  # the deal may have been waiting for exactly this
+
+
+def _fair_reveal_locked(t: LiveTable, uid: int, hand_id: str, nonce: str) -> None:
+    nxt = t.fair_next
+    if not FAIR_ON or nxt is None or nxt.sealed.hand_id != str(hand_id) or nxt.stage != "reveal":
+        raise HTTPException(status_code=409, detail="that shuffle is closed")
+    seat = next((st for st, u in nxt.commit_users.items()
+                 if u == int(uid) and st in dict(nxt.sealed.locked)), None)
+    if seat is None:
+        raise HTTPException(status_code=409, detail="this device is not part of the lock list")
+    if not nxt.sealed.accepts(seat, str(nonce)):
+        raise HTTPException(status_code=400, detail="that number does not open your commitment")
+    nxt.reveals[seat] = str(nonce)
+    t.fair_strikes.pop(int(uid), None)
+    if len(nxt.reveals) == len(nxt.sealed.locked):
+        _fair_complete_locked(t)
+
+
+def _fair_expected(t: LiveTable, mask: list[bool]) -> set[int]:
+    """Dealt-in seats whose browser has taken part before and is here now."""
+    nxt = t.fair_next
+    now = time.monotonic()
+    out = set()
+    for i, p in enumerate(t.seats):
+        if p is None or i >= len(mask) or not mask[i]:
+            continue
+        uid = int(p.user_id)
+        if uid not in t.fair_capable or uid in nxt.barred or _fair_penalized(t, uid):
+            continue
+        if now - t.seen.get(uid, -1e9) > FAIR_PRESENT_S:
+            continue
+        out.add(i)
+    return out
+
+
+def _fair_lock_locked(t: LiveTable, mask: list[bool]) -> bool:
+    """Freeze the commitments of the seats being dealt in. True = waiting for
+    their numbers; False = nobody contributed, deal now."""
+    nxt = t.fair_next
+    now = time.monotonic()
+    # Only a device that is HERE is asked for its number: one that committed and
+    # then went to sleep (a locked phone) would hold the table up for nothing.
+    locked = {
+        st: c for st, c in nxt.commits.items()
+        if st < len(mask) and mask[st] and t.seats[st] is not None
+        and int(t.seats[st].user_id) == nxt.commit_users.get(st)
+        and nxt.commit_users.get(st) not in nxt.barred
+        and now - t.seen.get(int(t.seats[st].user_id), -1e9) <= FAIR_PRESENT_S
+    }
+    nxt.sealed.set_lock(locked)
+    nxt.reveals = {}
+    if not locked:
+        nxt.pending = False
+        nxt.deadline_mono = None
+        return False
+    nxt.stage = "reveal"
+    nxt.pending = True
+    nxt.deadline_mono = time.monotonic() + FAIR_REVEAL_S
+    t.rev += 1
+    return True
+
+
+def _fair_begin_locked(t: LiveTable, mask: list[bool]) -> bool:
+    """The deal wants to happen. True = it now waits on the shuffle."""
+    nxt = t.fair_next
+    missing = _fair_expected(t, mask) - set(nxt.commits)
+    if missing and nxt.attempt < FAIR_MAX_ATTEMPTS:
+        nxt.pending = True
+        nxt.deadline_mono = time.monotonic() + (FAIR_COMMIT_GRACE_S if nxt.attempt == 1 else FAIR_RECOMMIT_S)
+        t.rev += 1
+        return True
+    return _fair_lock_locked(t, mask)
+
+
+def _fair_void_locked(t: LiveTable, reason: str, seats: list[int] | None = None) -> None:
+    """Throw the sealed deck away (its cut may already be known to the server)
+    and seal a new one. ALWAYS announced: a voided shuffle is a re-roll."""
+    nxt = t.fair_next
+    if nxt is None:
+        return
+    names = [_seat_name(t, i) for i in (seats or [])]
+    for i in seats or []:
+        uid = nxt.commit_users.get(i)
+        if uid is None:
+            continue
+        nxt.barred.add(int(uid))
+        n = int(t.fair_strikes.get(int(uid), 0)) + 1
+        t.fair_strikes[int(uid)] = n
+        if n >= FAIR_STRIKES:
+            t.fair_penalty_until[int(uid)] = int(t.hand_no) + 1 + FAIR_PENALTY_HANDS
+            t.fair_strikes.pop(int(uid), None)
+    for nm in names:
+        t.fair_void_counts[nm] = int(t.fair_void_counts.get(nm, 0)) + 1
+    voids = list(nxt.voids) + [{
+        "attempt": nxt.attempt, "seal": nxt.sealed.seal, "reason": reason, "names": names,
+    }]
+    was_pending = bool(nxt.pending)
+    t.fair_next = FairPending(
+        sealed=fairdeal.SealedDeck.create(_fair_hand_id(t, nxt.hand_no, nxt.attempt + 1), t.num_seats),
+        hand_no=nxt.hand_no, attempt=nxt.attempt + 1, barred=set(nxt.barred), voids=voids,
+    )
+    _emit(t, "fair", "Shuffle redone — " + (
+        f"{', '.join(names)} didn't confirm in time" if names else reason))
+    t.rev += 1
+    if was_pending and seats:  # the deal is still wanted: a short window to commit to the new seal
+        t.fair_next.pending = True
+        t.fair_next.deadline_mono = time.monotonic() + FAIR_RECOMMIT_S
+
+
+def _fair_complete_locked(t: LiveTable) -> None:
+    """Every locked device revealed: cut, and deal."""
+    nxt = t.fair_next
+    if nxt is None:
+        return
+    nxt.pending = False
+    nxt.deadline_mono = None
+    try:
+        _deal_now_locked(t)
+    except HTTPException as e:  # nobody left to deal to, game paused, …
+        if t.fair_next is nxt:
+            _fair_void_locked(t, f"the hand could not be dealt ({e.detail})")
+
+
+def _fair_tick_locked(t: LiveTable) -> None:
+    nxt = t.fair_next
+    if not FAIR_ON or nxt is None or not nxt.pending:
+        return
+    if t.status != "open" or not t.running or t.phase == "in_hand":
+        nxt.pending = False
+        nxt.deadline_mono = None
+        if nxt.stage == "reveal":
+            _fair_void_locked(t, "the deal was called off")
+        return
+    now = time.monotonic()
+    if nxt.stage == "commit":
+        mask = _eligible_mask(t)
+        waiting = _fair_expected(t, mask) - set(nxt.commits)
+        if waiting and nxt.deadline_mono is not None and now < nxt.deadline_mono:
+            return
+        if not _fair_lock_locked(t, mask):
+            _fair_complete_locked(t)
+        return
+    if len(nxt.reveals) == len(nxt.sealed.locked):
+        _fair_complete_locked(t)
+    elif nxt.deadline_mono is not None and now >= nxt.deadline_mono:
+        _fair_void_locked(t, "a device did not confirm", [
+            st for st, _ in nxt.sealed.locked if st not in nxt.reveals])
+
+
+def _fair_openings(sealed: Any, cards: list[int]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for c in cards:
+        try:
+            out[str(int(c))] = sealed.opening(int(c))
+        except KeyError:
+            continue
+    return out
+
+
+def _fair_view(t: LiveTable, viewer_id: int, visible: list[int]) -> dict[str, Any]:
+    """What the viewer's device needs: the upcoming shuffle (to take part) and
+    the proof of every card the viewer can see right now (never of any other)."""
+    out: dict[str, Any] = {"supported": bool(FAIR_ON), "spec": fairdeal.SPEC}
+    if not FAIR_ON:
+        return out
+    seat = t.seat_of(viewer_id)
+    nxt = t.fair_next
+    if nxt is not None and t.status == "open":
+        mine = seat is not None and nxt.commit_users.get(seat) == int(viewer_id)
+        out["next"] = {
+            "hand_no": nxt.hand_no, "attempt": nxt.attempt, "hand_id": nxt.sealed.hand_id,
+            "seal": nxt.sealed.seal, "stage": nxt.stage, "pending": bool(nxt.pending),
+            "locked": [[st, c] for st, c in nxt.sealed.locked] if nxt.stage == "reveal" else [],
+            "lock": nxt.sealed.lock if nxt.stage == "reveal" else None,
+            "you": {
+                "seat": seat, "committed": bool(mine),
+                "revealed": bool(mine and seat in nxt.reveals),
+                "barred": bool(int(viewer_id) in nxt.barred or _fair_penalized(t, viewer_id)),
+            },
+        }
+    fh = t.fair_hand
+    if fh is not None and t.phase in ("in_hand", "showdown"):
+        meta = t.fair_hand_meta or {}
+        out["hand"] = {
+            "hand_no": int(meta.get("hand_no") or t.hand_no), "hand_id": fh.hand_id,
+            "seal": fh.seal, "lock": fh.lock, "num_seats": fh.num_seats,
+            "contributors": [st for st, _ in fh.locked],
+            "names": list(meta.get("names") or []),
+            "voids": list(meta.get("voids") or []),
+            "open": _fair_openings(fh, visible),
+        }
+    out["void_counts"] = dict(t.fair_void_counts)
+    return out
+
+
+def _fair_transcript(t: LiveTable, viewer_id: int, hand_no: int) -> dict[str, Any]:
+    """The public transcript of a dealt hand + the openings of the cards THIS
+    viewer may see (live hand: what is on their screen; older: their history
+    view — the table's reveal rule either way)."""
+    if not FAIR_ON or hand_no < 1 or hand_no > t.hand_no:
+        raise HTTPException(status_code=404, detail="Not Found")
+    live = hand_no == t.hand_no and (t.phase == "in_hand" or _runout_blocking(t))
+    if hand_no == t.hand_no and t.fair_hand is not None:
+        sealed, meta = t.fair_hand, dict(t.fair_hand_meta or {})
+    else:
+        row = pub.DB.one("SELECT data FROM homegame_fair WHERE game_id=? AND hand_no=?",
+                         (t.game_id, int(hand_no)))
+        if row is None:
+            raise HTTPException(status_code=404, detail="Not Found")
+        data = json.loads(row["data"])
+        sealed, meta = fairdeal.SealedDeck.from_store(data["sealed"]), dict(data.get("meta") or {})
+    visible: list[int] = []
+    if live:
+        v = _view(t, viewer_id)
+        for srow in v["seats"]:
+            visible += [c for c in (srow.get("hole") or []) if isinstance(c, int) and c >= 0]
+        for b in ("a", "b"):
+            bd = v["board"][b]
+            visible += [c for c in list(bd["flop"]) + [bd["turn"], bd["river"]] if isinstance(c, int) and c >= 0]
+    else:
+        _require_member(t, viewer_id)
+        rec_row = pub.DB.one("SELECT summary FROM homegame_hands WHERE game_id=? AND hand_no=?",
+                             (t.game_id, int(hand_no)))
+        if rec_row is not None:
+            rec = _hand_for_viewer(json.loads(rec_row["summary"]), viewer_id, bool(t.show_grades))
+            for srow in rec.get("seats") or []:
+                visible += [c for c in (srow.get("hole") or []) if isinstance(c, int) and c >= 0]
+            visible += [int(c) for c in (rec.get("board_a") or []) + (rec.get("board_b") or [])]
+    out = sealed.public()
+    out.update({"hand_no": int(hand_no), "names": list(meta.get("names") or []),
+                "voids": list(meta.get("voids") or []), "open": _fair_openings(sealed, visible)})
+    return out
+
+
 def _deal_ready(t: LiveTable, *, present_only: bool = False) -> bool:
     """Could a hand be dealt right now (2+ seats that would be dealt in)?
     Counts a busted seat whose auto-stack tops it up at the deal.
@@ -1506,6 +1896,9 @@ def _auto_deal_tick_locked(t: LiveTable) -> None:
     timer in the HOST'S browser — a host who switched tabs or locked their
     phone stalled the table for everyone."""
     delay = float(t.deal_delay_secs or 0.0)
+    if FAIR_ON and t.fair_next is not None and t.fair_next.pending:
+        t.next_deal_mono = None  # this deal is already under way: its shuffle is being confirmed
+        return
     if delay <= 0.0 or not _deal_ready(t, present_only=True):
         t.next_deal_mono = None
         return
@@ -1853,7 +2246,10 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
     now_mono = time.monotonic()
     now_wall = time.time()
     last_hand_no = t.hand_no if (t.phase != "in_hand" and not blocking) else t.hand_no - 1
+    _fair_prepare_locked(t)
+    visible_cards = [int(c) for h in holes if h for c in h if int(c) >= 0] + ba_src + bb_src
     return {
+        "fair": _fair_view(t, viewer_id, visible_cards),
         "id": t.game_id,
         "name": t.name,
         "status": t.status,
@@ -1939,6 +2335,7 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
             "listed": bool(t.listed),
             "allow_rabbit": bool(t.allow_rabbit),
             "approve_buyins": bool(t.approve_buyins),
+            "show_grades": bool(t.show_grades),
         },
         "auto_topup": {
             "mode": _norm_auto_mode(t.topup_mode),
@@ -2050,6 +2447,8 @@ def _set_running_locked(t: LiveTable, uid: int, running: bool) -> None:
         t.running = bool(running)
         _persist_meta(t)
     t.next_deal_mono = None
+    if not running:
+        _fair_tick_locked(t)  # a deal waiting on its shuffle is called off (announced)
     if was != bool(running):
         _emit(t, "run", "Game started" if running else (
             "Game pauses after this hand" if t.phase == "in_hand" else "Game paused"))
@@ -2068,6 +2467,34 @@ def _deal_locked(t: LiveTable) -> None:
         # POST /deal itself never checked, so any seated player could cut
         # everyone's river and pot awards short.
         raise HTTPException(status_code=400, detail="wait for the runout to finish")
+    if FAIR_ON and t.fair_next is not None and t.fair_next.pending:
+        return  # this deal is already waiting on its shuffle (an impatient second click)
+    _settle_locked(t)
+    _apply_sit_out_next_locked(t)
+    _apply_queued_topups_locked(t, force=True)
+    _apply_auto_stacks_locked(t)
+    mask = _eligible_mask(t)
+    if sum(mask) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="need at least 2 players with more than the ante",
+        )
+    if FAIR_ON:
+        # Verifiable shuffle: devices that take part get a moment to confirm.
+        # A table nobody's browser takes part in (scripts, tests) deals at once.
+        _fair_prepare_locked(t)
+        if _fair_begin_locked(t, mask):
+            return
+    _deal_now_locked(t)
+
+
+def _deal_now_locked(t: LiveTable) -> None:
+    """Put the hand on the table (the shuffle, if any, is settled)."""
+    _require_open(t)
+    if not t.running:
+        raise HTTPException(status_code=400, detail="game is paused")
+    if t.phase == "in_hand" or _runout_blocking(t):
+        raise HTTPException(status_code=400, detail="hand already in progress")
     _settle_locked(t)
     _apply_sit_out_next_locked(t)
     _apply_queued_topups_locked(t, force=True)
@@ -2089,8 +2516,42 @@ def _deal_locked(t: LiveTable) -> None:
         variant=VARIANT_PLO5,
     )
     env = _make_env(cfg)
-    seed = secrets.randbits(63)
-    _, info = env.reset(seed, button, in_hand_mask=mask)
+    nxt = t.fair_next if FAIR_ON else None
+    if nxt is not None and (nxt.hand_no != t.hand_no + 1 or nxt.sealed.num_seats != t.num_seats):
+        _fair_void_locked(t, "the table changed before the deal")
+        raise HTTPException(status_code=409, detail="the shuffle is being redone")
+    if nxt is not None:
+        if not nxt.sealed.lock:
+            nxt.sealed.set_lock({})  # nobody contributed: the seal still pins every card
+        deck = nxt.sealed.finish(dict(nxt.reveals))
+        _, info = env.reset_with_deck(deck, button, in_hand_mask=mask)
+        t.hand_seed = 0
+        t.hand_deck = list(deck)
+        t.fair_hand = nxt.sealed
+        t.fair_hand_meta = {
+            "hand_no": int(t.hand_no) + 1,
+            "names": [[st, _seat_name(t, st)] for st, _ in nxt.sealed.locked],
+            "voids": list(nxt.voids),
+        }
+        t.fair_next = None
+        try:  # the transcript outlives the process (history, later audits)
+            pub.DB.q(
+                "INSERT OR REPLACE INTO homegame_fair(game_id,hand_no,data) VALUES(?,?,?)",
+                (t.game_id, int(t.hand_no) + 1, json.dumps(
+                    {"sealed": nxt.sealed.to_store(), "meta": t.fair_hand_meta},
+                    separators=(",", ":"))),
+            )
+        except Exception:  # noqa: BLE001 — never stop a hand over its paperwork
+            logger.exception("homegame fair transcript not stored (table %s)", t.game_id)
+    else:
+        seed = secrets.randbits(63)
+        _, info = env.reset(seed, button, in_hand_mask=mask)
+        t.hand_seed = int(seed)
+        t.hand_deck = []
+        t.fair_hand = None
+        t.fair_hand_meta = {}
+        t.fair_next = None
+    t.hand_actions = []
     # The engine accepted the hand — commit it to the table.
     t.button = button
     t.env = env
@@ -2199,6 +2660,7 @@ def _finish_hand_locked(t: LiveTable) -> None:
     _record_hand_locked(t, raw, payouts, folded)
     _settle_locked(t)  # no-op while an all-in runout is still revealing
     _flush_result_locked(t)
+    _fair_prepare_locked(t)
 
 
 def _record_hand_locked(
@@ -2238,6 +2700,7 @@ def _record_hand_locked(
                 "user_id": int(dealt[i]),
                 "name": name,
                 "start_cents": chips_to_cents(start, t.bb_cents),
+                "start_chips": start,
                 "delta_cents": chips_to_cents(delta, t.bb_cents),
                 "folded": is_folded,
                 "shown": bool(t.showdown_reveal and not is_folded),
@@ -2246,6 +2709,20 @@ def _record_hand_locked(
             if delta > 0:
                 winners.append((name, chips_to_cents(delta, t.bb_cents)))
         pot_cents = chips_to_cents(sum(commit), t.bb_cents)
+        actions = _history_entries(raw, t.bb_cents)
+        for k, a in enumerate(actions):  # who decided: the player, or the clock
+            if k < len(t.hand_actions):
+                a["auto"] = not t.hand_actions[k][3]
+        # who paid whom (runout.money_flows), by user id
+        flow_holes: list[list[int] | None] = [None] * t.num_seats
+        for i in range(t.num_seats):
+            if mask[i] and i < len(all_holes) and not (folded[i] if i < len(folded) else True):
+                flow_holes[i] = [int(c) for c in all_holes[i]]
+        fold_full = [bool(folded[i]) if i < len(folded) else True for i in range(t.num_seats)]
+        flows = money_flows(
+            (commit + [0] * t.num_seats)[: t.num_seats], fold_full, flow_holes,
+            full_a, full_b, t.button,
+        )
         record = {
             "hand_no": int(t.hand_no),
             "ended_at": pub._now(),
@@ -2257,7 +2734,20 @@ def _record_hand_locked(
             "showdown": bool(t.showdown_reveal),
             "board_a": full_a[:n_board],
             "board_b": full_b[:n_board],
-            "actions": _history_entries(raw, t.bb_cents),
+            "actions": actions,
+            "ante_chips": int(t.ante_chips),
+            "bb_chips": BB_CHIPS,
+            "flows": [
+                {"from": int(a), "to": int(b), "cents": chips_to_cents(int(v), t.bb_cents)}
+                for (a, b), v in sorted(flows.items())
+            ],
+            "grades": None,  # filled in by the background grader
+            "fair": (
+                {"hand_id": t.fair_hand.hand_id,
+                 "contributors": [st for st, _ in t.fair_hand.locked],
+                 "voids": len((t.fair_hand_meta or {}).get("voids") or [])}
+                if t.fair_hand is not None else None
+            ),
             "awards": [
                 {
                     "board": a.get("board"),
@@ -2287,6 +2777,15 @@ def _record_hand_locked(
                     (t.game_id, int(t.hand_no), s["user_id"], s["delta_cents"],
                      1 if s["shown"] else 0),
                 )
+            uid_of = {s["seat"]: s["user_id"] for s in seats}
+            for (a, b), v in flows.items():
+                if a in uid_of and b in uid_of and v > 0:
+                    pub.DB.q(
+                        "INSERT OR REPLACE INTO homegame_flows(game_id,hand_no,payer,"
+                        "payee,chips) VALUES(?,?,?,?,?)",
+                        (t.game_id, int(t.hand_no), uid_of[a], uid_of[b], int(v)),
+                    )
+        _enqueue_grading(t, mask, uid_of)
         t.pending_result = {
             "hand_no": int(t.hand_no),
             # Net winners; a hand where everyone got their money back (one
@@ -2296,6 +2795,136 @@ def _record_hand_locked(
         }
     except Exception:  # noqa: BLE001
         logger.exception("homegame hand record failed (table %s)", t.game_id)
+
+
+# --- background grading ------------------------------------------------------------
+
+_GRADE_Q: "queue.Queue[dict | None]" = queue.Queue()
+_GRADE_THREAD: threading.Thread | None = None
+
+
+def _enqueue_grading(t: LiveTable, mask: list[bool], uid_of: dict[int, int]) -> None:
+    """Hand over a finished hand to the grader (cheap: a snapshot of plain
+    values — the worker never touches the live table)."""
+    if not GRADING_ON or not t.hand_actions or not (t.hand_seed or t.hand_deck):
+        return
+    _GRADE_Q.put({
+        "game_id": t.game_id, "hand_no": int(t.hand_no), "seed": int(t.hand_seed),
+        "deck": list(t.hand_deck or []),
+        "button": int(t.button), "num_seats": int(t.num_seats),
+        "stacks": [int(x) for x in (t.hand_start_stacks or [])],
+        "ante": int(t.ante_chips), "mask": [bool(x) for x in mask],
+        "actions": list(t.hand_actions), "uid_of": dict(uid_of),
+    })
+    _start_grader()
+
+
+def _start_grader() -> None:
+    global _GRADE_THREAD
+    if _GRADE_THREAD is not None and _GRADE_THREAD.is_alive():
+        return
+    _GRADE_THREAD = threading.Thread(target=_grader_loop, name="homegame-grader", daemon=True)
+    _GRADE_THREAD.start()
+
+
+def _grader_loop() -> None:
+    while not _WATCHDOG_STOP.is_set():
+        try:
+            job = _GRADE_Q.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        if job is None:
+            return
+        try:
+            _store_grades(job, grade_hand(job))
+        except Exception:  # noqa: BLE001 — cosmetic; never take the table down
+            logger.exception("homegame grading failed (%s #%s)", job.get("game_id"), job.get("hand_no"))
+        finally:
+            _GRADE_Q.task_done()
+
+
+def grade_hand(job: dict[str, Any]) -> list[dict[str, Any]]:
+    """Replay the hand in a full-observation env and score every PLAYER decision
+    with the Trainer's scorer against the served PLO5 model's node distribution
+    (each node from the actor's own seat — exactly what Study would show them)."""
+    from plo5bp.sizing import PLO_ANCHOR_SPEC
+    from plo5bp.ui import server as srv
+    from plo5bp.ui import trainer as tr
+
+    model = srv.MODEL
+    device = next(model.parameters()).device
+    cfg = GameConfig(
+        num_seats=job["num_seats"], starting_stack=0,
+        starting_stacks=tuple(job["stacks"]), ante=job["ante"], bb=BB_CHIPS,
+        variant=VARIANT_PLO5,
+    )
+    env = BombPotEnv(cfg, ev_runout_samples=0)  # FULL observation (not "minimal")
+    if job.get("deck"):
+        obs, info = env.reset_with_deck(job["deck"], job["button"], in_hand_mask=job["mask"])
+    else:
+        obs, info = env.reset(job["seed"], job["button"], in_hand_mask=job["mask"])
+    spec = getattr(model, "anchor_spec", PLO_ANCHOR_SPEC)
+    out: list[dict[str, Any]] = []
+    for k, (seat, gate, chips, by_player) in enumerate(job["actions"]):
+        if env.is_terminal() or info is None or info.actor is None:
+            break
+        if int(info.actor) != int(seat):
+            raise RuntimeError(f"replay diverged at action {k}: actor {info.actor} != {seat}")
+        if by_player:
+            dist = tr.attach_unclamped_brackets(
+                tr.compute_node_distribution(model, device, obs, info), info, spec
+            )
+            if dist["head_version"] >= 2:
+                sc = tr.score_move_v2(dist, int(gate), int(chips))
+            else:
+                sc = tr.score_move(
+                    dist["gate_probs"], dist["alpha"], dist["beta"],
+                    dist["min_chips"], dist["max_chips"], int(gate), int(chips),
+                )
+            out.append({
+                "i": k, "seat": int(seat), "score": round(float(sc["score"]), 1),
+                "cat": str(sc["category"]),
+            })
+        obs, _, _done, info = env.step_hybrid(int(gate), int(chips))
+    return out
+
+
+def _store_grades(job: dict[str, Any], grades: list[dict[str, Any]]) -> None:
+    row = pub.DB.one(
+        "SELECT summary FROM homegame_hands WHERE game_id=? AND hand_no=?",
+        (job["game_id"], job["hand_no"]),
+    )
+    if row is None:
+        return
+    rec = json.loads(row["summary"])
+    rec["grades"] = grades
+    per_seat: dict[int, list[float]] = {}
+    for g in grades:
+        per_seat.setdefault(int(g["seat"]), []).append(float(g["score"]))
+    with pub.DB.transaction():
+        pub.DB.q(
+            "UPDATE homegame_hands SET summary=? WHERE game_id=? AND hand_no=?",
+            (json.dumps(rec, separators=(",", ":")), job["game_id"], job["hand_no"]),
+        )
+        for seat, scores in per_seat.items():
+            uid = job["uid_of"].get(seat)
+            if uid is None:
+                continue
+            pub.DB.q(
+                "UPDATE homegame_hand_results SET acc_sum=?, acc_n=? "
+                "WHERE game_id=? AND hand_no=? AND user_id=?",
+                (float(sum(scores)), len(scores), job["game_id"], job["hand_no"], int(uid)),
+            )
+
+
+def wait_for_grading(timeout: float = 20.0) -> bool:
+    """Tests: block until the grader has drained its queue."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if _GRADE_Q.unfinished_tasks == 0:
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def _flush_result_locked(t: LiveTable) -> None:
@@ -2423,7 +3052,8 @@ def _quantize_raise(t: LiveTable, chips: int, committed: int, lo: int, hi: int) 
 
 
 def _apply_action_locked(
-    t: LiveTable, gate: int, raise_chips: int, *, _resume: bool = True
+    t: LiveTable, gate: int, raise_chips: int, *, _resume: bool = True,
+    by_player: bool = False,
 ) -> None:
     """Apply one action for the CURRENT actor (turn ownership is the
     caller's business: `_act_locked` for players, the away/clock paths for
@@ -2452,6 +3082,11 @@ def _apply_action_locked(
         _, _, done, info = t.env.step_hybrid(gate, chips)
     except Exception as e:  # noqa: BLE001 — engine rejects illegal amounts
         raise HTTPException(status_code=400, detail=str(e)) from e
+    # (seat, gate, chips, the player's own decision?) — what the grader replays.
+    # Clock / away / host auto-actions are recorded but never graded.
+    t.hand_actions.append(
+        (int(actor_raw) if actor_raw is not None else -1, int(gate), int(chips), bool(by_player))
+    )
     # Charge the time bank for THIS decision before the decision id moves on.
     _settle_bank_locked(t, int(actor_raw) if actor_raw is not None else None)
     t.info = info
@@ -2475,7 +3110,7 @@ def _act_locked(t: LiveTable, uid: int, gate: int, raise_chips: int) -> None:
     if actor is None or seat is None or actor != seat:
         raise HTTPException(status_code=400, detail="not your turn")
     me = t.seats[seat]
-    _apply_action_locked(t, gate, raise_chips)
+    _apply_action_locked(t, gate, raise_chips, by_player=True)
     if me is not None:
         me.timeouts = 0  # acted for themselves: the timeout streak is over
 
@@ -3153,6 +3788,8 @@ def _settings_locked(t: LiveTable, uid: int, body: dict) -> None:
             t.listed = _parse_bool(body, "listed", t.listed)
         if body.get("allow_rabbit") is not None:
             t.allow_rabbit = _parse_bool(body, "allow_rabbit", t.allow_rabbit)
+        if body.get("show_grades") is not None:
+            t.show_grades = _parse_bool(body, "show_grades", t.show_grades)
         if body.get("approve_buyins") is not None:
             on = _parse_bool(body, "approve_buyins", t.approve_buyins)
             if on != t.approve_buyins:
@@ -3259,7 +3896,9 @@ def _resize_locked(t: LiveTable, n: int) -> None:
     t.rabbit_full_b = []
 
 
-def _hand_for_viewer(rec: dict[str, Any], viewer_id: int) -> dict[str, Any]:
+def _hand_for_viewer(
+    rec: dict[str, Any], viewer_id: int, show_all_grades: bool = True
+) -> dict[str, Any]:
     """A stored hand as THIS viewer may see it: own cards, plus hands tabled
     at showdown or shown voluntarily. Everything else is face-down — same
     rule as the live table (review 2026-09-20 G1/G2)."""
@@ -3274,6 +3913,12 @@ def _hand_for_viewer(rec: dict[str, Any], viewer_id: int) -> dict[str, Any]:
         s2.pop("user_id", None)
         seats.append(s2)
     out["seats"] = seats
+    my_seats = {int(s["seat"]) for s in seats if s.get("is_me")}
+    grades = rec.get("grades")
+    if grades is not None and not show_all_grades:
+        grades = [g for g in grades if int(g.get("seat", -1)) in my_seats]
+    out["grades"] = grades
+    out["grades_public"] = bool(show_all_grades)
     return out
 
 
@@ -3298,7 +3943,7 @@ def _hands_list(t: LiveTable, viewer_id: int, before: int | None, limit: int) ->
     hands = []
     for r in rows:
         try:
-            rec = _hand_for_viewer(json.loads(r["summary"]), viewer_id)
+            rec = _hand_for_viewer(json.loads(r["summary"]), viewer_id, t.show_grades)
         except Exception:  # noqa: BLE001
             continue
         me = next((s for s in rec["seats"] if s.get("is_me")), None)
@@ -3315,10 +3960,12 @@ def _hands_list(t: LiveTable, viewer_id: int, before: int | None, limit: int) ->
             ],
             "my_delta_cents": int(me["delta_cents"]) if me else None,
             "my_hole": me.get("hole") if me else None,
+            "my_accuracy": _seat_accuracy(rec.get("grades"), me["seat"]) if me else None,
         })
     stats = pub.DB.q(
         "SELECT r.user_id, COUNT(*) hands, SUM(CASE WHEN r.delta_cents>0 THEN 1 ELSE 0 END) wins, "
-        "SUM(r.showdown) showdowns, MAX(r.delta_cents) biggest, u.name, u.email "
+        "SUM(r.showdown) showdowns, MAX(r.delta_cents) biggest, SUM(r.acc_sum) acc_sum, "
+        "SUM(r.acc_n) acc_n, u.name, u.email "
         "FROM homegame_hand_results r JOIN users u ON u.id=r.user_id "
         "WHERE r.game_id=? AND r.hand_no<=? GROUP BY r.user_id ORDER BY hands DESC",
         (t.game_id, _hands_visible_upto(t)),
@@ -3334,9 +3981,274 @@ def _hands_list(t: LiveTable, viewer_id: int, before: int | None, limit: int) ->
                 "wins": int(r["wins"] or 0),
                 "showdowns": int(r["showdowns"] or 0),
                 "biggest_win_cents": max(0, int(r["biggest"] or 0)),
+                "accuracy": (
+                    round(float(r["acc_sum"] or 0) / int(r["acc_n"]), 1)
+                    if int(r["acc_n"] or 0) else None
+                ),
+                "graded": int(r["acc_n"] or 0),
             }
             for r in stats
         ],
+        "h2h": _table_h2h(t),
+    }
+
+
+def _seat_accuracy(grades: list | None, seat: int) -> float | None:
+    mine = [float(g["score"]) for g in (grades or []) if int(g.get("seat", -1)) == int(seat)]
+    return round(sum(mine) / len(mine), 1) if mine else None
+
+
+def _table_h2h(t: LiveTable) -> list[dict[str, Any]]:
+    """Net money between every pair at this table: ``to`` is up ``cents`` on
+    ``from``. Hands still revealing are excluded (G11)."""
+    rows = pub.DB.q(
+        "SELECT payer, payee, SUM(chips) chips FROM homegame_flows "
+        "WHERE game_id=? AND hand_no<=? GROUP BY payer, payee",
+        (t.game_id, _hands_visible_upto(t)),
+    )
+    gross = {(int(r["payer"]), int(r["payee"])): int(r["chips"] or 0) for r in rows}
+    names: dict[int, str] = {}
+    out = []
+    for (a, b), v in gross.items():
+        net = v - gross.get((b, a), 0)
+        if net <= 0:
+            continue
+        for uid in (a, b):
+            if uid not in names:
+                u = pub._user_by_id(uid)
+                names[uid] = _display_name(u) if u is not None else f"player-{uid}"
+        out.append({"from": names[a], "to": names[b],
+                    "cents": chips_to_cents(net, t.bb_cents)})
+    out.sort(key=lambda x: -x["cents"])
+    return out
+
+
+# --- the club: everyone's numbers, side by side ------------------------------------------
+#
+# Home games are a private circle (admin-granted), so stats are open inside it:
+# every member sees every player's accuracy, profit and loss, the money between
+# every pair, and can browse anyone's hands (cards still follow the reveal
+# rule). Sessions an admin took out of the record (``homegames.excluded`` —
+# test tables) count nowhere; that is a soft flag and can be undone.
+
+
+def _revealing_now() -> list[tuple[str, int]]:
+    """(game_id, hand_no) of hands whose runout is still being shown: their
+    result must not surface through an aggregate a few seconds early (G11)."""
+    with HUB._lock:
+        tables = list(HUB._tables.values())
+    out = []
+    for tb in tables:
+        with tb.lock:
+            if _runout_blocking(tb):
+                out.append((tb.game_id, int(tb.hand_no)))
+    return out
+
+
+def _community(viewer_id: int, is_admin: bool) -> dict[str, Any]:
+    skip = _revealing_now()
+    guard = "".join(" AND NOT (r.game_id=? AND r.hand_no=?)" for _ in skip)
+    gargs = [x for pair in skip for x in pair]
+    rows = pub.DB.q(
+        "SELECT r.user_id, u.name, u.email, COUNT(*) hands, SUM(r.delta_cents) net, "
+        "SUM(r.acc_sum) a, SUM(r.acc_n) n, SUM(CASE WHEN r.delta_cents>0 THEN 1 ELSE 0 END) wins, "
+        "COUNT(DISTINCT r.game_id) sessions, MAX(r.delta_cents) best "
+        "FROM homegame_hand_results r JOIN homegames g ON g.id=r.game_id "
+        f"JOIN users u ON u.id=r.user_id WHERE g.excluded=0{guard} GROUP BY r.user_id",
+        tuple(gargs),
+    )
+    players = [
+        {
+            "user_id": int(r["user_id"]), "name": _display_name(r),
+            "is_me": int(r["user_id"]) == int(viewer_id),
+            "hands": int(r["hands"] or 0), "wins": int(r["wins"] or 0),
+            "sessions": int(r["sessions"] or 0), "net_cents": int(r["net"] or 0),
+            "best_cents": max(0, int(r["best"] or 0)),
+            "accuracy": round(float(r["a"] or 0) / int(r["n"]), 1) if int(r["n"] or 0) else None,
+            "graded": int(r["n"] or 0),
+        }
+        for r in rows
+    ]
+    players.sort(key=lambda x: -x["net_cents"])
+    fguard = guard.replace("r.game_id", "f.game_id").replace("r.hand_no", "f.hand_no")
+    gross: dict[tuple[int, int], float] = {}
+    for r in pub.DB.q(
+        "SELECT f.payer, f.payee, SUM(f.chips * g.bb_cents) v FROM homegame_flows f "
+        f"JOIN homegames g ON g.id=f.game_id WHERE g.excluded=0{fguard} "
+        "GROUP BY f.payer, f.payee", tuple(gargs),
+    ):
+        gross[(int(r["payer"]), int(r["payee"]))] = float(r["v"] or 0) / BB_CHIPS
+    pairs = []
+    for (a, b), v in gross.items():
+        net = v - gross.get((b, a), 0.0)
+        if net > 0.5:  # b is up `cents` on a
+            pairs.append({"from": a, "to": b, "cents": int(round(net))})
+    sess = pub.DB.q(
+        "SELECT g.id, g.name, g.status, g.excluded, g.created_at, g.closed_at, g.hand_no, "
+        "g.sb_cents, g.bb_cents, g.ante_cents, "
+        "(SELECT COUNT(*) FROM homegame_players p WHERE p.game_id=g.id AND p.buyin_cents>0) players "
+        "FROM homegames g " + ("" if is_admin else "WHERE g.excluded=0 ") +
+        "ORDER BY g.created_at DESC LIMIT 300"
+    )
+    return {
+        "players": players, "pairs": pairs, "is_admin": bool(is_admin),
+        "sessions": [
+            {"id": r["id"], "name": r["name"], "open": r["status"] == "open",
+             "excluded": bool(int(r["excluded"] or 0)), "created_at": r["created_at"],
+             "closed_at": r["closed_at"], "hands": int(r["hand_no"] or 0),
+             "players": int(r["players"] or 0), "sb_cents": int(r["sb_cents"]),
+             "bb_cents": int(r["bb_cents"]), "ante_cents": int(r["ante_cents"])}
+            for r in sess
+        ],
+    }
+
+
+def _exclude_locked(t: LiveTable, user: Any, on: bool) -> None:
+    """Admin: take a session out of the record (test tables) or put it back.
+    Nothing is deleted — hands, ledger and flows stay in the database and the
+    table still opens by its link; it just counts nowhere. An open table is
+    closed first (everyone is cashed out), so it also leaves the lobby."""
+    if not pub._is_admin(user):
+        raise HTTPException(status_code=403, detail="only the site admin can do that")
+    if on and t.status == "open":
+        if _hand_busy(t):
+            raise HTTPException(status_code=400, detail="wait for the hand to finish")
+        with _mutation(t):
+            for i in list(t.occupied()):
+                _cash_out_seat(t, i)
+            t.pending_kicks.clear()
+            t.status = "closed"
+            t.running = False
+            t.phase = "waiting"
+            _persist_meta(t)
+        t.env = None
+        t.info = None
+        t.runout_active = False
+    pub.DB.q("UPDATE homegames SET excluded=? WHERE id=?", (1 if on else 0, t.game_id))
+    t.rev += 1
+
+
+# --- a player's lifetime database ---------------------------------------------------
+
+_MY_SORTS = {
+    "time": "h.ended_at",
+    "pot": "h.pot_cents",
+    "net": "r.delta_cents",
+    "accuracy": "(CASE WHEN r.acc_n>0 THEN r.acc_sum/r.acc_n ELSE NULL END)",
+}
+
+
+def _my_hands(viewer_id: int, sort: str, direction: str, game_id: str | None,
+              offset: int, limit: int, player_id: int | None = None) -> dict[str, Any]:
+    """``player_id``'s hands (default: the viewer's own). The club is private and
+    everyone may browse everyone's history — but the CARDS in it follow the live
+    table's rule for the VIEWER: their own, plus hands that were tabled or shown.
+    Browsing Riley's history never turns over a hand Riley mucked."""
+    player = int(player_id) if player_id is not None else int(viewer_id)
+    col = _MY_SORTS.get(sort, _MY_SORTS["time"])
+    desc = str(direction).lower() != "asc"
+    limit = max(1, min(HANDS_PAGE_MAX, int(limit)))
+    offset = max(0, int(offset))
+    where = "r.user_id=? AND g.excluded=0"
+    args: list[Any] = [player]
+    if game_id:
+        where += " AND r.game_id=?"
+        args.append(str(game_id))
+    # A hand is never served while its table is still playing / revealing it.
+    live = {}
+    with HUB._lock:
+        tables = list(HUB._tables.values())
+    for tb in tables:
+        with tb.lock:
+            live[tb.game_id] = _hands_visible_upto(tb)
+    total = pub.DB.one(
+        "SELECT COUNT(*) c FROM homegame_hand_results r "
+        f"JOIN homegames g ON g.id=r.game_id WHERE {where}", tuple(args)
+    )["c"]
+    rows = pub.DB.q(
+        "SELECT r.game_id, r.hand_no, r.delta_cents, r.acc_sum, r.acc_n, h.ended_at, "
+        "h.pot_cents, h.summary, g.name AS table_name FROM homegame_hand_results r "
+        "JOIN homegame_hands h ON h.game_id=r.game_id AND h.hand_no=r.hand_no "
+        "JOIN homegames g ON g.id=r.game_id "
+        f"WHERE {where} ORDER BY ({col} IS NULL), {col} {'DESC' if desc else 'ASC'}, "
+        "h.ended_at DESC LIMIT ? OFFSET ?",
+        tuple(args + [limit, offset]),
+    )
+    hands = []
+    for r in rows:
+        if r["game_id"] in live and int(r["hand_no"]) > live[r["game_id"]]:
+            continue
+        try:
+            full = json.loads(r["summary"])
+            seat_no = next(
+                (int(x["seat"]) for x in full.get("seats") or []
+                 if int(x.get("user_id") or -1) == player), None,
+            )
+            rec = _hand_for_viewer(full, viewer_id)
+        except Exception:  # noqa: BLE001
+            continue
+        me = next((x for x in rec["seats"] if int(x["seat"]) == seat_no), None)
+        hands.append({
+            "game_id": r["game_id"], "table_name": r["table_name"],
+            "hand_no": int(r["hand_no"]), "ended_at": r["ended_at"],
+            "pot_cents": int(r["pot_cents"]), "net_cents": int(r["delta_cents"]),
+            "accuracy": round(float(r["acc_sum"]) / int(r["acc_n"]), 1) if int(r["acc_n"] or 0) else None,
+            "showdown": bool(rec.get("showdown")),
+            "my_hole": me.get("hole") if me else None,
+            "board_a": rec.get("board_a") or [], "board_b": rec.get("board_b") or [],
+        })
+    return {"hands": hands, "total": int(total), "offset": offset, "limit": limit}
+
+
+def _my_stats(viewer_id: int) -> dict[str, Any]:
+    uid = int(viewer_id)
+    who = pub._user_by_id(uid)
+    tot = pub.DB.one(
+        "SELECT COUNT(*) hands, COALESCE(SUM(r.delta_cents),0) net, COALESCE(SUM(r.acc_sum),0) a, "
+        "COALESCE(SUM(r.acc_n),0) n, SUM(CASE WHEN r.delta_cents>0 THEN 1 ELSE 0 END) wins "
+        "FROM homegame_hand_results r JOIN homegames g ON g.id=r.game_id "
+        "WHERE r.user_id=? AND g.excluded=0", (uid,),
+    )
+    sessions = pub.DB.q(
+        "SELECT g.id, g.name, g.status, g.sb_cents, g.bb_cents, g.ante_cents, COUNT(*) hands, "
+        "SUM(r.delta_cents) net, SUM(r.acc_sum) a, SUM(r.acc_n) n, MAX(h.ended_at) last "
+        "FROM homegame_hand_results r JOIN homegames g ON g.id=r.game_id "
+        "JOIN homegame_hands h ON h.game_id=r.game_id AND h.hand_no=r.hand_no "
+        "WHERE r.user_id=? AND g.excluded=0 GROUP BY g.id ORDER BY last DESC LIMIT 200", (uid,),
+    )
+    # head to head, in CENTS (chips are relative to each table's big blind)
+    vs: dict[int, float] = {}
+    for r in pub.DB.q(
+        "SELECT f.payer, f.payee, SUM(f.chips * g.bb_cents) v FROM homegame_flows f "
+        "JOIN homegames g ON g.id=f.game_id WHERE (f.payer=? OR f.payee=?) AND g.excluded=0 "
+        "GROUP BY f.payer, f.payee", (uid, uid),
+    ):
+        other = int(r["payee"]) if int(r["payer"]) == uid else int(r["payer"])
+        sign = -1 if int(r["payer"]) == uid else 1
+        vs[other] = vs.get(other, 0.0) + sign * float(r["v"] or 0) / BB_CHIPS
+    versus = []
+    for other, cents in vs.items():
+        u = pub._user_by_id(other)
+        versus.append({"user_id": other,
+                       "name": _display_name(u) if u is not None else f"player-{other}",
+                       "net_cents": int(round(cents))})
+    versus.sort(key=lambda x: -x["net_cents"])
+    n = int(tot["n"] or 0)
+    return {
+        "user_id": uid, "name": _display_name(who) if who is not None else f"player-{uid}",
+        "hands": int(tot["hands"] or 0), "wins": int(tot["wins"] or 0),
+        "net_cents": int(tot["net"] or 0),
+        "accuracy": round(float(tot["a"]) / n, 1) if n else None, "graded": n,
+        "sessions": [
+            {"id": r["id"], "name": r["name"], "open": r["status"] == "open",
+             "sb_cents": int(r["sb_cents"]), "bb_cents": int(r["bb_cents"]),
+             "ante_cents": int(r["ante_cents"]), "hands": int(r["hands"]),
+             "net_cents": int(r["net"] or 0),
+             "accuracy": round(float(r["a"]) / int(r["n"]), 1) if int(r["n"] or 0) else None,
+             "last_played": r["last"]}
+            for r in sessions
+        ],
+        "versus": versus,
     }
 
 
@@ -3349,7 +4261,10 @@ def _hand_detail(t: LiveTable, viewer_id: int, hand_no: int) -> dict[str, Any]:
     )
     if row is None:
         raise HTTPException(status_code=404, detail="Not Found")
-    return _hand_for_viewer(json.loads(row["summary"]), viewer_id)
+    out = _hand_for_viewer(json.loads(row["summary"]), viewer_id, t.show_grades)
+    out["game_id"] = t.game_id
+    out["table_name"] = t.name
+    return out
 
 
 def _parse_cents(body: dict, key: str, default: int | None = None) -> int:
@@ -3555,7 +4470,7 @@ def _my_sessions(viewer_id: int, limit: int = 12) -> list[dict[str, Any]]:
         "SELECT g.id, g.name, g.sb_cents, g.bb_cents, g.ante_cents, g.hand_no, "
         "g.closed_at, p.buyin_cents, p.leftover_cents FROM homegame_players p "
         "JOIN homegames g ON g.id=p.game_id "
-        "WHERE p.user_id=? AND g.status='closed' AND p.buyin_cents>0 "
+        "WHERE p.user_id=? AND g.status='closed' AND p.buyin_cents>0 AND g.excluded=0 "
         "ORDER BY g.closed_at DESC LIMIT ?",
         (int(viewer_id), int(limit)),
     )
@@ -3802,6 +4717,68 @@ def install(app: FastAPI, *, static_dir: Path) -> None:
         with t.lock:
             _react_locked(t, uid, (body or {}).get("emote"))
             return _view(t, uid)
+
+    @app.get("/games/api/my/hands")
+    def api_my_hands(sort: str = "time", dir: str = "desc", game: str | None = None,
+                     offset: int = 0, limit: int = 40):
+        """The signed-in player's lifetime hand database."""
+        return _my_hands(_uid(), sort, dir, game, offset, limit)
+
+    @app.get("/games/api/my/stats")
+    def api_my_stats():
+        return _my_stats(_uid())
+
+    @app.get("/games/api/community")
+    def api_community():
+        """Everyone's numbers: player cards, the pairwise money, all sessions."""
+        uid = _uid()
+        user = pub._user_by_id(uid)
+        return _community(uid, bool(user is not None and pub._is_admin(user)))
+
+    @app.get("/games/api/players/{player_id}/stats")
+    def api_player_stats(player_id: int):
+        _uid()
+        if pub._user_by_id(int(player_id)) is None:
+            raise HTTPException(status_code=404, detail="Not Found")
+        return _my_stats(int(player_id))
+
+    @app.get("/games/api/players/{player_id}/hands")
+    def api_player_hands(player_id: int, sort: str = "time", dir: str = "desc",
+                         game: str | None = None, offset: int = 0, limit: int = 40):
+        return _my_hands(_uid(), sort, dir, game, offset, limit, player_id=int(player_id))
+
+    @app.post("/games/api/tables/{game_id}/fair/commit")
+    def api_fair_commit(game_id: str, body: dict = Body({})):
+        t = _table_for(game_id)
+        uid = _uid()
+        with t.lock:
+            _fair_commit_locked(t, uid, str(body.get("hand_id") or ""), str(body.get("commit") or ""))
+            return {"ok": True}
+
+    @app.post("/games/api/tables/{game_id}/fair/reveal")
+    def api_fair_reveal(game_id: str, body: dict = Body({})):
+        t = _table_for(game_id)
+        uid = _uid()
+        with t.lock:
+            _fair_reveal_locked(t, uid, str(body.get("hand_id") or ""), str(body.get("nonce") or ""))
+            return {"ok": True}
+
+    @app.get("/games/api/tables/{game_id}/fair/{hand_no}")
+    def api_fair_transcript(game_id: str, hand_no: int):
+        t = _table_for(game_id)
+        uid = _uid()
+        with t.lock:
+            return _fair_transcript(t, uid, int(hand_no))
+
+    @app.post("/games/api/tables/{game_id}/exclude")
+    def api_exclude(game_id: str, body: dict = Body({})):
+        t = _table_for(game_id)
+        uid = _uid()
+        user = pub._user_by_id(uid)
+        on = _parse_bool(body, "on", True)
+        with t.lock:
+            _exclude_locked(t, user, on)
+        return {"ok": True, "id": t.game_id, "excluded": on}
 
     @app.get("/games/api/tables/{game_id}/hands")
     def api_hands(game_id: str, before: int | None = None, limit: int = 30):

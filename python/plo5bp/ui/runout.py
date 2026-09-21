@@ -163,6 +163,74 @@ def build_awards(
     return awards
 
 
+# --- Who paid whom ---------------------------------------------------------------
+#
+# A pot is a stack of LAYERS (main pot, side pots). Every contributor puts the
+# same amount into a layer, and the layer is paid out to its winners (half per
+# board, split between tied hands). The money one player lost in a layer is
+# attributed to that layer's winners IN PROPORTION TO WHAT EACH OF THEM TOOK
+# from it; what a winner "pays" to themselves is not a transfer. Summed over the
+# layers this decomposes every player's result exactly into pairwise flows:
+# scoops, chops, quartering, dead money from folded players and any depth of
+# side pots all fall out of the same rule, and uncalled chips (a layer with one
+# contributor) flow back to their owner, i.e. nowhere.
+
+
+def money_flows(
+    total_commit: list[int],
+    folded: list[bool],
+    holes: list[list[int] | None],
+    board_a: list[int],
+    board_b: list[int],
+    button: int,
+) -> dict[tuple[int, int], int]:
+    """``{(payer_seat, payee_seat): chips}`` — NET, payer != payee, chips > 0."""
+    from fractions import Fraction
+
+    n = len(total_commit)
+    commit = [max(0, int(c)) for c in total_commit]
+    alive = [i for i in range(n) if not folded[i] and commit[i] > 0]
+    gross: dict[tuple[int, int], Fraction] = {}
+    prev = 0
+    for level in sorted({c for c in commit if c > 0}):
+        per = level - prev
+        prev = level
+        contributors = [i for i in range(n) if commit[i] >= level]
+        chips = per * len(contributors)
+        if chips <= 0:
+            continue
+        eligible = [i for i in contributors if not folded[i]]
+        shares: dict[int, int] = {}
+        if len(alive) <= 1:
+            if alive:
+                shares = {alive[0]: chips}
+        elif len(eligible) == 1:
+            shares = {eligible[0]: chips}
+        elif eligible:
+            half_a = chips // 2
+            for board, half in ((board_a, half_a), (board_b, chips - half_a)):
+                if half <= 0:
+                    continue
+                winners, _ = _winners_on_board(holes, eligible, board)
+                for k, v in _distribute(half, winners or list(eligible), button, n).items():
+                    shares[k] = shares.get(k, 0) + int(v)
+        if not shares:
+            continue  # nobody can win it: the chips go back where they came from
+        for i in contributors:
+            for w, got in shares.items():
+                if w != i and got:
+                    gross[(i, w)] = gross.get((i, w), Fraction(0)) + Fraction(per * got, chips)
+    net: dict[tuple[int, int], int] = {}
+    for a, b in {tuple(sorted(k)) for k in gross}:
+        d = gross.get((a, b), Fraction(0)) - gross.get((b, a), Fraction(0))  # a pays b
+        amt = int(round(d))
+        if amt > 0:
+            net[(a, b)] = amt
+        elif amt < 0:
+            net[(b, a)] = -amt
+    return net
+
+
 # --- All-in equity ------------------------------------------------------------
 #
 # (review 2026-09-20 G3) The first version enumerated ORDERED PAIRS of board
