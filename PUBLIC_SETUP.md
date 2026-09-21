@@ -24,15 +24,20 @@ scp checkpoints/stub.pt root@87.99.132.209:/opt/wrapgto/app/checkpoints/stub.pt
 ssh root@87.99.132.209 systemctl restart wrapgto
 ```
 
-- Deploy code changes: **`scripts/deploy_prod.sh`** (from the laptop — the
-  only key the server accepts). It is the tar-over-ssh ship (excl. .git/.venv/
-  checkpoints/data/secrets), then it REBUILDS THE RUST ENGINE on the server
-  (`.venv/bin/maturin develop --release` as user `wrapgto`), restarts
-  `wrapgto` and checks `/health`. The engine rebuild matters since
-  2026-09-25: the home games' verifiable shuffle needs the engine's
-  `reset_with_deck`; without it the site still runs and the tables deal the
-  old way, shown as "Unverified shuffle" (`SKIP_ENGINE=1` skips the rebuild).
-  Kill switch: `PLO5BP_HOMEGAME_FAIR=0` in `/etc/wrapgto/env`.
+- Deploy code changes: **`scripts/deploy_prod.sh`** (Git Bash; any machine whose
+  key the server accepts). `check` = read-only look at the server; `pack` = what
+  would ship (offline); `stage` = upload, BUILD THE RUST ENGINE and start-test the
+  new code in `/opt/wrapgto/ship-staging` without touching the live site; no
+  argument = stage, then switch: copy of the live code kept in
+  `/opt/wrapgto/backups/app-before-*.tgz`, one restart, health poll, automatic
+  rollback if the app does not come up. It runs the daily DB backup job first.
+  The engine is built by ROOT (rustup lives in `/root`; `wrapgto` is a no-login
+  service account and should stay one) as a wheel in staging, so Python and engine
+  go live together and a failed build changes nothing. Engine matters since
+  2026-09-25: the home games' verifiable shuffle needs `reset_with_deck`
+  (`SKIP_ENGINE=1` reuses the live engine; tables then say "Unverified shuffle").
+  Kill switch: `PLO5BP_HOMEGAME_FAIR=0` in `/etc/wrapgto/env`. A restart ends a
+  home-game hand in progress — `check` shows how many tables are open.
 - **Deploying from a new machine** (one-time, ~10 min). Every machine gets its
   OWN key — never copy a private key between machines; a lost PC is then one
   line to revoke.
@@ -48,7 +53,7 @@ ssh root@87.99.132.209 systemctl restart wrapgto
      address above>` / `User root` / `IdentityFile ~/.ssh/wrapgto_<machine>` /
      `IdentitiesOnly yes`.
   5. `scripts/deploy_prod.sh check` (read-only) must say "connected", "app
-     service: active" and cargo/maturin "ok". The script uses Windows' own
+     service: active" and cargo (root) / maturin "ok". The script uses Windows' own
      `ssh.exe` when it exists (that is the one that talks to the agent) and ships
      through a temp archive — PowerShell 5.1 pipes are not binary-safe, so never
      `tar | ssh` from PowerShell. `scripts/deploy_prod.sh pack` shows, offline,
