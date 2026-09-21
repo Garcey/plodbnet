@@ -249,127 +249,100 @@ fn eval_p0(nodes: &HashMap<String, Node>, cards: [usize; 2], history: &str) -> f
     v
 }
 
-/// Exploitability via infoset-consistent pure BR (not omniscient full-state BR).
-/// For each infoset of the BR player, pick the action that maximizes expected
-/// utility averaged over opponent cards (uniform over remaining cards).
+/// Exploitability (NashConv / 2) of the average strategy via an exact
+/// infoset-consistent best response.
+///
+/// (review 2026-09-20 F11) The previous "BR" was unsound twice over: it ranked
+/// each infoset's actions assuming BOTH players keep playing the average
+/// strategy afterwards (no backward induction — the responder's own later
+/// decisions were not best responses), and it averaged over the opponent's
+/// cards UNIFORMLY instead of weighting them by the opponent's reach to that
+/// infoset (after a bet, the bettor's range is not uniform). It under-reported:
+/// 0.00054 vs a true 0.0023 at 5k iterations, so the gate could pass a
+/// strategy that was 4x more exploitable than claimed.
 fn exploitability_avg(nodes: &HashMap<String, Node>) -> f64 {
     let v = game_value_avg(nodes);
-    let br0 = infoset_br_value(nodes, 0);
-    let br1 = infoset_br_value(nodes, 1);
+    let br0 = best_response_value(nodes, 0);
+    let br1 = best_response_value(nodes, 1);
     // br_* are utilities for that player
     ((br0 - v) + (br1 - (-v))) / 2.0
 }
 
-fn infoset_br_value(nodes: &HashMap<String, Node>, br_player: usize) -> f64 {
-    // Build pure BR policy: infoset_key -> action index
-    let mut policy: HashMap<String, usize> = HashMap::new();
-    // All infosets for br_player that appear under average play
-    let infosets = collect_infosets(br_player);
-    for key in infosets {
-        let best_a = best_action_for_infoset(nodes, &key, br_player);
-        policy.insert(key, best_a);
-    }
-    // Evaluate policy vs average opponent
-    let mut total = 0.0;
-    let mut n = 0.0;
-    for c0 in 0..3usize {
-        for c1 in 0..3usize {
-            if c0 == c1 {
-                continue;
+/// `w[own][opp]` = chance probability × the opponent's average-strategy reach.
+type DealWeights = [[f64; 3]; 3];
+
+/// Value of `br_player`'s best response to the opponent's average strategy.
+fn best_response_value(nodes: &HashMap<String, Node>, br_player: usize) -> f64 {
+    let mut w: DealWeights = [[0.0; 3]; 3];
+    for own in 0..3 {
+        for opp in 0..3 {
+            if own != opp {
+                w[own][opp] = 1.0 / 6.0;
             }
-            let u0 = eval_with_br(nodes, &policy, [c0, c1], "", br_player);
-            let up = if br_player == 0 { u0 } else { -u0 };
-            total += up;
-            n += 1.0;
         }
     }
-    total / n
+    br_cf_values(nodes, br_player, "", &w).iter().sum()
 }
 
-fn collect_infosets(player: usize) -> Vec<String> {
-    // All card×history pairs where it's this player's turn
-    let mut out = Vec::new();
-    let histories: &[&str] = if player == 0 {
-        &["", "pb"] // P0 acts at root and after check-bet
-    } else {
-        &["p", "b"] // P1 acts after check or bet
-    };
-    for card in 0..3usize {
-        for &h in histories {
-            out.push(infoset_key(card, h));
-        }
-    }
-    out
-}
-
-fn best_action_for_infoset(
+/// Backward induction. Returns, per own card, the counterfactual value
+/// `Σ_opp w[own][opp] · u(own, opp)` with the responder playing optimally
+/// from `history` on. At the responder's nodes the infoset is (own card,
+/// history), so the max is taken per own card over these reach-weighted sums.
+fn br_cf_values(
     nodes: &HashMap<String, Node>,
-    key: &str,
     br_player: usize,
-) -> usize {
-    // key = "{card}{history}"
-    let card = key.chars().next().unwrap().to_digit(10).unwrap() as usize;
-    let history = &key[1..];
-    let mut best_a = 0;
-    let mut best_v = f64::NEG_INFINITY;
-    for a in 0..N_ACTIONS {
-        let mut ev = 0.0;
-        let mut w = 0.0;
-        for opp in 0..3usize {
-            if opp == card {
-                continue;
-            }
-            let cards = if br_player == 0 {
-                [card, opp]
-            } else {
-                [opp, card]
-            };
-            let mut next = history.to_string();
-            next.push(if a == 0 { 'p' } else { 'b' });
-            // Continue with average strategy for both (BR only at this decision
-            // for action ranking — full tree BR is composed via policy table)
-            let u0 = eval_p0(nodes, cards, &next);
-            let up = if br_player == 0 { u0 } else { -u0 };
-            ev += up;
-            w += 1.0;
-        }
-        let v = if w > 0.0 { ev / w } else { 0.0 };
-        if v > best_v {
-            best_v = v;
-            best_a = a;
-        }
-    }
-    best_a
-}
-
-fn eval_with_br(
-    nodes: &HashMap<String, Node>,
-    policy: &HashMap<String, usize>,
-    cards: [usize; 2],
     history: &str,
-    br_player: usize,
-) -> f64 {
-    // Returns P0 utility
+    w: &DealWeights,
+) -> [f64; 3] {
+    let cards_of = |own: usize, opp: usize| -> [usize; 2] {
+        if br_player == 0 {
+            [own, opp]
+        } else {
+            [opp, own]
+        }
+    };
     if is_terminal(history) {
-        return terminal_util_for_player(history, cards, 0);
+        let mut v = [0.0; 3];
+        for own in 0..3 {
+            for opp in 0..3 {
+                if w[own][opp] != 0.0 {
+                    v[own] += w[own][opp]
+                        * terminal_util_for_player(history, cards_of(own, opp), br_player);
+                }
+            }
+        }
+        return v;
     }
     let player = history.len() % 2;
-    if player == br_player {
-        let key = infoset_key(cards[player], history);
-        let a = policy.get(&key).copied().unwrap_or(0);
+    let child = |a: usize| -> String {
         let mut next = history.to_string();
         next.push(if a == 0 { 'p' } else { 'b' });
-        eval_with_br(nodes, policy, cards, &next, br_player)
-    } else {
-        let s = avg_strat_at(nodes, cards[player], history);
-        let mut v = 0.0;
-        for (a, &ch) in [b'p', b'b'].iter().enumerate() {
-            let mut next = history.to_string();
-            next.push(ch as char);
-            v += s[a] * eval_with_br(nodes, policy, cards, &next, br_player);
+        next
+    };
+    if player == br_player {
+        let v0 = br_cf_values(nodes, br_player, &child(0), w);
+        let v1 = br_cf_values(nodes, br_player, &child(1), w);
+        let mut v = [0.0; 3];
+        for own in 0..3 {
+            v[own] = v0[own].max(v1[own]);
         }
-        v
+        return v;
     }
+    let mut v = [0.0; 3];
+    for a in 0..N_ACTIONS {
+        let mut w2 = *w;
+        for opp in 0..3 {
+            let p = avg_strat_at(nodes, opp, history)[a];
+            for own in 0..3 {
+                w2[own][opp] *= p;
+            }
+        }
+        let va = br_cf_values(nodes, br_player, &child(a), &w2);
+        for own in 0..3 {
+            v[own] += va[own];
+        }
+    }
+    v
 }
 
 #[derive(Debug, Clone)]
@@ -404,6 +377,89 @@ mod tests {
             rep.exploitability,
             rep.value_p0
         );
+    }
+
+    /// Exhaustive reference: evaluate all 2^6 pure responder policies.
+    fn brute_force_br(nodes: &HashMap<String, Node>, br_player: usize) -> f64 {
+        fn eval(
+            nodes: &HashMap<String, Node>,
+            policy: &HashMap<String, usize>,
+            cards: [usize; 2],
+            history: &str,
+            br_player: usize,
+        ) -> f64 {
+            if is_terminal(history) {
+                return terminal_util_for_player(history, cards, br_player);
+            }
+            let player = history.len() % 2;
+            let next = |a: usize| format!("{history}{}", if a == 0 { 'p' } else { 'b' });
+            if player == br_player {
+                let a = policy[&infoset_key(cards[player], history)];
+                return eval(nodes, policy, cards, &next(a), br_player);
+            }
+            let s = avg_strat_at(nodes, cards[player], history);
+            (0..N_ACTIONS)
+                .map(|a| s[a] * eval(nodes, policy, cards, &next(a), br_player))
+                .sum()
+        }
+        let hists: [&str; 2] = if br_player == 0 { ["", "pb"] } else { ["p", "b"] };
+        let keys: Vec<String> = (0..3)
+            .flat_map(|c| hists.iter().map(move |h| infoset_key(c, h)))
+            .collect();
+        let mut best = f64::NEG_INFINITY;
+        for mask in 0..(1usize << keys.len()) {
+            let policy: HashMap<String, usize> = keys
+                .iter()
+                .enumerate()
+                .map(|(i, k)| (k.clone(), (mask >> i) & 1))
+                .collect();
+            let mut tot = 0.0;
+            for c0 in 0..3 {
+                for c1 in 0..3 {
+                    if c0 != c1 {
+                        tot += eval(nodes, &policy, [c0, c1], "", br_player) / 6.0;
+                    }
+                }
+            }
+            best = best.max(tot);
+        }
+        best
+    }
+
+    /// (review 2026-09-20 F11) the gate's BR is a TRUE best response.
+    #[test]
+    fn kuhn_best_response_is_exact() {
+        // Uniform random play (empty table): known exploitability 11/24.
+        let empty: HashMap<String, Node> = HashMap::new();
+        assert!((exploitability_avg(&empty) - 11.0 / 24.0).abs() < 1e-12);
+
+        // Partially trained tables: backward induction == exhaustive search.
+        for iters in [1u32, 7, 200, 3000] {
+            let mut nodes: HashMap<String, Node> = HashMap::new();
+            for _ in 0..iters {
+                for c0 in 0..3 {
+                    for c1 in 0..3 {
+                        if c0 != c1 {
+                            cfr(&mut nodes, [c0, c1], "", 1.0, 1.0);
+                        }
+                    }
+                }
+            }
+            for p in 0..2 {
+                let fast = best_response_value(&nodes, p);
+                let slow = brute_force_br(&nodes, p);
+                assert!((fast - slow).abs() < 1e-12, "iters={iters} p={p}: {fast} vs {slow}");
+            }
+            assert!(exploitability_avg(&nodes) >= -1e-12);
+        }
+    }
+
+    /// Exploitability shrinks with training (it is a real convergence signal).
+    #[test]
+    fn kuhn_exploitability_decreases() {
+        let a = solve_kuhn(200).exploitability;
+        let b = solve_kuhn(20_000).exploitability;
+        assert!(b < 0.25 * a, "expl@200={a} expl@20k={b}");
     }
 
     #[test]

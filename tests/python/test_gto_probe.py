@@ -35,26 +35,46 @@ from plo5bp.gto.obs_from_label import labels_to_supervised_rows
 from plo5bp.sizing import NLH_ANCHOR_SPEC
 
 
-def _pure_fold_label(seed: int = 0) -> LabelRecord:
-    return make_smoke_label(seed=seed, trash_fold=True)
+def _as_teacher(lab: LabelRecord, root: str) -> LabelRecord:
+    """Dress a smoke label as an exported rust_cfr teacher record: a root id
+    and the per-record provenance ``cfr_export`` stamps (review 2026-09-20)."""
+    lab.source = "rust_cfr"
+    lab.root_name = root
+    lab.notes = {
+        **lab.notes,
+        "exploitability_bb": 0.4,
+        "expl_kind": "infoset_br",
+        "expl_verified": True,
+        "teacher_max_expl_bb": 1.0,
+    }
+    return lab
 
 
-def _pure_jam_label(seed: int = 1) -> LabelRecord:
-    return make_smoke_label(seed=seed, trash_fold=False)
+def _pure_fold_label(seed: int = 0, root: str = "train_root") -> LabelRecord:
+    return _as_teacher(make_smoke_label(seed=seed, trash_fold=True), root)
+
+
+def _pure_jam_label(seed: int = 1, root: str = "train_root") -> LabelRecord:
+    return _as_teacher(make_smoke_label(seed=seed, trash_fold=False), root)
 
 
 def test_evaluate_gates_pass_and_fail():
     from plo5bp.gto.probe import ProbeReport
 
+    sizing = dict(
+        n_raise_rows=8, mean_anchor_kl=0.05, mean_jam_gap=0.02, jam_freq_gap=0.01
+    )
     good = ProbeReport(
-        n=20, pure_n=10, pure_agree=0.95, mean_gate_kl=0.1, mean_gate_acc=0.9
+        n=20, pure_n=10, pure_agree=0.95, mean_gate_kl=0.1, mean_gate_acc=0.9,
+        **sizing,
     )
     r = evaluate_probe_gates(good, ProbeGates(min_n=5, min_pure_agree=0.9))
     assert r.passed
     assert not r.reasons
 
     bad_kl = ProbeReport(
-        n=20, pure_n=10, pure_agree=0.95, mean_gate_kl=0.9, mean_gate_acc=0.5
+        n=20, pure_n=10, pure_agree=0.95, mean_gate_kl=0.9, mean_gate_acc=0.5,
+        **sizing,
     )
     r2 = evaluate_probe_gates(
         bad_kl, ProbeGates(min_n=5, max_mean_gate_kl=0.5, min_pure_agree=0.9)
@@ -63,7 +83,8 @@ def test_evaluate_gates_pass_and_fail():
     assert any("mean_gate_kl" in x for x in r2.reasons)
 
     bad_pure = ProbeReport(
-        n=20, pure_n=10, pure_agree=0.5, mean_gate_kl=0.1, mean_gate_acc=0.5
+        n=20, pure_n=10, pure_agree=0.5, mean_gate_kl=0.1, mean_gate_acc=0.5,
+        **sizing,
     )
     r3 = evaluate_probe_gates(
         bad_pure, ProbeGates(min_n=5, min_pure_agree=0.9)
@@ -72,8 +93,13 @@ def test_evaluate_gates_pass_and_fail():
     assert any("pure_agree" in x for x in r3.reasons)
 
 
-def test_probe_self_fit_passes(tmp_path: Path):
-    """Train on pure canaries; probe same labels → should pass easy gates."""
+def test_probe_disjoint_holdout_passes_and_stamps(tmp_path: Path):
+    """Train on pure canaries from one root; probe canaries of ANOTHER root.
+
+    (review 2026-09-20 D4) This test used to probe the very labels it trained
+    on and expected a stamp — a self-fit, which the probe now refuses
+    (``test_review_gto_probe.py::test_self_fit_is_refused``).
+    """
     labels = [_pure_fold_label(i) for i in range(8)] + [
         _pure_jam_label(100 + i) for i in range(8)
     ]
@@ -95,7 +121,11 @@ def test_probe_self_fit_passes(tmp_path: Path):
         meta={"source": "rust_cfr", "n_train": len(rows)},
     )
     holdout = tmp_path / "holdout.jsonl"
-    write_jsonl(holdout, labels)
+    write_jsonl(
+        holdout,
+        [_pure_fold_label(i, root="holdout_root") for i in range(8)]
+        + [_pure_jam_label(100 + i, root="holdout_root") for i in range(8)],
+    )
     result = probe_checkpoint(
         ckpt,
         holdout,

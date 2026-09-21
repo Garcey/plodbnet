@@ -10,7 +10,12 @@ Layout (991 dims total):
   160..168  active mask, hero-rotated, padded to 8
   168..176  all-in mask, hero-rotated, padded to 8
   176..184  stacks / bb (stack-depth in bb), hero-rotated, padded to 8
-  184..188  scalars: pot, bet_to_call, min_bet, max_bet — all / bb (bb units)
+  184..188  scalars: pot, bet_to_call, min_total, max_total — all / bb (bb
+            units). min/max_total = the LEGAL raise window as street totals
+            (street_commit[hero] + the engine's min/max raise delta; both 0
+            when Raise is illegal) — NOT min_bet_total()/max_bet_total(),
+            which leak the deepest opponent's unreachable chips (review
+            2026-09-20 B3).
   188..196  relative-position one-hot of actor (actor - hero) mod num_seats
   196..772  history: last 32 actions oldest-first, each slot 18 dims
             (seat-one-hot hero-rel 8 + gate one-hot 4 + street one-hot 4
@@ -92,11 +97,14 @@ Layout (991 dims total):
 
 from __future__ import annotations
 
+import os
+import warnings
 from itertools import combinations
-from typing import Any, Mapping
+from typing import Any, Mapping, NamedTuple
 
 import numpy as np
 
+import plo5bp._engine as _engine  # type: ignore[attr-defined]
 from plo5bp._engine import (  # type: ignore[attr-defined]
     cross_board_straight_batch as _rust_cross_board_straight,
     draw_flags_batch as _rust_draw_flags,
@@ -111,6 +119,85 @@ from plo5bp.sizing import (  # v7 STK-2 raise-ladder envelope
 )
 
 OBS_DIM: int = 1171  # v7 batch-2 tail (stack+board+dual) appended after 1019
+
+# ---- observation-SEMANTICS revision switch (PLO5BP_OBS_REV) -----------------
+# The 2026-09-20 review fixed features whose VALUES were wrong while the layout
+# stayed put (OBS_DIM 1171 / NLH 995 / minimal 796 are identical in both revs).
+# Those fixes move values at 15-78% of decision nodes, and a checkpoint is only
+# served / resumed EXACTLY on the semantics it was trained on (same convention
+# as the downgrade_obs_* adapters), so the old values stay selectable:
+#
+#   PLO5BP_OBS_REV unset or "2"  (DEFAULT) — the fixed semantics.
+#   PLO5BP_OBS_REV=1             — the pre-2026-09-20 values, bit-exact with
+#                                  that encoder. Set it to SERVE or RESUME a
+#                                  checkpoint trained before 2026-09-20.
+#
+# Gated (rev 1 restores the old VALUES of exactly these):
+#   B1  v7 STK-2 (1024-1029) and STK-5[2:4] (1040-1041)
+#   B2  straight-draw flags (800, 802)
+#   B3  min/max scalars (PLO 186/187, minimal slots 2/3, NLH 134/135)
+#   B5  blockers-to-nuts flush dims (999/1000, 1003/1004)
+#   B7  NLH flush nut distance (NLH 906)
+# NOT gated (identical in both revs): B6 STK-10 (serving-only), the STK-6
+# comparison chain (no value moved), the binding fixes C4/C6/C7, the guards.
+#
+# Read ONCE here; every encoder in this module and encoding_nlh.py branches on
+# this constant, and the Rust engine reads the same variable when a GameState /
+# BatchedEngine is constructed (`obs_semantics_rev()` — cross-checked below, so
+# the two sides can never disagree silently). train.py stamps `obs_rev` into
+# checkpoints and refuses a mismatched warm start; the UI warns on a mismatch.
+OBS_REV_ENV: str = "PLO5BP_OBS_REV"
+OBS_REV_LEGACY: int = 1
+OBS_REV_CURRENT: int = 2
+
+
+def _read_obs_semantics_rev() -> int:
+    # Unset, empty or whitespace-only (`PLO5BP_OBS_REV=` is common in .env
+    # files) all mean "not chosen" -> the default. Same rule in Rust
+    # (`obs_rev_from_env`); anything else but "1"/"2" is an error, never a
+    # silent default.
+    raw = os.environ.get(OBS_REV_ENV)
+    value = "" if raw is None else raw.strip()
+    if not value:
+        return OBS_REV_CURRENT
+    if value == str(OBS_REV_LEGACY):
+        return OBS_REV_LEGACY
+    if value == str(OBS_REV_CURRENT):
+        return OBS_REV_CURRENT
+    raise ValueError(
+        f"{OBS_REV_ENV}={raw!r} is not a known observation-semantics revision: "
+        f"use {OBS_REV_CURRENT} (default, the 2026-09-20 fixed features) or "
+        f"{OBS_REV_LEGACY} (pre-2026-09-20 values, to serve/resume a checkpoint "
+        "trained before that date)"
+    )
+
+
+OBS_SEMANTICS_REV: int = _read_obs_semantics_rev()
+
+# The Rust side of the switch. A binary built before the switch has no
+# `obs_semantics_rev`; it implements rev-1 values only (see `_draw_flags_boards`).
+_rust_obs_rev_fn = getattr(_engine, "obs_semantics_rev", None) or getattr(
+    _engine.GameState, "obs_semantics_rev", None
+)
+_RUST_OBS_REV_AWARE: bool = _rust_obs_rev_fn is not None
+if _RUST_OBS_REV_AWARE:
+    _rust_rev = int(_rust_obs_rev_fn())
+    if _rust_rev != OBS_SEMANTICS_REV:
+        raise RuntimeError(
+            f"observation-semantics revision mismatch: Python read {OBS_REV_ENV}"
+            f"={OBS_SEMANTICS_REV} but the Rust engine reads {_rust_rev}"
+        )
+    del _rust_rev
+elif OBS_SEMANTICS_REV != OBS_REV_LEGACY:
+    warnings.warn(
+        "plo5bp._engine predates the observation-semantics switch and only "
+        "implements rev-1 values: the numpy batch encoder falls back to its "
+        "numpy draw flags (slower, exact), but the fused Rust encoder "
+        "(PLO5_RUST_ENCODER=1) would emit rev-1 observations. Rebuild with "
+        "`maturin develop --release`.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 
 # v1 (pre-anchor-head era) observation layout: 17-dim history slots, no
 # pot-fraction dim, tail blocks 32 lower. v1 checkpoints can keep
@@ -300,7 +387,7 @@ _MINIMAL_RANGES: tuple[tuple[int, int], ...] = (
     (_ACTIVE_OFF, _ACTIVE_OFF + 8),          # active mask (8)
     (_ALLIN_OFF, _ALLIN_OFF + 8),            # all-in mask (8)
     (_STACKS_OFF, _STACKS_OFF + 8),          # stacks/bb (8)
-    (_SCALARS_OFF, _SCALARS_OFF + 4),        # pot, to_call, min_bet, max_bet (4)
+    (_SCALARS_OFF, _SCALARS_OFF + 4),        # pot, bet_to_call, legal min/max raise total (4)
     (_HISTORY_OFF, _HISTORY_OFF + _HISTORY_DEPTH * _HISTORY_SLOT_DIM),  # 576
     (_SEAT_EXISTS_OFF, _SEAT_EXISTS_OFF + 8),       # seat-exists (8)
     (_TOTAL_COMMIT_OFF, _TOTAL_COMMIT_OFF + 8),     # hand total commit (8)
@@ -340,6 +427,77 @@ _M_TOTAL_COMMIT = 772
 _M_STREET_COMMIT = 780
 _M_HERO_BTN = 788
 assert _M_HERO_BTN + 8 == OBS_DIM_MINIMAL
+
+
+# ---- raise window (shared by every encoder) ---------------------------------
+# PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 B1/B3; OBS_SEMANTICS_REV 2):
+# the raise-window dims (scalars min/max, v7 STK-2, STK-5[2:4]) are derived
+# from the engine's LEGAL chip deltas `min_raise`/`max_raise`
+# (min_raise_chips()/max_raise_chips()), not from min_bet_total()/
+# max_bet_total(). The totals are not capped by the actor's own stack, ignore
+# the short-shove lockout, and max_bet_total() is the deepest opponent's RAW
+# reach — which broke dead-chip invariance and described a window the sizing
+# head can never use. Rev 1 keeps the old totals-derived window
+# (`_legacy_raise_window`). Rust twins: `legal_raise_window` /
+# `legacy_raise_window` in rust_engine/src/bindings.rs.
+
+
+class _RaiseWindow(NamedTuple):
+    """The raise window an observation describes, as chip DELTAS the actor
+    adds. Fields are scalars on the serial path and (N,) arrays on the batch
+    path."""
+
+    legal: Any       # bool — Raise available; the STK-2 / STK-5[2:4] gate
+    min_d: Any       # f64 — smallest raise delta
+    max_d: Any       # f64 — largest raise delta
+    anchor_min: Any  # min fed to the legal-anchor count (max is `max_d`)
+
+
+def _legal_raise_window(
+    min_raise: int, max_raise: int, hero_stack_raw: int, bb: int
+) -> _RaiseWindow:
+    """Rev 2: the LEGAL raise window.
+
+    `legal` mirrors the env's Raise gate (`actions.gate_mask_from_bounds`):
+    max_raise > 0, and a sub-1bb raise only counts as hero's own all-in. With
+    max_raise > 0, `legal[ALL_IN]` holds exactly when hero's stack is the
+    binding cap (max_raise == raw stack); the other case is the cover-short
+    DUST the gate screens off. Short-shove regime (min_raise == 0 < max_raise):
+    the only legal size is max_raise, so min_d == max_d — while `anchor_min`
+    stays the RAW min_raise (0), which is how `sizing.anchor_grid_np` detects
+    the regime and counts its single all-in atom. Deltas are 0.0 when illegal.
+    """
+    if max_raise <= 0 or (max_raise < bb and max_raise != hero_stack_raw):
+        return _RaiseWindow(False, 0.0, 0.0, float(min_raise))
+    min_d = min_raise if min_raise > 0 else max_raise
+    return _RaiseWindow(True, float(min_d), float(max_raise), float(min_raise))
+
+
+def _legal_raise_window_batch(
+    min_raise: np.ndarray,
+    max_raise: np.ndarray,
+    hero_stack_raw: np.ndarray,
+    bb: int,
+) -> _RaiseWindow:
+    """Vectorized `_legal_raise_window` ((N,) fields). Integer comparisons on
+    the raw chip counts, f64 only on the way out."""
+    mn = np.asarray(min_raise).astype(np.int64)
+    mx = np.asarray(max_raise).astype(np.int64)
+    stack = np.asarray(hero_stack_raw).astype(np.int64)
+    legal = (mx > 0) & ((mx >= int(bb)) | (mx == stack))
+    min_d = np.where(legal, np.where(mn > 0, mn, mx), 0).astype(np.float64)
+    max_d = np.where(legal, mx, 0).astype(np.float64)
+    return _RaiseWindow(legal, min_d, max_d, mn)
+
+
+def _legacy_raise_window(min_bet, max_bet, hero_street_commit, to_call) -> _RaiseWindow:
+    """Rev 1 (pre-2026-09-20, kept bit-exact for old checkpoints): the window
+    recovered from the min_bet_total()/max_bet_total() TOTALS. Pure f64
+    arithmetic, so the same expression serves the serial path (floats) and the
+    batch path ((N,) arrays). Known-wrong — see the block comment above."""
+    min_d = min_bet - hero_street_commit
+    max_d = max_bet - hero_street_commit
+    return _RaiseWindow(max_d > to_call, min_d, max_d, min_d)
 
 
 def encode_observation_minimal(
@@ -389,10 +547,25 @@ def encode_observation_minimal(
 
     pot = float(obs["pot"])
     btc = float(obs["bet_to_call"])
+    street_commit = obs.get("street_commit", [0] * num_seats)
     out[_M_SCALARS + 0] = pot * inv_bb
     out[_M_SCALARS + 1] = btc * inv_bb
-    out[_M_SCALARS + 2] = float(obs["min_bet"]) * inv_bb
-    out[_M_SCALARS + 3] = float(obs["max_bet"]) * inv_bb
+    if OBS_SEMANTICS_REV == OBS_REV_LEGACY:
+        # Rev 1: min_bet_total()/max_bet_total() verbatim.
+        out[_M_SCALARS + 2] = float(obs["min_bet"]) * inv_bb
+        out[_M_SCALARS + 3] = float(obs["max_bet"]) * inv_bb
+    else:
+        # PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 B3): slots 2/3 are
+        # the LEGAL raise window as street totals (0/0 when Raise is
+        # illegal), same /bb normalization — see `_legal_raise_window`.
+        window = _legal_raise_window(
+            int(obs["min_raise"]), int(obs["max_raise"]), int(stacks[hero]),
+            int(config.bb),
+        )
+        if window.legal:
+            hero_sc = float(street_commit[hero])
+            out[_M_SCALARS + 2] = (hero_sc + window.min_d) * inv_bb
+            out[_M_SCALARS + 3] = (hero_sc + window.max_d) * inv_bb
 
     history = obs["history"]
     if len(history) > _HISTORY_DEPTH:
@@ -419,7 +592,6 @@ def encode_observation_minimal(
     for k in range(num_seats):
         out[_M_SEAT_EXISTS + k] = 1.0
 
-    street_commit = obs.get("street_commit", [0] * num_seats)
     total_commit = obs["total_commit"]
     for k in range(num_seats):
         seat = (hero + k) % num_seats
@@ -492,12 +664,30 @@ def encode_observation_batch_minimal(
 
     pot = obs_arrays["pot"].astype(np.float64)
     bet_to_call = obs_arrays["bet_to_call"].astype(np.float64)
-    min_bet = obs_arrays["min_bet"].astype(np.float64)
-    max_bet = obs_arrays["max_bet"].astype(np.float64)
     out[live_mask, _M_SCALARS + 0] = pot[live_mask] * inv_bb
     out[live_mask, _M_SCALARS + 1] = bet_to_call[live_mask] * inv_bb
-    out[live_mask, _M_SCALARS + 2] = min_bet[live_mask] * inv_bb
-    out[live_mask, _M_SCALARS + 3] = max_bet[live_mask] * inv_bb
+    if OBS_SEMANTICS_REV == OBS_REV_LEGACY:
+        # Rev 1: min_bet_total()/max_bet_total() verbatim.
+        min_bet = obs_arrays["min_bet"].astype(np.float64)
+        max_bet = obs_arrays["max_bet"].astype(np.float64)
+        out[live_mask, _M_SCALARS + 2] = min_bet[live_mask] * inv_bb
+        out[live_mask, _M_SCALARS + 3] = max_bet[live_mask] * inv_bb
+    else:
+        # PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 B3): legal raise
+        # window as street totals — twin of the scalar minimal encoder.
+        hero_col = hero_idx[:, None]
+        window = _legal_raise_window_batch(
+            obs_arrays["min_raise"],
+            obs_arrays["max_raise"],
+            np.take_along_axis(stacks, hero_col, axis=1)[:, 0],
+            int(config.bb),
+        )
+        hero_sc = np.take_along_axis(
+            obs_arrays["street_commit"], hero_col, axis=1
+        )[:, 0].astype(np.float64)
+        wl_raise = live_mask & window.legal
+        out[wl_raise, _M_SCALARS + 2] = ((hero_sc + window.min_d) * inv_bb)[wl_raise]
+        out[wl_raise, _M_SCALARS + 3] = ((hero_sc + window.max_d) * inv_bb)[wl_raise]
 
     history_seat = obs_arrays["history_seat"].astype(np.int64)
     history_action = obs_arrays["history_action"].astype(np.int64)
@@ -706,7 +896,11 @@ def _scoop_pair_count(ba_mask: int, bb_mask: int) -> int:
     return scoop
 
 
-def _blocker_features(hole_idx: list[int], board_idx: list[int]) -> np.ndarray:
+def _blocker_features(
+    hole_idx: list[int],
+    board_idx: list[int],
+    other_board_idx: list[int] | tuple[int, ...] = (),
+) -> np.ndarray:
     """Unconditional blockers-to-nuts for ONE board (obs v2 P3, 4 dims).
 
     "Unconditional": hero need not hold the made hand or the draw — the
@@ -716,7 +910,9 @@ def _blocker_features(hole_idx: list[int], board_idx: list[int]) -> np.ndarray:
 
     0. hero holds the TOP missing card of the board's flush suit (a suit
        with >= 3 board cards; two such suits cannot coexist on 5 cards).
-       0 when no flush is possible.
+       0 when no flush is possible. "Missing" = holdable: not on THIS
+       board and not on `other_board_idx` either (a card face-up on the
+       other board is in nobody's hand).
     1. count of the top-3 missing flush-suit cards hero holds, / 3.
     2. hero cards whose rank completes the NUT straight (the highest
        5-rank window where the board supplies >= 3 distinct ranks),
@@ -743,9 +939,18 @@ def _blocker_features(hole_idx: list[int], board_idx: list[int]) -> np.ndarray:
         hero_rank_counts[c // 4] += 1
 
     # Flush blockers.
+    # PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 B5, dims 999/1000 and
+    # 1003/1004): cards visible on the OTHER board are skipped too — they
+    # used to count as "missing", so e.g. hero's Qs on a Ks-high spade board
+    # read 0 although the As lay face-up on the other board.
+    other_cards = set(other_board_idx)
     for s in range(4):
         if board_suit_counts[s] >= 3:
-            missing = [r for r in range(12, -1, -1) if r not in board_suit_ranks[s]]
+            missing = [
+                r
+                for r in range(12, -1, -1)
+                if r not in board_suit_ranks[s] and (r * 4 + s) not in other_cards
+            ]
             if missing and (missing[0] * 4 + s) in hero_cards:
                 out[0] = 1.0
             held = sum(1 for r in missing[:3] if (r * 4 + s) in hero_cards)
@@ -776,11 +981,15 @@ def _blocker_features_batch(
     hole_valid: np.ndarray,
     board: np.ndarray,
     board_valid: np.ndarray,
+    other_board: np.ndarray | None = None,
+    other_valid: np.ndarray | None = None,
 ) -> np.ndarray:
     """Vectorized `_blocker_features` for one board: (N, 4) float32.
     Bit-exact vs the scalar helper (integer counts, identical f64
     divisions, same first-match tie-breaks: argmax on a reversed mask ==
-    the scalar's descending-rank / tuple-order scans)."""
+    the scalar's descending-rank / tuple-order scans). `other_board` is
+    the OTHER board's (N, 5) cards — its cards are not holdable, so the
+    flush dims skip them (review 2026-09-20 B5)."""
     n = hole.shape[0]
     out = np.zeros((n, 4), dtype=np.float32)
     has_board = board_valid.sum(axis=1) >= 3
@@ -792,6 +1001,13 @@ def _blocker_features_batch(
     ei, si = np.nonzero(board_valid)
     cards = board[ei, si].astype(np.int64)
     board_presence[ei, cards >> 2, cards & 3] = True
+    # Face-up anywhere = this board ∪ the other board (flush dims only).
+    faceup_presence = board_presence
+    if other_board is not None:
+        faceup_presence = board_presence.copy()
+        ei, si = np.nonzero(other_valid)
+        ocards = other_board[ei, si].astype(np.int64)
+        faceup_presence[ei, ocards >> 2, ocards & 3] = True
     hero_presence = np.zeros((n, 13, 4), dtype=bool)
     ei, si = np.nonzero(hole_valid)
     hcards = hole[ei, si].astype(np.int64)
@@ -802,9 +1018,11 @@ def _blocker_features_batch(
     flush_suit_exists = board_suit_counts >= 3
     has_flush = flush_suit_exists.any(axis=1)
     suit_idx = np.argmax(flush_suit_exists, axis=1)
-    suit_board_desc = board_presence[rows, :, suit_idx][:, ::-1]  # idx 0 = rank 12
+    suit_faceup_desc = faceup_presence[rows, :, suit_idx][:, ::-1]  # idx 0 = rank 12
     suit_hero_desc = hero_presence[rows, :, suit_idx][:, ::-1]
-    missing_desc = ~suit_board_desc
+    # PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 B5): "missing" excludes
+    # cards face-up on EITHER board — twin of the scalar helper.
+    missing_desc = ~suit_faceup_desc
     cum = np.cumsum(missing_desc, axis=1)
     top1 = missing_desc & (cum <= 1)
     top3 = missing_desc & (cum <= 3)
@@ -1029,7 +1247,9 @@ def _gate_from_action(action: int, chips: int) -> int:
     return _GATE_RAISE
 
 
-def _draw_flags(hole_idx: list[int], board_idx: list[int]) -> tuple[float, float]:
+def _draw_flags(
+    hole_idx: list[int], board_idx: list[int], rev: int | None = None
+) -> tuple[float, float]:
     """Return (flush_draw, straight_draw) flags for hero's best draw on a board.
 
     Flush draw: hero has ≥2 cards of a suit AND board has exactly 2 of that
@@ -1039,6 +1259,9 @@ def _draw_flags(hole_idx: list[int], board_idx: list[int]) -> tuple[float, float
     Straight draw: the union of hero's ranks and board's ranks contains 4
     consecutive ranks (including wheel A-2-3-4). Coarse: doesn't verify
     that the 4 cards respect the 2-hole + 2-board split.
+
+    `rev` is the observation-semantics revision (None = OBS_SEMANTICS_REV);
+    it only affects the straight flag's ace handling.
     """
     if not board_idx:
         return 0.0, 0.0
@@ -1052,17 +1275,24 @@ def _draw_flags(hole_idx: list[int], board_idx: list[int]) -> tuple[float, float
         if hs >= 2 and bs == 2:
             flush = 1.0
             break
-    # Ranks (0..=12; ace = 12, wheel handled via bit 13)
+    # Rev 2: ranks shifted up one — rank r (0=deuce .. 12=ace) sits at bit
+    # r+1 and the ace-low shadow at bit 0, BELOW the deuce, where a wheel
+    # draw needs it; the 4-bit windows then run A234 (bits 0..3) .. JQKA.
+    # PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 B2, dims 800/802): in
+    # rev 1 (kept for old checkpoints) rank r sits at bit r and the shadow
+    # at bit 13, ABOVE the ace, so Q-K-A reads as 4-in-a-row (false
+    # positive) and A-2-3-4 never fires (false negative).
+    legacy = (OBS_SEMANTICS_REV if rev is None else rev) == OBS_REV_LEGACY
+    shift = 0 if legacy else 1
     rank_set = 0
     for c in hole_idx:
-        rank_set |= 1 << (c // 4)
+        rank_set |= 1 << (c // 4 + shift)
     for c in board_idx:
-        rank_set |= 1 << (c // 4)
-    # Add "ace-low" bit 13 if ace present.
-    if rank_set & (1 << 12):
-        rank_set |= 1 << 13  # shadow bit so A-2-3-4 window works
+        rank_set |= 1 << (c // 4 + shift)
+    if rank_set & (1 << (12 + shift)):  # ace present: add its low shadow
+        rank_set |= (1 << 13) if legacy else 1
     straight = 0.0
-    for start in range(11):  # windows 0..3, 1..4, ..., 10..13
+    for start in range(11):  # 4-bit windows over bits 0..13
         window = ((1 << 4) - 1) << start
         if bin(rank_set & window).count("1") >= 4:
             straight = 1.0
@@ -1296,6 +1526,25 @@ def _straight_flush_features(
 # Chunk B. Every dim's spec is V7_OBS_CANDIDATES.md; parity twin is the
 # `_..._batch` function below. Bodies filled 2026-07-12.
 
+# STK-6[0] "bets to jam" thresholds: 3**0 .. 3**5 as exact f64 constants.
+# (review 2026-09-20 STK-6) The dim is clip(ceil(log3(x6)), 0, 6), which used
+# to be computed as ceil(log(x6) / log(3)). That quotient sits ON an integer
+# at x6 = 3, 9, 27, 81, 243 (SPR 1, 4, 13, 40, 121), where a 1-ulp difference
+# between libm / numpy-SVML / Rust `ln` flips the ceil — a cross-platform
+# parity hazard. An exact comparison chain has no such boundary; it returns
+# the same 1, 2, 3, 4, 5 the log form produced at those five points on the
+# reference (Windows x86-64) build, so no value moved.
+_POW3: tuple[float, ...] = (1.0, 3.0, 9.0, 27.0, 81.0, 243.0)
+_POW3_ARR: np.ndarray = np.asarray(_POW3, dtype=np.float64)
+
+
+def _bets_to_jam(x6: float) -> int:
+    """Smallest k in 0..=6 with x6 <= 3**k (k = 6 when x6 > 243)."""
+    for k, p in enumerate(_POW3):
+        if x6 <= p:
+            return k
+    return 6
+
 
 def _encode_stack_v3(
     out: np.ndarray,
@@ -1310,8 +1559,7 @@ def _encode_stack_v3(
     street_commit,
     pot: float,
     btc: float,
-    min_bet: float,
-    max_bet: float,
+    window: _RaiseWindow,
     to_call: float,
     eff_to_call: float,
     hero_stack: float,
@@ -1320,9 +1568,10 @@ def _encode_stack_v3(
     acted=None,
 ) -> None:
     """Stack/pot/price geometry, dims 1020..1061. `acted` is the engine's
-    per-seat acted_this_street bits (None on pre-v7 fixtures → STK-1 zero)."""
+    per-seat acted_this_street bits (None on pre-v7 fixtures → STK-1 zero).
+    `window` is the raise window STK-2 / STK-5[2:4] describe — the caller
+    picks `_legal_raise_window` (rev 2) or `_legacy_raise_window` (rev 1)."""
     # Shared hero-frame scalars.
-    hero_sc = float(street_commit[hero])
     hero_commit = float(total_commit[hero])
     pot_denom = max(pot, 1.0)
 
@@ -1358,12 +1607,17 @@ def _encode_stack_v3(
             out[_STK1_OFF + 3] = 1.0 if max_eff >= hero_stack else 0.0
 
     # ---- STK-2: raise-ladder envelope (6) @ _STK2_OFF ----
-    # min_d/max_d are the raise DELTAS (additional chips) recovered from the
-    # already-packed totals; identical to sizing_from_info's min/max_raise_chips.
-    min_d = min_bet - hero_sc
-    max_d = max_bet - hero_sc
+    # PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 B1, dims 1024-1029 and
+    # STK-5[2:4] = 1040-1041; OBS_SEMANTICS_REV 2): min_d/max_d are the
+    # engine's LEGAL raise deltas — exactly sizing_from_info's
+    # min/max_raise_chips — and the block is zero when Raise is illegal. In
+    # rev 1 they are recovered from the min_bet/max_bet totals, which are
+    # NOT capped by the actor's own stack and ignore the short-shove
+    # lockout, so a short hero sees a pot-sized 11-anchor ladder it can
+    # never use (and STK-5[2] goes negative). Which window applies is the
+    # caller's choice (`window`); the arithmetic below is shared.
+    raise_legal, min_d, max_d, anchor_min = window
     base = pot + to_call
-    raise_legal = max_d > to_call
     if raise_legal:
         base_safe = max(base, 1.0)
         eff_denom = max(hero_stack, 1.0)
@@ -1372,10 +1626,12 @@ def _encode_stack_v3(
         out[_STK2_OFF + 2] = min(max(min_d / eff_denom, 0.0), 1.0)
         out[_STK2_OFF + 3] = min(max(max_d / eff_denom, 0.0), 1.0)
         out[_STK2_OFF + 4] = 1.0 if max_d < to_call + base else 0.0
-        # Legal-anchor count only (no brackets) — bit-identical to
-        # anchor_grid_np(...).legal.sum() / ANCHOR_COUNT.
+        # Legal-anchor count only (no brackets) — in rev 2 bit-identical to
+        # anchor_grid_np(*sizing_from_info(info)).legal.sum() / ANCHOR_COUNT
+        # (anchor_min is the RAW min_raise, so the short-shove regime counts
+        # its one atom).
         out[_STK2_OFF + 5] = (
-            float(n_legal_anchors_np(min_d, max_d, pot, to_call))
+            float(n_legal_anchors_np(anchor_min, max_d, pot, to_call))
             / float(ANCHOR_COUNT)
         )
 
@@ -1407,7 +1663,7 @@ def _encode_stack_v3(
     spr_e = hero_stack / pot_denom
     r = 4 - street_idx
     x6 = 1.0 + 2.0 * spr_e
-    out[_STK6_OFF + 0] = min(max(np.ceil(np.log(x6) / np.log(3.0)), 0.0), 6.0)
+    out[_STK6_OFF + 0] = float(_bets_to_jam(x6))
     out[_STK6_OFF + 1] = min(max((np.power(x6, 1.0 / r) - 1.0) / 2.0, 0.0), 2.0)
 
     # ---- STK-7: pot-ceiling implied odds (2) @ _STK7_OFF ----
@@ -1444,10 +1700,19 @@ def _encode_stack_v3(
     out[_STK9_OFF + 1] = eff_to_call / max(hero_commit + hero_stack, 1.0)
 
     # ---- STK-10: ante-pot bloat (2) @ _STK10_OFF ----
-    # pure config arithmetic; frozen, history-independent (truncation-immune).
+    # config arithmetic over the DEALT-IN seats; frozen, history-independent
+    # (truncation-immune).
+    # PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 B6, dim 1052; SERVING
+    # ONLY — training never passes an in_hand_mask): a sitting-out seat is
+    # pre-folded and posts no ante (folded with nothing committed), so it no
+    # longer inflates pot_at_flop. With every seat dealt in the sum is
+    # unchanged: a dealt-in seat has committed its ante, and with ante == 0
+    # every term is 0 anyway.
     ante_i = int(config.ante)
     pot_at_flop = 0
     for s in range(num_seats):
+        if folded[s] and int(total_commit[s]) == 0:
+            continue
         pot_at_flop += min(ante_i, int(config.resolved_stacks[s]))
     paf = float(pot_at_flop)
     out[_STK10_OFF + 0] = ante_i * inv_bb
@@ -1888,10 +2153,30 @@ def encode_observation(obs: Mapping[str, Any], config: GameConfig) -> np.ndarray
 
     pot = float(obs["pot"])
     btc = float(obs["bet_to_call"])
+    street_commit = obs.get("street_commit", [0] * num_seats)
     out[_SCALARS_OFF + 0] = pot * inv_bb
     out[_SCALARS_OFF + 1] = btc * inv_bb
-    out[_SCALARS_OFF + 2] = float(obs["min_bet"]) * inv_bb
-    out[_SCALARS_OFF + 3] = float(obs["max_bet"]) * inv_bb
+    rev = OBS_SEMANTICS_REV
+    window = None  # rev 1 builds it below, once to_call is known
+    if rev == OBS_REV_LEGACY:
+        # Rev 1: min_bet_total()/max_bet_total() verbatim.
+        out[_SCALARS_OFF + 2] = float(obs["min_bet"]) * inv_bb
+        out[_SCALARS_OFF + 3] = float(obs["max_bet"]) * inv_bb
+    else:
+        # PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 B3, dims 186/187):
+        # the min/max scalars are the LEGAL raise window as street totals —
+        # street_commit[hero] + the engine's min/max raise delta, 0/0 when
+        # Raise is illegal. max_bet_total() is the deepest opponent's RAW
+        # reach, so chips no one could ever bet leaked into the obs
+        # (dead-chip invariance broke at ~25% of nodes).
+        window = _legal_raise_window(
+            int(obs["min_raise"]), int(obs["max_raise"]), int(stacks[hero]),
+            int(config.bb),
+        )
+        if window.legal:
+            hero_sc = float(street_commit[hero])
+            out[_SCALARS_OFF + 2] = (hero_sc + window.min_d) * inv_bb
+            out[_SCALARS_OFF + 3] = (hero_sc + window.max_d) * inv_bb
 
     actor_rel = (hero - hero) % num_seats
     out[_REL_POS_OFF + actor_rel] = 1.0
@@ -1930,7 +2215,6 @@ def encode_observation(obs: Mapping[str, Any], config: GameConfig) -> np.ndarray
         out[_SPR_OFF + k] = min(max(spr, 0.0), 4.0)
 
     # Pot odds.
-    street_commit = obs.get("street_commit", [0] * num_seats)
     hero_street_commit = float(street_commit[hero]) if hero < len(street_commit) else 0.0
     to_call = max(btc - hero_street_commit, 0.0)
     if to_call > 0.0:
@@ -1954,8 +2238,8 @@ def encode_observation(obs: Mapping[str, Any], config: GameConfig) -> np.ndarray
     hole_list = [int(x) for x in obs["hero_hole"]]
     board_a_list = [int(x) for x in obs["board_a"]]
     board_b_list = [int(x) for x in obs["board_b"]]
-    f_a, s_a = _draw_flags(hole_list, board_a_list)
-    f_b, s_b = _draw_flags(hole_list, board_b_list)
+    f_a, s_a = _draw_flags(hole_list, board_a_list, rev)
+    f_b, s_b = _draw_flags(hole_list, board_b_list, rev)
     out[_DRAW_A_OFF + 0] = f_a
     out[_DRAW_A_OFF + 1] = s_a
     out[_DRAW_B_OFF + 0] = f_b
@@ -2035,12 +2319,16 @@ def encode_observation(obs: Mapping[str, Any], config: GameConfig) -> np.ndarray
             _PER_BOARD_OUTCOME_OFF : _PER_BOARD_OUTCOME_OFF + _PER_BOARD_OUTCOME_DIM
         ] = np.asarray(pb, dtype=np.float32)
 
-    # Unconditional blockers-to-nuts per board.
+    # Unconditional blockers-to-nuts per board. Rev 2 also hands over the
+    # OTHER board: its face-up cards are not holdable (review 2026-09-20
+    # B5); rev 1 keeps the board-local flush dims.
+    other_a = () if rev == OBS_REV_LEGACY else board_b_list
+    other_b = () if rev == OBS_REV_LEGACY else board_a_list
     out[_BLOCKER_A_OFF : _BLOCKER_A_OFF + 4] = _blocker_features(
-        hole_list, board_a_list
+        hole_list, board_a_list, other_a
     )
     out[_BLOCKER_B_OFF : _BLOCKER_B_OFF + 4] = _blocker_features(
-        hole_list, board_b_list
+        hole_list, board_b_list, other_b
     )
 
     # Effective price: to_call capped by hero's EFFECTIVE remaining stack
@@ -2070,6 +2358,11 @@ def encode_observation(obs: Mapping[str, Any], config: GameConfig) -> np.ndarray
     # ---- obs v3 batch-2 tail (stack + board + dual) ---------------------
     hero_board_v3 = obs.get("hero_board_v3")
     board_draw_v3 = obs.get("board_draw_v3")
+    if window is None:  # rev 1: the totals-derived window
+        window = _legacy_raise_window(
+            float(obs["min_bet"]), float(obs["max_bet"]), hero_street_commit,
+            to_call,
+        )
     _encode_stack_v3(
         out,
         config=config,
@@ -2082,8 +2375,7 @@ def encode_observation(obs: Mapping[str, Any], config: GameConfig) -> np.ndarray
         street_commit=street_commit,
         pot=pot,
         btc=btc,
-        min_bet=float(obs["min_bet"]),
-        max_bet=float(obs["max_bet"]),
+        window=window,
         to_call=to_call,
         eff_to_call=eff_to_call,
         hero_stack=hero_stack,
@@ -2137,7 +2429,7 @@ def encode_observation(obs: Mapping[str, Any], config: GameConfig) -> np.ndarray
 
 
 def _draw_flags_batch(
-    hole: np.ndarray, board: np.ndarray
+    hole: np.ndarray, board: np.ndarray, rev: int | None = None
 ) -> tuple[np.ndarray, np.ndarray]:
     """Vectorized `_draw_flags`. `hole` is (N, 5) u8 with 255 sentinels for
     empty slots; `board` is (N, 5) u8 with 255 sentinels. Returns
@@ -2145,8 +2437,9 @@ def _draw_flags_batch(
 
     Semantics mirror the scalar path exactly:
     - flush: some suit has ≥2 in hole AND exactly 2 on board.
-    - straight: the rank-union (including ace-low shadow) contains any 4
-      consecutive ranks.
+    - straight: the rank-union (ace counted high AND low) contains any 4
+      consecutive ranks, A-2-3-4 through J-Q-K-A (rev 2; rev 1 keeps the
+      old ace-shadow-above-the-ace windows — see `_draw_flags`).
     - Returns (0, 0) when the board has no cards (all sentinels).
     """
     n = hole.shape[0]
@@ -2178,17 +2471,24 @@ def _draw_flags_batch(
 
     hole_ranks = (hole >> 2).astype(np.int64)
     board_ranks = (board >> 2).astype(np.int64)
+    # Rev 2: column r+1 = rank r, column 0 = ace-low shadow. Rev 1: column r =
+    # rank r, column 13 = the shadow (review 2026-09-20 B2 — PRODUCTION
+    # BEHAVIOR CHANGE, see the scalar `_draw_flags`).
+    legacy = (OBS_SEMANTICS_REV if rev is None else rev) == OBS_REV_LEGACY
+    shift = 0 if legacy else 1
     rank_mask = np.zeros((n, 14), dtype=bool)
     for k in range(hole.shape[1]):
         vh = hole_valid[:, k]
         if vh.any():
-            rank_mask[np.nonzero(vh)[0], hole_ranks[vh, k]] = True
+            rank_mask[np.nonzero(vh)[0], hole_ranks[vh, k] + shift] = True
     for k in range(5):
         vb = board_valid[:, k]
         if vb.any():
-            rank_mask[np.nonzero(vb)[0], board_ranks[vb, k]] = True
-    # Ace-low shadow: bit 13 follows bit 12 (ace).
-    rank_mask[:, 13] |= rank_mask[:, 12]
+            rank_mask[np.nonzero(vb)[0], board_ranks[vb, k] + shift] = True
+    if legacy:
+        rank_mask[:, 13] |= rank_mask[:, 12]
+    else:
+        rank_mask[:, 0] |= rank_mask[:, 13]
     straight = np.zeros(n, dtype=bool)
     for start in range(11):
         straight |= rank_mask[:, start : start + 4].all(axis=1)
@@ -2197,6 +2497,24 @@ def _draw_flags_batch(
     flush_f = np.where(board_has_cards, flush, False).astype(np.float32)
     straight_f = np.where(board_has_cards, straight, False).astype(np.float32)
     return flush_f, straight_f
+
+
+def _draw_flags_boards(
+    hole: np.ndarray, board_a: np.ndarray, board_b: np.ndarray, rev: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """(flush_a, straight_a, flush_b, straight_b) for the batch encoder: the
+    Rust `draw_flags_batch` hot path under semantics revision `rev`.
+
+    A binary built before the switch takes no `obs_rev` and computes the rev-1
+    flags, so with it rev 1 still uses Rust and rev 2 falls back to the numpy
+    twin (exact, ~60x slower; import warned about the stale binary)."""
+    if _RUST_OBS_REV_AWARE:
+        return _rust_draw_flags(hole, board_a, board_b, obs_rev=rev)
+    if rev == OBS_REV_LEGACY:
+        return _rust_draw_flags(hole, board_a, board_b)
+    f_a, s_a = _draw_flags_batch(hole, board_a, rev)
+    f_b, s_b = _draw_flags_batch(hole, board_b, rev)
+    return f_a, s_a, f_b, s_b
 
 
 def _pair_features_batch(
@@ -2527,12 +2845,37 @@ def encode_observation_batch(
     # Scalars — all arithmetic in f64, assignment casts to f32.
     pot = obs_arrays["pot"].astype(np.float64)
     bet_to_call = obs_arrays["bet_to_call"].astype(np.float64)
-    min_bet = obs_arrays["min_bet"].astype(np.float64)
-    max_bet = obs_arrays["max_bet"].astype(np.float64)
     out[live_mask, _SCALARS_OFF + 0] = pot[live_mask] * inv_bb
     out[live_mask, _SCALARS_OFF + 1] = bet_to_call[live_mask] * inv_bb
-    out[live_mask, _SCALARS_OFF + 2] = min_bet[live_mask] * inv_bb
-    out[live_mask, _SCALARS_OFF + 3] = max_bet[live_mask] * inv_bb
+    street_commit = obs_arrays["street_commit"]
+    hero_street_commit = np.take_along_axis(
+        street_commit, hero_idx[:, None], axis=1
+    )[:, 0].astype(np.float64)
+    rev = OBS_SEMANTICS_REV
+    window = None  # rev 1 builds it below, once to_call is known
+    if rev == OBS_REV_LEGACY:
+        # Rev 1: min_bet_total()/max_bet_total() verbatim.
+        min_bet = obs_arrays["min_bet"].astype(np.float64)
+        max_bet = obs_arrays["max_bet"].astype(np.float64)
+        out[live_mask, _SCALARS_OFF + 2] = min_bet[live_mask] * inv_bb
+        out[live_mask, _SCALARS_OFF + 3] = max_bet[live_mask] * inv_bb
+    else:
+        # PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 B3, dims 186/187):
+        # LEGAL raise window as street totals, 0/0 when Raise is illegal —
+        # twin of the scalar encoder (see `_legal_raise_window`).
+        window = _legal_raise_window_batch(
+            obs_arrays["min_raise"],
+            obs_arrays["max_raise"],
+            np.take_along_axis(stacks, hero_idx[:, None], axis=1)[:, 0],
+            int(config.bb),
+        )
+        wl_raise = live_mask & window.legal
+        out[wl_raise, _SCALARS_OFF + 2] = (
+            (hero_street_commit + window.min_d) * inv_bb
+        )[wl_raise]
+        out[wl_raise, _SCALARS_OFF + 3] = (
+            (hero_street_commit + window.max_d) * inv_bb
+        )[wl_raise]
 
     # Relative position: actor_rel = 0 for live envs (since obs is always
     # encoded from the actor's POV, `hero == actor`).
@@ -2603,10 +2946,6 @@ def encode_observation_batch(
     out[live_mask, _SPR_OFF : _SPR_OFF + num_seats] = spr[live_mask]
 
     # Pot odds. f64 throughout; assignment casts to f32.
-    street_commit = obs_arrays["street_commit"]
-    hero_street_commit = np.take_along_axis(
-        street_commit, hero_idx[:, None], axis=1
-    )[:, 0].astype(np.float64)
     to_call = np.maximum(bet_to_call - hero_street_commit, 0.0)
     denom = pot + to_call
     pot_odds = np.where(to_call > 0.0, to_call / np.where(denom > 0.0, denom, 1.0), 0.0)
@@ -2630,7 +2969,7 @@ def encode_observation_batch(
             out[rows, off + cats[rows]] = 1.0
 
     # Draw flags.
-    f_a, s_a, f_b, s_b = _rust_draw_flags(hole, ba, bb)
+    f_a, s_a, f_b, s_b = _draw_flags_boards(hole, ba, bb, rev)
     out[live_mask, _DRAW_A_OFF + 0] = f_a[live_mask]
     out[live_mask, _DRAW_A_OFF + 1] = s_a[live_mask]
     out[live_mask, _DRAW_B_OFF + 0] = f_b[live_mask]
@@ -2777,21 +3116,29 @@ def encode_observation_batch(
         out[live_mask, _STRAIGHT_DRAW_BOTH_OFF] = cb_dr[live_mask]
         out[live_mask, _STRAIGHT_MIXED_OFF] = cb_mx[live_mask]
 
+    # Live rows only (review 2026-09-20): every other block is gated by
+    # live_mask; these two used to rely on the packer zeroing terminal rows,
+    # so a caller-supplied bundle could leak values into an all-zero row.
     opp_fr = obs_arrays.get("opp_outcome_fractions")
     if opp_fr is not None:
-        out[:, _OPP_OUTCOME_OFF : _OPP_OUTCOME_OFF + _OPP_OUTCOME_DIM] = opp_fr.astype(
-            np.float32, copy=False
-        )
+        out[
+            live_mask, _OPP_OUTCOME_OFF : _OPP_OUTCOME_OFF + _OPP_OUTCOME_DIM
+        ] = np.asarray(opp_fr)[live_mask].astype(np.float32, copy=False)
 
     # ---- obs v2 tail (V5_DESIGN.md §3.2) — mirrors the scalar encoder ----
     pb = obs_arrays.get("per_board_outcome")
     if pb is not None:
         out[
-            :, _PER_BOARD_OUTCOME_OFF : _PER_BOARD_OUTCOME_OFF + _PER_BOARD_OUTCOME_DIM
-        ] = pb.astype(np.float32, copy=False)
+            live_mask,
+            _PER_BOARD_OUTCOME_OFF : _PER_BOARD_OUTCOME_OFF + _PER_BOARD_OUTCOME_DIM,
+        ] = np.asarray(pb)[live_mask].astype(np.float32, copy=False)
 
-    blk_a = _blocker_features_batch(hole, hole_valid, ba, ba_valid)
-    blk_b = _blocker_features_batch(hole, hole_valid, bb, bb_valid)
+    if rev == OBS_REV_LEGACY:  # board-local flush dims (pre review B5)
+        blk_a = _blocker_features_batch(hole, hole_valid, ba, ba_valid)
+        blk_b = _blocker_features_batch(hole, hole_valid, bb, bb_valid)
+    else:
+        blk_a = _blocker_features_batch(hole, hole_valid, ba, ba_valid, bb, bb_valid)
+        blk_b = _blocker_features_batch(hole, hole_valid, bb, bb_valid, ba, ba_valid)
     out[live_mask, _BLOCKER_A_OFF : _BLOCKER_A_OFF + 4] = blk_a[live_mask]
     out[live_mask, _BLOCKER_B_OFF : _BLOCKER_B_OFF + 4] = blk_b[live_mask]
 
@@ -2830,6 +3177,8 @@ def encode_observation_batch(
     # assignment (parity). effective (unrotated, f64, by seat), total_commit
     # (f64, by seat), street_commit_f64, pot/bet_to_call/to_call (f64) are
     # already built above. `street` (int64, by env) is the true obs street.
+    if window is None:  # rev 1: the totals-derived window
+        window = _legacy_raise_window(min_bet, max_bet, hero_street_commit, to_call)
     _encode_stack_v3_batch(
         out,
         config=config,
@@ -2843,8 +3192,7 @@ def encode_observation_batch(
         street_commit=street_commit_f64,
         pot=pot,
         bet_to_call=bet_to_call,
-        min_bet=min_bet,
-        max_bet=max_bet,
+        window=window,
         to_call=to_call,
         inv_bb=inv_bb,
         street=street,
@@ -2902,15 +3250,16 @@ def _encode_stack_v3_batch(
     street_commit: np.ndarray,
     pot: np.ndarray,
     bet_to_call: np.ndarray,
-    min_bet: np.ndarray,
-    max_bet: np.ndarray,
+    window: _RaiseWindow,
     to_call: np.ndarray,
     inv_bb: float,
     street: np.ndarray,
     acted=None,
 ) -> None:
     """Batched twin of _encode_stack_v3, dims 1020..1061. `acted` is the
-    (N, S) engine acted_this_street array (None → STK-1 stays zero)."""
+    (N, S) engine acted_this_street array (None → STK-1 stays zero).
+    `window` holds the (N,) raise window STK-2 / STK-5[2:4] describe —
+    `_legal_raise_window_batch` (rev 2) or `_legacy_raise_window` (rev 1)."""
     n = out.shape[0]
     seats = np.arange(num_seats, dtype=np.int64)
     rot = (hero_idx[:, None] + seats[None, :]) % num_seats  # (n, num_seats)
@@ -2918,7 +3267,6 @@ def _encode_stack_v3_batch(
     sc_rot = np.take_along_axis(street_commit, rot, axis=1)
     eff_rot = np.take_along_axis(effective, rot, axis=1)
     tc_rot = np.take_along_axis(total_commit, rot, axis=1)
-    hero_sc = sc_rot[:, 0]
     hero_stack = eff_rot[:, 0]
     hero_commit = tc_rot[:, 0]
     eff_to_call = np.minimum(to_call, hero_stack)
@@ -2955,16 +3303,19 @@ def _encode_stack_v3_batch(
         out[wl1, _STK1_OFF + 3] = (max_eff >= hero_stack).astype(np.float64)[wl1]
 
     # ---- STK-2: raise-ladder envelope (6) ----
-    min_d = min_bet - hero_sc
-    max_d = max_bet - hero_sc
+    # PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 B1, dims 1024-1029 and
+    # STK-5[2:4] = 1040-1041; OBS_SEMANTICS_REV 2): LEGAL raise deltas from
+    # the engine, zeros when Raise is illegal; rev 1 = the totals-derived
+    # window. The caller picks (`window`) — twin of the serial helper.
+    raise_legal, min_d, max_d, anchor_min = window
     base = pot + to_call
-    raise_legal = max_d > to_call
     base_safe = np.maximum(base, 1.0)
     eff_denom = np.maximum(hero_stack, 1.0)
-    # Legal-anchor count only (no brackets) — bit-identical to
-    # anchor_grid_np(...).legal.sum(-1) / ANCHOR_COUNT.
+    # Legal-anchor count only (no brackets) — in rev 2 bit-identical to
+    # anchor_grid_np(*sizing).legal.sum(-1) / ANCHOR_COUNT (anchor_min is the
+    # RAW min_raise, so the short-shove regime counts its one atom).
     n_legal = (
-        n_legal_anchors_np(min_d, max_d, pot, to_call).astype(np.float64)
+        n_legal_anchors_np(anchor_min, max_d, pot, to_call).astype(np.float64)
         / float(ANCHOR_COUNT)
     )
     wl2 = live_mask & raise_legal
@@ -3000,10 +3351,13 @@ def _encode_stack_v3_batch(
     spr_e = hero_stack / pot_denom
     r = 4 - street
     x6 = 1.0 + 2.0 * spr_e
+    # Exact comparison chain, NOT ceil(log/log) — see `_POW3` (review
+    # 2026-09-20 STK-6): count of powers 3**0..3**5 strictly below x6 ==
+    # the smallest k in 0..=6 with x6 <= 3**k.
+    btj = (x6[:, None] > _POW3_ARR[None, :]).sum(axis=1).astype(np.float64)
     with np.errstate(divide="ignore", invalid="ignore"):
-        btj = np.ceil(np.log(x6) / np.log(3.0))
         gfrac = (np.power(x6, 1.0 / r) - 1.0) / 2.0
-    out[live_mask, _STK6_OFF + 0] = np.clip(btj, 0.0, 6.0)[live_mask]
+    out[live_mask, _STK6_OFF + 0] = btj[live_mask]
     out[live_mask, _STK6_OFF + 1] = np.clip(gfrac, 0.0, 2.0)[live_mask]
 
     # ---- STK-7: pot-ceiling implied odds (2) ----
@@ -3044,14 +3398,21 @@ def _encode_stack_v3_batch(
     )[live_mask]
 
     # ---- STK-10: ante-pot bloat (2) ----
+    # PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 B6, dim 1052; SERVING
+    # ONLY): antes are summed over DEALT-IN seats — a sitting-out seat
+    # (folded with nothing committed) posted none. Per-row now, since the
+    # dealt-in set is per env; identical to the old config-only sum whenever
+    # every seat is dealt in (all of training). Twin of the serial helper.
     ante_i = int(config.ante)
-    pot_at_flop = 0
+    pot_at_flop = np.zeros(n, dtype=np.int64)
     for s in range(num_seats):
-        pot_at_flop += min(ante_i, int(config.resolved_stacks[s]))
-    paf = float(pot_at_flop)
+        sat_out = folded[:, s] & (total_commit[:, s] == 0.0)
+        ante_s = np.int64(min(ante_i, int(config.resolved_stacks[s])))
+        pot_at_flop += np.where(sat_out, np.int64(0), ante_s)
+    paf = pot_at_flop.astype(np.float64)
     out[live_mask, _STK10_OFF + 0] = ante_i * inv_bb
     out[live_mask, _STK10_OFF + 1] = np.log1p(
-        np.maximum(pot - paf, 0.0) / max(paf, 1.0)
+        np.maximum(pot - paf, 0.0) / np.maximum(paf, 1.0)
     )[live_mask]
 
     # ---- STK-11: per-seat price-to-continue (8), hero-rotated ----

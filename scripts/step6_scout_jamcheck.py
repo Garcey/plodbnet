@@ -10,7 +10,7 @@ if str(_ROOT / "python") not in sys.path:
     sys.path.insert(0, str(_ROOT / "python"))
 
 from plo5bp.gto.cfr_api import RootSpec, SolveConfig, apply_teacher_iso_policy, solve
-from plo5bp.gto.teacher import TEACHER_MAX_EXPL_BB
+from plo5bp.gto.teacher import expl_provenance
 
 
 def main() -> None:
@@ -33,7 +33,9 @@ def main() -> None:
         cfg = SolveConfig.teacher(
             max_iterations=20000,
             seed=3 + i,
-            target_exploitability_bb=TEACHER_MAX_EXPL_BB,
+            # (review 2026-09-20 D8) never target == cap: that reports the first
+            # noisy poll dip. 0 = run to the cap, final estimator.
+            target_exploitability_bb=0.0,
             thread_num=4,
             poll_every=500,
             card_abstraction="none",
@@ -44,6 +46,7 @@ def main() -> None:
         rep = solve(root, cfg)
         print(
             f"[step6] JAMCHECK {root.root_id} expl_bb={rep.exploitability_bb} "
+            f"verified={expl_provenance(rep).verified} "
             f"iters={rep.iterations_run} wall_s={time.time()-t0:.1f} "
             f"infosets={len(rep.strategy.get('infosets') or [])}",
             flush=True,

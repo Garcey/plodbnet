@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         plodbbot PokerNow bridge
 // @namespace    plodbbot
-// @version      1.1.0
+// @version      1.2.0
 // @description  Streams PokerNow PLO5 double-board bomb-pot table state from the DOM to the local plodbbot study server.
 // @match        https://www.pokernow.com/games/*
 // @match        https://www.pokernow.club/games/*
@@ -73,22 +73,47 @@
     return Math.round(a);
   }
 
+  // "All In" marker. PokerNow replaces the stack NUMBER with this label when a
+  // player has 0 behind.
+  const ALL_IN_RE = /\ball[\s-]*in\b/i;
+
   function readSeat(el, center) {
     const seat = parseInt((el.className.match(/table-player-(\d+)/) || [])[1], 10);
     const cards = [...el.querySelectorAll('.card')].map(cardStr);
-    const stack = num(el.querySelector('.table-player-stack .normal-value')?.textContent);
+    const stackEl = el.querySelector('.table-player-stack');
+    const stackText = clean(stackEl?.textContent);
+    const stack = num(stackEl?.querySelector('.normal-value')?.textContent);
     // Bet-value: a numeric amount (bet/raise/call/ante) OR a verb ("check").
     const betRaw = clean(el.querySelector('.table-player-bet-value')?.textContent);
     const betNum = num(betRaw);
     const folded = /\bfold\b/.test(el.className);
+    const name = clean(el.querySelector('.table-player-name')?.textContent);
+    // All-in ONLY when the DOM says so (review 2026-09-20). This used to be
+    // `stack === null && !folded`, but a missing `.normal-value` is just as
+    // often a mid-render snapshot or some other non-numeric seat state, and the
+    // server turns all-in into "stack 0" — a full-stack drop that corroborates
+    // any bet shown and routes the seat through the all-in paths. Evidence, in
+    // order: the stack label's text, an all-in class on the seat, or the label
+    // anywhere in the seat EXCEPT the player's name (a "Mr All In" must not
+    // count). `stackText` rides along so a capture log shows what was read.
+    const seatTextSansName = name
+      ? clean(el.textContent).split(name).join(' ')
+      : clean(el.textContent);
+    const allIn =
+      !folded &&
+      stack === null &&
+      (ALL_IN_RE.test(stackText) ||
+        /\ball-?in\b/i.test(el.className) ||
+        ALL_IN_RE.test(seatTextSansName));
     return {
       seat,
-      name: clean(el.querySelector('.table-player-name')?.textContent),
+      name,
       isHero: el.classList.contains('you-player'),
       isActor: el.classList.contains('decision-current'),
       angleCW: seatAngle(el, center),
       stackDollars: stack,
-      allIn: stack === null && !folded, // empty stack render == all-in (0 behind)
+      stackText: stackText || null,
+      allIn,
       folded,
       betDollars: betNum,
       betText: betNum === null && betRaw ? betRaw.toLowerCase() : null,
@@ -150,12 +175,26 @@
   setBadge('starting…', '#e0a000');
 
   // ---- POST transport (GM_xmlhttpRequest) + change-dedupe --------------------
+  //
+  // Delivery contract (review 2026-09-20): the server rebuilds the hand from
+  // the ORDERED stream of distinct frames, so a frame may be delayed but never
+  // silently lost or reordered while the table is live.
+  //   * transport failure (offline / timeout / abort): the frame goes back on
+  //     the FRONT of the queue and is retried after RETRY_MS. It used to be
+  //     dropped, and nothing drained again until a later mutation happened to
+  //     change the fingerprint — one hiccup cost an action for the whole hand.
+  //   * HTTP error status: the server saw and rejected THIS frame; resending
+  //     it cannot help and would block everything behind it, so it is dropped
+  //     and draining continues.
+  //   * every path out of enqueueCurrent() ends in drain().
 
   let lastKey = '';
-  let lastPayload = null; // last distinct state enqueued (for heartbeats)
   let queue = [];         // distinct frames awaiting send, in order (FIFO)
   let inFlight = false;
+  let nextAttemptAt = 0;  // backoff gate (ms epoch) after a transport failure
+  let retryTimer = null;
   const MAX_QUEUE = 60;   // safety bound if the server stalls
+  const RETRY_MS = 1000;
 
   function payloadKey(p) {
     // Cheap structural fingerprint so identical states don't re-send.
@@ -164,6 +203,33 @@
       p.boards.map((b) => b.cards),
       p.seats.map((s) => [s.seat, s.stackDollars, s.betDollars, s.betText, s.cards, s.isActor, s.folded, s.allIn]),
     ]);
+  }
+
+  // Bound memory by dropping the OLDEST frames (only reachable if the server is
+  // badly stalled or offline for a long stretch).
+  function trimQueue() {
+    while (queue.length > MAX_QUEUE) queue.shift();
+  }
+
+  function scheduleRetry() {
+    if (retryTimer !== null) return;
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      drain();
+    }, RETRY_MS);
+  }
+
+  function transportFailed(payload, isHeartbeat, label) {
+    inFlight = false;
+    nextAttemptAt = Date.now() + RETRY_MS;
+    // A heartbeat carries no new state — nothing to keep. A real frame goes
+    // back where it came from so order is preserved.
+    if (!isHeartbeat) {
+      queue.unshift(payload);
+      trimQueue();
+    }
+    setBadge(`${label} (q${queue.length})`, '#c0392b');
+    scheduleRetry();
   }
 
   function doPost(payload, isHeartbeat) {
@@ -176,6 +242,7 @@
       timeout: 4000,
       onload: (res) => {
         inFlight = false;
+        nextAttemptAt = 0;
         if (res.status >= 200 && res.status < 300) {
           if (!isHeartbeat) sent += 1;
           setBadge(`connected (q${queue.length})`, '#2faf4f');
@@ -186,9 +253,14 @@
         }
         drain(); // immediately send the next queued frame
       },
-      onerror: () => { inFlight = false; setBadge('server offline (start on :8765)', '#c0392b'); },
-      ontimeout: () => { inFlight = false; setBadge('server timeout', '#c0392b'); },
+      onerror: () => transportFailed(payload, isHeartbeat, 'server offline (start on :8765)'),
+      ontimeout: () => transportFailed(payload, isHeartbeat, 'server timeout'),
+      onabort: () => transportFailed(payload, isHeartbeat, 'request aborted'),
     });
+  }
+
+  function canSend() {
+    return !inFlight && Date.now() >= nextAttemptAt;
   }
 
   // Send queued frames one at a time, in order. We send EVERY distinct frame
@@ -197,42 +269,94 @@
   // per-frame work kept light (no model inference on ingest) the queue drains
   // in ~ms, so this stays near-empty under live play.
   function drain() {
-    if (inFlight || queue.length === 0) return;
+    if (queue.length === 0) return;
+    if (!canSend()) {
+      // Backing off after a failure: make sure something wakes us up again
+      // even if the table goes quiet.
+      if (!inFlight) scheduleRetry();
+      return;
+    }
     doPost(queue.shift(), false);
+  }
+
+  // Snapshot the table, or null when there is nothing truthful to report
+  // (no table on the page, or a transient mid-render DOM that threw).
+  function safeSnapshot() {
+    try {
+      return snapshot();
+    } catch (e) {
+      return null; // next mutation / heartbeat retries
+    }
   }
 
   // Snapshot the table; enqueue it if it's an observable change. Driven by the
   // MutationObserver (which Chrome does NOT throttle in a background tab, so the
   // table stays live regardless of which tab is focused).
+  //
+  // ALWAYS ends in drain(): the "nothing changed" / "no table" exits used to
+  // `return` first, so after a failed send the queue sat untouched through
+  // every mutation that did not alter the fingerprint (timers, animations).
   function enqueueCurrent() {
-    let p;
-    try {
-      p = snapshot();
-    } catch (e) {
-      return; // transient DOM mid-render; next mutation retries
+    const p = safeSnapshot();
+    if (p) {
+      const key = payloadKey(p);
+      if (key !== lastKey) {
+        lastKey = key;
+        queue.push(p);
+        trimQueue();
+      }
     }
-    if (!p) return;
-    const key = payloadKey(p);
-    if (key === lastKey) return; // no observable change since last enqueue
-    lastKey = key;
-    lastPayload = p;
-    queue.push(p);
-    // If the server falls far behind, bound memory by dropping the oldest
-    // (only reachable if the server is badly stalled).
-    while (queue.length > MAX_QUEUE) queue.shift();
     drain();
   }
 
+  // ---- Observer (re-attachable) ---------------------------------------------
+  //
+  // PokerNow is a single-page app and can REPLACE the `.table` node. An
+  // observer bound to the old, now-detached node never fires again, so the
+  // stream silently stopped while the heartbeat kept re-sending the last
+  // snapshot it had — stale state presented as live, and replayed as a fresh
+  // frame into a restarted server. Re-resolve the root on every heartbeat.
+  const OBSERVE_OPTS = { subtree: true, childList: true, attributes: true, characterData: true };
+  const obs = new MutationObserver(enqueueCurrent);
+  let root = null;
+
+  function ensureObserver() {
+    const want = document.querySelector('.table') || document.body;
+    if (want === root && root.isConnected !== false) return false;
+    obs.disconnect();
+    root = want;
+    obs.observe(root, OBSERVE_OPTS);
+    return true;
+  }
+
   // Heartbeat keeps the server's "connected" status warm during idle stretches
-  // (no DOM mutations between hands). The server dedupes identical payloads.
-  setInterval(() => {
-    if (!inFlight && queue.length === 0 && lastPayload) doPost(lastPayload, true);
-  }, HEARTBEAT_MS);
+  // (no DOM mutations between hands). It sends a snapshot taken NOW — never a
+  // remembered payload — so it cannot assert a table state that is no longer on
+  // screen: unchanged state is deduped by the server, changed state (mutations
+  // we missed) is enqueued as a real frame, and no table means no heartbeat
+  // (the server's recency-based "connected" then lapses, which is the truth).
+  function heartbeat() {
+    ensureObserver();
+    if (queue.length > 0) {
+      drain(); // doubles as the retry pump while backing off
+      return;
+    }
+    if (!canSend()) return;
+    const p = safeSnapshot();
+    if (!p) return;
+    const key = payloadKey(p);
+    if (key !== lastKey) {
+      lastKey = key;
+      queue.push(p);
+      drain();
+    } else {
+      doPost(p, true);
+    }
+  }
+  setInterval(heartbeat, HEARTBEAT_MS);
 
   // Observe the table subtree; every change enqueues a fresh snapshot.
-  const root = document.querySelector('.table') || document.body;
-  const obs = new MutationObserver(enqueueCurrent);
-  obs.observe(root, { subtree: true, childList: true, attributes: true, characterData: true });
+  ensureObserver();
 
   enqueueCurrent();
 })();

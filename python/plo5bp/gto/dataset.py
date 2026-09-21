@@ -9,7 +9,8 @@ Two sources:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
@@ -19,7 +20,15 @@ from torch.utils.data import Dataset
 
 from plo5bp.config import GameConfig
 from plo5bp.env import BombPotEnv
-from plo5bp.gto.labels import LabelRecord, read_jsonl
+from plo5bp.gto.labels import (
+    ILLEGAL_MASS_TOL,
+    IllegalTeacherMassError,
+    LabelRecord,
+    illegal_teacher_mass,
+    jam_anchor_index,
+    read_jsonl,
+)
+from plo5bp.gto.obs_rev import UNSTAMPED_OBS_REV, current_obs_rev
 from plo5bp.gto.roots import CLUBGG_NLH_ROOT
 from plo5bp.network import ActorCritic, obs_adapter
 from plo5bp.sizing import NLH_ANCHOR_SPEC, sizing_from_info
@@ -28,6 +37,31 @@ from plo5bp.sizing import NLH_ANCHOR_SPEC, sizing_from_info
 def _node_dist(model, device, obs, info):
     from plo5bp.ui.trainer import compute_node_distribution
     return compute_node_distribution(model, device, obs, info)
+
+
+@dataclass(frozen=True)
+class RowProvenance:
+    """Where a supervised row came from (review 2026-09-20 D4/F6/F11).
+
+    Carried per row so the CHECKPOINT meta (train root ids, label sources,
+    teacher exploitability cap, seat/street coverage) is DERIVED from the
+    records that were trained on — never asserted by the calling script.
+    """
+
+    root_id: str = ""            # LabelRecord.root_name ("" = not a solver root)
+    source: str = ""             # LabelRecord.source / "rule_bootstrap" / ...
+    num_seats: int = 0           # 0 = unknown
+    expl_bb: float | None = None       # teacher root exploitability
+    expl_verified: bool = False        # produced by a FINAL estimator
+    teacher_cap_bb: float | None = None  # cap the exporter enforced
+    # How the row's obs was produced: "canonical" (solver-root form — what
+    # PolicyNetHost serves postflop), "live" (raw env obs), "synthetic_preflop",
+    # "synthetic_fallback", "attached", "custom". The host canonicalizes at
+    # serve only for nets trained on canonical rows (review 2026-09-20 D3).
+    obs_form: str = ""
+
+
+_NO_PROVENANCE = RowProvenance()
 
 
 @dataclass
@@ -39,6 +73,11 @@ class SupervisedRow:
     anchor_probs: np.ndarray # (K,) float32 soft target (zeros if raise illegal)
     value_bb: float
     street: int
+    # (review 2026-09-20 F11) False when the label had NO value target
+    # (``value_bb is None`` — every CFR export today): the row is masked out
+    # of the value loss instead of being trained toward 0.
+    value_mask: bool = True
+    prov: RowProvenance = _NO_PROVENANCE
 
 
 class PolicyDataset(Dataset):
@@ -59,7 +98,11 @@ class PolicyDataset(Dataset):
             "gate_probs": torch.from_numpy(r.gate_probs),
             "anchor_probs": torch.from_numpy(r.anchor_probs),
             "value_bb": torch.tensor(r.value_bb, dtype=torch.float32),
+            "value_mask": torch.tensor(bool(r.value_mask), dtype=torch.bool),
             "street": torch.tensor(r.street, dtype=torch.int64),
+            # Row index: lets the trainer name the offending ROOT when an
+            # assertion fires on a batch.
+            "idx": torch.tensor(idx, dtype=torch.int64),
         }
 
 
@@ -72,12 +115,19 @@ def collect_teacher_distill(
     stack_bb_range: tuple[float, float] = (20.0, 250.0),
     device: torch.device | str = "cpu",
     max_hands: int = 50_000,
+    canonical_obs: bool = True,
 ) -> list[SupervisedRow]:
     """Roll NLH hands; at every decision store teacher soft labels.
 
     Multiway 2–6 is included so T1 play generalizes (decision #3).
     Stacks / seats randomize around the ClubGG stake structure.
+
+    ``canonical_obs`` (review 2026-09-20 D3): the STUDENT row stores the
+    solver-root canonical obs postflop — the form ``PolicyNetHost`` serves —
+    while the teacher is still queried on its own live obs.
     """
+    from plo5bp.gto.obs_from_label import canonical_serve_obs
+
     teacher = teacher.to(device).eval()
     adapt = obs_adapter(teacher)
     rng = np.random.default_rng(int(seed))
@@ -126,15 +176,27 @@ def collect_teacher_distill(
                 if bool(info.gate_mask[2]):
                     ap[0] = 1.0
 
+            canon = (
+                canonical_serve_obs(info.raw_obs, bb=cfg.bb)
+                if canonical_obs
+                else None
+            )
             rows.append(
                 SupervisedRow(
-                    obs=np.asarray(adapt(obs), dtype=np.float32).copy(),
+                    obs=np.asarray(
+                        adapt(obs) if canon is None else canon, dtype=np.float32
+                    ).copy(),
                     gate_mask=np.asarray(info.gate_mask, dtype=bool).copy(),
                     sizing=sizing_from_info(info).astype(np.int64),
                     gate_probs=gate_p,
                     anchor_probs=ap,
                     value_bb=float(dist.get("value_bb", 0.0)),
                     street=int(info.raw_obs.get("street", 0)),
+                    prov=RowProvenance(
+                        source="teacher_distill",
+                        num_seats=n_seats,
+                        obs_form="live" if canon is None else "canonical",
+                    ),
                 )
             )
             # Advance with teacher sample (mixed) so trajectories cover
@@ -152,45 +214,122 @@ def collect_teacher_distill(
     return rows
 
 
+def provenance_from_label(lab: LabelRecord, *, obs_form: str = "") -> RowProvenance:
+    """Teacher provenance of one LabelRecord, read from the RECORD itself."""
+    notes = lab.notes or {}
+
+    def _num(key: str) -> float | None:
+        v = notes.get(key)
+        try:
+            return None if v is None else float(v)
+        except (TypeError, ValueError):
+            return None
+
+    return RowProvenance(
+        root_id=str(lab.root_name or ""),
+        source=str(lab.source or ""),
+        num_seats=int(lab.num_seats),
+        expl_bb=_num("exploitability_bb"),
+        expl_verified=bool(notes.get("expl_verified") is True),
+        teacher_cap_bb=_num("teacher_max_expl_bb"),
+        obs_form=obs_form,
+    )
+
+
 def rows_from_label_records(
     labels: Sequence[LabelRecord],
     *,
     obs_fn=None,
     synthesize_obs: bool = True,
+    include_lossy_obs: bool = False,
+    stats: Any | None = None,
+    kept: list[int] | None = None,
 ) -> list[SupervisedRow]:
-    """Convert LabelRecords to SupervisedRows.
+    """Convert LabelRecords to SupervisedRows (THE row builder).
+
+    ``kept`` (optional out-list) receives the index into ``labels`` of every
+    returned row, so callers can align rows back to their records.
 
     Priority for obs:
       1. ``notes['obs']`` if present
       2. ``obs_fn(lab)`` if given
       3. ``obs_from_label`` synthesis (``OBS_DIM_NLH``) when ``synthesize_obs``
+
+    (review 2026-09-20 D16) Postflop labels whose obs fell back to the LOSSY
+    synthetic dict are counted, logged loudly and EXCLUDED unless
+    ``include_lossy_obs=True``. ``stats`` (an
+    :class:`plo5bp.gto.obs_from_label.ObsSynthesisStats`) receives the tally.
+
+    (review 2026-09-20 D1/D2) Teacher mass on a gate / anchor the serve masks
+    out raises :class:`IllegalTeacherMassError` (naming the root) instead of
+    being renormalized away. Labels exported before the fix trip this —
+    re-export them.
     """
-    if synthesize_obs and obs_fn is None:
-        from plo5bp.gto.obs_from_label import obs_from_label as _default_obs
+    from plo5bp.gto.obs_from_label import (
+        OBS_KIND_ENGINE,
+        OBS_KIND_LOSSY,
+        OBS_KIND_NO_HOLE,
+        ObsSynthesisStats,
+        obs_from_label_detailed,
+    )
 
-        obs_fn = _default_obs
-
+    if stats is None:
+        stats = ObsSynthesisStats()
     k = NLH_ANCHOR_SPEC.count
     rows: list[SupervisedRow] = []
-    for lab in labels:
+    for i_lab, lab in enumerate(labels):
         obs = None
+        kind = "attached"
         if lab.notes.get("obs") is not None:
             obs = np.asarray(lab.notes["obs"], dtype=np.float32)
         elif obs_fn is not None:
-            obs = obs_fn(lab)
+            obs, kind = obs_fn(lab), "custom"
+        elif synthesize_obs:
+            obs, kind = obs_from_label_detailed(lab)
         if obs is None:
+            stats.record(OBS_KIND_NO_HOLE, root=str(lab.root_name))
             continue
+        if kind == OBS_KIND_LOSSY and not include_lossy_obs:
+            stats.record(kind, root=str(lab.root_name), excluded=True)
+            continue
+        stats.record(kind, root=str(lab.root_name))
+
+        where = f"root {lab.root_name!r} node {lab.solve_id!r}"
         fold_legal = int(lab.to_call_chips) > 0
         raise_legal = int(lab.max_raise_chips) > 0
         gate_mask = np.array([fold_legal, True, raise_legal], dtype=bool)
         g = np.asarray(lab.gate_probs, dtype=np.float32).copy()
         if len(g) != 3:
             g = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        masked_gate = float(np.clip(g, 0.0, None)[~gate_mask].sum())
+        if masked_gate > ILLEGAL_MASS_TOL:
+            raise IllegalTeacherMassError(
+                f"{where}: {masked_gate:.6g} of gate mass on an illegal gate "
+                f"(gate_probs={g.tolist()} mask={gate_mask.tolist()}, "
+                f"to_call={lab.to_call_chips} max_raise={lab.max_raise_chips}) "
+                f"— re-export the labels (review 2026-09-20 D1/D2)"
+            )
         g = g * gate_mask.astype(np.float32)
         if float(g.sum()) <= 0:
             g = np.array([0.0, 1.0, 0.0], dtype=np.float32)
         else:
             g /= g.sum()
+
+        bad_anchor = illegal_teacher_mass(
+            lab.action_probs,
+            min_raise=lab.min_raise_chips,
+            max_raise=lab.max_raise_chips,
+            pot_chips=lab.pot_chips,
+            to_call=lab.to_call_chips,
+        )
+        if bad_anchor > ILLEGAL_MASS_TOL:
+            raise IllegalTeacherMassError(
+                f"{where}: {bad_anchor:.6g} of teacher mass on serve-illegal "
+                f"actions (sizing min={lab.min_raise_chips} "
+                f"max={lab.max_raise_chips} pot={lab.pot_chips} "
+                f"to_call={lab.to_call_chips}) — re-export the labels "
+                f"(review 2026-09-20 D1)"
+            )
         ap = np.zeros(k, dtype=np.float32)
         for a in lab.action_probs:
             if a.gate == "raise" and a.anchor_k is not None:
@@ -200,7 +339,15 @@ def rows_from_label_records(
         if s > 0:
             ap /= s
         elif raise_legal:
-            ap[-1] = 1.0
+            # No sizing info (raise weight is 0): park on the LEGAL jam anchor.
+            ap[
+                jam_anchor_index(
+                    min_raise=lab.min_raise_chips,
+                    max_raise=lab.max_raise_chips,
+                    pot=lab.pot_chips,
+                    to_call=lab.to_call_chips,
+                )
+            ] = 1.0
         rows.append(
             SupervisedRow(
                 obs=np.asarray(obs, dtype=np.float32),
@@ -216,10 +363,18 @@ def rows_from_label_records(
                 ),
                 gate_probs=g,
                 anchor_probs=ap,
-                value_bb=float(lab.value_bb or 0.0),
+                value_bb=0.0 if lab.value_bb is None else float(lab.value_bb),
                 street=int(lab.street),
+                value_mask=lab.value_bb is not None,
+                prov=provenance_from_label(
+                    lab,
+                    obs_form="canonical" if kind == OBS_KIND_ENGINE else kind,
+                ),
             )
         )
+        if kept is not None:
+            kept.append(i_lab)
+    stats.log(prefix="[gto-rows]")
     return rows
 
 
@@ -227,10 +382,15 @@ def load_label_shard_rows(
     path: Path | str,
     *,
     synthesize_obs: bool = True,
+    include_lossy_obs: bool = False,
+    stats: Any | None = None,
 ) -> list[SupervisedRow]:
     """Load LabelRecord JSONL → supervised rows (obs synthesized by default)."""
     return rows_from_label_records(
-        list(read_jsonl(path)), synthesize_obs=synthesize_obs
+        list(read_jsonl(path)),
+        synthesize_obs=synthesize_obs,
+        include_lossy_obs=include_lossy_obs,
+        stats=stats,
     )
 
 
@@ -238,18 +398,46 @@ def load_label_shards(
     paths: Sequence[Path | str],
     *,
     synthesize_obs: bool = True,
+    include_lossy_obs: bool = False,
+    stats: Any | None = None,
 ) -> list[SupervisedRow]:
     """Load multiple JSONL shards into one row list."""
     rows: list[SupervisedRow] = []
     for p in paths:
-        rows.extend(load_label_shard_rows(p, synthesize_obs=synthesize_obs))
+        rows.extend(
+            load_label_shard_rows(
+                p,
+                synthesize_obs=synthesize_obs,
+                include_lossy_obs=include_lossy_obs,
+                stats=stats,
+            )
+        )
     return rows
 
 
+class StaleObsCacheError(ValueError):
+    """A cached row bundle embeds obs from another semantics revision."""
+
+
 def save_rows_npz(path: Path | str, rows: Sequence[SupervisedRow]) -> None:
-    """Compact numpy bundle for fast reload."""
+    """Compact numpy bundle for fast reload.
+
+    Provenance is root-level, so it is stored as a small JSON table plus a
+    per-row index (no pickle). The bundle EMBEDS encoded obs, so it is stamped
+    with the observation semantics revision it was built under
+    (:mod:`plo5bp.gto.obs_rev`).
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    table: list[RowProvenance] = []
+    index: dict[RowProvenance, int] = {}
+    prov_idx = np.zeros(len(rows), dtype=np.int64)
+    for i, r in enumerate(rows):
+        j = index.get(r.prov)
+        if j is None:
+            j = index[r.prov] = len(table)
+            table.append(r.prov)
+        prov_idx[i] = j
     np.savez_compressed(
         path,
         obs=np.stack([r.obs for r in rows]),
@@ -259,12 +447,35 @@ def save_rows_npz(path: Path | str, rows: Sequence[SupervisedRow]) -> None:
         anchor_probs=np.stack([r.anchor_probs for r in rows]),
         value_bb=np.asarray([r.value_bb for r in rows], dtype=np.float32),
         street=np.asarray([r.street for r in rows], dtype=np.int64),
+        value_mask=np.asarray([bool(r.value_mask) for r in rows], dtype=bool),
+        obs_rev=np.asarray(current_obs_rev(), dtype=np.int64),
+        prov_idx=prov_idx,
+        prov_table=np.asarray(json.dumps([asdict(p) for p in table])),
     )
 
 
-def load_rows_npz(path: Path | str) -> list[SupervisedRow]:
+def load_rows_npz(
+    path: Path | str, *, allow_stale_obs: bool = False
+) -> list[SupervisedRow]:
+    """Reload a row bundle. Raises :class:`StaleObsCacheError` when its obs
+    were encoded under another semantics revision (no stamp ⇒ revision 1), so
+    a stale cache is REBUILT rather than silently reused."""
     data = np.load(path, allow_pickle=False)
+    have = int(data["obs_rev"]) if "obs_rev" in data else UNSTAMPED_OBS_REV
+    if have != current_obs_rev() and not allow_stale_obs:
+        raise StaleObsCacheError(
+            f"{path}: cached obs are semantics revision {have}, this process "
+            f"encodes revision {current_obs_rev()} (PLO5BP_OBS_REV) — rebuild "
+            f"the bundle (or pass allow_stale_obs=True to study the old one)"
+        )
     n = data["obs"].shape[0]
+    # Bundles written before 2026-09-20 carry no value mask / provenance.
+    value_mask = data["value_mask"] if "value_mask" in data else np.ones(n, bool)
+    if "prov_table" in data and "prov_idx" in data:
+        table = [RowProvenance(**d) for d in json.loads(str(data["prov_table"]))]
+        prov_idx = data["prov_idx"]
+    else:
+        table, prov_idx = [_NO_PROVENANCE], np.zeros(n, dtype=np.int64)
     return [
         SupervisedRow(
             obs=data["obs"][i],
@@ -274,6 +485,8 @@ def load_rows_npz(path: Path | str) -> list[SupervisedRow]:
             anchor_probs=data["anchor_probs"][i],
             value_bb=float(data["value_bb"][i]),
             street=int(data["street"][i]),
+            value_mask=bool(value_mask[i]),
+            prov=table[int(prov_idx[i])],
         )
         for i in range(n)
     ]

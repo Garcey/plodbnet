@@ -25,8 +25,13 @@ impl AbstractAction {
 
 /// Legal abstract actions at a public node, given the size menu.
 ///
-/// **Push/fold mode** (`raise_sizes_pm` empty + `allin_atom`): only FOLD and
-/// ALLIN (no limp / no partial call). Matches Monker all-in-or-fold trees.
+/// **Push/fold mode** (PREFLOP, `raise_sizes_pm` empty + `allin_atom`): only
+/// FOLD and ALLIN (no limp / no partial call). Matches Monker all-in-or-fold
+/// trees.
+///
+/// `ALLIN` is the maximum legal raise, `max_raise_chips()`: the actor's whole
+/// stack, or — when the actor covers every live opponent — the raise that puts
+/// the deepest of them all-in.
 pub fn legal_actions(state: &PublicState, raise_sizes_pm: &[u32], allin_atom: bool) -> Vec<AbstractAction> {
     if state.is_terminal() {
         return vec![];
@@ -38,7 +43,11 @@ pub fn legal_actions(state: &PublicState, raise_sizes_pm: &[u32], allin_atom: bo
     let max_r = state.max_raise_chips();
 
     // Pure jam-or-fold tree: empty size menu + all-in atom.
-    if raise_sizes_pm.is_empty() && allin_atom {
+    // (review 2026-09-20 F10) PREFLOP only. The "no check / no limp" rule is a
+    // preflop push/fold convention; applied to a postflop root it removed the
+    // check, so "jam/check" spots were really jam-only and the known-spot
+    // gates tested nothing.
+    if raise_sizes_pm.is_empty() && allin_atom && state.street == 0 {
         let mut out = Vec::with_capacity(2);
         if to_call > 0 {
             out.push(AbstractAction::Fold);
@@ -69,6 +78,14 @@ pub fn legal_actions(state: &PublicState, raise_sizes_pm: &[u32], allin_atom: bo
         let mut seen_chips = Vec::new();
         for &pm in raise_sizes_pm {
             if let Some(chips) = state.raise_chips_for_pm(pm) {
+                // (review 2026-09-20 D11) One physical action = one abstract
+                // action. A size that clamps to the maximum raise IS the
+                // all-in: it is offered once, under the ALLIN label. The old
+                // menu kept both RAISE_x and a re-added ALLIN for the same
+                // chips (twin jams splitting regret/strategy mass).
+                if allin_atom && chips == max_r {
+                    continue;
+                }
                 if !seen_chips.contains(&chips) {
                     seen_chips.push(chips);
                     out.push(AbstractAction::RaisePm(pm));
@@ -76,21 +93,13 @@ pub fn legal_actions(state: &PublicState, raise_sizes_pm: &[u32], allin_atom: bo
             }
         }
         if allin_atom {
-            // All-in as raise only when stack is a legal raise amount
-            if stack >= min_r && stack <= max_r && !seen_chips.contains(&stack) {
-                out.push(AbstractAction::AllIn);
-            } else if stack > 0 && to_call > 0 && stack == to_call {
-                // short call-all-in already covered by CheckCall
-            } else if stack > max_r && max_r >= min_r {
-                // stack exceeds max (shouldn't for NL with cover cap) — skip
-            } else if stack >= min_r && stack <= max_r {
-                out.push(AbstractAction::AllIn);
-            }
+            // (review 2026-09-20 D11) Offered whenever a raise is legal — also
+            // for a stack that COVERS the table (`stack > max_r`), which used
+            // to get no ALLIN at all in sized trees.
+            out.push(AbstractAction::AllIn);
         }
-    } else if allin_atom {
-        // No raise legal; call-all-in covered by CheckCall when facing bet.
-        let _ = (stack, min_r, max_r, to_call);
     }
+    // No raise legal: call-all-in is covered by CheckCall when facing a bet.
 
     out
 }
@@ -118,17 +127,22 @@ pub fn apply_abstract(
             Ok(chips)
         }
         AbstractAction::AllIn => {
-            let actor = state.actor.ok_or_else(|| {
-                super::CfrError::InvalidConfig("allin terminal".into())
-            })? as usize;
-            let stack = state.stacks[actor];
+            if state.actor.is_none() {
+                return Err(super::CfrError::InvalidConfig("allin terminal".into()));
+            }
             let min_r = state.min_raise_chips();
             let max_r = state.max_raise_chips();
-            if stack >= min_r && stack <= max_r && min_r > 0 {
-                state.apply_raise(stack)?;
-                Ok(stack)
+            // (review 2026-09-20 D11) `max_r == min(stack, cap to the deepest
+            // live opponent)`. The old guard required `stack <= max_r`, so a
+            // stack that COVERED the table fell through to the call branch:
+            // in a push/fold tree the big stack's "ALLIN" open was a LIMP.
+            // Same rule as `engine_bridge::replay_cfr_path` ("AI" → max raise).
+            if min_r > 0 && max_r >= min_r {
+                state.apply_raise(max_r)?;
+                Ok(max_r)
             } else {
-                // Fall back to call all-in
+                // No raise is legal (facing a covering jam / short lockout):
+                // ALLIN is the call all-in.
                 let c = state.to_call_chips();
                 state.apply_check_call();
                 Ok(c)
@@ -186,6 +200,123 @@ mod tests {
         s.stacks[0] = 100_000;
         let acts = legal_actions(&s, &[], true);
         assert_eq!(acts, vec![AbstractAction::AllIn]);
+    }
+
+    /// (review 2026-09-20 D11) 3-way push/fold, stacks [30, 10, 10] bb: the
+    /// covering UTG stack's ALLIN must RAISE to the cap, not limp.
+    #[test]
+    fn covering_stack_allin_raises_to_the_cap() {
+        let bb = 10_000u64;
+        let mut s =
+            PublicState::preflop_root(&[300_000, 100_000, 100_000], bb, 5_000, 0, 0).unwrap();
+        assert_eq!(s.actor, Some(0));
+        assert_eq!(
+            legal_actions(&s, &[], true),
+            vec![AbstractAction::Fold, AbstractAction::AllIn]
+        );
+        let paid = apply_abstract(&mut s, AbstractAction::AllIn).unwrap();
+        // Deepest opponent can reach 10 bb in total ⇒ UTG raises to 10 bb.
+        assert_eq!(paid, 100_000, "ALLIN degraded to a {paid}-chip call/limp");
+        assert_eq!(s.bet_to_call, 100_000);
+        assert_eq!(s.street_commit[0], 100_000);
+        assert_eq!(s.stacks[0], 200_000);
+        assert_eq!(s.last_aggressor, Some(0));
+        // SB faces a jam: fold or call all-in (no re-raise possible).
+        assert_eq!(s.actor, Some(1));
+        assert_eq!(
+            legal_actions(&s, &[], true),
+            vec![AbstractAction::Fold, AbstractAction::AllIn]
+        );
+        assert_eq!(apply_abstract(&mut s, AbstractAction::AllIn).unwrap(), 95_000);
+        assert!(s.all_in[1]);
+        // BB calls too → betting closed, nobody left to act.
+        assert_eq!(apply_abstract(&mut s, AbstractAction::AllIn).unwrap(), 90_000);
+        assert!(s.actor.is_none());
+        assert_eq!(s.pot, 15_000 + 100_000 + 95_000 + 90_000);
+    }
+
+    /// Same rule in a sized postflop tree: a covering stack still gets ALLIN.
+    #[test]
+    fn covering_stack_has_allin_in_sized_tree() {
+        let mut s = PublicState::postflop_root(
+            2,
+            100_000,
+            &[300_000, 100_000],
+            &[0, 1, 2, 3, 4],
+            10_000,
+            3,
+        )
+        .unwrap();
+        let acts = legal_actions(&s, &[500], true);
+        assert_eq!(
+            acts,
+            vec![
+                AbstractAction::CheckCall,
+                AbstractAction::RaisePm(500),
+                AbstractAction::AllIn
+            ]
+        );
+        assert_eq!(apply_abstract(&mut s, AbstractAction::AllIn).unwrap(), 100_000);
+        assert_eq!(s.bet_to_call, 100_000);
+    }
+
+    /// (review 2026-09-20 D11) SPR-1 root: the pot-size raise IS the jam — one
+    /// abstract action, labelled ALLIN (no RAISE_1000/ALLIN twins).
+    #[test]
+    fn spr1_root_has_no_twin_jam() {
+        let s = PublicState::river_hu_root(100_000, 100_000, &[0, 1, 2, 3, 4], 10_000).unwrap();
+        assert_eq!(
+            legal_actions(&s, &[1000], true),
+            vec![AbstractAction::CheckCall, AbstractAction::AllIn]
+        );
+        assert_eq!(
+            legal_actions(&s, &[500, 1000, 1500], true),
+            vec![
+                AbstractAction::CheckCall,
+                AbstractAction::RaisePm(500),
+                AbstractAction::AllIn
+            ]
+        );
+        // Every action is a distinct chip amount.
+        for menu in [vec![1000u32], vec![330, 500, 750, 1000, 1500]] {
+            let mut chips = Vec::new();
+            for a in legal_actions(&s, &menu, true) {
+                let mut c = s.clone();
+                chips.push((a, apply_abstract(&mut c, a).unwrap()));
+            }
+            for i in 0..chips.len() {
+                for j in 0..i {
+                    assert_ne!(chips[i].1, chips[j].1, "twin actions {:?}", (chips[i], chips[j]));
+                }
+            }
+        }
+        // Without the all-in atom the sized raise keeps its own label.
+        assert_eq!(
+            legal_actions(&s, &[1000], false),
+            vec![AbstractAction::CheckCall, AbstractAction::RaisePm(1000)]
+        );
+    }
+
+    /// (review 2026-09-20 F10) the "no check" push/fold rule is preflop-only:
+    /// a postflop root with an empty size menu is a JAM/CHECK tree.
+    #[test]
+    fn postflop_empty_menu_keeps_the_check() {
+        let mut s = PublicState::river_hu_root(100_000, 100_000, &[0, 1, 2, 3, 4], 10_000).unwrap();
+        assert_eq!(
+            legal_actions(&s, &[], true),
+            vec![AbstractAction::CheckCall, AbstractAction::AllIn]
+        );
+        apply_abstract(&mut s, AbstractAction::CheckCall).unwrap();
+        assert_eq!(
+            legal_actions(&s, &[], true),
+            vec![AbstractAction::CheckCall, AbstractAction::AllIn]
+        );
+        apply_abstract(&mut s, AbstractAction::AllIn).unwrap();
+        // Facing the jam: fold or call (CHECK_CALL); no raise is possible.
+        assert_eq!(
+            legal_actions(&s, &[], true),
+            vec![AbstractAction::Fold, AbstractAction::CheckCall]
+        );
     }
 
     /// BB facing a jam: FOLD | ALLIN only (no limp / partial call).

@@ -68,8 +68,11 @@ def main() -> None:
         board=[0, 5, 10, 15, 20],
         raise_sizes_pm=[],
         allin_atom=True,
-        range_oop="2:1,9:1,27:1,44:1",
-        range_ip="77:1,104:1,152:1,189:1",
+        # `#id` is the unambiguous combo-id form: a bare two-digit token such as
+        # 44 or 77 also reads as a pocket pair in range notation (review
+        # 2026-09-20 D12).
+        range_oop="#2:1,#9:1,#27:1,#44:1",
+        range_ip="#77:1,#104:1,#152:1,#189:1",
         root_id="tiny4x4",
     )
     run("tiny4x4", t, 3_000, 1)

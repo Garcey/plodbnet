@@ -29,13 +29,53 @@ the table center; this mapper sorts those angles clockwise from hero to assign
 the engine's ``hero=0, then clockwise`` seat convention. Only seats that are
 part of the current hand (have cards, or have folded out of it) are included,
 so ``num_seats`` reflects the actual table size for the hand.
+
+Payload contract (``pokernow.v1``) — validated, review 2026-09-20
+-----------------------------------------------------------------
+``map_payload`` is the trust boundary for JSON that arrives over HTTP, so it
+checks the shape up front and raises `PokerNowPayloadError` (a ``ValueError``)
+with the offending path — the server should answer 400. It used to let
+garbage through to fail deep inside (``int(None)`` → TypeError, ``inf`` →
+OverflowError → a 500 on every heartbeat), and a payload in the pre-v1 key
+spelling (``stack``/``bet``/``pot``) mapped "successfully" to a table where
+every player was all-in for an unknown amount.
+
+    seats:       list, required. Each seat is an object with
+      seat          int (PokerNow physical seat), required, unique
+      cards         list of card strings / nulls (``[]`` = none), required
+      stackDollars  finite number >= 0, or null — key required
+      betDollars    finite number >= 0, or null — key required
+      betText       string or null (``"check"`` = 0 this street)
+      folded, isHero, isActor, allIn   booleans (absent = false)
+      angleCW       finite number (absent = 0)
+      name          string or null
+    boards:      list of {run, cards} (absent = no board yet)
+    button:      null | {"seat": int} | int
+    heroCards:   list or null
+    potDollars:  finite number >= 0, or null
+    schema:      "pokernow.v1" when present
+
+Unparseable *card strings* stay lenient (→ face-down): PokerNow's card DOM is
+the one place a mid-render snapshot produces junk, and a dropped frame is worse
+than an unknown card.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from plo5bp.ocr.types import Card, FrameState, SeatObs
+
+SCHEMA = "pokernow.v1"
+
+
+class PokerNowPayloadError(ValueError):
+    """The payload is not a well-formed ``pokernow.v1`` snapshot.
+
+    Subclasses ``ValueError`` so callers can turn it into an HTTP 400
+    without importing this module's types.
+    """
 
 
 @dataclass(frozen=True)
@@ -55,6 +95,113 @@ class PokerNowFrame:
     physical_to_engine: dict[int, int]
     bomb_pot: bool
     variant: str
+
+
+def _bad(where: str, problem: str, value) -> PokerNowPayloadError:
+    shown = repr(value)
+    if len(shown) > 80:  # the message ends up in a 400 body / log line
+        shown = shown[:77] + "..."
+    return PokerNowPayloadError(f"pokernow payload: {where} {problem} (got {shown})")
+
+
+def _req_int(v, where: str) -> int:
+    # bool is an int subclass; JSON true/false is never a seat number.
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise _bad(where, "must be an integer", v)
+    if isinstance(v, float) and (not math.isfinite(v) or v != int(v)):
+        raise _bad(where, "must be an integer", v)
+    return int(v)
+
+
+def _opt_amount(v, where: str) -> float | None:
+    """A dollar amount: finite number >= 0, or None."""
+    if v is None:
+        return None
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise _bad(where, "must be a number or null", v)
+    f = float(v)
+    if not math.isfinite(f) or f < 0:
+        raise _bad(where, "must be a finite number >= 0", v)
+    return f
+
+
+def _opt_cards(v, where: str) -> list:
+    if v is None:
+        return []
+    if not isinstance(v, (list, tuple)):
+        raise _bad(where, "must be a list of card strings/nulls", v)
+    for i, c in enumerate(v):
+        if c is not None and not isinstance(c, str):
+            raise _bad(f"{where}[{i}]", "must be a card string or null", c)
+    return list(v)
+
+
+def _validate_seat(seat, idx: int) -> dict:
+    where = f"seats[{idx}]"
+    if not isinstance(seat, dict):
+        raise _bad(where, "must be an object", seat)
+    # Key PRESENCE is what tells a v1 payload from the pre-v1 spelling
+    # (`stack` / `bet`): with `.get()` alone those read as "no stack, no bet".
+    for key in ("seat", "cards", "stackDollars", "betDollars"):
+        if key not in seat:
+            raise PokerNowPayloadError(
+                f"pokernow payload: {where} is missing required key {key!r} "
+                f"(keys present: {sorted(map(str, seat))})"
+            )
+    _req_int(seat["seat"], f"{where}.seat")
+    _opt_cards(seat["cards"], f"{where}.cards")
+    _opt_amount(seat["stackDollars"], f"{where}.stackDollars")
+    _opt_amount(seat["betDollars"], f"{where}.betDollars")
+    text = seat.get("betText")
+    if text is not None and not isinstance(text, str):
+        raise _bad(f"{where}.betText", "must be a string or null", text)
+    ang = seat.get("angleCW")
+    if ang is not None and (
+        isinstance(ang, bool)
+        or not isinstance(ang, (int, float))
+        or not math.isfinite(float(ang))
+    ):
+        raise _bad(f"{where}.angleCW", "must be a finite number", ang)
+    return seat
+
+
+def _validate_payload(payload) -> None:
+    if not isinstance(payload, dict):
+        raise _bad("payload", "must be an object", payload)
+    schema = payload.get("schema")
+    if schema is not None and schema != SCHEMA:
+        raise _bad("schema", f"must be {SCHEMA!r}", schema)
+    if not isinstance(payload.get("seats"), list):
+        raise _bad("seats", "must be a list", payload.get("seats"))
+    seen: set[int] = set()
+    heroes = 0
+    for idx, seat in enumerate(payload["seats"]):
+        _validate_seat(seat, idx)
+        phys = int(seat["seat"])
+        if phys in seen:
+            raise _bad(f"seats[{idx}].seat", "duplicates an earlier seat", phys)
+        seen.add(phys)
+        heroes += 1 if seat.get("isHero") else 0
+    if heroes > 1:
+        raise _bad("seats", "must flag at most one isHero seat", heroes)
+
+    boards = payload.get("boards")
+    if boards is not None:
+        if not isinstance(boards, list):
+            raise _bad("boards", "must be a list", boards)
+        for i, b in enumerate(boards):
+            if not isinstance(b, dict):
+                raise _bad(f"boards[{i}]", "must be an object", b)
+            _opt_cards(b.get("cards"), f"boards[{i}].cards")
+    _opt_cards(payload.get("heroCards"), "heroCards")
+    _opt_amount(payload.get("potDollars"), "potDollars")
+
+    button = payload.get("button")
+    if isinstance(button, dict):
+        if button.get("seat") is not None:
+            _req_int(button["seat"], "button.seat")
+    elif button is not None:
+        _req_int(button, "button")
 
 
 def _dollars_to_cents(v) -> int | None:
@@ -109,8 +256,11 @@ def _engine_order(seats: list[dict]) -> list[dict]:
         # No hero seat flagged — fall back to physical-seat order so the
         # caller still gets a deterministic (if unrotated) layout.
         return sorted(seats, key=lambda s: s.get("seat", 0))
-    hero_ang = float(hero.get("angleCW", 0.0))
-    return sorted(seats, key=lambda s: (float(s.get("angleCW", 0.0)) - hero_ang) % 360.0)
+    # `or 0.0`: the key may be present with an explicit null.
+    hero_ang = float(hero.get("angleCW") or 0.0)
+    return sorted(
+        seats, key=lambda s: (float(s.get("angleCW") or 0.0) - hero_ang) % 360.0
+    )
 
 
 def _seat_committed_cents(seat: dict) -> int | None:
@@ -132,8 +282,13 @@ def _seat_committed_cents(seat: dict) -> int | None:
 
 
 def map_payload(payload: dict) -> PokerNowFrame:
-    """Map a ``pokernow.v1`` DOM snapshot to a `PokerNowFrame`."""
-    raw_seats = [s for s in (payload.get("seats") or []) if _is_in_hand(s)]
+    """Map a ``pokernow.v1`` DOM snapshot to a `PokerNowFrame`.
+
+    Raises `PokerNowPayloadError` (a ``ValueError``) on a malformed payload —
+    see "Payload contract" in the module docstring.
+    """
+    _validate_payload(payload)
+    raw_seats = [s for s in payload["seats"] if _is_in_hand(s)]
     ordered = _engine_order(raw_seats)
 
     physical_to_engine: dict[int, int] = {}
@@ -144,15 +299,26 @@ def map_payload(payload: dict) -> PokerNowFrame:
         physical_to_engine[phys] = eng_idx
         seat_names[eng_idx] = str(s.get("name") or "")
         stack_cents = _dollars_to_cents(s.get("stackDollars"))
-        all_in = bool(s.get("allIn")) or (
-            s.get("stackDollars") is None and not s.get("folded")
-        )
+        # All-in ONLY when the DOM says so (review 2026-09-20). This used to
+        # also infer it from a null stack on a non-folded seat, but a missing
+        # `.normal-value` is just as often a mid-render snapshot or a seat in
+        # some other non-numeric state — and "all-in" is not a harmless
+        # default: it becomes stack 0, i.e. a full-stack DROP that corroborates
+        # whatever the bet oval shows, and it routes the action through the
+        # short-shove / all-in-call paths. The userscript (>= 1.2.0) sets
+        # `allIn` from the stack element's "All In" text; older scripts still
+        # send their own `stack === null && !folded` inference in the same
+        # field, so they behave exactly as before. A folded seat is never
+        # all-in (its stack text is irrelevant to the hand).
+        all_in = bool(s.get("allIn")) and not bool(s.get("folded"))
         # An all-in player has $0 behind — PokerNow shows "all in" text instead
         # of a number, which reads as a null stack. Map it to 0, NOT None: the
         # reconstructor's corroboration guard needs the stack DROP to back the
         # shove's committed amount, and it also routes a stack→0 raise through
         # the engine's short-shove path. Leaving it None makes the guard discard
         # the all-in bet, collapsing the hand to a phantom check-down/showdown.
+        # Unknown (null, not all-in) stays None: the reconstructor carries the
+        # previous stack forward instead of inventing a drop.
         stack_chips = 0 if all_in else stack_cents
         seat_obs.append(
             SeatObs(

@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
-from plo5bp.sizing import NLH_ANCHOR_SPEC
+from plo5bp.sizing import NLH_ANCHOR_SPEC, anchor_grid_np
 
 
 LABEL_SCHEMA_VERSION = 1
@@ -152,6 +152,110 @@ def map_size_to_anchor(
     return int(best_k)
 
 
+def jam_anchor_index(
+    *,
+    min_raise: int,
+    max_raise: int,
+    pot: int,
+    to_call: int,
+) -> int:
+    """Grid-LEGAL anchor index of the jam (chips == ``max_raise``).
+
+    (review 2026-09-20 D1) The network's anchor grid dedupes by "strictly
+    greater chips than the previous anchor", so whenever a pot-fraction anchor
+    already clamps to ``max_raise`` the explicit ALL-IN atom (last index) is
+    ILLEGAL and any teacher mass put there is masked out in training. The
+    legal jam anchor is the FIRST anchor whose chips reach ``max_raise`` —
+    exactly what :func:`map_size_to_anchor` returns for ``chips=max_raise``
+    (ties break to the smaller index). In the short-shove regime
+    (``min_raise == 0 < max_raise``) the grid keeps only the top atom legal,
+    so that is the jam anchor there.
+    """
+    if int(min_raise) > 0 and int(max_raise) > 0:
+        return map_size_to_anchor(
+            int(max_raise),
+            min_raise=int(min_raise),
+            max_raise=int(max_raise),
+            pot=int(pot),
+            to_call=int(to_call),
+        )
+    return NLH_ANCHOR_SPEC.count - 1
+
+
+# Teacher mass the serve grid would mask out (review 2026-09-20 D1).
+ILLEGAL_MASS_TOL = 1e-6
+
+
+class IllegalTeacherMassError(ValueError):
+    """Teacher probability sits on an action the serve grid marks illegal.
+
+    Training multiplies targets by the legality mask and renormalizes, so such
+    mass used to vanish silently (D1: ~40% of the jam mass at SPR 2; D2: every
+    push/fold call). Export, row building and training now refuse instead —
+    re-export the labels with the fixed ``cfr_export``.
+    """
+
+
+def illegal_teacher_mass(
+    action_probs: Sequence[ActionProb],
+    *,
+    min_raise: int,
+    max_raise: int,
+    pot_chips: int,
+    to_call: int,
+) -> float:
+    """Teacher probability on actions the SERVE grid masks out at this node.
+
+    Counts raise mass when the raise gate is illegal (``max_raise <= 0``), mass
+    on grid-illegal / out-of-range anchors, and fold mass with nothing to call.
+    Training masks exactly these, so anything > ``ILLEGAL_MASS_TOL`` would be
+    erased by renormalization (review 2026-09-20 D1/D2).
+    """
+    raise_mass = sum(float(a.prob) for a in action_probs if a.gate == "raise")
+    bad = 0.0
+    if int(to_call) <= 0:
+        bad += sum(float(a.prob) for a in action_probs if a.gate == "fold")
+    if raise_mass <= 0.0:
+        return bad
+    if int(max_raise) <= 0:
+        return bad + raise_mass
+    legal = anchor_grid_np(
+        int(min_raise), int(max_raise), int(pot_chips), int(to_call), NLH_ANCHOR_SPEC
+    ).legal
+    for a in action_probs:
+        if a.gate != "raise":
+            continue
+        k = a.anchor_k
+        if k is None or not (0 <= int(k) < len(legal)) or not bool(legal[int(k)]):
+            bad += float(a.prob)
+    return bad
+
+
+def merge_action_probs(action_probs: Sequence[ActionProb]) -> list[ActionProb]:
+    """Merge entries that land on the same ``(gate, anchor_k)`` by summing probs.
+
+    (review 2026-09-20 D1) Two solver actions can be the same serve-menu
+    action — e.g. ``RAISE_500`` clamped to the stack and ``ALLIN`` are one jam,
+    and push/fold ``ALLIN``-as-call joins ``CHECK_CALL``. First-seen order is
+    kept; the merged entry keeps the first entry's chips / pot_frac.
+    """
+    merged: dict[tuple[str, int | None], ActionProb] = {}
+    for a in action_probs:
+        key = (str(a.gate), None if a.anchor_k is None else int(a.anchor_k))
+        prev = merged.get(key)
+        if prev is None:
+            merged[key] = ActionProb(
+                gate=a.gate,
+                anchor_k=a.anchor_k,
+                pot_frac=a.pot_frac,
+                chips=int(a.chips),
+                prob=float(a.prob),
+            )
+        else:
+            prev.prob = float(prev.prob) + float(a.prob)
+    return list(merged.values())
+
+
 def write_jsonl(path: Path | str, records: Iterable[LabelRecord]) -> int:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -184,12 +288,18 @@ def make_smoke_label(
     trash_fold=True → almost-sure fold (air facing huge bet).
     trash_fold=False → almost-sure raise all-in (nuts).
     """
+    # (review 2026-09-20 D1) The jam sits on the grid-LEGAL jam anchor for this
+    # node's sizing (pot 20bb, facing 10bb, 50bb behind → the 160% anchor
+    # already clamps to the stack, so the ALL-IN atom (11) is deduped/illegal).
+    k_jam = jam_anchor_index(
+        min_raise=200_000, max_raise=500_000, pot=200_000, to_call=100_000
+    )
     if trash_fold:
         gate = [0.97, 0.02, 0.01]
         actions = [
             ActionProb("fold", None, None, 0, 0.97),
             ActionProb("check_call", None, None, 0, 0.02),
-            ActionProb("raise", 11, None, 500_000, 0.01),
+            ActionProb("raise", k_jam, None, 500_000, 0.01),
         ]
         value = -5.0
         hole = [0, 13]  # 2c 2d — weak on wet board narrative
@@ -198,7 +308,7 @@ def make_smoke_label(
         actions = [
             ActionProb("fold", None, None, 0, 0.0),
             ActionProb("check_call", None, None, 0, 0.05),
-            ActionProb("raise", 11, None, 500_000, 0.95),
+            ActionProb("raise", k_jam, None, 500_000, 0.95),
         ]
         value = 12.0
         hole = [51, 50]  # As Ah

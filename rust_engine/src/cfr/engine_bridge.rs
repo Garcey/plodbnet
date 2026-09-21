@@ -406,6 +406,32 @@ mod tests {
         assert!(g.pot > 100_000);
     }
 
+    /// (review 2026-09-20 D11) A covering stack's abstract ALLIN is the same
+    /// physical action in the CFR tree and in the engine replay: the raise to
+    /// the cap (it used to be a CALL in the tree but a raise in the replay, so
+    /// every label below such a node described a different game).
+    #[test]
+    fn covering_allin_matches_engine_replay() {
+        use crate::cfr::actions::{apply_abstract, AbstractAction};
+        let board = [0u8, 5, 10, 15, 20];
+        let stacks = [300_000u64, 100_000];
+        let mut ps = PublicState::postflop_root(2, 100_000, &stacks, &board, 10_000, 3).unwrap();
+        let mut gs =
+            game_state_from_solver_root(2, 100_000, &stacks, &board, 10_000, Street::River).unwrap();
+        apply_abstract(&mut ps, AbstractAction::AllIn).unwrap();
+        replay_cfr_path(&mut gs, &["ALLIN".to_string()]).unwrap();
+        assert_eq!(ps.pot, gs.pot);
+        assert_eq!(ps.bet_to_call, gs.bet_to_call);
+        assert_eq!(ps.bet_to_call, 100_000, "covering ALLIN must raise to the cap");
+        assert_eq!(&ps.stacks[..2], &gs.stacks[..]);
+        assert_eq!(ps.actor.map(|a| a as usize), gs.actor);
+        // ...and the short stack's reply (call all-in) matches too.
+        apply_abstract(&mut ps, AbstractAction::CheckCall).unwrap();
+        replay_cfr_path(&mut gs, &["CHECK_CALL".to_string()]).unwrap();
+        assert_eq!(ps.pot, gs.pot);
+        assert_eq!(&ps.stacks[..2], &gs.stacks[..]);
+    }
+
     #[test]
     fn short_stack_max_raise_parity() {
         let board = [0u8, 5, 10, 15, 20];

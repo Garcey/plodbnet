@@ -1,5 +1,13 @@
 #!/usr/bin/env python
-"""Raise iters on one already-rejected Step 6 root. Floor stays 1.0 bb."""
+"""Raise iters on one already-rejected Step 6 root. Floor stays 1.0 bb.
+
+(review 2026-09-20 D8) The solve runs to its iteration cap with NO
+exploitability target. The old ``target == cap`` made the solver stop at the
+first 24-deal POLL estimate that dipped under 1.0 bb — a noisy, upward-biased
+number (5.27 polled vs 1.99 final) — and the root was accepted on it. Acceptance
+now goes through the batch gate: only a FINAL-estimator number is judged
+against the cap; anything else lands in ``unverified/``.
+"""
 
 from __future__ import annotations
 
@@ -12,8 +20,9 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT / "python") not in sys.path:
     sys.path.insert(0, str(_ROOT / "python"))
 
-from plo5bp.gto.cfr_api import RootSpec, SolveConfig, apply_teacher_iso_policy, solve  # noqa: E402
-from plo5bp.gto.teacher import TEACHER_MAX_EXPL_BB, expl_reject_reason  # noqa: E402
+from plo5bp.gto.cfr_api import RootSpec, SolveConfig, apply_teacher_iso_policy  # noqa: E402
+from plo5bp.gto.cfr_batch import BatchJob, _run_one, job_payload  # noqa: E402
+from plo5bp.gto.teacher import TEACHER_MAX_EXPL_BB  # noqa: E402
 
 
 def main() -> int:
@@ -25,7 +34,8 @@ def main() -> int:
     cfg = SolveConfig.teacher(
         max_iterations=80000,
         seed=4,
-        target_exploitability_bb=TEACHER_MAX_EXPL_BB,
+        # 0 = no early stop: the reported number is the final estimator's.
+        target_exploitability_bb=0.0,
         thread_num=4,
         poll_every=2000,
         card_abstraction="none",
@@ -33,54 +43,28 @@ def main() -> int:
     )
     apply_teacher_iso_policy(cfg)
     print(
-        f"[step6] RAISE ITERS {job_id} cap=80000 target={TEACHER_MAX_EXPL_BB} "
+        f"[step6] RAISE ITERS {job_id} cap=80000 floor={TEACHER_MAX_EXPL_BB} "
         f"prev_expl={rej['exploitability_bb']}",
         flush=True,
     )
     t0 = time.time()
-    rep = solve(root, cfg)
+    r = _run_one(
+        job_payload(
+            BatchJob(root=root, config=cfg, job_id=job_id), out, TEACHER_MAX_EXPL_BB
+        )
+    )
     dt = time.time() - t0
-    why = expl_reject_reason(rep.exploitability_bb, max_expl_bb=TEACHER_MAX_EXPL_BB)
     print(
-        f"[step6] RAISE DONE {job_id} expl_bb={rep.exploitability_bb} "
-        f"iters={rep.iterations_run} wall_s={dt:.1f} reject={why} "
-        f"notes={rep.notes[-4:]}",
+        f"[step6] RAISE DONE {job_id} status={r.get('status')} "
+        f"expl_bb={r.get('exploitability_bb')} iters={r.get('iterations')} "
+        f"wall_s={dt:.1f} expl={r.get('expl')} err={r.get('error')}",
         flush=True,
     )
-
-    marker = out / "markers" / f"{job_id}.done"
-    if why is None:
-        path = out / "strategies" / f"{job_id}.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(rep.as_dict(), indent=2) + "\n", encoding="utf-8")
-        tmp.replace(path)
-        rej_path = out / "rejected" / f"{job_id}.json"
-        if rej_path.exists():
-            rej_path.unlink()
-        marker.write_text("ok\n", encoding="utf-8")
-        print(f"[step6] ACCEPTED {job_id} -> {path}", flush=True)
+    if r.get("ok"):
+        print(f"[step6] ACCEPTED {job_id} -> {out / 'strategies' / (job_id + '.json')}", flush=True)
         return 0
-
-    rpath = out / "rejected" / f"{job_id}.json"
-    rpath.parent.mkdir(parents=True, exist_ok=True)
-    rpath.write_text(
-        json.dumps(
-            {
-                "job_id": job_id,
-                "reason": why,
-                "status": "rejected",
-                "exploitability_bb": rep.exploitability_bb,
-                "max_expl_bb": TEACHER_MAX_EXPL_BB,
-                "report": rep.as_dict(),
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    marker.write_text("rejected\n", encoding="utf-8")
-    print(f"[step6] STILL REJECTED {job_id} {why}", flush=True)
+    verdict = "UNVERIFIED" if r.get("unverified") else "STILL REJECTED"
+    print(f"[step6] {verdict} {job_id} {r.get('error')}", flush=True)
     return 1
 
 

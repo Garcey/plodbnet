@@ -185,7 +185,9 @@ def test_env_batched_rust_encoder_width_gated(monkeypatch):
     import plo5bp.env_batched as eb
     from plo5bp.config import GameConfig
 
-    # Default (flag unset): numpy encoder.
+    # Default (flag unset): numpy encoder. delenv so the suite can also be run
+    # with PLO5_RUST_ENCODER=1 exported (the three-way parity configuration).
+    monkeypatch.delenv("PLO5_RUST_ENCODER", raising=False)
     assert eb.BatchedBombPotEnv(2, GameConfig(num_seats=2))._use_rust_encoder is False
     # Opt in: enabled when widths match (1171).
     monkeypatch.setenv("PLO5_RUST_ENCODER", "1")

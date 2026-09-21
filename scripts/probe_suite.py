@@ -157,7 +157,20 @@ def load_checkpoint(path):
         p.requires_grad_(False)
     critic = None
     if "critic" in ckpt and ckpt["critic"] is not None:
-        critic = build_critic_from_state_dict(ckpt["critic"]).eval()
+        # This suite reads Q, so the critic must be rebuilt with the run's
+        # unsniffable forward semantics + TRAINED value support from the
+        # checkpoint's config stamp (review 2026-09-20 A19): at the builder
+        # defaults a support-3000 + q_base_raw critic reads Q up to ~113bb
+        # off (V exact), and q_fold_zero / q_base_raw stems were being probed
+        # as if the flags were off. Old checkpoints lack the keys -> the
+        # defaults they trained with.
+        critic = build_critic_from_state_dict(
+            ckpt["critic"],
+            q_fold_zero=bool(cfgb.get("q_fold_zero", False)),
+            q_base_raw=bool(cfgb.get("q_base_raw", False)),
+            value_support=cfgb.get("value_support"),
+            value_hlgauss_sigma=cfgb.get("value_hlgauss_sigma"),
+        ).eval()
         for p in critic.parameters():
             p.requires_grad_(False)
     return actor, critic

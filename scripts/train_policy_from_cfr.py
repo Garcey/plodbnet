@@ -50,7 +50,13 @@ def main(argv: list[str] | None = None) -> int:
         default=Path("checkpoints/gto_policy_cfr.pt"),
         help="Output PolicyNet checkpoint",
     )
-    p.add_argument("--source", type=str, default="rust_cfr", help="Label source tag")
+    p.add_argument(
+        "--source",
+        type=str,
+        default="rust_cfr",
+        help="Source tag written on the exported LabelRecords (the checkpoint's "
+        "source + provenance are then derived from those records)",
+    )
     p.add_argument(
         "--max-infosets",
         type=int,
@@ -114,12 +120,26 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--holdout-out", type=Path, default=None)
     p.add_argument("--split-seed", type=int, default=TEACHER_SPLIT_SEED)
     p.add_argument("--split-manifest", type=Path, default=None)
+    p.add_argument(
+        "--allow-unverified-expl",
+        action="store_true",
+        help="Also export roots whose exploitability is a poll / early-stop / "
+        "time-budget / mc_br_proxy number (default: skipped — such a "
+        "checkpoint can never carry the GTO badge)",
+    )
+    p.add_argument(
+        "--include-lossy-obs",
+        action="store_true",
+        help="Train on postflop labels whose obs fell back to the LOSSY "
+        "synthetic dict (default: excluded and reported)",
+    )
     args = p.parse_args(argv)
 
     from plo5bp.gto.cfr_export import export_teacher_dir
     from plo5bp.gto.dataset import load_label_shard_rows
     from plo5bp.gto.train import TrainConfig, train_policy_net
 
+    planned_holdout: list[str] = []
     if not args.skip_export:
         res = export_teacher_dir(
             args.strategies,
@@ -133,8 +153,12 @@ def main(argv: list[str] | None = None) -> int:
             holdout_jsonl=args.holdout_out,
             split_seed=args.split_seed,
             split_manifest=args.split_manifest,
+            require_verified_expl=not (
+                args.no_expl_floor or args.allow_unverified_expl
+            ),
         )
         n_lab = res.n_train
+        planned_holdout = list(res.holdout_root_ids)
         print(
             f"[cfr-train] exported train={n_lab} holdout={res.n_holdout} "
             f"skipped_expl={len(res.skipped_expl)} -> {args.labels_out}"
@@ -143,6 +167,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[cfr-train] holdout -> {res.holdout_path}")
         if n_lab == 0:
             print("[cfr-train] ERROR: zero labels exported", file=sys.stderr)
+            for s in res.skipped_expl[:10]:
+                # e.g. expl_unverified:expl_kind_missing for multiway
+                # mc_br_proxy solves — see --allow-unverified-expl.
+                print(
+                    f"[cfr-train]   skipped root {s['root_id']}: {s['reason']}",
+                    file=sys.stderr,
+                )
             return 2
     else:
         if not args.labels_out.is_file():
@@ -153,7 +184,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.export_only:
         return 0
 
-    rows = load_label_shard_rows(args.labels_out, synthesize_obs=True)
+    rows = load_label_shard_rows(
+        args.labels_out,
+        synthesize_obs=True,
+        include_lossy_obs=args.include_lossy_obs,
+    )
     if args.max_rows is not None and len(rows) > args.max_rows:
         rows = rows[: args.max_rows]
     print(f"[cfr-train] supervised rows={len(rows)} (obs synthesized)")
@@ -180,13 +215,15 @@ def main(argv: list[str] | None = None) -> int:
         seed=args.seed,
         log_every=max(1, len(rows) // (args.batch_size * 4) or 1),
     )
+    # source / label provenance / train roots are DERIVED from the rows by
+    # train_policy_net (review 2026-09-20 F6) — nothing is asserted here.
     meta = {
-        "source": args.source,
         "labels_path": str(args.labels_out),
         "strategies": str(args.strategies),
         "n_labels_file": None,
         "pipeline": "cfr_export→obs_from_label→train_policy_net",
-        "is_gto_validated": False,  # need holdout probe for badge
+        # Lets the trainer refuse rows from a root the probe will hold out.
+        "planned_holdout_root_ids": planned_holdout,
     }
     try:
         meta["n_labels_file"] = sum(

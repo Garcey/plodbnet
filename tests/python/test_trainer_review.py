@@ -53,6 +53,17 @@ def test_review_reconstructs_each_decision(trainer_factory):
         assert state["actor"] == ts.hand.hero_seat
         assert all(x["hole"] is not None for x in state["seats"])
         assert state["trainer"]["review"]["decision"] == i
+        # Sizing context the client turns raise-BY chips into raise-TO totals
+        # with: the record, the pill and the detail view all carry hero's
+        # exact street commit BEFORE the action (= the replayed engine
+        # state's), plus the amount to call.
+        hero_row = state["seats"][ts.hand.hero_seat]
+        assert d.actor_commit_chips == hero_row["committed_this_street_chips"]
+        pill = review["decisions"][i]
+        assert pill["actor_commit_chips"] == d.actor_commit_chips
+        assert pill["to_call_chips"] == d.to_call_chips == state["to_call_chips"]
+        assert review["current"]["actor_commit_chips"] == d.actor_commit_chips
+        assert review["current"]["to_call_chips"] == d.to_call_chips
 
 
 def test_whatif_noop_matches_original_distribution(trainer_factory, play_to_terminal):
@@ -185,9 +196,16 @@ def test_villain_node_view(trainer_factory, play_to_terminal):
     )
     if villain is None:
         pytest.skip("no villain decision in this hand")
-    nc = _review(ts, villain["node_idx"])["node_current"]
+    state = ts.review_at_node(villain["node_idx"])
+    nc = state["trainer"]["review"]["node_current"]
     assert nc["is_hero"] is False
     assert nc["node_idx"] == villain["node_idx"]
+    # The ACTING seat's pre-action street commit, straight off the replayed
+    # engine state (exact for villains too — no client-side derivation).
+    assert nc["actor_commit_chips"] == (
+        state["seats"][nc["seat"]]["committed_this_street_chips"]
+    )
+    assert nc["to_call_chips"] == state["to_call_chips"]
     assert len(nc["gate_probs"]) == 3
     assert abs(sum(nc["gate_probs"]) - 1.0) < 1e-2
     assert isinstance(nc["value_bb"], float)
@@ -205,6 +223,8 @@ def test_hero_node_overlays_stored_record(trainer_factory, play_to_terminal):
     nc = _review(ts, d.action_log_idx)["node_current"]
     assert nc["is_hero"] is True
     assert nc["decision_idx"] == d.decision_idx
+    assert nc["actor_commit_chips"] == d.actor_commit_chips
+    assert nc["to_call_chips"] == d.to_call_chips
     assert nc["score"] == round(d.score, 1)
     assert nc["category"] == d.category
     assert nc["ev_loss_bb"] == d.ev_loss_bb  # MC value a fresh forward can't reproduce

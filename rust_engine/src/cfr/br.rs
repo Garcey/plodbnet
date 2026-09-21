@@ -16,7 +16,14 @@ fn history_hash(actions: &[AbstractAction]) -> u64 {
     h.finish()
 }
 
-/// Monte-Carlo NashConv/2 estimate given an infoset table and a terminal fn.
+/// Monte-Carlo PERFECT-INFORMATION best-response gap given an infoset table
+/// and a terminal fn (mean per-seat gain / bb).
+///
+/// (review 2026-09-20 D8/D10) The responder maximizes on the sampled deal, so
+/// it effectively sees every opponent's private cards: this is an upward-biased
+/// proxy (`expl_kind=mc_br_proxy`), NOT an infoset best response and not a
+/// Nash certificate. HU postflop reporting uses the vectorized infoset BR in
+/// `dcfr.rs` instead.
 ///
 /// `sample_deal` returns (private_views per seat, terminal_eval closure state).
 /// `terminal` maps (state, seat) → chip EV for seat under the sampled deal.

@@ -248,6 +248,10 @@ def test_snap_fold_chain_via_obs_folded_signal():
     (seats 1, 2, 3) snap-fold. Walk starts at seat 1 and must emit
     FOLD for each even though every folded seat's committed_chips
     reads None.
+
+    UPDATED 2026-09-20 (review I6): pixel folds now need TWO consecutive
+    frames (one glitched frame used to fold live seats irreversibly), so
+    the chain lands on the second snap-fold frame, not the first.
     """
     rec = EventReconstructor(num_seats=4)
 
@@ -322,21 +326,22 @@ def test_snap_fold_chain_via_obs_folded_signal():
         pot_total_chips=10_000,
         seats=fold_seats,
     )
-    ev = rec.step(
-        snap_fold,
-        _engine(
-            current_actor=1,
-            commits=[10_000, 0, 0, 0],
-            stacks=[20_000, 30_000, 30_000, 30_000],
-            bet_to_call=10_000,
-            button=3,
-        ),
+    eng = _engine(
+        current_actor=1,
+        commits=[10_000, 0, 0, 0],
+        stacks=[20_000, 30_000, 30_000, 30_000],
+        bet_to_call=10_000,
+        button=3,
     )
+    # First sighting: unconfirmed — nothing may be folded yet.
+    ev_first = rec.step(snap_fold, eng)
+    assert [e for e in ev_first if isinstance(e, SeatAction)] == []
+
+    # Second consecutive frame agrees → the whole chain is emitted.
+    ev = rec.step(snap_fold, eng)
     seat_actions = [e for e in ev if isinstance(e, SeatAction)]
-    # Walk may also coast into hero seat with a phantom check (hero
-    # already matched the bet so delta==0, to_call==0). That's a
-    # harmless side effect for this test — assert the three FOLDs
-    # land in order.
+    # The walk stops at hero via the round-closed guard (hero's bet is
+    # matched by everyone still in), so exactly the three FOLDs land.
     assert seat_actions[:3] == [
         SeatAction(seat=1, gate="fold", chips=0),
         SeatAction(seat=2, gate="fold", chips=0),
@@ -675,18 +680,20 @@ def test_facing_bet_with_cards_visible_waits_for_fix_j():
         hero_hole=fs_a.hero_hole, button_seat=fs_a.button_seat,
         pot_total_chips=fs_a.pot_total_chips, seats=tuple(fold_seats),
     )
-    ev_b = rec.step(
-        fs_b,
-        _engine(
-            current_actor=0,
-            commits=[0, 90_000, 0, 0, 0, 0],
-            stacks=[200_000, 182_000, 200_000, 200_000, 200_000, 200_000],
-            bet_to_call=90_000,
-            chips_per_cent=5.0,
-        ),
+    eng_b = _engine(
+        current_actor=0,
+        commits=[0, 90_000, 0, 0, 0, 0],
+        stacks=[200_000, 182_000, 200_000, 200_000, 200_000, 200_000],
+        bet_to_call=90_000,
+        chips_per_cent=5.0,
     )
-    sa_b = [e for e in ev_b if isinstance(e, SeatAction)]
-    assert SeatAction(seat=0, gate="fold", chips=0) in sa_b
+    # UPDATED 2026-09-20 (review I6): the first folded frame is only a
+    # candidate; the fold is emitted once a second frame confirms it.
+    ev_b = rec.step(fs_b, eng_b)
+    assert [e for e in ev_b if isinstance(e, SeatAction)] == []
+    ev_c = rec.step(fs_b, eng_b)
+    sa_c = [e for e in ev_c if isinstance(e, SeatAction)]
+    assert SeatAction(seat=0, gate="fold", chips=0) in sa_c
 
 
 def test_reraise_emits_delta_not_total():
@@ -1346,17 +1353,18 @@ def test_walk_past_sitting_out_captures_real_downstream_fold():
         board_a=_flop_a(), board_b=_flop_b(), hero_hole=_hero(),
         button_seat=5, pot_total_chips=20_000, seats=fold_seats,
     )
-    ev = rec.step(
-        fold_fs,
-        _engine(
-            current_actor=1,
-            commits=[10_000, 0, 0, 0, 10_000, 0],
-            stacks=[20_000, 0, 30_000, 0, 30_000, 30_000],
-            bet_to_call=10_000,
-            button=5,
-            sitting_out=[False, True, False, True, False, False],
-        ),
+    eng = _engine(
+        current_actor=1,
+        commits=[10_000, 0, 0, 0, 10_000, 0],
+        stacks=[20_000, 0, 30_000, 0, 30_000, 30_000],
+        bet_to_call=10_000,
+        button=5,
+        sitting_out=[False, True, False, True, False, False],
     )
+    # UPDATED 2026-09-20 (review I6): folds need two consecutive frames.
+    first = rec.step(fold_fs, eng)
+    assert [e for e in first if isinstance(e, SeatAction)] == []
+    ev = rec.step(fold_fs, eng)
     seat_actions = [e for e in ev if isinstance(e, SeatAction)]
     folds = [a for a in seat_actions if a.gate == "fold"]
     assert folds == [SeatAction(seat=2, gate="fold", chips=0)], (
@@ -1561,11 +1569,16 @@ def test_uncorroborated_commit_then_fold_on_next_tick():
         board_a=_flop_a(), board_b=_flop_b(), hero_hole=_hero(),
         button_seat=3, pot_total_chips=20_000, seats=fold_seats,
     )
+    # UPDATED 2026-09-20 (review I6): first folded frame = candidate only.
     ev_b = rec.step(fold_fs, eng)
-    sa_b = [e for e in ev_b if isinstance(e, SeatAction)]
-    folds = [a for a in sa_b if a.gate == "fold" and a.seat == 2]
+    assert not [e for e in ev_b if isinstance(e, SeatAction)]
+
+    # Tick C: the fold persists → confirmed and emitted.
+    ev_c = rec.step(fold_fs, eng)
+    sa_c = [e for e in ev_c if isinstance(e, SeatAction)]
+    folds = [a for a in sa_c if a.gate == "fold" and a.seat == 2]
     assert folds == [SeatAction(seat=2, gate="fold", chips=0)], (
-        f"expected one fold on seat 2, got {sa_b}"
+        f"expected one fold on seat 2, got {sa_c}"
     )
 
 
@@ -1774,11 +1787,19 @@ def test_fix_q_exact_call_emits_check_call_not_break():
     assert SeatAction(seat=2, gate="check_call", chips=0) in seat_actions
 
 
-def test_fix_q_short_all_in_below_facing_bet_still_emits_raise():
-    """Fix Q does not pre-empt the short-shove branch (line 513). A
-    short shove with new_stack == 0 but delta < facing_bet is detected
-    before Fix Q is reached, so the raise emission (encoding the
-    shove) is preserved.
+def test_fix_q_short_all_in_below_facing_bet_emits_call_not_raise():
+    """An all-in for LESS than the facing bet is a CALL.
+
+    UPDATED 2026-09-20 (review I4) — this test used to be
+    `..._still_emits_raise` and pinned the bug: the stack-zero branch ran
+    before the call branch and emitted gate="raise" chips=5_000 against a
+    10_000 bet. The engine rejects that (ALL_IN is illegal when the shove
+    does not exceed `bet_to_call`; `apply_raise_chips` refuses with
+    min_raise == 0), `_rebuild_env` drops the entry and the engine stays
+    parked on the seat. Fix Q still must not swallow it (no `break`): the
+    short stack's chips are real — they are just a call.
+    `test_allin_call_sequences_are_legal_in_a_real_engine` replays this
+    shape through an actual env.
     """
     rec = EventReconstructor(num_seats=4)
     # Custom baseline: seat 2 has a short stack (below facing_bet).
@@ -1806,9 +1827,8 @@ def test_fix_q_short_all_in_below_facing_bet_still_emits_raise():
     )
     rec.step(base, eng)
 
-    # Tick B: seat 2 shoves all 5_000 in. Stack → 0, new_commit=5_000.
-    # facing_bet=10_000, so new_commit < facing_bet — but the
-    # short-shove branch fires first on new_stack==0.
+    # Tick B: seat 2 puts its last 5_000 in. Stack → 0, new_commit=5_000
+    # < facing_bet=10_000 → all-in CALL for less.
     shove_seats = (
         base_seats[0],
         base_seats[1],
@@ -1822,7 +1842,7 @@ def test_fix_q_short_all_in_below_facing_bet_still_emits_raise():
     )
     ev = rec.step(shove_fs, eng)
     seat_actions = [e for e in ev if isinstance(e, SeatAction)]
-    assert SeatAction(seat=2, gate="raise", chips=5_000) in seat_actions
+    assert seat_actions == [SeatAction(seat=2, gate="check_call", chips=0)]
 
 
 def test_fix_q_open_pot_bet_with_no_facing_bet_emits():
@@ -1982,14 +2002,11 @@ def test_timer_bar_does_not_fire_when_facing_bet():
               [30_000, 25_000, 30_000, 30_000, 30_000, 30_000], actors=_actors(3))
     ev = rec.step(fs2, eng)
     seat_actions = [e for e in ev if isinstance(e, SeatAction)]
-    # The new timer-bar branch must NOT emit a check_call here. The
-    # walk's standard delta==0+to_call>0 fold path may emit a FOLD,
-    # which is acceptable — the assertion is just that we don't
-    # emit a phantom CHECK.
-    assert all(
-        not (e.seat == 2 and e.gate == "check_call")
-        for e in seat_actions
-    )
+    # The timer-bar branch must NOT emit a check_call here. Since the
+    # 2026-09-20 review (I3) the walk never INFERS a fold from "no new
+    # chips" either, so the bar moving off a seat that owes chips emits
+    # nothing at all — the fold arrives via `obs.folded` (Fix J).
+    assert seat_actions == []
 
 
 def test_timer_bar_rebaseline_clears_lock():
@@ -2029,8 +2046,8 @@ def test_no_phantom_check_on_first_tick_of_new_street():
     The guard: branch 4 (``primary_read`` agrees with ``base_commit``)
     only fires for seats whose action is already accounted for in
     the engine state — never for the engine's own ``current_actor``,
-    who needs positive corroboration (timer-bar transition,
-    hero-hole-hid, downstream activity)."""
+    who needs positive corroboration (timer-bar transition or
+    downstream activity)."""
     rec = EventReconstructor(num_seats=6)
     # Bootstrap with the bar on seat 1 (fastaf), the new actor.
     base = _fs([0] * 6, [30_000] * 6, actors=_actors(1))
@@ -2137,12 +2154,20 @@ def test_allin_shove_recorded_when_stack_reads_zero():
     phantom check-down.
     """
     rec = EventReconstructor(num_seats=2)
-    base = _fs([0, 0], [8800, 1800], actors=[False, True])
+    # Fixture fix 2026-09-20 (review I2): the engine is on the TURN
+    # (street=2), so the frames must show turn cards — a flop-only screen
+    # under a turn engine is exactly the "engine ahead of the screen"
+    # state the street gate now refuses to walk.
+    turn_a = _flop_a()[:3] + (_c(2, 3), None)
+    turn_b = _flop_b()[:3] + (_c(9, 2), None)
+    base = _fs([0, 0], [8800, 1800], actors=[False, True],
+               board_a=turn_a, board_b=turn_b)
     rec.step(base, _engine(current_actor=1, commits=[0, 0],
                            stacks=[8800, 1800], bet_to_call=0, street=2))
 
     # seat 1 shoves: committed = their whole 1800, stack now 0 (all in).
-    allin = _fs([0, 1800], [8800, 0], actors=[False, True])
+    allin = _fs([0, 1800], [8800, 0], actors=[False, True],
+                board_a=turn_a, board_b=turn_b)
     events = rec.step(allin, _engine(current_actor=1, commits=[0, 0],
                                      stacks=[8800, 1800], bet_to_call=0, street=2))
     actions = [e for e in events if isinstance(e, SeatAction)]
@@ -2152,15 +2177,20 @@ def test_allin_shove_recorded_when_stack_reads_zero():
     assert actions[0].chips == 1800  # chips_per_cent=1.0 in _engine
 
 
-def test_exact_folds_suppresses_inferred_fold_on_coasted_seat():
-    """With exact fold data (PokerNow), the walk must not INFER a fold for a
-    seat that is merely facing a bet with no committed change.
+def test_coasted_seat_facing_a_raise_is_never_fold_inferred():
+    """The walk must not INFER a fold for a seat that is merely facing a bet
+    with no committed change — on EITHER source.
 
     seat2 bet 100; seat1 already has 50 in and is yet to respond; seat0 calls.
-    The walk coasts past seat1 (committed unchanged at 50, facing 100) — the
-    OCR path infers a FOLD there, but PokerNow says seat1 hasn't folded, so it
-    must be left alone (it's a thinking/closing-call seat). This is the
-    "last caller registers as a fold and the hand ends" bug.
+    The walk coasts past seat1 (committed unchanged at 50, facing 100). Its
+    cards are still visible (`folded=False`): it simply has not acted yet.
+
+    UPDATED 2026-09-20 (review I3). This test was
+    `test_exact_folds_suppresses_inferred_fold_on_coasted_seat` and ASSERTED
+    the bug for the OCR path ("scenario should trigger the inferred fold
+    without exact_folds"): seat1 was folded the instant seat0 called, in the
+    same tick, irreversibly. The PokerNow-only guard is now the rule for both
+    sources; real folds come from the positive `obs.folded` signal (Fix J).
     """
     def run(exact):
         rec = EventReconstructor(num_seats=3)
@@ -2173,13 +2203,12 @@ def test_exact_folds_suppresses_inferred_fold_on_coasted_seat():
                                      stacks=[200, 150, 100], bet_to_call=100,
                                      exact_folds=exact))
 
-    inferred = [e for e in run(False)
-                if isinstance(e, SeatAction) and e.gate == "fold" and e.seat == 1]
-    assert inferred, "scenario should trigger the inferred fold without exact_folds"
-
-    suppressed = [e for e in run(True)
-                  if isinstance(e, SeatAction) and e.gate == "fold" and e.seat == 1]
-    assert not suppressed, "exact_folds must not infer a fold for a non-folded seat"
+    for exact in (False, True):
+        actions = [e for e in run(exact) if isinstance(e, SeatAction)]
+        # seat0's call is still recovered; seat1 is left to act.
+        assert actions == [SeatAction(seat=0, gate="check_call", chips=0)], (
+            f"exact_folds={exact}: {actions}"
+        )
 
 
 # --- Bug #8: last_fs stack carry-forward over a banner-occluded read -----

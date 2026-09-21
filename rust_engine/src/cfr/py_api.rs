@@ -195,6 +195,8 @@ pub fn cfr_solve_kuhn(py: Python<'_>, iterations: u32) -> PyResult<Bound<'_, PyD
     d.set_item("deals", rep.deals)?;
     d.set_item("value_p0", rep.value_p0)?;
     d.set_item("exploitability", rep.exploitability)?;
+    // (review 2026-09-20 F11) exact infoset best response by backward induction.
+    d.set_item("exploitability_kind", "exact_best_response")?;
     d.set_item("training_value", rep.training_value)?;
     d.set_item("nash_value", super::kuhn::KUHN_NASH_VALUE)?;
     Ok(d)
@@ -235,6 +237,8 @@ pub fn cfr_induce_range(
     postflop_time_budget_secs=0.0,
     stop_file="",
     raise_sizes_pm=vec![330, 500, 1000, 1500],
+    progress_file="",
+    line=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn cfr_pipeline<'py>(
@@ -252,6 +256,8 @@ pub fn cfr_pipeline<'py>(
     postflop_time_budget_secs: f64,
     stop_file: &str,
     raise_sizes_pm: Vec<u32>,
+    progress_file: &str,
+    line: Option<Vec<String>>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let mut pf = RootSpec::preflop_hu(stack_bb, 10_000, 5_000, 5_000);
     if !raise_sizes_pm.is_empty() {
@@ -264,6 +270,9 @@ pub fn cfr_pipeline<'py>(
     pcfg.time_budget_secs = preflop_time_budget_secs;
     pcfg.stop_file = stop_file.to_string();
     pcfg.poll_every = 1000;
+    // (review 2026-09-20 E1) live progress was never plumbed through the
+    // pipeline; both phases write the same file (their `root_id`s differ).
+    pcfg.progress_file = progress_file.to_string();
     let mut rcfg = SolveConfig::default();
     rcfg.max_iterations = postflop_iters;
     rcfg.seed = seed.wrapping_add(1);
@@ -271,6 +280,7 @@ pub fn cfr_pipeline<'py>(
     rcfg.time_budget_secs = postflop_time_budget_secs;
     rcfg.stop_file = stop_file.to_string();
     rcfg.poll_every = 50;
+    rcfg.progress_file = progress_file.to_string();
     let street = match postflop_board.len() {
         3 => StreetRoot::Flop,
         4 => StreetRoot::Turn,
@@ -284,18 +294,38 @@ pub fn cfr_pipeline<'py>(
     if street == StreetRoot::Flop {
         rcfg.card_abstraction = "ochs".into();
     }
-    let pipe = super::pipeline::solve_preflop_to_postflop(
-        &pf,
-        &pcfg,
-        &postflop_board,
-        street,
-        pot_bb,
-        postflop_stack_bb,
-        oop_action,
-        ip_action,
-        &rcfg,
-    )
-    .map_err(map_err)?;
+    // (review 2026-09-20 E1) Release the GIL for the whole two-stage solve —
+    // `cfr_solve` already did, the pipeline held it for minutes and froze
+    // every other Python thread (progress polls, the UI event loop).
+    //
+    // `line` (abstract-action labels from the BTN/SB's first decision, e.g.
+    // ["RAISE_500", "CHECK_CALL"]) takes precedence over the legacy
+    // `ip_action` / `oop_action` indices (review 2026-09-20 D9).
+    let pipe = py
+        .allow_threads(|| match line {
+            Some(ref labels) => super::pipeline::solve_preflop_to_postflop_line(
+                &pf,
+                &pcfg,
+                &postflop_board,
+                street,
+                pot_bb,
+                postflop_stack_bb,
+                labels,
+                &rcfg,
+            ),
+            None => super::pipeline::solve_preflop_to_postflop(
+                &pf,
+                &pcfg,
+                &postflop_board,
+                street,
+                pot_bb,
+                postflop_stack_bb,
+                oop_action,
+                ip_action,
+                &rcfg,
+            ),
+        })
+        .map_err(map_err)?;
     let d = PyDict::new(py);
     d.set_item("preflop_status", pipe.preflop.status.clone())?;
     d.set_item("preflop_infosets", pipe.preflop.strategy.infosets.len())?;
@@ -316,6 +346,8 @@ pub fn cfr_pipeline<'py>(
             .unwrap_or(0),
     )?;
     d.set_item("notes", pipe.notes.clone())?;
+    d.set_item("line", pipe.line.clone())?;
+    d.set_item("preflop_notes", pipe.preflop.notes.clone())?;
     d.set_item(
         "induced_oop_mass",
         pipe.induced_oop.iter().sum::<f64>(),

@@ -20,6 +20,7 @@ v2 additions (anchor sizing head + centralized critic):
 from __future__ import annotations
 
 import copy
+import math
 from dataclasses import dataclass
 
 import torch
@@ -78,9 +79,11 @@ class PPOStats:
     # is the offending value (excluded from the approx_kl average).
     kl_stopped_at: int = -1
     kl_stop: float = 0.0
-    # True ONLY on a hard-threshold (kl_hard) trip — the whole update
-    # was rolled back. A soft early-stop leaves this False (it keeps
-    # the minibatches already applied).
+    # True ONLY when the whole update was rolled back: a hard-threshold
+    # (kl_hard) trip, or a NON-FINITE kl with a rollback snapshot available
+    # (kl_hard > 0). A soft early-stop leaves this False (it keeps the
+    # minibatches already applied) — as does a non-finite trip with kl_hard
+    # off, which can only refuse the bad step (`kl_stop` is then nan/inf).
     rolled_back: bool = False
 
 
@@ -208,6 +211,13 @@ class PPOTrainer:
             list(critic.parameters()) if critic is not None else []
         )
         params = self._actor_params + self._critic_params
+        # NOTE (review 2026-09-20 A20, documented — deliberately NOT changed):
+        # no `weight_decay=` is passed, so AdamW's DEFAULT 0.01 decoupled
+        # decay is live on EVERY tensor (biases, LayerNorm gains, the
+        # zero-init heads included): each step shrinks weights by lr*0.01
+        # (~1.5e-6 relative at lr 1.5e-4). Every stem to date trained with
+        # it; setting it to 0 or exempting tensors is a production behavior
+        # change for the owner to make at a stem boundary.
         self.optimizer = optim.AdamW(
             params,
             lr=config.lr,
@@ -252,15 +262,20 @@ class PPOTrainer:
         # only (name contains "torso", 2D weights) so the heads stay free.
         self._l2_init_coef = float(getattr(config, "l2_init_coef", 0.0))
         self._l2_init_pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
+        # Qualified names of the pairs ("actor."/"critic." + param name), so
+        # the references can be persisted and re-attached by NAME (review
+        # 2026-09-20 A14 — see optimizer_sidecar_state / load_l2_init_refs).
+        self._l2_init_names: list[str] = []
         if self._l2_init_coef > 0.0:
-            named = list(model.named_parameters())
+            named = [("actor." + n, p) for n, p in model.named_parameters()]
             if critic is not None:
-                named += list(critic.named_parameters())
-            self._l2_init_pairs = [
-                (p, p.detach().clone())
-                for name, p in named
-                if "torso" in name and p.dim() >= 2
-            ]
+                named += [
+                    ("critic." + n, p) for n, p in critic.named_parameters()
+                ]
+            for name, p in named:
+                if "torso" in name and p.dim() >= 2:
+                    self._l2_init_pairs.append((p, p.detach().clone()))
+                    self._l2_init_names.append(name)
 
         # KL-to-EMA reference: zero overhead unless the flag is on.
         self.kl_anchor_coef = float(getattr(config, "kl_anchor_coef", 0.0))
@@ -337,6 +352,80 @@ class PPOTrainer:
         off or the checkpoint predates model_ema)."""
         if self._ref is not None and state_dict:
             self._ref.load_state_dict(state_dict)
+
+    # ---- optimizer sidecar (review 2026-09-20 A3 + A14) -------------------
+    # Adam moments and the l2-init reference tensors are RUN STATE that was
+    # never checkpointed: every guardian relaunch restarted AdamW from zero
+    # moments (first step ~lr*sign(g): KL ~ +1.08 measured on a 2048x4 actor
+    # at lr 1.5e-4 vs ~0.04 warm — one big step, then KLSTOP), and re-took
+    # the "init" snapshot at the relaunch point. train.py persists both in
+    # ONE rolling `<stem>.optim.pt` next to the numbered checkpoints (they
+    # are ~3x the parameter bytes — too heavy to ride in every checkpoint).
+
+    def optimizer_sidecar_state(self) -> dict:
+        """CPU copy of everything the sidecar persists. `param_shapes`
+        fingerprints the optimizer's parameter ORDER (actor then critic) so
+        a sidecar from a different architecture is refused, not mis-mapped."""
+        opt_sd = self.optimizer.state_dict()
+        return {
+            "optimizer_state": {
+                idx: {
+                    k: (v.detach().cpu() if torch.is_tensor(v) else v)
+                    for k, v in st.items()
+                }
+                for idx, st in opt_sd["state"].items()
+            },
+            "param_shapes": [tuple(p.shape) for p in self._all_params],
+            "l2_init": {
+                name: p0.detach().cpu()
+                for name, (_p, p0) in zip(
+                    self._l2_init_names, self._l2_init_pairs
+                )
+            },
+        }
+
+    def load_optimizer_moments(self, sidecar: dict) -> "tuple[bool, str]":
+        """Restore Adam moments + step counters from a sidecar dict. Returns
+        (restored, reason). Only the per-parameter STATE is loaded — this
+        run's param_groups (lr, betas, fused, ...) stay as constructed, so a
+        changed --lr / --adam-b2 is honored. All-or-nothing: any shape
+        mismatch leaves the optimizer cold and says why."""
+        state = sidecar.get("optimizer_state")
+        shapes = sidecar.get("param_shapes")
+        if not isinstance(state, dict) or shapes is None:
+            return False, "sidecar has no optimizer state"
+        want = [tuple(p.shape) for p in self._all_params]
+        if [tuple(s) for s in shapes] != want:
+            return False, "parameter shapes differ from this run's model/critic"
+        for idx, st in state.items():
+            m = st.get("exp_avg")
+            if m is not None and tuple(m.shape) != want[int(idx)]:
+                return False, f"moment shape mismatch at param {idx}"
+        self.optimizer.load_state_dict({
+            "state": state,
+            "param_groups": self.optimizer.state_dict()["param_groups"],
+        })
+        return True, f"{len(state)} tensors"
+
+    def load_l2_init_refs(self, sidecar: dict) -> "tuple[bool, str]":
+        """Re-attach the ORIGINAL decay-to-init reference tensors (A14) so the
+        L2 pull keeps pointing at the stem's true init across relaunches, not
+        at wherever the last relaunch happened to load. No-op (False) when
+        l2_init is off. All-or-nothing on name/shape agreement."""
+        if not self._l2_init_pairs:
+            return False, "l2_init_coef is 0 (no references in use)"
+        refs = sidecar.get("l2_init") or {}
+        if set(refs) != set(self._l2_init_names):
+            return False, "sidecar l2_init names differ from this run's trunk"
+        for name, (_p, p0) in zip(self._l2_init_names, self._l2_init_pairs):
+            if tuple(refs[name].shape) != tuple(p0.shape):
+                return False, f"l2_init shape mismatch at {name}"
+        with torch.no_grad():
+            for name, (_p, p0) in zip(
+                self._l2_init_names, self._l2_init_pairs
+            ):
+                p0.copy_(refs[name].to(p0.device, p0.dtype))
+        return True, f"{len(refs)} tensors"
 
     def _gate_clip_bounds(
         self, old_gate_logp: torch.Tensor
@@ -543,14 +632,24 @@ class PPOTrainer:
                                     )
                                 else:
                                     value = display_value
-                                value_pred_clipped = mb.values + torch.clamp(
-                                    value - mb.values,
-                                    -cfg.value_clip,
-                                    cfg.value_clip,
-                                )
                                 v1 = (value - mb.returns).pow(2)
-                                v2 = (value_pred_clipped - mb.returns).pow(2)
-                                value_loss = 0.5 * torch.max(v1, v2).mean()
+                                if cfg.value_clip > 0.0:
+                                    value_pred_clipped = mb.values + torch.clamp(
+                                        value - mb.values,
+                                        -cfg.value_clip,
+                                        cfg.value_clip,
+                                    )
+                                    v2 = (value_pred_clipped - mb.returns).pow(2)
+                                    value_loss = 0.5 * torch.max(v1, v2).mean()
+                                else:
+                                    # value_clip <= 0 DISABLES clipping — plain
+                                    # MSE (review 2026-09-20 A20). A literal 0
+                                    # radius pinned value_pred_clipped to the
+                                    # rollout values, so max(v1, v2) only ever
+                                    # passed gradient where the critic was
+                                    # already WORSE than its old self: "0 = off"
+                                    # froze the critic instead of unclipping it.
+                                    value_loss = 0.5 * v1.mean()
 
                             # Fold-column canary (audit 2026-07-11): the
                             # per-update mean of Q[FOLD] over fold-LEGAL
@@ -690,13 +789,38 @@ class PPOTrainer:
                     # The .item() forces a per-minibatch sync; negligible
                     # against multi-minute updates, and load-bearing for
                     # aborting in time.
-                    if self.kl_hard > 0.0 or self.target_kl > 0.0:
-                        kl_now = float(kl.item())
+                    #
+                    # A NON-FINITE kl (or loss) is a HARD trip regardless of
+                    # either threshold (review 2026-09-20 A8): `abs(nan) > x`
+                    # is False, so a NaN/inf minibatch used to sail through
+                    # BOTH guards, the step was applied and every actor param
+                    # went NaN — train.py's NaN assert only fired afterwards,
+                    # on a dead model. Never apply that step; roll the update
+                    # back when a snapshot exists (kl_hard > 0), else keep the
+                    # finite minibatches already applied, like a soft stop.
+                    # The loss rides the same single sync: a NaN confined to
+                    # returns/advantages leaves kl finite but poisons the step
+                    # just the same (`kl_stop` then reports nan).
+                    kl_now, loss_now = torch.stack(
+                        (kl.float(), loss.detach().float())
+                    ).tolist()
+                    step_finite = math.isfinite(kl_now) and math.isfinite(loss_now)
+                    if (
+                        not step_finite
+                        or self.kl_hard > 0.0
+                        or self.target_kl > 0.0
+                    ):
                         abs_kl = abs(kl_now)
-                        if self.kl_hard > 0.0 and abs_kl > self.kl_hard:
+                        if not step_finite or (
+                            self.kl_hard > 0.0 and abs_kl > self.kl_hard
+                        ):
                             kl_stopped_at = count
-                            kl_stop_val = kl_now
-                            rolled_back_flag = True
+                            kl_stop_val = (
+                                kl_now
+                                if step_finite or not math.isfinite(kl_now)
+                                else float("nan")  # finite kl, non-finite loss
+                            )
+                            rolled_back_flag = snapshot is not None
                             if snapshot is not None:
                                 with torch.no_grad():
                                     for p, (pd, m1, m2) in zip(

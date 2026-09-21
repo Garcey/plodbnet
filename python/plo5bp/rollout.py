@@ -23,7 +23,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, replace
-from typing import Iterable
+from typing import Callable, Iterable
 
 import numpy as np
 import torch
@@ -46,14 +46,71 @@ from plo5bp.selfplay import OpponentPool
 from plo5bp.sizing import sizing_from_info
 
 # Slack rows per env appended to the obs-pool / output-slab capacity beyond
-# rollout_target: learner steps can still be written after `wcursor` last
-# crosses the target (the in-flight hands flush to completion). 32 steps/env
-# is ~50x observed need; the overflow guards below turn the (near-impossible)
-# overshoot into a clean error. Module-level (P7+P8): collect_rollout_batched
-# AND collect_rollout_multiconfig's shared-staging allocation must derive the
-# per-sub capacity from the SAME formula.
+# rollout_target. What lands past the target (review 2026-09-20 A6 — the old
+# note here claimed in-flight hands "flush to completion"; they did NOT, they
+# were dropped):
+#   - drain_inflight ON (default): every hand in flight when the target is
+#     reached is played out and flushed, so the batch ends roughly
+#     n_envs x (rows of one length-biased hand) past the target;
+#   - drain_inflight OFF (legacy): only the last flush wave's overshoot lands
+#     in the output slabs, but the obs POOL still holds the unflushed rows of
+#     the abandoned in-flight hands.
+# The slack is only the INITIAL capacity: pool and slabs grow on demand
+# (`_slack_per_env` learns the real need so growth stays rare), so an
+# undersized guess costs one copy, never a crash or a dropped row.
+# Module-level (P7+P8): collect_rollout_batched AND
+# collect_rollout_multiconfig's shared-staging allocation size from the same
+# helper.
 
 POOL_SLACK_PER_ENV = 32
+
+# Largest rows-per-env actually needed beyond rollout_target by any collection
+# in this process (monotone max). A SIZING HINT ONLY — it changes buffer
+# capacities, never a collected value — so later collections start right-sized
+# instead of re-paying a grow copy every update.
+_observed_slack_per_env = 0
+
+# A hand that is already over AT DEAL (every seat all-in on the ante/blinds —
+# nobody can act) yields no decision; it is re-dealt with a fresh seed. After
+# this many consecutive done-at-deal re-deals of one env the config itself
+# cannot produce a live hand and the collectors raise instead of spinning
+# (review 2026-09-20 A1: the batched loop used to spin forever there).
+_MAX_REDEALS = 64
+
+
+def _slack_per_env() -> int:
+    seen = _observed_slack_per_env
+    return max(POOL_SLACK_PER_ENV, seen + seen // 4 + 4)
+
+
+def _note_slack_used(rows: int, rollout_target: int, n_envs: int) -> None:
+    global _observed_slack_per_env
+    extra = -(-max(0, int(rows) - int(rollout_target)) // max(1, int(n_envs)))
+    if extra > _observed_slack_per_env:
+        _observed_slack_per_env = extra
+
+
+def _resolve_drain_inflight(
+    train_config: TrainingConfig, override: "bool | None"
+) -> bool:
+    """Whether hands still in flight when the row target is reached are played
+    out and flushed (True, the default) or dropped (False = the pre-2026-09-20
+    behavior, byte-identical). An explicit collector kwarg wins; else the
+    TrainingConfig field; else True. Read via getattr so configs that predate
+    the field (old checkpoints' stamped dicts, hand-built test configs) work."""
+    if override is not None:
+        return bool(override)
+    return bool(getattr(train_config, "drain_inflight", True))
+
+
+def _dead_config_error(where: str, game_config: GameConfig, n_dead: int) -> RuntimeError:
+    return RuntimeError(
+        f"{where}: {n_dead} env(s) were still terminal AT DEAL after "
+        f"{_MAX_REDEALS} re-deals — this GameConfig cannot produce a hand with "
+        "a decision (fewer than two seats can act after posting the ante/"
+        f"blinds): {game_config!r}. Resample the config (scripts/train.py "
+        "_sample_game_config does) instead of collecting from it."
+    )
 
 
 
@@ -330,12 +387,18 @@ def _build_frozen_model(
 
 
 def _hole_cache(env) -> np.ndarray:
-    """(num_seats, 5) u8 per-hand hole cache from `env.all_hole_cards()`.
-    Variants with fewer hole cards (NLH: 2) are right-padded with 255 —
-    the multihot expansion's empty sentinel — so the critic's opponent
-    input width is fixed across variants. PLO rows are unchanged."""
+    """(num_seats, hole_w) u8 per-hand hole cache from
+    `env.all_hole_cards()`, at the VARIANT's hole width (NLH 2 / PLO4 4 /
+    PLO5 5 / PLO6 6) — the same compact layout the batched collector stores
+    (`all_hole_cards_batch`). The critic's input width is fixed by
+    `opp_holes_multihot` (5 slots x 52), not by this array.
+
+    (review 2026-09-20 A16) This used to hard-code width 5: PLO6 raised on
+    the 6-card assignment, and NLH/PLO4 rows were right-padded with 255,
+    which the old multihot then scattered over a genuine card 51. PLO5 rows
+    are unchanged. A seat with no cards (not dealt in) stays all-255."""
     holes = env.all_hole_cards()
-    out = np.full((len(holes), 5), 255, dtype=np.uint8)
+    out = np.full((len(holes), env.config.hole_count), 255, dtype=np.uint8)
     for s, h in enumerate(holes):
         out[s, : len(h)] = h
     return out
@@ -803,6 +866,7 @@ def collect_rollout(
     train_config: TrainingConfig,
     rng: np.random.Generator,
     critic: CentralCritic | None = None,
+    drain_inflight: "bool | None" = None,
 ) -> Batch:
     """Serial rollout driver. Each env has a separate `BombPotEnv`; the
     learner batch-forwards over all learner-acting envs per step and
@@ -811,8 +875,12 @@ def collect_rollout(
     With `critic` provided, GAE values come from the centralized critic
     (which sees all hole cards); otherwise the actor's own value head is
     used (v1 behavior / profiling fallback).
+
+    `drain_inflight` (None = `train_config.drain_inflight`, default True):
+    see `_resolve_drain_inflight` / the batched collector's docstring.
     """
     n_envs = train_config.num_envs
+    drain = _resolve_drain_inflight(train_config, drain_inflight)
     n_seats = game_config.num_seats
     reward_norm = 1.0 / float(game_config.bb)
     gamma = train_config.gamma
@@ -858,16 +926,32 @@ def collect_rollout(
         learner_seats[env_idx] = set(range(n_seats)) - opp_set
 
     # Per-hand hole-card cache (static within a hand) — feeds the
-    # centralized critic and the stored opp_holes blocks.
+    # centralized critic and the stored opp_holes blocks. Variant hole
+    # width (review 2026-09-20 A16; was a hard-coded 5).
     hole_caches: list[np.ndarray] = [
-        np.full((n_seats, 5), 255, dtype=np.uint8) for _ in range(n_envs)
+        np.full((n_seats, game_config.hole_count), 255, dtype=np.uint8)
+        for _ in range(n_envs)
     ]
+
+    def _deal(env_idx: int):
+        """Deal env `env_idx` a fresh hand. A hand that is already terminal
+        AT DEAL (every seat all-in on the ante/blinds) has no decision to
+        collect: re-deal with a fresh seed, bounded, then raise — this
+        driver used to die on `assert opp is not None` there, and the
+        batched one spun forever (review 2026-09-20 A1). The first draw is
+        the pre-fix (seed, button) pair, so live configs are byte-identical."""
+        env = envs[env_idx]
+        for _ in range(_MAX_REDEALS + 1):
+            seed = int(rng.integers(0, 2**63 - 1))
+            button = int(rng.integers(0, n_seats))
+            o, info = env.reset(seed, button)
+            if not env.is_terminal():
+                return o, info
+        raise _dead_config_error("collect_rollout", game_config, 1)
 
     for i, env in enumerate(envs):
         _assign_pool_mix(i)
-        seed = int(rng.integers(0, 2**63 - 1))
-        button = int(rng.integers(0, n_seats))
-        o, info = env.reset(seed, button)
+        o, info = _deal(i)
         obs_vecs.append(o)
         infos.append(info)
         hole_caches[i] = _hole_cache(env)
@@ -917,10 +1001,19 @@ def collect_rollout(
     aggr_steps_total_by_street: list[int] = [0, 0, 0]
     aggr_bonus_steps_by_street: list[int] = [0, 0, 0]
 
-    while len(all_obs) < train_config.rollout_length:
+    # PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 A6) — drain_inflight:
+    # once the row target is reached, finished envs are no longer re-dealt
+    # (`live[i]` goes False) and the loop keeps stepping until every hand
+    # still in flight has finished and flushed. The old loop exited at the
+    # target and DROPPED those hands, under-sampling long hands by ~len/W.
+    # With drain off `live` stays all-True: byte-identical to before.
+    live = [True] * n_envs
+    while len(all_obs) < train_config.rollout_length or (drain and any(live)):
         learner_idx: list[int] = []
         opp_idx: list[int] = []
         for i in range(n_envs):
+            if not live[i]:
+                continue
             actor = infos[i].actor
             if actor in learner_seats[i]:
                 learner_idx.append(i)
@@ -939,7 +1032,8 @@ def collect_rollout(
         # tensor fed to act() is also what gets stored (no recompute drift).
         sizing_per_env = np.zeros((n_envs, 4), dtype=np.int64)
         for i in range(n_envs):
-            sizing_per_env[i] = sizing_from_info(infos[i])
+            if live[i]:
+                sizing_per_env[i] = sizing_from_info(infos[i])
 
         if learner_idx:
             batch_obs = np.stack([obs_vecs[i] for i in learner_idx], axis=0)
@@ -993,6 +1087,8 @@ def collect_rollout(
                 )
 
         for i in range(n_envs):
+            if not live[i]:
+                continue
             env = envs[i]
             info = infos[i]
             actor = info.actor
@@ -1114,10 +1210,12 @@ def collect_rollout(
                 cost_trajs[i] = [[] for _ in range(n_seats)]
                 pot_trajs[i] = [[] for _ in range(n_seats)]
                 street_trajs[i] = [[] for _ in range(n_seats)]
+                if drain and len(all_obs) >= train_config.rollout_length:
+                    # Target reached: this env deals no further hand (A6).
+                    live[i] = False
+                    continue
                 _assign_pool_mix(i)
-                seed = int(rng.integers(0, 2**63 - 1))
-                button = int(rng.integers(0, n_seats))
-                next_obs, next_info = env.reset(seed, button)
+                next_obs, next_info = _deal(i)
                 hole_caches[i] = _hole_cache(env)
 
             obs_vecs[i] = next_obs
@@ -1162,6 +1260,70 @@ def collect_rollout(
 TRAIN_OPP_OUTCOME_MC = 384
 
 
+# Output-slab layout — ONE definition for collect_rollout_batched's own slabs
+# and collect_rollout_multiconfig's shared staging buffer (they used to carry
+# two hand-synced 15-line allocation lists). Order is irrelevant; keys are the
+# `out_slabs` contract.
+_SLAB_KEYS = (
+    "obs", "gm", "ga", "rc", "sz", "an", "ru", "oh",
+    "lp", "glp", "alp", "v", "ret", "adv", "last",
+)
+
+
+class _SlabAllocator:
+    """Allocates / grows a `_SLAB_KEYS` dict of host output slabs, optionally
+    in pinned memory (PLO5BP_PIN_ROLLOUT — see the pinning-tax note in
+    collect_rollout_batched). `grow` is the A6 replacement for the old hard
+    overflow error: a bigger set + one copy of the rows already written."""
+
+    def __init__(self, obs_dim: int, hole_count: int, pin: bool) -> None:
+        self._pin = bool(pin)
+        # Pinned tensors own the memory behind their numpy views.
+        self._keepalive: list[torch.Tensor] = []
+        f32, i64 = (np.float32, torch.float32), (np.int64, torch.int64)
+        self._spec: dict[str, tuple[tuple[int, ...], type, torch.dtype]] = {
+            "obs": ((int(obs_dim),), *f32),
+            "gm": ((GATE_ACTIONS,), bool, torch.bool),
+            "ga": ((), *i64),
+            "rc": ((), *i64),
+            "sz": ((4,), *i64),
+            "an": ((), *i64),
+            "ru": ((), *f32),
+            "oh": ((5, int(hole_count)), np.uint8, torch.uint8),
+            "lp": ((), *f32),
+            "glp": ((), *f32),
+            "alp": ((), *f32),
+            "v": ((), *f32),
+            "ret": ((), *f32),
+            "adv": ((), *f32),
+            "last": ((), bool, torch.bool),
+        }
+        assert tuple(self._spec) == _SLAB_KEYS
+
+    def alloc(self, cap: int) -> dict[str, np.ndarray]:
+        self._keepalive = []
+        out: dict[str, np.ndarray] = {}
+        for key, (tail, np_dtype, torch_dtype) in self._spec.items():
+            shape = (int(cap), *tail)
+            if self._pin:
+                t = torch.empty(shape, dtype=torch_dtype, pin_memory=True)
+                self._keepalive.append(t)
+                out[key] = t.numpy()
+            else:
+                out[key] = np.empty(shape, dtype=np_dtype)
+        return out
+
+    def grow(
+        self, slabs: dict[str, np.ndarray], used_rows: int, new_cap: int
+    ) -> dict[str, np.ndarray]:
+        old_keepalive = self._keepalive
+        new = self.alloc(new_cap)
+        for key in _SLAB_KEYS:
+            new[key][:used_rows] = slabs[key][:used_rows]
+        del old_keepalive
+        return new
+
+
 def collect_rollout_batched(
     learner: ActorCritic,
     pool: OpponentPool,
@@ -1173,9 +1335,25 @@ def collect_rollout_batched(
     snapshot_cache: "dict[int, ActorCritic] | None" = None,
     env: "BatchedBombPotEnv | None" = None,
     env_cache: "dict[tuple, BatchedBombPotEnv] | None" = None,
+    drain_inflight: "bool | None" = None,
+    out_slabs_grow: "Callable[[int, int], dict[str, np.ndarray]] | None" = None,
 ) -> Batch:
     """Batched rollout using `BatchedBombPotEnv` + snapshot-bucket
     opponent forwards. Drives all envs through `apply_hybrid_batch`.
+
+    `drain_inflight` (review 2026-09-20 A6; None = `train_config
+    .drain_inflight`, default True — PRODUCTION BEHAVIOR CHANGE): once
+    `rollout_length` rows are flushed, finished envs are NOT re-dealt and the
+    loop keeps stepping until every hand still in flight has finished and
+    flushed, so the batch is "every hand STARTED before the target was
+    reached" (a stopping-time sample — unbiased in hand length). False = the
+    legacy exit-at-target, which dropped the in-flight hands (the one in
+    progress at a cut is length-biased long, so long hands were under-sampled
+    by ~len/W: ~7.5% of started hands at the production ratio, a 40-action
+    pot sampled ~15-19% less than a 6-action one) — row count, order and RNG
+    consumption are byte-identical to the pre-fix collector. With drain on
+    the batch is LARGER than `rollout_length` by about n_envs x (rows of one
+    in-flight hand); size `--rollout-length` / GPU memory accordingly.
 
     `snapshot_cache` (P5): caller-owned cache of built frozen-opponent
     models, keyed by pool snapshot index. Multiconfig passes one dict for
@@ -1195,8 +1373,13 @@ def collect_rollout_batched(
     returns a Batch of CPU view-tensors (no device copy except the tiny
     per-sub advantage-normalization hop, which stays on the learner device
     for bit-exactness with the legacy path). Default None = the original
-    self-allocating, finalize-to-device path, byte-identical to before."""
+    self-allocating, finalize-to-device path, byte-identical to before.
+    The views' length IS the capacity; `out_slabs_grow(used_rows, min_rows)`
+    (optional) must return replacement views of >= `min_rows` rows whose
+    first `used_rows` rows are preserved — called when a flush would
+    overflow. Without it an overflow raises, as before."""
     n_envs = train_config.num_envs
+    drain = _resolve_drain_inflight(train_config, drain_inflight)
     global _ACTIVE_STEP_TIMERS
     if _ACTIVE_STEP_TIMERS is not None:
         step_timers = _ACTIVE_STEP_TIMERS
@@ -1329,6 +1512,45 @@ def collect_rollout_batched(
         np.uint8
     )
     env.reset_batch(init_seeds, init_buttons)
+
+    def _redeal_done_at_deal(env_ids: np.ndarray) -> np.ndarray:
+        """Re-deal (fresh seed + button) every env in `env_ids` that is
+        already terminal AT DEAL, until each has a live hand; returns the
+        ids that were re-dealt at least once (their hole cards changed).
+
+        (review 2026-09-20 A1) With every stack <= ante the hand is over at
+        deal: `dones` is True straight after the reset, `apply_hybrid_batch`
+        never reports a NEWLY terminal env, nothing flushes or resets — the
+        `while wcursor < rollout_target` loop span forever, silently (the
+        guardians only watch PID + entropy). Done-at-deal is otherwise a
+        normal, cheap outcome (no decision = no row; the engine runs such a
+        hand out at deal), so it is simply re-dealt; only a config that can
+        NEVER deal a live hand raises. Draws RNG only when some env is dead,
+        so ordinary configs consume exactly the pre-fix stream."""
+        touched = np.zeros(n_envs, dtype=bool)
+        dead = np.zeros(n_envs, dtype=bool)
+        dead[env_ids] = env._dones[env_ids]
+        tries = 0
+        while dead.any():
+            if tries >= _MAX_REDEALS:
+                raise _dead_config_error(
+                    "collect_rollout_batched", game_config, int(dead.sum())
+                )
+            tries += 1
+            touched |= dead
+            seeds = rng.integers(
+                0, 2**63 - 1, size=n_envs, dtype=np.int64
+            ).astype(np.uint64)
+            buttons = rng.integers(
+                0, n_seats, size=n_envs, dtype=np.int64
+            ).astype(np.uint8)
+            env._be.reset_terminal_batch(seeds, buttons, dead)
+            env._reset_seeds = np.where(dead, seeds, env._reset_seeds)
+            env._refresh_subset(dead)
+            dead &= env._dones
+        return np.nonzero(touched)[0]
+
+    _redeal_done_at_deal(np.arange(n_envs, dtype=np.int64))
     # Per-hand hole cache (holes are static within a hand): one bulk
     # fetch per reset wave feeds the critic input + stored opp blocks.
     holes_cache = np.asarray(env._be.all_hole_cards_batch(), dtype=np.uint8)
@@ -1366,9 +1588,9 @@ def collect_rollout_batched(
     # exceeded in practice on a deep-tier rollout (vTwo1 update 94,
     # 2026-06-10). 192 bounds the theoretical worst case with margin;
     # cost is only the per-(env, seat) trajectory arrays (~4GB at 49k
-    # envs) — the obs pool / output slabs use POOL_SLACK_PER_ENV below,
-    # NOT this capacity, and flush temporaries are bounded by the
-    # actual max trajectory length per flush.
+    # envs) — the obs pool / output slabs are sized by `_slack_per_env`
+    # below (growing on demand), NOT this capacity, and flush temporaries
+    # are bounded by the actual max trajectory length per flush.
     MAX_STEPS_PER_SEAT = 192
     traj_lengths = np.zeros((n_envs, n_seats), dtype=np.int32)
     # Absolute index into `step_obs_pool` / `step_gm_pool` per (env, seat, slot).
@@ -1404,62 +1626,57 @@ def collect_rollout_batched(
     # terminal-flush gather a single `np.take` rather than a Python
     # walk over chunked storage.
     rollout_target = int(train_config.rollout_length)
-    # Slack for learner steps written after `wcursor` last crossed the
-    # rollout target (in-flight, unflushed hands). This is a per-env
-    # STATISTICAL bound (~avg hand length, a handful of steps), NOT the
-    # per-seat capacity above — there is no reason for it to scale with
-    # MAX_STEPS_PER_SEAT. Note the cost of oversizing is only VIRTUAL
+    # Slack for learner steps written past the rollout target: with
+    # drain_inflight every in-flight hand's rows (flushed as those hands
+    # finish), without it the abandoned in-flight hands' unflushed rows
+    # (pool only). This is a per-env STATISTICAL figure (~one hand's rows),
+    # NOT the per-seat capacity above — there is no reason for it to scale
+    # with MAX_STEPS_PER_SEAT. The cost of oversizing is only VIRTUAL
     # address space (np.empty pages materialize on first write and the
-    # slack tail is mostly never written), but keeping the bound honest
-    # documents the actual requirement, and the explicit guards below
-    # turn a (near-impossible) overflow into a clean error instead of a
-    # silent numpy shape mismatch. 32 steps/env is ~50x observed need.
-    # (POOL_SLACK_PER_ENV is module-level — shared with multiconfig's
-    # shared-staging allocation.)
-    pool_cap = rollout_target + n_envs * POOL_SLACK_PER_ENV
+    # slack tail is mostly never written). It is the INITIAL capacity
+    # only: an undersized guess GROWS (one copy, `_grow_pool` /
+    # `_grow_slabs` below) instead of raising, and `_slack_per_env` learns
+    # the real need so later collections start right-sized (review
+    # 2026-09-20 A6 — a drained cold-start policy plays long hands and can
+    # exceed any fixed per-env constant). Module-level helper — shared with
+    # multiconfig's shared-staging allocation.
+    pool_cap = rollout_target + n_envs * _slack_per_env()
     # env.obs_dim, not the OBS_DIM constant: the batched env's layout is
     # per-variant (991 PLO / 995 NLH).
     step_obs_pool = np.empty((pool_cap, env.obs_dim), dtype=np.float32)
     step_gm_pool = np.empty((pool_cap, GATE_ACTIONS), dtype=bool)
     pool_cursor = 0
 
-    # Pre-allocated output slabs. Eliminates the `np.stack` over millions
-    # of small arrays at finalize time. `wcursor` tracks the count of
-    # transitions written so far across all terminal flushes. On CUDA,
-    # back the slabs with pinned host memory so the finalize transfer
-    # can run with `non_blocking=True` and overlap the first PPO forward.
-    out_cap = rollout_target + n_envs * POOL_SLACK_PER_ENV
+    def _grow_pool(min_rows: int) -> None:
+        nonlocal step_obs_pool, step_gm_pool, pool_cap
+        new_cap = max(int(min_rows), pool_cap + max(pool_cap // 4, n_envs))
+        new_obs = np.empty((new_cap, env.obs_dim), dtype=np.float32)
+        new_gm = np.empty((new_cap, GATE_ACTIONS), dtype=bool)
+        new_obs[:pool_cursor] = step_obs_pool[:pool_cursor]
+        new_gm[:pool_cursor] = step_gm_pool[:pool_cursor]
+        step_obs_pool, step_gm_pool, pool_cap = new_obs, new_gm, new_cap
+
+    # Pre-allocated output slabs (`_SLAB_KEYS` layout). Eliminates the
+    # `np.stack` over millions of small arrays at finalize time. `wcursor`
+    # tracks the count of transitions written so far across all terminal
+    # flushes. On CUDA, back the slabs with pinned host memory so the finalize
+    # transfer can run with `non_blocking=True` and overlap the first PPO
+    # forward.
     if out_slabs is not None:
         # P8 shared staging: write into the caller's views of one big host
-        # buffer. Capacity is computed with the SAME formula the caller used,
-        # so the slab-overflow guard below keeps identical semantics; the
-        # width assert catches any variant/obs-dim drift between the caller's
-        # allocation and this env.
-        all_obs_arr = out_slabs["obs"]
-        all_gm_arr = out_slabs["gm"]
-        all_ga_arr = out_slabs["ga"]
-        all_rc_arr = out_slabs["rc"]
-        all_sz_arr = out_slabs["sz"]
-        all_an_arr = out_slabs["an"]
-        all_ru_arr = out_slabs["ru"]
-        all_oh_arr = out_slabs["oh"]
-        all_lp_arr = out_slabs["lp"]
-        all_glp_arr = out_slabs["glp"]
-        all_alp_arr = out_slabs["alp"]
-        all_v_arr = out_slabs["v"]
-        all_ret_arr = out_slabs["ret"]
-        all_adv_arr = out_slabs["adv"]
-        all_last_arr = out_slabs["last"]
-        assert all_obs_arr.shape[0] == out_cap, (
-            f"out_slabs capacity {all_obs_arr.shape[0]} != expected {out_cap}"
+        # buffer. The views' length IS the capacity (the caller sizes them
+        # with the same `_slack_per_env` helper and may hand over all of its
+        # remaining buffer); the width asserts catch any variant/obs-dim
+        # drift between the caller's allocation and this env.
+        slabs = {key: out_slabs[key] for key in _SLAB_KEYS}
+        assert slabs["obs"].shape[1] == env.obs_dim, (
+            f"out_slabs obs width {slabs['obs'].shape[1]} != env {env.obs_dim}"
         )
-        assert all_obs_arr.shape[1] == env.obs_dim, (
-            f"out_slabs obs width {all_obs_arr.shape[1]} != env {env.obs_dim}"
-        )
-        assert all_oh_arr.shape[2] == game_config.hole_count, (
-            f"out_slabs hole width {all_oh_arr.shape[2]} != "
+        assert slabs["oh"].shape[2] == game_config.hole_count, (
+            f"out_slabs hole width {slabs['oh'].shape[2]} != "
             f"config {game_config.hole_count}"
         )
+        _slab_alloc = None
     else:
         # Pinned host memory makes the finalize H2D copy overlap downstream compute
         # (via non_blocking=True), but PINNING THE ~36GB obs slab can cost 60+ SECONDS
@@ -1475,33 +1692,29 @@ def collect_rollout_batched(
              else str(device).startswith("cuda"))
             and os.environ.get("PLO5BP_PIN_ROLLOUT", "0") == "1"
         )
-        _pinned_keepalive: list[torch.Tensor] = []
-
-        def _alloc_slab(shape, np_dtype, torch_dtype):
-            if _pin:
-                t = torch.empty(shape, dtype=torch_dtype, pin_memory=True)
-                _pinned_keepalive.append(t)
-                return t.numpy()
-            return np.empty(shape, dtype=np_dtype)
-
-        all_obs_arr = _alloc_slab((out_cap, env.obs_dim), np.float32, torch.float32)
-        all_gm_arr = _alloc_slab((out_cap, GATE_ACTIONS), bool, torch.bool)
-        all_ga_arr = _alloc_slab(out_cap, np.int64, torch.int64)
-        all_rc_arr = _alloc_slab(out_cap, np.int64, torch.int64)
-        all_sz_arr = _alloc_slab((out_cap, 4), np.int64, torch.int64)
-        all_an_arr = _alloc_slab(out_cap, np.int64, torch.int64)
-        all_ru_arr = _alloc_slab(out_cap, np.float32, torch.float32)
-        all_oh_arr = _alloc_slab(
-            (out_cap, 5, game_config.hole_count), np.uint8, torch.uint8
-        )
-        all_lp_arr = _alloc_slab(out_cap, np.float32, torch.float32)
-        all_glp_arr = _alloc_slab(out_cap, np.float32, torch.float32)
-        all_alp_arr = _alloc_slab(out_cap, np.float32, torch.float32)
-        all_v_arr = _alloc_slab(out_cap, np.float32, torch.float32)
-        all_ret_arr = _alloc_slab(out_cap, np.float32, torch.float32)
-        all_adv_arr = _alloc_slab(out_cap, np.float32, torch.float32)
-        all_last_arr = _alloc_slab(out_cap, bool, torch.bool)
+        _slab_alloc = _SlabAllocator(env.obs_dim, game_config.hole_count, _pin)
+        slabs = _slab_alloc.alloc(rollout_target + n_envs * _slack_per_env())
+    out_cap = int(slabs["obs"].shape[0])
     wcursor = 0
+
+    def _grow_slabs(min_rows: int) -> None:
+        """Make room for `min_rows` output rows, preserving the `wcursor`
+        rows already flushed (A6: replaces the old hard overflow error)."""
+        nonlocal slabs, out_cap
+        if _slab_alloc is not None:
+            new_cap = max(int(min_rows), out_cap + max(out_cap // 4, n_envs))
+            slabs = _slab_alloc.grow(slabs, wcursor, new_cap)
+        elif out_slabs_grow is not None:
+            grown = out_slabs_grow(wcursor, int(min_rows))
+            slabs = {key: grown[key] for key in _SLAB_KEYS}
+        else:
+            raise RuntimeError(
+                f"output slab overflow: {min_rows} > out_cap={out_cap} "
+                f"(rollout_target={rollout_target}, {n_envs} envs) and the "
+                "caller's out_slabs came without an out_slabs_grow callback"
+            )
+        out_cap = int(slabs["obs"].shape[0])
+        assert out_cap >= min_rows, f"slab grow fell short: {out_cap} < {min_rows}"
 
     aggression_bonus_c = float(train_config.aggression_bonus_c)
     retroactive_bonus_c = float(train_config.retroactive_bonus_c)
@@ -1807,13 +2020,28 @@ def collect_rollout_batched(
 
     env_idx_range = np.arange(n_envs)
 
-    while wcursor < rollout_target:
+    # PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 A6) — drain_inflight.
+    # Phase 1 (`wcursor < rollout_target`) is the pre-fix loop verbatim:
+    # every finished env is re-dealt. Phase 2 (drain only) starts once the
+    # target is reached: finished envs are flushed but NOT re-dealt, and the
+    # loop runs until every env is done, i.e. every hand STARTED in phase 1 is
+    # in the batch. With drain off the loop exits at the target exactly as
+    # before (in-flight hands dropped) — byte-identical rows, order and RNG.
+    while wcursor < rollout_target or (drain and not env._dones.all()):
         obs = env._obs
         gate_masks = env._gate_mask
         min_raise = env._min_raise
         max_raise = env._max_raise
         actors = env._actors
         dones = env._dones
+        if dones.all():
+            # Unreachable by construction (every reset re-deals done-at-deal
+            # envs or raises) — but an all-done table can never make progress,
+            # so fail loudly rather than spin (review 2026-09-20 A1).
+            raise RuntimeError(
+                "collect_rollout_batched: no live env below the row target "
+                f"({wcursor}/{rollout_target} rows) — config {game_config!r}"
+            )
         # Pre-step total_commit / bet_to_call / street_commit / street
         # snapshots for the aggression-bonus and forward-EV reward.
         pre_total_commit = env._total_commit.copy()
@@ -2010,11 +2238,7 @@ def collect_rollout_batched(
             k_step = learner_idx_np.size
             pool_end = pool_cursor + k_step
             if pool_end > pool_cap:
-                raise RuntimeError(
-                    f"obs pool overflow: {pool_end} > pool_cap={pool_cap} "
-                    f"(rollout_target={rollout_target} + "
-                    f"{n_envs}x{POOL_SLACK_PER_ENV} slack)"
-                )
+                _grow_pool(pool_end)
             step_obs_pool[pool_cursor:pool_end] = obs[learner_idx_np]
             step_gm_pool[pool_cursor:pool_end] = gate_masks[learner_idx_np]
             pool_indices = np.arange(pool_cursor, pool_end, dtype=np.int64)
@@ -2092,13 +2316,16 @@ def collect_rollout_batched(
         # total_commit / legal / actors stay correct for payouts and
         # aggression bookkeeping. Bit-exact for non-terminal rows;
         # terminal rows get zeros (same as a full encode of actor==-1).
+        # `active &` only matters in the A6 drain phase, where envs that
+        # finished on an EARLIER step stay done (never re-dealt) and need no
+        # encode either; before the target `active` is all-True, so the mask
+        # is `~newly_terminal` exactly as before.
         with _TimedRF("step1a/refresh"):
-            if newly_terminal.any() and not newly_terminal.all():
-                env._refresh(encode_mask=~newly_terminal)
-            elif newly_terminal.all():
-                env._refresh(encode_mask=np.zeros(n_envs, dtype=bool))
-            else:
+            _enc = active & ~newly_terminal
+            if _enc.all():
                 env._refresh()
+            else:
+                env._refresh(encode_mask=_enc)
         post_total_commit = env._total_commit
 
         # Rust-parallel aggression bonus + per-step cost/pot/street
@@ -2168,12 +2395,6 @@ def collect_rollout_batched(
                 won_f32 = payouts_f32 + post_total_commit.astype(np.float32)
 
             reset_mask = newly_terminal
-            new_seeds = rng.integers(
-                0, 2**63 - 1, size=n_envs, dtype=np.int64
-            ).astype(np.uint64)
-            new_buttons = rng.integers(
-                0, n_seats, size=n_envs, dtype=np.int64
-            ).astype(np.uint8)
 
             # Vectorized terminal flush: process every newly-terminal env
             # in one numpy block. Replaces the per-(env, seat, t) Python
@@ -2298,12 +2519,7 @@ def collect_rollout_batched(
                     n_new = int(flat.sum())
                     if n_new:
                         if wcursor + n_new > out_cap:
-                            raise RuntimeError(
-                                f"output slab overflow: {wcursor + n_new} > "
-                                f"out_cap={out_cap} (rollout_target="
-                                f"{rollout_target} + {n_envs}x"
-                                f"{POOL_SLACK_PER_ENV} slack)"
-                            )
+                            _grow_slabs(wcursor + n_new)
                         sel = np.nonzero(flat)[0]
                         end = wcursor + n_new
                         # Single (T,S,L) window into traj storage.
@@ -2319,39 +2535,54 @@ def collect_rollout_batched(
                         obs_idx = obs_idx_tsl.ravel()[sel]
                         np.take(
                             step_obs_pool, obs_idx, axis=0,
-                            out=all_obs_arr[wcursor:end],
+                            out=slabs["obs"][wcursor:end],
                         )
                         np.take(
                             step_gm_pool, obs_idx, axis=0,
-                            out=all_gm_arr[wcursor:end],
+                            out=slabs["gm"][wcursor:end],
                         )
-                        all_ga_arr[wcursor:end] = gate_tsl.ravel()[sel].astype(
+                        slabs["ga"][wcursor:end] = gate_tsl.ravel()[sel].astype(
                             np.int64, copy=False
                         )
-                        all_rc_arr[wcursor:end] = chips_tsl.ravel()[sel]
-                        all_sz_arr[wcursor:end] = sizing_tsl.reshape(-1, 4)[sel]
-                        all_an_arr[wcursor:end] = anchor_tsl.ravel()[sel].astype(
+                        slabs["rc"][wcursor:end] = chips_tsl.ravel()[sel]
+                        slabs["sz"][wcursor:end] = sizing_tsl.reshape(-1, 4)[sel]
+                        slabs["an"][wcursor:end] = anchor_tsl.ravel()[sel].astype(
                             np.int64, copy=False
                         )
-                        all_ru_arr[wcursor:end] = u_tsl.ravel()[sel]
+                        slabs["ru"][wcursor:end] = u_tsl.ravel()[sel]
                         # (T, S, 5, hole_w) already rotated; ts_idx = env*S+seat
                         ts_idx = sel // L
-                        all_oh_arr[wcursor:end] = holes_rot_cache[term_envs].reshape(
+                        slabs["oh"][wcursor:end] = holes_rot_cache[term_envs].reshape(
                             T * S, 5, _hole_w
                         )[ts_idx]
-                        all_lp_arr[wcursor:end] = lp_tsl.ravel()[sel]
-                        all_glp_arr[wcursor:end] = glp_tsl.ravel()[sel]
-                        all_alp_arr[wcursor:end] = alp_tsl.ravel()[sel]
-                        all_v_arr[wcursor:end] = vals_t.ravel()[sel]
-                        all_ret_arr[wcursor:end] = rets_t.ravel()[sel]
-                        all_adv_arr[wcursor:end] = adv_out_t.ravel()[sel]
-                        all_last_arr[wcursor:end] = (
+                        slabs["lp"][wcursor:end] = lp_tsl.ravel()[sel]
+                        slabs["glp"][wcursor:end] = glp_tsl.ravel()[sel]
+                        slabs["alp"][wcursor:end] = alp_tsl.ravel()[sel]
+                        slabs["v"][wcursor:end] = vals_t.ravel()[sel]
+                        slabs["ret"][wcursor:end] = rets_t.ravel()[sel]
+                        slabs["adv"][wcursor:end] = adv_out_t.ravel()[sel]
+                        slabs["last"][wcursor:end] = (
                             t_idx[None, None, :] == last_t_arr[..., None]
                         ).ravel()[sel]
                         wcursor = end
 
+                traj_lengths[term_envs] = 0
+
+            # A6 drain: once the row target is reached the finished envs are
+            # NOT re-dealt — they stay done (`active` masks them out) while
+            # the hands still in flight play to completion. The draws below
+            # sit AFTER the flush (which consumes no RNG) so the numpy stream
+            # keeps its pre-fix order — seeds, buttons, pool-mix — and a
+            # drain-off run is byte-identical.
+            redeal = not (drain and wcursor >= rollout_target)
+            if redeal:
+                new_seeds = rng.integers(
+                    0, 2**63 - 1, size=n_envs, dtype=np.int64
+                ).astype(np.uint64)
+                new_buttons = rng.integers(
+                    0, n_seats, size=n_envs, dtype=np.int64
+                ).astype(np.uint8)
                 with _TimedRF("step9e/pool_mix"):
-                    traj_lengths[term_envs] = 0
                     # Attack #4: fast path when pool mix is inactive; else
                     # preserve sequential term_envs order for RNG bit-exactness.
                     if len(pool) == 0 or pool_opp_seats == 0 or pool_mix_prob <= 0.0:
@@ -2363,27 +2594,33 @@ def collect_rollout_batched(
                         for i_int in term_envs.tolist():
                             _assign_pool_mix(int(i_int))
 
-            with _TimedRF("step9f/reset_terminal"):
-                env._be.reset_terminal_batch(new_seeds, new_buttons, reset_mask)
-                env._reset_seeds = np.where(reset_mask, new_seeds, env._reset_seeds)
-                # Refresh the per-hand hole cache for the re-dealt envs
-                # only (holes are static within a hand; non-reset envs
-                # keep their prior rows). Subset fetch mirrors
-                # observation_and_features_subset_batch.
-                term_idx = term_envs.astype(np.int64)
-                holes_sub = np.asarray(
-                    env._be.all_hole_cards_subset_batch(term_idx), dtype=np.uint8
-                )
-                holes_cache[term_envs] = holes_sub
-                _fill_holes_rot(term_envs.astype(np.int64))
-                # Second refresh to pick up the post-reset state for the next
-                # iteration. `reset_terminal_batch` mutates ONLY the masked
-                # (terminal) envs, and nothing above mutated non-masked envs'
-                # engine state since the post-apply refresh — so only the
-                # reset rows need re-packing/re-encoding. The subset refresh
-                # is bit-exact-equivalent to a full `_refresh()` here (see
-                # `_refresh_subset` docstring + test_refresh_subset_parity).
-                env._refresh_subset(reset_mask)
+                with _TimedRF("step9f/reset_terminal"):
+                    env._be.reset_terminal_batch(new_seeds, new_buttons, reset_mask)
+                    env._reset_seeds = np.where(
+                        reset_mask, new_seeds, env._reset_seeds
+                    )
+                    # Second refresh to pick up the post-reset state for the next
+                    # iteration. `reset_terminal_batch` mutates ONLY the masked
+                    # (terminal) envs, and nothing above mutated non-masked envs'
+                    # engine state since the post-apply refresh — so only the
+                    # reset rows need re-packing/re-encoding. The subset refresh
+                    # is bit-exact-equivalent to a full `_refresh()` here (see
+                    # `_refresh_subset` docstring + test_refresh_subset_parity).
+                    env._refresh_subset(reset_mask)
+                    # A1: a re-dealt hand that is already over at deal is
+                    # re-dealt again (bounded), never left to stall the loop.
+                    _redeal_done_at_deal(term_envs)
+                    # Refresh the per-hand hole cache for the re-dealt envs
+                    # only (holes are static within a hand; non-reset envs
+                    # keep their prior rows). Subset fetch mirrors
+                    # observation_and_features_subset_batch. After the A1
+                    # re-deal pass so the cache holds the FINAL deal's cards.
+                    term_idx = term_envs.astype(np.int64)
+                    holes_sub = np.asarray(
+                        env._be.all_hole_cards_subset_batch(term_idx), dtype=np.uint8
+                    )
+                    holes_cache[term_envs] = holes_sub
+                    _fill_holes_rot(term_envs.astype(np.int64))
 
             # Wave B: re-dealt envs may now need an action; queue after reset.
             if _prefetch_queued is not None:
@@ -2450,6 +2687,9 @@ def collect_rollout_batched(
                     if wcursor < rollout_target:
                         _act_prefetch = host_a
 
+    # Sizing hint for the next collection's pool/slab slack (never a value).
+    _note_slack_used(max(wcursor, pool_cursor), rollout_target, n_envs)
+
     if out_slabs is not None:
         # P7 shared-staging finalize: no full H2D — the rows already sit in the
         # caller's big host buffer. Only the per-sub advantage normalization
@@ -2458,7 +2698,7 @@ def collect_rollout_batched(
         # reduction order, so ship the tiny (wcursor,) vector up, run the
         # IDENTICAL op sequence, and write the result back into the slab.
         with _TimedRF("step11/shared_adv_norm"):
-            adv_view = all_adv_arr[:wcursor]
+            adv_view = slabs["adv"][:wcursor]
             adv_t = torch.from_numpy(adv_view).to(device, non_blocking=True)
             adv_mean = adv_t.mean()
             adv_std = adv_t.std().clamp(min=1e-8)
@@ -2469,21 +2709,21 @@ def collect_rollout_batched(
                 adv_t = adv_t.clamp(-_adv_clip, _adv_clip)
             np.copyto(adv_view, adv_t.cpu().numpy())
         return Batch(
-            obs=torch.from_numpy(all_obs_arr[:wcursor]),
-            gate_masks=torch.from_numpy(all_gm_arr[:wcursor]),
-            gate_actions=torch.from_numpy(all_ga_arr[:wcursor]),
-            raise_chips=torch.from_numpy(all_rc_arr[:wcursor]),
-            sizing=torch.from_numpy(all_sz_arr[:wcursor]),
-            anchor_actions=torch.from_numpy(all_an_arr[:wcursor]),
-            refine_u=torch.from_numpy(all_ru_arr[:wcursor]),
-            opp_holes=torch.from_numpy(all_oh_arr[:wcursor]),
-            log_probs=torch.from_numpy(all_lp_arr[:wcursor]),
-            values=torch.from_numpy(all_v_arr[:wcursor]),
-            returns=torch.from_numpy(all_ret_arr[:wcursor]),
+            obs=torch.from_numpy(slabs["obs"][:wcursor]),
+            gate_masks=torch.from_numpy(slabs["gm"][:wcursor]),
+            gate_actions=torch.from_numpy(slabs["ga"][:wcursor]),
+            raise_chips=torch.from_numpy(slabs["rc"][:wcursor]),
+            sizing=torch.from_numpy(slabs["sz"][:wcursor]),
+            anchor_actions=torch.from_numpy(slabs["an"][:wcursor]),
+            refine_u=torch.from_numpy(slabs["ru"][:wcursor]),
+            opp_holes=torch.from_numpy(slabs["oh"][:wcursor]),
+            log_probs=torch.from_numpy(slabs["lp"][:wcursor]),
+            values=torch.from_numpy(slabs["v"][:wcursor]),
+            returns=torch.from_numpy(slabs["ret"][:wcursor]),
             advantages=torch.from_numpy(adv_view),
-            old_gate_logp=torch.from_numpy(all_glp_arr[:wcursor]),
-            old_anchor_logp=torch.from_numpy(all_alp_arr[:wcursor]),
-            is_terminal=torch.from_numpy(all_last_arr[:wcursor]),
+            old_gate_logp=torch.from_numpy(slabs["glp"][:wcursor]),
+            old_anchor_logp=torch.from_numpy(slabs["alp"][:wcursor]),
+            is_terminal=torch.from_numpy(slabs["last"][:wcursor]),
             aggr_bonus_total_bb=float(aggr_bonus_total_bb),
             aggr_steps_total=int(aggr_steps_total),
             aggr_bonus_steps=int(aggr_bonus_steps),
@@ -2501,20 +2741,20 @@ def collect_rollout_batched(
         step_timers.report(label="collect_rollout_batched")
         _ACTIVE_STEP_TIMERS = None
     return _finalize_batch_arr(
-        all_obs_arr,
-        all_gm_arr,
-        all_ga_arr,
-        all_rc_arr,
-        all_sz_arr,
-        all_an_arr,
-        all_ru_arr,
-        all_oh_arr,
-        all_lp_arr,
-        all_v_arr,
-        all_ret_arr,
-        all_adv_arr,
-        all_glp_arr,
-        all_alp_arr,
+        slabs["obs"],
+        slabs["gm"],
+        slabs["ga"],
+        slabs["rc"],
+        slabs["sz"],
+        slabs["an"],
+        slabs["ru"],
+        slabs["oh"],
+        slabs["lp"],
+        slabs["v"],
+        slabs["ret"],
+        slabs["adv"],
+        slabs["glp"],
+        slabs["alp"],
         wcursor,
         device=device,
         aggr_bonus_total_bb=aggr_bonus_total_bb,
@@ -2523,7 +2763,7 @@ def collect_rollout_batched(
         aggr_steps_total_by_street=tuple(aggr_steps_total_by_street),
         aggr_bonus_steps_by_street=tuple(aggr_bonus_steps_by_street),
         adv_clip=float(getattr(train_config, "adv_clip", 0.0)),
-        all_last_arr=all_last_arr,
+        all_last_arr=slabs["last"],
     )
 
 
@@ -2532,7 +2772,9 @@ def collect_rollout_batched(
 # instead of one config + a 50-update block. This removes the consecutive-
 # shallow exposure that saturated the gate (vTwo10-13 all died ~38 clubgg
 # updates in). Implemented as a thin wrapper over the bit-exact single-config
-# collector: split → host-concat → global advantage re-normalization.
+# collector: split → host-concat → a final pooled advantage re-normalization
+# which is numerically a NO-OP — advantages are effectively normalized PER
+# CONFIG (see the `_concat_batches` docstring; review 2026-09-20 A5).
 
 _BATCH_TENSOR_FIELDS = (
     "obs", "gate_masks", "gate_actions", "raise_chips", "sizing",
@@ -2557,15 +2799,31 @@ def _batch_to_device(batch: Batch, device: torch.device) -> Batch:
 
 
 def _concat_batches(batches: list[Batch], adv_clip: float) -> Batch:
-    """Concatenate sub-rollout Batches along the transition axis, then RE-normalize
-    the combined advantages GLOBALLY (mean 0 / std 1, then the fat-tail clamp) so
-    no single config's value scale dominates. Scalar aggression diagnostics sum.
+    """Concatenate sub-rollout Batches along the transition axis, then
+    re-normalize the combined advantages (mean 0 / std 1, then the fat-tail
+    clamp). Scalar aggression diagnostics sum.
 
-    NOTE (2026-06-23): a per-config variant (preserve each sub-rollout's own
-    unit-std; no global pool) was tried as a suspected full-LR collapse fix. It
-    did NOT fix full LR AND it destabilized the low-LR run (the anchor spikes
-    stopped settling — Ha 1.4->0.4 by u15 where global norm had held). So global
-    renorm is retained; it was the more stable of the two."""
+    WHAT THIS ACTUALLY DOES (review 2026-09-20 A5 — the earlier text here
+    claimed a GLOBAL normalization "so no single config's value scale
+    dominates"; that is not what happens): every sub-rollout arrives ALREADY
+    normalized to mean 0 / std 1 (+ clamp) by its own collector
+    (`_finalize_batch_arr`, or the shared-staging `step11/shared_adv_norm`
+    hop). Pooling N unit-variance, zero-mean vectors gives mean ~0 / std ~1,
+    so the renorm below rescales by ~1.000x — numerically a no-op. Measured:
+    raw advantage sigma 6.96bb (10bb config) vs 34.9bb (250bb config) -> both
+    0.9996 after (`.claude/reviews/repro-2026-09-20/agent_rollout/
+    mix_norm.py`). Advantage normalization under --mix-configs is therefore
+    PER CONFIG: a 10bb config's transitions carry the same advantage scale as
+    a 250bb config's. A genuinely pooled normalization (normalize the RAW
+    advantages once, across configs) would be a production behavior change
+    and is NOT implemented.
+
+    NOTE (2026-06-23): a "per-config variant (preserve each sub-rollout's own
+    unit-std; no global pool)" was tried as a suspected full-LR collapse fix
+    and judged less stable (Ha 1.4->0.4 by u15). Given the above, that A/B
+    compared two numerically near-identical normalizations, so its stability
+    conclusion was run-to-run noise, not evidence for this renorm. The op is
+    kept only because removing it would perturb f32 bits for no benefit."""
     if len(batches) == 1:
         return batches[0]
 
@@ -2607,11 +2865,15 @@ def collect_rollout_multiconfig(
     config_tiers: "list[str] | None" = None,
     tier_ent: "dict[str, float] | None" = None,
     _legacy_staging: bool = False,
+    drain_inflight: "bool | None" = None,
 ) -> Batch:
     """One update's rollout MIXED across `configs` distinct (seats,stacks) setups.
 
     Runs `collect_rollout_batched` once per config — each sub-rollout sized
-    `num_envs // N` envs and `rollout_length // N` learner steps.
+    `num_envs // N` envs and `rollout_length // N` learner steps (a row
+    TARGET: with `drain_inflight` — resolved ONCE here and passed to every
+    sub, see `collect_rollout_batched` — each sub also flushes its in-flight
+    hands, so the combined batch runs past `rollout_length`).
 
     Staging (P7+P8, 2026-07-09): sub-rollouts write directly into per-sub
     VIEWS of one big preallocated host buffer (bases chained by each sub's
@@ -2651,6 +2913,9 @@ def collect_rollout_multiconfig(
         )
     device = next(learner.parameters()).device
     host = torch.device("cpu")
+    # Resolved BEFORE `replace`: a drain flag attached to a config that
+    # predates the dataclass field would not survive it.
+    drain = _resolve_drain_inflight(train_config, drain_inflight)
     sub_config = replace(
         train_config,
         num_envs=max(1, train_config.num_envs // n),
@@ -2673,24 +2938,32 @@ def collect_rollout_multiconfig(
 
     if _legacy_staging:
         # Reference path (test-only): finalize each sub to the learner device,
-        # evacuate to host, torch.cat, global renorm inside _concat_batches.
+        # evacuate to host, torch.cat, pooled renorm inside _concat_batches
+        # (numerically a no-op — see its docstring).
         host_batches: list[Batch] = []
         for cfg in configs:
             sub = collect_rollout_batched(
                 learner, pool, cfg, sub_config, rng, critic=critic,
                 snapshot_cache=snapshot_cache,
                 env_cache=env_cache,
+                drain_inflight=drain,
             )
             host_batches.append(_batch_to_device(sub, host))
             del sub
         combined = _concat_batches(host_batches, adv_clip)
         subs: list[Batch] = host_batches
+        sub_rows = [int(b.obs.shape[0]) for b in host_batches]
     else:
         # P7+P8 shared staging: one big host buffer, per-sub views, chained
-        # bases. Capacity per sub uses the collector's own formula (asserted
-        # inside it); total = worst case of every sub filling to cap.
+        # bases. Each sub gets a view of ALL the buffer's remaining rows
+        # (`arr[base:]`), so the per-sub slack is POOLED: a long-handed config
+        # borrows what a short-handed one left unused. Initial capacity =
+        # every sub at target + `_slack_per_env` rows/env; if the pooled
+        # buffer still runs out (A6: a drained sub can need more than any
+        # fixed constant), `_grow` reallocates it bigger and copies the rows
+        # written so far — rare once `_slack_per_env` has learned the need.
         n_sub_envs = sub_config.num_envs
-        sub_cap = sub_config.rollout_length + n_sub_envs * POOL_SLACK_PER_ENV
+        sub_cap = sub_config.rollout_length + n_sub_envs * _slack_per_env()
         total_cap = n * sub_cap
         hole_count = configs[0].hole_count
         assert all(c.hole_count == hole_count for c in configs), (
@@ -2709,50 +2982,50 @@ def collect_rollout_multiconfig(
             device.type == "cuda"
             and os.environ.get("PLO5BP_PIN_ROLLOUT", "0") == "1"
         )
-        _pinned_keepalive: list[torch.Tensor] = []
-
-        def _alloc(shape, np_dtype, torch_dtype):
-            if _pin:
-                t = torch.empty(shape, dtype=torch_dtype, pin_memory=True)
-                _pinned_keepalive.append(t)
-                return t.numpy()
-            return np.empty(shape, dtype=np_dtype)
-
-        big = {
-            "obs": _alloc((total_cap, obs_dim), np.float32, torch.float32),
-            "gm": _alloc((total_cap, GATE_ACTIONS), bool, torch.bool),
-            "ga": _alloc(total_cap, np.int64, torch.int64),
-            "rc": _alloc(total_cap, np.int64, torch.int64),
-            "sz": _alloc((total_cap, 4), np.int64, torch.int64),
-            "an": _alloc(total_cap, np.int64, torch.int64),
-            "ru": _alloc(total_cap, np.float32, torch.float32),
-            "oh": _alloc((total_cap, 5, hole_count), np.uint8, torch.uint8),
-            "lp": _alloc(total_cap, np.float32, torch.float32),
-            "glp": _alloc(total_cap, np.float32, torch.float32),
-            "alp": _alloc(total_cap, np.float32, torch.float32),
-            "v": _alloc(total_cap, np.float32, torch.float32),
-            "ret": _alloc(total_cap, np.float32, torch.float32),
-            "adv": _alloc(total_cap, np.float32, torch.float32),
-            "last": _alloc(total_cap, bool, torch.bool),
-        }
-        subs = []
+        staging = _SlabAllocator(obs_dim, hole_count, _pin)
+        big = staging.alloc(total_cap)
         base = 0
+
+        def _grow(used_rows: int, min_rows: int) -> dict[str, np.ndarray]:
+            """`out_slabs_grow` for the sub running at `base`: it has written
+            `used_rows` and needs `min_rows`. Everything below
+            `base + used_rows` is live and is copied across."""
+            nonlocal big, total_cap
+            total_cap = max(
+                base + int(min_rows), total_cap + max(total_cap // 4, 1)
+            )
+            big = staging.grow(big, base + int(used_rows), total_cap)
+            return {key: arr[base:] for key, arr in big.items()}
+
+        # Per-sub scalar diagnostics only: a sub's tensors are VIEWS of `big`,
+        # and holding them would pin a superseded buffer alive after a grow.
+        subs = []
+        sub_rows: list[int] = []
         for cfg in configs:
-            views = {key: arr[base : base + sub_cap] for key, arr in big.items()}
+            views = {key: arr[base:] for key, arr in big.items()}
             sub = collect_rollout_batched(
                 learner, pool, cfg, sub_config, rng,
                 critic=critic, out_slabs=views,
                 snapshot_cache=snapshot_cache,
                 env_cache=env_cache,
+                drain_inflight=drain,
+                out_slabs_grow=_grow,
             )
-            rows = sub.obs.shape[0]
+            rows = int(sub.obs.shape[0])
             # Chain the next sub's base to this sub's actual row count so the
             # buffer's first `total` rows reproduce torch.cat's layout exactly.
-            assert rows <= sub_cap and base + rows <= total_cap, (
+            assert base + rows <= total_cap, (
                 f"shared-staging overflow: base={base} rows={rows} "
-                f"sub_cap={sub_cap} total_cap={total_cap}"
+                f"total_cap={total_cap}"
             )
-            subs.append(sub)
+            _empty = torch.empty(0)
+            subs.append(replace(
+                sub,
+                **{f: _empty for f in _BATCH_TENSOR_FIELDS},
+                is_terminal=None,
+            ))
+            sub_rows.append(rows)
+            del sub, views
             base += rows
         total = base
 
@@ -2761,9 +3034,11 @@ def collect_rollout_multiconfig(
 
         adv = _t("adv")
         if n > 1:
-            # Global advantage re-normalization — the identical ops
+            # Pooled advantage re-normalization — the identical ops
             # _concat_batches applies (and, like it, skipped when there is
-            # only one sub-rollout).
+            # only one sub-rollout). Each sub is already unit-normalized, so
+            # this is numerically a no-op: normalization is PER CONFIG (see
+            # the _concat_batches docstring; review 2026-09-20 A5).
             adv = (adv - adv.mean()) / adv.std().clamp(min=1e-8)
             if adv_clip > 0.0:
                 adv = adv.clamp(-adv_clip, adv_clip)
@@ -2799,11 +3074,11 @@ def collect_rollout_multiconfig(
         if tier_ent is not None:
             combined.ent_coef_rows = torch.cat([
                 torch.full(
-                    (b.obs.shape[0],),
+                    (rows,),
                     float(tier_ent[t]),
                     dtype=torch.float32,
                 )
-                for b, t in zip(subs, config_tiers)
+                for rows, t in zip(sub_rows, config_tiers)
             ])
         ftr: dict[str, tuple[list[int], list[int]]] = {}
         for b, t in zip(subs, config_tiers):
@@ -2823,6 +3098,38 @@ def collect_rollout_multiconfig(
     return _batch_to_device(combined, device)
 
 
+def _minibatch_bounds(n: int, batch_size: int) -> list[tuple[int, int]]:
+    """[start, stop) slices of the shuffled index for one epoch.
+
+    PRODUCTION BEHAVIOR CHANGE, small (review 2026-09-20 A10): a tail
+    SMALLER THAN HALF a batch is folded back into the full minibatches
+    instead of becoming its own step. The collectors always overshoot the
+    row target a little, and train.py derives batch_size =
+    ceil(rollout_length / num_minibatches), so every epoch ended in a runt
+    (num_minibatches+1)-th minibatch — a few hundred rows that still took a
+    full-LR optimizer step and its own KL-guard check on a very noisy
+    gradient (e.g. 96,297 rows at batch_size 6,000 -> 16 full minibatches +
+    a 297-row 17th; now 16 minibatches of 6,018/6,019 rows).
+
+    The folded rows are spread EVENLY over the full minibatches rather than
+    stacked on the last one: the largest minibatch is then
+    batch_size * (1 + <0.5/k), not 1.5x — matters on the pod, where
+    activation memory scales with the minibatch and sits near the VRAM
+    ceiling. Tails >= half a batch, and rollouts shorter than one batch,
+    keep the old slicing exactly."""
+    n_full, tail = divmod(n, batch_size)
+    if n_full == 0 or tail == 0 or 2 * tail >= batch_size:
+        return [(s, min(s + batch_size, n)) for s in range(0, n, batch_size)]
+    base, extra = divmod(n, n_full)
+    bounds: list[tuple[int, int]] = []
+    start = 0
+    for k in range(n_full):
+        stop = start + base + (1 if k < extra else 0)
+        bounds.append((start, stop))
+        start = stop
+    return bounds
+
+
 def iter_minibatches(
     batch: Batch, batch_size: int, rng: np.random.Generator
 ) -> Iterable[Batch]:
@@ -2830,8 +3137,8 @@ def iter_minibatches(
     idx = np.arange(n)
     rng.shuffle(idx)
     device = batch.obs.device
-    for start in range(0, n, batch_size):
-        sel = torch.from_numpy(idx[start : start + batch_size]).to(device)
+    for start, stop in _minibatch_bounds(n, batch_size):
+        sel = torch.from_numpy(idx[start:stop]).to(device)
         yield Batch(
             obs=batch.obs[sel],
             gate_masks=batch.gate_masks[sel],

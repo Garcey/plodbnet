@@ -268,10 +268,11 @@ fn ck_eval_inline(c: [u32; 5], t: &CkTables) -> u16 {
     // P2: single-probe open-addressing lookup, replacing a ~12-deep binary
     // search. Key-verified: probe until the stored product matches `prod`
     // (return its ck) or an empty slot (key 0) is reached. The empty-slot case
-    // returns the same 0 sentinel the old `Err(_)` did — a study-mode duplicate
-    // hole can give a >4-of-a-kind multiset (e.g. 41^5) with no table entry;
-    // production deals are duplicate-free and can't reach it. The table is
-    // <100% full, so a missing key always reaches an empty slot.
+    // returns the same 0 sentinel the old `Err(_)` did — only a multiset no
+    // real hand can form (5 of a rank, e.g. 41^5, from duplicated cards) has
+    // no table entry; every deal the engine produces is duplicate-free and
+    // can't reach it. The table is <100% full, so a missing key always
+    // reaches an empty slot.
     let mut slot = (prod.wrapping_mul(0x9E3779B9) >> 18) as usize;
     loop {
         let (k, v) = t.paired_hash[slot];
@@ -287,13 +288,19 @@ fn ck_eval_inline(c: [u32; 5], t: &CkTables) -> u16 {
 
 #[inline]
 fn ck_to_hand_rank(ck: u16) -> HandRank {
-    // ck=0 is the sentinel ck_eval_inline returns when the 5-card hand
-    // has a duplicate card (flush-bitset table has no entry for a rank
-    // bitset with <5 bits). This is reachable in study mode when a
-    // user-supplied turn/river card collides with a non-hero seat's
-    // placeholder hole. Downgrade to the worst high-card rank rather
-    // than panic — evaluate_plo5* loops filter degenerate combos first,
-    // so this path only fires on evaluate_5 direct callers.
+    // ck=0 is the sentinel ck_eval_inline returns for SOME 5-card hands
+    // holding a duplicated card: single-suit ones (the flush table has no
+    // entry for a rank bitset with <5 bits) and 5-of-a-rank multisets. It
+    // is NOT a duplicate detector — a duplicate inside a mixed-suit hand
+    // hits a real paired-table entry and scores as a genuine pair / trips
+    // (review 2026-09-20 C8). Duplicate-free input is therefore the
+    // CALLER's contract: production deals satisfy it by construction, and
+    // study mode now does too (a user street card that collides with a
+    // hidden placeholder hole redraws the placeholder — see
+    // `GameState::redraw_colliding_placeholders`; it used to reach this).
+    // Downgrade to the worst high-card rank rather than panic; the
+    // evaluate_plo5* loops skip ck == 0 combos first, so this path only
+    // fires on evaluate_5 direct callers.
     let ck = if ck == 0 { 7462 } else { ck as u32 };
     let (cat, hi) = match ck {
         1..=10 => (CAT_STRAIGHT_FLUSH, 10),
@@ -414,10 +421,11 @@ pub fn evaluate_plo5_partial(hole: &[Card], board: &[Card]) -> HandRank {
                 for &(hi0, hi1) in pairs {
                     let c = [h[hi0], h[hi1], b0, b1, b2];
                     let ck = ck_eval_inline(c, t);
-                    // Skip degenerate 5-card hands (duplicate card).
-                    // Reachable when a user-supplied turn/river coincides
-                    // with a non-hero placeholder hole drawn at
-                    // reset_study — a study-mode-only state.
+                    // Skip the degenerate 5-card hands the sentinel CAN
+                    // flag (single-suit duplicates; see ck_to_hand_rank —
+                    // it is not a general duplicate filter). Best-effort
+                    // guard only: no engine path feeds duplicates any
+                    // more, study mode included (review 2026-09-20 C8).
                     if ck != 0 && ck < best_ck {
                         best_ck = ck;
                     }
@@ -1341,8 +1349,10 @@ mod tests {
         // card that the user later sets as the turn. The 5-card hand
         // derived from picking that card from BOTH hole and board is
         // degenerate. Pre-fix: panicked in ck_to_hand_rank(0). Post-
-        // fix: loop filters the degenerate combo and returns the best
-        // valid combo (here, two hole-card high cards + flop).
+        // fix: the evaluator never panics on it and returns a valid
+        // rank. (Since review 2026-09-20 C8 study mode redraws the
+        // colliding placeholder, so the engine no longer produces this
+        // input; the no-panic guarantee stays pinned at this level.)
         let hole = [c(11, 0), c(9, 1), c(7, 2), c(4, 3), c(2, 0)];
         // Board contains c(11, 0) — same card as hole[0].
         let board = [c(11, 0), c(8, 1), c(5, 2)];
@@ -1360,6 +1370,26 @@ mod tests {
         let rank = evaluate_plo5(&hole, &board);
         let cat = rank >> 20;
         assert!(cat <= CAT_STRAIGHT_FLUSH, "category out of range: {cat}");
+    }
+
+    #[test]
+    fn ck_sentinel_is_not_a_duplicate_detector() {
+        // (review 2026-09-20 C8) Pins the LIMIT of the ck == 0 filter so
+        // nobody leans on it: the sentinel fires for a duplicated card only
+        // when all five cards share a suit (flush table miss). In a
+        // mixed-suit hand the duplicate is scored as a genuine pair — which
+        // is why study mode keeps duplicates out at the source (placeholder
+        // redraw in engine.rs) instead of relying on the evaluator.
+        let t = tables();
+        let ck = |cards: [Card; 5]| ck_eval_inline(cards.map(card_to_ck), t);
+        // Kh Kh 9h 6h 3h — single suit: flagged.
+        assert_eq!(ck([c(11, 2), c(11, 2), c(7, 2), c(4, 2), c(1, 2)]), 0);
+        // Kh Kh 9d 6c 3s — mixed suits: indistinguishable from Kh Ks 9d 6c 3s.
+        let dup = ck([c(11, 2), c(11, 2), c(7, 1), c(4, 0), c(1, 3)]);
+        let real = ck([c(11, 2), c(11, 3), c(7, 1), c(4, 0), c(1, 3)]);
+        assert_ne!(dup, 0);
+        assert_eq!(dup, real);
+        assert_eq!(category(ck_to_hand_rank(dup)), CAT_PAIR);
     }
 
     // -------- evaluate_plo5_k_partial (k-card opp hand) --------

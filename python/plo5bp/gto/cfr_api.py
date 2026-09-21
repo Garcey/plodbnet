@@ -7,12 +7,14 @@ script/batch contract: ``RootSpec`` / ``SolveConfig`` / ``solve()``.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
 from plo5bp.gto.iso import TEACHER_USE_ISOMORPHISM
 from plo5bp.gto.roots import CLUBGG_NLH_ROOT
+from plo5bp.gto.teacher import root_fingerprint
 
 # Per-mille pot fractions
 DEFAULT_RAISE_SIZES_PM: tuple[int, ...] = (330, 500, 750, 1000, 1500)
@@ -53,7 +55,28 @@ class RootSpec:
 
     def __post_init__(self) -> None:
         if not self.root_id:
-            self.root_id = f"s{self.street}_pot{self.pot_bb:g}_eff{self.effective_stack_bb:g}"
+            self.root_id = self.with_fingerprint(self.legacy_auto_id())
+
+    def legacy_auto_id(self) -> str:
+        """Pre-2026-09-20 auto id. It named street / pot / stack only, so two
+        boards (or size menus, seat counts, ranges) shared one id."""
+        return f"s{self.street}_pot{self.pot_bb:g}_eff{self.effective_stack_bb:g}"
+
+    def fingerprint(self) -> str:
+        """Hash of the fields that DEFINE the solved game — see
+        :func:`plo5bp.gto.teacher.root_fingerprint`."""
+        return root_fingerprint(self.as_dict())
+
+    def with_fingerprint(self, base: str) -> str:
+        """``<base>-<fingerprint>`` — the NEW auto / grid id format.
+
+        (review 2026-09-20 F10) The discriminator keeps different solves from
+        colliding on resume markers, split manifests and label ``root_name``.
+        It is only ever added to ids generated from now on: explicit ids are
+        kept verbatim and batch resume still recognizes a campaign directory
+        written under the bare legacy id (``cfr_batch.resolve_job_id``).
+        """
+        return f"{base}-{self.fingerprint()}"
 
     def validate(self) -> None:
         if not 2 <= self.num_seats <= 6:
@@ -94,6 +117,12 @@ class RootSpec:
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    def _fingerprinted(self) -> "RootSpec":
+        """Factory ids (``river_pot10``, ``preflop_hu_100bb`` …) never named
+        the board / sizes either — append the discriminator."""
+        self.root_id = self.with_fingerprint(self.root_id)
+        return self
+
     @classmethod
     def preflop_hu(cls, stack_bb: float = 100.0) -> "RootSpec":
         bb = CLUBGG_NLH_ROOT.bb
@@ -106,7 +135,7 @@ class RootSpec:
             effective_stack_bb=float(stack_bb),
             board=[],
             root_id=f"preflop_hu_{stack_bb:g}bb",
-        )
+        )._fingerprinted()
 
     @classmethod
     def preflop_pushfold(
@@ -142,7 +171,7 @@ class RootSpec:
             allin_atom=True,
             stacks_bb=[float(stack_bb)] * n,
             root_id=f"pushfold_{n}h_{stack_bb:g}bb_ante{ante_chips}",
-        )
+        )._fingerprinted()
 
     @classmethod
     def river_hu(
@@ -161,7 +190,7 @@ class RootSpec:
             board=[int(c) for c in board],
             raise_sizes_pm=sizes,
             root_id=f"river_pot{pot_bb:g}",
-        )
+        )._fingerprinted()
 
 
 @dataclass
@@ -185,7 +214,11 @@ class SolveConfig:
     progress_file: str = ""
 
     def validate(self) -> None:
-        # max_iterations == 0 means unlimited — allowed.
+        # max_iterations == 0 means unlimited — allowed HERE because callers
+        # (the desktop app's SolveSession) validate the user's config first
+        # and wire their own stop_file in afterwards. The native solver is
+        # the guard: it rejects `max_iterations=0` with neither a time budget
+        # nor a stop file at solve time (review 2026-09-20 F13).
         if self.max_iterations < 0:
             raise ValueError("max_iterations must be >= 0 (0 = unlimited)")
         if self.thread_num < 1:
@@ -225,9 +258,13 @@ class SolveReport:
         return asdict(self)
 
     def write_json(self, path: Path | str) -> None:
+        """Atomic (temp file + rename): a kill mid-write must not leave a
+        truncated strategy where a finished one is expected (review F10)."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self.as_dict(), indent=2) + "\n", encoding="utf-8")
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(self.as_dict(), indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
 
     @property
     def is_mc_br_proxy(self) -> bool:

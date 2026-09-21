@@ -83,6 +83,8 @@ def main() -> int:
                 "skipped": len(man.skipped),
                 "failed": len(man.failed),
                 "rejected": man.rejected,
+                # Solved, but the exploitability is not a final estimate.
+                "unverified": man.unverified,
                 "out_dir": man.out_dir,
                 "max_expl_bb": max_expl,
             },

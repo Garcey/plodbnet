@@ -75,6 +75,25 @@ def test_selection_ignores_future_and_missing():
     assert got2 == [490, 500]
 
 
+def test_selection_young_run_is_not_backfilled_with_earliest_files():
+    # (review 2026-09-20 A18) Files 5..100 every 5, resume at 103 with
+    # snapshot_every=50: a never-stopped run holds the snapshots of updates
+    # 0, 50, 100 — three members. The grid walk used to continue BELOW 0 and
+    # pad the pool with 10, 15, 20, 25, 30 (the weakest checkpoints on disk).
+    available = list(range(5, 105, 5))
+    got = select_warmstart_pool_updates(
+        available, target_update=103, capacity=8, snapshot_every=50
+    )
+    assert got == [5, 50, 100]  # 5 = the nearest file to the update-0 snapshot
+    # Even younger than one snapshot interval: just the update-0 stand-in.
+    assert select_warmstart_pool_updates([5, 10, 15], 17, 8, 50) == [5]
+    # The production cadence (snapshot 5 / checkpoint 5) is untouched, young
+    # or old: every grid point has its own file.
+    assert select_warmstart_pool_updates(
+        list(range(5, 25, 5)), 20, 8, 5
+    ) == [5, 10, 15, 20]
+
+
 def test_selection_nearest_tie_prefers_newer():
     got = select_warmstart_pool_updates(
         [485, 495], 500, capacity=1, snapshot_every=10
@@ -195,3 +214,33 @@ def test_seed_pool_respects_capacity(tmp_path):
     )
     assert seeded == [85, 90, 95, 100]
     assert len(pool) == 4
+
+
+def test_seed_pool_skips_siblings_of_another_obs_rev(tmp_path, capsys):
+    """2026-09-20: `obs_rev` stamps the observation-SEMANTICS revision a
+    checkpoint trained on (same widths, different feature values — so the
+    shape check cannot see it). Siblings of another rev are skipped; a file
+    with no stamp counts as rev 1 (trained before the feature fixes)."""
+    ref = _tiny_net(0)
+    for u in (485, 490):  # unstamped -> rev 1
+        _write_ckpt(tmp_path / f"vZ_{u}.pt", _tiny_net(u), update=u)
+    for u in (495, 500):  # stamped rev 2
+        _write_ckpt(tmp_path / f"vZ_{u}.pt", _tiny_net(u), update=u)
+        ck = torch.load(tmp_path / f"vZ_{u}.pt", weights_only=False)
+        ck["obs_rev"] = 2
+        torch.save(ck, tmp_path / f"vZ_{u}.pt")
+
+    def seed(rev):
+        pool = OpponentPool(capacity=8)
+        return seed_pool_from_checkpoints(
+            pool, tmp_path / "vZ_500.pt", target_update=500, snapshot_every=5,
+            expected_variant="plo5_double_bomb", expected_head_version=2,
+            reference_state_dict=ref.state_dict(), expected_obs_rev=rev,
+        )
+
+    assert seed(2) == [495, 500]
+    out = capsys.readouterr().out
+    assert "[pool] skip vZ_485.pt: obs_rev mismatch (file 1 vs run 2)" in out
+    assert seed(1) == [485, 490]
+    assert seed(None) == [485, 490, 495, 500]  # callers that predate the stamp
+

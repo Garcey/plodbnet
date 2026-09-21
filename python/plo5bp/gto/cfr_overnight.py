@@ -12,6 +12,18 @@ Usage::
 Stop early (exports current average strategy)::
 
   echo. > data/cfr/overnight/STOP
+
+Resume after a hard kill (review 2026-09-20 D13). The only thing left of a
+killed solve is its ``*.progress.json`` snapshot, and the solver cannot be
+warm-started from it. The old resume promoted ANY snapshot — even iteration 1 —
+to a finished ``status="ok"`` job. Now:
+
+- a THIN snapshot (too few iterations / too little of the time budget, see
+  :func:`progress_is_substantial`) is ignored and the job is solved again;
+- a SUBSTANTIAL snapshot is kept as ``strategies/<job>.partial.json`` with
+  ``status="partial"`` and marker ``partial`` — never ``ok``, never a teacher
+  (export skips partials, and its poll exploitability is unverified). The job
+  is skipped on later resumes unless ``rerun_partial=True``.
 """
 
 from __future__ import annotations
@@ -50,6 +62,64 @@ def _strategy_path(out_dir: Path, job_id: str) -> Path:
 
 def _progress_path(out_dir: Path, job_id: str) -> Path:
     return out_dir / "strategies" / f"{job_id}.progress.json"
+
+
+def _partial_path(out_dir: Path, job_id: str) -> Path:
+    return out_dir / "strategies" / f"{job_id}.partial.json"
+
+
+def _started_path(out_dir: Path, job_id: str) -> Path:
+    """Sidecar stamped when a blueprint solve starts (elapsed-time evidence:
+    the solver's progress snapshot carries iterations but no wall clock)."""
+    return out_dir / "markers" / f"{job_id}.started.json"
+
+
+def _marker_status(out_dir: Path, job_id: str) -> str | None:
+    p = _marker(out_dir, job_id)
+    if not p.exists():
+        return None
+    words = p.read_text(encoding="utf-8").split()
+    return words[0] if words else ""
+
+
+# A killed solve is worth keeping once it got through this share of its budget.
+MIN_PROMOTE_FRAC = 0.5
+# ... or, with neither an iteration cap nor a recorded start, this many iters.
+MIN_PROMOTE_ITERATIONS = 100_000
+# ``max_iterations`` at/above this is the "run until the time budget" sentinel.
+_UNBOUNDED_ITERS = 1_000_000_000
+
+
+def progress_is_substantial(
+    iterations_run: int,
+    job: dict[str, Any],
+    *,
+    elapsed_secs: float | None = None,
+) -> tuple[bool, str]:
+    """Is a progress snapshot worth keeping as a PARTIAL result?
+
+    Per-job overrides: ``min_promote_iterations`` / ``min_promote_frac``.
+    """
+    iters = int(iterations_run or 0)
+    frac = float(job.get("min_promote_frac", MIN_PROMOTE_FRAC))
+    if "min_promote_iterations" in job:
+        need = int(job["min_promote_iterations"])
+        return iters >= need, f"iterations {iters} vs min_promote_iterations {need}"
+    cap = int(job.get("max_iterations", 2_000_000_000))
+    if 0 < cap < _UNBOUNDED_ITERS:
+        need = int(frac * cap)
+        return iters >= need, f"iterations {iters} vs {frac:g} x max_iterations {cap}"
+    budget = float(job.get("time_budget_secs", 3600))
+    if elapsed_secs is not None and budget > 0:
+        need_s = frac * budget
+        return (
+            elapsed_secs >= need_s,
+            f"elapsed {elapsed_secs:.0f}s vs {frac:g} x time budget {budget:.0f}s",
+        )
+    return (
+        iters >= MIN_PROMOTE_ITERATIONS,
+        f"iterations {iters} vs default floor {MIN_PROMOTE_ITERATIONS}",
+    )
 
 
 def _global_stop(stop_file: Path) -> bool:
@@ -121,10 +191,13 @@ def promote_progress_if_any(
     job_id: str,
     job: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """If a prior kill left a progress snapshot, promote it to a strategy.
+    """If a prior kill left a SUBSTANTIAL progress snapshot, keep it as a
+    ``status="partial"`` result; ``None`` when there is nothing worth keeping
+    (the caller then solves the job again).
 
-    This is the kill-safe contract: morning STOP / process death still yields
-    a usable JSON instead of an empty strategies/ dir.
+    Kill-safe contract: process death still yields a usable JSON instead of an
+    empty strategies/ dir — but (review 2026-09-20 D13) never as a finished
+    ``ok`` job, and never from a snapshot with next to no work in it.
     """
     prog = _progress_path(out_dir, job_id)
     if not prog.is_file():
@@ -136,23 +209,39 @@ def promote_progress_if_any(
     strat = data.get("strategy") or {}
     if not strat.get("infosets"):
         return None
+    iters = int(data.get("iterations_run") or 0)
+    elapsed: float | None = None
+    try:
+        started = json.loads(_started_path(out_dir, job_id).read_text(encoding="utf-8"))
+        elapsed = max(0.0, prog.stat().st_mtime - float(started["started_at"]))
+    except (OSError, ValueError, KeyError, TypeError):
+        elapsed = None
+    enough, why = progress_is_substantial(iters, job, elapsed_secs=elapsed)
+    if not enough:
+        print(
+            f"[overnight] progress snapshot for {job_id} is too thin to keep "
+            f"({why}) — solving again",
+            flush=True,
+        )
+        return None
     root, _cfg = blueprint_root_and_config(job, stop_file="", progress_file="")
     payload = {
-        "status": "ok",
+        "status": "partial",
         "root": root.as_dict(),
         "config": data.get("config") or {},
         "strategy": strat,
-        "iterations_run": int(data.get("iterations_run") or 0),
+        "iterations_run": iters,
+        # A poll estimate from the snapshot — NOT a verified exploitability.
         "exploitability_bb": data.get("exploitability_bb"),
-        "notes": ["promoted_from_progress", f"job_id={job_id}"],
+        "notes": ["promoted_from_progress", f"job_id={job_id}", why],
         "job": job,
         "promoted_from_progress": True,
     }
-    path = _strategy_path(out_dir, job_id)
+    path = _partial_path(out_dir, job_id)
     _atomic_write_json(path, payload)
     _marker(out_dir, job_id).parent.mkdir(parents=True, exist_ok=True)
     _marker(out_dir, job_id).write_text(
-        f"promoted_from_progress iters={payload['iterations_run']}\n",
+        f"partial promoted_from_progress iters={iters}\n",
         encoding="utf-8",
     )
     try:
@@ -161,8 +250,8 @@ def promote_progress_if_any(
         pass
     return {
         "job_id": job_id,
-        "status": "ok",
-        "iterations": payload["iterations_run"],
+        "status": "partial",
+        "iterations": iters,
         "exploitability_bb": payload["exploitability_bb"],
         "promoted_from_progress": True,
         "path": str(path),
@@ -180,6 +269,15 @@ def _run_blueprint(job: dict[str, Any], *, stop_file: str, out_dir: Path) -> dic
         f"[overnight] blueprint {job_id} budget={cfg.time_budget_secs:.0f}s "
         f"poll={cfg.poll_every} progress={progress_file}",
         flush=True,
+    )
+    _atomic_write_json(
+        _started_path(out_dir, job_id),
+        {
+            "job_id": job_id,
+            "started_at": time.time(),
+            "time_budget_secs": cfg.time_budget_secs,
+            "max_iterations": cfg.max_iterations,
+        },
     )
     rep = solve(root, cfg)
     elapsed = time.perf_counter() - t0
@@ -224,11 +322,14 @@ def _run_pipeline_board(
     *,
     stop_file: str,
     out_dir: Path,
+    resume: bool = True,
 ) -> dict[str, Any]:
     from plo5bp import _engine  # type: ignore
 
     job_id = f"{job['job_id']}_{board_id}"
-    if _marker(out_dir, job_id).exists():
+    # (review 2026-09-20 F10) ``--no-resume`` used to be ignored here: the
+    # marker check was unconditional, so pipeline boards never re-ran.
+    if resume and _marker(out_dir, job_id).exists():
         print(f"[overnight] skip {job_id} (marker)", flush=True)
         return {"job_id": job_id, "status": "skipped"}
 
@@ -325,6 +426,8 @@ class OvernightReport:
                 for r in self.results
                 if r.get("status") in ("ok", "skipped")
             ),
+            # Salvaged from a killed solve — kept, but NOT a finished job.
+            "n_partial": sum(1 for r in self.results if r.get("status") == "partial"),
             "n_fail": sum(1 for r in self.results if r.get("status") == "error"),
         }
 
@@ -334,7 +437,10 @@ def run_overnight(
     *,
     resume: bool = True,
     dry_run: bool = False,
+    rerun_partial: bool = False,
 ) -> OvernightReport:
+    """``rerun_partial``: solve jobs again whose only result is a salvaged
+    ``partial`` snapshot (default: keep the partial and move on)."""
     grid_path = Path(grid_path)
     grid = json.loads(grid_path.read_text(encoding="utf-8"))
     out_dir = Path(grid.get("out_dir", "data/cfr/overnight"))
@@ -385,11 +491,18 @@ def run_overnight(
         job_id = job["job_id"]
 
         if kind == "preflop_blueprint":
-            if resume and _marker(out_dir, job_id).exists():
-                print(f"[overnight] skip {job_id} (marker)", flush=True)
-                results.append({"job_id": job_id, "status": "skipped"})
+            m_status = _marker_status(out_dir, job_id) if resume else None
+            rerun = rerun_partial or bool(job.get("rerun_partial"))
+            if m_status is not None and not (m_status == "partial" and rerun):
+                print(f"[overnight] skip {job_id} (marker {m_status})", flush=True)
+                results.append(
+                    {
+                        "job_id": job_id,
+                        "status": "partial" if m_status == "partial" else "skipped",
+                    }
+                )
                 continue
-            if resume:
+            if resume and m_status is None:
                 promoted = promote_progress_if_any(out_dir, job_id, job)
                 if promoted is not None:
                     print(
@@ -454,6 +567,7 @@ def run_overnight(
                             board,
                             stop_file=str(stop_file),
                             out_dir=out_dir,
+                            resume=resume,
                         )
                     )
                 except Exception as e:

@@ -24,7 +24,21 @@ infoset ids:
 Per-root teacher floors (``export_dir``, off unless passed):
 
 - skip the file when ``exploitability_bb`` is missing / above ``max_expl_bb``
-- split remaining roots by SHA-256 into train + holdout JSONL
+- skip the file when that number is UNVERIFIED (``require_verified_expl``;
+  poll / early-stop / time-budget / promoted estimates — see
+  :func:`plo5bp.gto.teacher.expl_provenance`)
+- split remaining roots by SHA-256 into train + holdout JSONL, stratified by
+  street × seats × SPR bucket
+
+Always (review 2026-09-20 D13): ``*.progress.json`` / ``*.partial.json``
+snapshots and any report whose ``status != "ok"`` are never exported.
+
+Action mapping (review 2026-09-20 D1/D2): ``ALLIN`` lands on the grid-LEGAL
+jam anchor (not blindly on the ALL-IN atom, which the network grid dedupes
+away whenever a fraction anchor already clamps to the stack); ``ALLIN`` at a
+node where no raise is legal is a CALL all-in and joins ``check_call``.
+Teacher mass on an action the serve grid marks illegal raises
+:class:`IllegalTeacherMassError` — it is never silently renormalized away.
 
 The whole file is not aborted; rejected rows are counted in ``ExportStats``.
 ``max_infosets=None`` exports **all infosets that pass the gates**.
@@ -33,6 +47,7 @@ The whole file is not aborted; rejected rows are counted in ``ExportStats``.
 from __future__ import annotations
 
 import json
+import os
 import re
 import math
 from dataclasses import dataclass, field
@@ -40,10 +55,15 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from plo5bp.gto.labels import (
+    ILLEGAL_MASS_TOL,
     LABEL_SCHEMA_VERSION,
     ActionProb,
+    IllegalTeacherMassError,
     LabelRecord,
+    illegal_teacher_mass,
+    jam_anchor_index,
     map_size_to_anchor,
+    merge_action_probs,
     normalize_gate_probs,
     write_jsonl,
 )
@@ -59,10 +79,13 @@ from plo5bp.gto.teacher import (
     TEACHER_MAX_EXPL_BB,
     TEACHER_MIN_VISIT_MASS,
     TEACHER_SPLIT_SEED,
-    expl_reject_reason,
+    expl_provenance,
     report_expl_bb,
+    root_fingerprint,
     root_id_from_report,
+    root_stratum,
     split_root_ids,
+    teacher_root_reject_reason,
 )
 from plo5bp.sizing import NLH_ANCHOR_SPEC
 
@@ -121,7 +144,14 @@ _RE_GENERIC_C = re.compile(r"_c(?P<priv>\d+)$")
 
 
 def pot_frac_pm_to_anchor(pm: int | None, *, is_allin: bool = False) -> int:
-    """Map solve pot-fraction per-mille (or ALLIN) → NLH_ANCHOR_SPEC index."""
+    """Map solve pot-fraction per-mille (or ALLIN) → NLH_ANCHOR_SPEC index.
+
+    Context-free: ``is_allin`` returns the ALL-IN ATOM, which is only the
+    right (grid-legal) jam anchor when no fraction anchor clamps to the stack.
+    Label export uses :func:`plo5bp.gto.labels.jam_anchor_index` with the
+    node's sizing instead (review 2026-09-20 D1); this helper stays for the
+    no-sizing fallback.
+    """
     k_allin = NLH_ANCHOR_SPEC.count - 1
     if is_allin or pm is None:
         return k_allin if NLH_ANCHOR_SPEC.allin_atom else NLH_ANCHOR_SPEC.count - 1
@@ -393,14 +423,22 @@ def _node_chips_from_path(
         if n_ai > 0:
             # Facing at least one jam: call is all-in remaining
             to_call = remaining
-            pot = pot0 + n_ai * stack_chips  # rough: each jam ~ full start
-            # Cap pot more carefully: each AI commits remaining at act time ≈ stack
+            # Each AI commits its remaining at act time ≈ stack (order-of-magnitude)
             pot = pot0
             for t in tokens:
                 if t == "AI":
-                    pot += stack_chips - ante  # order-of-magnitude
-            min_r = 0
-            max_r = remaining  # reshove / call-all-in via ALLIN atom
+                    pot += stack_chips - ante
+            # (review 2026-09-20 D2) The call already takes hero's whole
+            # stack (equal-stack push/fold), so NO raise is legal: ALLIN here
+            # means CALL all-in. The old estimate (max_r=remaining) labelled
+            # it gate=raise, which the row mask then erased.
+            return {
+                "pot_chips": max(pot0, pot),
+                "to_call_chips": max(0, int(to_call)),
+                "min_raise_chips": 0,
+                "max_raise_chips": 0,
+                "hero_stack": max(0, int(remaining)),
+            }
         else:
             # Open or facing blinds only (folds don't change bet_to_call)
             to_call = bb if seat != (n - 1) else 0
@@ -449,9 +487,23 @@ def _map_actions_to_probs(
     min_raise: int,
     max_raise: int,
 ) -> tuple[list[float], list[ActionProb]]:
-    """Aggregate gates + attach NLH anchor indices on raise/all-in."""
+    """Aggregate gates + attach NLH anchor indices on raise/all-in.
+
+    (review 2026-09-20 D1) ``ALLIN`` — and any ``RAISE_pm`` whose chips clamp to
+    ``max_raise`` — maps to the grid-LEGAL jam anchor for this node's sizing
+    (:func:`jam_anchor_index`), not blindly to the ALL-IN atom; entries landing
+    on the same ``(gate, anchor_k)`` (the solver's twin ``RAISE_x``/``ALLIN``
+    jam) are merged by summing their probs.
+
+    (review 2026-09-20 D2) When NO raise is legal at the node
+    (``max_raise == 0`` — push/fold trees facing a jam, menu ``[FOLD, ALLIN]``)
+    ``ALLIN`` means CALL all-in: its mass joins ``check_call`` with
+    ``chips = to_call``. Labelling it gate=raise let the row mask ``[T,T,F]``
+    erase it and AA trained as 100% fold.
+    """
     fold_p = xc_p = raise_p = 0.0
     action_probs: list[ActionProb] = []
+    raise_legal = int(max_raise) > 0
     for a, p in zip(actions, probs):
         p = float(p)
         if p < 0:
@@ -462,7 +514,9 @@ def _map_actions_to_probs(
             action_probs.append(
                 ActionProb(gate="fold", anchor_k=None, pot_frac=None, chips=0, prob=p)
             )
-        elif al in ("CHECK_CALL", "CHECK", "CALL"):
+        elif al in ("CHECK_CALL", "CHECK", "CALL") or (
+            al == "ALLIN" and not raise_legal
+        ):
             xc_p += p
             action_probs.append(
                 ActionProb(
@@ -475,14 +529,17 @@ def _map_actions_to_probs(
             )
         elif al == "ALLIN":
             raise_p += p
-            k = pot_frac_pm_to_anchor(None, is_allin=True)
-            chips = int(max_raise) if max_raise > 0 else int(to_call)
             action_probs.append(
                 ActionProb(
                     gate="raise",
-                    anchor_k=k,
+                    anchor_k=jam_anchor_index(
+                        min_raise=min_raise,
+                        max_raise=max_raise,
+                        pot=pot_chips,
+                        to_call=to_call,
+                    ),
                     pot_frac=None,
-                    chips=chips,
+                    chips=int(max_raise),
                     prob=p,
                 )
             )
@@ -501,7 +558,17 @@ def _map_actions_to_probs(
                 chips = max(min_raise, min(max_raise, chips)) if max_raise > 0 else chips
             else:
                 chips = max_raise
-            if max_raise > 0 and min_raise > 0:
+            if raise_legal and chips >= max_raise:
+                # Clamped to the stack: this IS the jam (same legal anchor as
+                # ALLIN, so the twin actions merge below).
+                chips = int(max_raise)
+                k = jam_anchor_index(
+                    min_raise=min_raise,
+                    max_raise=max_raise,
+                    pot=pot_chips,
+                    to_call=to_call,
+                )
+            elif max_raise > 0 and min_raise > 0:
                 k = map_size_to_anchor(
                     chips,
                     min_raise=min_raise,
@@ -533,7 +600,7 @@ def _map_actions_to_probs(
                 )
             )
     gates = normalize_gate_probs(fold_p, xc_p, raise_p)
-    return gates, action_probs
+    return gates, merge_action_probs(action_probs)
 
 
 def strategy_to_labels(
@@ -544,6 +611,8 @@ def strategy_to_labels(
     require_hole: bool = False,
     stats: ExportStats | None = None,
     min_visit_mass: float = 0.0,
+    teacher_max_expl_bb: float | None = None,
+    root_name: str | None = None,
 ) -> list[LabelRecord]:
     """Map a SolveReport dict into LabelRecord rows that pass export gates.
 
@@ -555,6 +624,16 @@ def strategy_to_labels(
         min_visit_mass: DROP ``low_visit`` when visit_mass is present and
             below this floor. 0 (library default) disables. Teacher CLI
             uses ``TEACHER_MIN_VISIT_MASS`` (1.0).
+        teacher_max_expl_bb: the per-root exploitability cap the CALLER
+            enforced (None = no cap). Stamped on every record so checkpoint
+            provenance is derived from the records, not asserted by a script
+            (review 2026-09-20 F6).
+        root_name: override the report's ``root_id`` on the records (the
+            directory export disambiguates legacy id collisions this way).
+
+    Raises:
+        IllegalTeacherMassError: a row carries > ``ILLEGAL_MASS_TOL`` of
+            teacher mass on an action the serve grid marks illegal.
     """
     root = strategy_report.get("root") or {}
     strategy = strategy_report.get("strategy") or {}
@@ -572,7 +651,9 @@ def strategy_to_labels(
     board = [int(c) for c in (root.get("board") or [])]
     street = int(root.get("street") or 0)
     num_seats = int(root.get("num_seats") or 2)
-    root_name = str(root.get("root_id") or strategy.get("root_id") or "cfr")
+    root_name = str(
+        root_name or root.get("root_id") or strategy.get("root_id") or "cfr"
+    )
     stacks_bb = list(root.get("stacks_bb") or [])
     if len(stacks_bb) == num_seats:
         stacks_chips = [int(round(float(s) * bb)) for s in stacks_bb]
@@ -583,11 +664,23 @@ def strategy_to_labels(
     if street == 0 and num_seats >= 2:
         pot_chips_root = num_seats * ante + sb + bb
 
+    # (review 2026-09-20 D8/F6) Per-record teacher provenance: which estimator
+    # produced exploitability_bb, whether it is a FINAL (verified) number, and
+    # the cap the exporter enforced. Checkpoint stamping reads these back.
+    prov = expl_provenance(strategy_report)
     notes_base = {
         "source_status": strategy_report.get("status"),
         "iterations": strategy_report.get("iterations_run"),
         "exploitability_bb": strategy_report.get("exploitability_bb"),
+        "expl_kind": prov.kind,
+        "expl_verified": bool(prov.verified),
+        "expl_unverified_reason": prov.reason or None,
+        "teacher_max_expl_bb": (
+            None if teacher_max_expl_bb is None else float(teacher_max_expl_bb)
+        ),
         "solve_notes": list(strategy_report.get("notes") or [])[:12],
+        "root_street": street,
+        "root_board": list(board),
     }
     is_mc_proxy = any(
         ("mc_br_proxy" in str(n)) or ("MC BR proxy" in str(n))
@@ -719,18 +812,41 @@ def strategy_to_labels(
             min_raise=min_r,
             max_raise=max_r,
         )
-        # If raise illegal in menu, force raise mass to 0
-        has_raise = any(
-            str(a).upper().startswith("RAISE") or str(a).upper() == "ALLIN"
-            for a in actions
-        )
+        # If the MAPPED menu has no raise (ALLIN-as-call is not one), the
+        # label's raise gate is closed.
+        has_raise = any(a.gate == "raise" for a in action_probs)
         if not has_raise:
             gates = normalize_gate_probs(gates[0], gates[1] + gates[2], 0.0)
             max_r = 0
 
+        # (review 2026-09-20 D1) Never let the training mask erase teacher
+        # mass silently — refuse, naming the root.
+        bad_mass = illegal_teacher_mass(
+            action_probs,
+            min_raise=min_r,
+            max_raise=max_r,
+            pot_chips=pot_chips,
+            to_call=to_call,
+        )
+        if bad_mass > ILLEGAL_MASS_TOL:
+            raise IllegalTeacherMassError(
+                f"root {root_name!r} infoset {iid!r}: {bad_mass:.6g} of teacher "
+                f"mass sits on serve-illegal actions (sizing min={min_r} "
+                f"max={max_r} pot={pot_chips} to_call={to_call}; actions="
+                f"{[(a.gate, a.anchor_k, round(a.prob, 6)) for a in action_probs]})"
+            )
+
         spr = (max_r / pot_chips) if pot_chips > 0 else 0.0
-        # button: multiway last seat; HU seat 1
-        button = num_seats - 1 if num_seats > 2 else 1
+        # Button seat. HU: seat 1 (IP). Multiway POSTFLOP: last seat (seat 0
+        # acts first). (review 2026-09-20 D14) Multiway PREFLOP follows the
+        # Rust MCCFR seat map — BTN n-3, SB n-2, BB n-1, seat 0 first to act —
+        # so the button is n-3; n-1 put it on the BB seat and rotated every
+        # button-distance one-hot by two seats vs the live table.
+        # Keyed on the ROOT street: the seat map is a property of the solve.
+        if num_seats > 2:
+            button = num_seats - 3 if street == 0 else num_seats - 1
+        else:
+            button = 1
 
         class_id = None
         if kind == PRIV_CLASS and priv is not None:
@@ -797,9 +913,13 @@ _EXPORT_SKIP_NAMES = frozenset(
         "INDEX.json",
         "certificate.json",
         "split.json",
+        "status.json",
     }
 )
-_EXPORT_SKIP_PARENTS = frozenset({"rejected", "markers"})
+# ``unverified`` / ``partial`` hold reports a batch refused to certify.
+_EXPORT_SKIP_PARENTS = frozenset({"rejected", "markers", "unverified", "partial"})
+# (review 2026-09-20 D13) Live / promoted solver snapshots are never teachers.
+_EXPORT_SKIP_SUFFIXES = (".progress.json", ".partial.json", ".started.json")
 
 
 @dataclass
@@ -815,6 +935,12 @@ class ExportDirResult:
     train_path: str = ""
     holdout_path: str | None = None
     split_path: str | None = None
+    # Reports with ``status != "ok"`` (running / paused / partial / error).
+    skipped_status: list[dict[str, Any]] = field(default_factory=list)
+    # Extra files holding the SAME root (same id + same game) — one is kept.
+    skipped_dupes: list[dict[str, Any]] = field(default_factory=list)
+    # Legacy ids shared by DIFFERENT games → exported under ``<id>-<fingerprint>``.
+    root_id_collisions: dict[str, list[str]] = field(default_factory=dict)
 
     @property
     def n_kept(self) -> int:
@@ -829,7 +955,7 @@ def _export_json_files(in_path: Path) -> list[Path]:
     for f in files:
         if f.name in _EXPORT_SKIP_NAMES:
             continue
-        if f.name.endswith("_split.json"):
+        if f.name.endswith("_split.json") or f.name.endswith(_EXPORT_SKIP_SUFFIXES):
             continue
         if "chart" in f.name.lower():
             continue
@@ -853,6 +979,34 @@ def _is_solve_report(rep: Any) -> bool:
     return True
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write via a sibling temp file + ``os.replace`` (review 2026-09-20 F10)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _load_report(path: Path) -> dict[str, Any] | None:
+    try:
+        rep = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return rep if _is_solve_report(rep) else None
+
+
+@dataclass
+class _RootScan:
+    """Pass-1 record: everything the split needs, WITHOUT the strategy body."""
+
+    path: Path
+    root_id: str
+    fingerprint: str
+    iterations: int
+    stratum: str
+    export_id: str = ""
+
+
 def export_dir_detailed(
     in_path: Path | str,
     out_jsonl: Path | str,
@@ -866,49 +1020,109 @@ def export_dir_detailed(
     holdout_jsonl: Path | str | None = None,
     split_seed: int = TEACHER_SPLIT_SEED,
     split_manifest: Path | str | None = None,
+    require_verified_expl: bool = False,
+    stratify: bool = True,
 ) -> ExportDirResult:
     """Read strategy JSON file(s) and write train (+ optional holdout) JSONL.
 
-    Library defaults: no expl floor, ``min_visit_mass=0``, no holdout split.
-    Teacher CLIs pass :func:`plo5bp.gto.teacher.teacher_export_kwargs`.
+    Library defaults: no expl floor, ``min_visit_mass=0``, no holdout split,
+    unverified exploitability tolerated. Teacher CLIs pass
+    :func:`plo5bp.gto.teacher.teacher_export_kwargs`.
+
+    (review 2026-09-20 F10) Reports are STREAMED: pass 1 keeps only a small
+    per-root record (id, game fingerprint, stratum), pass 2 re-reads one file
+    at a time. JSONL outputs and the split manifest are written to a temp file
+    and renamed, so an aborted export never leaves a plausible-looking partial.
     """
     in_path = Path(in_path)
     out_jsonl = Path(out_jsonl)
     out_jsonl.parent.mkdir(parents=True, exist_ok=True)
-    files = _export_json_files(in_path)
 
-    loaded: list[tuple[Path, dict[str, Any], str]] = []
+    scans: list[_RootScan] = []
     skipped_expl: list[dict[str, Any]] = []
-    for f in files:
-        try:
-            rep = json.loads(f.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        if not _is_solve_report(rep):
+    skipped_status: list[dict[str, Any]] = []
+    for f in _export_json_files(in_path):
+        rep = _load_report(f)
+        if rep is None:
             continue
         rid = root_id_from_report(rep, fallback=f.stem)
-        if max_expl_bb is not None:
-            why = expl_reject_reason(report_expl_bb(rep), max_expl_bb=max_expl_bb)
-            if why is not None:
-                skipped_expl.append(
-                    {
-                        "root_id": rid,
-                        "reason": why,
-                        "path": str(f),
-                        "exploitability_bb": report_expl_bb(rep),
-                    }
-                )
-                continue
-        loaded.append((f, rep, rid))
+        # (review 2026-09-20 D13) running / paused / partial / error reports
+        # are not finished solves.
+        # Snapshots the OLD overnight resume promoted carry status "ok" plus a
+        # ``promoted_from_progress`` flag — still not a finished solve.
+        status = (
+            "promoted_from_progress"
+            if rep.get("promoted_from_progress")
+            else rep.get("status")
+        )
+        if status != "ok":
+            skipped_status.append({"root_id": rid, "status": status, "path": str(f)})
+            continue
+        why = teacher_root_reject_reason(
+            rep,
+            max_expl_bb=max_expl_bb,
+            require_verified_expl=require_verified_expl,
+        )
+        if why is not None:
+            skipped_expl.append(
+                {
+                    "root_id": rid,
+                    "reason": why,
+                    "path": str(f),
+                    "exploitability_bb": report_expl_bb(rep),
+                }
+            )
+            continue
+        root = rep.get("root") or {}
+        scans.append(
+            _RootScan(
+                path=f,
+                root_id=rid,
+                fingerprint=root_fingerprint(root),
+                iterations=int(rep.get("iterations_run") or 0),
+                stratum=root_stratum(root),
+            )
+        )
+        del rep
 
-    root_ids = [rid for _, _, rid in loaded]
+    # Same id + same game in several files (e.g. re-solves): keep the most
+    # iterated one. Same id + DIFFERENT games (legacy ids carried no board /
+    # pot / stack / size discriminator): export each under ``<id>-<fp>``.
+    skipped_dupes: list[dict[str, Any]] = []
+    collisions: dict[str, list[str]] = {}
+    by_id: dict[str, dict[str, _RootScan]] = {}
+    for sc in scans:
+        games = by_id.setdefault(sc.root_id, {})
+        prev = games.get(sc.fingerprint)
+        if prev is None:
+            games[sc.fingerprint] = sc
+            continue
+        keep, drop = (sc, prev) if sc.iterations > prev.iterations else (prev, sc)
+        games[sc.fingerprint] = keep
+        skipped_dupes.append(
+            {"root_id": sc.root_id, "path": str(drop.path), "kept": str(keep.path)}
+        )
+    kept: list[_RootScan] = []
+    for rid, games in by_id.items():
+        for fp, sc in games.items():
+            sc.export_id = rid if len(games) == 1 else f"{rid}-{fp}"
+            kept.append(sc)
+        if len(games) > 1:
+            collisions[rid] = sorted(sc.export_id for sc in games.values())
+    kept.sort(key=lambda sc: str(sc.path))
+
+    root_ids = [sc.export_id for sc in kept]
     if float(holdout_frac) > 0.0:
         train_ids, hold_ids = split_root_ids(
-            root_ids, seed=split_seed, holdout_frac=holdout_frac
+            root_ids,
+            seed=split_seed,
+            holdout_frac=holdout_frac,
+            strata=(
+                {sc.export_id: sc.stratum for sc in kept} if stratify else None
+            ),
         )
     else:
         train_ids, hold_ids = sorted(set(root_ids)), []
-    train_set = set(train_ids)
     hold_set = set(hold_ids)
 
     hold_path: Path | None = None
@@ -923,30 +1137,53 @@ def export_dir_detailed(
     stats = ExportStats()
     n_train = 0
     n_hold = 0
-    with out_jsonl.open("w", encoding="utf-8") as fh_train:
-        fh_hold = hold_path.open("w", encoding="utf-8") if hold_path else None
-        try:
-            for _f, rep, rid in loaded:
-                dest = "holdout" if rid in hold_set else "train"
-                if dest == "holdout" and fh_hold is None:
-                    dest = "train"
-                fh = fh_hold if dest == "holdout" else fh_train
-                for lab in strategy_to_labels(
-                    rep,
-                    source=source,
-                    max_infosets=max_infosets_per_file,
-                    require_hole=require_hole,
-                    stats=stats,
-                    min_visit_mass=min_visit_mass,
-                ):
-                    fh.write(json.dumps(lab.as_dict(), separators=(",", ":")) + "\n")
-                    if dest == "holdout":
-                        n_hold += 1
-                    else:
-                        n_train += 1
-        finally:
-            if fh_hold is not None:
-                fh_hold.close()
+    tmp_train = out_jsonl.with_name(f"{out_jsonl.name}.{os.getpid()}.tmp")
+    tmp_hold = (
+        None
+        if hold_path is None
+        else hold_path.with_name(f"{hold_path.name}.{os.getpid()}.tmp")
+    )
+    try:
+        with tmp_train.open("w", encoding="utf-8") as fh_train:
+            fh_hold = tmp_hold.open("w", encoding="utf-8") if tmp_hold else None
+            try:
+                for sc in kept:
+                    rep = _load_report(sc.path)
+                    if rep is None:
+                        continue
+                    to_hold = sc.export_id in hold_set and fh_hold is not None
+                    fh = fh_hold if to_hold else fh_train
+                    for lab in strategy_to_labels(
+                        rep,
+                        source=source,
+                        max_infosets=max_infosets_per_file,
+                        require_hole=require_hole,
+                        stats=stats,
+                        min_visit_mass=min_visit_mass,
+                        teacher_max_expl_bb=max_expl_bb,
+                        root_name=sc.export_id,
+                    ):
+                        fh.write(
+                            json.dumps(lab.as_dict(), separators=(",", ":")) + "\n"
+                        )
+                        if to_hold:
+                            n_hold += 1
+                        else:
+                            n_train += 1
+                    del rep
+            finally:
+                if fh_hold is not None:
+                    fh_hold.close()
+        os.replace(tmp_train, out_jsonl)
+        if tmp_hold is not None and hold_path is not None:
+            os.replace(tmp_hold, hold_path)
+    finally:
+        for tmp in (tmp_train, tmp_hold):
+            if tmp is not None and tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
 
     split_path: Path | None = None
     if float(holdout_frac) > 0.0 or hold_set:
@@ -955,12 +1192,16 @@ def export_dir_detailed(
             if split_manifest is not None
             else out_jsonl.with_name(f"{out_jsonl.stem}_split.json")
         )
-        split_path.write_text(
+        _atomic_write_text(
+            split_path,
             json.dumps(
                 {
                     "split_seed": int(split_seed),
                     "holdout_frac": float(holdout_frac),
+                    "stratified": bool(stratify),
+                    "strata": {sc.export_id: sc.stratum for sc in kept},
                     "max_expl_bb": max_expl_bb,
+                    "require_verified_expl": bool(require_verified_expl),
                     "min_visit_mass": float(min_visit_mass),
                     "train_root_ids": list(train_ids),
                     "holdout_root_ids": list(hold_ids),
@@ -969,17 +1210,21 @@ def export_dir_detailed(
                     "train_path": str(out_jsonl),
                     "holdout_path": None if hold_path is None else str(hold_path),
                     "skipped_expl": skipped_expl,
+                    "skipped_status": skipped_status,
+                    "skipped_dupes": skipped_dupes,
+                    "root_id_collisions": collisions,
                 },
                 indent=2,
             )
             + "\n",
-            encoding="utf-8",
         )
 
-    if stats.n_dropped or skipped_expl:
+    if stats.n_dropped or skipped_expl or skipped_status or skipped_dupes:
         print(
             f"[cfr_export] kept={stats.kept} dropped={stats.n_dropped} "
             f"{stats.rejected} skipped_expl={len(skipped_expl)} "
+            f"skipped_status={len(skipped_status)} "
+            f"skipped_dupes={len(skipped_dupes)} "
             f"train={n_train} holdout={n_hold}",
             flush=True,
         )
@@ -993,6 +1238,9 @@ def export_dir_detailed(
         train_path=str(out_jsonl),
         holdout_path=None if hold_path is None else str(hold_path),
         split_path=None if split_path is None else str(split_path),
+        skipped_status=skipped_status,
+        skipped_dupes=skipped_dupes,
+        root_id_collisions=collisions,
     )
 
 
@@ -1009,12 +1257,15 @@ def export_dir(
     holdout_jsonl: Path | str | None = None,
     split_seed: int = TEACHER_SPLIT_SEED,
     split_manifest: Path | str | None = None,
+    require_verified_expl: bool = False,
+    stratify: bool = True,
 ) -> int:
     """Read strategy JSON file(s) and write LabelRecord JSONL. Returns train count.
 
     Default exports **all** infosets (``max_infosets_per_file=None``).
     Teacher floors are off unless ``max_expl_bb`` / ``min_visit_mass`` /
-    ``holdout_frac`` are passed (see ``export_dir_detailed``).
+    ``holdout_frac`` / ``require_verified_expl`` are passed (see
+    ``export_dir_detailed``).
     """
     return export_dir_detailed(
         in_path,
@@ -1028,6 +1279,8 @@ def export_dir(
         holdout_jsonl=holdout_jsonl,
         split_seed=split_seed,
         split_manifest=split_manifest,
+        require_verified_expl=require_verified_expl,
+        stratify=stratify,
     ).n_train
 
 
@@ -1044,8 +1297,16 @@ def export_teacher_dir(
     holdout_jsonl: Path | str | None = None,
     split_seed: int = TEACHER_SPLIT_SEED,
     split_manifest: Path | str | None = None,
+    require_verified_expl: bool = True,
+    stratify: bool = True,
 ) -> ExportDirResult:
-    """Teacher export: expl cap + visit floor + holdout split (defaults on)."""
+    """Teacher export: VERIFIED expl under the cap + visit floor + stratified
+    holdout split (defaults on).
+
+    (review 2026-09-20 D8/F6) ``require_verified_expl=True``: a root whose
+    ``exploitability_bb`` is a poll / early-stop / time-budget / proxy number
+    is skipped (``expl_unverified:<why>``) instead of being judged on it.
+    """
     return export_dir_detailed(
         in_path,
         out_jsonl,
@@ -1058,6 +1319,8 @@ def export_teacher_dir(
         holdout_jsonl=holdout_jsonl,
         split_seed=split_seed,
         split_manifest=split_manifest,
+        require_verified_expl=require_verified_expl,
+        stratify=stratify,
     )
 
 

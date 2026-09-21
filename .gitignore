@@ -48,4 +48,11 @@ Thumbs.db
 .env.public
 data/
 
+# SSH keys / known_hosts for the training pod + VPS (never commit — a broad
+# `git add -A` sync commit would otherwise push the private key to GitHub).
+ssh/
+*.pem
+id_ed25519*
+id_rsa*
+
 

@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -28,15 +30,60 @@ _VENV_PYTHONW = _ROOT / ".venv" / "Scripts" / "pythonw.exe"
 _VENV_PYTHON = _ROOT / ".venv" / "Scripts" / "python.exe"
 
 
-def _desktop_dir() -> Path:
-    # Prefer the real Desktop (handles OneDrive redirection on Windows).
+def _have_pywin32() -> bool:
+    try:
+        import win32com.client  # type: ignore  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+def _powershell(script: str, env: dict[str, str] | None = None) -> str:
+    """Run an inline PowerShell script; return stdout. Raises on failure.
+
+    Values reach the script through ENVIRONMENT VARIABLES (``$env:NAME``), never
+    by string interpolation, so a path containing quotes / ``$`` / backticks
+    cannot break — or inject into — the command.
+    """
+    exe = shutil.which("powershell") or shutil.which("pwsh")
+    if not exe:
+        raise RuntimeError("neither pywin32 nor PowerShell is available to create the shortcut")
+    proc = subprocess.run(
+        [exe, "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={**os.environ, **(env or {})},
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"PowerShell failed ({proc.returncode}): {proc.stderr.strip()[:400]}")
+    return proc.stdout.strip()
+
+
+def _special_folder(name: str) -> Path | None:
+    """Real shell folder (handles OneDrive redirection) via pywin32, else PowerShell."""
     try:
         import win32com.client  # type: ignore
 
-        shell = win32com.client.Dispatch("WScript.Shell")
-        return Path(shell.SpecialFolders("Desktop"))
+        return Path(win32com.client.Dispatch("WScript.Shell").SpecialFolders(name))
     except Exception:
         pass
+    try:
+        out = _powershell(
+            "[Environment]::GetFolderPath([Environment+SpecialFolder]$env:CFR_FOLDER)",
+            {"CFR_FOLDER": name},
+        )
+        return Path(out) if out else None
+    except Exception:
+        return None
+
+
+def _desktop_dir() -> Path:
+    # Prefer the real Desktop (handles OneDrive redirection on Windows).
+    found = _special_folder("Desktop")
+    if found is not None:
+        return found
     for key in ("OneDrive", "USERPROFILE"):
         base = os.environ.get(key)
         if base:
@@ -47,19 +94,13 @@ def _desktop_dir() -> Path:
 
 
 def _start_menu_dir() -> Path:
-    try:
-        import win32com.client  # type: ignore
-
-        shell = win32com.client.Dispatch("WScript.Shell")
-        programs = Path(shell.SpecialFolders("Programs"))
-        d = programs / "CFR Solver"
-        d.mkdir(parents=True, exist_ok=True)
-        return d
-    except Exception:
+    programs = _special_folder("Programs")
+    if programs is None:
         appdata = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
-        d = appdata / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "CFR Solver"
-        d.mkdir(parents=True, exist_ok=True)
-        return d
+        programs = appdata / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+    d = programs / "CFR Solver"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def _pythonw() -> Path:
@@ -73,19 +114,58 @@ def _pythonw() -> Path:
     return sibling if sibling.is_file() else exe
 
 
-def _create_shortcut(path: Path, target: Path, args: str, workdir: Path, icon: Path | None) -> None:
-    import win32com.client  # type: ignore
+_DESCRIPTION = "CFR Solver — NLH native (Monker/Pio-like)"
 
-    shell = win32com.client.Dispatch("WScript.Shell")
-    sc = shell.CreateShortCut(str(path))
-    sc.Targetpath = str(target)
-    sc.Arguments = args
-    sc.WorkingDirectory = str(workdir)
-    sc.Description = "CFR Solver — NLH native (Monker/Pio-like)"
-    sc.WindowStyle = 7  # minimized — pythonw has no window anyway
-    if icon is not None and icon.is_file():
-        sc.IconLocation = f"{icon},0"
-    sc.save()
+# Same WScript.Shell COM object pywin32 drives, from PowerShell (ships with Windows).
+_PS_CREATE_SHORTCUT = """
+$ErrorActionPreference = 'Stop'
+$sc = (New-Object -ComObject WScript.Shell).CreateShortcut($env:CFR_LNK_PATH)
+$sc.TargetPath = $env:CFR_LNK_TARGET
+$sc.Arguments = $env:CFR_LNK_ARGS
+$sc.WorkingDirectory = $env:CFR_LNK_WORKDIR
+$sc.Description = $env:CFR_LNK_DESC
+$sc.WindowStyle = 7
+if ($env:CFR_LNK_ICON) { $sc.IconLocation = $env:CFR_LNK_ICON }
+$sc.Save()
+"""
+
+
+def _create_shortcut(path: Path, target: Path, args: str, workdir: Path, icon: Path | None) -> str:
+    """Create a .lnk; returns which backend did it (``pywin32`` / ``powershell``).
+
+    (review 2026-09-20) pywin32 was a hard requirement that no install step
+    declared, so the one-click installer failed on a fresh venv. It is now
+    optional: without it the same COM object is driven from PowerShell.
+    """
+    icon_loc = f"{icon},0" if icon is not None and icon.is_file() else ""
+    if _have_pywin32():
+        import win32com.client  # type: ignore
+
+        shell = win32com.client.Dispatch("WScript.Shell")
+        sc = shell.CreateShortCut(str(path))
+        sc.Targetpath = str(target)
+        sc.Arguments = args
+        sc.WorkingDirectory = str(workdir)
+        sc.Description = _DESCRIPTION
+        sc.WindowStyle = 7  # minimized — pythonw has no window anyway
+        if icon_loc:
+            sc.IconLocation = icon_loc
+        sc.save()
+        return "pywin32"
+    _powershell(
+        _PS_CREATE_SHORTCUT,
+        {
+            "CFR_LNK_PATH": str(path),
+            "CFR_LNK_TARGET": str(target),
+            "CFR_LNK_ARGS": args,
+            "CFR_LNK_WORKDIR": str(workdir),
+            "CFR_LNK_DESC": _DESCRIPTION,
+            "CFR_LNK_ICON": icon_loc,
+        },
+    )
+    if not path.is_file():
+        raise RuntimeError(f"PowerShell reported success but {path} was not created")
+    return "powershell"
 
 
 def install() -> list[Path]:
@@ -133,15 +213,36 @@ def uninstall() -> list[Path]:
     return removed
 
 
+def _warn_if_app_deps_missing() -> None:
+    """A shortcut to an app that cannot start helps nobody — say what is missing.
+
+    The shortcut launches with pythonw (no console), so a missing dependency
+    would otherwise surface only as a message box / a line in runs/cfr_app.log.
+    """
+    import importlib.util
+
+    missing = [m for m in ("fastapi", "uvicorn", "multipart") if importlib.util.find_spec(m) is None]
+    if missing:
+        print(f'WARNING: missing packages {missing} — run:  .venv\\Scripts\\pip install -e ".[ui,dev]"')
+    if importlib.util.find_spec("webview") is None:
+        print("note: pywebview is not installed — the app will open in your browser instead "
+              'of its own window (pip install -e ".[ui]" adds it).')
+    # Look for the built file rather than importing plo5bp (that pulls in torch,
+    # and an unrelated import error would masquerade as "extension not built").
+    pkg = _ROOT / "python" / "plo5bp"
+    if not (list(pkg.glob("_engine*.pyd")) or list(pkg.glob("_engine*.so"))):
+        print("WARNING: the Rust solver extension is not built — from the repo root run:\n"
+              "  .venv\\Scripts\\maturin develop --release")
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Install CFR Solver Desktop shortcut")
     p.add_argument("--uninstall", action="store_true")
     args = p.parse_args()
 
-    try:
-        import win32com.client  # noqa: F401
-    except ImportError:
-        print("pywin32 is required:  .venv/Scripts/pip install pywin32", file=sys.stderr)
+    if sys.platform != "win32":
+        print("This installer creates Windows .lnk shortcuts. On other systems run:\n"
+              "  python scripts/cfr_app.py --desktop", file=sys.stderr)
         return 1
 
     if args.uninstall:
@@ -152,7 +253,15 @@ def main() -> int:
             print(f"removed  {r}")
         return 0
 
-    created = install()
+    # pywin32 is optional (review 2026-09-20): PowerShell drives the same COM object.
+    backend = "pywin32" if _have_pywin32() else "PowerShell (pywin32 not installed — that is fine)"
+    try:
+        created = install()
+    except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+        print(f"could not create the shortcut: {e}", file=sys.stderr)
+        return 1
+    print(f"Shortcuts created via {backend}.")
+    _warn_if_app_deps_missing()
     print("CFR Solver installed as a desktop app:")
     for c in created:
         print(f"  {c}")

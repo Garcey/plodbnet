@@ -60,6 +60,29 @@ def position_name(
     return f"S{seat}"
 
 
+def effective_button(
+    button: int,
+    num_seats: int,
+    in_hand: frozenset[int] | set[int] | None,
+) -> int:
+    """The seat that plays the button when the physical button is dead.
+
+    The engine seats the first in-hand player clockwise of the button as
+    first to act, so a button parked on a seat that was NOT dealt in (dead
+    button — the player left / is sitting out) leaves the first in-hand
+    seat COUNTER-clockwise from it acting last, i.e. in the button's
+    position. Returns ``button`` unchanged when it is dealt in, or when
+    there is no in-hand set to consult.
+    """
+    if not in_hand or button in in_hand:
+        return button
+    for offset in range(1, num_seats + 1):
+        candidate = (button - offset) % num_seats
+        if candidate in in_hand:
+            return candidate
+    return button
+
+
 def chips_to_bb(chips: int | float, bb: int) -> float:
     return float(chips) / float(bb)
 

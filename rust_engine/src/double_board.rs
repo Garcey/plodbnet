@@ -4,7 +4,10 @@
 //! layer, eligible seats (`total_commit >= level && !folded`) contest that
 //! layer's chips, with half going to the best PLO5 hand on each board. Ties
 //! on a board half split that half; odd-chip remainders are awarded to the
-//! first tied winner encountered clockwise from button.
+//! first tied winner encountered clockwise from button. Chips no alive seat
+//! ever matched — a layer whose contributors all folded, or a folded seat's
+//! commit above a lone survivor's — go back to the seats that put them in
+//! (review 2026-09-20 C1; unreachable on real lines, see the helpers).
 
 use crate::cards::Card;
 use crate::hand_eval::{evaluate_nlh, evaluate_plo5, HandRank};
@@ -27,10 +30,10 @@ pub fn double_board_payout(
     assert_eq!(total_commit.len(), n);
     let mut result = vec![0u64; n];
 
-    // Fold-out: single survivor takes all chips (no showdown).
+    // Fold-out: single survivor takes every matched chip (no showdown).
     let alive: Vec<usize> = (0..n).filter(|&i| !folded[i]).collect();
     if alive.len() == 1 {
-        result[alive[0]] = total_commit.iter().sum();
+        award_single_survivor(&mut result, alive[0], total_commit);
         return result;
     }
 
@@ -45,7 +48,8 @@ pub fn double_board_payout(
             continue;
         }
         let contributors: u64 = total_commit.iter().filter(|&&c| c >= level).count() as u64;
-        let layer_chips = (level - prev_level) * contributors;
+        let layer_each = level - prev_level;
+        let layer_chips = layer_each * contributors;
         prev_level = level;
         if layer_chips == 0 {
             continue;
@@ -56,9 +60,7 @@ pub fn double_board_payout(
             .collect();
 
         if eligible.is_empty() {
-            // Orphaned layer (shouldn't occur with ≥2 survivors at showdown).
-            // Distribute evenly across alive seats as a safe fallback.
-            distribute_evenly(&mut result, &alive, layer_chips, button);
+            refund_orphan_layer(&mut result, total_commit, level, layer_each);
             continue;
         }
 
@@ -89,10 +91,10 @@ pub fn single_board_payout(
     assert_eq!(total_commit.len(), n);
     let mut result = vec![0u64; n];
 
-    // Fold-out: single survivor takes all chips (no showdown).
+    // Fold-out: single survivor takes every matched chip (no showdown).
     let alive: Vec<usize> = (0..n).filter(|&i| !folded[i]).collect();
     if alive.len() == 1 {
-        result[alive[0]] = total_commit.iter().sum();
+        award_single_survivor(&mut result, alive[0], total_commit);
         return result;
     }
 
@@ -117,7 +119,8 @@ pub fn single_board_payout(
             continue;
         }
         let contributors: u64 = total_commit.iter().filter(|&&c| c >= level).count() as u64;
-        let layer_chips = (level - prev_level) * contributors;
+        let layer_each = level - prev_level;
+        let layer_chips = layer_each * contributors;
         prev_level = level;
         if layer_chips == 0 {
             continue;
@@ -128,8 +131,7 @@ pub fn single_board_payout(
             .collect();
 
         if eligible.is_empty() {
-            // Orphaned layer (shouldn't occur with ≥2 survivors at showdown).
-            distribute_evenly(&mut result, &alive, layer_chips, button);
+            refund_orphan_layer(&mut result, total_commit, level, layer_each);
             continue;
         }
 
@@ -147,6 +149,40 @@ pub fn single_board_payout(
     }
 
     result
+}
+
+/// Fold-out settlement: the lone survivor collects, from every seat, at
+/// most its OWN total commit; whatever a folded seat put in above that
+/// was never matched by anyone still in the hand and goes back to it.
+///
+/// Defence in depth (review 2026-09-20 C1). On every line the engine can
+/// reach the survivor holds the largest commit — a seat only folds to a
+/// bigger live bet — so this is the old "survivor takes the sum". The one
+/// way around that was NLH's nominal `bet_to_call` (a covering SB folding
+/// to a short all-in BB's phantom bet, paid `[-10000, +10000]` with only
+/// 8000 ever matched), which the engine's actor walk no longer offers.
+fn award_single_survivor(result: &mut [u64], survivor: usize, total_commit: &[u64]) {
+    let cap = total_commit[survivor];
+    for (i, &commit) in total_commit.iter().enumerate() {
+        let matched = commit.min(cap);
+        result[survivor] += matched;
+        result[i] += commit - matched;
+    }
+}
+
+/// Orphaned layer: every seat that paid into it has folded, so no alive
+/// seat ever matched these chips — each contributor gets its `layer_each`
+/// slice back. It used to be split across the alive seats, which let a
+/// showdown LOSER collect chips nobody had called (NLH 3-way
+/// [51, 10000, 51]: the folded SB's uncalled 49). Defence in depth, same
+/// as [`award_single_survivor`]: unreachable on real lines, where the top
+/// commit always belongs to an alive seat. (review 2026-09-20 C1)
+fn refund_orphan_layer(result: &mut [u64], total_commit: &[u64], level: u64, layer_each: u64) {
+    for (i, &commit) in total_commit.iter().enumerate() {
+        if commit >= level {
+            result[i] += layer_each;
+        }
+    }
 }
 
 /// Award `half` chips on one board to the best hand(s) among `eligible`.
@@ -449,5 +485,69 @@ mod tests {
         let board = [c(12, 0), c(11, 1), c(10, 2), c(9, 3), c(8, 0)];
         let result = single_board_payout(&hole, &folded, &commit, &board, 0);
         assert_eq!(result, vec![1_000u64, 0]);
+    }
+
+    // ---- Unmatched chips (review 2026-09-20 C1, defence in depth) ----
+    //
+    // Neither state is reachable through the engine any more (the actor
+    // walk no longer offers a fold to NLH's nominal bet), so they are
+    // pinned here at the function level.
+
+    #[test]
+    fn fold_out_survivor_cannot_win_unmatched_chips() {
+        // Review scenario A books: the covering SB (10000 in) "folded" to
+        // the short all-in BB (8000 in). Only 8000 was ever matched — the
+        // SB's other 2000 goes back to it. Used to pay [0, 18000].
+        let folded = vec![true, false];
+        let commit = vec![10_000u64, 8_000];
+        let nlh_hole = vec![vec![c(0, 0), c(1, 0)], vec![c(2, 0), c(3, 0)]];
+        let board = [c(12, 0), c(11, 1), c(10, 2), c(9, 3), c(8, 0)];
+        assert_eq!(
+            single_board_payout(&nlh_hole, &folded, &commit, &board, 0),
+            vec![2_000u64, 16_000]
+        );
+        let plo_hole = vec![[c(0, 0); 5]; 2];
+        assert_eq!(
+            double_board_payout(&holes(&plo_hole), &folded, &commit, &board, &board, 0),
+            vec![2_000u64, 16_000]
+        );
+        // Multiway: every folded seat is capped at the survivor's commit.
+        let folded = vec![true, false, true, true];
+        let commit = vec![900u64, 400, 250, 400];
+        let plo_hole = vec![[c(0, 0); 5]; 4];
+        assert_eq!(
+            double_board_payout(&holes(&plo_hole), &folded, &commit, &board, &board, 2),
+            vec![500u64, 400 + 400 + 250 + 400, 0, 0]
+        );
+    }
+
+    #[test]
+    fn orphan_layer_is_refunded_to_its_contributors() {
+        // Review scenario B books: commits [51, 100, 51], the deep SB
+        // (seat 1) folded, seats 0 and 2 show down. Its top 49 chips were
+        // matched by nobody — they used to be split 25/24 between the
+        // alive seats, handing the showdown LOSER chips. Now: back to
+        // seat 1, and only the 153 matched chips are contested.
+        let folded = vec![false, true, false];
+        let commit = vec![51u64, 100, 51];
+        let hole = vec![
+            vec![c(12, 0), c(12, 1)], // AA — wins
+            vec![c(5, 0), c(3, 1)],
+            vec![c(0, 0), c(1, 1)], // 32o — loses
+        ];
+        let board = [c(11, 2), c(9, 3), c(7, 2), c(4, 3), c(2, 1)]; // K J 9 6 4
+        let result = single_board_payout(&hole, &folded, &commit, &board, 0);
+        assert_eq!(result, vec![153u64, 49, 0]);
+
+        let hole5 = vec![
+            [c(12, 0), c(12, 1), c(12, 2), c(12, 3), c(0, 0)], // AAAA2
+            [c(6, 1), c(6, 2), c(0, 2), c(1, 1), c(2, 3)],
+            [c(1, 0), c(1, 2), c(2, 2), c(2, 1), c(3, 0)], // 33445
+        ];
+        let board_a = [c(11, 0), c(10, 1), c(8, 2), c(6, 3), c(4, 0)]; // K Q T 8 6
+        let board_b = [c(9, 0), c(7, 1), c(5, 2), c(4, 3), c(0, 1)]; // J 9 7 6 2
+        let result = double_board_payout(&holes(&hole5), &folded, &commit, &board_a, &board_b, 0);
+        assert_eq!(result, vec![153u64, 49, 0]);
+        assert_eq!(result.iter().sum::<u64>(), commit.iter().sum::<u64>());
     }
 }

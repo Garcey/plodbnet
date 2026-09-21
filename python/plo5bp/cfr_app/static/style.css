@@ -514,6 +514,35 @@ input:focus, select:focus, textarea:focus {
   color: var(--muted);
   font-weight: 600;
 }
+/* What the range text means (server-parsed), or why it was rejected. */
+.range-status {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  margin: 0.35rem 0 0.5rem;
+  min-height: 1em;
+}
+.range-status.range-error {
+  color: var(--danger);
+}
+/* Runout picker (flop/turn roots) — sits between the label and the actor. */
+.runout-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-right: auto;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  font-weight: 600;
+}
+.runout-wrap select {
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  padding: 0.15rem 0.35rem;
+  text-transform: none;
+  letter-spacing: 0;
+}
 .tree-breadcrumb {
   font-family: var(--mono);
   font-size: 0.75rem;

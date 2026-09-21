@@ -1,5 +1,11 @@
 #!/usr/bin/env python
-"""After Step 7 batch: export + train + probe. Stamp only if all train roots expl<=1.0 and probe passes."""
+"""After Step 7 batch: export + train + probe.
+
+The GTO badge is DERIVED, never asserted here (review 2026-09-20 F6): the
+checkpoint's label sources / teacher exploitability + cap / training root ids
+come from the training records, the probe refuses a holdout that intersects
+them, and ``stamp_probe_on_checkpoint`` re-derives ``is_gto_validated``.
+"""
 
 from __future__ import annotations
 
@@ -15,7 +21,7 @@ from plo5bp.gto.cfr_export import export_teacher_dir
 from plo5bp.gto.cfr_batch import _strategy_path
 from plo5bp.gto.labels import read_jsonl
 from plo5bp.gto.obs_from_label import labels_to_supervised_rows
-from plo5bp.gto.policy_net import is_validated_gto_checkpoint
+from plo5bp.gto.policy_net import is_validated_gto_checkpoint, load_policy_checkpoint
 from plo5bp.gto.probe import ProbeGates, probe_checkpoint, stamp_probe_on_checkpoint
 from plo5bp.gto.teacher import TEACHER_MAX_EXPL_BB, expl_reject_reason
 from plo5bp.gto.train import TrainConfig, train_policy_net
@@ -77,9 +83,22 @@ def main() -> int:
 
     print("[step7] TRAIN", flush=True)
     labels = list(read_jsonl(labels_train))
-    rows = labels_to_supervised_rows(labels)
+    rows = labels_to_supervised_rows(labels)  # lossy-obs rows excluded + logged
     print(f"[step7] {len(rows)} supervised rows", flush=True)
     init = load if load.is_file() else None
+    if init is not None:
+        # A checkpoint from before 2026-09-20 records neither its training roots
+        # nor its label provenance (and learned sizing from labels whose jam
+        # mass was masked away — review D1). Warm-starting from it would make
+        # this net unverifiable for good, so start clean instead.
+        _m, init_meta = load_policy_checkpoint(init)
+        if not init_meta.get("train_roots_known"):
+            print(
+                f"[step7] NOT warm-starting from {init}: no recorded training "
+                f"roots / label provenance — training from scratch",
+                flush=True,
+            )
+            init = None
     tr = train_policy_net(
         rows,
         ckpt,
@@ -94,12 +113,12 @@ def main() -> int:
             log_every=40,
             value_coef=0.05,
         ),
+        # No ``source`` / ``is_gto_validated`` here: train_policy_net derives
+        # the source + label provenance from the rows.
         meta={
-            "source": "rust_cfr",
             "n_train": len(rows),
-            "is_gto_validated": False,
-            "warm_start": None if init is None else str(init),
             "campaign": "teacher_s7",
+            "planned_holdout_root_ids": list(res.holdout_root_ids),
         },
         init_ckpt=init,
     )
@@ -114,18 +133,16 @@ def main() -> int:
     gates = ProbeGates(min_n=50)
     pr = probe_checkpoint(ckpt, hold_path, device="cpu", gates=gates)
     print(json.dumps(pr.as_dict(), indent=2), flush=True)
-    can_stamp = bool(pr.passed) and not over
-    if can_stamp:
-        stamp_probe_on_checkpoint(ckpt, pr, device="cpu")
-        print(
-            f"[step7] STAMP yes is_gto_validated={is_validated_gto_checkpoint(ckpt)}",
-            flush=True,
-        )
-    else:
-        print(
-            f"[step7] STAMP no passed={pr.passed} over_cap={bool(over)}",
-            flush=True,
-        )
+    if over:
+        print(f"[step7] STAMP no over_cap={over}", flush=True)
+        return 0
+    meta = stamp_probe_on_checkpoint(ckpt, pr, device="cpu")
+    print(
+        f"[step7] STAMP probe_passed={pr.passed} "
+        f"is_gto_validated={is_validated_gto_checkpoint(ckpt)} "
+        f"note={meta.get('gto_badge_note')}",
+        flush=True,
+    )
     return 0
 
 

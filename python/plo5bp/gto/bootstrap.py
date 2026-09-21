@@ -17,9 +17,10 @@ import numpy as np
 
 from plo5bp.actions import GATE_CHECK_CALL, GATE_FOLD, GATE_RAISE
 from plo5bp.env import BombPotEnv, StepInfo
-from plo5bp.gto.dataset import SupervisedRow
+from plo5bp.gto.dataset import RowProvenance, SupervisedRow
+from plo5bp.gto.labels import jam_anchor_index, map_size_to_anchor
 from plo5bp.gto.roots import CLUBGG_NLH_ROOT
-from plo5bp.sizing import NLH_ANCHOR_SPEC, sizing_from_info
+from plo5bp.sizing import NLH_ANCHOR_SPEC, anchor_grid_np, sizing_from_info
 
 # Engine hand categories (mirrors Rust / env hero_category): higher = stronger
 # 0 high card … 8 straight flush (typical poker category order).
@@ -52,38 +53,43 @@ def _pure_gate(preferred: int, strength: float = 0.94) -> np.ndarray:
     return np.array([m / s for m in mass], dtype=np.float32)
 
 
-def _allin_anchor_probs(k: int | None = None) -> np.ndarray:
-    k = NLH_ANCHOR_SPEC.count if k is None else k
-    ap = np.full(k, _EPS / k, dtype=np.float32)
-    ap[-1] = 1.0 - _EPS  # ALL-IN atom
-    ap /= ap.sum()
+def _anchor_probs_on(main: int, legal: np.ndarray) -> np.ndarray:
+    """``1 - eps`` on ``main``, ``eps`` spread over the OTHER LEGAL anchors.
+
+    (review 2026-09-20 D1) The old helpers spread ``eps`` over all 12 anchors
+    and parked jams on the ALL-IN atom regardless of the node's grid, so part
+    (at short SPR: all) of the target sat on anchors the training mask erases.
+    """
+    legal = np.asarray(legal, dtype=bool)
+    ap = np.zeros(legal.shape[0], dtype=np.float32)
+    if not bool(legal[main]):  # defensive: fall back to the first legal anchor
+        main = int(np.argmax(legal))
+    others = legal.copy()
+    others[main] = False
+    n_other = int(others.sum())
+    if n_other:
+        ap[others] = _EPS / n_other
+        ap[main] = 1.0 - _EPS
+    else:
+        ap[main] = 1.0
     return ap
 
 
-def _pot_anchor_probs(k: int | None = None) -> np.ndarray:
-    """Mass on ~pot (100% = index of 1000 pm in NLH ladder)."""
-    k = NLH_ANCHOR_SPEC.count if k is None else k
-    fracs = NLH_ANCHOR_SPEC.fracs_pm
-    # find closest to 1000 pm among fraction anchors (exclude all-in last)
-    best = 0
-    best_d = 10**9
-    for i, f in enumerate(fracs):
-        d = abs(int(f) - 1000)
-        if d < best_d:
-            best_d = d
-            best = i
-    ap = np.full(k, _EPS / k, dtype=np.float32)
-    ap[best] = 1.0 - _EPS
-    ap /= ap.sum()
-    return ap
-
-
-def _min_anchor_probs(k: int | None = None) -> np.ndarray:
-    k = NLH_ANCHOR_SPEC.count if k is None else k
-    ap = np.full(k, _EPS / k, dtype=np.float32)
-    ap[0] = 1.0 - _EPS
-    ap /= ap.sum()
-    return ap
+def _sizing_anchor_probs(sizing: np.ndarray, target: str) -> np.ndarray:
+    """Anchor target for this node's sizing. ``target``: jam | pot | min."""
+    mn, mx, pot, tc = (int(x) for x in sizing)
+    legal = anchor_grid_np(mn, mx, pot, tc, NLH_ANCHOR_SPEC).legal
+    jam = jam_anchor_index(min_raise=mn, max_raise=mx, pot=pot, to_call=tc)
+    if target == "jam" or not (mn > 0 and mx > 0):
+        # Short-shove regime: the jam atom is the only legal anchor.
+        return _anchor_probs_on(jam, legal)
+    if target == "pot":
+        pot_chips = tc + (1000 * (pot + tc) + 500) // 1000
+        main = map_size_to_anchor(
+            pot_chips, min_raise=mn, max_raise=mx, pot=pot, to_call=tc
+        )
+        return _anchor_probs_on(main, legal)
+    return _anchor_probs_on(0, legal)
 
 
 def label_node(info: StepInfo) -> tuple[np.ndarray, np.ndarray, float]:
@@ -113,7 +119,7 @@ def label_node(info: StepInfo) -> tuple[np.ndarray, np.ndarray, float]:
     fold_ok = bool(gm[GATE_FOLD])
     call_ok = bool(gm[GATE_CHECK_CALL])
 
-    k = NLH_ANCHOR_SPEC.count
+    sizing = sizing_from_info(info)
     pot_odds = to_call_chips / float(to_call_chips + pot) if to_call_chips > 0 else 0.0
 
     # --- Pure: trash facing bet on turn/river --------------------------------
@@ -128,49 +134,49 @@ def label_node(info: StepInfo) -> tuple[np.ndarray, np.ndarray, float]:
         # zero illegal
         if not fold_ok:
             g = _pure_gate(GATE_CHECK_CALL if call_ok else GATE_RAISE)
-        return g, _min_anchor_probs(k), -float(to_call_chips) / 10000.0
+        return g, _sizing_anchor_probs(sizing, "min"), -float(to_call_chips) / 10000.0
 
     # --- Pure: nuts-class → jam ---------------------------------------------
     if cat >= _CAT_FULL_HOUSE and raise_ok:
         g = _pure_gate(GATE_RAISE, 0.92)
         if not raise_ok and call_ok:
             g = _pure_gate(GATE_CHECK_CALL, 0.9)
-        return g, _allin_anchor_probs(k), float(pot) / 10000.0 * 0.5
+        return g, _sizing_anchor_probs(sizing, "jam"), float(pot) / 10000.0 * 0.5
 
     # strong made (straight+) facing no bet → pot bet often
     if cat >= _CAT_STRAIGHT and to_call_chips == 0 and raise_ok and street >= 1:
         g = _pure_gate(GATE_RAISE, 0.75)
-        return g, _pot_anchor_probs(k), float(pot) / 10000.0 * 0.3
+        return g, _sizing_anchor_probs(sizing, "pot"), float(pot) / 10000.0 * 0.3
 
     # --- Free check when weak -----------------------------------------------
     if to_call_chips == 0 and call_ok and cat <= _CAT_PAIR:
         g = _pure_gate(GATE_CHECK_CALL, 0.88)
-        return g, _min_anchor_probs(k), 0.0
+        return g, _sizing_anchor_probs(sizing, "min"), 0.0
 
     # --- Facing bet with strong made → call / raise mix ---------------------
     if to_call_chips > 0 and cat >= _CAT_TWO_PAIR:
         if raise_ok and cat >= _CAT_TRIPS:
             g = _renorm3(0.02, 0.35, 0.63)
-            return g, _pot_anchor_probs(k), float(pot) / 20000.0
+            return g, _sizing_anchor_probs(sizing, "pot"), float(pot) / 20000.0
         if call_ok:
             g = _pure_gate(GATE_CHECK_CALL, 0.85)
-            return g, _min_anchor_probs(k), 0.0
+            return g, _sizing_anchor_probs(sizing, "min"), 0.0
 
     # --- Default: check/call preferred, small raise mix ---------------------
     if to_call_chips == 0:
         if raise_ok:
             g = _renorm3(0.0 if not fold_ok else _EPS, 0.70, 0.28)
-            return g, _min_anchor_probs(k), 0.0
+            return g, _sizing_anchor_probs(sizing, "min"), 0.0
         g = _pure_gate(GATE_CHECK_CALL if call_ok else GATE_FOLD)
-        return g, _min_anchor_probs(k), 0.0
+        return g, _sizing_anchor_probs(sizing, "min"), 0.0
 
     # facing bet, medium: pot-odds style call bias
     if call_ok and pot_odds < 0.35 and cat >= _CAT_PAIR:
         g = _renorm3(0.15 if fold_ok else 0.0, 0.75, 0.10 if raise_ok else 0.0)
-        return g, _min_anchor_probs(k), 0.0
+        return g, _sizing_anchor_probs(sizing, "min"), 0.0
     if fold_ok and pot_odds >= 0.35 and cat <= _CAT_PAIR:
         g = _renorm3(0.70, 0.25 if call_ok else 0.0, 0.05 if raise_ok else 0.0)
-        return g, _min_anchor_probs(k), -float(to_call_chips) / 20000.0
+        return g, _sizing_anchor_probs(sizing, "min"), -float(to_call_chips) / 20000.0
 
     # fallback legal-uniform-ish
     mass = np.array(
@@ -184,7 +190,7 @@ def label_node(info: StepInfo) -> tuple[np.ndarray, np.ndarray, float]:
     if mass.sum() <= 0:
         mass = np.array([0.0, 1.0, 0.0], dtype=np.float32)
     mass /= mass.sum()
-    return mass, _min_anchor_probs(k), 0.0
+    return mass, _sizing_anchor_probs(sizing, "min"), 0.0
 
 
 def _mask_gate_probs(g: np.ndarray, gm: np.ndarray) -> np.ndarray:
@@ -212,12 +218,20 @@ def collect_bootstrap(
     stack_bb_range: tuple[float, float] = (20.0, 250.0),
     max_hands: int = 80_000,
     pure_only: bool = False,
+    canonical_obs: bool = True,
 ) -> list[SupervisedRow]:
     """Roll NLH hands; label every decision with bootstrap rules.
 
     Advance policy: sample from the bootstrap gate (mixed) so trajectories
     visit both check-down and jam lines.
+
+    ``canonical_obs`` (review 2026-09-20 D3): postflop rows store the
+    solver-root canonical obs — the form ``PolicyNetHost`` serves and the form
+    rust_cfr label rows are in — so a bootstrap mix never teaches the net a
+    second obs distribution. Preflop rows keep the live obs.
     """
+    from plo5bp.gto.obs_from_label import canonical_serve_obs
+
     rng = np.random.default_rng(int(seed))
     root = CLUBGG_NLH_ROOT
     rows: list[SupervisedRow] = []
@@ -245,15 +259,27 @@ def collect_bootstrap(
             g = _mask_gate_probs(g, info.gate_mask)
             keep = (not pure_only) or float(g.max()) >= 0.85
             if keep:
+                canon = (
+                    canonical_serve_obs(info.raw_obs, bb=cfg.bb)
+                    if canonical_obs
+                    else None
+                )
                 rows.append(
                     SupervisedRow(
-                        obs=np.asarray(obs, dtype=np.float32).copy(),
+                        obs=np.asarray(
+                            obs if canon is None else canon, dtype=np.float32
+                        ).copy(),
                         gate_mask=np.asarray(info.gate_mask, dtype=bool).copy(),
                         sizing=sizing_from_info(info).astype(np.int64),
                         gate_probs=g,
                         anchor_probs=ap.astype(np.float32),
                         value_bb=float(v),
                         street=int(info.raw_obs.get("street", 0)),
+                        prov=RowProvenance(
+                            source="rule_bootstrap",
+                            num_seats=n_seats,
+                            obs_form="live" if canon is None else "canonical",
+                        ),
                     )
                 )
 

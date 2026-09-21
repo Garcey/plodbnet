@@ -26,6 +26,12 @@ launch(){
   # 796 directly, skips opp MC / v7 pack scans / engineered tails. opp_mc=0
   # is still forced by env_batched under obs_mode=minimal.
   export PLO5_RUST_ENCODER=1
+  # This stem was trained on the pre-2026-09-20 observation VALUES (the minimal
+  # layout carries the min/max-bet scalars, review B3). train.py refuses a warm
+  # start across an obs-semantics change, so pin rev 1 for byte-compatible
+  # resumes. To migrate the stem instead, drop this line and pass
+  # --allow-obs-rev-change ONCE (PRODUCTION BEHAVIOR CHANGE; expect a transient).
+  export PLO5BP_OBS_REV=1
   local load=""
   [ -n "${1:-}" ] && load="--load-checkpoint $1"
   setsid nohup .venv/bin/python -u scripts/train.py \
@@ -41,6 +47,7 @@ launch(){
     --lr 1.5e-4 --lr-warmup-updates 0 --clip-room-mid 0.07 \
     --target-kl 0.5 --kl-hard 10.0 --adv-clip 8 --cpu-threads 32 \
     --snapshot-every 5 \
+    --no-drain-inflight \
     $load --checkpoint checkpoints/vMin1.pt \
     --num-updates 100000000 >> "$LOG" 2>&1 < /dev/null &
   disown 2>/dev/null || true
@@ -89,6 +96,18 @@ pick_warm(){
   return 1
 }
 
+# (review 2026-09-20 A7) A stop flag left over from the last clean stop must be
+# cleared by hand: launching and THEN exiting on it (the loop's first check)
+# would leave a trainer running with no guardian.
+if [ -f "$STOPFLAG" ]; then
+  log "stop flag present at start -> not launching (rm $STOPFLAG to run)"
+  echo "vMin1 guardian: $STOPFLAG exists -> not launching (remove it to run)" >&2
+  exit 0
+fi
+
+# NOTE: train.py's rolling optimizer sidecar is checkpoints/vMin1.optim.pt —
+# deliberately NOT matched by pick_warm's vMin1_*.pt glob. Checkpoints are
+# written atomically (<name>.pt.tmp + rename), so every match is complete.
 if [ -z "$(train_pid)" ]; then
   if WARM=$(pick_warm); then
     log "initial launch warm-loading ${WARM} (128-wide)"
@@ -108,6 +127,11 @@ while true; do
     sleep 15; PID=$(train_pid)
     if [ -z "$PID" ]; then
       if [ "$restarts" -ge "$MAX_RESTARTS" ]; then log "DEAD; restart cap hit -> STOP"; touch "$STOPFLAG"; exit 0; fi
+      # Re-check the stop flag RIGHT before relaunching (A7): a clean stop
+      # (touch the flag, kill the trainer) usually lands inside the POLL sleep
+      # above, a full POLL before the loop-top check — the guardian used to
+      # resurrect the run the operator had just stopped.
+      [ -f "$STOPFLAG" ] && { log "process DEAD and stop flag present -> NOT relaunching; exiting"; exit 0; }
       restarts=$((restarts+1))
       if WARM=$(pick_warm); then
         log "process DEAD; relaunch #$restarts warm=${WARM}"

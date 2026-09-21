@@ -24,7 +24,9 @@ pub enum StudyTerminal {
     /// One survivor; payouts valid (uncontested pot).
     FoldOut,
     /// Action closed with fewer than 2 voluntary actors but cards remain
-    /// undealt. No showdown evaluated; payouts report zeros.
+    /// undealt — including a hand nobody can act in from the deal (every
+    /// seat all-in from the antes / blinds), classified at construction.
+    /// No showdown evaluated; payouts report zeros.
     RunOut,
     /// River action closed with ≥2 survivors. Opp cards unknown, so no
     /// evaluation; payouts report zeros.
@@ -38,6 +40,10 @@ pub enum StudyError {
     SeatOutOfRange,
     WrongState,
     InvalidAmount,
+    /// More seats than one deck can deal for the variant through the
+    /// river (hero + placeholder holes + full boards). Was an index
+    /// panic in the placeholder deal (review 2026-09-20 C4).
+    TooManySeats,
 }
 
 impl std::fmt::Display for StudyError {
@@ -47,6 +53,7 @@ impl std::fmt::Display for StudyError {
             StudyError::SeatOutOfRange => write!(f, "seat out of range"),
             StudyError::WrongState => write!(f, "operation not valid in current state"),
             StudyError::InvalidAmount => write!(f, "chip amount out of legal range"),
+            StudyError::TooManySeats => write!(f, "too many seats for one deck"),
         }
     }
 }
@@ -119,6 +126,14 @@ impl Variant {
     /// live, no board revealed until the round closes).
     pub fn has_preflop(self) -> bool {
         matches!(self, Variant::NlhSingle)
+    }
+
+    /// Most seats one 52-card deck can deal: `hole_count` per seat plus
+    /// five cards per board. PLO4 10, PLO5 8, PLO6 7, NLH 23. A pure deck
+    /// bound — the observation encoders cap tables at 8 seats on their
+    /// own (enforced by the Python `GameConfig`). (review 2026-09-20 C4)
+    pub fn max_seats(self) -> usize {
+        (crate::cards::DECK_SIZE - 5 * self.num_boards()) / self.hole_count()
     }
 }
 

@@ -5,6 +5,13 @@ Exit codes:
   0 — probe gates passed (and optionally stamped onto the checkpoint)
   1 — probe gates failed or fatal error
 
+Gates (review 2026-09-20 D4): gate KL (absolute + vs the card-blind per-node
+baseline), pure-node agreement (``pure_n == 0`` FAILS), sizing (anchor KL +
+jam-frequency gap), NaN-safe, and the holdout must be disjoint from the
+checkpoint's recorded training roots. ``--stamp`` never asserts the badge: it
+records the probe and ``is_gto_validated`` is re-derived from record-derived
+label provenance (training labels AND this holdout) — see ``gto_badge_note``.
+
 Examples::
 
   .venv/Scripts/python scripts/gto_probe.py \\
@@ -15,7 +22,7 @@ Examples::
   .venv/Scripts/python scripts/gto_probe.py \\
       --ckpt checkpoints/gto_policy.pt \\
       --holdout data/gto_nlh/holdout_labels.jsonl \\
-      --min-pure-agree 0.90 --max-gate-kl 0.50 --min-n 50
+      --min-pure-agree 0.90 --max-gate-kl 0.12 --min-n 50
 """
 
 from __future__ import annotations
@@ -30,6 +37,12 @@ if str(_ROOT / "python") not in sys.path:
     sys.path.insert(0, str(_ROOT / "python"))
 
 from plo5bp.gto.probe import (  # noqa: E402
+    DEFAULT_MAX_JAM_FREQ_GAP,
+    DEFAULT_MAX_MEAN_ANCHOR_KL,
+    DEFAULT_MAX_MEAN_GATE_KL,
+    DEFAULT_MAX_MEAN_JAM_GAP,
+    DEFAULT_MIN_PURE_AGREE,
+    DEFAULT_MIN_PURE_N,
     ProbeGates,
     probe_checkpoint,
     stamp_probe_on_checkpoint,
@@ -47,10 +60,39 @@ def main() -> int:
         help="Holdout LabelRecord JSONL (export writes <stem>_holdout.jsonl)",
     )
     p.add_argument("--device", default="cpu")
-    p.add_argument("--min-pure-agree", type=float, default=0.90)
-    p.add_argument("--max-gate-kl", type=float, default=0.50)
+    p.add_argument("--min-pure-agree", type=float, default=DEFAULT_MIN_PURE_AGREE)
+    p.add_argument("--max-gate-kl", type=float, default=DEFAULT_MAX_MEAN_GATE_KL)
+    p.add_argument("--max-anchor-kl", type=float, default=DEFAULT_MAX_MEAN_ANCHOR_KL)
+    p.add_argument(
+        "--max-jam-freq-gap",
+        type=float,
+        default=DEFAULT_MAX_JAM_FREQ_GAP,
+        help="Holdout-wide |target - model| jam frequency",
+    )
+    p.add_argument(
+        "--max-jam-gap",
+        type=float,
+        default=DEFAULT_MAX_MEAN_JAM_GAP,
+        help="Per-row mean |target - model| jam frequency",
+    )
     p.add_argument("--min-n", type=int, default=1)
-    p.add_argument("--min-pure-n", type=int, default=0)
+    p.add_argument("--min-pure-n", type=int, default=DEFAULT_MIN_PURE_N)
+    p.add_argument(
+        "--allow-no-pure",
+        action="store_true",
+        help="Do not fail when the holdout has no near-pure nodes (diagnostics)",
+    )
+    p.add_argument(
+        "--allow-no-sizing",
+        action="store_true",
+        help="Do not fail when the holdout has no raise rows (diagnostics)",
+    )
+    p.add_argument(
+        "--allow-overlapping-roots",
+        action="store_true",
+        help="Skip the holdout-vs-training-roots check (diagnostics; a "
+        "self-fit proves nothing)",
+    )
     p.add_argument(
         "--stamp",
         action="store_true",
@@ -76,6 +118,12 @@ def main() -> int:
         max_mean_gate_kl=args.max_gate_kl,
         min_n=args.min_n,
         min_pure_n=args.min_pure_n,
+        max_mean_anchor_kl=args.max_anchor_kl,
+        max_jam_freq_gap=args.max_jam_freq_gap,
+        max_mean_jam_gap=args.max_jam_gap,
+        allow_no_pure=args.allow_no_pure,
+        allow_no_sizing=args.allow_no_sizing,
+        require_disjoint_roots=not args.allow_overlapping_roots,
     )
     result = probe_checkpoint(
         args.ckpt, args.holdout, device=args.device, gates=gates
@@ -90,7 +138,8 @@ def main() -> int:
         meta = stamp_probe_on_checkpoint(args.ckpt, result, device=args.device)
         print(
             f"[probe] stamped ckpt is_gto_validated="
-            f"{meta.get('is_gto_validated')} source={meta.get('source')}"
+            f"{meta.get('is_gto_validated')} source={meta.get('source')} "
+            f"note={meta.get('gto_badge_note')}"
         )
 
     if result.passed:

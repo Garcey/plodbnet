@@ -31,18 +31,151 @@ fn parse_variant(s: &str) -> PyResult<Variant> {
     }
 }
 
+// ---- observation-SEMANTICS revision switch (PLO5BP_OBS_REV) ----------------
+// Twin of `OBS_SEMANTICS_REV` in python/plo5bp/encoding.py — read that block
+// comment first. The 2026-09-20 review fixed features whose VALUES were wrong
+// while the layout stayed put; a checkpoint is only served / resumed exactly on
+// the semantics it was trained on, so the old values stay selectable:
+//
+//   PLO5BP_OBS_REV unset or "2"  (DEFAULT) — the fixed semantics.
+//   PLO5BP_OBS_REV=1             — the pre-2026-09-20 values, bit-exact. Set it
+//                                  to serve or resume a checkpoint trained
+//                                  before 2026-09-20.
+//
+// Gated here: B1 (STK-2, STK-5[2:4]), B2 (draw flags 800/802), B3 (min/max
+// scalars, full + minimal), B5 (blocker flush dims). B7 is NLH (numpy-only).
+// NOT gated: B6, the STK-6 comparison chain, C4/C6/C7.
+//
+// The variable is read when a `GameState` / `BatchedEngine` is CONSTRUCTED and
+// stored in its `obs_rev` field (an explicit `obs_rev=` constructor argument
+// overrides it); the standalone feature pyfunctions take `obs_rev` explicitly.
+// Python reads the same variable once at import and cross-checks it against
+// `obs_semantics_rev()`. train.py stamps `obs_rev` into checkpoints and refuses
+// a mismatched warm start; the UI warns on a mismatch.
+const OBS_REV_ENV: &str = "PLO5BP_OBS_REV";
+const OBS_REV_LEGACY: u8 = 1;
+const OBS_REV_CURRENT: u8 = 2;
+
+fn check_obs_rev(rev: u8) -> PyResult<u8> {
+    if rev == OBS_REV_LEGACY || rev == OBS_REV_CURRENT {
+        Ok(rev)
+    } else {
+        Err(PyValueError::new_err(format!(
+            "obs_rev must be {OBS_REV_CURRENT} (default, the 2026-09-20 fixed features) or \
+             {OBS_REV_LEGACY} (pre-2026-09-20 values), got {rev}"
+        )))
+    }
+}
+
+/// `PLO5BP_OBS_REV` parsed exactly like `encoding._read_obs_semantics_rev`:
+/// unset, empty or whitespace-only (`PLO5BP_OBS_REV=` is common in .env files)
+/// -> 2; "1" / "2" (surrounding whitespace ignored); anything else is an error
+/// rather than a silent default.
+fn obs_rev_from_env() -> PyResult<u8> {
+    let raw = match std::env::var(OBS_REV_ENV) {
+        Ok(v) => v,
+        Err(std::env::VarError::NotPresent) => return Ok(OBS_REV_CURRENT),
+        Err(std::env::VarError::NotUnicode(v)) => {
+            return Err(PyValueError::new_err(format!(
+                "{OBS_REV_ENV}={v:?} is not a known observation-semantics revision"
+            )))
+        }
+    };
+    match raw.trim() {
+        "" => Ok(OBS_REV_CURRENT),
+        "1" => Ok(OBS_REV_LEGACY),
+        "2" => Ok(OBS_REV_CURRENT),
+        _ => Err(PyValueError::new_err(format!(
+            "{OBS_REV_ENV}={raw:?} is not a known observation-semantics revision: use \
+             {OBS_REV_CURRENT} (default, the 2026-09-20 fixed features) or {OBS_REV_LEGACY} \
+             (pre-2026-09-20 values, to serve/resume a checkpoint trained before that date)"
+        ))),
+    }
+}
+
+/// Constructor argument wins; otherwise the environment decides.
+fn resolve_obs_rev(explicit: Option<u8>) -> PyResult<u8> {
+    match explicit {
+        Some(rev) => check_obs_rev(rev),
+        None => obs_rev_from_env(),
+    }
+}
+
+/// The observation-semantics revision the engine reads from `PLO5BP_OBS_REV`
+/// right now (1 or 2). Python asserts at import that it equals
+/// `encoding.OBS_SEMANTICS_REV`. Module-level registration lives in lib.rs;
+/// the same value is reachable as `GameState.obs_semantics_rev()`.
+#[pyfunction]
+pub fn obs_semantics_rev() -> PyResult<u8> {
+    obs_rev_from_env()
+}
+
+/// Seat cap of the observation encoders: every hero-rotated block is padded to
+/// 8 slots (`encoding._MAX_SEATS`; the `[f64; 8]` effective-stack scratch in
+/// `encode_obs_row*`). A 9th seat's active flag would land in all-in slot 0.
+const MAX_SEATS: usize = 8;
+
+/// Constructor-time table validation (review 2026-09-20 C4). Each case used to
+/// surface later as a Rust panic — a `PanicException`, which derives from
+/// `BaseException` and so escapes Python's `except Exception`: 1 seat ("need
+/// at least 2 seats"), a deck overrun at PLO5 >= 9 / PLO6 >= 8 seats, and
+/// PLO4 at 9 seats overrunning the 8-slot encoder arrays.
+fn validate_table(num_seats: usize, variant: Variant, bb: u64) -> PyResult<()> {
+    if !(2..=MAX_SEATS).contains(&num_seats) {
+        return Err(PyValueError::new_err(format!(
+            "num_seats must be in 2..={MAX_SEATS}, got {num_seats}"
+        )));
+    }
+    if bb == 0 {
+        // Every encoder scales by 1/bb: bb == 0 yields a non-finite obs.
+        return Err(PyValueError::new_err("bb must be >= 1"));
+    }
+    let needed = num_seats * variant.hole_count() + 5 * variant.num_boards();
+    if needed > crate::cards::DECK_SIZE {
+        return Err(PyValueError::new_err(format!(
+            "{num_seats} seats need {needed} cards for this variant; the deck has {}",
+            crate::cards::DECK_SIZE
+        )));
+    }
+    Ok(())
+}
+
+/// Bounds-checked env indices for every `*_subset_batch(indices)` entry point
+/// (review 2026-09-20 C4): a negative index used to wrap to a huge `usize` and
+/// an out-of-range one indexed past `states`, both panicking mid-pack.
+fn checked_env_indices(indices: &[i64], n: usize, what: &str) -> PyResult<Vec<usize>> {
+    indices
+        .iter()
+        .map(|&x| {
+            if x < 0 || x as usize >= n {
+                Err(PyValueError::new_err(format!(
+                    "{what}: index {x} out of range (num_envs={n})"
+                )))
+            } else {
+                Ok(x as usize)
+            }
+        })
+        .collect()
+}
+
 /// Python-facing `GameState`. Construct with config, then `reset(seed, button)`
 /// to deal a hand. Subsequent calls drive the state machine.
 #[pyclass(name = "GameState")]
 pub struct PyGameState {
     inner: Option<GameState>,
     config: GameConfig,
+    /// Observation-semantics revision fixed at construction (see
+    /// `OBS_REV_ENV`). The serial dict / range packers emit raw fields only,
+    /// so nothing here branches on it yet; it is validated and exposed so the
+    /// Python env can check it against `encoding.OBS_SEMANTICS_REV`.
+    obs_rev: u8,
 }
 
 #[pymethods]
 impl PyGameState {
     #[new]
-    #[pyo3(signature = (num_seats=6, starting_stack=200000, ante=30000, bb=10000, starting_stacks=None, variant="plo5_double_bomb", sb=0))]
+    #[pyo3(signature = (num_seats=6, starting_stack=200000, ante=30000, bb=10000, starting_stacks=None, variant="plo5_double_bomb", sb=0, obs_rev=None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         num_seats: usize,
         starting_stack: u64,
@@ -51,9 +184,12 @@ impl PyGameState {
         starting_stacks: Option<PyReadonlyArray1<'_, u64>>,
         variant: &str,
         sb: u64,
+        obs_rev: Option<u8>,
     ) -> PyResult<Self> {
-        let stacks = resolve_starting_stacks(num_seats, starting_stack, starting_stacks)?;
         let variant = parse_variant(variant)?;
+        validate_table(num_seats, variant, bb)?;
+        let obs_rev = resolve_obs_rev(obs_rev)?;
+        let stacks = resolve_starting_stacks(num_seats, starting_stack, starting_stacks)?;
         Ok(PyGameState {
             inner: None,
             config: GameConfig {
@@ -64,7 +200,21 @@ impl PyGameState {
                 sb,
                 variant,
             },
+            obs_rev,
         })
+    }
+
+    /// Observation-semantics revision this state was constructed under.
+    fn obs_rev(&self) -> u8 {
+        self.obs_rev
+    }
+
+    /// Same as the module-level `obs_semantics_rev()` (the revision
+    /// `PLO5BP_OBS_REV` selects right now).
+    #[staticmethod]
+    #[pyo3(name = "obs_semantics_rev")]
+    fn obs_semantics_rev_static() -> PyResult<u8> {
+        obs_rev_from_env()
     }
 
     #[pyo3(signature = (seed, button, in_hand_mask=None))]
@@ -186,6 +336,31 @@ impl PyGameState {
         if hero_hole.len() != 2 {
             return Err(PyValueError::new_err("hero_hole must be 2 cards"));
         }
+        // Validate up front (review 2026-09-20 C4): the bridge indexes a
+        // 52-slot table by raw card value and deals a fresh hand for
+        // `stacks.len()` seats, so a bad card / seat count used to panic.
+        // The seat count must also equal the wrapper's, or `num_seats()`,
+        // `hero_category` and `pack_range_nlh` would disagree with the state.
+        if stacks.len() != self.config.num_seats {
+            return Err(PyValueError::new_err(format!(
+                "stacks has {} entries but this GameState was built with num_seats={}",
+                stacks.len(),
+                self.config.num_seats
+            )));
+        }
+        let bb = bb.unwrap_or(self.config.bb);
+        validate_table(stacks.len(), Variant::NlhSingle, bb)?;
+        let mut seen = [false; 52];
+        for &c in board.iter().chain(hero_hole.iter()) {
+            if c >= 52 {
+                return Err(PyValueError::new_err(format!("card index {c} out of range")));
+            }
+            if std::mem::replace(&mut seen[c as usize], true) {
+                return Err(PyValueError::new_err(format!(
+                    "duplicate card {c} across board / hero_hole"
+                )));
+            }
+        }
         let street = match street {
             1 => Street::Flop,
             2 => Street::Turn,
@@ -196,7 +371,6 @@ impl PyGameState {
                 ))
             }
         };
-        let bb = bb.unwrap_or(self.config.bb);
         let hole = [hero_hole[0], hero_hole[1]];
         match game_state_from_cfr_label(
             pot,
@@ -291,16 +465,30 @@ impl PyGameState {
         Ok(self.get()?.current_actor())
     }
 
+    /// Chip delta per seat. All zeros while the hand is still live — same
+    /// contract as `payouts_batch` (review 2026-09-20 C7): the engine's
+    /// `payouts` is only valid at terminal, and on a live hand it used to
+    /// return the showdown over the PRE-DEALT full boards, leaking the
+    /// undealt turn/river (and villain holes) through a plain getter.
     fn payouts(&self) -> PyResult<Vec<i64>> {
-        Ok(self.get()?.payouts())
+        let g = self.get()?;
+        if !g.is_terminal() {
+            return Ok(vec![0i64; g.config.num_seats]);
+        }
+        Ok(g.payouts())
     }
 
     /// Expected chip delta per seat, averaged over `num_samples`
     /// Monte-Carlo runouts of the community cards undealt at the street
     /// where action closed. Delegates to `payouts` when sampling is a
-    /// no-op (fold-out, river-close, or `num_samples == 0`).
+    /// no-op (fold-out, river-close, or `num_samples == 0`). All zeros
+    /// while the hand is still live (see `payouts`).
     fn payouts_ev(&self, num_samples: u32, seed: u64) -> PyResult<Vec<i64>> {
-        Ok(self.get()?.payouts_ev(num_samples, seed))
+        let g = self.get()?;
+        if !g.is_terminal() {
+            return Ok(vec![0i64; g.config.num_seats]);
+        }
+        Ok(g.payouts_ev(num_samples, seed))
     }
 
     fn num_seats(&self) -> usize {
@@ -330,11 +518,18 @@ impl PyGameState {
         Ok(self.get()?.max_raise_chips())
     }
 
-    /// Hand category index (0..=8) of seat's best PLO5 hand on `board`.
+    /// Hand category index (0..=8) of seat's best PLO5 hand on `board`
+    /// (0 = board A, 1 = board B).
     fn hero_category(&self, seat: usize, board: u8) -> PyResult<u8> {
         let g = self.get()?;
-        if seat >= self.config.num_seats {
+        // The STATE's seat count bounds `hole_cards` (review 2026-09-20 C4).
+        if seat >= g.config.num_seats {
             return Err(PyValueError::new_err("seat out of range"));
+        }
+        // Same contract as `hero_category_batch`: any other value used to be
+        // read as board B silently.
+        if board > 1 {
+            return Err(PyValueError::new_err(format!("board {board} must be 0 or 1")));
         }
         Ok(g.hero_category(seat, board))
     }
@@ -471,7 +666,9 @@ impl PyGameState {
             return Err(PyValueError::new_err("holes must have shape (N, 2)"));
         }
         let n = holes.nrows();
-        let s = self.config.num_seats;
+        // The STATE's seat count sizes its per-seat vectors (review
+        // 2026-09-20 C4; equal to the wrapper's by construction).
+        let s = g.config.num_seats;
 
         let mut on_board = [false; 52];
         for c in g.board_a.iter() {
@@ -1076,22 +1273,56 @@ pub struct PyBatchedEngine {
     /// engine. Serial/UI/eval use 1024; batched TRAINING sets it lower
     /// (256) to cut the dominant per-decision encode cost.
     opp_outcome_mc: usize,
-    /// Per-env memoization of the opp-outcome MC output (the 20-dim fused
-    /// pass), keyed on `GameState::outcome_seed` = hash of exactly the MC's
-    /// inputs (hero seat + street + hero hole + both boards). The MC is a pure
-    /// function of those, so within a street (board unchanged across the
-    /// street's actions) it recomputes identically every step; this reuses it
-    /// and recomputes only when the seed changes (street advance / new hand).
+    /// Memoization of the opp-outcome MC output (the 22-dim fused pass), one
+    /// slot per (env, SEAT), keyed on `GameState::outcome_seed` = hash of
+    /// exactly the MC's inputs (street + the actor's hole + both boards). The
+    /// MC is a pure function of those, so a seat that acts AGAIN on the same
+    /// street (facing a raise after it already acted) reuses its result; a
+    /// street advance or a new hand changes the seed and recomputes.
+    /// (review 2026-09-20 C6) This used to be ONE slot per env, which never
+    /// hit in a rollout: the key includes the actor's hole and the actor
+    /// changes on every action, so each pack evicted the previous seat's
+    /// entry (0 / 51,200 hits measured).
     /// Bit-exact vs always-recompute (pinned by test_encoding_rust: cached
     /// batched == fresh serial). Accessed only serially (locked outside the
     /// parallel MC), so the Mutex adds no contention and keeps the pyclass Sync.
-    outcome_cache: std::sync::Mutex<Vec<Option<(u64, [f32; 22])>>>,
+    outcome_cache: std::sync::Mutex<OutcomeCache>,
+    /// Observation-semantics revision the fused encoders emit, fixed at
+    /// construction (see `OBS_REV_ENV`).
+    obs_rev: u8,
+}
+
+/// See `PyBatchedEngine::outcome_cache`. `slots[env * num_seats + seat]`.
+struct OutcomeCache {
+    slots: Vec<Option<(u64, [f32; 22])>>,
+    /// Lifetime counters behind `outcome_cache_stats()` — the dead single-slot
+    /// cache went unnoticed precisely because nothing reported its hit rate.
+    lookups: u64,
+    hits: u64,
+}
+
+impl OutcomeCache {
+    fn new(num_envs: usize, num_seats: usize) -> Self {
+        OutcomeCache {
+            slots: vec![None; num_envs * num_seats],
+            lookups: 0,
+            hits: 0,
+        }
+    }
+
+    /// Drop every seat's entry for one env (its hand was re-dealt).
+    fn clear_env(&mut self, env: usize, num_seats: usize) {
+        for slot in &mut self.slots[env * num_seats..(env + 1) * num_seats] {
+            *slot = None;
+        }
+    }
 }
 
 #[pymethods]
 impl PyBatchedEngine {
     #[new]
-    #[pyo3(signature = (num_envs, num_seats=6, starting_stack=200000, ante=30000, bb=10000, starting_stacks=None, opp_outcome_mc=1024, variant="plo5_double_bomb", sb=0))]
+    #[pyo3(signature = (num_envs, num_seats=6, starting_stack=200000, ante=30000, bb=10000, starting_stacks=None, opp_outcome_mc=1024, variant="plo5_double_bomb", sb=0, obs_rev=None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         num_envs: usize,
         num_seats: usize,
@@ -1102,17 +1333,18 @@ impl PyBatchedEngine {
         opp_outcome_mc: usize,
         variant: &str,
         sb: u64,
+        obs_rev: Option<u8>,
     ) -> PyResult<Self> {
         if num_envs == 0 {
             return Err(PyValueError::new_err("num_envs must be >= 1"));
         }
-        if num_seats < 2 {
-            return Err(PyValueError::new_err("num_seats must be >= 2"));
-        }
-        // 0 is allowed: skips the fused outcome_features_mc pass entirely
-        // (zeros the opp-outcome / per-board / share-bound slots). Used by
-        // obs_mode=minimal training which never consumes those features.
         let variant = parse_variant(variant)?;
+        validate_table(num_seats, variant, bb)?;
+        let obs_rev = resolve_obs_rev(obs_rev)?;
+        // opp_outcome_mc == 0 is allowed: skips the fused outcome_features_mc
+        // pass entirely (zeros the opp-outcome / per-board / share-bound
+        // slots). Used by obs_mode=minimal training which never consumes
+        // those features.
         let stacks = resolve_starting_stacks(num_seats, starting_stack, starting_stacks)?;
         Ok(PyBatchedEngine {
             states: (0..num_envs).map(|_| None).collect(),
@@ -1125,8 +1357,22 @@ impl PyBatchedEngine {
                 variant,
             },
             opp_outcome_mc,
-            outcome_cache: std::sync::Mutex::new(vec![None; num_envs]),
+            outcome_cache: std::sync::Mutex::new(OutcomeCache::new(num_envs, num_seats)),
+            obs_rev,
         })
+    }
+
+    /// Observation-semantics revision the fused encoders of this engine emit.
+    fn obs_rev(&self) -> u8 {
+        self.obs_rev
+    }
+
+    /// Same as the module-level `obs_semantics_rev()` (the revision
+    /// `PLO5BP_OBS_REV` selects right now).
+    #[staticmethod]
+    #[pyo3(name = "obs_semantics_rev")]
+    fn obs_semantics_rev_static() -> PyResult<u8> {
+        obs_rev_from_env()
     }
 
     fn num_envs(&self) -> usize {
@@ -1147,6 +1393,8 @@ impl PyBatchedEngine {
         bb: u64,
         sb: u64,
     ) -> PyResult<()> {
+        // num_seats / variant are fixed at construction; re-check the rest.
+        validate_table(self.config.num_seats, self.config.variant, bb)?;
         let stacks = resolve_starting_stacks(
             self.config.num_seats,
             /*starting_stack=*/ 0,
@@ -1160,11 +1408,19 @@ impl PyBatchedEngine {
         for st in self.states.iter_mut() {
             *st = None;
         }
-        let mut cache = self.outcome_cache.lock().unwrap();
-        for slot in cache.iter_mut() {
+        let cache = self.outcome_cache.get_mut().unwrap();
+        for slot in cache.slots.iter_mut() {
             *slot = None;
         }
         Ok(())
+    }
+
+    /// `(lookups, hits)` of the opp-outcome MC memo since construction. A
+    /// lookup is one live PLO row with a flop on both boards; a hit reused
+    /// the cached 22-dim result instead of re-running the MC.
+    fn outcome_cache_stats(&self) -> (u64, u64) {
+        let cache = self.outcome_cache.lock().unwrap();
+        (cache.lookups, cache.hits)
     }
 
     fn num_seats(&self) -> usize {
@@ -1205,19 +1461,16 @@ impl PyBatchedEngine {
         py: Python<'py>,
         indices: PyReadonlyArray1<'_, i64>,
     ) -> PyResult<Bound<'py, PyArray3<u8>>> {
-        let idx: Vec<usize> = indices.as_slice()?.iter().map(|&x| x as usize).collect();
+        let idx = checked_env_indices(
+            indices.as_slice()?,
+            self.states.len(),
+            "all_hole_cards_subset_batch",
+        )?;
         let k = idx.len();
         let s = self.config.num_seats;
         let hole_w = self.config.variant.hole_count();
         let mut arr = numpy::ndarray::Array3::<u8>::from_elem((k, s, hole_w), 255u8);
         for (j, &ei) in idx.iter().enumerate() {
-            if ei >= self.states.len() {
-                return Err(PyValueError::new_err(format!(
-                    "all_hole_cards_subset_batch: index {} out of range (n={})",
-                    ei,
-                    self.states.len()
-                )));
-            }
             if let Some(g) = self.states[ei].as_ref() {
                 for seat in 0..s {
                     for c in 0..hole_w {
@@ -1267,8 +1520,10 @@ impl PyBatchedEngine {
                 .map(|i| GameState::new_hand(config.clone(), seeds_vec[i], buttons_vec[i] as usize))
                 .collect()
         });
+        let cache = self.outcome_cache.get_mut().unwrap();
         for (i, s) in new_states.into_iter().enumerate() {
             self.states[i] = Some(s);
+            cache.clear_env(i, num_seats);
         }
         Ok(())
     }
@@ -1321,9 +1576,11 @@ impl PyBatchedEngine {
                 })
                 .collect()
         });
+        let cache = self.outcome_cache.get_mut().unwrap();
         for (i, s) in new_states.into_iter().enumerate() {
             if let Some(state) = s {
                 self.states[i] = Some(state);
+                cache.clear_env(i, num_seats);
             }
         }
         Ok(())
@@ -1771,6 +2028,9 @@ impl PyBatchedEngine {
     ///                                          (scoop_opp, quarter_opp,
     ///                                           scoop_hero, quarter_hero).
     ///                                          All-zero pre-flop / terminal.
+    /// - `sb_seat` / `bb_seat` (N,)   i8   — blind seats, -1 when the variant has none.
+    /// - `nlh_opp_outcome`   (N, 3)   f32  — NLH [opp_ahead, tied, opp_behind];
+    ///                                        all-zero for PLO variants.
     fn observation_arrays<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let n = self.states.len();
         let s = self.config.num_seats;
@@ -1818,6 +2078,12 @@ impl PyBatchedEngine {
         )?;
         d.set_item("hero_board_v3", packed.hero_board_v3.into_pyarray(py))?;
         d.set_item("board_draw_v3", packed.board_draw_v3.into_pyarray(py))?;
+        // Same keys as the other dict builders (review 2026-09-20 C4): without
+        // these an `nlh_single` engine's observation_arrays() could not feed
+        // `encode_observation_batch_nlh` (KeyError on the blind seats).
+        d.set_item("sb_seat", packed.sb_seat.into_pyarray(py))?;
+        d.set_item("bb_seat", packed.bb_seat.into_pyarray(py))?;
+        d.set_item("nlh_opp_outcome", packed.nlh_opp_outcome.into_pyarray(py))?;
         Ok(d)
     }
 
@@ -1928,7 +2194,11 @@ impl PyBatchedEngine {
         py: Python<'py>,
         indices: PyReadonlyArray1<'_, i64>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let idx: Vec<usize> = indices.as_slice()?.iter().map(|&x| x as usize).collect();
+        let idx = checked_env_indices(
+            indices.as_slice()?,
+            self.states.len(),
+            "observation_and_features_subset_batch",
+        )?;
         let k = idx.len();
         let s = self.config.num_seats;
 
@@ -2026,7 +2296,11 @@ impl PyBatchedEngine {
         py: Python<'py>,
         indices: PyReadonlyArray1<'_, i64>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let idx: Vec<usize> = indices.as_slice()?.iter().map(|&x| x as usize).collect();
+        let idx = checked_env_indices(
+            indices.as_slice()?,
+            self.states.len(),
+            "observation_encoded_subset_batch",
+        )?;
         self.encode_indexed(py, &idx)
     }
 
@@ -2049,7 +2323,11 @@ impl PyBatchedEngine {
         py: Python<'py>,
         indices: PyReadonlyArray1<'_, i64>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let idx: Vec<usize> = indices.as_slice()?.iter().map(|&x| x as usize).collect();
+        let idx = checked_env_indices(
+            indices.as_slice()?,
+            self.states.len(),
+            "observation_encoded_minimal_subset_batch",
+        )?;
         self.encode_indexed_minimal(py, &idx)
     }
 }
@@ -2191,28 +2469,43 @@ impl PyBatchedEngine {
         } else {
             let opp_outcome_mc = self.opp_outcome_mc;
             let states = &self.states;
-            // Per-env deterministic outcome seed (cheap hash of hero + street +
-            // both boards). The fused MC is a pure function of exactly those, so
-            // it is constant across a street's actions; recompute only when the
-            // seed changes (street advance / new hand) and reuse the cached
-            // 20-dim result otherwise. Bit-exact vs always-recompute — pinned by
-            // test_encoding_rust (cached batched == fresh serial). Non-actor /
-            // <3-board rows have seed None and stay all-zeros, matching the
-            // early return in `outcome_features_mc`.
-            let seeds: Vec<Option<u64>> = (0..n)
+            // Per-row (cache slot, deterministic outcome seed). The seed is a
+            // cheap hash of the actor's hole + street + both boards; the fused
+            // MC is a pure function of exactly those, so it is constant for a
+            // given SEAT across a street — NOT across a street's actions (the
+            // actor, hence the hole, changes every action), which is why the
+            // slot is per (env, seat) (review 2026-09-20 C6). Recompute only
+            // when that seat's seed changed (street advance / new hand) and
+            // reuse the cached 22-dim result otherwise. Bit-exact vs
+            // always-recompute — pinned by test_encoding_rust (cached batched
+            // == fresh serial). Non-actor / <3-board rows have key None and
+            // stay all-zeros, matching the early return in
+            // `outcome_features_mc`.
+            let keys: Vec<Option<(usize, u64)>> = (0..n)
                 .into_par_iter()
-                .map(|i| states[idx[i]].as_ref().and_then(|st| st.outcome_seed()))
+                .map(|i| {
+                    let st = states[idx[i]].as_ref()?;
+                    let seed = st.outcome_seed()?;
+                    let actor = st.current_actor()?;
+                    Some((idx[i] * s + actor, seed))
+                })
                 .collect();
-            // Decide which envs need a fresh MC (seed changed, or never cached).
+            // Decide which rows need a fresh MC (seed changed, or never cached).
             let recompute: Vec<usize> = {
-                let cache = self.outcome_cache.lock().unwrap();
-                (0..n)
-                    .filter(|&i| match (seeds[i], &cache[idx[i]]) {
-                        (Some(sd), Some((csd, _))) => sd != *csd,
-                        (Some(_), None) => true,
-                        (None, _) => false,
+                let mut cache = self.outcome_cache.lock().unwrap();
+                let mut lookups = 0u64;
+                let recompute: Vec<usize> = (0..n)
+                    .filter(|&i| match keys[i] {
+                        Some((slot, sd)) => {
+                            lookups += 1;
+                            !matches!(cache.slots[slot], Some((csd, _)) if csd == sd)
+                        }
+                        None => false,
                     })
-                    .collect()
+                    .collect();
+                cache.lookups += lookups;
+                cache.hits += lookups - recompute.len() as u64;
+                recompute
             };
             // Expensive fused pass — only for the changed envs (12 joint
             // fractions + 8 per-board dims, obs v2 P1).
@@ -2227,19 +2520,22 @@ impl PyBatchedEngine {
                     (i, out)
                 })
                 .collect();
-            // Store fresh results, then assemble every env's vector from the
-            // cache (unchanged envs reuse; None-seed envs stay all-zeros).
+            // Store fresh results, then assemble every row's vector from the
+            // cache (unchanged seats reuse; None-key rows stay all-zeros).
             let opp_fr_per_env: Vec<[f32; 22]> = {
                 let mut cache = self.outcome_cache.lock().unwrap();
                 for &(i, out) in &fresh {
-                    if let Some(sd) = seeds[i] {
-                        cache[idx[i]] = Some((sd, out));
+                    if let Some((slot, sd)) = keys[i] {
+                        cache.slots[slot] = Some((sd, out));
                     }
                 }
                 (0..n)
-                    .map(|i| match (seeds[i], &cache[idx[i]]) {
-                        (Some(_), Some((_, out))) => *out,
-                        _ => [0.0f32; 22],
+                    .map(|i| match keys[i] {
+                        Some((slot, _)) => match &cache.slots[slot] {
+                            Some((_, out)) => *out,
+                            None => [0.0f32; 22],
+                        },
+                        None => [0.0f32; 22],
                     })
                     .collect()
             };
@@ -2491,6 +2787,7 @@ impl PyBatchedEngine {
         let s = self.config.num_seats;
         let bb = self.config.bb;
         let ante = self.config.ante;
+        let obs_rev = self.obs_rev;
         let starting = self.config.starting_stacks.clone();
 
         let (obs_vec, packed, legal_mask) = py.allow_threads(|| {
@@ -2525,7 +2822,10 @@ impl PyBatchedEngine {
                 .par_chunks_exact_mut(obs_layout::OBS_DIM)
                 .enumerate()
                 .for_each(|(j, row)| {
-                    encode_obs_row(&packed, j, s, cat_a[j], cat_b[j], inv_bb, ante, &starting, row);
+                    encode_obs_row(
+                        &packed, j, s, cat_a[j], cat_b[j], inv_bb, bb, ante, &starting,
+                        obs_rev, row,
+                    );
                 });
 
             (obs_vec, packed, legal_mask)
@@ -2565,6 +2865,7 @@ impl PyBatchedEngine {
         let n = idx.len();
         let s = self.config.num_seats;
         let bb = self.config.bb;
+        let obs_rev = self.obs_rev;
         let starting = self.config.starting_stacks.clone();
 
         let (obs_vec, packed, legal_mask) = py.allow_threads(|| {
@@ -2591,7 +2892,7 @@ impl PyBatchedEngine {
                 .par_chunks_exact_mut(obs_layout_minimal::OBS_DIM_MINIMAL)
                 .enumerate()
                 .for_each(|(j, row)| {
-                    encode_obs_row_minimal(&packed, j, s, inv_bb, &starting, row);
+                    encode_obs_row_minimal(&packed, j, s, inv_bb, bb, &starting, obs_rev, row);
                 });
 
             (obs_vec, packed, legal_mask)
@@ -2637,6 +2938,7 @@ impl PyBatchedEngine {
         let mut bet_to_call = Array1::<u64>::zeros(n);
         let mut street_commit = Array2::<u64>::zeros((n, s));
         let mut total_commit = Array2::<u64>::zeros((n, s));
+        // min_bet / max_bet: read by the rev-1 scalars only (OBS_REV_LEGACY).
         let mut min_bet = Array1::<u64>::zeros(n);
         let mut max_bet = Array1::<u64>::zeros(n);
         let mut min_raise = Array1::<u64>::zeros(n);
@@ -2945,6 +3247,59 @@ mod obs_layout_minimal {
     pub const HERO_BTN_OFF: usize = 788;
 }
 
+/// The raise window an observation describes, as chip DELTAS the actor adds.
+/// Twin of `_RaiseWindow` (python/plo5bp/encoding.py) — keep in lockstep.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RaiseWindow {
+    /// Raise available: the STK-2 / STK-5[2:4] gate.
+    legal: bool,
+    min_d: f64,
+    max_d: f64,
+    /// Min fed to the legal-anchor count (the max is `max_d`).
+    anchor_min: f64,
+}
+
+/// Rev 2: the LEGAL raise window. Twin of `_legal_raise_window`.
+///
+/// PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 B1/B3; obs_rev 2): the
+/// raise-window dims (scalars min/max, v7 STK-2, STK-5[2:4]) come from the
+/// engine's legal `min_raise_chips()`/`max_raise_chips()`, not from
+/// `min_bet_total()`/`max_bet_total()`: the totals are not capped by the
+/// actor's own stack, ignore the short-shove lockout, and `max_bet_total()` is
+/// the deepest opponent's RAW reach (breaks dead-chip invariance).
+///
+/// `legal` mirrors the env's Raise gate (`actions.gate_mask_from_bounds`):
+/// `max_raise > 0`, and a sub-1bb raise only counts as hero's own all-in — with
+/// `max_raise > 0`, `legal[AllIn]` holds exactly when hero's stack is the
+/// binding cap (`max_raise == stack`); the other case is the cover-short DUST
+/// the gate screens off. Short-shove regime (`min_raise == 0 < max_raise`): the
+/// only legal size is `max_raise`, so `min_d == max_d`, while `anchor_min`
+/// stays the RAW `min_raise` (0) — how the anchor count detects the regime.
+#[inline]
+fn legal_raise_window(
+    min_raise: u64,
+    max_raise: u64,
+    hero_stack_raw: u64,
+    bb: u64,
+) -> RaiseWindow {
+    let anchor_min = min_raise as f64;
+    if max_raise == 0 || (max_raise < bb && max_raise != hero_stack_raw) {
+        return RaiseWindow { legal: false, min_d: 0.0, max_d: 0.0, anchor_min };
+    }
+    let min_d = if min_raise > 0 { min_raise } else { max_raise };
+    RaiseWindow { legal: true, min_d: min_d as f64, max_d: max_raise as f64, anchor_min }
+}
+
+/// Rev 1 (pre-2026-09-20, kept bit-exact for old checkpoints): the window
+/// recovered from the `min_bet_total()`/`max_bet_total()` TOTALS. Known-wrong —
+/// see `legal_raise_window`. Twin of `_legacy_raise_window`.
+#[inline]
+fn legacy_raise_window(min_bet: u64, max_bet: u64, hero_sc: f64, to_call: f64) -> RaiseWindow {
+    let min_d = min_bet as f64 - hero_sc;
+    let max_d = max_bet as f64 - hero_sc;
+    RaiseWindow { legal: max_d > to_call, min_d, max_d, anchor_min: min_d }
+}
+
 /// Encode one env into bare-visibility `out` (length OBS_DIM_MINIMAL=796,
 /// pre-zeroed). Bit-exact with python `encode_observation_minimal` /
 /// `encode_observation_batch_minimal`. Terminal rows (actor < 0) stay zero.
@@ -2953,7 +3308,9 @@ fn encode_obs_row_minimal(
     j: usize,
     num_seats: usize,
     inv_bb: f64,
+    bb: u64,
     starting: &[u64],
+    obs_rev: u8,
     out: &mut [f32],
 ) {
     use obs_layout_minimal::*;
@@ -3019,8 +3376,25 @@ fn encode_obs_row_minimal(
     let btc = packed.bet_to_call[j] as f64;
     out[SCALARS_OFF] = (pot * inv_bb) as f32;
     out[SCALARS_OFF + 1] = (btc * inv_bb) as f32;
-    out[SCALARS_OFF + 2] = (packed.min_bet[j] as f64 * inv_bb) as f32;
-    out[SCALARS_OFF + 3] = (packed.max_bet[j] as f64 * inv_bb) as f32;
+    if obs_rev == OBS_REV_LEGACY {
+        // Rev 1: min_bet_total()/max_bet_total() verbatim.
+        out[SCALARS_OFF + 2] = (packed.min_bet[j] as f64 * inv_bb) as f32;
+        out[SCALARS_OFF + 3] = (packed.max_bet[j] as f64 * inv_bb) as f32;
+    } else {
+        // PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 B3): slots 2/3 are the
+        // LEGAL raise window as street totals (0/0 when Raise is illegal).
+        let window = legal_raise_window(
+            packed.min_raise[j],
+            packed.max_raise[j],
+            packed.stacks[[j, hero]],
+            bb,
+        );
+        if window.legal {
+            let hero_sc = packed.street_commit[[j, hero]] as f64;
+            out[SCALARS_OFF + 2] = ((hero_sc + window.min_d) * inv_bb) as f32;
+            out[SCALARS_OFF + 3] = ((hero_sc + window.max_d) * inv_bb) as f32;
+        }
+    }
 
     // History (oldest-first). REL_POS is dropped in minimal — history starts
     // at HISTORY_OFF=188 (8 dims earlier than full's 196).
@@ -3093,8 +3467,10 @@ fn encode_obs_row(
     cat_a: u8,
     cat_b: u8,
     inv_bb: f64,
+    bb: u64,
     ante: u64,
     starting: &[u64],
+    obs_rev: u8,
     out: &mut [f32],
 ) {
     use obs_layout::*;
@@ -3167,13 +3543,32 @@ fn encode_obs_row(
         out[STACKS_OFF + k] = (eff_per_seat[seat] * inv_bb) as f32;
     }
 
-    // --- Scalars: pot, bet_to_call, min_bet, max_bet (all / bb). ---
+    // --- Scalars: pot, bet_to_call, legal min/max raise total (all / bb). ---
     let pot = packed.pot[j] as f64;
     let btc = packed.bet_to_call[j] as f64;
     out[SCALARS_OFF] = (pot * inv_bb) as f32;
     out[SCALARS_OFF + 1] = (btc * inv_bb) as f32;
-    out[SCALARS_OFF + 2] = (packed.min_bet[j] as f64 * inv_bb) as f32;
-    out[SCALARS_OFF + 3] = (packed.max_bet[j] as f64 * inv_bb) as f32;
+    let legacy = obs_rev == OBS_REV_LEGACY;
+    let legal_window = legal_raise_window(
+        packed.min_raise[j],
+        packed.max_raise[j],
+        packed.stacks[[j, hero]],
+        bb,
+    );
+    if legacy {
+        // Rev 1: min_bet_total()/max_bet_total() verbatim.
+        out[SCALARS_OFF + 2] = (packed.min_bet[j] as f64 * inv_bb) as f32;
+        out[SCALARS_OFF + 3] = (packed.max_bet[j] as f64 * inv_bb) as f32;
+    } else if legal_window.legal {
+        // PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 B3, dims 186/187): the
+        // LEGAL raise window as street totals — street_commit[hero] + the
+        // engine's min/max raise delta, 0/0 when Raise is illegal. Was
+        // min_bet_total()/max_bet_total() (the deepest opponent's raw reach
+        // leaked in).
+        let hero_sc = packed.street_commit[[j, hero]] as f64;
+        out[SCALARS_OFF + 2] = ((hero_sc + legal_window.min_d) * inv_bb) as f32;
+        out[SCALARS_OFF + 3] = ((hero_sc + legal_window.max_d) * inv_bb) as f32;
+    }
 
     // --- Relative position one-hot: actor is always slot 0 (hero == actor). ---
     out[REL_POS_OFF] = 1.0;
@@ -3258,8 +3653,8 @@ fn encode_obs_row(
     }
 
     // --- Draw flags (per board). ---
-    let (fa, sa) = draw_flags_one_board(&hole_suit_count, hole_rank_mask, ba_slice);
-    let (fb, sb) = draw_flags_one_board(&hole_suit_count, hole_rank_mask, bb_slice);
+    let (fa, sa) = draw_flags_one_board(&hole_suit_count, hole_rank_mask, ba_slice, obs_rev);
+    let (fb, sb) = draw_flags_one_board(&hole_suit_count, hole_rank_mask, bb_slice, obs_rev);
     out[DRAW_A_OFF] = fa;
     out[DRAW_A_OFF + 1] = sa;
     out[DRAW_B_OFF] = fb;
@@ -3401,9 +3796,16 @@ fn encode_obs_row(
     for m in 0..8 {
         out[PER_BOARD_OUTCOME_OFF + m] = packed.per_board_outcome[[j, m]];
     }
-    // Unconditional blockers-to-nuts per board (4 dims each).
-    blocker_features_one_board(hole_slice, ba_slice, &mut out[BLOCKER_A_OFF..BLOCKER_A_OFF + 4]);
-    blocker_features_one_board(hole_slice, bb_slice, &mut out[BLOCKER_B_OFF..BLOCKER_B_OFF + 4]);
+    // Unconditional blockers-to-nuts per board (4 dims each). Rev 2 also hands
+    // over the OTHER board — its face-up cards are not holdable (review
+    // 2026-09-20 B5); rev 1 keeps the board-local flush dims.
+    let (other_a, other_b): (&[u8], &[u8]) = if legacy { (&[], &[]) } else { (bb_slice, ba_slice) };
+    blocker_features_one_board(
+        hole_slice, ba_slice, other_a, &mut out[BLOCKER_A_OFF..BLOCKER_A_OFF + 4],
+    );
+    blocker_features_one_board(
+        hole_slice, bb_slice, other_b, &mut out[BLOCKER_B_OFF..BLOCKER_B_OFF + 4],
+    );
     // Effective price: to_call capped by hero's EFFECTIVE remaining stack, plus
     // commitment fraction and log1p money companions. f64 throughout, cast on store.
     let hero_stack = eff_per_seat[hero];
@@ -3428,6 +3830,13 @@ fn encode_obs_row(
     }
 
     // ===== v7 batch-2 tail (dims 1020..1171) =====
+    // The raise window STK-2 / STK-5[2:4] describe: legal (rev 2) or the
+    // totals-derived one (rev 1).
+    let window = if legacy {
+        legacy_raise_window(packed.min_bet[j], packed.max_bet[j], hero_street_commit, to_call)
+    } else {
+        legal_window
+    };
     encode_v7_tail(
         packed,
         j,
@@ -3444,6 +3853,7 @@ fn encode_obs_row(
         pot_safe,
         hero_stack,
         eff_to_call,
+        &window,
         hole_slice,
         ba_slice,
         bb_slice,
@@ -3456,21 +3866,32 @@ fn encode_obs_row(
 /// blocker + top-3 held, nut-straight window blockers, top board-pair blocker.
 /// `out` is a 4-wide pre-zeroed slice. Divisions are done in f64 then cast to
 /// f32 (matching numpy's `held / 3.0` → f32-array assignment).
-fn blocker_features_one_board(hole: &[u8], board: &[u8], out: &mut [f32]) {
+/// `other_board` is the OTHER board's row: its face-up cards are in nobody's
+/// hand, so the flush dims skip them when ranking the "missing" suit cards.
+fn blocker_features_one_board(hole: &[u8], board: &[u8], other_board: &[u8], out: &mut [f32]) {
     let mut board_rank_counts = [0i32; 13];
     let mut board_suit_counts = [0i32; 4];
-    let mut board_suit_ranks = [0u16; 4]; // rank bitmask per suit
+    let mut faceup_suit_ranks = [0u16; 4]; // rank bitmask per suit, EITHER board
     let mut nboard = 0usize;
     for &c in board {
         if c < 52 {
             nboard += 1;
             board_rank_counts[(c >> 2) as usize] += 1;
             board_suit_counts[(c & 3) as usize] += 1;
-            board_suit_ranks[(c & 3) as usize] |= 1u16 << (c >> 2);
+            faceup_suit_ranks[(c & 3) as usize] |= 1u16 << (c >> 2);
         }
     }
     if nboard < 3 {
         return;
+    }
+    // PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 B5, dims 999/1000 and
+    // 1003/1004): "missing" excludes cards visible on the OTHER board too —
+    // they used to count as holdable, so hero's Qs read 0 on a Ks-high spade
+    // board although the As lay face-up on the other board.
+    for &c in other_board {
+        if c < 52 {
+            faceup_suit_ranks[(c & 3) as usize] |= 1u16 << (c >> 2);
+        }
     }
     let mut hero_rank_counts = [0i32; 13];
     let mut hero_cards: u64 = 0;
@@ -3486,7 +3907,7 @@ fn blocker_features_one_board(hole: &[u8], board: &[u8], out: &mut [f32]) {
         if board_suit_counts[s] >= 3 {
             let mut missing: Vec<usize> = Vec::with_capacity(13);
             for r in (0..13usize).rev() {
-                if board_suit_ranks[s] & (1u16 << r) == 0 {
+                if faceup_suit_ranks[s] & (1u16 << r) == 0 {
                     missing.push(r);
                 }
             }
@@ -3547,6 +3968,14 @@ fn blocker_features_one_board(hole: &[u8], board: &[u8], out: &mut [f32]) {
             break;
         }
     }
+}
+
+/// C-contiguous owned copy of a 2-D pyfunction input. `to_owned()` preserves an
+/// F-ordered (or otherwise strided) layout, whose rows are NOT contiguous, so
+/// the per-row `as_slice().unwrap()` in the four feature pyfunctions panicked
+/// on e.g. `np.asfortranarray(hole)` (review 2026-09-20 C4).
+fn owned_c_order<T: Clone>(v: numpy::ndarray::ArrayView2<'_, T>) -> Array2<T> {
+    v.as_standard_layout().into_owned()
 }
 
 // =============================================================================
@@ -3761,8 +4190,10 @@ pub fn straight_flush_features_batch<'py>(
     let vc_v = visible_count.as_array();
 
     let n = hole_v.shape()[0];
-    let hole_w = if n > 0 { hole_v.shape()[1] } else { 5 };
-    if !(4..=6).contains(&hole_w) || hole_v.shape() != [n, hole_w] {
+    // Width straight from the array: an EMPTY PLO4/PLO6 batch is (0, 4) /
+    // (0, 6), which the old `n > 0 ? shape[1] : 5` guess rejected.
+    let hole_w = hole_v.shape()[1];
+    if !(4..=6).contains(&hole_w) {
         return Err(PyValueError::new_err(
             "hole shape must be (N, 4), (N, 5), or (N, 6)",
         ));
@@ -3778,11 +4209,12 @@ pub fn straight_flush_features_batch<'py>(
         ));
     }
 
-    // Materialize owned copies so the parallel section runs GIL-free.
-    let hole_owned = hole_v.to_owned();
-    let ba_owned = ba_v.to_owned();
-    let bb_owned = bb_v.to_owned();
-    let vc_owned = vc_v.to_owned();
+    // Materialize owned C-order copies so the parallel section runs GIL-free
+    // and every row is a contiguous slice (see `owned_c_order`).
+    let hole_owned = owned_c_order(hole_v);
+    let ba_owned = owned_c_order(ba_v);
+    let bb_owned = owned_c_order(bb_v);
+    let vc_owned = vc_v.to_owned(); // indexed element-wise, layout-agnostic
 
     let mut sf_a = vec![0f32; n * 38];
     let mut sf_b = vec![0f32; n * 38];
@@ -4114,9 +4546,9 @@ pub fn cross_board_straight_batch<'py>(
         return Err(PyValueError::new_err("valid shape must be (N,)"));
     }
 
-    let hole_owned = hole_v.to_owned();
-    let ba_owned = ba_v.to_owned();
-    let bb_owned = bb_v.to_owned();
+    let hole_owned = owned_c_order(hole_v);
+    let ba_owned = owned_c_order(ba_v);
+    let bb_owned = owned_c_order(bb_v);
     let valid_owned = valid_v.to_owned();
 
     let mut made_both = vec![0f32; n];
@@ -4157,6 +4589,7 @@ fn draw_flags_one_board(
     hole_suit_count: &[u8; 4],
     hole_rank_mask: u16,
     board_row: &[u8],
+    obs_rev: u8,
 ) -> (f32, f32) {
     let mut board_suit_count: [u8; 4] = [0; 4];
     let mut board_rank_mask: u16 = 0;
@@ -4183,11 +4616,20 @@ fn draw_flags_one_board(
     }
 
     let rank_mask = hole_rank_mask | board_rank_mask;
-    // Ace-low shadow: if bit 12 (ace) is set, also set bit 13. Window check
-    // looks for 4 consecutive ranks across bits {0..13}, matching the
-    // scalar `_draw_flags` (popcount>=4 over a 4-bit window).
+    // Rev 2: ranks shifted up one (rank r -> bit r+1) with the ace-low shadow
+    // at bit 0, BELOW the deuce. Window check looks for 4 consecutive ranks
+    // across bits {0..13} — A234 (start 0) through JQKA (start 10) —
+    // matching the scalar `_draw_flags`.
+    // PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 B2, dims 800/802): in
+    // rev 1 (kept for old checkpoints) the shadow sits at bit 13, ABOVE the
+    // ace, so Q-K-A reads as 4-in-a-row (false positive) and A-2-3-4 never
+    // fires (false negative).
     let ace_bit = (rank_mask >> 12) & 1;
-    let extended = rank_mask | (ace_bit << 13);
+    let extended = if obs_rev == OBS_REV_LEGACY {
+        rank_mask | (ace_bit << 13)
+    } else {
+        (rank_mask << 1) | ace_bit
+    };
     let mut straight = false;
     for start in 0..11u32 {
         if (extended >> start) & 0b1111 == 0b1111 {
@@ -4202,25 +4644,33 @@ fn draw_flags_one_board(
     )
 }
 
+/// `obs_rev` selects the straight flag's ace handling (see
+/// `draw_flags_one_board`); the numpy batch encoder passes
+/// `encoding.OBS_SEMANTICS_REV` explicitly. Default = the current revision.
 #[pyfunction]
+#[pyo3(signature = (hole, board_a, board_b, obs_rev=OBS_REV_CURRENT))]
 pub fn draw_flags_batch<'py>(
     py: Python<'py>,
     hole: PyReadonlyArray2<'_, u8>,
     board_a: PyReadonlyArray2<'_, u8>,
     board_b: PyReadonlyArray2<'_, u8>,
+    obs_rev: u8,
 ) -> PyResult<(
     Bound<'py, PyArray1<f32>>,
     Bound<'py, PyArray1<f32>>,
     Bound<'py, PyArray1<f32>>,
     Bound<'py, PyArray1<f32>>,
 )> {
+    let obs_rev = check_obs_rev(obs_rev)?;
     let hole_v = hole.as_array();
     let ba_v = board_a.as_array();
     let bb_v = board_b.as_array();
 
     let n = hole_v.shape()[0];
-    let hole_w = if n > 0 { hole_v.shape()[1] } else { 5 };
-    if !(4..=6).contains(&hole_w) || hole_v.shape() != [n, hole_w] {
+    // Width straight from the array: an EMPTY PLO4/PLO6 batch is (0, 4) /
+    // (0, 6), which the old `n > 0 ? shape[1] : 5` guess rejected.
+    let hole_w = hole_v.shape()[1];
+    if !(4..=6).contains(&hole_w) {
         return Err(PyValueError::new_err(
             "hole shape must be (N, 4), (N, 5), or (N, 6)",
         ));
@@ -4231,9 +4681,9 @@ pub fn draw_flags_batch<'py>(
         ));
     }
 
-    let hole_owned = hole_v.to_owned();
-    let ba_owned = ba_v.to_owned();
-    let bb_owned = bb_v.to_owned();
+    let hole_owned = owned_c_order(hole_v);
+    let ba_owned = owned_c_order(ba_v);
+    let bb_owned = owned_c_order(bb_v);
 
     let mut flush_a = vec![0f32; n];
     let mut straight_a = vec![0f32; n];
@@ -4263,10 +4713,18 @@ pub fn draw_flags_batch<'py>(
 
                 let ba_slice = ba_owned.row(i);
                 let bb_slice = bb_owned.row(i);
-                let (fa_v, sa_v) =
-                    draw_flags_one_board(&hole_suit_count, hole_rank_mask, ba_slice.as_slice().unwrap());
-                let (fb_v, sb_v) =
-                    draw_flags_one_board(&hole_suit_count, hole_rank_mask, bb_slice.as_slice().unwrap());
+                let (fa_v, sa_v) = draw_flags_one_board(
+                    &hole_suit_count,
+                    hole_rank_mask,
+                    ba_slice.as_slice().unwrap(),
+                    obs_rev,
+                );
+                let (fb_v, sb_v) = draw_flags_one_board(
+                    &hole_suit_count,
+                    hole_rank_mask,
+                    bb_slice.as_slice().unwrap(),
+                    obs_rev,
+                );
                 *fa = fa_v;
                 *sa = sa_v;
                 *fb = fb_v;
@@ -4363,8 +4821,10 @@ pub fn pair_features_batch<'py>(
     let bb_v = board_b.as_array();
 
     let n = hole_v.shape()[0];
-    let hole_w = if n > 0 { hole_v.shape()[1] } else { 5 };
-    if !(4..=6).contains(&hole_w) || hole_v.shape() != [n, hole_w] {
+    // Width straight from the array: an EMPTY PLO4/PLO6 batch is (0, 4) /
+    // (0, 6), which the old `n > 0 ? shape[1] : 5` guess rejected.
+    let hole_w = hole_v.shape()[1];
+    if !(4..=6).contains(&hole_w) {
         return Err(PyValueError::new_err(
             "hole shape must be (N, 4), (N, 5), or (N, 6)",
         ));
@@ -4375,9 +4835,9 @@ pub fn pair_features_batch<'py>(
         ));
     }
 
-    let hole_owned = hole_v.to_owned();
-    let ba_owned = ba_v.to_owned();
-    let bb_owned = bb_v.to_owned();
+    let hole_owned = owned_c_order(hole_v);
+    let ba_owned = owned_c_order(ba_v);
+    let bb_owned = owned_c_order(bb_v);
 
     let mut counts_a = vec![0f32; n * 5];
     let mut struct_a = vec![0f32; n * 4];
@@ -4538,7 +4998,7 @@ mod encoder_port_tests {
                 hrm |= 1u16 << (c >> 2);
             }
         }
-        let (f, s) = draw_flags_one_board(&hsc, hrm, &empty_board);
+        let (f, s) = draw_flags_one_board(&hsc, hrm, &empty_board, OBS_REV_CURRENT);
         assert_eq!(f, 0.0);
         assert_eq!(s, 0.0);
     }
@@ -4557,8 +5017,218 @@ mod encoder_port_tests {
                 hrm |= 1u16 << (c >> 2);
             }
         }
-        let (f, _) = draw_flags_one_board(&hsc, hrm, &board);
+        let (f, _) = draw_flags_one_board(&hsc, hrm, &board, OBS_REV_CURRENT);
         assert_eq!(f, 1.0);
+    }
+
+    /// (hole_suit_count, hole_rank_mask) the way the encoders derive them.
+    fn hole_summary(hole: &[u8]) -> ([u8; 4], u16) {
+        let mut hsc: [u8; 4] = [0; 4];
+        let mut hrm: u16 = 0;
+        for &c in hole {
+            if c < 52 {
+                hsc[(c & 3) as usize] += 1;
+                hrm |= 1u16 << (c >> 2);
+            }
+        }
+        (hsc, hrm)
+    }
+
+    /// review 2026-09-20 B2: in rev 2 the ace plays BOTH ends of the 4-run
+    /// ladder and nothing wraps around it; rev 1 keeps the old shadow-above-
+    /// the-ace values bit for bit.
+    #[test]
+    fn draw_flags_ace_low_shadow_sits_below_the_deuce() {
+        let straight = |hole: &[u8], board: &[u8], rev: u8| {
+            let (hsc, hrm) = hole_summary(hole);
+            draw_flags_one_board(&hsc, hrm, &pad5(board), rev).1
+        };
+        let qka_hole = [card(10, 3), card(11, 1), card(0, 0), card(5, 2), card(5, 1)];
+        let qka_board = [card(12, 2), card(1, 3), card(6, 0)];
+        let wheel_hole = [card(12, 3), card(0, 1), card(7, 0), card(7, 2), card(11, 1)];
+        let wheel_board = [card(1, 2), card(2, 3), card(9, 0)];
+        // Q-K-A is three cards at the top, not a 4-run (rev-1 false positive).
+        assert_eq!(straight(&qka_hole, &qka_board, OBS_REV_CURRENT), 0.0);
+        assert_eq!(straight(&qka_hole, &qka_board, OBS_REV_LEGACY), 1.0);
+        // A-2-3-4 wheel draw (rev-1 false negative).
+        assert_eq!(straight(&wheel_hole, &wheel_board, OBS_REV_CURRENT), 1.0);
+        assert_eq!(straight(&wheel_hole, &wheel_board, OBS_REV_LEGACY), 0.0);
+        for rev in [OBS_REV_LEGACY, OBS_REV_CURRENT] {
+            // J-Q-K-A fires and K-A-2-3 does not wrap, in both revisions.
+            assert_eq!(
+                straight(&[card(9, 3), card(10, 1)], &[card(11, 2), card(12, 3), card(6, 0)], rev),
+                1.0
+            );
+            assert_eq!(
+                straight(&[card(11, 3), card(12, 1)], &[card(0, 2), card(1, 3), card(9, 0)], rev),
+                0.0
+            );
+        }
+    }
+
+    /// review 2026-09-20 B5: a card face-up on the OTHER board is in nobody's
+    /// hand, so it is not the "top missing" flush card.
+    #[test]
+    fn blocker_flush_dims_skip_the_other_board() {
+        let hole = [card(10, 3), card(6, 0), card(6, 1), card(2, 2), card(1, 0)]; // Qs
+        let board_a = pad5(&[card(11, 3), card(5, 3), card(0, 3)]); // Ks 7s 2s
+        let board_b = pad5(&[card(12, 3), card(8, 1), card(3, 2)]); // As on B
+        let mut out = [0f32; 4];
+        blocker_features_one_board(&hole, &board_a, &board_b, &mut out);
+        assert_eq!(out[0], 1.0); // Qs is the top HOLDABLE spade
+        assert_eq!(out[1], (1.0f64 / 3.0) as f32); // of Qs/Js/Ts hero holds one
+        let mut alone = [0f32; 4];
+        blocker_features_one_board(&hole, &board_a, &pad5(&[]), &mut alone);
+        assert_eq!(alone[0], 0.0); // without board B the As is still "missing"
+    }
+
+    /// review 2026-09-20 B1/B3: regimes of the legal (rev 2) raise window, and
+    /// the totals-derived rev-1 window it replaced.
+    #[test]
+    fn raise_window_regimes() {
+        let bb = 10_000;
+        let w = |legal, min_d, max_d, anchor_min| RaiseWindow { legal, min_d, max_d, anchor_min };
+        // Normal raise.
+        assert_eq!(
+            legal_raise_window(20_000, 70_000, 70_000, bb),
+            w(true, 20_000.0, 70_000.0, 20_000.0)
+        );
+        // Short shove: min 0 < max — the only legal size is the all-in, and the
+        // anchor count still sees the RAW 0.
+        assert_eq!(legal_raise_window(0, 4_000, 4_000, bb), w(true, 4_000.0, 4_000.0, 0.0));
+        // No raise at all.
+        assert_eq!(legal_raise_window(0, 0, 50_000, bb), w(false, 0.0, 0.0, 0.0));
+        // Cover-short DUST: a sub-1bb raise that is NOT hero's own all-in is
+        // screened off by the env's Raise gate.
+        assert_eq!(legal_raise_window(4_000, 4_000, 900_000, bb), w(false, 0.0, 0.0, 4_000.0));
+        // A cover-short raise of >= 1bb is an ordinary (single-size) raise.
+        assert_eq!(
+            legal_raise_window(15_000, 15_000, 900_000, bb),
+            w(true, 15_000.0, 15_000.0, 15_000.0)
+        );
+        // Rev 1, the review's example: hero 7bb behind, min_bet 1bb / max_bet
+        // 18bb (the pot) as TOTALS, nothing committed, nothing to call — a
+        // "legal" 18bb raise out of a 7bb stack.
+        assert_eq!(
+            legacy_raise_window(10_000, 180_000, 0.0, 0.0),
+            w(true, 10_000.0, 180_000.0, 10_000.0)
+        );
+        // ... and "illegal" only when the totals cap sits at/below the call.
+        assert_eq!(
+            legacy_raise_window(360_000, 180_000, 0.0, 180_000.0),
+            w(false, 360_000.0, 180_000.0, 360_000.0)
+        );
+    }
+
+    /// Pack + encode env 0 of a one-env engine built around `state` (pure
+    /// Rust: no Python objects are touched).
+    fn encode_single(state: GameState, config: GameConfig, obs_rev: u8) -> Vec<f32> {
+        let s = config.num_seats;
+        let engine = PyBatchedEngine {
+            states: vec![Some(state)],
+            config: config.clone(),
+            opp_outcome_mc: 0,
+            outcome_cache: std::sync::Mutex::new(OutcomeCache::new(1, s)),
+            obs_rev,
+        };
+        let packed = engine.pack_observation_indexed(&[0], s);
+        let mut row = vec![0f32; obs_layout::OBS_DIM];
+        encode_obs_row(
+            &packed,
+            0,
+            s,
+            0,
+            0,
+            1.0 / config.bb as f64,
+            config.bb,
+            config.ante,
+            &config.starting_stacks,
+            obs_rev,
+            &mut row,
+        );
+        row
+    }
+
+    /// review 2026-09-20 B6: STK-10 sums antes over the DEALT-IN seats. The
+    /// batched engine never deals masked hands, so this is the only place the
+    /// Rust twin of that rule is exercised.
+    #[test]
+    fn stk10_pot_at_flop_skips_sitting_out_seats() {
+        let config = GameConfig {
+            num_seats: 6,
+            starting_stacks: vec![200_000; 6],
+            ante: 30_000,
+            bb: 10_000,
+            sb: 0,
+            variant: Variant::Plo5DoubleBomb,
+        };
+        let mask = vec![true, true, false, true, false, false];
+        let mut g = GameState::new_hand_with_mask(config.clone(), 5, 0, Some(mask));
+        assert_eq!(g.pot, 90_000); // three antes, not six
+        let bet = g.max_raise_chips();
+        assert!(bet > 0);
+        g.apply_raise_chips(bet).unwrap();
+        // Chips on top of the antes actually posted: bet / (3 antes). Six
+        // antes would have read max(90k + bet - 180k, 0) / 180k = 0.
+        let expected = (bet as f64 / 90_000.0).ln_1p() as f32;
+        assert!(expected > 0.0);
+        // B6 is NOT gated by the semantics revision.
+        for rev in [OBS_REV_LEGACY, OBS_REV_CURRENT] {
+            let row = encode_single(g.clone(), config.clone(), rev);
+            assert_eq!(row[obs_layout::STK10_OFF + 1], expected);
+        }
+    }
+
+    /// The semantics switch end to end through the fused row encoder, on the
+    /// review's B1 example (hero 7bb behind in an 18bb pot, first to act).
+    #[test]
+    fn obs_rev_switches_the_gated_dims_only() {
+        let config = GameConfig {
+            num_seats: 6,
+            starting_stacks: vec![100_000, 500_000, 500_000, 500_000, 500_000, 500_000],
+            ante: 30_000,
+            bb: 10_000,
+            sb: 0,
+            variant: Variant::Plo5DoubleBomb,
+        };
+        let g = (0..6)
+            .map(|button| GameState::new_hand(config.clone(), 123, button))
+            .find(|g| g.current_actor() == Some(0))
+            .expect("some button puts seat 0 first to act");
+        assert_eq!((g.min_raise_chips(), g.max_raise_chips()), (10_000, 70_000));
+        let new = encode_single(g.clone(), config.clone(), OBS_REV_CURRENT);
+        let old = encode_single(g, config, OBS_REV_LEGACY);
+        use obs_layout::*;
+        // Rev 2: the legal window — 1bb..7bb, stack-capped, 5 of 11 anchors.
+        assert_eq!(new[SCALARS_OFF + 2], 1.0);
+        assert_eq!(new[SCALARS_OFF + 3], 7.0);
+        assert_eq!(new[STK2_OFF + 1], (70_000.0f64 / 180_000.0) as f32);
+        assert_eq!(new[STK2_OFF + 4], 1.0);
+        assert_eq!(new[STK2_OFF + 5], (5.0f64 / 11.0) as f32);
+        assert_eq!(new[STK5_OFF + 2], 0.0);
+        // Rev 1: min_bet_total()/max_bet_total() — a pot-sized 11-anchor ladder
+        // out of a 7bb stack, and a NEGATIVE spr-after-max-raise.
+        assert_eq!(old[SCALARS_OFF + 2], 1.0);
+        assert_eq!(old[SCALARS_OFF + 3], 18.0);
+        assert_eq!(old[STK2_OFF + 1], 1.0);
+        assert_eq!(old[STK2_OFF + 4], 0.0);
+        assert_eq!(old[STK2_OFF + 5], 1.0);
+        assert!(old[STK5_OFF + 2] < 0.0);
+        // Nothing outside the gated dims moves.
+        let gated = |d: usize| {
+            (SCALARS_OFF + 2..SCALARS_OFF + 4).contains(&d)
+                || d == DRAW_A_OFF + 1
+                || d == DRAW_B_OFF + 1
+                || (BLOCKER_A_OFF..BLOCKER_A_OFF + 2).contains(&d)
+                || (BLOCKER_B_OFF..BLOCKER_B_OFF + 2).contains(&d)
+                || (STK2_OFF..STK2_OFF + 6).contains(&d)
+                || (STK5_OFF + 2..STK5_OFF + 4).contains(&d)
+        };
+        for d in 0..OBS_DIM {
+            if !gated(d) {
+                assert_eq!(new[d], old[d], "ungated dim {d} differs between revisions");
+            }
+        }
     }
 
     #[test]
@@ -4575,7 +5245,7 @@ mod encoder_port_tests {
                 hrm |= 1u16 << (c >> 2);
             }
         }
-        let (_, s) = draw_flags_one_board(&hsc, hrm, &board);
+        let (_, s) = draw_flags_one_board(&hsc, hrm, &board, OBS_REV_CURRENT);
         assert_eq!(s, 1.0);
     }
 

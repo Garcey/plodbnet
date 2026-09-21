@@ -32,7 +32,7 @@ from plo5bp.gto.preflop_class import (
     representative_hole,
 )
 from plo5bp.gto.train import TrainConfig, train_policy_net
-from plo5bp.sizing import NLH_ANCHOR_SPEC
+from plo5bp.sizing import NLH_ANCHOR_SPEC, anchor_grid_np
 
 
 def test_preflop_class_roundtrip():
@@ -107,14 +107,33 @@ def test_strategy_to_labels_pushfold_full(tmp_path: Path):
     assert len(labels) == 3
     # Full export (no 64 cap)
     assert all(len(lab.hero_hole) == 2 for lab in labels)
-    # AA open: all-in → raise gate, all-in anchor
+    # AA open: all-in → raise gate on the grid-LEGAL jam anchor.
+    # (review 2026-09-20 D1) This used to pin ``anchor_k == count - 1`` — the
+    # ALL-IN atom — which the network grid marks ILLEGAL here (min == max, so
+    # every anchor clamps to the stack and only anchor 0 survives the dedupe):
+    # training masked the jam away.
     open_lab = labels[0]
     assert open_lab.gate_probs[2] > 0.9  # raise
-    assert any(a.gate == "raise" and a.anchor_k == NLH_ANCHOR_SPEC.count - 1 for a in open_lab.action_probs)
-    # Facing jam: fold legal
+    grid = anchor_grid_np(
+        open_lab.min_raise_chips,
+        open_lab.max_raise_chips,
+        open_lab.pot_chips,
+        open_lab.to_call_chips,
+        NLH_ANCHOR_SPEC,
+    )
+    jams = [a for a in open_lab.action_probs if a.gate == "raise"]
+    assert len(jams) == 1
+    assert bool(grid.legal[jams[0].anchor_k])
+    assert int(grid.chips[jams[0].anchor_k]) == open_lab.max_raise_chips == jams[0].chips
+    # Facing jam: fold legal; ALLIN there is a CALL all-in (review D2) — no
+    # raise is legal, so none of its mass may be labelled gate=raise.
     jam_lab = labels[2]
     assert jam_lab.to_call_chips > 0
     assert jam_lab.gate_probs[0] > 0.5
+    assert jam_lab.max_raise_chips == 0
+    assert jam_lab.gate_probs[2] == 0.0
+    assert jam_lab.gate_probs[1] == pytest.approx(0.1)
+    assert [a.gate for a in jam_lab.action_probs] == ["fold", "check_call"]
     assert jam_lab.notes.get("mc_br_proxy") is True
     assert jam_lab.notes.get("class_id") == 91
 

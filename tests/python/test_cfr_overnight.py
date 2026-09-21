@@ -36,6 +36,12 @@ def test_blueprint_config_is_kill_safe():
 
 
 def test_promote_progress_on_resume(tmp_path: Path):
+    """A SUBSTANTIAL snapshot of a killed solve is kept — as ``partial``.
+
+    (review 2026-09-20 D13) This used to promote any snapshot to a finished
+    ``status="ok"`` strategy; the thin-snapshot / export side is pinned in
+    test_review_gto_overnight.py.
+    """
     out = tmp_path / "overnight"
     (out / "strategies").mkdir(parents=True)
     (out / "markers").mkdir()
@@ -47,6 +53,7 @@ def test_promote_progress_on_resume(tmp_path: Path):
         "raise_sizes_pm": [500, 1000],
         "allin_atom": True,
         "seed": 0,
+        "max_iterations": 1000,  # 777 of 1000 iterations: most of the job
     }
     prog = out / "strategies" / f"{job_id}.progress.json"
     prog.write_text(
@@ -76,10 +83,13 @@ def test_promote_progress_on_resume(tmp_path: Path):
     assert got is not None
     assert got["promoted_from_progress"] is True
     assert got["iterations"] == 777
-    strat = out / "strategies" / f"{job_id}.json"
-    assert strat.is_file()
+    assert got["status"] == "partial"
+    assert not (out / "strategies" / f"{job_id}.json").exists()  # never "ok"
+    partial = out / "strategies" / f"{job_id}.partial.json"
+    assert json.loads(partial.read_text(encoding="utf-8"))["status"] == "partial"
     assert not prog.exists()
-    assert (out / "markers" / f"{job_id}.done").is_file()
+    marker = out / "markers" / f"{job_id}.done"
+    assert marker.read_text(encoding="utf-8").split()[0] == "partial"
 
 
 def test_overnight_dry_run(tmp_path: Path):

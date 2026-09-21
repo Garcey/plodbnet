@@ -32,6 +32,30 @@ CHART = REPO / "data" / "cfr" / "pushfold_14_charts" / "00_CO_open.json"
 PUSHFOLD_FULL = REPO / "data" / "cfr" / "pushfold_4handed_10bb_300k.json"
 
 
+@pytest.fixture(autouse=True)
+def _isolated_cfr_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """(review 2026-09-20 J4) No test in this file may write to the real data/cfr.
+
+    Redirects every app directory (jobs / export / uploads / library roots) to
+    ``tmp_path`` and swaps the server's import-time session for a fresh one, so
+    solve outputs never land in ``data/cfr/app_jobs`` / ``app_export`` and no
+    test depends on a previous run's leftovers. The read-only fixtures above
+    (RIVER_STRAT / CHART) are still read from the repo when present.
+    """
+    from plo5bp.cfr_app import server
+    from plo5bp.cfr_app.session import SolveSession
+
+    data_dir = tmp_path / "cfr_data"
+    monkeypatch.setenv("CFR_APP_DATA_DIR", str(data_dir))
+    # The local-only API guard rejects non-loopback Hosts; TestClient sends
+    # "testserver", which is opted in HERE rather than allowed in production.
+    monkeypatch.setenv("CFR_APP_ALLOWED_HOSTS", "testserver")
+    monkeypatch.setattr(server, "session", SolveSession())
+    monkeypatch.setitem(server._view_cache, "key", None)
+    monkeypatch.setitem(server._view_cache, "view", None)
+    yield data_dir
+
+
 # ---------------------------------------------------------------------------
 # strategy_view
 # ---------------------------------------------------------------------------
@@ -113,16 +137,25 @@ def test_build_preflop_matrix_from_synthetic_rows():
     assert found_pair
 
 
-def test_list_strategy_library_finds_data_cfr():
-    items = list_strategy_library(max_files=50)
-    assert items, "expected strategy files under data/cfr"
+def test_list_strategy_library_finds_data_cfr(_isolated_cfr_data: Path):
+    # (review 2026-09-20 J4) Builds its own fixture instead of relying on
+    # whatever a previous run left in the real data/cfr.
+    jobs = _isolated_cfr_data / "app_jobs"
+    jobs.mkdir(parents=True)
+    report = {
+        "status": "ok",
+        "root": {"street": 3, "board": [12, 28, 38, 41, 45]},
+        "strategy": {"infosets": []},
+    }
+    (jobs / "abc123.json").write_text(json.dumps(report), encoding="utf-8")
+    # (review 2026-09-20 E12) live-solve snapshots must not be listed.
+    (jobs / "abc123.progress.json").write_text(json.dumps(report), encoding="utf-8")
+
+    items = list_strategy_library(max_files=50)  # default roots → env override
     names = {i["name"] for i in items}
-    # at least one known artifact
-    assert any(
-        n.endswith(".json") for n in names
-    )
-    # paths exist
+    assert names == {"abc123.json"}
     assert Path(items[0]["path"]).is_file()
+    assert items[0]["size"] > 0
 
 
 def test_summarize_report_light_river():
@@ -307,10 +340,10 @@ def test_session_stop_writes_stop_file(tmp_path: Path):
         ).lower()
 
 
-def test_session_load_report_file():
+def test_session_load_report_file(tmp_path: Path):
     if not RIVER_STRAT.is_file():
         pytest.skip("missing")
-    sess = SolveSession(work_dir=REPO / "data" / "cfr" / "app_jobs")
+    sess = SolveSession(work_dir=tmp_path)
     job = sess.load_report_file(RIVER_STRAT)
     assert job["status"] == "done"
     assert job["report"]["status"] == "ok"
@@ -442,13 +475,14 @@ def test_api_upload_solution_json():
         pytest.skip("missing chart")
     from fastapi.testclient import TestClient
 
-    from plo5bp.cfr_app.server import app
+    from plo5bp.cfr_app.server import API_TOKEN, app
 
     client = TestClient(app)
     raw = CHART.read_bytes()
     r = client.post(
         "/api/upload",
         files={"file": ("utg_chart.json", raw, "application/json")},
+        headers={"X-CFR-Token": API_TOKEN},  # multipart can't be JSON → token (API guard)
     )
     assert r.status_code == 200, r.text
     body = r.json()
@@ -467,12 +501,13 @@ def test_api_upload_solution_json():
 def test_api_upload_rejects_non_json():
     from fastapi.testclient import TestClient
 
-    from plo5bp.cfr_app.server import app
+    from plo5bp.cfr_app.server import API_TOKEN, app
 
     client = TestClient(app)
     r = client.post(
         "/api/upload",
         files={"file": ("notes.txt", b"hello", "text/plain")},
+        headers={"X-CFR-Token": API_TOKEN},  # so the 400 is about the FILE, not the guard
     )
     assert r.status_code == 400
 
@@ -634,7 +669,7 @@ def test_filter_rows_matches_history_hash_path():
     assert page["rows"][0]["hand_label"] == "AA"
 
 
-def test_session_unlimited_pause_resume_stop_live_strategy():
+def test_session_unlimited_pause_resume_stop_live_strategy(tmp_path: Path):
     """Play without max iters; pause keeps state; progress dumps strategy."""
     import time
 
@@ -643,7 +678,7 @@ def test_session_unlimited_pause_resume_stop_live_strategy():
     if not __import__("plo5bp.gto.cfr_api", fromlist=["rust_cfr_available"]).rust_cfr_available():
         pytest.skip("no rust cfr")
 
-    s = SolveSession()
+    s = SolveSession(work_dir=tmp_path)
     job = s.start(
         {
             "street": 3,
@@ -831,7 +866,7 @@ def test_api_solve_short_river_smoke():
 
     client = TestClient(app)
     # stop any leftover
-    client.post("/api/solve/stop")
+    client.post("/api/solve/stop", json={})  # JSON, like the app's own client (API guard)
     time.sleep(0.1)
 
     resp = client.post(
@@ -888,7 +923,7 @@ def test_e2e_solve_with_ranges_then_inspect_quality():
     from plo5bp.cfr_app.server import app
 
     client = TestClient(app)
-    client.post("/api/solve/stop")
+    client.post("/api/solve/stop", json={})  # JSON, like the app's own client (API guard)
     time.sleep(0.15)
 
     # Preview tree first (builder)

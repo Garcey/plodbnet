@@ -18,12 +18,21 @@ if str(_ROOT / "python") not in sys.path:
     sys.path.insert(0, str(_ROOT / "python"))
 
 from plo5bp.gto.cfr_api import apply_teacher_iso_policy  # noqa: E402
-from plo5bp.gto.cfr_batch import BatchManifest, _run_one, expand_river_grid  # noqa: E402
+from plo5bp.gto.cfr_batch import (  # noqa: E402
+    BatchManifest,
+    _atomic_write_text,
+    _record_worker_result,
+    _run_one,
+    expand_river_grid,
+    job_payload,
+    resolve_job_ids,
+)
 from plo5bp.gto.teacher import (  # noqa: E402
     TEACHER_HOLDOUT_FRAC,
     TEACHER_MAX_EXPL_BB,
     TEACHER_MIN_VISIT_MASS,
     TEACHER_SPLIT_SEED,
+    root_stratum,
     split_root_ids,
 )
 
@@ -53,9 +62,14 @@ def run_batch_printed(
         iters=iters,
         streets=[3],
     )
-    ids = [j.job_id for j in jobs]
+    # Campaign dirs written under the pre-fingerprint ids keep resuming.
+    ids = resolve_job_ids(out_dir, jobs)
+    # Same stratified split the export will compute (street x seats x SPR).
     train_ids, hold_ids = split_root_ids(
-        ids, seed=TEACHER_SPLIT_SEED, holdout_frac=TEACHER_HOLDOUT_FRAC
+        ids,
+        seed=TEACHER_SPLIT_SEED,
+        holdout_frac=TEACHER_HOLDOUT_FRAC,
+        strata={j.job_id: root_stratum(j.root) for j in jobs},
     )
     print(
         f"[step6] BATCH START n={len(jobs)} seed={seed} iters_cap={iters} "
@@ -74,7 +88,8 @@ def run_batch_printed(
         j.config.poll_every = 10_000
 
     man = BatchManifest(out_dir=str(out_dir), jobs=ids, started_at=time.time())
-    (out_dir / "plan.json").write_text(
+    _atomic_write_text(
+        out_dir / "plan.json",
         json.dumps(
             {
                 "n_jobs": len(jobs),
@@ -82,7 +97,8 @@ def run_batch_printed(
                 "train_root_ids": train_ids,
                 "holdout_root_ids": hold_ids,
                 "max_expl_bb": TEACHER_MAX_EXPL_BB,
-                "target_exploitability_bb": TEACHER_MAX_EXPL_BB,
+                # 0 = no early stop (the final estimator's number is reported).
+                "target_exploitability_bb": 0.0,
                 "min_visit_mass": TEACHER_MIN_VISIT_MASS,
                 "holdout_frac": TEACHER_HOLDOUT_FRAC,
                 "size_preset": size_preset,
@@ -92,46 +108,33 @@ def run_batch_printed(
             indent=2,
         )
         + "\n",
-        encoding="utf-8",
     )
 
     for j in jobs:
         print(f"[step6] ROOT START {j.job_id} board={j.root.board}", flush=True)
         t0 = time.time()
-        r = _run_one(
-            {
-                "root": j.root.as_dict(),
-                "config": j.config.as_dict(),
-                "out_dir": str(out_dir),
-                "job_id": j.job_id,
-                "max_expl_bb": TEACHER_MAX_EXPL_BB,
-            }
-        )
+        r = _run_one(job_payload(j, out_dir, TEACHER_MAX_EXPL_BB))
         dt = time.time() - t0
         expl = r.get("exploitability_bb")
-        status = "REJECTED" if r.get("rejected") else ("OK" if r.get("ok") else "FAILED")
+        status = (
+            "UNVERIFIED"
+            if r.get("unverified")
+            else "REJECTED" if r.get("rejected") else ("OK" if r.get("ok") else "FAILED")
+        )
         print(
             f"[step6] ROOT {status} {j.job_id} expl_bb={expl} "
             f"iters={r.get('iterations')} wall_s={dt:.1f} "
             f"err={r.get('error')}",
             flush=True,
         )
-        if r.get("rejected"):
-            man.rejected.append(
-                {"job_id": r["job_id"], "error": str(r.get("error", "rejected"))}
-            )
-        elif r.get("ok"):
-            man.completed.append(r["job_id"])
-        else:
-            man.failed.append(
-                {"job_id": r["job_id"], "error": r.get("error", r.get("status", "?"))}
-            )
+        _record_worker_result(man, r)
 
     man.finished_at = time.time()
     man.write(out_dir / "manifest.json")
     print(
         f"[step6] BATCH DONE completed={len(man.completed)} "
-        f"rejected={len(man.rejected)} failed={len(man.failed)}",
+        f"rejected={len(man.rejected)} unverified={len(man.unverified)} "
+        f"failed={len(man.failed)}",
         flush=True,
     )
     return man

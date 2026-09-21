@@ -194,6 +194,7 @@ def test_act_returns_animation_frames(trainer_factory):
     while not ts.hand.terminal and guard < 40:
         s = ts.project_state()
         legal = s["legal"]
+        hero_row = s["seats"][s["hero_seat"]]
         if legal["check_call"]:
             frames = ts.act("check_call", None)
         elif legal["fold"]:
@@ -201,6 +202,13 @@ def test_act_returns_animation_frames(trainer_factory):
         else:
             frames = ts.act("raise", s["raise_bounds"]["min_chips"])
         assert len(frames) >= 1
+        # The flash carries the decision's sizing context: hero's street
+        # commit BEFORE the action, the amount to call and the street name.
+        for f in frames:
+            fb = f["trainer"]["feedback"]
+            assert fb["actor_commit_chips"] == hero_row["committed_this_street_chips"]
+            assert fb["to_call_chips"] == s["to_call_chips"]
+            assert fb["street"] == s["street"]
         # Hero's own frame first (no anim_action), then opponents'.
         assert "anim_action" not in frames[0]["trainer"] \
             or frames[0]["trainer"].get("anim_action") is None
@@ -210,7 +218,14 @@ def test_act_returns_animation_frames(trainer_factory):
             a = f["trainer"]["anim_action"]
             saw_opp_frame = True
             assert a["gate"] in ("fold", "check_call", "raise")
-            assert a["seat"] != ts.hand.hero_seat
+            # Frames after hero's own are opponents' actions — or hero's
+            # engine-forced checks at moot nodes, which must say so
+            # (review 2026-09-20: `is_hero` / `auto` flags).
+            if a["seat"] == ts.hand.hero_seat:
+                assert a["is_hero"] is True and a["auto"] is True
+                assert a["gate"] == "check_call"
+            else:
+                assert a["is_hero"] is False
             if f["terminal"] is None:
                 for seat in f["seats"]:
                     if not seat["is_hero"]:

@@ -72,6 +72,18 @@ def main() -> int:
         default=None,
         help="Root-id split manifest (default: <out-stem>_split.json)",
     )
+    p.add_argument(
+        "--allow-unverified-expl",
+        action="store_true",
+        help="Also export roots whose exploitability is NOT a final estimate "
+        "(poll / early stop / time budget / mc_br_proxy). Default: skipped.",
+    )
+    p.add_argument(
+        "--no-stratify",
+        action="store_true",
+        help="Plain per-root hash split (default: stratified by street x seats "
+        "x SPR bucket so every stratum with >= 2 roots gets a holdout root)",
+    )
     args = p.parse_args()
 
     res = export_teacher_dir(
@@ -85,10 +97,14 @@ def main() -> int:
         holdout_jsonl=args.holdout_out,
         split_seed=args.split_seed,
         split_manifest=args.split_manifest,
+        require_verified_expl=not (args.no_expl_floor or args.allow_unverified_expl),
+        stratify=not args.no_stratify,
     )
     print(
         f"[cfr_export] train={res.n_train} holdout={res.n_holdout} "
-        f"skipped_expl={len(res.skipped_expl)} -> {args.out}"
+        f"skipped_expl={len(res.skipped_expl)} "
+        f"skipped_status={len(res.skipped_status)} "
+        f"skipped_dupes={len(res.skipped_dupes)} -> {args.out}"
         + (f" holdout={res.holdout_path}" if res.holdout_path else "")
     )
     if res.split_path:

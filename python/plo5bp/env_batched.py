@@ -35,6 +35,7 @@ from plo5bp.actions import (
     gate_mask_from_bounds,
 )
 from plo5bp.config import GameConfig, VARIANT_NLH
+from plo5bp.env import _engine_obs_rev_kwargs
 from plo5bp.encoding import (
     OBS_DIM,
     OBS_DIM_MINIMAL,
@@ -141,6 +142,7 @@ class BatchedBombPotEnv:
             opp_outcome_mc=self._opp_outcome_mc,
             variant=self.config.variant,
             sb=self.config.sb,
+            **_engine_obs_rev_kwargs(BatchedEngine),
         )
         self._ev_runout_samples = int(ev_runout_samples)
         self._reset_seeds = np.zeros(self.n, dtype=np.uint64)
@@ -174,6 +176,11 @@ class BatchedBombPotEnv:
         # 2=turn, 3=river, 4=showdown). Bomb pots start at 1; rollout
         # consults this to bucket per-street aggression-bonus diagnostics.
         self._street = np.zeros(self.n, dtype=np.uint8)
+        # (N,) u64 — current pot per env. Was only ever created inside
+        # `_unpack_post`, so `_refresh_subset` (in-place `self._pot[idx] =`)
+        # or any reader before the first full refresh hit an AttributeError
+        # (review 2026-09-20 C8).
+        self._pot = np.zeros(self.n, dtype=np.uint64)
 
     @property
     def num_envs(self) -> int:
@@ -238,6 +245,7 @@ class BatchedBombPotEnv:
         self._actors.fill(-1)
         self._obs.fill(0.0)
         self._reset_seeds.fill(0)
+        self._pot.fill(0)
 
     def reset_batch(
         self, seeds: np.ndarray, buttons: np.ndarray

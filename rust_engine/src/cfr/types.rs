@@ -184,7 +184,60 @@ impl RootSpec {
             }
         }
         // allin-only menus are legal (jam/check / push-fold trees)
+
+        // (review 2026-09-20 E1) bb amounts that round to 0 chips (or overflow
+        // the chip math) are rejected HERE with a normal error. They used to
+        // reach `PublicState::…root(..).unwrap()` inside the solvers and
+        // surface in Python as a `PanicException` (a BaseException).
+        self.pot_chips()?;
+        self.seat_stacks_chips()?;
         Ok(())
+    }
+
+    /// Largest chip amount the solver accepts for a pot or a stack. Keeps
+    /// `pot + Σ stacks` exact in both u64 and f64 (6 seats + pot < 2^53).
+    pub const MAX_CHIPS: u64 = 1 << 50;
+
+    fn bb_to_chips(&self, what: &str, amount_bb: f64) -> Result<u64, CfrError> {
+        let chips_f = (amount_bb * self.bb_chips as f64).round();
+        if !chips_f.is_finite() || chips_f < 1.0 {
+            return Err(CfrError::InvalidRoot(format!(
+                "{what}={amount_bb} bb rounds to 0 chips at bb_chips={} (need >= 1 chip)",
+                self.bb_chips
+            )));
+        }
+        if chips_f > Self::MAX_CHIPS as f64 {
+            return Err(CfrError::InvalidRoot(format!(
+                "{what}={amount_bb} bb is {chips_f:e} chips, above the supported maximum {}",
+                Self::MAX_CHIPS
+            )));
+        }
+        Ok(chips_f as u64)
+    }
+
+    /// `pot_bb` in engine chips (error instead of a silent 0).
+    pub fn pot_chips(&self) -> Result<u64, CfrError> {
+        self.bb_to_chips("pot_bb", self.pot_bb)
+    }
+
+    /// `effective_stack_bb` in engine chips (error instead of a silent 0).
+    pub fn effective_stack_chips(&self) -> Result<u64, CfrError> {
+        self.bb_to_chips("effective_stack_bb", self.effective_stack_bb)
+    }
+
+    /// Per-seat starting stacks in chips: `stacks_bb` when given (length is
+    /// checked by `validate_for_solve`), else `effective_stack_bb` for all.
+    pub fn seat_stacks_chips(&self) -> Result<Vec<u64>, CfrError> {
+        let n = self.num_seats as usize;
+        if self.stacks_bb.len() == n {
+            self.stacks_bb
+                .iter()
+                .enumerate()
+                .map(|(i, &s)| self.bb_to_chips(&format!("stacks_bb[{i}]"), s))
+                .collect()
+        } else {
+            Ok(vec![self.effective_stack_chips()?; n])
+        }
     }
 
     /// Starting pot in chips for multiway preflop: `n*ante + sb + bb`.
@@ -192,7 +245,9 @@ impl RootSpec {
     /// (which often double-counts or desyncs from seat blinds).
     pub fn multiway_preflop_pot_chips(&self) -> u64 {
         let n = self.num_seats as u64;
-        n * self.ante_chips + self.sb_chips + self.bb_chips
+        n.saturating_mul(self.ante_chips)
+            .saturating_add(self.sb_chips)
+            .saturating_add(self.bb_chips)
     }
 }
 
@@ -244,9 +299,90 @@ impl Default for SolveConfig {
     }
 }
 
+/// Regret / average-strategy discounting a tabular solve actually applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Discounting {
+    /// DCFR (Brown & Sandholm 2019) α=1.5, β=0, γ=2.
+    Dcfr,
+    /// Linear CFR = DCFR with α=β=γ=1.
+    Linear,
+    /// Plain (undiscounted) regret matching.
+    None,
+}
+
+impl Discounting {
+    /// `(alpha, beta, gamma)`; `None` when nothing is discounted.
+    pub fn params(self) -> Option<(f64, f64, f64)> {
+        match self {
+            Discounting::Dcfr => Some((1.5, 0.0, 2.0)),
+            Discounting::Linear => Some((1.0, 1.0, 1.0)),
+            Discounting::None => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Discounting::Dcfr => "dcfr(a=1.5,b=0,g=2)",
+            Discounting::Linear => "linear(a=b=g=1)",
+            Discounting::None => "none",
+        }
+    }
+}
+
 impl SolveConfig {
+    /// Accepted `algorithm` tags. (review 2026-09-20, latent) Anything else
+    /// used to run undiscounted CFR while the report said "DCFR".
+    pub const KNOWN_ALGORITHMS: [&'static str; 6] =
+        ["dcfr", "linear", "cfr", "vanilla", "mccfr_es", "mccfr"];
+
+    /// Accepted `card_abstraction` tags ("" = "none"; "exact" = "none").
+    pub const KNOWN_CARD_ABSTRACTIONS: [&'static str; 7] =
+        ["", "none", "exact", "ochs", "buckets", "ehs", "preflop169"];
+
+    fn algorithm_tag(&self) -> String {
+        self.algorithm.trim().to_ascii_lowercase()
+    }
+
+    /// Discounting implied by `algorithm` (the tag is validated separately).
+    pub fn discounting(&self) -> Discounting {
+        match self.algorithm_tag().as_str() {
+            "dcfr" => Discounting::Dcfr,
+            "linear" => Discounting::Linear,
+            _ => Discounting::None,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), CfrError> {
-        // max_iterations == 0 means unlimited — allowed.
+        let tag = self.algorithm_tag();
+        if !Self::KNOWN_ALGORITHMS.contains(&tag.as_str()) {
+            return Err(CfrError::InvalidConfig(format!(
+                "unknown algorithm {:?}; expected one of {:?}",
+                self.algorithm,
+                Self::KNOWN_ALGORITHMS
+            )));
+        }
+        // (review 2026-09-20 F14) Unknown abstraction tags used to be treated as
+        // "not exact" on flops and "exact" elsewhere, depending on the caller.
+        if !Self::KNOWN_CARD_ABSTRACTIONS.contains(&self.card_abstraction.as_str()) {
+            return Err(CfrError::InvalidConfig(format!(
+                "unknown card_abstraction {:?}; expected one of {:?}",
+                self.card_abstraction,
+                Self::KNOWN_CARD_ABSTRACTIONS
+            )));
+        }
+        // max_iterations == 0 means "unlimited" — only meaningful when something
+        // else can end the run. (review 2026-09-20 E1) With no time budget and
+        // no stop file it was an un-stoppable ~4e9-iteration solve.
+        if self.max_iterations == 0 && self.time_budget_secs <= 0.0 && self.stop_file.is_empty() {
+            return Err(CfrError::InvalidConfig(
+                "max_iterations=0 (unlimited) needs time_budget_secs > 0 or a stop_file".into(),
+            ));
+        }
+        if !self.target_exploitability_bb.is_finite() || !self.time_budget_secs.is_finite() {
+            return Err(CfrError::InvalidConfig(
+                "target_exploitability_bb and time_budget_secs must be finite".into(),
+            ));
+        }
         if self.thread_num == 0 {
             return Err(CfrError::InvalidConfig("thread_num must be > 0".into()));
         }
@@ -330,10 +466,16 @@ impl SolveConfig {
 
     /// Write a lightweight progress JSON (status + iters + optional strategy).
     /// Best-effort: IO errors are ignored so the solve never fails on a bad path.
+    ///
+    /// `expl_kind` labels what `exploitability_bb` is (e.g. `"mc_poll"` for the
+    /// cheap in-loop Monte-Carlo estimate) — written as an extra `expl_kind`
+    /// key so a live viewer never mistakes a poll for the final number.
+    #[allow(clippy::too_many_arguments)]
     pub fn write_progress(
         &self,
         iterations_run: u32,
         exploitability_bb: Option<f64>,
+        expl_kind: Option<&str>,
         n_infosets: usize,
         strategy: Option<&Strategy>,
         root_id: &str,
@@ -342,7 +484,6 @@ impl SolveConfig {
         if self.progress_file.is_empty() {
             return;
         }
-        use std::io::Write;
         let status = if paused { "paused" } else { "running" };
         let mut body = format!(
             "{{\n  \"status\": \"{status}\",\n  \"iterations_run\": {iterations_run},\n  \"num_infosets\": {n_infosets},\n  \"root_id\": \"{}\"",
@@ -356,6 +497,12 @@ impl SolveConfig {
             }
         } else {
             body.push_str(",\n  \"exploitability_bb\": null");
+        }
+        if let Some(kind) = expl_kind {
+            body.push_str(&format!(
+                ",\n  \"expl_kind\": \"{}\"",
+                Self::json_escape_str(kind)
+            ));
         }
         if let Some(strat) = strategy {
             body.push_str(",\n  \"strategy\": {\n    \"root_id\": \"");
@@ -373,20 +520,39 @@ impl SolveConfig {
             body.push_str("\n    ]\n  }");
         }
         body.push_str("\n}\n");
-        // Atomic-ish: write temp then rename. On Windows, rename fails if dest
-        // exists — remove first so live progress actually updates every poll.
-        let path = std::path::Path::new(&self.progress_file);
-        let tmp = path.with_extension("progress.tmp");
-        if let Ok(mut f) = std::fs::File::create(&tmp) {
-            let _ = f.write_all(body.as_bytes());
-            let _ = f.sync_all();
-            let _ = std::fs::remove_file(path);
-            if std::fs::rename(&tmp, path).is_err() {
-                // Last resort: direct overwrite
-                let _ = std::fs::copy(&tmp, path);
-                let _ = std::fs::remove_file(&tmp);
+        Self::write_file_atomic(std::path::Path::new(&self.progress_file), body.as_bytes());
+    }
+
+    /// Write `bytes` to a sibling temp file, then rename it OVER `path`.
+    ///
+    /// (review 2026-09-20, latent) `std::fs::rename` replaces an existing
+    /// destination on every platform (Windows: `MOVEFILE_REPLACE_EXISTING`),
+    /// so there is no need to delete the target first. The old
+    /// remove-then-rename sequence left a window in which a polling reader saw
+    /// NO progress file, and its `fs::copy` fallback could expose a torn file.
+    /// A rename can still fail transiently on Windows while a reader holds the
+    /// target open: retry briefly, then keep the previous (complete) snapshot.
+    /// Best-effort: IO errors never fail the solve.
+    pub(crate) fn write_file_atomic(path: &std::path::Path, bytes: &[u8]) {
+        use std::io::Write;
+        let tmp = path.with_extension(format!("progress.{}.tmp", std::process::id()));
+        let written = std::fs::File::create(&tmp).and_then(|mut f| {
+            f.write_all(bytes)?;
+            f.sync_all()
+        });
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
+        for attempt in 0..5 {
+            if std::fs::rename(&tmp, path).is_ok() {
+                return;
+            }
+            if attempt < 4 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -625,5 +791,88 @@ mod stop_tests {
         let start = Instant::now() - Duration::from_secs(1);
         // iteration 3 is not a poll tick; must still honour wall clock
         assert_eq!(cfg.should_stop(start, 3), Some("time_budget"));
+    }
+
+    /// (review 2026-09-20, latent) progress is renamed OVER the target: a
+    /// reader never sees a missing/torn file, and no temp file is left behind.
+    #[test]
+    fn progress_write_replaces_the_target_atomically() {
+        let dir = std::env::temp_dir().join(format!("cfr_progress_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("job.progress.json");
+        let mut cfg = SolveConfig::default();
+        cfg.progress_file = path.to_string_lossy().into_owned();
+        for it in 1..=25u32 {
+            cfg.write_progress(it, Some(0.5), Some("mc_poll"), 7, None, "root", false);
+            // The target exists and is complete after EVERY write (the old
+            // remove-then-rename sequence had a window with no file at all).
+            let body = std::fs::read_to_string(&path).expect("progress file present");
+            assert!(body.contains(&format!("\"iterations_run\": {it}")), "{body}");
+            assert!(body.contains("\"expl_kind\": \"mc_poll\""));
+            assert!(body.trim_end().ends_with('}'));
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "job.progress.json")
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_validation_rejects_unknown_tags_and_unstoppable_runs() {
+        let ok = SolveConfig::default();
+        assert!(ok.validate().is_ok());
+        let mut c = ok.clone();
+        c.algorithm = "dcfr+".into();
+        assert!(c.validate().is_err());
+        c.algorithm = " DCFR ".into(); // tags are trimmed / case-insensitive
+        assert!(c.validate().is_ok());
+        assert_eq!(c.discounting(), Discounting::Dcfr);
+        let mut c = ok.clone();
+        c.card_abstraction = "ochz".into();
+        assert!(c.validate().is_err());
+        let mut c = ok.clone();
+        c.max_iterations = 0;
+        assert!(c.validate().is_err(), "unlimited run with no stop condition");
+        c.stop_file = "x.stop".into();
+        assert!(c.validate().is_ok());
+        c.stop_file.clear();
+        c.time_budget_secs = 1.0;
+        assert!(c.validate().is_ok());
+        // "linear" really is Linear CFR now, not the DCFR parameters.
+        let mut lin = ok.clone();
+        lin.algorithm = "linear".into();
+        assert_eq!(lin.discounting().params(), Some((1.0, 1.0, 1.0)));
+        assert_eq!(ok.discounting().params(), Some((1.5, 0.0, 2.0)));
+        let mut es = ok;
+        es.algorithm = "mccfr_es".into();
+        assert_eq!(es.discounting().params(), None);
+    }
+
+    #[test]
+    fn chip_conversions_error_instead_of_rounding_to_zero() {
+        let mut root = RootSpec::postflop_hu(
+            StreetRoot::River,
+            10.0,
+            50.0,
+            vec![0, 1, 2, 3, 4],
+            vec![1000],
+        );
+        assert_eq!(root.pot_chips().unwrap(), 100_000);
+        assert_eq!(root.seat_stacks_chips().unwrap(), vec![500_000, 500_000]);
+        root.pot_bb = 0.00004;
+        assert!(root.pot_chips().is_err());
+        assert!(root.validate_for_solve().is_err());
+        root.pot_bb = 10.0;
+        root.effective_stack_bb = 1e15;
+        assert!(root.validate_for_solve().is_err());
+        root.effective_stack_bb = 50.0;
+        root.num_seats = 3;
+        root.stacks_bb = vec![10.0, 0.00001, 10.0];
+        let err = root.validate_for_solve().unwrap_err();
+        assert!(format!("{err}").contains("stacks_bb[1]"), "{err}");
     }
 }

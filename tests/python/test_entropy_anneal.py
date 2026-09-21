@@ -144,7 +144,38 @@ def test_one_point_slip_on_every_street_still_lowers_at_default_tol():
     )
     assert action == "lowered"
     assert ent == pytest.approx(0.088)
-    assert base == (29.0, 29.0, 29.0)
+    # (review 2026-09-20 A15) the slip is ABSORBED, not adopted: the bar
+    # stays at 30. This assertion used to pin `base == (29, 29, 29)` — the
+    # downward creep itself (see the next test).
+    assert base == (30.0, 30.0, 30.0)
+
+
+def test_baseline_does_not_creep_down_under_a_steady_slip():
+    """A15: F/T/R slipping 0.9/block — always inside tol 1.0 of the PREVIOUS
+    block — used to read as 'held' forever (30 -> 20.1 over 11 blocks, entropy
+    cut on every one). With the per-street max(old, now) ratchet the second
+    slip is a drop vs the 30 bar: entropy is cut once, then held."""
+    ent, base, ftr = 0.10, None, 30.0
+    actions = []
+    for _ in range(12):
+        ent, base, action = decide((ftr, ftr, ftr), base, ent, STEP, FLOOR, 1.0)
+        actions.append(action)
+        ftr -= 0.9
+    assert actions[0] == "record-baseline"
+    assert actions[1] == "lowered"            # 29.1 >= 30 - 1
+    assert set(actions[2:]) == {"drop:hold"}  # 28.2 < 29: no further cuts
+    assert ent == pytest.approx(0.10 - STEP)
+    assert base == (30.0, 30.0, 30.0)
+
+
+def test_baseline_ratchets_up_per_street():
+    # flop rose, turn slipped inside tol, river equal -> held; new bar is the
+    # per-street max, never below the old one.
+    ent, base, action = decide(
+        (33.0, 27.5, 35.0), (30.0, 28.0, 35.0), 0.05, STEP, FLOOR, 1.0
+    )
+    assert action == "lowered"
+    assert base == (33.0, 28.0, 35.0)
 
 
 def test_anneal_due_warmup_gating():

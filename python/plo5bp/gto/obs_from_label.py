@@ -1,18 +1,41 @@
 """Synthesize NLH obs vectors from LabelRecords for supervised training.
 
 v2 dumps carry path labels + pot/to_call/stacks. When the label has a
-solver-root (``root_pot_chips`` / ``root_stacks_chips``) we rebuild a
-live ``GameState`` via ``reset_nlh_cfr_node`` and encode that node's
-``observation_dict`` — bit-exact vs the Trainer/Study encode path.
+solver-root (``root_pot_chips`` / ``root_stacks_chips``) we rebuild an
+engine ``GameState`` via ``reset_nlh_cfr_node`` and encode that node's
+``observation_dict`` with the SAME encoder the Trainer/Study path uses.
 
-Fallback (legacy labels, preflop, reconstruct fail): a synthetic raw_obs
-with history filled from path tokens. ``last_aggressor`` is ``-1`` (never
-``None``) so encode does not throw.
+**The label obs is a CANONICAL form, not a played hand's obs** (review
+2026-09-20 D3). The solver root is synthetic: nothing happened before it, so
+``history`` holds the root street's actions only, ``total_commit`` counts
+chips since the root (== ``street_commit`` on the root street), the blind
+seats are ``None`` and stacks are the street-start stacks. A played hand's
+obs carries prior-street history, hand-total commits and blind flags — inputs
+that are ALWAYS zero in training. :func:`canonical_serve_obs` rebuilds the
+same canonical form from a live env's raw obs; ``PolicyNetHost`` serves that,
+so train == serve (pinned by ``tests/python/test_review_gto_serve_parity.py``).
+
+Obs kinds (:func:`obs_from_label_detailed`):
+
+- ``engine`` — exact engine reconstruction (postflop labels on the root
+  street).
+- ``synthetic_preflop`` — preflop labels: a hand-built raw dict (by design;
+  category / opp-outcome are legitimately zero preflop, but blinds /
+  commits are approximations — NOT engine-exact).
+- ``synthetic_fallback`` — a POSTFLOP label the engine could not rebuild
+  (legacy labels without root notes; every later-street row of a flop/turn
+  root). LOSSY: ``hero_category=0``, ``nlh_opp_outcome=0``, naive actor
+  alternation. (review 2026-09-20 D16) Row builders count + log these and
+  EXCLUDE them unless ``include_lossy_obs=True``; nothing trains on them
+  silently.
+
+``last_aggressor`` is ``-1`` (never ``None``) so encode does not throw.
 """
 
 from __future__ import annotations
 
-from typing import Sequence
+from dataclasses import dataclass, field
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
@@ -59,6 +82,25 @@ def _root_pot(lab: LabelRecord) -> int:
     return 0
 
 
+def cfr_root_config(stacks: Sequence[int], bb: int) -> GameConfig:
+    """Config of the synthetic solver root (``engine_bridge.rs``): the root
+    stacks ARE the starting stacks, the ante already sits in the pot.
+
+    Shared by the label path and the serve canonicalization so both encode
+    under the identical config.
+    """
+    stacks = [int(s) for s in stacks]
+    return GameConfig(
+        num_seats=len(stacks),
+        starting_stack=int(stacks[0]),
+        starting_stacks=tuple(stacks),
+        ante=0,
+        bb=int(bb),
+        sb=max(int(bb) // 2, 1),
+        variant=VARIANT_NLH,
+    )
+
+
 def live_config_from_label(lab: LabelRecord) -> GameConfig:
     """Config matching ``reset_nlh_cfr_node`` (ante already in the pot)."""
     n = max(2, int(lab.num_seats))
@@ -66,16 +108,7 @@ def live_config_from_label(lab: LabelRecord) -> GameConfig:
     stacks = _root_stacks(lab)
     while len(stacks) < n:
         stacks.append(stacks[-1] if stacks else bb * 100)
-    stacks = stacks[:n]
-    return GameConfig(
-        num_seats=n,
-        starting_stack=int(stacks[0]),
-        starting_stacks=tuple(int(s) for s in stacks),
-        ante=0,
-        bb=bb,
-        sb=max(bb // 2, 1),
-        variant=VARIANT_NLH,
-    )
+    return cfr_root_config(stacks[:n], bb)
 
 
 def reconstruct_live_engine(lab: LabelRecord):
@@ -139,7 +172,8 @@ def reconstruct_live_engine(lab: LabelRecord):
 
 
 def encode_live_engine(gs, lab: LabelRecord) -> np.ndarray:
-    """Same pack as ``BombPotEnv._pack_obs`` (category + encode_observation_nlh)."""
+    """Same pack as ``BombPotEnv._pack_obs`` (category + encode_observation_nlh),
+    applied to the SYNTHETIC-ROOT engine node (canonical form, see module doc)."""
     raw = dict(gs.observation_dict())
     actor = raw.get("actor")
     if actor is not None:
@@ -339,22 +373,72 @@ def game_config_from_label(lab: LabelRecord) -> GameConfig:
     )
 
 
-def obs_from_label(lab: LabelRecord) -> np.ndarray | None:
-    """Return (OBS_DIM_NLH,) float32 or None if label is aggregate (no hole)."""
+OBS_KIND_ENGINE = "engine"
+OBS_KIND_SYNTHETIC_PREFLOP = "synthetic_preflop"
+OBS_KIND_LOSSY = "synthetic_fallback"
+OBS_KIND_NO_HOLE = "no_hole"
+
+
+@dataclass
+class ObsSynthesisStats:
+    """Tally of how label obs were produced (review 2026-09-20 D16)."""
+
+    kinds: dict[str, int] = field(default_factory=dict)
+    excluded_lossy: int = 0
+    lossy_roots: dict[str, int] = field(default_factory=dict)
+
+    def record(self, kind: str, *, root: str = "", excluded: bool = False) -> None:
+        self.kinds[kind] = self.kinds.get(kind, 0) + 1
+        if kind == OBS_KIND_LOSSY:
+            self.lossy_roots[root] = self.lossy_roots.get(root, 0) + 1
+            if excluded:
+                self.excluded_lossy += 1
+
+    @property
+    def n_lossy(self) -> int:
+        return int(self.kinds.get(OBS_KIND_LOSSY, 0))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "kinds": dict(self.kinds),
+            "n_lossy": self.n_lossy,
+            "excluded_lossy": int(self.excluded_lossy),
+            "lossy_roots": dict(self.lossy_roots),
+        }
+
+    def log(self, *, prefix: str = "[obs_from_label]") -> None:
+        """Print one LOUD line when anything was lossy / dropped."""
+        if not self.n_lossy and not self.kinds.get(OBS_KIND_NO_HOLE):
+            return
+        worst = sorted(self.lossy_roots.items(), key=lambda kv: -kv[1])[:5]
+        print(
+            f"{prefix} WARNING lossy synthetic obs for {self.n_lossy} postflop "
+            f"label(s) (engine reconstruction failed: later-street rows of a "
+            f"flop/turn root, or legacy labels without root notes); "
+            f"excluded={self.excluded_lossy} "
+            f"no_hole_dropped={self.kinds.get(OBS_KIND_NO_HOLE, 0)} "
+            f"kinds={self.kinds} worst_roots={worst}",
+            flush=True,
+        )
+
+
+def obs_from_label_detailed(lab: LabelRecord) -> tuple[np.ndarray | None, str]:
+    """``(obs, kind)`` — see the module docstring for the kinds."""
     if not lab.hero_hole or len(lab.hero_hole) < 2:
-        return None
+        return None, OBS_KIND_NO_HOLE
     if lab.notes.get("aggregate"):
-        return None
+        return None, OBS_KIND_NO_HOLE
     gs = reconstruct_live_engine(lab)
     if gs is not None:
-        try:
-            return encode_live_engine(gs, lab)
-        except Exception:
-            pass
+        # The engine rebuilt the node, so an encoder error here is a BUG in the
+        # encoder, not a lossy label: let it surface. (It used to be swallowed,
+        # silently demoting every row to the synthetic fallback.)
+        return encode_live_engine(gs, lab), OBS_KIND_ENGINE
+    kind = OBS_KIND_SYNTHETIC_PREFLOP if int(lab.street) == 0 else OBS_KIND_LOSSY
     raw = _raw_obs_from_label(lab)
     cfg = game_config_from_label(lab)
     try:
-        return encode_observation_nlh(raw, cfg)
+        return encode_observation_nlh(raw, cfg), kind
     except Exception:
         out = np.zeros(OBS_DIM_NLH, dtype=np.float32)
         for c in lab.hero_hole[:2]:
@@ -369,58 +453,89 @@ def obs_from_label(lab: LabelRecord) -> np.ndarray | None:
         inv = 1.0 / float(CLUBGG_NLH_ROOT.bb)
         out[132] = lab.pot_chips * inv
         out[133] = lab.to_call_chips * inv
-        return out
+        return out, OBS_KIND_LOSSY
 
 
-def labels_to_supervised_rows(labels: Sequence[LabelRecord]):
-    """LabelRecords with holes → SupervisedRows (skips aggregates)."""
-    from plo5bp.gto.dataset import SupervisedRow
-    from plo5bp.sizing import NLH_ANCHOR_SPEC
+def obs_from_label(lab: LabelRecord) -> np.ndarray | None:
+    """Return (OBS_DIM_NLH,) float32 or None if label is aggregate (no hole).
 
-    k = NLH_ANCHOR_SPEC.count
-    rows = []
-    for lab in labels:
-        obs = obs_from_label(lab)
-        if obs is None:
-            continue
-        fold_legal = int(lab.to_call_chips) > 0
-        raise_legal = int(lab.max_raise_chips) > 0
-        gm = np.array([fold_legal, True, raise_legal], dtype=bool)
-        g = np.asarray(lab.gate_probs, dtype=np.float32).copy()
-        if len(g) != 3:
-            g = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-        g = g * gm.astype(np.float32)
-        if float(g.sum()) <= 0:
-            g = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-        else:
-            g /= g.sum()
-        ap = np.zeros(k, dtype=np.float32)
-        for a in lab.action_probs:
-            if a.gate == "raise" and a.anchor_k is not None:
-                if 0 <= int(a.anchor_k) < k:
-                    ap[int(a.anchor_k)] += float(a.prob)
-        s = float(ap.sum())
-        if s > 0:
-            ap /= s
-        elif raise_legal:
-            ap[-1] = 1.0
-        rows.append(
-            SupervisedRow(
-                obs=obs.astype(np.float32),
-                gate_mask=gm,
-                sizing=np.array(
-                    [
-                        lab.min_raise_chips,
-                        lab.max_raise_chips,
-                        lab.pot_chips,
-                        lab.to_call_chips,
-                    ],
-                    dtype=np.int64,
-                ),
-                gate_probs=g,
-                anchor_probs=ap,
-                value_bb=float(lab.value_bb or 0.0),
-                street=int(lab.street),
-            )
-        )
-    return rows
+    Includes the lossy ``synthetic_fallback`` obs; callers that TRAIN must go
+    through :func:`labels_to_supervised_rows` /
+    :func:`plo5bp.gto.dataset.rows_from_label_records`, which exclude and
+    report those rows (review 2026-09-20 D16).
+    """
+    return obs_from_label_detailed(lab)[0]
+
+
+# --- Serve-side canonicalization (review 2026-09-20 D3) ----------------------
+
+
+def canonical_serve_raw(raw: Mapping[str, Any]) -> tuple[dict[str, Any], list[int]]:
+    """Rewrite a LIVE raw obs dict into the label's canonical form.
+
+    Returns ``(raw_canonical, street_start_stacks)``. Exactly what the
+    synthetic solver root + path replay produces for the same public state:
+
+    - ``history``: current-street records only (the root has no past);
+    - ``total_commit := street_commit`` (chips since the root);
+    - ``sb_seat`` / ``bb_seat`` := ``None`` (blind flags off);
+    - ``eff_stack_cap``: recomputed from the STREET-START stacks with every
+      seat in hand (``compute_eff_stack_cap`` on the root config).
+
+    Everything else (pot, stacks, commits, bet bounds, cards, category,
+    opp-outcome, button, aggressor) is already per-street / seat-relative and
+    is left untouched.
+    """
+    street = int(raw["street"])
+    stacks = [int(x) for x in raw["stacks"]]
+    n = len(stacks)
+    street_commit = [int(x) for x in (raw.get("street_commit") or [0] * n)][:n]
+    street_commit += [0] * (n - len(street_commit))
+    start = [stacks[i] + street_commit[i] for i in range(n)]
+    out = dict(raw)
+    out["history"] = [
+        tuple(r) for r in (raw.get("history") or []) if int(r[3]) == street
+    ]
+    out["total_commit"] = list(street_commit)
+    out["sb_seat"] = None
+    out["bb_seat"] = None
+    out["eff_stack_cap"] = [
+        min(start[i], max((start[j] for j in range(n) if j != i), default=start[i]))
+        for i in range(n)
+    ]
+    return out, start
+
+
+def canonical_serve_obs(raw: Mapping[str, Any], *, bb: int) -> np.ndarray | None:
+    """Canonical (label-form) obs for a live POSTFLOP decision node.
+
+    ``None`` when there is nothing to canonicalize: no actor, or preflop —
+    preflop labels are hand-built synthetic dicts (not an engine form), so
+    there is no exact serve-side equivalent; the caller keeps the live obs.
+    """
+    if raw.get("actor") is None:
+        return None
+    if not (1 <= int(raw.get("street", 0)) <= 3):
+        return None
+    canon, start = canonical_serve_raw(raw)
+    return encode_observation_nlh(canon, cfr_root_config(start, int(bb)))
+
+
+def labels_to_supervised_rows(
+    labels: Sequence[LabelRecord],
+    *,
+    include_lossy_obs: bool = False,
+    stats: ObsSynthesisStats | None = None,
+    kept: list[int] | None = None,
+):
+    """LabelRecords with holes → SupervisedRows (skips aggregates).
+
+    Thin alias of :func:`plo5bp.gto.dataset.rows_from_label_records` (one row
+    builder — the two copies had drifted). Lossy ``synthetic_fallback`` rows
+    are excluded unless ``include_lossy_obs=True``.
+    """
+    from plo5bp.gto.dataset import rows_from_label_records
+
+    return rows_from_label_records(
+        labels, include_lossy_obs=include_lossy_obs, stats=stats, kept=kept
+    )

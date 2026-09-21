@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections import Counter
 from itertools import combinations
+from typing import Any
 
 # rank index 0..12 -> display string. "10" (not "T") to match ClubGG.
 _RANK_DISP = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"]
@@ -65,9 +66,20 @@ def _eval5(cards: list[int]) -> tuple[int, tuple, tuple]:
     return 0, tuple(ranks), ("high", ranks[0])
 
 
+def _known(cards) -> list[int]:
+    """Real card indices only. ``None`` and NEGATIVE sentinels (the UI's
+    ``-1`` = face-down / not dealt) are dropped.
+
+    (review 2026-09-20) `_best` / `_best_nlh` used to keep negatives, and
+    ``-1 // 4 == -1`` indexes the rank table from the end — five face-down
+    cards were labelled "a pair of As". `best_combo` already filtered; all
+    three now share this."""
+    return [int(c) for c in (cards or ()) if c is not None and int(c) >= 0]
+
+
 def _best(hole, board) -> tuple[int, tuple, tuple] | None:
-    hole = [int(c) for c in hole if c is not None]
-    board = [int(c) for c in board if c is not None]
+    hole = _known(hole)
+    board = _known(board)
     if len(hole) < 2 or len(board) < 3:
         return None
     best: tuple[int, tuple, tuple] | None = None
@@ -115,11 +127,47 @@ def describe_made_hand(hole, board) -> str | None:
     return None if b is None else _fmt(b[2])
 
 
+def best_combo(hole, board) -> dict[str, Any] | None:
+    """Best PLO combo: the 2 hole + 3 board cards that play, plus label.
+
+    When several combos tie, pick the lexicographically smallest card
+    lists so the highlight is stable.
+    """
+    hole = _known(hole)
+    board = _known(board)
+    if len(hole) < 2 or len(board) < 3:
+        return None
+    best_e: tuple[int, tuple, tuple] | None = None
+    best_h2: tuple[int, ...] | None = None
+    best_b3: tuple[int, ...] | None = None
+    for h2 in combinations(hole, 2):
+        for b3 in combinations(board, 3):
+            e = _eval5([*h2, *b3])
+            score = (e[0], e[1])
+            h2s = tuple(sorted(h2))
+            b3s = tuple(sorted(b3))
+            if best_e is None or score > (best_e[0], best_e[1]):
+                best_e = e
+                best_h2 = h2s
+                best_b3 = b3s
+            elif score == (best_e[0], best_e[1]) and (h2s, b3s) < (best_h2, best_b3):
+                best_h2 = h2s
+                best_b3 = b3s
+    assert best_e is not None and best_h2 is not None and best_b3 is not None
+    return {
+        "hole": list(best_h2),
+        "board": list(best_b3),
+        "label": _fmt(best_e[2]),
+        "category": int(best_e[0]),
+        "tiebreak": tuple(best_e[1]),
+    }
+
+
 def _best_nlh(hole, board) -> tuple[int, tuple, tuple] | None:
     """Best 5-card hand under NLH rules: ANY 5 of hole+board (0, 1, or 2
     hole cards may play). None with fewer than 3 board / 2 hole cards."""
-    hole = [int(c) for c in hole if c is not None]
-    board = [int(c) for c in board if c is not None]
+    hole = _known(hole)
+    board = _known(board)
     if len(hole) < 2 or len(board) < 3:
         return None
     pool = [*hole, *board]

@@ -13,6 +13,7 @@ Two layers:
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
@@ -20,23 +21,6 @@ from typing import Any, Sequence
 from plo5bp.gto.cfr_api import RootSpec
 
 STREET_NAMES = {0: "Preflop", 1: "Flop", 2: "Turn", 3: "River"}
-
-
-def _action_menu(root: RootSpec, *, facing_bet: bool) -> list[str]:
-    acts: list[str] = []
-    if facing_bet:
-        acts.append("FOLD")
-        acts.append("CHECK_CALL")
-    else:
-        acts.append("CHECK_CALL")  # check
-    for pm in root.raise_sizes_pm:
-        acts.append(f"RAISE_{int(pm)}")
-    if root.allin_atom:
-        acts.append("ALLIN")
-    # pure push/fold: only FOLD + ALLIN
-    if not root.raise_sizes_pm and root.allin_atom:
-        return ["FOLD", "ALLIN"] if facing_bet else ["CHECK_CALL", "ALLIN"]
-    return acts
 
 
 @dataclass
@@ -52,7 +36,8 @@ class TreeNode:
     actions: list[str] = field(default_factory=list)
     children: list["TreeNode"] = field(default_factory=list)
     terminal: bool = False
-    terminal_kind: str = ""  # fold | showdown | allin_runout
+    terminal_kind: str = ""  # fold | showdown | next_street | allin_runout | truncated
+    seat_label: str = ""  # position in the SOLVER's seat order (SB / BB / UTG… / OOP / IP)
 
     def as_dict(self, *, max_depth: int | None = None) -> dict[str, Any]:
         if max_depth is not None and self.depth > max_depth:
@@ -60,6 +45,7 @@ class TreeNode:
                 "id": self.id,
                 "label": self.label + " …",
                 "seat": self.seat,
+                "seat_label": self.seat_label,
                 "depth": self.depth,
                 "truncated": True,
                 "num_children": len(self.children),
@@ -68,6 +54,7 @@ class TreeNode:
             "id": self.id,
             "label": self.label,
             "seat": self.seat,
+            "seat_label": self.seat_label,
             "depth": self.depth,
             "facing_bet": self.facing_bet,
             "pot_bb": round(self.pot_bb, 3),
@@ -83,16 +70,213 @@ class TreeNode:
         }
 
 
+def _position_names(n: int, street: int) -> list[str]:
+    """Seat index → position, in the SOLVER's seat order.
+
+    Preflop HU: seat 0 = BB, seat 1 = SB/button (acts first). Preflop 3+ handed:
+    seats 0..n-3 = UTG…BTN, n-2 = SB, n-1 = BB, seat 0 first
+    (``solve_multiway_preflop_mccfr``). Postflop: seat 0 acts first (OOP).
+    """
+    if street != 0:
+        return ["OOP", "IP"] if n == 2 else [f"seat{i}" for i in range(n)]
+    if n == 2:
+        return ["BB", "SB"]
+    # Standard names for the non-blind seats, first to act → button (n ≤ 6).
+    early = {3: ["BTN"], 4: ["CO", "BTN"], 5: ["HJ", "CO", "BTN"], 6: ["UTG", "HJ", "CO", "BTN"]}.get(
+        n, [f"seat{i}" for i in range(n - 2)]
+    )
+    return early + ["SB", "BB"]
+
+
+class _PreviewState:
+    """One betting round in integer chips — a mirror of ``PublicState``.
+
+    (review 2026-09-20 preview tree ≠ solver) The old preview worked in float bb
+    with its own rules: no min-raise clamp, no de-dup of sizes that clamp to the
+    same chips, a limp that ended the hand, antes folded into the amount to
+    call, and P0 first preflop. Same arithmetic as the solver (integer chips,
+    ``pot * pm / 1000`` floor division) means the same menus, to the chip.
+    """
+
+    def __init__(self, root: RootSpec) -> None:
+        bb = max(1, int(root.bb_chips))
+        n = max(2, int(root.num_seats))
+        self.bb, self.n, self.street = bb, n, int(root.street)
+        eff = int(round(float(root.effective_stack_bb) * bb))
+        self.stacks = (
+            [int(round(float(s) * bb)) for s in root.stacks_bb]
+            if root.stacks_bb and len(root.stacks_bb) == n
+            else [eff] * n
+        )
+        self.commit = [0] * n
+        self.acted = [False] * n
+        self.folded = [False] * n
+        self.bet_to_call = 0
+        self.last_raise = bb
+        if self.street == 0:
+            self.pot = 0
+            ante = max(0, int(root.ante_chips))
+            for i in range(n):  # antes are dead money: pot, not street commit
+                put = min(self.stacks[i], ante)
+                self.stacks[i] -= put
+                self.pot += put
+            sb_seat, bb_seat = (1, 0) if n == 2 else (n - 2, n - 1)
+            for seat, blind in ((sb_seat, max(0, int(root.sb_chips))), (bb_seat, bb)):
+                put = min(self.stacks[seat], blind)  # blinds are live
+                self.stacks[seat] -= put
+                self.commit[seat] += put
+                self.pot += put
+            self.bet_to_call = bb
+            self.actor: int | None = 1 if n == 2 else 0
+        else:
+            self.pot = int(round(float(root.pot_bb) * bb))
+            self.actor = 0
+        if self.actor is not None and not self._can_act(self.actor):
+            self.actor = self._next_actor(self.actor)
+
+    def clone(self) -> "_PreviewState":
+        other = object.__new__(type(self))  # keep the subclass (and its menu rules)
+        other.__dict__ = dict(self.__dict__)
+        for k in ("stacks", "commit", "acted", "folded"):
+            setattr(other, k, list(getattr(self, k)))
+        return other
+
+    # --- queries (names follow public_state.rs) ---------------------------
+
+    def alive(self) -> list[int]:
+        return [i for i in range(self.n) if not self.folded[i]]
+
+    def _can_act(self, i: int) -> bool:
+        return not self.folded[i] and self.stacks[i] > 0
+
+    def _next_actor(self, after: int) -> int | None:
+        for step in range(1, self.n + 1):
+            i = (after + step) % self.n
+            if self._can_act(i) and (not self.acted[i] or self.commit[i] < self.bet_to_call):
+                return i
+        return None
+
+    def to_call(self) -> int:
+        a = self.actor
+        return min(max(0, self.bet_to_call - self.commit[a]), self.stacks[a])
+
+    def _max_other_total(self) -> int:
+        a = self.actor
+        return max(
+            (self.commit[j] + self.stacks[j] for j in range(self.n) if j != a and not self.folded[j]),
+            default=0,
+        )
+
+    def _min_bet_total(self) -> int:
+        return self.bb if self.bet_to_call == 0 else self.bet_to_call + self.last_raise
+
+    def min_raise(self) -> int:
+        a = self.actor
+        min_total = self._min_bet_total()
+        if min_total <= self.commit[a]:
+            return 0
+        max_other = self._max_other_total()
+        if max_other <= self.bet_to_call:
+            return 0
+        cap_delta = max_other - self.commit[a]
+        if cap_delta <= 0:
+            return 0
+        clamped = min(min_total - self.commit[a], cap_delta)
+        return 0 if clamped > self.stacks[a] else clamped
+
+    def max_raise(self) -> int:
+        a = self.actor
+        cap_total = min(self._max_other_total(), self.commit[a] + self.stacks[a])
+        if cap_total <= self.commit[a] or cap_total <= self.bet_to_call:
+            return 0
+        return cap_total - self.commit[a]
+
+    def raise_chips_for_pm(self, pm: int) -> int | None:
+        """Pot-fraction raise, clamped to [min raise, max raise] — or None."""
+        a = self.actor
+        to_call_raw = max(0, self.bet_to_call - self.commit[a])
+        if self.bet_to_call == 0:
+            target_total = self.pot * pm // 1000
+        else:
+            target_total = self.bet_to_call + (self.pot + to_call_raw) * pm // 1000
+        clamped = min(max(target_total, self._min_bet_total()), self._max_other_total())
+        want = min(max(0, clamped - self.commit[a]), self.stacks[a])
+        min_r, max_r = self.min_raise(), self.max_raise()
+        if min_r == 0 or want < min_r or want > max_r:
+            return None
+        return want
+
+    def menu(self, sizes: Sequence[int], allin_atom: bool) -> list[str]:
+        """``legal_actions`` in actions.rs: one physical action = one label."""
+        to_call, stack = self.to_call(), self.stacks[self.actor]
+        min_r, max_r = self.min_raise(), self.max_raise()
+        can_raise = min_r > 0 and max_r >= min_r
+        if not sizes and allin_atom and self.street == 0:  # preflop push/fold
+            if to_call > 0:
+                return ["FOLD", "ALLIN"] if stack > 0 else ["FOLD"]
+            return ["ALLIN"] if can_raise and stack >= min_r else ["CHECK_CALL"]
+        out = (["FOLD"] if to_call > 0 else []) + ["CHECK_CALL"]
+        if can_raise:
+            seen: list[int] = []
+            for pm in sizes:
+                chips = self.raise_chips_for_pm(int(pm))
+                if chips is None or (allin_atom and chips == max_r) or chips in seen:
+                    continue  # illegal, IS the all-in, or same chips as an earlier size
+                seen.append(chips)
+                out.append(f"RAISE_{int(pm)}")
+            if allin_atom:
+                out.append("ALLIN")
+        return out
+
+    # --- transitions ------------------------------------------------------
+
+    def apply(self, action: str) -> None:
+        a = self.actor
+        if action == "FOLD":
+            self.folded[a] = True
+        else:
+            if action == "CHECK_CALL":
+                chips = self.to_call()
+            elif action == "ALLIN":
+                # The maximum legal raise; with no raise legal it is a call all-in.
+                chips = self.max_raise() if self.min_raise() > 0 else self.to_call()
+            else:
+                chips = self.raise_chips_for_pm(int(action.split("_", 1)[1])) or self.to_call()
+            chips = min(chips, self.stacks[a])
+            self.stacks[a] -= chips
+            self.commit[a] += chips
+            self.pot += chips
+            if self.commit[a] > self.bet_to_call:
+                size = self.commit[a] - self.bet_to_call
+                if size >= self.last_raise:
+                    self.last_raise = size  # a full raise sets the next minimum
+                self.bet_to_call = self.commit[a]
+        self.acted[a] = True
+        self.actor = None if len(self.alive()) <= 1 else self._next_actor(a)
+
+    def terminal_kind(self) -> str:
+        alive = self.alive()
+        if len(alive) <= 1:
+            return "fold"
+        # Betting is over. With at most one player holding chips the rest of the
+        # board is simply run out; otherwise play continues on the next street.
+        if sum(1 for i in alive if self.stacks[i] > 0) <= 1:
+            return "allin_runout"
+        return "showdown" if self.street >= 3 else "next_street"
+
+
 def build_abstract_tree(
     root: RootSpec | dict[str, Any],
     *,
     max_nodes: int = 400,
     max_depth: int = 8,
 ) -> dict[str, Any]:
-    """Enumerate the abstract bet-size tree for a root (HU simplified).
+    """Enumerate the abstract bet-size tree of the ROOT street's betting round.
 
-    Multiway (>2) uses a push/fold-style or sequential simplified model:
-    each active seat acts once per betting round with the same menu.
+    Mirrors the solver's public state (seat order, blinds/antes, min-raise
+    clamp, size de-dup, all-in) — see :class:`_PreviewState`. Later streets are
+    not expanded: a closed round ends in ``next_street`` / ``showdown`` /
+    ``allin_runout`` / ``fold``.
     """
     if isinstance(root, dict):
         from plo5bp.cfr_app.session import _root_from_dict
@@ -101,118 +285,83 @@ def build_abstract_tree(
     else:
         r = root
 
-    n = max(2, int(r.num_seats))
-    pot = float(r.pot_bb)
-    eff = float(r.effective_stack_bb)
+    bb = float(max(1, int(r.bb_chips)))
+    names = _position_names(max(2, int(r.num_seats)), int(r.street))
     counter = {"n": 0}
     nodes_flat: list[dict[str, Any]] = []
+    sizes = [int(pm) for pm in r.raise_sizes_pm]
 
     def new_id() -> str:
         counter["n"] += 1
         return f"n{counter['n']}"
 
-    def build(
-        *,
-        seat: int,
-        depth: int,
-        pot_bb: float,
-        stacks: list[float],
-        invested: list[float],
-        facing: float,
-        active: list[bool],
-        last_full_raise: float,
-        path_label: str,
-    ) -> TreeNode:
+    def build(state: _PreviewState, depth: int, path_label: str) -> TreeNode:
         nid = new_id()
+        if state.actor is None:
+            kind = state.terminal_kind()
+            alive = state.alive()
+            seat = alive[0] if alive else 0
+            suffix = {
+                "fold": "fold_win",
+                "showdown": "showdown",
+                "next_street": "next street",
+                "allin_runout": "runout",
+            }[kind]
+            return TreeNode(
+                id=nid,
+                label=f"{path_label} → {suffix}" if path_label else suffix,
+                seat=seat,
+                depth=depth,
+                facing_bet=False,
+                pot_bb=state.pot / bb,
+                stack_bb=state.stacks[seat] / bb,
+                to_call_bb=0.0,
+                terminal=True,
+                terminal_kind=kind,
+                seat_label=names[seat],
+            )
+        seat = state.actor
+        to_call = state.to_call()
         if counter["n"] > max_nodes or depth > max_depth:
+            # A genuine size cap — not an all-in chain (those terminate above).
             return TreeNode(
                 id=nid,
                 label="(truncated)",
                 seat=seat,
                 depth=depth,
-                facing_bet=facing > 1e-9,
-                pot_bb=pot_bb,
-                stack_bb=stacks[seat],
-                to_call_bb=max(0.0, facing - invested[seat]),
+                facing_bet=to_call > 0,
+                pot_bb=state.pot / bb,
+                stack_bb=state.stacks[seat] / bb,
+                to_call_bb=to_call / bb,
                 terminal=True,
                 terminal_kind="truncated",
+                seat_label=names[seat],
             )
-
-        # skip folded seats
-        if not active[seat]:
-            nxt = (seat + 1) % n
-            return build(
-                seat=nxt,
-                depth=depth,
-                pot_bb=pot_bb,
-                stacks=stacks,
-                invested=invested,
-                facing=facing,
-                active=active,
-                last_full_raise=last_full_raise,
-                path_label=path_label,
-            )
-
-        to_call = max(0.0, facing - invested[seat])
-        facing_bet = to_call > 1e-9
-        # can act?
-        if stacks[seat] <= 1e-12:
-            # all-in already — pass
-            nxt = (seat + 1) % n
-            # if everyone all-in or matched → terminal
-            return build(
-                seat=nxt,
-                depth=depth + 1,
-                pot_bb=pot_bb,
-                stacks=stacks,
-                invested=invested,
-                facing=facing,
-                active=active,
-                last_full_raise=last_full_raise,
-                path_label=path_label,
-            )
-
-        menu = _action_menu(r, facing_bet=facing_bet)
-        # filter illegal: if to_call >= stack, only fold / allin call
-        if to_call >= stacks[seat] - 1e-12 and facing_bet:
-            menu = ["FOLD", "ALLIN"]
-
+        menu = state.menu(sizes, bool(r.allin_atom))
         node = TreeNode(
             id=nid,
             label=path_label or "root",
             seat=seat,
             depth=depth,
-            facing_bet=facing_bet,
-            pot_bb=pot_bb,
-            stack_bb=stacks[seat],
-            to_call_bb=to_call,
+            facing_bet=to_call > 0,
+            pot_bb=state.pot / bb,
+            stack_bb=state.stacks[seat] / bb,
+            to_call_bb=to_call / bb,
             actions=menu,
+            seat_label=names[seat],
         )
-
         for act in menu:
-            child = _apply_action(
-                act=act,
-                seat=seat,
-                depth=depth,
-                pot_bb=pot_bb,
-                stacks=list(stacks),
-                invested=list(invested),
-                facing=facing,
-                active=list(active),
-                last_full_raise=last_full_raise,
-                path_label=path_label,
-                n=n,
-                build_fn=build,
-                new_id=new_id,
-                root=r,
+            child_state = state.clone()
+            child_state.apply(act)
+            node.children.append(
+                build(child_state, depth + 1, f"{path_label}/{act}" if path_label else act)
             )
-            node.children.append(child)
-
         nodes_flat.append(
             {
                 "id": node.id,
                 "label": node.label,
                 "seat": node.seat,
+                "seat_label": node.seat_label,
                 "depth": node.depth,
                 "actions": node.actions,
                 "pot_bb": node.pot_bb,
@@ -222,234 +371,16 @@ def build_abstract_tree(
         )
         return node
 
-    def _apply_action(
-        *,
-        act: str,
-        seat: int,
-        depth: int,
-        pot_bb: float,
-        stacks: list[float],
-        invested: list[float],
-        facing: float,
-        active: list[bool],
-        last_full_raise: float,
-        path_label: str,
-        n: int,
-        build_fn,
-        new_id,
-        root: RootSpec,
-    ) -> TreeNode:
-        to_call = max(0.0, facing - invested[seat])
-        short = act if len(act) < 12 else act[:10]
-        child_label = f"{path_label}/{short}" if path_label else short
-
-        if act == "FOLD":
-            active[seat] = False
-            alive = [i for i, a in enumerate(active) if a]
-            if len(alive) <= 1:
-                return TreeNode(
-                    id=new_id(),
-                    label=child_label + " → fold_win",
-                    seat=alive[0] if alive else seat,
-                    depth=depth + 1,
-                    facing_bet=False,
-                    pot_bb=pot_bb,
-                    stack_bb=stacks[alive[0]] if alive else 0,
-                    to_call_bb=0,
-                    terminal=True,
-                    terminal_kind="fold",
-                )
-            nxt = (seat + 1) % n
-            return build_fn(
-                seat=nxt,
-                depth=depth + 1,
-                pot_bb=pot_bb,
-                stacks=stacks,
-                invested=invested,
-                facing=facing,
-                active=active,
-                last_full_raise=last_full_raise,
-                path_label=child_label,
-            )
-
-        if act == "CHECK_CALL":
-            put = min(stacks[seat], to_call)
-            stacks[seat] -= put
-            invested[seat] += put
-            pot_bb += put
-            # if check (to_call=0), advance; if call, check if round closes
-            nxt = (seat + 1) % n
-            if to_call <= 1e-12:
-                # check — if back to aggressor / all checked close street
-                if _round_closed_check(seat, n, active, invested, facing):
-                    return TreeNode(
-                        id=new_id(),
-                        label=child_label + " → showdown/next",
-                        seat=seat,
-                        depth=depth + 1,
-                        facing_bet=False,
-                        pot_bb=pot_bb,
-                        stack_bb=stacks[seat],
-                        to_call_bb=0,
-                        terminal=True,
-                        terminal_kind="showdown",
-                    )
-            else:
-                if _bets_matched(active, invested, facing):
-                    return TreeNode(
-                        id=new_id(),
-                        label=child_label + " → showdown/next",
-                        seat=seat,
-                        depth=depth + 1,
-                        facing_bet=False,
-                        pot_bb=pot_bb,
-                        stack_bb=stacks[seat],
-                        to_call_bb=0,
-                        terminal=True,
-                        terminal_kind="showdown",
-                    )
-            return build_fn(
-                seat=nxt,
-                depth=depth + 1,
-                pot_bb=pot_bb,
-                stacks=stacks,
-                invested=invested,
-                facing=facing,
-                active=active,
-                last_full_raise=last_full_raise,
-                path_label=child_label,
-            )
-
-        # raise or allin
-        if act == "ALLIN":
-            put = stacks[seat]
-            stacks[seat] = 0.0
-            invested[seat] += put
-            pot_bb += put
-            new_face = invested[seat]
-            raise_size = max(0.0, new_face - facing)
-            last_full_raise = max(last_full_raise, raise_size)
-            facing = max(facing, new_face)
-            if _all_others_allin_or_matched(seat, active, stacks, invested, facing):
-                return TreeNode(
-                    id=new_id(),
-                    label=child_label + " → runout",
-                    seat=seat,
-                    depth=depth + 1,
-                    facing_bet=False,
-                    pot_bb=pot_bb,
-                    stack_bb=0,
-                    to_call_bb=0,
-                    terminal=True,
-                    terminal_kind="allin_runout",
-                )
-            nxt = (seat + 1) % n
-            return build_fn(
-                seat=nxt,
-                depth=depth + 1,
-                pot_bb=pot_bb,
-                stacks=stacks,
-                invested=invested,
-                facing=facing,
-                active=active,
-                last_full_raise=last_full_raise,
-                path_label=child_label,
-            )
-
-        # RAISE_pm
-        pm = 1000
-        if act.startswith("RAISE_"):
-            try:
-                pm = int(act.split("_", 1)[1])
-            except ValueError:
-                pm = 1000
-        # pot-fraction raise sizing (approx): raise to pot*pm/1000 more after call
-        call_amt = min(stacks[seat], to_call)
-        pot_after_call = pot_bb + call_amt
-        raise_extra = pot_after_call * (pm / 1000.0)
-        want = call_amt + raise_extra
-        put = min(stacks[seat], want)
-        stacks[seat] -= put
-        invested[seat] += put
-        pot_bb += put
-        new_face = invested[seat]
-        raise_size = max(0.0, new_face - facing)
-        last_full_raise = max(last_full_raise, raise_size) if raise_size > 0 else last_full_raise
-        facing = max(facing, new_face)
-        nxt = (seat + 1) % n
-        return build_fn(
-            seat=nxt,
-            depth=depth + 1,
-            pot_bb=pot_bb,
-            stacks=stacks,
-            invested=invested,
-            facing=facing,
-            active=active,
-            last_full_raise=last_full_raise,
-            path_label=child_label,
-        )
-
-    stacks0 = (
-        list(r.stacks_bb)
-        if r.stacks_bb and len(r.stacks_bb) == n
-        else [eff] * n
-    )
-    invested0 = [0.0] * n
-    # preflop blinds simplification
-    if r.street == 0 and n >= 2:
-        bb = 1.0
-        sb = 0.5
-        ante = (r.ante_chips / float(r.bb_chips)) if r.bb_chips else 0.5
-        pot0 = n * ante + sb + bb
-        # seat 0 = first to act (UTG / SB in HU)
-        if n == 2:
-            # HU: seat0 SB, seat1 BB; SB acts first
-            invested0[0] = sb + ante
-            invested0[1] = bb + ante
-            stacks0[0] = max(0.0, stacks0[0] - sb - ante)
-            stacks0[1] = max(0.0, stacks0[1] - bb - ante)
-            facing0 = bb + ante
-            first = 0
-        else:
-            for i in range(n):
-                invested0[i] = ante
-                stacks0[i] = max(0.0, stacks0[i] - ante)
-            # SB = n-2, BB = n-1
-            sb_i, bb_i = n - 2, n - 1
-            invested0[sb_i] += sb
-            invested0[bb_i] += bb
-            stacks0[sb_i] = max(0.0, stacks0[sb_i] - sb)
-            stacks0[bb_i] = max(0.0, stacks0[bb_i] - bb)
-            facing0 = bb + ante
-            first = 0  # UTG
-            pot0 = sum(invested0)
-        pot = pot0
-        facing = facing0
-    else:
-        facing = 0.0
-        first = 0  # OOP acts first postflop
-        pot = float(r.pot_bb)
-
-    active = [True] * n
-    tree = build(
-        seat=first,
-        depth=0,
-        pot_bb=pot,
-        stacks=stacks0,
-        invested=invested0,
-        facing=facing,
-        active=active,
-        last_full_raise=1.0,
-        path_label="",
-    )
+    tree = build(_PreviewState(r), 0, "")
 
     return {
         "root_id": r.root_id,
         "street": r.street,
         "street_name": STREET_NAMES.get(r.street, str(r.street)),
-        "num_seats": n,
+        "num_seats": max(2, int(r.num_seats)),
+        "seat_labels": names,
         "pot_bb": float(r.pot_bb),
-        "effective_stack_bb": eff,
+        "effective_stack_bb": float(r.effective_stack_bb),
         "raise_sizes_pm": list(r.raise_sizes_pm),
         "allin_atom": r.allin_atom,
         "board": list(r.board),
@@ -458,38 +389,6 @@ def build_abstract_tree(
         "tree": tree.as_dict(max_depth=max_depth),
         "flat": nodes_flat[:max_nodes],
     }
-
-
-def _round_closed_check(
-    seat: int, n: int, active: list[bool], invested: list[float], facing: float
-) -> bool:
-    """After a check: if next active seats would complete a full orbit of checks."""
-    # simplified: if facing==0 and we've gone around — treat single check from last as open
-    return facing <= 1e-12 and seat == (n - 1) % n
-
-
-def _bets_matched(active: list[bool], invested: list[float], facing: float) -> bool:
-    for i, a in enumerate(active):
-        if a and abs(invested[i] - facing) > 1e-9:
-            # still can put more if stack remains — handled elsewhere
-            if invested[i] + 1e-9 < facing:
-                return False
-    return True
-
-
-def _all_others_allin_or_matched(
-    seat: int,
-    active: list[bool],
-    stacks: list[float],
-    invested: list[float],
-    facing: float,
-) -> bool:
-    for i, a in enumerate(active):
-        if i == seat or not a:
-            continue
-        if stacks[i] > 1e-12 and invested[i] + 1e-9 < facing:
-            return False
-    return True
 
 
 # ---------------------------------------------------------------------------
@@ -593,7 +492,18 @@ def build_solution_tree(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
 
 
 def aggregate_node(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    """Frequency-weighted (uniform hand weight) action mix at a node."""
+    """Range-weighted action mix at a node.
+
+    (review 2026-09-20 E7) Rows are weighted by ``visit_mass`` — the solver's
+    accumulated reach at the infoset — falling back to combos-per-class (6/4/12)
+    when a file has no mass. This used to be an unweighted mean over the LIST of
+    hands, so never-reached hands (still at their 1/n default) and rarely-held
+    hands counted as much as the core of the range: 52.7% shown where the
+    reach-weighted mix was 36.6%. ``actions`` keeps the SOLVER's order (E8) —
+    it was sorted by frequency, which reshuffled the action strip per node.
+    """
+    from plo5bp.cfr_app.strategy_view import row_weights, weighted_strategy
+
     if not rows:
         return {
             "actions": [],
@@ -604,63 +514,51 @@ def aggregate_node(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
             "allin": 0.0,
             "entropy": 0.0,
             "num_hands": 0,
+            "weight": 0.0,
         }
-    totals: dict[str, float] = {}
+    actions, probs = weighted_strategy(rows)
+    mean_mix = {str(a).upper(): float(p) for a, p in zip(actions, probs)}
     fold = call = raise_p = allin = 0.0
-    ent_sum = 0.0
-    for r in rows:
-        strat = r.get("strategy") or []
-        if not strat and r.get("actions"):
-            strat = [
-                {"action": a, "prob": float(p)}
-                for a, p in zip(r.get("actions") or [], r.get("probs") or [])
-            ]
-        local_ent = 0.0
-        for s in strat:
-            a = str(s.get("action", "")).upper()
-            p = float(s.get("prob") or 0.0)
-            totals[a] = totals.get(a, 0.0) + p
-            if a == "FOLD":
-                fold += p
-            elif a == "CHECK_CALL":
-                call += p
-            elif a == "ALLIN":
-                allin += p
-            elif a.startswith("RAISE"):
-                raise_p += p
-            if p > 1e-12:
-                import math
+    for a, p in mean_mix.items():
+        if a == "FOLD":
+            fold += p
+        elif a in ("CHECK_CALL", "CHECK", "CALL"):
+            call += p
+        elif a == "ALLIN":
+            allin += p
+        elif a.startswith("RAISE"):
+            raise_p += p
 
-                local_ent -= p * math.log(p + 1e-15)
-        ent_sum += local_ent
-    n = float(len(rows))
-    mean_mix = {a: v / n for a, v in sorted(totals.items(), key=lambda x: -x[1])}
+    weights = row_weights(rows)
+    total_w = sum(weights)
+    ent = agg50 = fold50 = 0.0
+    for r, w in zip(rows, weights):
+        if w <= 0.0:
+            continue
+        for p in r.get("probs") or [s.get("prob") for s in (r.get("strategy") or [])]:
+            p = float(p or 0.0)
+            if p > 1e-12 and math.isfinite(p):
+                ent -= w * p * math.log(p)
+        if float(r.get("primary_prob") or 0) >= 0.5:
+            primary = str(r.get("primary_action") or "").upper()
+            if primary == "FOLD":
+                fold50 += w
+            elif primary not in ("CHECK_CALL", "CHECK", "CALL"):
+                agg50 += w
+    denom = total_w if total_w > 0 else 1.0
     return {
-        "actions": list(mean_mix.keys()),
+        "actions": list(mean_mix.keys()),  # solver order
         "mean_mix": {k: round(v, 4) for k, v in mean_mix.items()},
-        "fold": round(fold / n, 4),
-        "call": round(call / n, 4),
-        "raise": round(raise_p / n, 4),
-        "allin": round(allin / n, 4),
-        "entropy": round(ent_sum / n, 4),
+        "fold": round(fold, 4),
+        "call": round(call, 4),
+        "raise": round(raise_p, 4),
+        "allin": round(allin, 4),
+        "entropy": round(ent / denom, 4),
         "num_hands": len(rows),
-        # range weight proxy: fraction of hands with primary aggressive action ≥ 50%
-        "agg_ge_50pct": round(
-            sum(1 for r in rows if float(r.get("primary_prob") or 0) >= 0.5
-                and str(r.get("primary_action") or "").upper() not in ("FOLD", "CHECK_CALL"))
-            / n,
-            4,
-        ),
-        "fold_ge_50pct": round(
-            sum(
-                1
-                for r in rows
-                if str(r.get("primary_action") or "").upper() == "FOLD"
-                and float(r.get("primary_prob") or 0) >= 0.5
-            )
-            / n,
-            4,
-        ),
+        "weight": round(total_w, 6),
+        # share of the range (by weight) whose primary action is ≥ 50% aggressive / fold
+        "agg_ge_50pct": round(agg50 / denom, 4),
+        "fold_ge_50pct": round(fold50 / denom, 4),
     }
 
 
@@ -681,14 +579,20 @@ def action_to_token(action: str) -> str:
     return a
 
 
+def _is_hash(path: str | None) -> bool:
+    """A legacy history-hash node id (``1499570753115261709`` / ``h1499…``)."""
+    p = str(path or "").strip()
+    if p.isdigit() and len(p) >= 8:
+        return True
+    return p.startswith("h") and p[1:].isdigit() and len(p) >= 8  # same bounds as before
+
+
 def path_tokens(path: str | None) -> list[str]:
     p = str(path or "").strip()
     if p in ("", "root", "open"):
         return []
     # History hashes are not action sequences
-    if p.isdigit() and len(p) >= 8:
-        return []
-    if p.startswith("h") and p[1:].isdigit() and len(p) >= 8:
+    if _is_hash(p):
         return []
     return [t for t in p.replace("-", ",").split(",") if t]
 
@@ -750,33 +654,52 @@ def build_line_nav(
     dumps are marked ``navigable=False`` (action mix still listed).
     """
     pack_paths = (chart_pack or {}).get("by_path") or {}
+
+    def _nav_key(path: Any) -> str:
+        # A legacy history hash is a node id, not an action line: keep it as its
+        # own key. (path_tokens() maps every hash to [] → all of them used to
+        # collapse onto the single key "open".)
+        p = str(path or "")
+        if _is_hash(p):
+            return p
+        return join_path(path_tokens(p))
+
     by_path: dict[str, dict[str, Any]] = {}
     for n in nodes:
-        key = join_path(path_tokens(n.get("path")))
         # Prefer the node that actually owns this path (first wins; usually unique)
-        by_path.setdefault(key, n)
+        by_path.setdefault(_nav_key(n.get("path")), n)
+
+    # (review 2026-09-20 E8) Native dumps spell path tokens with the solver's full
+    # action labels (CHECK_CALL, RAISE_500, ALLIN); chart packs use short tokens
+    # (XC, R500, AI). next_path was always built from the SHORT token, so in a
+    # native dump no child was ever found and every action showed as terminal.
+    full_style = any(
+        t in ("FOLD", "ALLIN", "CHECK_CALL") or t.startswith("RAISE_")
+        for n in nodes
+        for t in path_tokens(n.get("path"))
+    )
 
     def _actions_for(node: dict[str, Any]) -> list[dict[str, Any]]:
         tokens = path_tokens(node.get("path"))
         mix = ((node.get("aggregate") or {}).get("mean_mix")) or {}
-        # Preserve solver action order when present
+        # Solver action order (aggregate_node keeps it) — not frequency order.
         order = list((node.get("aggregate") or {}).get("actions") or mix.keys())
         out: list[dict[str, Any]] = []
         for act in order:
             freq = float(mix.get(act, 0.0))
             tok = action_to_token(act)
-            nxt_path = join_path([*tokens, tok])
-            nxt = by_path.get(nxt_path)
-            pack = pack_paths.get(nxt_path)
-            # Charts use F for fold / AI for all-in; XC may not appear
-            if nxt is None and pack is None and tok == "XC":
-                for alt in ("X", "C"):
-                    alt_path = join_path([*tokens, alt])
-                    nxt = by_path.get(alt_path)
-                    pack = pack_paths.get(alt_path)
-                    if nxt or pack:
-                        nxt_path = alt_path
-                        break
+            full = str(act).upper()
+            # Try the dump's own spelling first, then chart tokens (XC may be X / C).
+            candidates = [full, tok] + (["X", "C"] if tok == "XC" else [])
+            nxt = pack = None
+            nxt_path = join_path([*tokens, full if full_style else tok])
+            for cand in candidates:
+                cand_path = join_path([*tokens, cand])
+                nxt = by_path.get(cand_path)
+                pack = pack_paths.get(cand_path)
+                if nxt or pack:
+                    nxt_path = cand_path
+                    break
             a_up = str(act).upper()
             css = (
                 "act-fold"
@@ -825,13 +748,17 @@ def build_line_nav(
             "actions": _actions_for(n),
         }
 
-    # Root = shortest token path, then lowest seat
+    # Root = the "open" node when the dump has one, else the shortest line.
     if by_path:
         root_node = min(
             by_path.values(),
-            key=lambda n: (len(path_tokens(n.get("path"))), int(n.get("seat", 0))),
+            key=lambda n: (
+                _nav_key(n.get("path")) != "open",
+                len(path_tokens(n.get("path"))),
+                int(n.get("seat", 0)),
+            ),
         )
-        root_path = join_path(path_tokens(root_node.get("path")))
+        root_path = _nav_key(root_node.get("path"))
         root_seat = int(root_node.get("seat", 0))
     else:
         root_path, root_seat = "open", 0
@@ -872,9 +799,11 @@ def compare_strategies(
     def index(rows: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         out = {}
         for r in rows:
+            # hand_label is the REAL hand (raw_combo under isomorphism) — the same
+            # label the viewer and the hand filter use (review 2026-09-20 E5).
             key = str(r.get("hand_label") or r.get("private") or r.get("infoset_id"))
-            # also seat+path for disambiguation
-            full = f"{r.get('seat')}|{r.get('path')}|{key}"
+            # seat + path + runout: the same line on two river cards is two nodes (E6).
+            full = f"{r.get('seat')}|{r.get('path')}|{r.get('runout') or ''}|{key}"
             out[full] = r
         return out
 

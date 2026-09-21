@@ -23,10 +23,15 @@ ui = [
   "uvicorn[standard]>=0.27",
   "python-multipart>=0.0.9",  # CFR app solution upload
   "pywebview>=5.0",           # native desktop window
+  # Desktop-shortcut installer (scripts/install_cfr_desktop_shortcut.py).
+  "pywin32>=306; sys_platform == 'win32'",
 ]
 # Public build only (PLO5BP_PUBLIC=1): Google sign-in, cookie sessions, Stripe.
 public = [
   "authlib>=1.3",
+  # Authlib's Starlette OAuth client imports httpx at module import; without it
+  # `public.install` raises ModuleNotFoundError at boot once Google creds are set.
+  "httpx>=0.27",
   "itsdangerous>=2.1",
   "stripe>=9.0",
 ]

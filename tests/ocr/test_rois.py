@@ -6,8 +6,9 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("cv2")
-
+# No cv2 gate (review 2026-09-20 I12/J2): `rois` is pure Python, and since
+# `plo5bp.ocr.__init__` stopped importing `extract` eagerly this module runs
+# on machines without the `[ocr]` extras.
 from plo5bp.ocr import rois
 
 

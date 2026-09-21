@@ -3,12 +3,25 @@
 Architecture is the v2 torso + flat anchor categorical (same act path as
 ActorCriticV2) so Trainer / Study / Ranges reuse existing scoring without
 a second code path. Checkpoints stamp ``kind=gto_policy_net`` for the
-host load path. **Badge "GTO AI"** requires validated meta (native
-``rust_cfr`` source + holdout probe pass) — see :func:`is_validated_gto_meta`.
+host load path. **Badge "GTO AI"** requires validated meta — see
+:func:`is_validated_gto_meta`:
+
+1. a native ``rust_cfr`` source,
+2. label provenance DERIVED FROM THE TRAINING RECORDS
+   (:func:`label_provenance_problem`): every label source is the rust_cfr
+   teacher, every label's exploitability was produced by a final estimator,
+   and it sits under a recorded teacher cap no looser than
+   ``TEACHER_MAX_EXPL_BB``,
+3. a recorded holdout probe pass.
+
+A bare ``is_gto_validated=True`` / ``source="rust_cfr"`` asserted by a script
+is NOT honoured (review 2026-09-20 F6).
 """
 
 from __future__ import annotations
 
+import logging
+import math
 from pathlib import Path
 from typing import Any
 
@@ -16,8 +29,12 @@ import torch
 import torch.nn as nn
 
 from plo5bp.encoding_nlh import OBS_DIM_NLH
+from plo5bp.gto.obs_rev import obs_rev_mismatch
+from plo5bp.gto.teacher import TEACHER_MAX_EXPL_BB
 from plo5bp.network import ActorCriticV2, build_actor_from_state_dict, model_class_for_state_dict
 from plo5bp.sizing import NLH_ANCHOR_SPEC
+
+logger = logging.getLogger(__name__)
 
 POLICY_KIND = "gto_policy_net"
 DEFAULT_HIDDEN = 512
@@ -52,7 +69,9 @@ def save_policy_checkpoint(
     Always stamps ``kind=gto_policy_net``. ``is_gto`` in the file means
     "this is a PolicyNet artifact" (loadable by the host), **not** that
     the UI may show "GTO AI". Serving uses :func:`is_validated_gto_meta`
-    (``rust_cfr`` source + probe.passed).
+    (``rust_cfr`` source + record-derived label provenance + probe.passed).
+    ``is_gto_validated`` is always RE-DERIVED here; a value passed in ``meta``
+    is ignored.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -94,14 +113,74 @@ def source_is_gto_teacher(source: str | None) -> bool:
     return s.startswith("rust_cfr")
 
 
+def label_provenance_problem(
+    meta: dict[str, Any] | None,
+    *,
+    max_teacher_cap_bb: float = TEACHER_MAX_EXPL_BB,
+) -> str | None:
+    """Why this checkpoint's labels can NOT back a GTO claim (None = fine).
+
+    Reads ``meta['label_provenance']`` — written by
+    :func:`plo5bp.gto.train.derive_training_provenance` from the rows that were
+    actually trained on (review 2026-09-20 F6). Checkpoints saved before that
+    have no such block and therefore cannot be validated until retrained.
+    """
+    lp = (meta or {}).get("label_provenance")
+    if not isinstance(lp, dict) or lp.get("derived_from_records") is not True:
+        return "no record-derived label_provenance in checkpoint meta"
+    sources = lp.get("sources") or {}
+    if not sources:
+        return "label_provenance lists no label sources"
+    for src in sources:
+        base = str(src)
+        if base.startswith("warm_start:"):
+            base = base[len("warm_start:"):]
+        if not source_is_gto_teacher(base):
+            return f"label source {src!r} is not the rust_cfr teacher"
+    n_unv = int(lp.get("n_unverified_expl") or 0)
+    if n_unv > 0:
+        return f"{n_unv} training label(s) without a verified exploitability"
+    cap = lp.get("teacher_max_expl_bb")
+    try:
+        cap_f = float(cap)
+    except (TypeError, ValueError):
+        return "teacher exploitability cap missing from label_provenance"
+    if not math.isfinite(cap_f) or cap_f > float(max_teacher_cap_bb):
+        return (
+            f"teacher cap {cap_f:g} bb is looser than the "
+            f"{float(max_teacher_cap_bb):g} bb badge bar"
+        )
+    worst = lp.get("max_label_expl_bb")
+    try:
+        worst_f = float(worst)
+    except (TypeError, ValueError):
+        return "max label exploitability missing from label_provenance"
+    if not (worst_f <= cap_f):
+        return f"label exploitability {worst_f:g} bb exceeds the cap {cap_f:g} bb"
+    return None
+
+
 def _meta_claims_gto(meta: dict[str, Any]) -> bool:
-    """rust_cfr source + probe.passed (or explicit is_gto_validated)."""
+    """rust_cfr source + record-derived label provenance + probe.passed.
+
+    (review 2026-09-20 F6) A bare ``is_gto_validated=True`` is never enough:
+    the flag is an OUTPUT of this function, not an input.
+    """
     if not source_is_gto_teacher(str(meta.get("source") or "")):
         return False
+    if label_provenance_problem(meta) is not None:
+        return False
     probe = meta.get("probe")
-    if isinstance(probe, dict) and probe.get("passed") is True:
-        return True
-    return bool(meta.get("is_gto_validated"))
+    if not (isinstance(probe, dict) and probe.get("passed") is True):
+        return False
+    # The HOLDOUT the probe scored against must itself be verified teacher
+    # labels (``probe.report.holdout_provenance``, derived from its records).
+    hold = (probe.get("report") or {}).get("holdout_provenance")
+    return (
+        isinstance(hold, dict)
+        and "problem" in hold
+        and hold["problem"] is None
+    )
 
 
 def _infer_num_layers(model: nn.Module) -> int:
@@ -174,6 +253,10 @@ def load_policy_checkpoint(
     meta = {k: v for k, v in ckpt.items() if k not in ("model", "actor", "policy")}
     meta["path"] = str(path)
     meta["kind"] = kind or "unknown"
+    if kind == POLICY_KIND or ckpt.get("is_gto"):
+        stale = obs_rev_mismatch(meta)
+        if stale is not None:
+            logger.warning("GTO PolicyNet %s: %s", path, stale)
     return model, meta  # type: ignore[return-value]
 
 
@@ -207,7 +290,7 @@ def is_gto_checkpoint(path: Path | str) -> bool:
 
 
 def is_validated_gto_meta(meta: dict[str, Any] | None) -> bool:
-    """Badge-level: rust_cfr source + recorded probe pass."""
+    """Badge-level: rust_cfr source + label provenance + recorded probe pass."""
     if not meta:
         return False
     return _meta_claims_gto(dict(meta))

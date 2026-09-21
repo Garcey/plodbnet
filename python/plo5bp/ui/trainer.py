@@ -25,7 +25,26 @@ State/replay invariants:
   auto-checked by `_advance` for hero and opponents alike — an all-in
   hand runs out to showdown without drilling the user on meaningless
   check nodes. Auto-checks consume no model RNG and are recorded in
-  `action_log` like any action, so replay determinism is unchanged.
+  `action_log` like any action (tagged `auto`), so replay determinism is
+  unchanged.
+- Hidden information (review 2026-09-20 H2): the MC EV-loss replays the
+  REAL deal (villain cards + the real future board), so it is computed
+  and stored on the `DecisionRecord` at act time but only SHOWN once the
+  hand is terminal — live frames carry `feedback.ev_loss_bb = None` +
+  `ev_loss_hidden`, and the stats blocks are committed per completed
+  hand (`_commit_hand_stats`), never per move. Score / category are
+  observation-only and show immediately. A hand abandoned mid-way
+  contributes nothing to the stats.
+- Every seed→sample region holds `_TORCH_RNG_LOCK` and ONLY those
+  regions do: env replays / steps never run under it (`_rollout_ev`
+  resumes its own RNG stream per depth via snapshot/restore).
+- One host per NODE (`_backend_for`): a non-PPO backend (the GTO
+  PolicyNetHost) serves a node only where its `supports(seats, street)`
+  says its training covers it; every other node is served by the format's
+  PPO host and tagged `backend: "ppo_fallback"`. Opponent sampling,
+  recommendations / scoring, review and the MC continuations all go
+  through that same per-node host, so the policy that is graded is the
+  policy that plays. The choice reads public node state only.
 """
 
 from __future__ import annotations
@@ -35,9 +54,10 @@ import logging
 import math
 import os
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import numpy as np
 import torch
@@ -55,7 +75,7 @@ from plo5bp.config import GameConfig, VARIANT_NLH, VARIANT_PLO5
 from plo5bp.env import BombPotEnv, StepInfo
 from plo5bp.eval import model_policy
 from plo5bp.gto.backend import PpoSolverHost, StrategyBackend, make_ppo_host
-from plo5bp.gto.policy_host import PolicyNetHost, try_load_gto_host
+from plo5bp.gto.policy_host import try_load_gto_host
 from plo5bp.network import ActorCritic, CentralCritic, obs_adapter
 from plo5bp.rollout import _critic_values, _rotate_opp_holes
 from plo5bp.sizing import (
@@ -90,11 +110,19 @@ def _engine_variant(fmt_id: str) -> str:
 
 logger = logging.getLogger("plo5bp.ui.trainer")
 
+def _public_mode() -> bool:
+    """PLO5BP_PUBLIC, read at CALL time. The security-relevant guards (the
+    `mc_rollouts` cap, `_ts` failing closed) use this rather than the
+    import-time `_PUBLIC` constant so they hold no matter which module was
+    imported first or how a test toggles the flag."""
+    return os.environ.get("PLO5BP_PUBLIC", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 # Mirrors server.PLO5BP_PUBLIC (avoids a circular import): in the public
 # build the state payload must carry no trace of the live-capture fields.
-_PUBLIC = os.environ.get("PLO5BP_PUBLIC", "").strip().lower() in (
-    "1", "true", "yes", "on",
-)
+_PUBLIC = _public_mode()
 
 BB_CHIPS = 10000
 
@@ -103,6 +131,36 @@ BB_CHIPS = 10000
 # (public build) two requests may interleave between seed and sample, so
 # every seed→sample region takes this lock. Uncontended in the local build.
 _TORCH_RNG_LOCK = threading.Lock()
+
+
+def _snapshot_rng_state(
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """The global torch RNG stream position (CPU + the sampling device's
+    CUDA generator). Call while holding `_TORCH_RNG_LOCK`."""
+    cuda = torch.cuda.get_rng_state(device) if device.type == "cuda" else None
+    return torch.get_rng_state(), cuda
+
+
+def _restore_rng_state(
+    state: tuple[torch.Tensor, torch.Tensor | None], device: torch.device
+) -> None:
+    """Resume a stream captured by `_snapshot_rng_state` (lock held): lets a
+    multi-draw seed→sample sequence release the lock between draws and still
+    see exactly the uninterrupted stream."""
+    cpu, cuda = state
+    torch.set_rng_state(cpu)
+    if cuda is not None:
+        torch.cuda.set_rng_state(cuda, device)
+
+
+# `_persist`: transient os.replace PermissionError retries (Windows).
+_PERSIST_RETRIES = 5
+_PERSIST_RETRY_SLEEP_S = 0.02
+
+# Node-level `backend` tag when the ACTIVE (non-PPO) host declined a node via
+# `supports()` and the format's PPO host served it instead.
+BACKEND_PPO_FALLBACK = "ppo_fallback"
 
 GATE_SLUGS = {GATE_FOLD: "fold", GATE_CHECK_CALL: "check_call", GATE_RAISE: "raise"}
 GATE_NAME_TO_IDX = {v: k for k, v in GATE_SLUGS.items()}
@@ -194,6 +252,175 @@ def score_move(
     }
 
 
+def unclamped_brackets(
+    min_raise: int, max_raise: int, pot: int, to_call: int, spec: Any,
+) -> tuple[list[int], list[int]]:
+    """Per-anchor refinement bracket in chips WITHOUT the
+    [min_raise, max_raise] clip — the chip axis the POLICY maps `u` over.
+
+    (review 2026-09-20 H1) `sizing.refine_chips_*` computes
+    ``chips = clip(round(to_call + frac(u) * base), min_raise, max_raise)``
+    with ``frac(u)`` spanning the spec's per-mille bracket, i.e. `u` lives
+    on the UNCLAMPED bracket and only the resulting chips are clamped.
+    `AnchorGrid.lo/hi` are the CLAMPED bounds, so inverting chips→u over
+    them misplaces every size whenever min-raise lands inside a bracket
+    (or max-raise inside the top one). Same integer half-up rounding as
+    `sizing.anchor_grid_np`, minus the clip (sizing.py owns the canonical
+    math; this is its inverse-side twin for the scorer only). The ALL-IN
+    atom (NLH) has no fraction: its "bracket" is the single point
+    `max_raise`, as in the grid.
+    """
+    base = int(pot) + int(to_call)
+    tc = int(to_call)
+    lo = [tc + (int(pm) * base + 500) // 1000 for pm in spec.bracket_lo_pm]
+    hi = [tc + (int(pm) * base + 500) // 1000 for pm in spec.bracket_hi_pm]
+    if spec.allin_atom:
+        lo.append(int(max_raise))
+        hi.append(int(max_raise))
+    return lo, hi
+
+
+def attach_unclamped_brackets(
+    dist: dict[str, Any], info: StepInfo, spec: Any,
+) -> dict[str, Any]:
+    """Ensure a v2+ node-distribution dict carries `anchor_lo_raw` /
+    `anchor_hi_raw`. `compute_node_distribution` exports them, but
+    `gto.backend.NodeDist` (not this module's) round-trips a fixed field
+    list and drops them — so the session re-derives them from the node's
+    own `StepInfo` after `as_dict()`. No-op for v1 dicts, for dicts that
+    already carry the keys, and when `spec` does not match the dict's
+    ladder length. (review 2026-09-20 H1)"""
+    if int(dist.get("head_version", 1)) < 2 or "anchor_lo_raw" in dist:
+        return dist
+    if spec is None or spec.count != len(dist.get("anchor_chips") or ()):
+        return dist
+    sizing = sizing_from_info(info)
+    lo, hi = unclamped_brackets(
+        int(sizing[0]), int(sizing[1]), int(sizing[2]), int(sizing[3]), spec
+    )
+    dist["anchor_lo_raw"], dist["anchor_hi_raw"] = lo, hi
+    return dist
+
+
+def refine_u_interval(
+    dist: dict[str, Any], k: int, chips: int,
+) -> tuple[float, float] | None:
+    """Inverse image `[u_lo, u_hi]` of `chips` under the policy's
+    (anchor k, u) -> chips map; None when anchor `k` has no slider (atom /
+    collapsed bracket).
+
+    (review 2026-09-20 H1) `u` is inverted over the UNCLAMPED bracket
+    (`anchor_lo_raw/hi_raw`) - the axis the policy samples on - falling
+    back to the clamped `anchor_lo/hi` only for hand-built dicts that lack
+    the raw keys. Away from the clip the image is the single point
+    `(chips - lo) / (hi - lo)`. Where the clip is active it is an INTERVAL:
+    every u below the min-raise crossing collapses onto min_raise
+    (`[0, u_pt]`), every u above the max-raise crossing onto max_raise
+    (`[u_pt, 1]`).
+    """
+    if not dist["refine_ok"][k]:
+        return None
+    lo_raw = dist.get("anchor_lo_raw")
+    hi_raw = dist.get("anchor_hi_raw")
+    if lo_raw is not None and hi_raw is not None:
+        lo, hi = int(lo_raw[k]), int(hi_raw[k])
+    else:
+        lo, hi = int(dist["anchor_lo"][k]), int(dist["anchor_hi"][k])
+    if hi <= lo:
+        return None
+    u_pt = (chips - lo) / (hi - lo)
+    u_lo = u_hi = u_pt
+    max_chips = int(dist["max_chips"])
+    min_chips = min(int(dist["min_chips"]), max_chips)
+    if chips <= min_chips and lo < chips:
+        u_lo = 0.0           # lower clip active: u in [0, u_pt] -> min_raise
+    if chips >= max_chips and hi > chips:
+        u_hi = 1.0           # upper clip active: u in [u_pt, 1] -> max_raise
+    return u_lo, u_hi
+
+
+def _refine_pdf_ratio(
+    dist: dict[str, Any], k: int, chips: int,
+) -> float:
+    """Beta-density ratio (vs the Beta MEAN reference) of playing `chips`
+    inside refinable anchor `k`'s bracket; 1.0 for atoms / collapsed
+    brackets. Over a clipped interval (see `refine_u_interval`) the point
+    closest to the reference is scored: a min-raise that the anchor's own
+    mean would also have produced earns full size credit instead of being
+    read as an off-centre `u`. (review 2026-09-20 H1)"""
+    interval = refine_u_interval(dist, k, chips)
+    if interval is None:
+        return 1.0
+    u_lo, u_hi = interval
+    eps = SCORING["u_eps"]
+    alpha, beta = dist["refine_params"][k - 1]
+    # Reference the Beta MEAN (= the size the deterministic policy bets and
+    # the UI shows as the recommendation), clamped to <=1, so betting the
+    # recommended size earns full size credit. The earlier mode reference
+    # penalized the recommended mean on any skewed Beta (a matched bet
+    # could score well under 100%).
+    ref = alpha / (alpha + beta)
+    ref = min(1.0 - eps, max(eps, ref))
+    u = min(max(ref, u_lo), u_hi)
+    u = min(1.0 - eps, max(eps, u))
+
+    def logpdf(x: float) -> float:
+        return (alpha - 1.0) * math.log(x) + (beta - 1.0) * math.log(1.0 - x)
+
+    return min(1.0, math.exp(logpdf(u) - logpdf(ref)))
+
+
+def snap_to_anchor(dist: dict[str, Any], chips: int) -> tuple[int | None, float]:
+    """Map a raise of `chips` onto the v2 anchor ladder: returns
+    `(anchor, refinement-pdf-ratio)`.
+
+    (review 2026-09-20 H1) Candidates are the LEGAL anchors that can
+    actually PRODUCE `chips` under the policy's own (anchor, u) → chips
+    map: refinable anchors whose bracket contains the chips (for a legal
+    raise, clamped-bracket containment == unclamped-bracket containment)
+    and atoms / collapsed anchors whose chips equal them. Among candidates
+    the one with the highest `P(anchor) × pdf-ratio` wins (ties → the
+    recommended anchor, then the nearer anchor, then the lower index) — a
+    min-raise is simultaneously "the min atom" and "the low end of the
+    first clipped bracket", and the user is credited with whichever
+    reading the network likes more. The pre-fix nearest-by-chips snap sent
+    a clipped recommendation to the wrong anchor (repro t5_snap). Chips no
+    anchor can produce (the gaps of the NLH ladder) fall back to the
+    nearest legal anchor by chip distance (tie → lower), as before.
+    """
+    legal_ks = [
+        k for k in range(len(dist["anchor_legal"])) if dist["anchor_legal"][k]
+    ]
+    if not legal_ks:
+        return None, 1.0
+    a_chips = dist["anchor_chips"]
+    a_probs = dist["anchor_probs"]
+    rec_anchor = dist.get("rec_anchor")
+
+    candidates: list[int] = []
+    for k in legal_ks:
+        if dist["refine_ok"][k]:
+            if int(dist["anchor_lo"][k]) <= chips <= int(dist["anchor_hi"][k]):
+                candidates.append(k)
+        elif int(a_chips[k]) == chips:
+            candidates.append(k)
+    if not candidates:
+        k_near = min(legal_ks, key=lambda k: (abs(chips - int(a_chips[k])), k))
+        return k_near, _refine_pdf_ratio(dist, k_near, chips)
+
+    ratios = {k: _refine_pdf_ratio(dist, k, chips) for k in candidates}
+    best = max(
+        candidates,
+        key=lambda k: (
+            float(a_probs[k]) * ratios[k],
+            k == rec_anchor,
+            -abs(chips - int(a_chips[k])),
+            -k,
+        ),
+    )
+    return best, ratios[best]
+
+
 def score_move_v2(
     dist: dict[str, Any],
     user_gate: int,
@@ -202,13 +429,19 @@ def score_move_v2(
     """Score one decision against a v2 (anchor head) node distribution.
 
     `gate_ratio` is unchanged from v1. For raises, the user's chips snap
-    to `user_anchor` — the nearest LEGAL anchor by chip distance (tie →
-    lower anchor) — and
+    to `user_anchor` via `snap_to_anchor` (the legal anchor whose bracket
+    can produce them; nearest-by-chips only as a fallback) and
     `size_q = P(user_anchor)/P(best_anchor) × refinement-pdf-ratio`,
     where the pdf ratio compares the user anchor's Beta density at the
-    user's in-bracket position vs at its mode. Atoms, short-shove and
-    collapsed brackets have no within-anchor size choice → pdf ratio 1.
-    Categories, the size floor, and the blunder override match v1.
+    user's position on the UNCLAMPED bracket vs at its mean. Atoms,
+    short-shove and collapsed brackets have no within-anchor size choice
+    → pdf ratio 1. Categories, the size floor, and the blunder override
+    match v1.
+
+    (review 2026-09-20 H1) Playing EXACTLY the recommendation's chips is
+    the recommended (anchor, u) by definition — full size credit, no
+    inversion — so the exact rec always grades as the top category
+    regardless of how min/max-raise clip the rec anchor's bracket.
     """
     gate_probs = dist["gate_probs"]
     g_star = max(range(len(gate_probs)), key=lambda i: gate_probs[i])
@@ -224,39 +457,23 @@ def score_move_v2(
             k for k in range(len(dist["anchor_legal"]))
             if dist["anchor_legal"][k]
         ]
-        user_anchor = min(
-            legal_ks,
-            key=lambda k: (abs(user_chips - dist["anchor_chips"][k]), k),
-        )
-        a_probs = dist["anchor_probs"]
-        k_best = max(legal_ks, key=lambda k: a_probs[k])
-        p_ku = float(a_probs[user_anchor])
-        p_kb = float(a_probs[k_best])
-        anchor_ratio = (p_ku / p_kb) if p_kb > 0 else 0.0
-
-        pdf_ratio = 1.0
-        if dist["refine_ok"][user_anchor]:
-            lo = int(dist["anchor_lo"][user_anchor])
-            hi = int(dist["anchor_hi"][user_anchor])
-            if hi > lo:
-                eps = SCORING["u_eps"]
-                u = (user_chips - lo) / (hi - lo)
-                u = min(1.0 - eps, max(eps, u))
-                alpha, beta = dist["refine_params"][user_anchor - 1]
-                # Reference the Beta MEAN (= the size the deterministic policy
-                # bets and the UI shows as the recommendation), clamped to <=1,
-                # so betting the recommended size earns full size credit. The
-                # earlier mode reference penalized the recommended mean on any
-                # skewed Beta (a matched bet could score well under 100%).
-                ref = alpha / (alpha + beta)
-                ref = min(1.0 - eps, max(eps, ref))
-
-                def logpdf(x: float) -> float:
-                    return (alpha - 1.0) * math.log(x) \
-                        + (beta - 1.0) * math.log(1.0 - x)
-
-                pdf_ratio = min(1.0, math.exp(logpdf(u) - logpdf(ref)))
-        size_q = anchor_ratio * pdf_ratio
+        rec_anchor = dist.get("rec_anchor")
+        if (
+            int(dist.get("rec_gate", -1)) == GATE_RAISE
+            and int(user_chips) == int(dist.get("rec_chips", -1))
+            and rec_anchor is not None
+            and bool(dist["anchor_legal"][int(rec_anchor)])
+        ):
+            user_anchor, pdf_ratio = int(rec_anchor), 1.0
+        else:
+            user_anchor, pdf_ratio = snap_to_anchor(dist, int(user_chips))
+        if user_anchor is not None:  # (a legal raise always has >=1 legal anchor)
+            a_probs = dist["anchor_probs"]
+            k_best = max(legal_ks, key=lambda k: a_probs[k])
+            p_ku = float(a_probs[user_anchor])
+            p_kb = float(a_probs[k_best])
+            anchor_ratio = (p_ku / p_kb) if p_kb > 0 else 0.0
+            size_q = anchor_ratio * pdf_ratio
 
     size_factor = SCORING["size_floor"] + (1.0 - SCORING["size_floor"]) * size_q
     score = 100.0 * gate_ratio * (size_factor if user_gate == GATE_RAISE else 1.0)
@@ -331,6 +548,11 @@ def compute_node_distribution(
                     "w": [round(float(x), 4) for x in w_t.squeeze(0).tolist()],
                 }
         grid = anchor_grid_np(sizing[0], sizing[1], sizing[2], sizing[3], spec)
+        # (review 2026-09-20 H1) The scorer inverts chips -> u over the
+        # UNCLAMPED bracket (the policy's own u axis); grid.lo/hi are clipped.
+        lo_raw, hi_raw = unclamped_brackets(
+            int(sizing[0]), int(sizing[1]), int(sizing[2]), int(sizing[3]), spec
+        )
         return {
             "head_version": model.head_version,
             "gate_probs": [float(p) for p in gate_probs],
@@ -339,6 +561,8 @@ def compute_node_distribution(
             "anchor_legal": [bool(b) for b in grid.legal],
             "anchor_lo": [int(c) for c in grid.lo],
             "anchor_hi": [int(c) for c in grid.hi],
+            "anchor_lo_raw": lo_raw,
+            "anchor_hi_raw": hi_raw,
             "refine_ok": [bool(b) for b in grid.refine_ok],
             "refine_params": [[float(a), float(b)] for a, b in refine_np],
             "rec_anchor": int(_act_out.anchor.item()),
@@ -452,6 +676,8 @@ class TrainerSettings(BaseModel):
     ante_bb: float = Field(3.0, ge=0.0, le=100.0)
     # Monte-Carlo rollouts per EV-loss candidate; 0 disables EV loss.
     # 16 keeps a deviating /trainer/act under ~1s with the 2048x4 net on CPU.
+    # The PUBLIC build clamps this to MC_ROLLOUTS_PUBLIC_CAP (see
+    # `_cap_settings`); 256 is the local-build ceiling.
     mc_rollouts: int = Field(16, ge=0, le=256)
     # Display conversion: dollars per 1bb when the UI is in $ mode.
     dollars_per_bb: float = Field(20.0, gt=0.0, le=100000.0)
@@ -470,6 +696,30 @@ class TrainerSettings(BaseModel):
                     f"stacks_per_seat_bb[{i}]: need 1 <= lo <= hi <= 1000"
                 )
         return self
+
+
+# (review 2026-09-20 F5/F7) Public-build ceiling on `mc_rollouts`. Each MC
+# arm costs ~n env replays + a batched forward per depth on a CPU 2048x4
+# net, shared by every signed-in user; a free user could set 256 and stall
+# the box. 32 keeps a deviating /trainer/act at ~2x the default cost. The
+# local build keeps the model's own 0..256 range.
+MC_ROLLOUTS_PUBLIC_CAP = 32
+
+
+def mc_rollouts_cap() -> int:
+    """Largest `mc_rollouts` the running build honours."""
+    return MC_ROLLOUTS_PUBLIC_CAP if _public_mode() else 256
+
+
+def _cap_settings(settings: TrainerSettings) -> TrainerSettings:
+    """Clamp (not reject) `mc_rollouts` to the build's cap: a settings save
+    from a client that still offers 256 — or a stats file persisted before
+    the cap existed — keeps working, and the stored/echoed value is the one
+    actually used."""
+    cap = mc_rollouts_cap()
+    if settings.mc_rollouts > cap:
+        return settings.model_copy(update={"mc_rollouts": cap})
+    return settings
 
 
 def _default_settings(variant: str) -> TrainerSettings:
@@ -535,10 +785,21 @@ class DecisionRecord:
     category: str
     ev_user_bb: float | None = None
     ev_best_bb: float | None = None
+    # Per-decision DISPLAY value: max(0, best - user). The aggregate stats
+    # accumulate `ev_loss_signed_bb` instead (review 2026-09-20 H4): the MC
+    # estimate is noisy (sd ~4-5bb at n=16), so clamping each decision at
+    # zero before summing biased every total upward.
     ev_loss_bb: float | None = None
+    ev_loss_signed_bb: float | None = None
     # Hero's total committed chips AT the decision node (= chips forfeited
     # on a fold). Rebases the EV components to forward-facing (fold = 0).
     hero_committed_chips: int = 0
+    # Hero's STREET commit at the decision node, BEFORE the action. Engine
+    # raise chips (`user_chips` / `rec_chips`) are raise-BY deltas; the
+    # client shows raise-TO totals = delta + this. Sent as
+    # `actor_commit_chips` so the client never has to derive it (a walk over
+    # the action list is inexact for a blind that posted short).
+    actor_commit_chips: int = 0
     # v2 (anchor head) extras; None/1 on v1 records. For v2, (alpha,
     # beta) above hold the REC anchor's refinement params (1.0/1.0 when
     # the rec anchor is an atom).
@@ -550,6 +811,9 @@ class DecisionRecord:
     user_anchor: int | None = None
     # 100%-pot bet reference (chips) for the sizing-curve axis; 0 on v1.
     pot_ref_chips: int = 0
+    # Host that served this node: the active backend's name, or
+    # BACKEND_PPO_FALLBACK when it did not cover the node (see `_backend_for`).
+    backend: str = "ppo"
 
 
 @dataclass
@@ -574,7 +838,19 @@ class HandRecord:
     all_holes: list[list[int]] = field(default_factory=list)
     all_holes_dealt: list[list[int]] = field(default_factory=list)
     is_repeat: bool = False
-    feedback: dict[str, Any] | None = None
+    # Set once this hand's decisions were folded into the stats blocks
+    # (`_commit_hand_stats`, at hand end) — guards against a double commit.
+    stats_committed: bool = False
+
+
+def _finite(x: Any, default: float = 0.0) -> float:
+    """float(x) if finite, else `default` — a hand-edited / corrupted stats
+    file must not poison every later aggregate with NaN."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return default
+    return v if math.isfinite(v) else default
 
 
 @dataclass
@@ -585,7 +861,18 @@ class StatsBlock:
     cat_counts: dict[str, int] = field(
         default_factory=lambda: {c: 0 for c in CATEGORIES}
     )
+    # (review 2026-09-20 H4) EV loss is kept as TWO sums:
+    # - `ev_loss_sum_bb`: FROZEN legacy history. Until 2026-09-20 each
+    #   decision was clamped at zero before it was added here, so this sum is
+    #   already-clamped (upward-biased) and can't be un-biased after the fact.
+    #   Old stats files load into it unchanged; nothing adds to it any more.
+    # - `ev_loss_signed_sum_bb`: the SIGNED per-decision estimates
+    #   (best - user, negative when noise favours the user's action), over
+    #   `ev_loss_n` MC-estimated decisions. Zero-mean noise cancels in the
+    #   sum; the clamp at zero happens once, on the aggregate, in `project`.
     ev_loss_sum_bb: float = 0.0
+    ev_loss_signed_sum_bb: float = 0.0
+    ev_loss_n: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -594,6 +881,8 @@ class StatsBlock:
             "score_sum": self.score_sum,
             "cat_counts": dict(self.cat_counts),
             "ev_loss_sum_bb": self.ev_loss_sum_bb,
+            "ev_loss_signed_sum_bb": self.ev_loss_signed_sum_bb,
+            "ev_loss_n": self.ev_loss_n,
         }
 
     @classmethod
@@ -604,20 +893,38 @@ class StatsBlock:
         return cls(
             hands=int(d.get("hands", 0)),
             moves=int(d.get("moves", 0)),
-            score_sum=float(d.get("score_sum", 0.0)),
+            score_sum=_finite(d.get("score_sum", 0.0)),
             cat_counts=counts,
-            ev_loss_sum_bb=float(d.get("ev_loss_sum_bb", 0.0)),
+            # Pre-H4 files carry only this key: already-clamped history.
+            ev_loss_sum_bb=max(0.0, _finite(d.get("ev_loss_sum_bb", 0.0))),
+            ev_loss_signed_sum_bb=_finite(d.get("ev_loss_signed_sum_bb", 0.0)),
+            ev_loss_n=int(d.get("ev_loss_n", 0)),
         )
+
+    @property
+    def ev_loss_total_bb(self) -> float:
+        """Aggregate EV loss for display: legacy (already-clamped) history
+        plus the signed sum clamped at zero ONCE, as an aggregate."""
+        return self.ev_loss_sum_bb + max(0.0, self.ev_loss_signed_sum_bb)
+
+    def add_decision(self, d: "DecisionRecord") -> None:
+        self.moves += 1
+        self.score_sum += d.score
+        self.cat_counts[d.category] += 1
+        if d.ev_loss_signed_bb is not None:
+            self.ev_loss_signed_sum_bb += d.ev_loss_signed_bb
+            self.ev_loss_n += 1
 
     def project(self) -> dict[str, Any]:
         gto = (self.score_sum / self.moves) if self.moves > 0 else None
-        per_hand = (self.ev_loss_sum_bb / self.hands) if self.hands > 0 else None
+        total = self.ev_loss_total_bb
+        per_hand = (total / self.hands) if self.hands > 0 else None
         return {
             "hands": self.hands,
             "moves": self.moves,
             "gto_score": round(gto, 1) if gto is not None else None,
             "cat_counts": dict(self.cat_counts),
-            "ev_loss_total_bb": round(self.ev_loss_sum_bb, 2),
+            "ev_loss_total_bb": round(total, 2),
             "ev_loss_per_hand_bb": round(per_hand, 3) if per_hand is not None else None,
         }
 
@@ -643,6 +950,12 @@ class TrainerSession:
         # StrategyBackend: T0 = PpoSolverHost (default). T1 swaps in
         # PolicyNetHost without rewriting act / score / advance.
         self.backend: StrategyBackend = backend or make_ppo_host(model, device)
+        # The FORMAT's own PPO actor and its host. Under a non-PPO backend
+        # this is the per-node fallback for every node that backend does not
+        # cover (`_backend_for`); under the PPO backend it IS the backend.
+        self._format_model = model
+        self._ppo_host: PpoSolverHost | None = None
+        self._refresh_ppo_host()
         # Active game format. `set_format` swaps model/critic to the new
         # format's pair and points `self.settings` at that format's OWN
         # settings object (see settings_by_variant).
@@ -661,6 +974,13 @@ class TrainerSession:
         self.rng = np.random.default_rng()
         self._policy = model_policy(model, deterministic=False)
         self._obs_adapt = obs_adapter(model)
+        # The critic is paired with the FORMAT's PPO actor (they were trained
+        # together and share an obs width) — NOT with whatever network the
+        # active backend serves. Its obs projection therefore follows
+        # `model` here / in `set_format`, never `set_backend`.
+        # (review 2026-09-20 H3)
+        self._critic_obs_adapt = obs_adapter(model)
+        self._sync_from_backend()
         env_path = os.environ.get("PLO5BP_TRAINER_STATS")
         self.stats_path = (
             stats_path
@@ -670,14 +990,75 @@ class TrainerSession:
         )
         self._load_persisted()
 
+    def _sync_from_backend(self) -> None:
+        """`self.model` / `_policy` / `_obs_adapt` ALWAYS mirror the network
+        the ACTIVE backend serves (anchor-spec labels, direct callers).
+
+        (review 2026-09-20 H3) `set_backend` did this; `set_format(...,
+        backend=gto_host)` did not, so under the GTO PolicyNetHost the MC
+        sampled continuations from the format's PPO net (random-init when no
+        nlh_stub.pt exists) while every other number came from the PolicyNet.
+        Since the coverage follow-up the MC no longer reads `self.model` at
+        all: `_rollout_ev` samples each node through the host that serves it
+        (`_backend_for`). Hosts without a `.model` leave the PPO model in
+        place."""
+        m = getattr(self.backend, "model", None)
+        if not isinstance(m, torch.nn.Module):
+            return
+        self.model = m
+        self.device = getattr(self.backend, "device", self.device)
+        self._policy = model_policy(m, deterministic=False)
+        self._obs_adapt = obs_adapter(m)
+
+    def _refresh_ppo_host(self) -> None:
+        """Keep `_ppo_host` = a PPO host over the FORMAT's actor. Called
+        before `_sync_from_backend` (which repoints `self.device`)."""
+        if isinstance(self.backend, PpoSolverHost):
+            self._ppo_host = self.backend
+        elif self._ppo_host is None or self._ppo_host.model is not self._format_model:
+            self._ppo_host = make_ppo_host(self._format_model, self.device)
+        self._ppo_obs_adapt = obs_adapter(self._ppo_host.model)
+
+    def _backend_for(self, info: StepInfo) -> tuple[StrategyBackend, str]:
+        """`(host, tag)` that serves THIS node.
+
+        (review 2026-09-20, GTO coverage) A teacher net is only valid on the
+        table shapes / streets it was trained on (`PolicyNetHost.supports`
+        answers from recorded coverage; preflop is never covered). The active
+        backend serves a node only if it has no `supports` or says yes;
+        otherwise the format's PPO host does and the node is tagged
+        BACKEND_PPO_FALLBACK — a river-only teacher never drives preflop or
+        multiway nodes, and the payload says which host produced the numbers.
+        The choice depends only on PUBLIC node state (seat count, street), so
+        opponents stay a pure function of the action prefix. `seats` is the
+        TABLE's seat count: a 6-max hand that got heads-up is still a 6-seat
+        observation, not the 2-seat form a HU teacher was trained on."""
+        be = self.backend
+        name = str(getattr(be, "name", "backend"))
+        if isinstance(be, PpoSolverHost):
+            return be, name
+        supports = getattr(be, "supports", None)
+        if not callable(supports):
+            return be, name
+        raw = info.raw_obs or {}
+        try:
+            ok = bool(supports(
+                seats=len(raw.get("stacks") or ()), street=int(raw.get("street", 0))
+            ))
+        except Exception:  # noqa: BLE001 — a broken host must not kill the hand
+            logger.exception("backend %s.supports() failed — using the PPO host", name)
+            ok = False
+        if ok:
+            return be, name
+        assert self._ppo_host is not None
+        return self._ppo_host, BACKEND_PPO_FALLBACK
+
     def set_backend(self, backend: StrategyBackend) -> None:
-        """Hot-swap the strategy host (T0 PPO ↔ T1 PolicyNet)."""
+        """Hot-swap the strategy host (T0 PPO ↔ T1 PolicyNet). The critic
+        (and its obs projection) stay paired with the format's PPO actor."""
         self.backend = backend
-        if isinstance(backend, (PpoSolverHost, PolicyNetHost)):
-            self.model = backend.model
-            self.device = backend.device
-            self._policy = model_policy(backend.model, deterministic=False)
-            self._obs_adapt = obs_adapter(backend.model)
+        self._refresh_ppo_host()
+        self._sync_from_backend()
 
     def set_format(
         self,
@@ -691,12 +1072,19 @@ class TrainerSession:
         point `self.settings` at the format's OWN settings object.
         Formats never share or overwrite each other's settings; each
         keeps whatever the user last configured for it. Session/lifetime
-        stats keep accumulating across formats."""
-        if variant == self.variant and backend is None:
+        stats keep accumulating across formats.
+
+        `model`/`critic` are the format's PPO pair; `backend` (optional) is
+        the host that actually serves the format (e.g. the GTO PolicyNet for
+        NLH). A no-op when neither the format nor the host changes, so a
+        repeated POST /format can't drop (and re-deal) the live hand."""
+        if variant == self.variant and (backend is None or backend is self.backend):
             return
         self.variant = variant
         self.model = model
+        self._format_model = model
         self.critic = critic
+        self._critic_obs_adapt = obs_adapter(model)
         self._policy = model_policy(model, deterministic=False)
         self._obs_adapt = obs_adapter(model)
         if backend is not None:
@@ -707,6 +1095,8 @@ class TrainerSession:
             # Non-PPO host cannot serve a different format's PPO weights —
             # fall back to a fresh PPO host for this format.
             self.backend = make_ppo_host(model, self.device)
+        self._refresh_ppo_host()
+        self._sync_from_backend()
         self.hand = None
         self.settings = self.settings_by_variant[variant]
 
@@ -714,8 +1104,22 @@ class TrainerSession:
         """Replace the ACTIVE format's settings (and keep the per-format
         registry in sync — `self.settings` must always be the same object
         as its registry entry)."""
+        settings = _cap_settings(settings)
         self.settings_by_variant[self.variant] = settings
         self.settings = settings
+
+    def _anchor_spec(self) -> Any:
+        return getattr(self.model, "anchor_spec", PLO_ANCHOR_SPEC)
+
+    def _node_dist(self, obs_np: np.ndarray, info: StepInfo) -> dict[str, Any]:
+        """The node distribution of the host that SERVES this node
+        (`_backend_for`) as a scorer-ready dict: carries the unclamped
+        brackets (H1; re-derived when a producer omits them) and a `backend`
+        tag (host name, or BACKEND_PPO_FALLBACK)."""
+        host, tag = self._backend_for(info)
+        dist = host.node_distribution(obs_np, info).as_dict()
+        dist["backend"] = tag
+        return attach_unclamped_brackets(dist, info, self._anchor_spec())
 
     # -- persistence ----------------------------------------------------------
 
@@ -738,9 +1142,12 @@ class TrainerSession:
             # belong to either format, so both restart at defaults.
             by_fmt = data.get("settings_by_format")
             if isinstance(by_fmt, dict):
-                for variant in (VARIANT_PLO5, VARIANT_NLH):
+                # Every format `_persist` writes — incl. the experimental
+                # one, which a hardcoded (PLO5, NLH) pair silently dropped on
+                # reload. (review 2026-09-20 F10)
+                for variant in list(self.settings_by_variant):
                     if isinstance(by_fmt.get(variant), dict):
-                        self.settings_by_variant[variant] = (
+                        self.settings_by_variant[variant] = _cap_settings(
                             TrainerSettings.model_validate(by_fmt[variant])
                         )
                 self.settings = self.settings_by_variant[self.variant]
@@ -761,7 +1168,18 @@ class TrainerSession:
             self.stats_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.stats_path.with_suffix(".tmp")
             tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            os.replace(tmp, self.stats_path)
+            # Windows: os.replace raises PermissionError while another handle
+            # (antivirus / indexer / a concurrent reader) briefly holds the
+            # destination. It clears in milliseconds — retry instead of
+            # dropping the write. (review 2026-09-20, latent)
+            for attempt in range(_PERSIST_RETRIES):
+                try:
+                    os.replace(tmp, self.stats_path)
+                    break
+                except PermissionError:
+                    if attempt == _PERSIST_RETRIES - 1:
+                        raise
+                    time.sleep(_PERSIST_RETRY_SLEEP_S)
         except Exception as e:
             logger.warning("failed to persist trainer stats to %s: %s",
                            self.stats_path, e)
@@ -882,9 +1300,11 @@ class TrainerSession:
             else:
                 # Re-seed per node: opponent behavior is a pure function
                 # of the action prefix (see module docstring). Goes
-                # through StrategyBackend so T1 PolicyNet swaps cleanly.
+                # through StrategyBackend so T1 PolicyNet swaps cleanly —
+                # via the host that COVERS this node (`_backend_for`).
+                host, _tag = self._backend_for(info)
                 with _TORCH_RNG_LOCK:
-                    gate, chips = self.backend.act(
+                    gate, chips = host.act(
                         h.last_obs,
                         info,
                         deterministic=False,
@@ -893,6 +1313,13 @@ class TrainerSession:
             obs, rewards, done, info2 = h.env.step_hybrid(gate, chips)
             entry = {"seat": actor, "gate": int(gate), "chips": int(chips),
                      "street": street}
+            if moot:
+                # Engine-forced check at a moot node, NOT a decision: the
+                # flag lets the client tell hero's auto-checks from opponent
+                # actions and lets review skip grading them (there is no
+                # DecisionRecord behind a hero auto-check). Replay reads only
+                # gate/chips, so determinism is untouched.
+                entry["auto"] = True
             h.action_log.append(entry)
             h.opp_actions_since_hero.append(entry)
             h.last_obs, h.last_info = obs, info2
@@ -903,6 +1330,8 @@ class TrainerSession:
                 frame["trainer"]["anim_action"] = {
                     "seat": actor,
                     "position": self._position_of(actor),
+                    "is_hero": actor == h.hero_seat,
+                    "auto": bool(moot),
                     "gate": GATE_SLUGS[int(gate)],
                     "chips": int(chips),
                     "to_call": int(to_call_pre),
@@ -916,16 +1345,41 @@ class TrainerSession:
         h.terminal = True
         h.rewards_bb = [round(float(r) / h.config.bb, 4) for r in rewards]
         if not h.is_repeat:
-            self.session_stats.hands += 1
-            self.lifetime_stats.hands += 1
+            self._commit_hand_stats(h)
             self._persist()
+
+    def _commit_hand_stats(self, h: HandRecord) -> None:
+        """Fold a COMPLETED hand into the session + lifetime blocks.
+
+        (review 2026-09-20 H2/H4) Stats are committed per HAND, at hand end,
+        not per move:
+        - the EV-loss estimate replays the real deal (villain cards + the
+          real future board), so a running `ev_loss_total_bb` that ticked
+          after each move leaked it mid-hand through the stats panel;
+        - a hand abandoned mid-way (New hand / Repeat / format switch while
+          live) used to leave its moves + EV loss in the sums without ever
+          counting as a hand, inflating `ev_loss_per_hand_bb`. POLICY: an
+          abandoned hand contributes NOTHING — hands, moves, score, category
+          counts and EV loss always describe the same set of completed
+          hands. (Repeat hands stay excluded entirely, as before.)
+        """
+        if h.stats_committed:
+            return
+        h.stats_committed = True
+        for block in (self.session_stats, self.lifetime_stats):
+            block.hands += 1
+            for d in h.decisions:
+                block.add_decision(d)
 
     # -- acting / scoring --------------------------------------------------------
 
     def act(self, gate_slug: str, chips_req: int | None) -> list[dict[str, Any]]:
         h = self.hand
         if h is None:
-            raise HTTPException(status_code=400, detail="no active hand")
+            # 409, not an implicit deal: the client's action was chosen for a
+            # hand this session no longer has (restart / LRU eviction /
+            # format switch). (review 2026-09-20 F9)
+            raise HTTPException(status_code=409, detail="no active hand")
         if h.terminal:
             raise HTTPException(status_code=400, detail="hand is over")
         info = h.last_info
@@ -950,7 +1404,7 @@ class TrainerSession:
                     detail=f"chips {chips} out of raise range [{lo}, {hi}]",
                 )
 
-        dist = self.backend.node_distribution(h.last_obs, info).as_dict()
+        dist = self._node_dist(h.last_obs, info)
         if dist["head_version"] >= 2:
             sc = score_move_v2(dist, gate_idx, chips)
             rec_alpha, rec_beta = _rec_refine_params(dist)
@@ -976,6 +1430,7 @@ class TrainerSession:
             pot_chips=int(raw["pot"]),
             to_call_chips=_to_call_chips(raw, h.hero_seat),
             hero_committed_chips=int(raw["total_commit"][h.hero_seat]),
+            actor_commit_chips=int(raw["street_commit"][h.hero_seat]),
             user_gate=gate_idx,
             user_chips=chips,
             gate_ratio=sc["gate_ratio"],
@@ -989,6 +1444,7 @@ class TrainerSession:
             rec_anchor=dist.get("rec_anchor"),
             user_anchor=sc.get("user_anchor"),
             pot_ref_chips=int(dist.get("pot_ref_chips", 0)),
+            backend=str(dist.get("backend", "ppo")),
         )
 
         street = int(raw["street"])
@@ -1006,10 +1462,10 @@ class TrainerSession:
         # run-out animations the client's animSeq abort skips that settle and
         # the review never appeared. Recording first makes the terminal frame
         # self-sufficient. (Non-terminal frames stay review-less — the review
-        # block is also gated on h.terminal.)
+        # block is also gated on h.terminal.) It must also precede _finalize:
+        # the hand's stats are committed there from h.decisions.
         self._estimate_ev_loss(decision)
         h.decisions.append(decision)
-        h.feedback = self._feedback_payload(decision)
         frames: list[dict[str, Any]] = []
         if done:
             self._finalize(rewards)
@@ -1017,19 +1473,23 @@ class TrainerSession:
         else:
             frames.append(self.project_state())  # hero's action landed
             self._advance(frames)
-
-        if not h.is_repeat:
-            for block in (self.session_stats, self.lifetime_stats):
-                block.moves += 1
-                block.score_sum += decision.score
-                block.cat_counts[decision.category] += 1
-                if decision.ev_loss_bb is not None:
-                    block.ev_loss_sum_bb += decision.ev_loss_bb
-            self._persist()
+        # Stats are committed per hand in _finalize (see _commit_hand_stats).
         return frames
 
-    def _feedback_payload(self, d: DecisionRecord) -> dict[str, Any]:
+    def _feedback_payload(
+        self, d: DecisionRecord, reveal_ev: bool = True
+    ) -> dict[str, Any]:
+        """Flash payload for decision `d`.
+
+        (review 2026-09-20 H2) The EV-loss estimate replays the REAL deal —
+        villains' hole cards and the real future board — so while the hand is
+        live it is a hidden-information channel (deviate, read the number,
+        infer who is strong / what is coming). `reveal_ev=False` withholds it:
+        `ev_loss_bb` is None and `ev_loss_hidden` says a value exists and will
+        show at hand end. Score / category / labels are observation-only and
+        are never withheld."""
         bb = BB_CHIPS
+        has_ev = d.ev_loss_bb is not None
         return {
             "decision_idx": d.decision_idx,
             "category": d.category,
@@ -1047,7 +1507,15 @@ class TrainerSession:
             "rec_gate": GATE_SLUGS[d.rec_gate],
             "rec_chips": int(d.rec_chips) if d.rec_gate == GATE_RAISE else None,
             "to_call_chips": int(d.to_call_chips),
-            "ev_loss_bb": round(d.ev_loss_bb, 3) if d.ev_loss_bb is not None else None,
+            # Hero's street commit before the action (raise-TO = chips + this)
+            # and the decision's street name — both observation-only.
+            "actor_commit_chips": int(d.actor_commit_chips),
+            "street": STREET_NAMES.get(d.street, str(d.street)),
+            # Which host graded this decision ("ppo_fallback" = the active GTO
+            # host does not cover this node; the PPO net served it).
+            "backend": d.backend,
+            "ev_loss_bb": round(d.ev_loss_bb, 3) if (has_ev and reveal_ev) else None,
+            "ev_loss_hidden": bool(has_ev and not reveal_ev),
         }
 
     # -- Monte-Carlo EV loss -------------------------------------------------------
@@ -1072,11 +1540,14 @@ class TrainerSession:
     def _estimate_ev_loss(self, d: DecisionRecord) -> None:
         h = self.hand
         assert h is not None
-        n = int(self.settings.mc_rollouts)
+        # Effective rollout count: the public build caps it server-side even
+        # if a larger value is somehow stored. (review 2026-09-20 F5/F7)
+        n = min(int(self.settings.mc_rollouts), mc_rollouts_cap())
         if n <= 0:
             return
         if self._candidates_equal(d):
             d.ev_loss_bb = 0.0
+            d.ev_loss_signed_bb = 0.0
             return
         node_seed = _stable_seed(h.seed, d.action_log_idx, 0xEC0FFEE)
         prefix = h.action_log[: d.action_log_idx]
@@ -1088,6 +1559,9 @@ class TrainerSession:
         committed_bb = chips_to_bb(d.hero_committed_chips, h.config.bb)
         d.ev_user_bb = round(ev_user + committed_bb, 4)
         d.ev_best_bb = round(ev_best + committed_bb, 4)
+        # Signed estimate feeds the aggregates; the per-decision display value
+        # stays clamped at zero. (review 2026-09-20 H4)
+        d.ev_loss_signed_bb = round(ev_best - ev_user, 4)
         d.ev_loss_bb = round(max(0.0, ev_best - ev_user), 4)
 
     def _rollout_ev(
@@ -1103,54 +1577,122 @@ class TrainerSession:
         of this deal after `prefix` + the candidate action. Same
         `node_seed` for both candidates = common random numbers.
 
-        Holds the RNG lock for the whole MC block: the common-random-numbers
-        property needs every draw after manual_seed to be ours alone."""
-        with _TORCH_RNG_LOCK:
-            torch.manual_seed(node_seed)
-            total = 0.0
-            live: list[list[Any]] = []  # [env, obs, info]
-            for _ in range(n):
-                # EV runouts: grade all-in continuations by expected value over
-                # board runouts instead of one sampled runout — same rollout
-                # count, much less estimator noise. (The live hand's displayed
-                # result stays realized; only this estimator uses EV.)
-                env = BombPotEnv(h.config, ev_runout_samples=32)
-                obs, info = env.reset(h.seed, h.button)
-                for a in prefix:
-                    obs, _, _, info = env.step_hybrid(a["gate"], a["chips"])
-                obs, rewards, done, info = env.step_hybrid(gate, chips)
-                if done:
-                    total += float(rewards[h.hero_seat])
+        (review 2026-09-20 F7) `_TORCH_RNG_LOCK` is process-global — every
+        user's opponent sampling queues behind it — and used to be held for
+        the WHOLE arm, including the n env resets / prefix replays /
+        candidate steps and every continuation env step, none of which touch
+        torch's RNG. Now only the seed→sample regions hold it: the env work
+        runs first, and each lockstep depth takes the lock just for
+        (restore our RNG stream → sample → snapshot the stream). Restoring
+        the snapshot makes the draws exactly the uninterrupted
+        `manual_seed(node_seed)` stream no matter what other threads seed in
+        between, so values are bit-identical to the hold-the-lock version
+        (pinned by tests/python/test_review_trainer_session.py).
+
+        (review 2026-09-20, GTO serve==train) Continuations are sampled by
+        the host that SERVES each node (`_backend_for`), the same one that
+        recommends and drives the live opponents there:
+        - PPO-served nodes (the PPO backend, or the fallback for nodes a GTO
+          host does not cover) go through ONE batched `model.act` per depth —
+          the path pinned bit-identical above;
+        - nodes served by a non-PPO host go through `host.act(...)` one env
+          at a time, so the host's own serving rules apply (PolicyNetHost:
+          canonical re-encoded obs, grid chips, jam snap). Sampling the raw
+          network on the live obs here played a DIFFERENT policy from the one
+          that produced the recommendation being graded.
+        Within a depth the draw order is fixed (the PPO batch, then the hosted
+        envs in rollout order), all inside one lock region."""
+        hero = h.hero_seat
+        total = 0.0
+        live: list[list[Any]] = []  # [env, obs, info]
+        for i in range(n):
+            # EV runouts: grade all-in continuations by expected value over
+            # board runouts instead of one sampled runout — same rollout
+            # count, much less estimator noise. (The live hand's displayed
+            # result stays realized; only this estimator uses EV.)
+            env = BombPotEnv(h.config, ev_runout_samples=32)
+            obs, info = env.reset(h.seed, h.button)
+            for a in prefix:
+                obs, _, _, info = env.step_hybrid(a["gate"], a["chips"])
+            obs, rewards, done, info = env.step_hybrid(gate, chips)
+            if not done:
+                live.append([env, obs, info])
+                continue
+            total += float(rewards[hero])
+            if i == 0:
+                # The replay is a pure function of (config, seed, button,
+                # prefix, candidate): if the candidate ends the hand (a fold,
+                # a closing call) all n copies end identically — add the same
+                # reward n-1 more times instead of replaying them.
+                for _ in range(n - 1):
+                    total += float(rewards[hero])
+                break
+
+        # Lockstep: one sampling region per depth across all live rollouts.
+        rng_state: tuple[torch.Tensor, torch.Tensor | None] | None = None
+        rng_device = self.device
+        while live:
+            hosts = [self._backend_for(x[2])[0] for x in live]
+            batch_idx = [
+                i for i, hst in enumerate(hosts) if isinstance(hst, PpoSolverHost)
+            ]
+            hosted_idx = [
+                i for i, hst in enumerate(hosts) if not isinstance(hst, PpoSolverHost)
+            ]
+            batch_in = None
+            if batch_idx:
+                # `_backend_for` only ever yields ONE PPO host: `_ppo_host`
+                # (the PPO backend itself, or the format's fallback host).
+                ppo = self._ppo_host
+                assert ppo is not None and hosts[batch_idx[0]] is ppo
+                rows = [live[i] for i in batch_idx]
+                batch_in = (
+                    ppo.model,
+                    torch.from_numpy(
+                        self._ppo_obs_adapt(np.stack([x[1] for x in rows]))
+                    ).to(ppo.device),
+                    torch.from_numpy(
+                        np.stack([x[2].gate_mask for x in rows])
+                    ).to(ppo.device),
+                    # (B, 4) sizing context — v1 models slice [..., :2], v2
+                    # needs all four columns for the anchor grid.
+                    torch.from_numpy(
+                        np.stack([sizing_from_info(x[2]) for x in rows])
+                    ).to(ppo.device),
+                )
+            actions: list[tuple[int, int] | None] = [None] * len(live)
+            with _TORCH_RNG_LOCK:
+                if rng_state is None:
+                    torch.manual_seed(node_seed)
                 else:
-                    live.append([env, obs, info])
-            # Lockstep: one batched forward per depth across all live rollouts.
-            while live:
-                obs_b = torch.from_numpy(
-                    self._obs_adapt(np.stack([x[1] for x in live]))
-                ).to(self.device)
-                gm_b = torch.from_numpy(
-                    np.stack([x[2].gate_mask for x in live])
-                ).to(self.device)
-                # (B, 4) sizing context — v1 models slice [..., :2], v2 needs
-                # all four columns for the anchor grid.
-                sizing_b = torch.from_numpy(
-                    np.stack([sizing_from_info(x[2]) for x in live])
-                ).to(self.device)
-                with torch.no_grad():
-                    _mc_out = self.model.act(
-                        obs_b, gm_b, sizing_b, deterministic=False
+                    _restore_rng_state(rng_state, rng_device)
+                if batch_in is not None:
+                    model_b, obs_b, gm_b, sizing_b = batch_in
+                    with torch.no_grad():
+                        _mc_out = model_b.act(
+                            obs_b, gm_b, sizing_b, deterministic=False
+                        )
+                    for j, g, c in zip(
+                        batch_idx, _mc_out.gate.tolist(), _mc_out.chips.tolist()
+                    ):
+                        actions[j] = (int(g), int(c))
+                for j in hosted_idx:
+                    # rng_seed=None: continue OUR stream, never re-seed.
+                    g, c = hosts[j].act(
+                        live[j][1], live[j][2], deterministic=False, rng_seed=None
                     )
-                nxt: list[list[Any]] = []
-                for i, x in enumerate(live):
-                    obs2, rewards, done, info2 = x[0].step_hybrid(
-                        int(_mc_out.gate[i].item()), int(_mc_out.chips[i].item())
-                    )
-                    if done:
-                        total += float(rewards[h.hero_seat])
-                    else:
-                        nxt.append([x[0], obs2, info2])
-                live = nxt
-            return total / n / h.config.bb
+                    actions[j] = (int(g), int(c))
+                rng_state = _snapshot_rng_state(rng_device)
+            nxt: list[list[Any]] = []
+            for x, action in zip(live, actions):
+                assert action is not None
+                obs2, rewards, done, info2 = x[0].step_hybrid(action[0], action[1])
+                if done:
+                    total += float(rewards[hero])
+                else:
+                    nxt.append([x[0], obs2, info2])
+            live = nxt
+        return total / n / h.config.bb
 
     # -- review / what-if ------------------------------------------------------------
 
@@ -1213,6 +1755,9 @@ class TrainerSession:
                 "actual_gate": GATE_SLUGS[int(a["gate"])],
                 "actual_chips": int(a["chips"]),
                 "decision_idx": d.decision_idx if d is not None else None,
+                # Engine-forced check at a moot node (hero or villain): not
+                # a decision — nothing to grade, no DecisionRecord.
+                "auto": bool(a.get("auto", False)),
             })
         return rows
 
@@ -1231,7 +1776,7 @@ class TrainerSession:
         actor = int(info.actor) if info.actor is not None else int(a["seat"])
         raw = info.raw_obs
         to_call = _to_call_chips(raw, actor)
-        dist = self.backend.node_distribution(obs_np, info).as_dict()
+        dist = self._node_dist(obs_np, info)
 
         # own EV = the actor's observation-only value head (blind to
         # opponents' cards); true EV = the centralized critic (sees all
@@ -1244,7 +1789,11 @@ class TrainerSession:
             # Match the critic's trained obs width (full / prefix / minimal).
             # Env always emits full OBS_DIM; without the adapter a 796-d
             # experimental critic gets 1171+opp and matmul-crashes (500).
-            crit_obs = np.asarray(self._obs_adapt(obs_np), dtype=np.float32)
+            # The CRITIC's adapter (paired with the format's PPO actor), not
+            # the served actor's: under a GTO host the two can differ (H3).
+            crit_obs = np.asarray(
+                self._critic_obs_adapt(obs_np), dtype=np.float32
+            )
             value_true_bb = round(float(_critic_values(
                 self.critic, self.device,
                 crit_obs[None], opp,
@@ -1267,10 +1816,17 @@ class TrainerSession:
             "value_bb": round(dist["value_bb"], 4),
             "value_true_bb": value_true_bb,
             "to_call_chips": to_call,
+            # The ACTING seat's street commit before its action, read off the
+            # replayed engine state (exact for any seat, incl. short blinds).
+            "actor_commit_chips": int(raw["street_commit"][actor]),
             "pot_chips": int(raw["pot"]),
             "actual_gate": GATE_SLUGS[actual_gate],
             "actual_chips": actual_chips if actual_gate == GATE_RAISE else None,
             "actual_label": _action_label(actual_gate, actual_chips, to_call),
+            "auto": bool(a.get("auto", False)),
+            # Host whose policy/EV this view shows: the active backend's
+            # name, or "ppo_fallback" when it does not cover this node.
+            "backend": dist.get("backend"),
         }
         if dist["head_version"] >= 2:
             nc["head_version"] = 2
@@ -1283,16 +1839,10 @@ class TrainerSession:
             nc["rec_anchor"] = dist["rec_anchor"]
             nc["mixture"] = dist.get("mixture")
             # Mark where the actor's ACTUAL raise landed (the ● on the EQ
-            # bars): nearest legal anchor by chip distance, tie -> lower.
+            # bars) with the scorer's own snap, so hero and villain markers
+            # follow one rule (the anchor that can produce those chips).
             if actual_gate == GATE_RAISE:
-                legal_ks = [
-                    k for k in range(len(dist["anchor_legal"]))
-                    if dist["anchor_legal"][k]
-                ]
-                nc["user_anchor"] = min(
-                    legal_ks,
-                    key=lambda k: (abs(actual_chips - dist["anchor_chips"][k]), k),
-                ) if legal_ks else None
+                nc["user_anchor"] = snap_to_anchor(dist, actual_chips)[0]
             else:
                 nc["user_anchor"] = None
 
@@ -1315,9 +1865,30 @@ class TrainerSession:
                 "ev_user_bb": d.ev_user_bb,
                 "ev_best_bb": d.ev_best_bb,
                 "ev_loss_bb": d.ev_loss_bb,
+                "ev_loss_signed_bb": d.ev_loss_signed_bb,
             })
             if d.head_version >= 2:
                 nc["user_anchor"] = d.user_anchor
+        elif actor == h.hero_seat:
+            # Hero node with NO DecisionRecord = a moot auto-check (`auto`).
+            # Send the graded keys as explicit nulls so the client can render
+            # "auto-check" instead of dereferencing a missing category.
+            nc.update({
+                "decision_idx": None,
+                "user_gate": GATE_SLUGS[actual_gate],
+                "user_chips": None,
+                "user_chips_bb": None,
+                "user_label": nc["actual_label"],
+                "score": None,
+                "category": None,
+                "marks": None,
+                "gate_ratio": None,
+                "size_q": None,
+                "ev_user_bb": None,
+                "ev_best_bb": None,
+                "ev_loss_bb": None,
+                "ev_loss_signed_bb": None,
+            })
         return nc
 
     def _hero_current(self, current_idx: int) -> dict[str, Any] | None:
@@ -1354,10 +1925,13 @@ class TrainerSession:
             "gate_ratio": round(d.gate_ratio, 4),
             "size_q": round(d.size_q, 4),
             "to_call_chips": d.to_call_chips,
+            "actor_commit_chips": d.actor_commit_chips,
+            "backend": d.backend,
             "pot_chips": d.pot_chips,
             "ev_user_bb": d.ev_user_bb,
             "ev_best_bb": d.ev_best_bb,
             "ev_loss_bb": d.ev_loss_bb,
+            "ev_loss_signed_bb": d.ev_loss_signed_bb,
         }
         if d.head_version >= 2:
             current["head_version"] = 2
@@ -1386,6 +1960,11 @@ class TrainerSession:
                 "score": round(d.score, 1),
                 "user_label": _action_label(d.user_gate, d.user_chips,
                                             d.to_call_chips),
+                # Exact sizing context for the pill label (raise-TO total =
+                # the node's raise-BY chips + actor_commit_chips).
+                "to_call_chips": int(d.to_call_chips),
+                "actor_commit_chips": int(d.actor_commit_chips),
+                "backend": d.backend,
                 "ev_loss_bb": round(d.ev_loss_bb, 3)
                 if d.ev_loss_bb is not None else None,
             }
@@ -1531,7 +2110,7 @@ class TrainerSession:
                 status_code=500,
                 detail="what-if replay did not reach hero's decision node",
             )
-        dist = self.backend.node_distribution(obs, info).as_dict()
+        dist = self._node_dist(obs, info)
         if dist["head_version"] >= 2:
             rescored = score_move_v2(dist, d.user_gate, d.user_chips)
         else:
@@ -1549,6 +2128,7 @@ class TrainerSession:
             if rec_chips_out is not None else None,
             "value_bb": round(dist["value_bb"], 4),
             "gate_distribution": [round(p, 4) for p in dist["gate_probs"]],
+            "backend": dist.get("backend"),
         }
         if dist["head_version"] >= 2:
             rec_alpha, rec_beta = _rec_refine_params(dist)
@@ -1807,15 +2387,39 @@ class TrainerSession:
             "format": self.variant,
             "trainer": {
                 "settings": self.settings.model_dump(),
+                # Server-side ceiling on settings.mc_rollouts for this build
+                # (32 in the public build) so the client can bound its input.
+                "mc_rollouts_max": mc_rollouts_cap(),
                 "hand_no": h.hand_no,
                 "hand_active": not h.terminal,
                 "rewards_bb": h.rewards_bb,
-                "feedback": h.feedback,
+                # Last hero decision's flash. Built per projection (not
+                # stored) so the EV-loss number is withheld in every frame
+                # while the hand is live and revealed once it is terminal
+                # (review 2026-09-20 H2).
+                "feedback": (
+                    self._feedback_payload(h.decisions[-1], reveal_ev=h.terminal)
+                    if h.decisions else None
+                ),
                 "backend": self.backend.coverage_badge(),
+                # Host serving the PROJECTED decision node (public info only:
+                # seat count + street): the active backend's name, or
+                # "ppo_fallback" when the badge's host does not cover it.
+                "node_backend": (
+                    self._backend_for(info)[1]
+                    if (actor is not None and info is not None
+                        and not info.terminal)
+                    else None
+                ),
                 "opp_actions": [
                     {
                         "seat": a["seat"],
                         "position": self._position_of(a["seat"]),
+                        # `auto` = engine-forced check at a moot node; with
+                        # `is_hero` it marks HERO's auto-checks, which ride in
+                        # this list but are not opponent actions.
+                        "is_hero": a["seat"] == h.hero_seat,
+                        "auto": bool(a.get("auto", False)),
                         "gate": GATE_SLUGS[a["gate"]],
                         "chips": a["chips"],
                         "chips_bb": round(chips_to_bb(a["chips"], bb), 4),
@@ -1955,8 +2559,9 @@ def _action_label(gate: int, chips: int, to_call: int) -> str:
 
 
 # Public-build hook: when installed (plo5bp.ui.public), returns the signed-in
-# user's own TrainerSession; None (or no hook) falls back to the router's
-# single default session, keeping the local build byte-identical.
+# user's own TrainerSession. In the LOCAL build None (or no hook) falls back
+# to the router's single default session, keeping it byte-identical; in the
+# PUBLIC build that fallback is refused (see `_ts`).
 _SESSION_RESOLVER: Callable[[], "TrainerSession | None"] | None = None
 
 
@@ -1989,6 +2594,17 @@ def create_trainer_router(
             resolved = _SESSION_RESOLVER()
             if resolved is not None:
                 return resolved
+        if _public_mode():
+            # FAIL CLOSED (review 2026-09-20, latent): the default session is
+            # ONE object shared by every caller. In the public build a request
+            # that reaches here without a per-user session (auth middleware
+            # bypassed / resolver not installed) must never read or drive it.
+            if _SESSION_RESOLVER is None:
+                raise HTTPException(
+                    status_code=500,
+                    detail="trainer session resolver not installed",
+                )
+            raise HTTPException(status_code=401, detail="sign in required")
         return default_ts
 
     def set_format(variant: str) -> None:
@@ -2049,7 +2665,11 @@ def create_trainer_router(
     def trainer_act(req: TrainerActRequest) -> dict[str, Any]:
         ts = _ts()
         with ts.lock:
-            _ensure_hand(ts)
+            # No `_ensure_hand` here (review 2026-09-20 F9 / F6): with no live
+            # hand (restart, LRU eviction, format switch) the old path dealt a
+            # fresh — unmetered — hand and applied the client's stale action to
+            # it blindly. `ts.act` answers 409; the client re-syncs via
+            # GET /trainer/state or deals through POST /trainer/new_hand.
             frames = ts.act(req.gate, req.chips)
             return {"state": ts.project_state(), "frames": frames}
 

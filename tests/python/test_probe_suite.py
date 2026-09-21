@@ -137,3 +137,54 @@ def test_jsonl_writer_schema(tiny_nets, small_bank, tmp_path):
     parsed = json.loads(lines[0])  # valid JSON, no NaN tokens
     assert set(parsed) >= {"ckpt", "update", "ts", "families", "locks"}
     assert _POLICY_KEYS <= set(parsed["families"][tag])
+
+
+def test_load_checkpoint_rebuilds_critic_with_trained_q_semantics(tmp_path):
+    """(review 2026-09-20 A19) The suite READS Q, so the critic must come back
+    with the run's value support + q_base_raw / q_fold_zero from the
+    checkpoint's config stamp. Rebuilt at the builder defaults, a support-3000
+    q_base_raw critic read Q far off (V exact) and the flags were dropped."""
+    from plo5bp.network import opp_holes_multihot
+
+    torch.manual_seed(0)
+    actor = ActorCriticV2(hidden_dim=32)
+    critic = CentralCritic(
+        hidden_dim=32, num_blocks=1, q_actions=3, value_bins=51,
+        value_support=3000.0, hlgauss_sigma=0.5,
+        q_base_raw=True, q_fold_zero=True,
+    )
+    with torch.no_grad():
+        critic.value_head.weight.normal_(0, 1.0)
+        critic.adv_head.weight.normal_(0, 0.1)
+    path = tmp_path / "probe_me_7.pt"
+    torch.save(
+        {
+            "model": actor.state_dict(),
+            "critic": critic.state_dict(),
+            "config": {
+                "hidden_dim": 32, "num_layers": 2,
+                "value_support": 3000.0, "value_hlgauss_sigma": 0.5,
+                "q_base_raw": True, "q_fold_zero": True,
+            },
+        },
+        path,
+    )
+    _actor, loaded = probe.load_checkpoint(str(path))
+    assert loaded.q_base_raw and loaded.q_fold_zero
+    obs = torch.randn(32, critic.obs_dim)
+    opp = opp_holes_multihot(torch.randint(0, 52, (32, 5, 5)).to(torch.uint8))
+    with torch.inference_mode():
+        v0, q0 = critic.q_values(obs, opp)
+        v1, q1 = loaded.q_values(obs, opp)
+    assert torch.equal(v0, v1) and torch.equal(q0, q1)
+    assert float(q1[:, 0].abs().max()) == 0.0  # fold column pinned
+
+    # A checkpoint whose config predates the keys still loads (defaults).
+    torch.save(
+        {"model": actor.state_dict(),
+         "critic": CentralCritic(hidden_dim=32, num_blocks=1).state_dict(),
+         "config": {"hidden_dim": 32, "num_layers": 2}},
+        tmp_path / "old_3.pt",
+    )
+    _a, old = probe.load_checkpoint(str(tmp_path / "old_3.pt"))
+    assert old is not None and not old.q_base_raw

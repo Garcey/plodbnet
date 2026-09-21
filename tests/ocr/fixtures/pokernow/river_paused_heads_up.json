@@ -1,37 +1,43 @@
 {
  "schema": "pokernow.v1",
+ "gameId": "pgl-fixture",
  "variant": "plo5",
  "bombPot": true,
- "pot": 12,
- "button": 6,
+ "potDollars": 12,
+ "button": { "seat": 6 },
  "boards": [
   { "run": "1", "cards": ["2c", "5h", "Ac", "6d", "3h"] },
   { "run": "2", "cards": ["7h", "Ks", "6s", "Kh", "Qs"] }
  ],
+ "heroCards": ["Ts", "As", "4h", "3d", "2d"],
  "seats": [
   {
    "seat": 1,
    "name": "Miles",
-   "stack": 74,
-   "bet": null,
-   "cards": ["Ts", "As", "4h", "3d", "2d"],
-   "cardCount": 5,
    "isHero": true,
    "isActor": true,
+   "angleCW": 147,
+   "stackDollars": 74,
+   "stackText": "74",
+   "allIn": false,
    "folded": false,
-   "classes": "table-player table-player-1 decision-current  you-player  five-cards"
+   "betDollars": null,
+   "betText": null,
+   "cards": ["Ts", "As", "4h", "3d", "2d"]
   },
   {
    "seat": 6,
    "name": "JJ",
-   "stack": 74,
-   "bet": null,
-   "cards": [null, null, null, null, null],
-   "cardCount": 5,
    "isHero": false,
    "isActor": false,
+   "angleCW": 328,
+   "stackDollars": 74,
+   "stackText": "74",
+   "allIn": false,
    "folded": false,
-   "classes": "table-player table-player-6 five-cards"
+   "betDollars": null,
+   "betText": null,
+   "cards": [null, null, null, null, null]
   }
  ]
 }

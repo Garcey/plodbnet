@@ -133,7 +133,13 @@ base URL is https. A real deploy (Docker etc.) is the next slice.
 | `PLO5BP_ADMIN_EMAILS` | `themilesgarcia@icloud.com` | Comma-separated admin allowlist |
 | `PLO5BP_FREE_HANDS` | `5` | Free trainer hands per UTC day |
 | `PLO5BP_PRICE_CENTS` | `1000` | Monthly price (before first checkout) |
-| `PLO5BP_DEV_LOGIN` | unset | 1 = loopback fake sign-in (testing only) |
+| `PLO5BP_DEV_LOGIN` | unset | 1 = loopback fake sign-in (testing only). The route is only registered when `PLO5BP_BASE_URL`'s host is loopback, and it rejects any request carrying a forwarding header (XFF, CF-Connecting-IP, Forwarded, …) |
+| `PLO5BP_DEV_LOGIN_TESTCLIENT` | unset | 1 = also accept Starlette's `testclient` host (the test fixtures set it; never in a real deployment) |
+| `PLO5BP_STRIPE_TIMEOUT` | `8` | Seconds before a Stripe status re-check gives up (runs in a threadpool, never on the event loop) |
+| `PLO5BP_STRIPE_GRACE_DAYS` | `3` | On a Stripe ERROR, keep access only until `current_period_end` + this many days ("No such subscription" is INACTIVE immediately) |
+| `PLO5BP_STRIPE_RETRY_S` | `900` | Minimum seconds between Stripe re-checks per user while the status is uncertain |
+| `PLO5BP_HOMEGAME_MAX_TABLES` | `5` | Open home-game tables per host |
+| `PLO5BP_OBS_REV` | `2` | Observation-semantics revision. Set `1` while the served checkpoint was trained before 2026-09-20 (the server logs `OBS-REV MISMATCH` and `/formats` reports `obs_rev_mismatch` when it disagrees with the checkpoint's stamp) |
 | `GOOGLE_CLIENT_ID/SECRET` | unset | Google OAuth (sign-in disabled without) |
 | `STRIPE_SECRET_KEY` | unset | Stripe (checkout 503s without) |
 | `STRIPE_WEBHOOK_SECRET` | unset | Only if running `stripe listen` / hosted webhook |

@@ -19,24 +19,50 @@ if str(_ROOT / "python") not in sys.path:
 
 from plo5bp.gto.cfr_api import apply_teacher_iso_policy  # noqa: E402
 from plo5bp.gto.cfr_batch import (  # noqa: E402
+    MARKER_REJECTED,
     BatchManifest,
+    _atomic_write_text,
+    _job_meta_path,
     _marker_path,
     _rejected_path,
     _run_one,
     _strategy_path,
+    _unverified_path,
     expand_river_spr_grid,
+    job_payload,
+    marker_status,
+    resolve_job_ids,
 )
 from plo5bp.gto.teacher import (  # noqa: E402
     TEACHER_HOLDOUT_FRAC,
     TEACHER_MAX_EXPL_BB,
     TEACHER_MIN_VISIT_MASS,
     TEACHER_SPLIT_SEED,
+    root_stratum,
     split_root_ids,
 )
 
 
+def campaign_split(jobs) -> tuple[list[str], list[str]]:
+    """The stratified split the export will compute for these roots
+    (review 2026-09-20 D4: the unstratified hash put both holdout roots at
+    SPR 3, so SPR 1 / 2 / 5 were never probed)."""
+    return split_root_ids(
+        [j.job_id for j in jobs],
+        seed=TEACHER_SPLIT_SEED,
+        holdout_frac=TEACHER_HOLDOUT_FRAC,
+        strata={j.job_id: root_stratum(j.root) for j in jobs},
+    )
+
+
 def _clear_job(out_dir: Path, job_id: str) -> None:
-    for fn in (_marker_path, _rejected_path, _strategy_path):
+    for fn in (
+        _marker_path,
+        _job_meta_path,
+        _rejected_path,
+        _strategy_path,
+        _unverified_path,
+    ):
         p = fn(out_dir, job_id)
         if p.exists():
             p.unlink()
@@ -89,9 +115,8 @@ def run_jobs(
         j.config.stop_file = str(stop_file)
         j.config.progress_file = str(out_dir / "progress" / f"{j.job_id}.progress.json")
 
-        marker = _marker_path(out_dir, j.job_id)
-        if marker.exists():
-            text = marker.read_text(encoding="utf-8").strip()
+        text = marker_status(out_dir, j.job_id)
+        if text is not None:
             print(f"[step7] SKIP {j.job_id} marker={text} ({pass_name})", flush=True)
             if j.job_id not in man.skipped:
                 man.skipped.append(j.job_id)
@@ -106,24 +131,31 @@ def run_jobs(
             flush=True,
         )
         t0 = time.time()
-        r = _run_one(
-            {
-                "root": j.root.as_dict(),
-                "config": j.config.as_dict(),
-                "out_dir": str(out_dir),
-                "job_id": j.job_id,
-                "max_expl_bb": TEACHER_MAX_EXPL_BB,
-            }
-        )
+        r = _run_one(job_payload(j, out_dir, TEACHER_MAX_EXPL_BB))
         dt = time.time() - t0
         expl = r.get("exploitability_bb")
-        status = "REJECTED" if r.get("rejected") else ("OK" if r.get("ok") else "FAILED")
+        status = (
+            "UNVERIFIED"
+            if r.get("unverified")
+            else "REJECTED" if r.get("rejected") else ("OK" if r.get("ok") else "FAILED")
+        )
         print(
             f"[step7] ROOT {status} {j.job_id} expl_bb={expl} "
             f"iters={r.get('iterations')} wall_s={dt:.1f} err={r.get('error')}",
             flush=True,
         )
-        if r.get("rejected"):
+        if r.get("unverified"):
+            # (review 2026-09-20 D8) STOP / time-budget exit: the number is a
+            # poll estimate — neither accepted nor rejected on it.
+            man.unverified = [x for x in man.unverified if x.get("job_id") != j.job_id]
+            man.unverified.append(
+                {
+                    "job_id": r["job_id"],
+                    "error": str(r.get("error")),
+                    "status": str(r.get("status")),
+                }
+            )
+        elif r.get("rejected"):
             if not any(x.get("job_id") == j.job_id for x in man.rejected):
                 man.rejected.append(
                     {
@@ -166,10 +198,9 @@ def main() -> int:
         size_preset=args.size_preset,
         iters=args.iters,
     )
-    ids = [j.job_id for j in jobs]
-    train_ids, hold_ids = split_root_ids(
-        ids, seed=TEACHER_SPLIT_SEED, holdout_frac=TEACHER_HOLDOUT_FRAC
-    )
+    # Campaign dirs written under the pre-fingerprint ids keep resuming.
+    ids = resolve_job_ids(out_dir, jobs)
+    train_ids, hold_ids = campaign_split(jobs)
     print(
         f"[step7] CAMPAIGN n={len(jobs)} spr={{1,2,3,5}}×{args.n_boards} boards "
         f"iters={args.iters} iso=OFF max_expl_bb={TEACHER_MAX_EXPL_BB}",
@@ -178,7 +209,8 @@ def main() -> int:
     print(f"[step7] split train={len(train_ids)} holdout={len(hold_ids)}", flush=True)
     print(f"[step7] holdout_ids={hold_ids}", flush=True)
     (out_dir).mkdir(parents=True, exist_ok=True)
-    (out_dir / "plan.json").write_text(
+    _atomic_write_text(
+        out_dir / "plan.json",
         json.dumps(
             {
                 "n_jobs": len(jobs),
@@ -197,7 +229,6 @@ def main() -> int:
             indent=2,
         )
         + "\n",
-        encoding="utf-8",
     )
 
     run_jobs(
@@ -214,8 +245,7 @@ def main() -> int:
     retry = []
     for j in jobs:
         rp = _rejected_path(out_dir, j.job_id)
-        mk = _marker_path(out_dir, j.job_id)
-        if rp.exists() and mk.exists() and mk.read_text(encoding="utf-8").strip() == "rejected":
+        if rp.exists() and marker_status(out_dir, j.job_id) == MARKER_REJECTED:
             retry.append(j)
     if not retry:
         print("[step7] no rejected roots to retry", flush=True)

@@ -4,10 +4,22 @@
 
 use obs_layout::*;
 
+/// STK-6[0] "bets to jam" thresholds: 3^0..3^5 as exact f64 constants. The dim
+/// is clip(ceil(log3(x6)), 0, 6); computed as `ceil(ln(x6) / ln(3))` it sits ON
+/// an integer at x6 = 3, 9, 27, 81, 243, where a 1-ulp difference between this
+/// `ln` and numpy's (SVML on AVX-512 Linux) flips the ceil. An exact comparison
+/// chain has no such boundary (review 2026-09-20 STK-6; twin of `_POW3` /
+/// `_bets_to_jam` in python/plo5bp/encoding.py — same values as the log form
+/// gave at those five points on the reference build).
+const POW3: [f64; 6] = [1.0, 3.0, 9.0, 27.0, 81.0, 243.0];
+
 /// PLO legal-anchor count (matches `n_legal_anchors_np` + PLO_ANCHOR_SPEC).
-fn n_legal_anchors_plo(min_d: f64, max_d: f64, pot: f64, to_call: f64) -> usize {
-    let mn = min_d as i64;
-    let mx = max_d as i64;
+/// Rev 2 passes the engine's RAW legal chip deltas (min 0 in the short-shove
+/// regime, which counts its single all-in atom); rev 1 the totals-derived
+/// deltas — `RaiseWindow::anchor_min` / `max_d` either way.
+fn n_legal_anchors_plo(min_raise: f64, max_raise: f64, pot: f64, to_call: f64) -> usize {
+    let mn = min_raise as i64;
+    let mx = max_raise as i64;
     let pot_a = pot as i64;
     let tc = to_call as i64;
     let mr = mn.min(mx);
@@ -49,16 +61,14 @@ fn encode_v7_tail(
     _pot_safe: f64,
     hero_stack: f64,
     eff_to_call: f64,
+    window: &RaiseWindow,
     hole_slice: &[u8],
     ba_slice: &[u8],
     bb_slice: &[u8],
     out: &mut [f32],
 ) {
     let pot_denom = pot.max(1.0);
-    let hero_sc = packed.street_commit[[j, hero]] as f64;
     let hero_commit = packed.total_commit[[j, hero]] as f64;
-    let min_bet = packed.min_bet[j] as f64;
-    let max_bet = packed.max_bet[j] as f64;
     let street_idx = street as i32;
 
     // ---- STK-1 ----
@@ -97,10 +107,16 @@ fn encode_v7_tail(
     }
 
     // ---- STK-2 ----
-    let min_d = min_bet - hero_sc;
-    let max_d = max_bet - hero_sc;
+    // PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 B1, dims 1024-1029 and
+    // STK-5[2:4] = 1040-1041; obs_rev 2): min_d/max_d are the engine's LEGAL
+    // raise deltas (== sizing_from_info's min/max_raise_chips) and the block is
+    // zero when Raise is illegal. In rev 1 they are recovered from the
+    // min_bet/max_bet totals, which are NOT capped by the actor's own stack and
+    // ignore the short-shove lockout. The caller picks the window
+    // (`legal_raise_window` / `legacy_raise_window` in bindings.rs); the
+    // arithmetic below is shared.
+    let RaiseWindow { legal: raise_legal, min_d, max_d, anchor_min } = *window;
     let base = pot + to_call;
-    let raise_legal = max_d > to_call;
     if raise_legal {
         let base_safe = base.max(1.0);
         let eff_denom = hero_stack.max(1.0);
@@ -109,7 +125,7 @@ fn encode_v7_tail(
         out[STK2_OFF + 2] = (min_d / eff_denom).clamp(0.0, 1.0) as f32;
         out[STK2_OFF + 3] = (max_d / eff_denom).clamp(0.0, 1.0) as f32;
         out[STK2_OFF + 4] = if max_d < to_call + base { 1.0 } else { 0.0 };
-        out[STK2_OFF + 5] = (n_legal_anchors_plo(min_d, max_d, pot, to_call) as f64
+        out[STK2_OFF + 5] = (n_legal_anchors_plo(anchor_min, max_d, pot, to_call) as f64
             / ANCHOR_COUNT as f64) as f32;
     }
 
@@ -141,12 +157,10 @@ fn encode_v7_tail(
         let spr_e = hero_stack / pot_denom;
         let r = 4 - street_idx;
         let x6 = 1.0 + 2.0 * spr_e;
-        let btj = if x6 > 0.0 {
-            (x6.ln() / 3.0f64.ln()).ceil()
-        } else {
-            0.0
-        };
-        out[STK6_OFF] = btj.clamp(0.0, 6.0) as f32;
+        // Smallest k in 0..=6 with x6 <= 3^k == the count of powers strictly
+        // below x6 (exact comparisons — see POW3).
+        let btj = POW3.iter().filter(|&&p| x6 > p).count();
+        out[STK6_OFF] = btj as f32;
         let gfrac = if r > 0 {
             (x6.powf(1.0 / r as f64) - 1.0) / 2.0
         } else {
@@ -194,10 +208,18 @@ fn encode_v7_tail(
     out[STK9_OFF + 1] = (eff_to_call / (hero_commit + hero_stack).max(1.0)) as f32;
 
     // ---- STK-10 ----
+    // PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 B6, dim 1052; SERVING
+    // ONLY — training never passes an in_hand_mask): antes are summed over the
+    // DEALT-IN seats. A sitting-out seat is pre-folded and posts no ante
+    // (folded with nothing committed); it used to inflate pot_at_flop. With
+    // every seat dealt in the sum is unchanged.
     {
         let ante_i = ante as i64;
         let mut pot_at_flop: i64 = 0;
         for s in 0..num_seats {
+            if packed.folded[[j, s]] && packed.total_commit[[j, s]] == 0 {
+                continue;
+            }
             let st = starting.get(s).copied().unwrap_or(0) as i64;
             pot_at_flop += ante_i.min(st);
         }

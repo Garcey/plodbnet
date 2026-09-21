@@ -1,8 +1,15 @@
 #!/usr/bin/env python
-"""Retry only close-to-cap rejected roots at 40k (holdout first). Cap stays 1.0."""
+"""Retry only close-to-cap rejected roots at 40k (holdout first). Cap stays 1.0.
+
+(review 2026-09-20 F10) A STOP file is the operator's halt request for the
+whole campaign; this script used to delete it unconditionally and start
+solving. It now refuses to run while STOP exists unless ``--clear-stop`` says
+the operator means it.
+"""
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -11,29 +18,41 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT / "python") not in sys.path:
     sys.path.insert(0, str(_ROOT / "python"))
 
-from plo5bp.gto.cfr_batch import expand_river_spr_grid  # noqa: E402
-from plo5bp.gto.teacher import TEACHER_HOLDOUT_FRAC, TEACHER_SPLIT_SEED, split_root_ids  # noqa: E402
+from plo5bp.gto.cfr_batch import expand_river_spr_grid, resolve_job_ids  # noqa: E402
 
 # Import campaign helpers
 sys.path.insert(0, str(_ROOT / "scripts"))
-from step7_teacher_campaign import _clear_job, run_jobs  # noqa: E402
+from step7_teacher_campaign import _clear_job, campaign_split, run_jobs  # noqa: E402
 
 CLOSE_MAX = 1.35  # 40k may land these; skip 1.5+ this session
 
 
 def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument(
+        "--clear-stop",
+        action="store_true",
+        help="Remove an existing STOP file and run (default: refuse while it exists)",
+    )
+    args = p.parse_args()
+
     out = Path("data/cfr/teacher_s7")
     stop = out / "STOP"
     if stop.exists():
+        if not args.clear_stop:
+            print(
+                f"[step7] {stop} exists — the campaign was told to halt. "
+                f"Remove it (or pass --clear-stop) to retry.",
+                file=sys.stderr,
+            )
+            return 2
         stop.unlink()
+        print(f"[step7] removed {stop} (--clear-stop)", flush=True)
     man = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     jobs = expand_river_spr_grid(n_boards=6, seed=7, iters=40_000)
+    resolve_job_ids(out, jobs)  # pre-fingerprint campaign dirs keep their ids
     by_id = {j.job_id: j for j in jobs}
-    tr, ho = split_root_ids(
-        [j.job_id for j in jobs],
-        seed=TEACHER_SPLIT_SEED,
-        holdout_frac=TEACHER_HOLDOUT_FRAC,
-    )
+    _tr, ho = campaign_split(jobs)
     hold = set(ho)
     retry_ids = []
     truncated = []

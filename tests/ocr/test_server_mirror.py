@@ -621,7 +621,16 @@ def test_reconcile_missed_folds_adds_one_fold_per_missing_seat():
         _seat(5, folded=True),                   # sitting out
     )
     fs = _fs(seats=seats)
-    server._reconcile_missed_folds_on_street_reveal(fs)
+    # (review 2026-09-20 F11) The OCR `folded` read is noisy, so the reveal
+    # tick only PARKS the first sighting; nothing is appended yet. This test
+    # used to pin the single-frame behaviour, which retired a live seat on a
+    # one-frame card-back miss.
+    assert server._reconcile_missed_folds_on_street_reveal(fs) is False
+    assert server.session.folded_this_hand == frozenset({1})
+    assert len(server.session.action_log) == 2
+    assert server.session._pending_reveal_folds == frozenset({2, 4})
+    # The follow-up tick still reads both seats folded → reconcile.
+    assert server._reconcile_missed_folds_on_street_reveal(fs) is True
 
     assert server.session.folded_this_hand == frozenset({1, 2, 4})
     assert server.session.sitting_out_seats == frozenset({1, 2, 3, 4, 5})
@@ -1051,6 +1060,22 @@ def test_button_glitch_below_threshold_does_not_fire():
 # --- POST /ocr/rescan ---------------------------------------------------
 
 
+def _fake_extractor(monkeypatch, fake_fs) -> None:
+    """Make the rescan route's `from plo5bp.ocr.extract import
+    extract_frame_state` resolve to a stub returning ``fake_fs``.
+
+    Swapping the module in ``sys.modules`` (instead of patching an attribute
+    of the real one) keeps these tests runnable without OpenCV: importing
+    the real `plo5bp.ocr.extract` needs cv2, and since the 2026-09-20 review
+    this directory is no longer skipped wholesale on machines without it."""
+    import sys
+    import types
+
+    fake = types.ModuleType("plo5bp.ocr.extract")
+    fake.extract_frame_state = lambda img, num_seats: fake_fs
+    monkeypatch.setitem(sys.modules, "plo5bp.ocr.extract", fake)
+
+
 def test_rescan_hole_preserves_action_log_button_and_board(monkeypatch):
     """Rescan Hole replaces hero cards from a fresh OCR read without
     touching action_log, button_seat, hand_in_hand_mask, or the board."""
@@ -1084,10 +1109,7 @@ def test_rescan_hole_preserves_action_log_button_and_board(monkeypatch):
         hero=(_c(12, 0), _c(12, 1), _c(11, 0), _c(11, 1), _c(10, 0)),
         flop_a_visible=False,
     )
-    monkeypatch.setattr(
-        "plo5bp.ocr.extract.extract_frame_state",
-        lambda img, num_seats: fake_fs,
-    )
+    _fake_extractor(monkeypatch, fake_fs)
 
     req = server.OcrRescanRequest(target="hole")
     _asyncio.run(server.ocr_rescan(req))
@@ -1131,10 +1153,7 @@ def test_rescan_hole_rolls_back_on_duplicate_card(monkeypatch):
         hero=(_c(2, 2), _c(3, 0), _c(4, 0), _c(5, 0), _c(6, 0)),
         flop_a_visible=False,
     )
-    monkeypatch.setattr(
-        "plo5bp.ocr.extract.extract_frame_state",
-        lambda img, num_seats: fake_fs,
-    )
+    _fake_extractor(monkeypatch, fake_fs)
 
     req = server.OcrRescanRequest(target="hole")
     with pytest.raises(HTTPException) as excinfo:

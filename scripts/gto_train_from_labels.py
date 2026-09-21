@@ -44,6 +44,13 @@ def main() -> int:
         default=None,
         help="Warm-start PolicyNet weights (same hidden_dim / num_layers)",
     )
+    p.add_argument(
+        "--include-lossy-obs",
+        action="store_true",
+        help="Also train on postflop labels whose obs fell back to the LOSSY "
+        "synthetic dict (later-street rows of flop/turn roots). Default: "
+        "excluded and reported.",
+    )
     args = p.parse_args()
 
     labels = []
@@ -52,7 +59,9 @@ def main() -> int:
         print(f"[train] {path}: {len(got)} label records")
         labels.extend(got)
 
-    rows = labels_to_supervised_rows(labels)
+    rows = labels_to_supervised_rows(
+        labels, include_lossy_obs=args.include_lossy_obs
+    )
     print(f"[train] {len(rows)} supervised rows from solver labels")
 
     if args.bootstrap_n > 0:
@@ -78,23 +87,18 @@ def main() -> int:
         seed=args.seed,
         value_coef=0.05,
     )
-    # Bootstrap mix is not badge-eligible as GTO until re-probed; source
-    # must stay rust_cfr* without "bootstrap" for the GTO teacher check.
-    if args.bootstrap_n > 0:
-        source = "rust_cfr+bootstrap"
-    else:
-        source = "rust_cfr"
+    # (review 2026-09-20 F6) ``source`` is no longer asserted here: the trainer
+    # derives it — and the label provenance the badge needs — from the rows
+    # (a bootstrap mix shows up as a "rule_bootstrap" source and is therefore
+    # never badge-eligible).
     result = train_policy_net(
         rows,
         args.out,
         cfg=cfg,
         meta={
-            "source": source,
             "n_train": len(rows),
             "n_solver_labels": len(labels),
             "n_rows": len(rows),
-            "is_gto_validated": False,  # require scripts/gto_probe.py --stamp
-            "warm_start": None if args.load is None else str(args.load),
         },
         init_ckpt=args.load,
     )

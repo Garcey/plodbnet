@@ -100,3 +100,32 @@ def test_wording_spot_checks():
 def test_too_few_cards_returns_none():
     assert describe_made_hand([_c(6, 0), _c(6, 1)], [_c(2, 0), _c(4, 1)]) is None
     assert best_hand_category([], []) is None
+
+
+def test_negative_sentinels_are_not_cards():
+    """review 2026-09-20: the UI marks face-down / undealt cards as -1.
+    `-1 // 4 == -1` indexes the rank table from the END, so five face-down
+    cards used to be described as "a pair of As". `best_combo` filtered them;
+    `_best` / `_best_nlh` (describe_made_hand*, best_hand_category*) did not."""
+    from plo5bp.ui.hand_describe import (
+        best_combo,
+        best_hand_category_nlh,
+        describe_made_hand_nlh,
+    )
+
+    board = [_c(0, 0), _c(1, 1), _c(2, 2)]
+    down = [-1] * 5
+    assert describe_made_hand(down, board) is None
+    assert best_hand_category(down, board) is None
+    assert best_combo(down, board) is None
+    assert describe_made_hand_nlh([-1, -1], board) is None
+    assert best_hand_category_nlh([-1, -1], board) is None
+    # One real card + sentinels is still fewer than two hole cards.
+    assert describe_made_hand([_c(12, 0), -1, -1, -1, -1], board) is None
+    # Sentinels / None on the BOARD are skipped, not evaluated.
+    hole = [_c(12, 0), _c(12, 1), _c(5, 2), _c(7, 3), _c(9, 0)]
+    clean = describe_made_hand(hole, board)
+    assert clean == "a pair of As"
+    assert describe_made_hand(hole, board + [-1, None]) == clean
+    assert best_hand_category(hole, board + [-1, -1]) == best_hand_category(hole, board)
+    assert best_combo(hole, board + [-1])["board"] == sorted(board)

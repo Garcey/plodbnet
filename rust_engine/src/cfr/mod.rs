@@ -3,6 +3,17 @@
 //! - DCFR for HU postflop (flop/turn with runouts, river exact)
 //! - External-sampling MCCFR for preflop / multiway
 //! - Compact [`public_state::PublicState`] (engine parity via engine_bridge)
+//!
+//! `exploitability_bb` is always labelled in the report notes
+//! (`expl_kind=<kind>`, review 2026-09-20 D8/D10):
+//!
+//! | kind | where | what it is |
+//! |---|---|---|
+//! | `exact_infoset` | HU river; HU turn when it fits the time allowance | vectorized infoset best response over all combos (turn: exact expectation over rivers) |
+//! | `sampled_runout_br` | HU flop; HU turn fallback | same best response against a sampled runout grid (upper-biased) |
+//! | `mc_poll` | any HU postflop | the final pass ran out of time; value is the last in-loop poll |
+//! | `mc_br_proxy` | HU preflop, multiway | perfect-information deal-BR proxy — not a Nash certificate |
+//! | `none` | any | nothing could be computed in the allowance |
 
 pub mod actions;
 pub mod br;
@@ -235,12 +246,96 @@ mod tests {
 
     #[test]
     fn known_jam_check_spot_tight() {
-        let rep = known_spot::solve_jam_check_spot(600, 3).expect("spot");
+        // Exact infoset exploitability (was a noisy MC number with a 4 bb bar
+        // on a tree that, before F10, had no check at all).
+        let rep = known_spot::solve_jam_check_spot(40_000, 3).expect("spot");
+        assert!(rep.tree_is_jam_or_check);
         assert!(
-            rep.exploitability_bb < 4.0,
+            rep.exploitability_bb < 1.0,
             "known spot expl {}",
             rep.exploitability_bb
         );
+    }
+
+    /// (review 2026-09-20 E1) HU preflop with a sub-blind stack used to recurse
+    /// forever (native stack overflow, the whole process died). Every
+    /// degenerate root is now an ordinary `InvalidRoot` error.
+    #[test]
+    fn sub_blind_hu_preflop_is_an_error_not_a_stack_overflow() {
+        let mut cfg = SolveConfig::default();
+        cfg.max_iterations = 20;
+        cfg.algorithm = "mccfr_es".into();
+        // Default blinds/ante: ante 0.5bb + bb 1bb ⇒ need > 1.5bb.
+        for stack in [0.3, 0.5, 0.9, 1.0, 1.4, 1.5] {
+            let mut root = RootSpec::preflop_hu(stack, 10_000, 5_000, 5_000);
+            root.raise_sizes_pm = vec![1000];
+            let err = solve(&root, &cfg).expect_err(&format!("stack {stack}bb must be refused"));
+            assert!(matches!(err, CfrError::InvalidRoot(_)), "{stack}: {err}");
+        }
+        // No ante: need > 1bb.
+        for stack in [0.4, 0.9, 1.0] {
+            let mut root = RootSpec::preflop_hu(stack, 10_000, 5_000, 0);
+            root.raise_sizes_pm = vec![1000];
+            assert!(matches!(solve(&root, &cfg), Err(CfrError::InvalidRoot(_))), "{stack}");
+        }
+        // Just above the blind: a real (tiny) tree that terminates.
+        for stack in [1.6, 2.0] {
+            let mut root = RootSpec::preflop_hu(stack, 10_000, 5_000, 5_000);
+            root.raise_sizes_pm = vec![1000];
+            let rep = solve(&root, &cfg).expect("shallow but valid");
+            assert_eq!(rep.status, "ok");
+            assert!(!rep.strategy.infosets.is_empty());
+        }
+        // Multiway: stacks that do not cover the ante leave nobody to act.
+        let mut mw = RootSpec::preflop_hu(0.2, 10_000, 5_000, 5_000);
+        mw.num_seats = 3;
+        mw.raise_sizes_pm = vec![];
+        mw.stacks_bb = vec![0.2; 3];
+        assert!(matches!(solve(&mw, &cfg), Err(CfrError::InvalidRoot(_))));
+    }
+
+    /// (review 2026-09-20 E1) `pot_bb` / `effective_stack_bb` that round to 0
+    /// chips (or overflow) are errors — they used to hit `unwrap()` and surface
+    /// in Python as a `PanicException`.
+    #[test]
+    fn zero_chip_roots_are_errors_not_panics() {
+        let board = vec![12, 28, 38, 41, 45];
+        let mut cfg = SolveConfig::default();
+        cfg.max_iterations = 5;
+        let river = |pot: f64, stack: f64| {
+            RootSpec::postflop_hu(StreetRoot::River, pot, stack, board.clone(), vec![1000])
+        };
+        for (pot, stack) in [(0.00004, 50.0), (10.0, 0.00004), (1e15, 1e15), (10.0, f64::MAX)] {
+            let err = solve(&river(pot, stack), &cfg).expect_err("degenerate chips");
+            assert!(matches!(err, CfrError::InvalidRoot(_)), "{pot}/{stack}: {err}");
+        }
+        let mut tiny_bb = river(0.4, 50.0);
+        tiny_bb.bb_chips = 1;
+        assert!(matches!(solve(&tiny_bb, &cfg), Err(CfrError::InvalidRoot(_))));
+        let mut mw = river(10.0, 0.00004);
+        mw.num_seats = 3;
+        cfg.algorithm = "mccfr_es".into();
+        assert!(matches!(solve(&mw, &cfg), Err(CfrError::InvalidRoot(_))));
+    }
+
+    /// (review 2026-09-20 E1) `max_iterations=0` means "unlimited": refused
+    /// unless a time budget or a stop file can end the run.
+    #[test]
+    fn unlimited_iterations_need_a_stop_condition() {
+        let root = RootSpec::postflop_hu(
+            StreetRoot::River,
+            10.0,
+            10.0,
+            vec![0, 5, 10, 15, 20],
+            vec![],
+        );
+        let mut cfg = SolveConfig::default();
+        cfg.max_iterations = 0;
+        assert!(matches!(solve(&root, &cfg), Err(CfrError::InvalidConfig(_))));
+        cfg.time_budget_secs = 0.05;
+        cfg.target_exploitability_bb = 0.0;
+        let rep = solve(&root, &cfg).expect("budgeted unlimited run");
+        assert!(rep.notes.iter().any(|n| n == "early_stop=time_budget"));
     }
 
     #[test]
@@ -252,15 +347,42 @@ mod tests {
             vec![0, 5, 10, 15, 20],
             vec![500, 1000],
         );
-        // Restrict to a few combos
-        root.range_oop = "100:1,101:1,102:1,103:1".into();
-        root.range_ip = "200:1,201:1,202:1,203:1".into();
+        // Restrict to a few combos.
+        // (review 2026-09-20 D12) This test used IP ids 200..203 = (x, 20):
+        // every one holds board card 20, so the whole IP range was blocked,
+        // the parser silently fell back to UNIFORM and the assertion on
+        // "parsed" still passed. Ids below avoid the board {0,5,10,15,20}.
+        root.range_oop = "100:1,102:1,103:1,104:1".into();
+        root.range_ip = "211:1,212:1,213:1,214:1".into();
         let mut cfg = SolveConfig::default();
         cfg.max_iterations = 40;
         cfg.seed = 5;
         cfg.target_exploitability_bb = 0.0;
         let rep = solve(&root, &cfg).expect("ranged");
         assert_eq!(rep.status, "ok");
-        assert!(rep.notes.iter().any(|n| n.contains("parsed")));
+        assert!(
+            rep.notes.iter().any(|n| n == "ranges=parsed oop=parsed:4 ip=parsed:4"),
+            "{:?}",
+            rep.notes
+        );
+        // Only the named combos ever get an infoset.
+        for is in &rep.strategy.infosets {
+            let raw = is.raw_combo.expect("raw combo");
+            let want: &[u32] = if is.actor == Some(0) {
+                &[100, 102, 103, 104]
+            } else {
+                &[211, 212, 213, 214]
+            };
+            assert!(want.contains(&raw), "actor {:?} combo {raw}", is.actor);
+        }
+
+        // The old, fully board-blocked IP range is now an error.
+        root.range_ip = "200:1,201:1,202:1,203:1".into();
+        assert!(matches!(solve(&root, &cfg), Err(CfrError::InvalidRoot(_))));
+        // No range given → labelled as the uniform fallback.
+        root.range_ip = String::new();
+        root.range_oop = String::new();
+        let rep = solve(&root, &cfg).expect("uniform");
+        assert!(rep.notes.iter().any(|n| n.starts_with("ranges=uniform_fallback")));
     }
 }

@@ -33,6 +33,11 @@ def main() -> int:
     )
     p.add_argument("--no-resume", action="store_true")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument(
+        "--rerun-partial",
+        action="store_true",
+        help="Solve again jobs whose only result is a salvaged partial snapshot",
+    )
     args = p.parse_args()
 
     if not args.grid.is_file():
@@ -43,6 +48,7 @@ def main() -> int:
         args.grid,
         resume=not args.no_resume,
         dry_run=args.dry_run,
+        rerun_partial=args.rerun_partial,
     )
     return 1 if report.as_dict().get("n_fail") else 0
 

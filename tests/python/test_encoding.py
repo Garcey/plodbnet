@@ -196,6 +196,10 @@ def test_effective_stack_encoding() -> None:
         "bet_to_call": 0,
         "min_bet": bb,
         "max_bet": 500 * bb,
+        # Legal raise deltas the encoder reads since review 2026-09-20 B1/B3
+        # (PL cap = the 9bb pot).
+        "min_raise": bb,
+        "max_raise": 30_000 * 3,
         "history": [],
         "street_commit": [0, 0, 0],
         "total_commit": [0, 0, 0],
@@ -247,6 +251,10 @@ def _pair_obs(
         "bet_to_call": 0,
         "min_bet": 10_000,
         "max_bet": 200_000,
+        # Legal raise deltas the encoder reads since review 2026-09-20 B1/B3
+        # (PL cap = the 3bb pot).
+        "min_raise": 10_000,
+        "max_raise": 30_000,
         "history": [],
         "street_commit": [0, 0],
         "total_commit": [0, 0],

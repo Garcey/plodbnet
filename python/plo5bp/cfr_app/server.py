@@ -8,23 +8,30 @@ Run::
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
+import secrets
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from plo5bp.cfr_app.paths import data_root, export_dir, uploads_dir
+from plo5bp.cfr_app.ranges import apply_ranges, parse_range, toggle_class
 from plo5bp.cfr_app.session import SolveSession, root_presets
 from plo5bp.cfr_app.strategy_view import (
     filter_rows,
     list_strategy_library,
     load_report,
     matrix_for_rows,
+    node_rows,
     summarize_report_light,
 )
 from plo5bp.cfr_app.tree_model import build_abstract_tree, compare_strategies
@@ -39,6 +46,58 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 
 app = FastAPI(title="CFR Solver Desktop", version="0.3.0")
 session = SolveSession()
+
+# ---------------------------------------------------------------------------
+# Local-only API guard (review 2026-09-20)
+# ---------------------------------------------------------------------------
+# The server binds 127.0.0.1, but the user's BROWSER can reach that too, so any
+# web page they have open could (a) fire "simple" cross-origin POSTs at it —
+# stop / pause / start a solve, load files — and (b) via DNS rebinding (a
+# hostile domain re-pointed at 127.0.0.1) read every response. Three checks:
+#
+# 1. Host must be a loopback name           → kills DNS rebinding.
+# 2. A present Origin must be loopback too  → kills cross-site requests.
+# 3. State-changing methods need `Content-Type: application/json` OR the
+#    per-launch token header. A cross-origin page can send neither without a
+#    CORS preflight, and this app never answers one. (Multipart upload cannot be
+#    JSON, so it carries the token, which only the same-origin page can read.)
+API_TOKEN = secrets.token_urlsafe(24)
+TOKEN_HEADER = "x-cfr-token"
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def _allowed_hosts() -> frozenset[str]:
+    # CFR_APP_ALLOWED_HOSTS: extra names, comma-separated (tests use "testserver").
+    extra = os.environ.get("CFR_APP_ALLOWED_HOSTS", "")
+    return _LOOPBACK_HOSTS | {h.strip().lower() for h in extra.split(",") if h.strip()}
+
+
+def _hostname(netloc: str) -> str:
+    """``host[:port]`` / ``[v6]:port`` → lower-case host without the port."""
+    netloc = (netloc or "").strip().lower()
+    if netloc.startswith("["):
+        return netloc[1:].split("]", 1)[0]
+    return netloc.rsplit(":", 1)[0] if netloc.count(":") == 1 else netloc
+
+
+@app.middleware("http")
+async def _local_only_guard(request: Request, call_next):
+    allowed = _allowed_hosts()
+    if _hostname(request.headers.get("host", "")) not in allowed:
+        return JSONResponse({"detail": "forbidden: non-local Host header"}, status_code=403)
+    origin = request.headers.get("origin")
+    if origin is not None and _hostname(urlsplit(origin).netloc) not in allowed:
+        return JSONResponse({"detail": "forbidden: cross-origin request"}, status_code=403)
+    if request.method in _UNSAFE_METHODS:
+        ctype = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        token_ok = secrets.compare_digest(request.headers.get(TOKEN_HEADER, ""), API_TOKEN)
+        if ctype != "application/json" and not token_ok:
+            return JSONResponse(
+                {"detail": "forbidden: send Content-Type: application/json or the app token"},
+                status_code=403,
+            )
+    return await call_next(request)
 
 # In-memory cache of last fully loaded view (for filter paging without re-parse)
 _view_cache: dict[str, Any] = {"key": None, "view": None}
@@ -122,8 +181,14 @@ class ExportRequest(BaseModel):
 
 
 @app.get("/", response_class=HTMLResponse)
-def index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
+def index() -> HTMLResponse:
+    # Hand the per-launch token to OUR page only: a cross-origin page cannot read
+    # this response (no CORS headers are ever sent), so it never learns the token.
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    inject = f"<script>window.CFR_TOKEN = {json.dumps(API_TOKEN)};</script>\n    "
+    marker = '<script src="/static/app.js">'
+    html = html.replace(marker, inject + marker, 1) if marker in html else html + inject
+    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
 
 
 if STATIC_DIR.is_dir():
@@ -169,17 +234,27 @@ def meta() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _root_dict(body: RootBody) -> dict[str, Any]:
+    """RootBody → dict with the ``stack_bb`` alias resolved.
+
+    Shared by /api/solve, /api/validate_root and /api/tree/preview so all three
+    see the SAME stack (review 2026-09-20 E1: Validate must check what Solve runs).
+    """
+    root_d = body.model_dump()
+    # Prefer explicit stack_bb when client sent it (effective_stack_bb has a default)
+    if body.stack_bb is not None:
+        # model_fields_set is pydantic v2; fall back to truthy override
+        fields_set = getattr(body, "model_fields_set", None) or set()
+        if "stack_bb" in fields_set or (
+            "effective_stack_bb" not in fields_set and body.stack_bb != 50.0
+        ):
+            root_d["effective_stack_bb"] = float(body.stack_bb)
+    return root_d
+
+
 @app.post("/api/solve")
 def api_solve(body: SolveRequest) -> dict[str, Any]:
-    root_d = body.root.model_dump()
-    # Prefer explicit stack_bb when client sent it (effective_stack_bb has a default)
-    if body.root.stack_bb is not None:
-        # model_fields_set is pydantic v2; fall back to truthy override
-        fields_set = getattr(body.root, "model_fields_set", None) or set()
-        if "stack_bb" in fields_set or (
-            "effective_stack_bb" not in fields_set and body.root.stack_bb != 50.0
-        ):
-            root_d["effective_stack_bb"] = float(body.root.stack_bb)
+    root_d = _root_dict(body.root)
     cfg_d = body.config.model_dump()
     # Allow algorithm / card_abstraction on root for preset convenience
     if body.root.algorithm:
@@ -252,24 +327,33 @@ def api_job_view(
     hand_query: str = "",
     limit: int = 200,
     offset: int = 0,
+    runout: str | None = None,
 ) -> dict[str, Any]:
-    # Pull latest progress snapshot (live strategy while solving)
+    # (review 2026-09-20 E4) Counters come from the cheap head read; the big
+    # snapshot is parsed only here, outside the session lock, and only when the
+    # file changed. The derived view (rows/nodes/matrix over every infoset) is
+    # cached on the same signature, so node clicks / paging / live ticks between
+    # dumps cost a filter, not a full rebuild.
     session.refresh_progress(job_id)
-    j = session.get_job(job_id, full=True)
+    j = session.get_job(job_id, full=False)
     if j is None:
         raise HTTPException(404, f"job {job_id} not found")
-    rep = j.get("report")
+    rep, sig = session.full_report(job_id)
     if not rep:
         raise HTTPException(
             409,
             f"job {job_id} has no report yet (status={j.get('status')}) — wait for first progress tick",
         )
-    try:
-        view = load_report(rep)
-    except Exception as e:
-        raise HTTPException(400, f"view failed: {e}") from e
-    _view_cache["key"] = f"job:{job_id}"
-    _view_cache["view"] = view
+    cache_key = ("job", job_id, sig)
+    if _view_cache.get("key") == cache_key and _view_cache.get("view"):
+        view = _view_cache["view"]
+    else:
+        try:
+            view = load_report(rep, source=j.get("out_path") if sig and sig[0] == "final" else None)
+        except Exception as e:
+            raise HTTPException(400, f"view failed: {e}") from e
+        _view_cache["key"] = cache_key
+        _view_cache["view"] = view
     return _view_payload(
         view,
         seat=seat,
@@ -277,6 +361,7 @@ def api_job_view(
         hand_query=hand_query,
         limit=limit,
         offset=offset,
+        runout=runout,
         extra={
             "job": {
                 "job_id": job_id,
@@ -333,10 +418,12 @@ def api_library_load(body: LoadPathRequest) -> dict[str, Any]:
         job = session.load_report_file(p)
     except Exception as e:
         raise HTTPException(400, f"load failed: {e}") from e
-    # also warm view cache
+    # Warm the view cache from the dict we just parsed. (review 2026-09-20 E4:
+    # this route used to parse the same — possibly 100+ MB — file three times.)
+    data = job.get("report") or {}
     try:
-        view = load_report(p)
-        _view_cache["key"] = f"file:{p}"
+        view = load_report(data, source=str(p))
+        _view_cache["key"] = _file_cache_key(p)
         _view_cache["view"] = view
     except Exception as e:
         logger.warning("view load failed: %s", e)
@@ -345,7 +432,7 @@ def api_library_load(body: LoadPathRequest) -> dict[str, Any]:
         "status": job["status"],
         "out_path": job.get("out_path"),
         "root": job.get("root"),
-        "summary_light": summarize_report_light(p),
+        "summary_light": summarize_report_light(p, data=data),
     }
 
 
@@ -357,9 +444,10 @@ def api_view(
     hand_query: str = "",
     limit: int = 200,
     offset: int = 0,
+    runout: str | None = None,
 ) -> dict[str, Any]:
     p = _safe_path(path)
-    cache_key = f"file:{p}"
+    cache_key = _file_cache_key(p)
     if _view_cache.get("key") == cache_key and _view_cache.get("view"):
         view = _view_cache["view"]
     else:
@@ -376,6 +464,7 @@ def api_view(
         hand_query=hand_query,
         limit=limit,
         offset=offset,
+        runout=runout,
     )
 
 
@@ -389,7 +478,7 @@ async def api_upload(file: UploadFile = File(...)) -> dict[str, Any]:
     safe = re.sub(r"[^\w.\-]+", "_", Path(name).name)[:120] or "upload.json"
     if not safe.lower().endswith(".json"):
         safe += ".json"
-    up_dir = REPO_ROOT / "data" / "cfr" / "uploads"
+    up_dir = uploads_dir()  # (review 2026-09-20 J4) env-overridable
     up_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d_%H%M%S")
     dest = up_dir / f"{stamp}_{safe}"
@@ -422,7 +511,7 @@ async def api_upload(file: UploadFile = File(...)) -> dict[str, Any]:
     except Exception as e:
         dest.unlink(missing_ok=True)
         raise HTTPException(400, f"could not parse strategy: {e}") from e
-    _view_cache["key"] = f"file:{dest.resolve()}"
+    _view_cache["key"] = _file_cache_key(dest.resolve())
     _view_cache["view"] = view
     try:
         job = session.load_report_file(dest)
@@ -432,7 +521,7 @@ async def api_upload(file: UploadFile = File(...)) -> dict[str, Any]:
     return {
         "ok": True,
         "path": str(dest.resolve()),
-        "rel": f"data/cfr/uploads/{dest.name}",
+        "rel": _rel_display(dest),
         "job_id": job_id,
         "summary": view["summary"],
         "num_infosets": view["summary"].get("num_infosets"),
@@ -442,24 +531,52 @@ async def api_upload(file: UploadFile = File(...)) -> dict[str, Any]:
 
 @app.post("/api/validate_root")
 def api_validate_root(body: RootBody) -> dict[str, Any]:
-    from plo5bp.cfr_app.session import _root_from_dict
+    from plo5bp.cfr_app.session import _root_from_dict, validate_root_for_app
 
     try:
-        r = _root_from_dict(body.model_dump())
-        r.validate()
-        return {"ok": True, "root": r.as_dict()}
+        # (review 2026-09-20 E11) strict range parse — RangeError is a ValueError.
+        root_d, ranges = apply_ranges(_root_dict(body))
+        r = _root_from_dict(root_d)
+        # (review 2026-09-20 E1) same checks /api/solve enforces — Validate used
+        # to say "Root OK" for roots that then crashed the native solver.
+        validate_root_for_app(r)
+        # `ranges` tells the UI what the text MEANS: combos, weight, per-class map.
+        return {"ok": True, "root": r.as_dict(), "ranges": ranges}
     except ValueError as e:
         return {"ok": False, "error": str(e)}
+
+
+class RangeParseRequest(BaseModel):
+    text: str = ""
+    board: list[int] = Field(default_factory=list)
+    toggle: str | None = None  # a 13×13 cell label to flip (AA / AKs / AKo)
+
+
+@app.post("/api/range/parse")
+def api_range_parse(body: RangeParseRequest) -> dict[str, Any]:
+    """Parse range text for the 13×13 grid — the grid has no grammar of its own.
+
+    (review 2026-09-20 E11) The JS used to light a cell only when its label was
+    literally a token in the box, so ``QQ+`` or ``KK-TT`` selected nothing on the
+    grid while the solver did something else again. One parser, used by both.
+    """
+    try:
+        pr = toggle_class(body.text, body.toggle, body.board) if body.toggle else parse_range(
+            body.text, body.board
+        )
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, **pr.summary()}
 
 
 @app.post("/api/tree/preview")
 def api_tree_preview(body: RootBody) -> dict[str, Any]:
     """Build the abstract bet-size game tree for the configured root."""
-    from plo5bp.cfr_app.session import _root_from_dict
+    from plo5bp.cfr_app.session import _root_from_dict, validate_root_for_app
 
     try:
-        r = _root_from_dict(body.model_dump())
-        r.validate()
+        r = _root_from_dict(_root_dict(body))
+        validate_root_for_app(r)
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
     tree = build_abstract_tree(r, max_nodes=350, max_depth=7)
@@ -481,8 +598,9 @@ def api_compare(body: CompareRequest) -> dict[str, Any]:
         rows_a = [r for r in rows_a if int(r.get("seat", 0)) == int(body.seat)]
         rows_b = [r for r in rows_b if int(r.get("seat", 0)) == int(body.seat)]
     if body.path_filter:
-        rows_a = [r for r in rows_a if str(r.get("path") or "") == body.path_filter]
-        rows_b = [r for r in rows_b if str(r.get("path") or "") == body.path_filter]
+        # Same node semantics as the viewer (open/root/"" = root; one runout).
+        rows_a = node_rows(rows_a, path=body.path_filter)["rows"]
+        rows_b = node_rows(rows_b, path=body.path_filter)["rows"]
     return {
         "a": {"path": str(pa), "summary": va["summary"]},
         "b": {"path": str(pb), "summary": vb["summary"]},
@@ -494,7 +612,7 @@ def api_compare(body: CompareRequest) -> dict[str, Any]:
 def api_export(body: ExportRequest) -> dict[str, Any]:
     """Copy a strategy into data/cfr/app_export/ for easy access / training handoff."""
     src = _safe_path(body.path)
-    out_dir = REPO_ROOT / "data" / "cfr" / "app_export"
+    out_dir = export_dir()  # (review 2026-09-20 J4) env-overridable
     out_dir.mkdir(parents=True, exist_ok=True)
     # Basename only — block path traversal via out_name
     raw_name = body.out_name.strip() or src.name
@@ -508,7 +626,7 @@ def api_export(body: ExportRequest) -> dict[str, Any]:
     except ValueError as e:
         raise HTTPException(400, "export path escapes app_export") from e
     dest.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
-    return {"ok": True, "path": str(dest), "rel": f"data/cfr/app_export/{name}"}
+    return {"ok": True, "path": str(dest), "rel": _rel_display(dest)}
 
 
 @app.get("/api/jobs/{job_id}/progress")
@@ -527,14 +645,10 @@ def api_job_progress(job_id: str) -> dict[str, Any]:
         elapsed = round(end - started, 2)
     rep = j.get("report") or {}
     n_info = j.get("num_infosets") or (rep.get("strategy") or {}).get("num_infosets") or 0
-    # Light job strips infosets — use counters / status for live flag.
-    has_live = (
-        j.get("status") in ("running", "paused", "queued")
-        and int(n_info or 0) > 0
-    ) or (
-        isinstance(rep.get("strategy"), dict)
-        and bool((rep.get("strategy") or {}).get("infosets"))
-    )
+    # A strategy is viewable once there are infosets: a live snapshot while the
+    # job is active, the final report afterwards. (The light dict never carries
+    # infosets, so this is decided from the counters.)
+    has_live = int(n_info or 0) > 0
     return {
         "job_id": job_id,
         "status": j.get("status"),
@@ -565,32 +679,29 @@ def _view_payload(
     hand_query: str = "",
     limit: int = 200,
     offset: int = 0,
+    runout: str | None = None,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Filter rows + rebuild 13×13 matrix for the selected decision node."""
-    page = filter_rows(
-        view["rows"],
-        seat=seat,
-        path=path,
-        hand_query=hand_query,
-        limit=limit,
-        offset=offset,
-    )
-    # Full filtered set (no page cap) for matrix of the selected node
-    filtered = filter_rows(
+    # One pass: the full filtered set feeds the matrix, a slice of it is the page.
+    full = filter_rows(
         view["rows"],
         seat=seat,
         path=path,
         hand_query=hand_query,
         limit=max(len(view["rows"]), 1),
         offset=0,
-    )["rows"]
+        runout=runout,
+    )
+    filtered = full["rows"]
+    offset = max(0, int(offset))
+    page = {**full, "offset": offset, "limit": limit, "rows": filtered[offset : offset + max(1, limit)]}
     street = (view.get("summary") or {}).get("street")
+    # Unfiltered first load → the ROOT node's matrix, precomputed by load_report
+    # (review 2026-09-20 E3). Any filter → the matrix of exactly those rows.
     matrix = view.get("matrix")
-    if seat is not None or (path is not None and path != "") or hand_query:
+    if seat is not None or path is not None or hand_query or matrix is None:
         matrix = matrix_for_rows(filtered, street=street)
-    elif matrix is None:
-        matrix = matrix_for_rows(view["rows"], street=street)
     out: dict[str, Any] = {
         "summary": view["summary"],
         "nodes": view["nodes"],
@@ -599,10 +710,36 @@ def _view_payload(
         "line_nav": view.get("line_nav"),
         "chart_pack": view.get("chart_pack"),
         "page": page,
+        # (review 2026-09-20 E6) which runout the rows/matrix are for + the picker
+        # options (most visited first). Empty on the root street.
+        "runout": {
+            "selected": full.get("runout") or "",
+            "label": full.get("runout_label") or "",
+            "options": full.get("runouts") or [],
+            "total": full.get("num_runouts") or 0,
+        },
     }
     if extra:
         out.update(extra)
     return out
+
+
+def _file_cache_key(p: Path) -> tuple[Any, ...]:
+    """View-cache key for a file: path + mtime + size, so an overwritten file
+    (re-export / re-upload under the same name) is never served stale."""
+    try:
+        st = p.stat()
+        return ("file", str(p), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return ("file", str(p), None, None)
+
+
+def _rel_display(p: Path) -> str:
+    """Repo-relative path for display; absolute when the data dir is elsewhere."""
+    try:
+        return p.resolve().relative_to(REPO_ROOT.resolve()).as_posix()
+    except ValueError:
+        return str(p)
 
 
 def _safe_path(path: str) -> Path:
@@ -612,16 +749,24 @@ def _safe_path(path: str) -> Path:
         cand = (REPO_ROOT / raw).resolve()
     else:
         cand = raw.resolve()
-    if not cand.exists():
+    # (review 2026-09-20) Strategy directories ONLY. This used to accept any path
+    # under the repo, so /api/library/load would read e.g. tests/**/labels.json —
+    # or any other JSON in the checkout — and serve it back through /api/jobs.
+    # Roots: the data dir (env-overridable, J4), the repo's own data/cfr, and the
+    # session work dir. Checked BEFORE existence so probing reveals nothing.
+    roots = (data_root(), REPO_ROOT / "data" / "cfr", session.work_dir)
+    if not any(_is_within(cand, root) for root in roots):
+        raise HTTPException(403, f"path outside the strategy directories: {path}")
+    if cand.suffix.lower() != ".json":
+        raise HTTPException(403, "only .json strategy files can be opened")
+    if not cand.is_file():
         raise HTTPException(404, f"path not found: {path}")
-    # Prefer files under repo or data/cfr app_jobs
+    return cand
+
+
+def _is_within(path: Path, root: Path) -> bool:
     try:
-        cand.relative_to(REPO_ROOT.resolve())
-        return cand
+        path.relative_to(root.resolve())
+        return True
     except ValueError:
-        # allow absolute under work_dir
-        try:
-            cand.relative_to(session.work_dir.resolve())
-            return cand
-        except ValueError as e:
-            raise HTTPException(403, f"path outside allowed roots: {path}") from e
+        return False

@@ -56,6 +56,7 @@
                 <input id="f-pot" type="number" step="0.1" min="0.1" value="10" />
               </label>
               <label class="inline-lab">Stack (bb)
+                <!-- min is raised for preflop roots by updateStackMin() in app.js -->
                 <input id="f-stack" type="number" step="0.5" min="0.5" value="50" />
               </label>
             </div>
@@ -119,7 +120,10 @@
             </div>
 
             <h3>Ranges</h3>
-            <p class="hint">Empty = 100% random. Click the grid or type labels (<code>AA,KK,AKs</code>).</p>
+            <p class="hint">Empty = 100% random. Click the grid or type hands, separated by commas or spaces:
+              <code>AA</code> <code>AKs</code> <code>AKo</code> <code>QQ+</code> <code>A5s+</code> <code>KK-TT</code>
+              <code>A5s-A2s</code> <code>AsKs</code>, with optional weights (<code>AA:0.5</code>).
+              Unknown tokens are rejected — nothing falls back to 100% silently.</p>
             <div class="range-editor">
               <div class="range-tabs">
                 <button type="button" class="btn btn-ghost btn-sm active" id="btn-range-oop-tab" data-which="oop">OOP</button>
@@ -128,6 +132,8 @@
                 <button type="button" id="btn-range-clear" class="btn btn-ghost btn-sm">Clear (100%)</button>
               </div>
               <div id="range-grid" class="range-grid"></div>
+              <!-- What the server's parser says each box means (combos / weight) or why it is invalid. -->
+              <div id="range-status" class="hint range-status"></div>
               <div class="form-grid">
                 <label>OOP range
                   <textarea id="f-range-oop" rows="2" placeholder="empty = 100%"></textarea>
@@ -159,7 +165,8 @@
                 <input id="c-expl" type="number" step="0.01" value="0" />
               </label>
               <label>Time budget (s, 0=off)
-                <input id="c-time" type="number" step="1" min="0" value="0" />
+                <input id="c-time" type="number" step="1" min="0" value="0"
+                       title="Checked between iterations. If a single iteration overruns the budget by more than ~15 s the solve is force-stopped (no final strategy; the last live snapshot stays viewable)." />
               </label>
               <label>Progress every N iters
                 <input id="c-poll" type="number" min="1" value="50" />
@@ -215,6 +222,11 @@
           <div class="card tree-strip-card line-nav-card">
             <div class="tree-strip-head">
               <span class="tree-strip-label">Line</span>
+              <!-- Flop/turn roots: the same line exists once per dealt card; pick ONE
+                   runout (default = most visited) instead of averaging across them. -->
+              <label id="runout-wrap" class="runout-wrap hidden">Runout
+                <select id="v-runout" title="Board cards dealt after the solve root"></select>
+              </label>
               <span id="line-actor" class="line-actor muted">—</span>
             </div>
             <div id="line-breadcrumb" class="line-breadcrumb muted">Load a solution, then play an action to walk the tree.</div>

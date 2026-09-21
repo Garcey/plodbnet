@@ -32,8 +32,12 @@ are bit-exact reproducible; tests lean heavily on parity.
 - Tesseract binary is required for chip-amount / pot OCR. If it isn't
   installed, `plo5bp.ocr.text` helpers return `None` and downstream
   code relies on the stack-delta / banner fallbacks.
-- OpenCV (`cv2`) and `pytesseract` are both required by the OCR
-  extras; tests `importorskip` them.
+- OpenCV (`cv2`) and `pytesseract` are required only by the PIXEL half
+  of the OCR stack (`extract`, `cards`, `live`). `plo5bp.ocr` imports
+  lazily, so `events`, `types`, `text` parsing and the PokerNow mapper
+  work — and their tests run — without OpenCV; the pixel test modules
+  `importorskip` cv2 individually (never from `conftest.py`: a
+  module-level skip there aborts the whole pytest session).
 
 ## Build & test
 
@@ -44,11 +48,14 @@ are bit-exact reproducible; tests lean heavily on parity.
 # from rust_engine/ installs to the wrong place.)
 .venv/Scripts/maturin develop --release
 
-# Python tests (250 as of 2026-04-24: 208 engine/trainer + 42 OCR)
+# Python tests (2,100 as of 2026-09-20; ~3.5 min on CPU)
 .venv/Scripts/python -m pytest tests/python/ tests/ocr/ -q
 
-# Rust tests
-cargo test --manifest-path rust_engine/Cargo.toml
+# Rust tests (~290). pyo3-build-config needs an interpreter: if cargo
+# says "no Python 3.x interpreter found", export
+# PYO3_PYTHON=<repo>\.venv\Scripts\python.exe and put the BASE python
+# dir (python3.dll) on PATH first.
+cargo test --manifest-path rust_engine/Cargo.toml --release --lib
 
 # Profile batched vs serial rollout
 .venv/Scripts/python scripts/profile_rollout.py --num-envs 64 --rollout-length 2048
@@ -72,6 +79,69 @@ critic's state rides in the checkpoint under `"critic"`). It refuses to
 warm-start v1 checkpoints, and head families are strict: `--sizing-head
 anchor` = v2 (head_version 2), `logistic` = v4 (3), `mixture` = v5 (4).
 
+### Current state (2026-09-20 — read this before the older v5 notes)
+
+- **Obs**: PLO OBS_DIM is **1171** (v7-obs tail 1020..1171: STK/BRD/DUAL
+  blocks, V7_DESIGN.md / V7_OBS_CANDIDATES.md), minimal layout 796
+  (`--obs-mode minimal`, vMin1), NLH 995. The fused **Rust obs encoder is
+  live again** at width 1171 (`PLO5_RUST_ENCODER=1`, width-gated in
+  `env_batched.py`; the pod guardians set it). Production stems: `vSix<N>`
+  (`--v6` preset) and `vMin1`; guardians `scripts/vSix4_guardian.sh`,
+  `scripts/vMin1_guardian.sh`.
+- **Observation-SEMANTICS revision (`PLO5BP_OBS_REV`)**. The 2026-09-20
+  review fixed feature VALUES without moving any dim: STK-2 / STK-5[2:4]
+  (1024-1029, 1040-1041) and the min/max-bet scalars (PLO 186/187, minimal
+  slots 2/3, NLH 134/135) now describe the LEGAL raise window (engine
+  `min_raise`/`max_raise`, zeros when Raise is illegal, dead-chip
+  invariant); the straight-draw flags (800/802) put the ace-low shadow
+  below the deuce; flush blockers (999-1006) see the other board; NLH
+  flush-nut distance (906) on five-flush boards. Unset/`2` = fixed values
+  (default); **`PLO5BP_OBS_REV=1` reproduces the pre-fix values exactly**
+  in all three encoders — use it to serve or resume any checkpoint trained
+  before 2026-09-20. Read once at import (`encoding.OBS_SEMANTICS_REV`);
+  the Rust engines are pinned to the same rev at construction. `train.py`
+  stamps `obs_rev` into checkpoints and REFUSES a warm start across a rev
+  change unless `--allow-obs-rev-change` (deliberate migration — expect a
+  transient); pool seeding skips other-rev siblings; the UI logs
+  `OBS-REV MISMATCH` and exposes `obs_rev_mismatch` in `GET /formats`; GTO
+  PolicyNet checkpoints and `.npz` row caches are stamped too. The live
+  guardians export `PLO5BP_OBS_REV=1`. NOT gated (same distribution, new
+  bits): the opp-outcome MC seed (dims 982-989) — see Determinism contracts.
+- **Rollout**: in-flight hands are DRAINED at rollout end by default
+  (`TrainingConfig.drain_inflight`; `--no-drain-inflight` restores the
+  legacy truncation that under-sampled long hands by ~len/W). Drain adds
+  ~2.5-8% rows (and VRAM) per update — the live guardians pass
+  `--no-drain-inflight`; for a new stem drop it and lower
+  `--rollout-length` ~5-8%. Configs where fewer than two seats can act
+  after posting are resampled by `_sample_game_config`, and both collectors
+  re-deal hands that are terminal at deal (bounded) instead of spinning.
+  Advantage normalization under `--mix-configs` is PER CONFIG (each
+  sub-rollout is unit-normalized first; the pooled renorm is a no-op).
+- **Checkpoints**: writes are atomic (`<name>.pt.tmp` + `os.replace`). Adam
+  moments + the L2-init reference live in ONE rolling sidecar
+  `<stem>.optim.pt` (never prune it; `--no-optimizer-sidecar` opts out);
+  it is restored only when its update counter matches the loaded
+  checkpoint — every outcome prints a line, a cold Adam start is never
+  silent. Default `--checkpoint` is `checkpoints/train_run.pt`; writing
+  `stub.pt` / `nlh_stub.pt` needs `--allow-overwrite-stub`.
+- **Live control file**: `runs/anneal_control.json` content is stamped into
+  checkpoints (`anneal_control_applied`); on relaunch a pre-existing file
+  is RE-APPLIED only if it equals the loaded checkpoint's stamp, otherwise
+  ignored with a loud line. Read as `utf-8-sig`; malformed/UTF-16 content
+  is logged once, never fatal; invalid values make the edit a logged
+  no-op; unknown keys/tiers are logged.
+- **PPO guards**: a non-finite KL or loss is a hard trip (never applied);
+  `--value-clip <= 0` disables value clipping; the v4/v5 sizing head
+  upcasts to fp32 inside `_anchor_dist` (bf16 autocast quantized the
+  upper-tail CDF differences — an asymmetric, passive-sizing bias).
+  OPEN design question (unchanged): the probability-dependent clip is
+  keyed on the gate prob but applied to the JOINT ratio.
+- **NLH**: the NLH PPO lineage (`nlh1`-`nlh4`) is RETIRED
+  (`scripts/nlh_guardian.sh` exits 1). The NLH path is the native Rust CFR
+  solver (`rust_engine/src/cfr/`) → label export → supervised PolicyNet
+  (`python/plo5bp/gto/`), served through `PolicyNetHost`; the desktop
+  "CFR Solver" app is `python/plo5bp/cfr_app/`. See "NLH GTO teacher".
+
 ### v5 (2026-07-06, IMPLEMENTED, not yet trained — V5_DESIGN.md canonical)
 
 - **Head**: `--sizing-head mixture` (+ `--mixture-k`, default 3) =
@@ -90,9 +160,9 @@ anchor` = v2 (head_version 2), `logistic` = v4 (3), `mixture` = v5 (4).
   effective-price block (5, capped by the EFFECTIVE stack — dead-chip
   invariance), log1p SPR (8, unclipped — the legacy [0,4] clip saturated
   the whole deep tier at the flop). 991-era checkpoints serve via the
-  `downgrade_obs_to_v2` slice; the **Rust obs encoder is force-disabled**
-  (predates the layout; PLO5_RUST_ENCODER=1 prints a notice and uses
-  numpy — port it and re-pin test_encoding_rust.py before re-enabling).
+  `downgrade_obs_to_v2` slice. (HISTORICAL: at v5 time the Rust obs
+  encoder was force-disabled; it was ported and re-enabled at width 1171
+  in 2026-07 — see "Current state".)
 - **Warm-start v4→v5**: `scripts/convert_v4_to_v5.py <v4.pt> <out.pt>` —
   component 0 = the v4 head (w₀≈0.92), zero-pads obs columns on actor AND
   critic, adds the zero-init critic `adv_head`, strips anneal/counter/
@@ -161,7 +231,8 @@ v2 specifics:
   0.08}}` manually sets a tier's coef (one-shot; anneal continues from
   there). Applied whenever file content changes.
 - `--kl-anchor-coef` (default 0 = off) enables the KL-to-EMA-reference
-  regularizer; the reference is not persisted in checkpoints.
+  regularizer; the reference IS persisted (`ckpt["model_ema"]`, restored
+  on warm-start — see the v5 notes).
 - **Warm-start pool seeding** (default ON with `--load-checkpoint`;
   `--no-warmstart-pool` disables): the opponent pool is ephemeral (too
   heavy for checkpoints), so a resume used to start EMPTY (pure
@@ -187,13 +258,17 @@ v2 specifics:
 ```
 
 Pod stem families: `optimized<N>` (v1, retired — `launch_auto.sh` /
-`watchdog_auto.sh`), `vTwo<N>`/`vFour<N>` (PLO5 v2/v4 — guardian
-scripts per stem, e.g. `vFour4_guardian.sh`), and `nlh<N>` (NLH v4 —
-`nlh_guardian.sh`, cold-started nlh1 on 2026-07-03 after vFour4 was
-PAUSED gracefully; vFour4 resumes later via warm-start + pool
-seeding — do NOT prune `checkpoints/vFour4_*.pt` on the pod). Every
-watchdog/guardian pgreps the same `scripts/train.py` — run ONE family
-per pod; stop the other via its `runs/*.stop` file.
+`watchdog_auto.sh`), `vTwo<N>`/`vFour<N>`/`vFive<N>` (PLO5 v2/v4/v5 —
+guardian scripts per stem), the current `vSix<N>` (`--v6`,
+`vSix4_guardian.sh`) and `vMin1` (minimal obs, `vMin1_guardian.sh`), and
+`nlh<N>` (NLH v4 PPO — RETIRED 2026-07-16, `nlh_guardian.sh` now exits 1;
+do NOT prune `checkpoints/vFour4_*.pt` on the pod). Guardians resume from
+the newest `<stem>_*.pt`; the `<stem>.optim.pt` sidecar and `.pt.tmp`
+files never match that glob. A guardian refuses to start while its stop
+flag exists and re-checks it right before every relaunch. vSix4's guardian
+pgreps any `scripts/train.py`; vMin1's matches only its own
+`--checkpoint` — still run ONE family per pod unless you know the GPU
+fits both; stop via the stem's `runs/*.stop` file.
 
 ## PLO4/PLO6 variants (`plo4_double_bomb`, `plo6_double_bomb`)
 
@@ -300,9 +375,60 @@ ante 5000; 6-max preflop pot = 45000 ("$45").
   = any-combo labels. Tests: `tests/python/test_nlh_ui.py`. NOT
   ported: OCR/PokerNow for NLH (deliberate — study/trainer only).
 - Entropy seeds / (μ,s) floor-cap for the 12-anchor ladder are
-  untuned — nlh1 launched 2026-07-03 with vFour4's proven hypers
-  (0.45 ent, lr 1.5e-4 warmup 75, target-kl 0.5) via
-  `scripts/nlh_guardian.sh`; watch the same health signals.
+  untuned. The NLH PPO lineage (nlh1–nlh4, launched 2026-07-03 with
+  vFour4's hypers) was ABANDONED 2026-07-16 and its checkpoints deleted;
+  `scripts/nlh_guardian.sh` is a retired stub that exits 1. NLH strategy
+  now comes from the CFR teacher pipeline below; the PPO path still
+  trains (tests cover it) but nothing runs it.
+- Engine (review 2026-09-20): a seat that already covers everything any
+  live opponent can still put in gets NO decision node (the nominal
+  `bet_to_call = bb` used to offer a covering SB a fold vs a short all-in
+  BB and forfeit uncalled chips) — the hand runs out; uncalled/orphan
+  layers are refunded to their contributors. Hands can therefore be
+  TERMINAL AT DEAL when fewer than two seats can act: `env.reset` returns
+  `info.terminal=True, actor=None`; use `env.terminal_rewards()`.
+
+### NLH GTO teacher (`rust_engine/src/cfr/`, `python/plo5bp/gto/`, `cfr_app/`)
+
+Native Rust CFR (DCFR for HU postflop, external-sampling MCCFR for
+preflop/multiway) → label export → supervised PolicyNet → `PolicyNetHost`
+(env `PLO5BP_GTO_CHECKPOINT`). Invariants after the 2026-09-20 review:
+
+- **Solver**: ES-MCCFR accumulates the average strategy at the OPPONENT's
+  sampled nodes (own-reach weighting); deals are sampled from the true
+  joint (rejection on card collision) and the BR weights hero combos by
+  their true marginal; the FINAL exploitability estimator runs on every
+  exit path and notes carry an honest `expl_kind=` (`exact_infoset`,
+  `hero_enum`, `sampled_runout_br`, `mc_poll`, `mc_br_proxy`);
+  `Range::parse` errors on unknown tokens (`#44` = combo id, `44` = pocket
+  fours); ALLIN raises to `max_raise_chips()` and a jam-sized `RAISE_x` is
+  merged into it; invalid roots (sub-blind stacks, 0-chip pots,
+  `max_iterations=0` with no stop condition, over-budget trees) are
+  `ValueError`s, never panics. Strategies solved BEFORE the review for
+  preflop/multiway (or with ranges) should be re-solved.
+- **Export/labels**: CFR `ALLIN` (and any raise that clamps to the stack)
+  maps to the grid-LEGAL jam anchor via `labels.jam_anchor_index`, never
+  blindly to the top atom; facing a jam, `ALLIN` with `max_raise == 0` is a
+  CALL; teacher mass on an illegal action raises
+  `IllegalTeacherMassError`. Only reports with a final estimator kind and
+  no `early_stop=`/promoted marker are exploitability-VERIFIED; everything
+  else lands in `unverified/` and is skipped by teacher export
+  (`--allow-unverified-expl` to override). Pre-review label shards and
+  PolicyNet checkpoints are invalid — re-export and retrain.
+- **Serve**: `PolicyNetHost` re-encodes postflop nodes to the canonical
+  obs the labels were built from (current-street history only,
+  `total_commit := street_commit`, blind seats None), serves GRID chips
+  (no refine head) and snaps near-stack sizes to exactly `max_raise`;
+  `supports(seats=, street=)` answers from recorded coverage and the UI
+  falls back to PPO (`gto_unsupported`) outside it. The probe scores gates
+  AND sizing, fails NaN, uses a stratified SHA-256 holdout and refuses
+  train/holdout overlap; the GTO badge requires recorded provenance.
+- **Desktop app** (`cfr_app/`): solves run in a spawned child process
+  (`CFR_APP_INPROCESS=1` to disable), directories resolve through
+  `cfr_app/paths.py` (`CFR_APP_DATA_DIR`), the local API is
+  loopback-Host/Origin checked (`CFR_APP_ALLOWED_HOSTS`), range text goes
+  through one strict parser (`/api/range/parse`), node views are keyed by
+  (seat, path, runout) and weighted by `visit_mass`.
 
 ```bash
 # NLH training (2048×4 rule applies to real runs, same as PLO)
@@ -340,6 +466,13 @@ filter as `/ocr`) — do NOT un-strip without an explicit user decision
   anchor-size raise buttons, street card popup, hover combo breakdown.
   Client queries NEVER drop-when-busy: latest-response-wins via RG_SEQ
   (dropping desyncs the line from the render — bug found in validation).
+  A failed query rolls back the line AND the viewed node.
+- Sizes: the wire format (`chips_bb`) is the engine's raise-BY delta; the
+  payload also carries raise-TO totals (`to_bb`, `actor_commit_bb`,
+  `min/max_raise_to_bb`) and the client shows/enters raise-TO. ANY legal
+  anchor whose chips equal `max_raise` is all-in (the ALL-IN atom is
+  deduped away whenever a fraction anchor already reaches the stack) — it
+  is summed into `allin_p` and labelled ALL-IN.
 
 ## Promote good checkpoints to the UI
 
@@ -420,7 +553,20 @@ Key invariants (documented in the module docstring — don't break):
   blunder. EV loss = paired Monte-Carlo rollouts (common random
   numbers) of user action vs the deterministic rec; `mc_rollouts`
   default 16 keeps a deviating `/trainer/act` under ~1s on CPU with the
-  2048×4 net (matching actions skip MC entirely).
+  2048×4 net (matching actions skip MC entirely). v2+ scoring inverts the
+  refinement `u` over the UNCLAMPED anchor bracket (`anchor_lo_raw/
+  hi_raw`) — the policy maps `u` over the unclamped bracket and clamps
+  chips afterwards, so inverting over the clamped grid graded the exact
+  recommendation as an "inaccuracy" whenever min/max-raise clipped the
+  bracket; chips equal to `rec_chips` always score "best" with no MC.
+- The EV-loss estimate replays the REAL deal and future board, so it is
+  hidden while the hand is live (`feedback.ev_loss_bb: null`,
+  `ev_loss_hidden: true`) and revealed at terminal / in review; stats are
+  committed once per COMPLETED hand (abandoned hands add nothing) and
+  accumulate the SIGNED estimate, clamping only the displayed aggregate.
+  `_rollout_ev` holds `_TORCH_RNG_LOCK` only around seed→sample regions
+  (env work happens outside it); the public build caps `mc_rollouts` at
+  32. `POST /trainer/act` with no live hand is a 409 (never auto-deals).
 - What-if card swaps replay through `reset_study` — an unmodified
   what-if reproduces the original node's observation bit-exactly
   (pinned by `test_trainer_review.py`). What-if stays hero-only.
@@ -458,6 +604,13 @@ Two drivers in `python/plo5bp/rollout.py`:
 - EV runout seed: hand base seed XOR `0x9E3779B97F4A7C15`.
 - Canonical orderings for multi-sets (hole cards, boards) are fixed in
   the encoder — see memory note on engine design preferences.
+- Opp-outcome MC seed (`engine.rs: outcome_mc_seed`, shared by
+  `outcome_seed()` and `outcome_features_mc`): street + SORTED hero hole +
+  each visible board as a SORTED set, through the hand-written `SeedMixer`
+  (FNV-1a 64 → splitmix64 finalizer). No hero seat, no deal order, no
+  `std` `DefaultHasher` (unspecified across Rust releases) — so dims
+  982-989 are invariant to card order / table rotation and stable across
+  toolchains. Study placeholder deals use the same mixer.
 
 ## Config surface
 
@@ -567,11 +720,19 @@ signal fires independently.
 4. After 2 stable ticks, `committed_ready=True`.
 5. Fire `_begin_new_hand(anchor_fs, button, hero_hole_indices)` when
    any of: button rotated, hero hole rotated, or first-ever commit
-   (`hand_in_hand_mask` empty).
-6. `_begin_new_hand`: resets defaults, locks
-   `hand_in_hand_mask = {i : anchor.seats[i].folded is False}`, seeds
-   `cfg.starting_stacks` from the anchor frame's OCR reads, and calls
-   `ocr_runner._reconstructor.rebaseline(anchor_fs)` so diff-based
+   (`hand_in_hand_mask` empty AND someone reads in hand — ten all-folded
+   ticks fire it once, not every tick). The hero-hole trigger NEVER fires
+   on a frame whose `fs.button_seat is None`.
+6. `_begin_new_hand`: resets defaults (incl. `last_hero_hole`, which is
+   then adopted from hero's first full read of the hand — a stale baseline
+   used to latch `hero_hole_rotated` and let one unreadable-button frame
+   wipe a live hand), locks
+   `hand_in_hand_mask = {i : anchor.seats[i].folded is False}` (hero CAN
+   join later through mask expansion and is never auto-folded), seeds
+   `cfg.starting_stacks` from the anchor frame's OCR reads via
+   `dataclasses.replace` (variant/sb carried), sets `session.env = None` so
+   the `EngineView` built on that tick reflects the NEW hand, and calls
+   `_active_reconstructor().rebaseline(anchor_fs)` so diff-based
    inference starts from the pre-commit frame.
 7. After any hand-start, refresh
    `sitting_out_seats = (all_seats - hand_in_hand_mask) |
@@ -585,8 +746,16 @@ signal fires independently.
   detection on the commit tick. Don't re-introduce.)
 - `session.sitting_out_seats` is not written pre-commit. Initial
   state is `frozenset()` until `hand_in_hand_mask` is populated.
-- `folded_this_hand` only grows during a hand; it's cleared by
-  `_new_session_defaults` which `_begin_new_hand` calls.
+- `folded_this_hand` is cleared by `_new_session_defaults` (which
+  `_begin_new_hand` calls) and, in live mode, RE-DERIVED from the engine
+  after every `_rebuild_env` (`_sync_folds_with_engine`): a FOLD the
+  engine rejected — or one the user `/undo`es — must not leave the seat
+  skipped while the engine still waits on it. The ClubGG reveal-frame
+  fold reconcile needs two consecutive ticks; PokerNow is immediate.
+- Live capture is PLO5-only: `/ocr/start`, `/ocr/rescan` and
+  `/pokernow/ingest` return 409 under any other format before touching
+  state. `/reset`, `/format`, `OcrRunner.start` and a live-source switch
+  clear the debounce state (`_reset_live_tracking`).
 
 ### The reconstructor fallback ladder (events.py)
 
@@ -603,22 +772,50 @@ signal fires independently.
 3. Banner alone with no chip amount → emit `OcrWarning`, break the
    walk (retry next tick).
 4. Primary read that matches `base_commit` → trust it (CHECK or no
-   action).
-5. Nothing → break.
+   action) — non-current seats only.
+5. Timer-bar transition off the actor with a READABLE, UNCHANGED stack →
+   CHECK (an unreadable stack holds the timer lock one more tick).
+6. Downstream evidence (`_any_remaining_delta`) → CHECK and continue.
+7. Nothing → break.
+
+Rules the ladder obeys (review 2026-09-20 — don't regress them):
+- **Street gate**: the server advances streets with padded cards as soon
+  as betting closes, so the engine can be a street AHEAD of the screen.
+  The walk is skipped while `engine_view.street` exceeds the street implied
+  by the visible boards (bounded at 25 ticks), and while no board card is
+  readable at all (antes are not actions). Stale ovals after the closing
+  action used to produce phantom CHECK cascades / a phantom raise.
+- **All-in CALL is `check_call`**: stack 0 with `new_commit <= facing_bet`
+  is a call (the engine rejects it as a raise and the action is lost);
+  only `new_commit > facing_bet` with stack 0 is a (short) raise. A ±1
+  engine-chip mismatch between a bet and its call counts as an exact call
+  (`cents_to_engine_chips` is the ONE conversion, shared with the server).
+- **Folds come only from `obs.folded`** — present in BOTH `last` and `fs`
+  for pixel OCR (one frame for PokerNow's exact folds). A seat with chips
+  in, facing a raise, with no new chips is NEVER fold-inferred: the walk
+  waits. Frames where no seat reads in-hand are dropped entirely. The
+  Task-C "hero hole hid" CHECK branch is deleted (ClubGG never re-hides
+  hero's cards mid-hand; it only fired on glitches).
+- **Baseline**: `last_fs` is replaced on every processed frame; only
+  `stack_chips` is conservative — a carried-forward None stack is reduced
+  by what the walk already explained, and an UNEXPLAINED drop is held (not
+  absorbed) for seats that showed chip evidence this street.
 
 `_any_remaining_delta` decides whether to continue the walk past a
-CHECK. It checks the same three independent signals (commit change,
-stack drop > 0 AND ≥ `max(1, min_bet_cents)`, banner) for any
-downstream seat. Require drop > 0 explicitly — `min_bet_cents == 0`
-in tests would otherwise make zero-drop look like a hit.
+CHECK. It checks two signals for any downstream seat — commit change
+(with the same banner/stack-drop corroboration Fix N requires) and stack
+drop > 0 AND ≥ `max(1, min_bet_cents)` — skipping the current actor,
+sitting-out/folded/all-in seats and seats already explained this pass.
+Require drop > 0 explicitly — `min_bet_cents == 0` in tests would
+otherwise make zero-drop look like a hit.
 
 ### Session field cheat sheet
 
 | Field | Owner | Semantics |
 |---|---|---|
-| `action_log` | server | List of `{gate, chips}` entries; replayed by `_rebuild_env` |
-| `hand_in_hand_mask` | `_begin_new_hand` | Seats dealt into current hand (locked at hand-start) |
-| `folded_this_hand` | `OcrRunner._tick` | Seats the reconstructor has emitted FOLD for this hand |
+| `action_log` | server | List of `{gate, chips, seat}` entries; replayed positionally by `_rebuild_env` (`seat` is recorded and a mismatch with the engine's actor is WARNED, replay semantics unchanged) |
+| `hand_in_hand_mask` | `_begin_new_hand` | Seats dealt into current hand (locked at hand-start; grows through expansion, hero included) |
+| `folded_this_hand` | `OcrRunner._tick` | Seats folded this hand; re-derived from the engine after each rebuild in live mode |
 | `sitting_out_seats` | refreshed every tick | `(all_seats - mask) \| folded_this_hand` |
 | `_pending_button`, `_pending_sitting_out`, `_pending_stable_ticks`, `_pending_anchor_fs` | `_mirror_observable_state` | 2-tick debounce state |
 | `observed_stacks`, `observed_pot` | `_mirror_observable_state` | Last OCR read, refreshed every tick regardless of hand state |
@@ -715,7 +912,19 @@ Things that differ from the ClubGG path (don't "fix" them to match):
   OCR path has one) — PokerNow reads are exact and `_begin_new_hand` guards
   per-seat, so a villain who ante'd all-in doesn't block the hand-start.
 - Both live runners register their reconstructor via `_set_active_reconstructor`
-  so the shared `_begin_new_hand` rebaselines whichever source is driving.
+  so the shared `_begin_new_hand` rebaselines whichever source is driving —
+  PokerNow re-registers on EVERY payload and `OcrRunner.stop()` retires its
+  own (a ClubGG session used to leave the wrong reconstructor active, logging
+  phantom ante RAISE/CALLs on every later PokerNow hand).
+- Review 2026-09-20: a bare button change with an unchanged hero card set
+  corrects the button and rebuilds — it does NOT restart the hand (button
+  DOM lag); mid-street seeding is `stack + committed + ante`; tables with
+  more than 8 seats are refused gracefully (the obs layout has 8 seat
+  slots; reason shown in `/pokernow/status`); `map_payload` validates the
+  schema and a malformed payload is a 400, never a 500 loop; a null stack is
+  all-in ONLY with the explicit `allIn` flag (userscript ≥ 1.2.0 — re-paste
+  it into Tampermonkey; its all-in DOM marker is still unverified against a
+  live table).
 
 ## Public build (`PLO5BP_PUBLIC`)
 
@@ -729,12 +938,18 @@ intact. Run it with:
 PLO5BP_PUBLIC=1 .venv/Scripts/python -m uvicorn plo5bp.ui.server:app --port 8765
 ```
 
-- Server (`server.py`): the flag strips every `/ocr` and `/pokernow` route
-  after registration (an `app.router.routes[:]` filter — the handlers stay
-  defined, they're just unmounted, so those paths 404). The `/` route
-  injects `window.PLO5BP_PUBLIC` into the served HTML so the client knows
-  its mode before first paint (no `/config` fetch race, no flash of the
-  live controls).
+- Server (`server.py`): the flag strips every `/ocr`, `/pokernow` and
+  `/ranges` route after registration (`_public_route_kept` — handles
+  FastAPI's `_IncludedRouter` wrapper too; the handlers stay defined, they're
+  just unmounted, so those paths 404). The `/` route injects
+  `window.PLO5BP_PUBLIC` into the served HTML so the client knows its mode
+  before first paint (no `/config` fetch race, no flash of the live
+  controls). Static files are policed on the RESOLVED file inside
+  `NoCacheStaticFiles` (so `/static//app.js`, trailing `/`, `..`, case
+  variants can't dodge it): `app.js`/`style.css` are served WGLIVE-stripped;
+  `index.html`, `ranges.js`, `admin.html` and the `games.*` assets 404 from
+  the mount (each has its own gated route). The public app is built with
+  `docs_url=None, redoc_url=None, openapi_url=None`.
 - Frontend (`app.js`): when `window.PLO5BP_PUBLIC`, `setupTopBar` skips the
   live-control wiring and hides `.ocr-group`, `init` skips `applySourceUI`
   (the OCR/PokerNow status polling), and the per-render `simple_ocr_mode`
@@ -753,7 +968,129 @@ $10/mo subscriptions (checkout + success-redirect confirm + optional webhook +
 lazy revalidation — no public URL needed), and `/admin` (users, comp
 grant/revoke, revenue) allowlisted to `PLO5BP_ADMIN_EMAILS` (default
 themilesgarcia@icloud.com). Setup/runbook: `PUBLIC_SETUP.md`. Tests:
-`tests/python/test_public_service.py` (sets env + reimports ui modules).
+`tests/python/test_public_service.py` (sets env + reimports ui modules —
+ALWAYS through `conftest.purge_ui_modules` / the `ui_purge` fixture: popping
+`sys.modules` alone leaves the stale module bound as an attribute of the
+`plo5bp.ui` package and `from plo5bp.ui import public` silently reuses it).
+
+Service-layer rules (review 2026-09-20 — keep them):
+
+- The access middleware authorizes on a NORMALIZED `scope["path"]`
+  (`//`, trailing `/`, `.`/`..`, backslashes resolved). `/format` is a
+  subscriber route. Implicit deals are metered: for a non-entitled user
+  whose `TrainerSession` has `hand_no > 0` and `hand is None`, a request to
+  `/trainer/state|settings|act|stats/reset` counts against the quota like
+  `POST /trainer/new_hand` (the first implicit hand of a fresh session
+  stays free).
+- Stripe: re-validation never runs on the event loop (threadpool, 8 s
+  timeout); `resource_missing`/"No such subscription" ⇒ INACTIVE; other
+  errors fail open only until `current_period_end` + 3 days, re-checked at
+  most every 15 min (`PLO5BP_STRIPE_TIMEOUT`, `PLO5BP_STRIPE_GRACE_DAYS`,
+  `PLO5BP_STRIPE_RETRY_S`). Activation (confirm AND webhook) requires
+  `mode == "subscription"`, a subscription id, `payment_status` paid or
+  `no_payment_required`, and a subscription that is active/trialing NOW —
+  replaying an old session cannot re-activate.
+- Dev login exists only when `PLO5BP_DEV_LOGIN=1` AND the `BASE_URL` host is
+  loopback; it rejects any forwarding header (XFF, CF-Connecting-IP,
+  Forwarded, …) and needs a loopback client + Host. The test client is
+  accepted only with `PLO5BP_DEV_LOGIN_TESTCLIENT=1` (fixtures set it).
+  `email_verified` defaults to False when the claim is absent.
+- `/me.homegame` is `{"href", "label"}` for granted users (absent
+  otherwise) so `app.js` ships no home-games strings to everyone else.
+
+**Home games** (`ui/homegame.py`, `static/games.*`, admin-granted
+`homegame_access`, 404 for everyone else): PokerNow-style private PLO5
+double-board tables over `BombPotEnv` (minimal obs, actual payouts, HTTP
+polling, per-table RLock + clock watchdog). Invariants: hole cards are
+revealed only when ≥ 2 hands are live at terminal (an uncontested winner
+stays face-down); "own" cards are shown against the user id DEALT into the
+seat this hand (a seated-but-not-dealt viewer or a seat taken over later
+sees nothing); all-in equities are computed once per (hand, street) from
+the ALIVE seats (`runout.board_equities` = one exact enumeration per
+board) — never per viewer under the lock; money is exact integers and the
+ledger always sums to zero (largest-remainder apportionment at cash-out);
+mutations persist before (or roll back with) in-memory state; `/act` and
+`/deal` carry `hand_no`/`action_seq` and 409 when stale; `/deal` refuses
+while a runout is still revealing and the payload releases deltas/awards
+progressively (no unrevealed card anywhere); chat/rabbit need table
+membership; new tables default to a 30 s clock and the watchdog auto-acts
+Away actors even on clock-less tables; a mid-hand leave folds/checks now
+and cashes out at hand end.
+
+Premium tables pass (2026-09-21 — `tests/python/test_homegame_premium.py`):
+
+- **The SERVER deals** (`_auto_deal_tick_locked`, table setting
+  `deal_delay_secs`; 0 = manual). An API create that omits it gets MANUAL
+  (scripted callers/tests stay deterministic); the create dialog sends 5 and
+  pre-existing rows migrate to 5 s. It deals only to a table somebody is AT
+  (`PRESENCE_WINDOW_S`: ≥ 2 eligible players polled recently) — an abandoned
+  table must not keep posting antes. The client never auto-deals.
+- **Time bank**: after the base clock the actor burns `Seat.time_bank_left`
+  (in-memory; only the seconds used are charged, `TIME_BANK_REFILL_S` comes
+  back per hand, capped by `time_bank_secs`). Two timeouts in a row sit the
+  player out.
+- **Table settings** (`POST /settings`, host): name, ante, buy-in min/default/
+  max, seats (between hands; shrink needs the high seats empty), clock, bank,
+  deal delay, runout pause, `listed` (link-only tables), `allow_rabbit`.
+  Blinds are fixed at creation (they are the chip unit — changing them would
+  re-value every stack). The hand in progress keeps the config it was dealt
+  with. Also `/transfer_host`, `/show` (table your own cards after the hand —
+  the ONLY way a fold-out winner or a folded hand is ever revealed), `/react`
+  (whitelisted emotes), `/hands` + `/hands/{n}`.
+- **Hand history** stores every dealt hand's cards (`homegame_hands`) and
+  filters per viewer with the live rule (own cards + hands tabled at showdown
+  or shown); members only; nothing about a hand — history, stats, the `win`
+  event line — is served while its runout is still revealing.
+- **Sitting / reloading mid-hand** is allowed for a seat that is NOT in the
+  hand (`_dealt_in`); `_sync_idle_stack` keeps `hand_start_stacks` in step so
+  the hand's end and the runout-time ledger stay zero-sum. Players holding
+  cards still wait (table stakes).
+- `events` / `reactions` are small in-memory feeds (dealer lines, toasts,
+  emotes). Lobby rows carry seated NAMES only (no emails / user ids).
+- **Client** = five gated modules (`homegame.GAMES_ASSETS`, each also "deny" in
+  `server._PUBLIC_STATIC_POLICY`): `games.js` (core: state, ordering guards,
+  polling, pre-actions, routing — no DOM building, driven headless by
+  `test_review_homegame_client_js.py`), `games.table.js` (persistent-node
+  felt renderer: every animation is a DIFF of prev→next state, so never
+  rebuild the table with innerHTML), `games.play.js` (dock: actions, sizing,
+  pre-actions, status strip, hotkeys — built once, updated in place),
+  `games.ui.js` (lobby, rail, Manage drawer, dialogs, toasts, player card),
+  `games.sound.js` (WebAudio synth, no audio files). On-felt sizes are
+  multiples of `--u` (set by `layout()`); the felt insets in `computeGeom`
+  and the seat geometry must stay in step. Player notes/tags and preferences
+  are localStorage-only.
+- **Chips in (2026-09-22 — `tests/python/test_homegame_chips.py`)**:
+  `approve_buyins` turns a sit / top-up by anyone but the host or a TRUSTED
+  player (`homegame_players.trusted`, `/trust`) into a pending request
+  (`LiveTable.requests`, in memory; `/request` approve|deny|cancel; a sit
+  request holds its seat; it lapses when the requester's browser is gone;
+  switching approval off or trusting the player lets it through). Two
+  DIFFERENT automatic-chip features, each off | host | player:
+  **auto top-up** (`topup_mode`, `/auto_topup`, per-seat target + below —
+  tops UP only, and only once the stack is under the threshold: no rathole)
+  and **set stack** (`auto_stack_mode`, `/auto_stack`, the older feature —
+  resets the stack to the target before EVERY deal, up or down: ratholing is
+  the point). Set-stack wins when a seat has both; players choose through
+  `/auto_chips_self {kind: off|topup|set}` and only touch the knobs the host
+  left to them; targets are capped by `max_buyin_cents`; while approval is on
+  neither runs for an untrusted player (`_auto_chips_allowed`). A top-up sent
+  with `queue: true` while holding cards is queued (`queued_topup_cents`) and
+  lands when the hand is over; without the flag it is still a 400.
+- **Live push**: `GET …/stream` (SSE, async generator — never a threadpool
+  thread per viewer; the view is built under the lock via
+  `run_in_threadpool`) pushes the viewer's state whenever `_stream_sig`
+  changes (rev + the clock-driven runout/award steps) and at least every
+  `STREAM_HEARTBEAT_S`; `max_events` exists for tests. The client
+  (`startLive`) falls back to the 450 ms poll after repeated stream errors.
+  Presence (`seen`, fed by polls AND stream pushes) drives server dealing,
+  the `spectators` name list and each seat's `present` flag.
+- Phone landscape = the `wide` geometry in `games.table.js` (boards side by
+  side, hero plate beside the hero cards, no seats along the bottom edge) plus
+  the `(max-height: 480px) and (orientation: landscape)` block in `games.css`
+  that floats the dock over the felt's bottom corners — keep the two in step.
+- Preview harness (gitignored): `.claude/tools/games_preview/` — launch
+  entry `games_preview` (public build + dev login + temp DB on :8772) and
+  `bot.py` (scripted guests).
 
 Per-user state plumbing (matters when touching server.py/trainer.py):
 
@@ -780,45 +1117,65 @@ in `events.py:_infer_seat_actions` has no positive signal to emit
 the StreetReveal CHECK reconciler to back-fill). Mid-street the UI
 sits stuck on hero as `current_actor`.
 
-See `HANDOFF.md` at repo root for the latest symptom, the three
-fixes shipped this session (Tasks A/B/C), and the open hypotheses
-for why Task C did not resolve the bug. Plan files live in
-`.claude/plans/`; the most recent is
-`in-the-last-session-mossy-hedgehog.md`. Treat every hypothesis in
-HANDOFF.md as speculation, not fact — Task C shipped on a documented
-ClubGG behavior assumption that may not hold empirically.
+The original investigation (Tasks A/B/C) is in the git history of
+`HANDOFF.md`; plan files live in `.claude/plans/`. Task C's "hero hole
+hid" branch was DELETED in the 2026-09-20 review (ClubGG never re-hides
+hero's cards mid-hand, so it only ever fired on glitches). Still open —
+treat all of these as hypotheses, not facts: (1) `simple_ocr_mode`
+defaults to True and then the reconstructor is never stepped — confirm it
+was off when validating; (2) the OCR loop sleeps `poll_ms` AFTER each
+tick, so the real period exceeds 200 ms; (3) the timer-transition CHECK
+branch needs a unique positive read on a villain timer bar whose ROI is
+only 1-2 px tall. Second open OCR item: `OcrRunner` can anchor a hand
+before ClubGG deducts antes, leaving seeded stacks one ante high. The
+full review (findings, fixes, deferrals, repro scripts) lives in
+`.claude/reviews/`.
 
 ## Layout
 
 ```
 rust_engine/src/              engine + PyO3 bindings
-  PyGameState (serial), PyBatchedEngine (batched)
+  engine.rs, state.rs, double_board.rs, hand_eval.rs, cards.rs
+  bindings.rs                 PyGameState (serial), PyBatchedEngine (batched),
+                              fused obs encoder + feature pyfunctions
+  obs_v7_inc.rs               v7 obs tail (include!d by bindings.rs)
+  cfr/                        native NLH CFR solver (DCFR / ES-MCCFR), py_api
 
 python/plo5bp/
   env.py, env_batched.py      Gym-style envs
-  encoding.py                 scalar + encode_observation_batch
-  rollout.py                  serial + batched rollout drivers
-  ppo.py, selfplay.py         training loop
-  network.py                  ActorCritic (gate head + Beta raise head)
-  actions.py, config.py, masking.py
+  encoding.py, encoding_nlh.py  scalar + batch encoders, OBS_SEMANTICS_REV
+  sizing.py                   canonical anchor-grid math (network/rollout/UI)
+  rollout.py                  serial + batched + multiconfig rollout drivers
+  ppo.py, selfplay.py         training loop, opponent pool
+  network.py                  ActorCritic v1/v2/v4/v5 + CentralCritic
+  actions.py, config.py, masking.py, eval.py, exploit.py
+  gto/                        CFR → labels → PolicyNet teacher pipeline + host
+  cfr_app/                    desktop "CFR Solver" app (FastAPI + pywebview)
   ocr/                        capture → extract → events pipeline
     live.py, rois.py, cards.py, text.py, extract.py,
-    events.py, types.py, tools/, templates/
+    events.py, pokernow.py, types.py, tools/, templates/
   ui/
-    server.py                 FastAPI app, Session, OcrRunner
-    static/                   index.html, app.js, style.css
+    server.py                 FastAPI app, Session, OcrRunner, PokerNowRunner
+    trainer.py, ranges.py     trainer mode, NLH range grid (local only)
+    public.py, homegame.py    public service layer, private home games
+    runout.py, hand_describe.py, common.py
+    static/                   index.html, app.js, ranges.js, admin.html,
+                              games.html/.css + games{,.table,.play,.ui,.sound}.js
 
 tests/
-  python/                     engine / encoder / env / rollout parity
+  python/                     engine / encoder / env / rollout / ui / gto
+                              (test_review_*.py = 2026-09-20 review regressions)
   ocr/                        extract / events / server_mirror / rois / cards
     fixtures/                 labeled frames + JSON state
 
 scripts/
-  train.py, profile_rollout.py, evaluate.py,
-  exploitability.py, smoke_test.py
+  train.py, profile_rollout.py, evaluate.py, exploitability.py,
+  probe_suite.py, smoke_test.py, *_guardian.sh (pod), cfr_*/gto_*/step*.py
 
-.claude/plans/                approved plan files
-checkpoints/                  trained weights; stub.pt is UI default
+tools/pokernow/               Tampermonkey userscript + README
+.claude/plans/, .claude/reviews/   plan files; code-review findings + repros
+checkpoints/                  trained weights; stub.pt is UI default;
+                              <stem>.optim.pt = rolling optimizer sidecar
 screenrecords/frames/         debug captures from /ocr/save_frame
-HANDOFF.md                    latest unresolved-issue handoff
+HANDOFF.md                    latest session handoff
 ```

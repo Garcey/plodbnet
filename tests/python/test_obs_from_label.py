@@ -1,4 +1,9 @@
-"""Dump → live-matching NLH obs (Step 3)."""
+"""Dump → canonical (synthetic solver-root) NLH obs (Step 3).
+
+These tests check the LABEL side only. That the served obs equals this
+canonical form for a played hand is pinned in
+test_review_gto_serve_parity.py (review 2026-09-20 D3).
+"""
 
 from __future__ import annotations
 
@@ -92,7 +97,17 @@ def test_reconstruct_facing_raise_has_history():
 
 
 @pytest.mark.skipif(not _engine_has_cfr_node(), reason="rebuild: reset_nlh_cfr_node")
-def test_golden_obs_bit_exact_vs_live_encode():
+def test_obs_from_label_is_the_synthetic_root_encode():
+    """SELF-CONSISTENCY only: ``obs_from_label`` == encoding the engine node
+    that ``reconstruct_live_engine`` itself built (same function on both sides).
+
+    (review 2026-09-20 D3) This was named ``..._bit_exact_vs_live_encode`` and
+    read as "labels match the obs a played hand serves". It never compared
+    against a played hand — and they did NOT match (prior-street history,
+    hand-total commits and blind flags are live at serve, always 0 here). The
+    real train == serve pin PLAYS hands:
+    ``test_review_gto_serve_parity.py``.
+    """
     lab = _river_label(path=["RAISE_500"], hero_seat=1)
     got = obs_from_label(lab)
     assert got is not None

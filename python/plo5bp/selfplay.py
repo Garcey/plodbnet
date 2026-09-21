@@ -90,7 +90,10 @@ def select_warmstart_pool_updates(
       `target_update`), each mapped to the nearest unused available file
       (ties prefer the newer file). When the disk cadence is coarser than
       the snapshot cadence the grid walk continues further back, so the
-      pool still fills to capacity with the most-recent distinct files.
+      pool still fills to capacity with the most-recent distinct files —
+      but never past grid point 0: a run younger than
+      `capacity * snapshot_every` updates gets the partially-filled pool it
+      would really hold, not a back-fill of its earliest checkpoints.
 
     Returns update numbers OLDEST-FIRST (FIFO order: the next natural
     snapshot evicts the oldest member, exactly as an uninterrupted run
@@ -110,7 +113,15 @@ def select_warmstart_pool_updates(
     s = max(1, int(snapshot_every))
     g = (int(target_update) // s) * s
     remaining = [a for a in pool_of if a not in set(chosen)]
-    while len(chosen) < capacity and remaining:
+    # Stop at grid point 0 (review 2026-09-20 A18): a never-stopped run has
+    # no snapshot older than its first, so a YOUNG run's pool is simply not
+    # full yet. The walk used to continue through negative grid points and
+    # back-fill with the EARLIEST files on disk (files 5..100 every 5, target
+    # 103, snapshot_every 50 -> the true pool {0, 50, 100} came back padded
+    # with 10, 15, 20, 25, 30 — five near-random-init opponents). The
+    # coarse-disk walk-back above is unaffected: it fills to capacity long
+    # before the grid reaches 0 on any production cadence.
+    while len(chosen) < capacity and remaining and g >= 0:
         best = min(remaining, key=lambda a: (abs(a - g), -a))
         chosen.append(best)
         remaining.remove(best)
@@ -154,6 +165,7 @@ def seed_pool_from_checkpoints(
     reference_state_dict: "dict[str, Any]",
     preferred: "list[int] | None" = None,
     directory: "Path | None" = None,
+    expected_obs_rev: "int | None" = None,
 ) -> "list[int]":
     """Reconstruct the opponent pool from a warm-start checkpoint's
     on-disk siblings. Returns the update numbers seeded (oldest-first).
@@ -163,10 +175,28 @@ def seed_pool_from_checkpoints(
     incompatible files are skipped with a warning rather than poisoning
     the pool. Loads one file at a time (peak memory ≈ one checkpoint over
     the pool's normal steady-state footprint).
+
+    `expected_obs_rev` (2026-09-20): the run's observation-SEMANTICS
+    revision (`plo5bp.encoding.OBS_SEMANTICS_REV`). A sibling stamped with a
+    different `obs_rev` (absent = 1, i.e. trained before the 2026-09-20
+    feature fixes) was trained on other feature VALUES at the same dims —
+    same shapes, so nothing else here would catch it — and is skipped. None
+    = don't check (callers that predate the stamp).
     """
     import torch
 
     base, family = discover_checkpoint_family(ckpt_path, directory)
+    if preferred:
+        # A18: recorded members with no `<base>_<N>.pt` on disk (pruned, or
+        # the checkpoint came from ANOTHER stem whose siblings live under a
+        # different base) used to fall through to the grid without a word.
+        gone = sorted({int(p) for p in preferred} - set(family))
+        if gone:
+            print(
+                f"[pool] {len(gone)}/{len(set(preferred))} recorded pool "
+                f"members have no {base}_<N>.pt on disk ({gone}) — filling "
+                "from the snapshot grid instead"
+            )
     chosen = select_warmstart_pool_updates(
         list(family.keys()),
         target_update,
@@ -190,6 +220,13 @@ def seed_pool_from_checkpoints(
             print(
                 f"[pool] skip {path.name}: variant/head mismatch "
                 f"({variant}, v{head})"
+            )
+            continue
+        obs_rev = int(ckpt.get("obs_rev", 1))
+        if expected_obs_rev is not None and obs_rev != int(expected_obs_rev):
+            print(
+                f"[pool] skip {path.name}: obs_rev mismatch (file "
+                f"{obs_rev} vs run {int(expected_obs_rev)})"
             )
             continue
         if not isinstance(sd, dict) or {

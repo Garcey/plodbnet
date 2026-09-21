@@ -19,7 +19,12 @@ Layout (995 dims total):
   108..116  active mask, hero-rotated, padded to 8
   116..124  all-in mask, hero-rotated, padded to 8
   124..132  stacks / bb (effective, dead-capped like PLO), hero-rotated
-  132..136  scalars: pot, bet_to_call, min_bet, max_bet — all / bb
+  132..136  scalars: pot, bet_to_call, min_total, max_total — all / bb.
+            min/max_total = the LEGAL raise window as street totals
+            (street_commit[hero] + the engine's min/max raise delta; both 0
+            when Raise is illegal) — see encoding._legal_raise_window.
+            (PLO5BP_OBS_REV=1 restores the pre-2026-09-20 values of these
+            two dims and of dim 906 — encoding.OBS_SEMANTICS_REV.)
   136..144  relative-position one-hot of actor
   144..864  history: last 40 actions oldest-first, each slot 18 dims
             (seat-one-hot 8 + gate one-hot 4 {Fold,Check,Call,Raise}
@@ -74,12 +79,16 @@ import numpy as np
 
 from plo5bp.config import GameConfig
 from plo5bp.encoding import (
+    OBS_REV_LEGACY,
+    OBS_SEMANTICS_REV,
     _GATE_CALL,
     _GATE_CHECK,
     _GATE_FOLD,
     _GATE_RAISE,
     _STRAIGHT_WINDOWS,
     _gate_from_action,
+    _legal_raise_window,
+    _legal_raise_window_batch,
     _pair_features,
     _pair_features_batch,
 )
@@ -166,7 +175,10 @@ def _draw_flags_nlh(hole_idx: list[int], board_idx: list[int]) -> tuple[float, f
 
 
 def _sf_features_nlh(
-    hole_idx: list[int], board_idx: list[int], visible_count: np.ndarray
+    hole_idx: list[int],
+    board_idx: list[int],
+    visible_count: np.ndarray,
+    rev: int | None = None,
 ) -> np.ndarray:
     """Straight / flush / straight-flush block under NLH rules. (38,) f32,
     sub-layout identical to encoding.py's `_straight_flush_features`:
@@ -185,10 +197,14 @@ def _sf_features_nlh(
     with no ≥2-hole requirement; a made flush is any suit with
     hole+board ≥ 5 and ≥1 hole card (or a 5-flush board); draws are
     hero-involved (≥1 hole card of the suit, 4 total).
+
+    `rev` is the observation-semantics revision (None = OBS_SEMANTICS_REV);
+    it only affects the flush nut distance on a five-flush board.
     """
     out = np.zeros(38, dtype=np.float32)
     if not board_idx:
         return out
+    legacy = (OBS_SEMANTICS_REV if rev is None else rev) == OBS_REV_LEGACY
 
     board_ranks_set = {c // 4 for c in board_idx}
     hole_ranks_set = {c // 4 for c in hole_idx}
@@ -257,12 +273,24 @@ def _sf_features_nlh(
         total_s = hole_suit_counts[s] + board_suit_counts[s]
         if total_s < 5:
             continue
-        if hole_suit_counts[s] >= 1:
-            h1 = hole_max_per_suit[s]
+        if legacy:
+            # Rev 1 (pre review B7, kept for old checkpoints).
+            if hole_suit_counts[s] >= 1:
+                h1 = hole_max_per_suit[s]
+            else:
+                # Board flush ("playing the board"): any unaccounted card of
+                # the suit above the board's 5th-highest beats it.
+                h1 = min(sorted(board_ranks_per_suit[s], reverse=True)[:5])
         else:
-            # Board flush ("playing the board"): any unaccounted card of
-            # the suit above the board's 5th-highest beats it.
-            h1 = min(sorted(board_ranks_per_suit[s], reverse=True)[:5])
+            h1 = hole_max_per_suit[s]  # -1 when hero holds none of the suit
+            if board_suit_counts[s] == 5:
+                # Five-flush board: everyone plays at least the board, so
+                # only an unaccounted card ABOVE the board's lowest card of
+                # the suit beats it; anything lower merely ties.
+                # PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 B7, dim
+                # 906): in rev 1 a hero card below the board's lowest sets
+                # h1, counting those tie-only ranks as "beats hero".
+                h1 = max(h1, min(board_ranks_per_suit[s]))
         for r in range(h1 + 1, 13):
             if visible_count[r, s] == 0:
                 flush_nut_distance += 1
@@ -366,10 +394,30 @@ def encode_observation_nlh(
 
     pot = float(obs["pot"])
     btc = float(obs["bet_to_call"])
+    street_commit = obs.get("street_commit", [0] * num_seats)
     out[_SCALARS_OFF + 0] = pot * inv_bb
     out[_SCALARS_OFF + 1] = btc * inv_bb
-    out[_SCALARS_OFF + 2] = float(obs["min_bet"]) * inv_bb
-    out[_SCALARS_OFF + 3] = float(obs["max_bet"]) * inv_bb
+    rev = OBS_SEMANTICS_REV
+    if rev == OBS_REV_LEGACY:
+        # Rev 1: min_bet_total()/max_bet_total() verbatim.
+        out[_SCALARS_OFF + 2] = float(obs["min_bet"]) * inv_bb
+        out[_SCALARS_OFF + 3] = float(obs["max_bet"]) * inv_bb
+    else:
+        # PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 B3, dims 134/135):
+        # the min/max scalars are the LEGAL raise window as street totals —
+        # street_commit[hero] + the engine's min/max raise delta, 0/0 when
+        # Raise is illegal (same rule as the PLO encoder,
+        # `_legal_raise_window`). In NL max_bet_total() is the deepest
+        # opponent's RAW reach, which broke dead-chip invariance at ~50% of
+        # nodes.
+        window = _legal_raise_window(
+            int(obs["min_raise"]), int(obs["max_raise"]), int(stacks[hero]),
+            int(config.bb),
+        )
+        if window.legal:
+            hero_sc = float(street_commit[hero])
+            out[_SCALARS_OFF + 2] = (hero_sc + window.min_d) * inv_bb
+            out[_SCALARS_OFF + 3] = (hero_sc + window.max_d) * inv_bb
 
     out[_REL_POS_OFF + 0] = 1.0  # actor is hero by construction
 
@@ -401,7 +449,6 @@ def encode_observation_nlh(
         spr = max(eff_per_seat[seat] / pot_safe, 0.0)
         out[_SPR_OFF + k] = float(np.log1p(spr))
 
-    street_commit = obs.get("street_commit", [0] * num_seats)
     hero_street_commit = float(street_commit[hero]) if hero < len(street_commit) else 0.0
     to_call = max(btc - hero_street_commit, 0.0)
     if to_call > 0.0:
@@ -433,7 +480,9 @@ def encode_observation_nlh(
         visible_count[c // 4, c % 4] = 1
     for c in board_list:
         visible_count[c // 4, c % 4] = 1
-    out[_SF_OFF:_SF_OFF + 38] = _sf_features_nlh(hole_list, board_list, visible_count)
+    out[_SF_OFF:_SF_OFF + 38] = _sf_features_nlh(
+        hole_list, board_list, visible_count, rev
+    )
 
     for k in range(num_seats):
         out[_SEAT_EXISTS_OFF + k] = 1.0
@@ -528,11 +577,15 @@ def _draw_flags_nlh_batch(
 
 
 def _sf_features_nlh_batch(
-    hole: np.ndarray, board: np.ndarray, visible_count: np.ndarray
+    hole: np.ndarray,
+    board: np.ndarray,
+    visible_count: np.ndarray,
+    rev: int | None = None,
 ) -> np.ndarray:
     """Vectorized `_sf_features_nlh`. Returns (N, 38) float32 with the same
     sub-layout. `visible_count` is (N, 13, 4) int with 1 iff card (r, s) is
-    in env n's hole or board."""
+    in env n's hole or board. `rev`: see `_sf_features_nlh`."""
+    legacy = (OBS_SEMANTICS_REV if rev is None else rev) == OBS_REV_LEGACY
     n = hole.shape[0]
     out = np.zeros((n, 38), dtype=np.float32)
     hole_valid = hole < 52
@@ -606,15 +659,21 @@ def _sf_features_nlh_batch(
     made_mask = total_suit >= 5  # at most one suit per env (7 cards total)
     any_made_flush = made_mask.any(axis=1)
     made_suit = np.argmax(made_mask, axis=1)  # (N,)
-    hole_in_made = (
-        hole_suit_counts[arange_n, made_suit] >= 1
-    )
-    h1_hole = hole_max_per_suit[arange_n, made_suit]
-    # Board flush ("playing the board"): h1 = lowest board rank of the suit
-    # (board_suit_count is 5 exactly — the board is the flush).
+    h1_hole = hole_max_per_suit[arange_n, made_suit]  # -1 = none of the suit
     B_made = B_rs[arange_n, :, made_suit]  # (N, 13)
-    h1_board = np.argmax(B_made, axis=1).astype(np.int64)
-    h1_made = np.where(hole_in_made, h1_hole, h1_board)
+    h1_board = np.argmax(B_made, axis=1).astype(np.int64)  # lowest board rank
+    if legacy:
+        # Rev 1 (pre review B7): the board's lowest rank only when hero
+        # holds none of the suit ("playing the board").
+        hole_in_made = hole_suit_counts[arange_n, made_suit] >= 1
+        h1_made = np.where(hole_in_made, h1_hole, h1_board)
+    else:
+        # Five-flush board: everyone plays at least the board, so h1 is
+        # floored at the LOWEST board rank of the suit (cards below it only
+        # tie). PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 B7, dim 906) —
+        # twin of the scalar `_sf_features_nlh`.
+        board_five = board_suit_counts[arange_n, made_suit] == 5
+        h1_made = np.where(board_five, np.maximum(h1_hole, h1_board), h1_hole)
     above_made = ranks_arr[None, :] > h1_made[:, None]
     unseen_made = unseen_rs[arange_n, :, made_suit]  # (N, 13)
     fnd = (above_made & unseen_made).sum(axis=1)
@@ -743,12 +802,36 @@ def encode_observation_batch_nlh(
     # Scalars.
     pot = obs_arrays["pot"].astype(np.float64)
     bet_to_call = obs_arrays["bet_to_call"].astype(np.float64)
-    min_bet = obs_arrays["min_bet"].astype(np.float64)
-    max_bet = obs_arrays["max_bet"].astype(np.float64)
     out[live_mask, _SCALARS_OFF + 0] = pot[live_mask] * inv_bb
     out[live_mask, _SCALARS_OFF + 1] = bet_to_call[live_mask] * inv_bb
-    out[live_mask, _SCALARS_OFF + 2] = min_bet[live_mask] * inv_bb
-    out[live_mask, _SCALARS_OFF + 3] = max_bet[live_mask] * inv_bb
+    street_commit = obs_arrays["street_commit"]
+    hero_street_commit = np.take_along_axis(
+        street_commit, hero_idx[:, None], axis=1
+    )[:, 0].astype(np.float64)
+    rev = OBS_SEMANTICS_REV
+    if rev == OBS_REV_LEGACY:
+        # Rev 1: min_bet_total()/max_bet_total() verbatim.
+        min_bet = obs_arrays["min_bet"].astype(np.float64)
+        max_bet = obs_arrays["max_bet"].astype(np.float64)
+        out[live_mask, _SCALARS_OFF + 2] = min_bet[live_mask] * inv_bb
+        out[live_mask, _SCALARS_OFF + 3] = max_bet[live_mask] * inv_bb
+    else:
+        # PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 B3, dims 134/135):
+        # LEGAL raise window as street totals, 0/0 when Raise is illegal —
+        # twin of the scalar encoder.
+        window = _legal_raise_window_batch(
+            obs_arrays["min_raise"],
+            obs_arrays["max_raise"],
+            np.take_along_axis(obs_arrays["stacks"], hero_idx[:, None], axis=1)[:, 0],
+            int(config.bb),
+        )
+        wl_raise = live_mask & window.legal
+        out[wl_raise, _SCALARS_OFF + 2] = (
+            (hero_street_commit + window.min_d) * inv_bb
+        )[wl_raise]
+        out[wl_raise, _SCALARS_OFF + 3] = (
+            (hero_street_commit + window.max_d) * inv_bb
+        )[wl_raise]
 
     out[live_mask, _REL_POS_OFF] = 1.0
 
@@ -760,6 +843,16 @@ def encode_observation_batch_nlh(
     history_street = obs_arrays["history_street"].astype(np.int64)
     history_len = obs_arrays["history_len"].astype(np.int64)
     depth = history_seat.shape[1]
+    # The packer keeps the NEWEST `width` records oldest-first from slot 0, so
+    # a pack wider than the encoder's depth would write past the history block
+    # into the SPR dims, and a narrower one would silently show a shorter
+    # window than the net trained on — refuse either instead of trusting the
+    # array shape (review 2026-09-20).
+    if depth != _HISTORY_DEPTH:
+        raise ValueError(
+            f"NLH history pack width {depth} != encoder depth {_HISTORY_DEPTH} "
+            "(bindings.rs history_cap(NlhSingle) must equal _HISTORY_DEPTH)"
+        )
     slot_idx = np.arange(depth, dtype=np.int64)[None, :]
     valid_slots = (slot_idx < history_len[:, None]) & live_mask[:, None]
     if valid_slots.any():
@@ -809,10 +902,6 @@ def encode_observation_batch_nlh(
     out[live_mask, _SPR_OFF : _SPR_OFF + num_seats] = np.log1p(spr)[live_mask]
 
     # Pot odds + bet-faced (both only when facing chips).
-    street_commit = obs_arrays["street_commit"]
-    hero_street_commit = np.take_along_axis(
-        street_commit, hero_idx[:, None], axis=1
-    )[:, 0].astype(np.float64)
     to_call = np.maximum(bet_to_call - hero_street_commit, 0.0)
     facing = to_call > 0.0
     denom = pot + to_call
@@ -862,7 +951,7 @@ def encode_observation_batch_nlh(
                     (src[v, k] >> 2).astype(np.int64),
                     (src[v, k] & 3).astype(np.int64),
                 ] = 1
-    sf = _sf_features_nlh_batch(hole, board, visible_count)
+    sf = _sf_features_nlh_batch(hole, board, visible_count, rev)
     out[live_mask, _SF_OFF : _SF_OFF + 38] = sf[live_mask]
 
     # Seat-exists + commits (raw, /bb).

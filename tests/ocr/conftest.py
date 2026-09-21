@@ -1,8 +1,23 @@
 """Pytest fixtures for OCR tests.
 
-Skips the whole module if `opencv-python-headless` is not installed, and
-bootstraps rank-NCC templates from the labeled fixture frames once per
+Bootstraps rank-NCC templates from the labeled fixture frames once per
 session so the card classifier has something to match against.
+
+Import safety (review 2026-09-20 J2): this conftest MUST stay importable
+without OpenCV. It used to run `pytest.importorskip("cv2")` at module level;
+a `Skipped` raised while pytest imports a *conftest* is not a module skip, it
+is a collection error that aborts the WHOLE session -- so the documented
+`pytest tests/python/ tests/ocr/` ran zero tests on any machine without the
+`[ocr]` extras. The cv2 requirement now lives where it belongs:
+
+  * pixel-level test modules (`test_cards`, `test_extract`,
+    `test_hero_rotation`, `test_slot0_ten`) each carry their own
+    module-level `pytest.importorskip("cv2")` (a supported module skip);
+  * the one fixture here that needs OpenCV skips from inside the fixture.
+
+The pure-Python suites (`test_events*`, `test_pokernow_mapping`,
+`test_text_parser`, `test_rois`, ...) need neither cv2 nor pytesseract and
+always run. Do not reintroduce a top-level cv2 import here.
 """
 
 from __future__ import annotations
@@ -11,8 +26,6 @@ import json
 from pathlib import Path
 
 import pytest
-
-cv2 = pytest.importorskip("cv2")
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -54,6 +67,8 @@ def frame_resolver():
 @pytest.fixture(scope="session")
 def rank_templates_bootstrapped(labels) -> bool:
     """Build rank templates from labeled rows if they don't already exist."""
+    # `cards` / `label_cards` import OpenCV; skip only the requesting test.
+    pytest.importorskip("cv2")
     from plo5bp.ocr import cards as card_mod
     from plo5bp.ocr.tools import label_cards as labeler
 

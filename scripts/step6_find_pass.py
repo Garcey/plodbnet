@@ -1,5 +1,11 @@
 #!/usr/bin/env python
-"""Find HU river boards that can pass expl_bb <= 1.0. Does not change the cap."""
+"""Find HU river boards that can pass expl_bb <= 1.0. Does not change the cap.
+
+(review 2026-09-20 D8) Runs every candidate to its iteration cap with NO
+exploitability target: ``target == cap`` stopped at the first noisy 24-deal
+POLL dip under 1.0 bb and reported that as a pass. PASS now needs a number
+from a FINAL estimator (``expl_provenance(...).verified``) under the cap.
+"""
 
 from __future__ import annotations
 
@@ -12,7 +18,7 @@ if str(_ROOT / "python") not in sys.path:
     sys.path.insert(0, str(_ROOT / "python"))
 
 from plo5bp.gto.cfr_api import RootSpec, SolveConfig, apply_teacher_iso_policy, solve
-from plo5bp.gto.teacher import TEACHER_MAX_EXPL_BB
+from plo5bp.gto.teacher import TEACHER_MAX_EXPL_BB, expl_provenance, expl_reject_reason
 
 CANDIDATES = [
     ("99TTT", [30, 31, 32, 33, 34]),
@@ -39,7 +45,7 @@ def main() -> None:
         cfg = SolveConfig.teacher(
             max_iterations=10000,
             seed=3,
-            target_exploitability_bb=TEACHER_MAX_EXPL_BB,
+            target_exploitability_bb=0.0,  # no early stop on the poll estimate
             thread_num=4,
             poll_every=500,
             card_abstraction="none",
@@ -48,12 +54,14 @@ def main() -> None:
         print(f"[step6] TRY {name} {board}", flush=True)
         t0 = time.time()
         rep = solve(root, cfg)
-        hit = (
-            rep.exploitability_bb is not None
-            and rep.exploitability_bb <= TEACHER_MAX_EXPL_BB
+        prov = expl_provenance(rep)
+        hit = prov.verified and (
+            expl_reject_reason(rep.exploitability_bb, max_expl_bb=TEACHER_MAX_EXPL_BB)
+            is None
         )
         print(
             f"[step6] TRY {name} expl_bb={rep.exploitability_bb} "
+            f"kind={prov.kind} verified={prov.verified} "
             f"iters={rep.iterations_run} wall_s={time.time()-t0:.1f} "
             f"PASS={hit}",
             flush=True,

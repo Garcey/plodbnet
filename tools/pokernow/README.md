@@ -43,6 +43,33 @@ bypasses those restrictions, which is why the script declares `@connect`.
 If the server runs on a non-default port, edit `INGEST_URL` at the top of the
 userscript.
 
+**Updating:** Tampermonkey does not auto-update a pasted script. After pulling a
+new `pokernow.user.js` (check `@version` — currently **1.2.0**), paste it over
+the old one.
+
+## Delivery guarantees (v1.2.0)
+
+The server rebuilds each hand from the *ordered* stream of distinct frames, so
+the collector treats a frame as something that may be late but must not vanish:
+
+- **Transport failure** (server offline, 4 s timeout, abort): the frame goes back
+  on the *front* of the queue and is retried every second; frames queued behind
+  it keep their order. The badge shows `server offline (qN)`. (≤ 1.1.0 dropped
+  the frame and stopped sending until the next table change.)
+- **HTTP error status** (400 malformed, 409 ClubGG OCR active, 5xx): the server
+  saw and rejected that frame, so it is dropped and the queue keeps draining.
+- **Heartbeat** (every 2 s while idle): sends a snapshot taken *now*, never a
+  remembered one. If PokerNow replaced the table element, the observer is
+  re-attached and the missed state is sent as a real frame; with no table on
+  screen nothing is sent and the UI's "connected" status lapses.
+- **All-in** is reported only when the DOM says so (the stack label reads
+  "All In", or the seat carries an all-in class). A seat whose stack number is
+  merely missing is sent as `stackDollars: null, allIn: false` — unknown, not
+  all-in. `stackText` carries the raw label for debugging.
+
+`tests/ocr/test_pokernow_userscript.py` runs the real script under node against
+a fake DOM and covers all of the above (skipped when node is not installed).
+
 ## Keep both windows visible
 
 Chrome heavily throttles timers in **background** tabs. For the live table to

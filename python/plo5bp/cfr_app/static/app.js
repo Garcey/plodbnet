@@ -31,8 +31,9 @@
     liveViewSeq: 0,
     loadedPath: null,
     rangeWhich: "oop",
-    rangeOop: new Set(),
-    rangeIp: new Set(),
+    rangeInfo: { oop: null, ip: null }, // last /api/range/parse reply per side
+    rangeSeq: { oop: 0, ip: 0 },
+    rangeTimers: { oop: null, ip: null },
     libItems: [],
   };
 
@@ -47,10 +48,17 @@
     el._t = setTimeout(() => el.classList.add("hidden"), 3800);
   }
 
+  // (review 2026-09-20 local API) The server only accepts state-changing requests
+  // that are JSON or carry the per-launch token (injected into index.html, which
+  // a cross-origin page cannot read) — so a random web page can't drive the app.
+  function authHeaders() {
+    return window.CFR_TOKEN ? { "X-CFR-Token": window.CFR_TOKEN } : {};
+  }
+
   async function api(path, opts = {}) {
     const res = await fetch(path, {
-      headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
       ...opts,
+      headers: { "Content-Type": "application/json", ...authHeaders(), ...(opts.headers || {}) },
     });
     let body = null;
     const ct = res.headers.get("content-type") || "";
@@ -108,6 +116,10 @@
 
   function renderBoardSlots() {
     ensureBoardLen();
+    // Board cards block combos, so what a range text means depends on the board
+    // (incl. "no board" preflop). Debounced: a burst of clicks = one request.
+    scheduleRangeRefresh("oop");
+    scheduleRangeRefresh("ip");
     const wrap = $("#board-slots");
     wrap.innerHTML = "";
     const n = boardNeed();
@@ -201,45 +213,102 @@
       $("#f-algo").value = "dcfr";
       $("#f-abs").value = "none";
     }
+    updateStackMin();
     renderBoardSlots();
   }
 
+  // (review 2026-09-20 E1) A PREFLOP stack that does not cover the big blind +
+  // ante crashed the native solver, and the spinner (min 0.5) walked straight
+  // into it. The server enforces the exact rule (validate_root_for_app); this
+  // just keeps the spinner out of the rejected zone. Postflop keeps 0.5 — a 1bb
+  // river stack is a legitimate root.
+  function updateStackMin() {
+    const stack = $("#f-stack");
+    if (!stack) return;
+    const street = parseInt($("#f-street").value, 10);
+    const bb = parseFloat($("#f-bb").value) || 0;
+    const ante = parseFloat($("#f-ante").value) || 0;
+    if (street === 0 && bb > 0) {
+      const need = (bb + ante) / bb; // must be strictly exceeded
+      stack.min = String(Math.floor(need * 2) / 2 + 0.5);
+    } else {
+      stack.min = "0.5";
+    }
+  }
+
   // ---------- range 13×13 ----------
-  function parseRangeText(text) {
-    const set = new Set();
-    const raw = (text || "").trim();
-    if (!raw || raw.toLowerCase() === "random") return set;
-    raw.split(/[,\s]+/).filter(Boolean).forEach((tok) => {
-      const t = tok.trim();
-      if (t) set.add(t);
-    });
-    return set;
+  // (review 2026-09-20 E11) The grid has NO range grammar of its own. It used to
+  // light a cell only when the cell's label was literally a token in the box, so
+  // "QQ+" / "KK-TT" / "AA:0.5" selected nothing here while the solver did
+  // something else again. The server's strict parser (cfr_app/ranges.py — the
+  // same one /api/validate_root and /api/solve use) now says what the text
+  // means; the text box stays the single source of truth.
+  function rangeBox(which) {
+    return $(which === "ip" ? "#f-range-ip" : "#f-range-oop");
   }
 
-  function rangeSetToText(set) {
-    return [...set].join(",");
+  function boardForRanges() {
+    return state.board.filter((c) => c != null).map(Number);
   }
 
-  function activeRangeSet() {
-    return state.rangeWhich === "ip" ? state.rangeIp : state.rangeOop;
+  async function refreshRangeInfo(which, toggle) {
+    const box = rangeBox(which);
+    if (!box) return;
+    state.rangeSeq[which] = (state.rangeSeq[which] || 0) + 1;
+    const seq = state.rangeSeq[which];
+    let info;
+    try {
+      info = await api("/api/range/parse", {
+        method: "POST",
+        body: JSON.stringify({ text: box.value, board: boardForRanges(), toggle: toggle || null }),
+      });
+    } catch (e) {
+      info = { ok: false, error: String(e.message || e) };
+    }
+    if (seq !== state.rangeSeq[which]) return; // a newer edit superseded this reply
+    if (info.ok && toggle) box.value = info.normalized || "";
+    state.rangeInfo[which] = info;
+    renderRangeGrid();
   }
 
-  function syncRangeTextareas() {
-    $("#f-range-oop").value = rangeSetToText(state.rangeOop);
-    $("#f-range-ip").value = rangeSetToText(state.rangeIp);
+  function refreshAllRanges() {
+    refreshRangeInfo("oop");
+    refreshRangeInfo("ip");
+  }
+
+  function scheduleRangeRefresh(which) {
+    clearTimeout(state.rangeTimers[which]);
+    state.rangeTimers[which] = setTimeout(() => refreshRangeInfo(which), 250);
   }
 
   function syncRangeFromTextareas() {
-    state.rangeOop = parseRangeText($("#f-range-oop").value);
-    state.rangeIp = parseRangeText($("#f-range-ip").value);
-    renderRangeGrid();
+    refreshAllRanges();
+  }
+
+  function renderRangeStatus() {
+    const el = $("#range-status");
+    if (!el) return;
+    const bits = ["oop", "ip"].map((which) => {
+      const info = state.rangeInfo[which];
+      const name = which.toUpperCase();
+      if (!info) return `${name}: …`;
+      if (!info.ok) return `${name}: ${info.error}`;
+      if (info.full) return `${name}: 100% (${info.combos} combos)`;
+      return `${name}: ${info.combos} combos · weight ${info.weight} · ${info.pct}%`;
+    });
+    el.textContent = bits.join("   |   ");
+    const bad = ["oop", "ip"].some((w) => state.rangeInfo[w] && !state.rangeInfo[w].ok);
+    el.classList.toggle("range-error", bad);
   }
 
   function renderRangeGrid() {
     const wrap = $("#range-grid");
     if (!wrap) return;
     wrap.innerHTML = "";
-    const set = activeRangeSet();
+    renderRangeStatus();
+    const info = state.rangeInfo[state.rangeWhich];
+    const classes = (info && info.ok && info.classes) || {};
+    const full = !!(info && info.ok && info.full);
     // A high at top-left. Suited above diagonal, pairs on diag, offsuit below.
     for (let ri = 0; ri < 13; ri++) {
       for (let ci = 0; ci < 13; ci++) {
@@ -253,16 +322,14 @@
               : RANKS[rLo] + RANKS[rHi] + "o";
         const btn = document.createElement("button");
         btn.type = "button";
-        btn.className = "rg-cell" + (set.has(label) ? " on" : "");
+        // Mean weight of the class's live combos: 1 = all in, 0.25 = e.g. one of
+        // four suited combos, or the whole class at weight 0.25.
+        const w = full ? 1 : floatOr(classes[label], 0);
+        btn.className = "rg-cell" + (w > 0 ? " on" : "");
+        if (w > 0 && w < 1) btn.style.opacity = String(0.35 + 0.65 * w);
         btn.textContent = label;
-        btn.title = label;
-        btn.addEventListener("click", () => {
-          const s = activeRangeSet();
-          if (s.has(label)) s.delete(label);
-          else s.add(label);
-          syncRangeTextareas();
-          renderRangeGrid();
-        });
+        btn.title = w > 0 && w < 1 ? `${label} · ${Math.round(w * 100)}%` : label;
+        btn.addEventListener("click", () => refreshRangeInfo(state.rangeWhich, label));
         wrap.appendChild(btn);
       }
     }
@@ -293,19 +360,33 @@
     if (p.bb_chips != null) $("#f-bb").value = String(p.bb_chips);
     if (p.sb_chips != null) $("#f-sb").value = String(p.sb_chips);
     $("#f-stacks").value = p.stacks_bb && p.stacks_bb.length ? p.stacks_bb.join(",") : "";
+    updateStackMin(); // street / bb / ante were set programmatically (no change event)
     state.board = (p.board || []).slice();
     renderBoardSlots();
     $$(".preset-btn").forEach((b) => b.classList.toggle("active", b.dataset.id === p.id));
   }
 
-  function parseSizes() {
-    const preset = $("#f-size-preset").value;
-    if (preset !== "custom" && state.meta && state.meta.size_presets[preset]) {
-      return state.meta.size_presets[preset].slice();
-    }
+  function sizesFromBox() {
     const raw = $("#f-sizes").value.trim();
     if (!raw) return [];
-    return raw.split(/[,\s]+/).filter(Boolean).map((x) => parseInt(x, 10));
+    return raw
+      .split(/[,\s]+/)
+      .filter(Boolean)
+      .map((x) => parseInt(x, 10))
+      .filter((x) => Number.isFinite(x) && x > 0);
+  }
+
+  // (review 2026-09-20) The "Raise sizes" box is what the user sees, so it is
+  // what gets solved. The old code returned the PRESET's list whenever a named
+  // preset was selected and silently ignored an edited box. Editing the box
+  // now flips the preset to "custom" (see boot), and as a backstop a box that
+  // no longer matches its preset wins here too.
+  function parseSizes() {
+    const preset = $("#f-size-preset").value;
+    const box = sizesFromBox();
+    const named = preset !== "custom" && state.meta && state.meta.size_presets[preset];
+    if (named && named.join(",") === box.join(",")) return named.slice();
+    return box;
   }
 
   function collectRoot() {
@@ -358,7 +439,10 @@
       line += `■ ${node.label} [${node.terminal_kind}] pot=${node.pot_bb}\n`;
       return line;
     }
-    line += `● p${node.seat} pot=${node.pot_bb} stack=${node.stack_bb} to_call=${node.to_call_bb}\n`;
+    // Seat index + position in the SOLVER's seat order (HU preflop: P1 = SB acts
+    // first, P0 = BB) so the preview reads like the solved strategy.
+    const who = `P${node.seat}` + (node.seat_label ? ` ${node.seat_label}` : "");
+    line += `● ${who} pot=${node.pot_bb} stack=${node.stack_bb} to_call=${node.to_call_bb}\n`;
     line += pad + `  menu: ${(node.actions || []).join(" | ")}\n`;
     (node.children || []).forEach((ch) => {
       line += formatTreeText(ch, indent + 1);
@@ -429,7 +513,11 @@
       if (btnPause) btnPause.disabled = true;
       if (btnResume) btnResume.disabled = true;
       $("#st-status").textContent = "stopping";
-      toast("Stop requested — finishing current tick…", "ok");
+      // (review 2026-09-20 E10) The solver only sees the stop file BETWEEN
+      // iterations, and one iteration of a deep tree can run for minutes. The
+      // solve now runs in a child process that the server kills if it has not
+      // stopped within ~10 s — say so, instead of implying an instant stop.
+      toast("Stop requested — saving at the next iteration; force-stopped after ~10 s if stuck", "ok");
     } catch (e) {
       toast(String(e.message || e), "error");
     }
@@ -492,6 +580,19 @@
   }
 
   async function pollJobs() {
+    // (review 2026-09-20 E4) setInterval fires every 800 ms whether or not the
+    // previous round-trip finished; slow responses used to stack up without
+    // bound. One poll in flight at a time — a busy tick is simply skipped.
+    if (state.pollBusy) return;
+    state.pollBusy = true;
+    try {
+      await pollJobsOnce();
+    } finally {
+      state.pollBusy = false;
+    }
+  }
+
+  async function pollJobsOnce() {
     try {
       const data = await api("/api/jobs");
       const active = data.active;
@@ -652,12 +753,27 @@
       if (!state.currentJobId || !state.liveView) return;
       if (!state.viewSource || state.viewSource.type !== "job") return;
       if (seq !== state.liveViewSeq) return;
+      // (review 2026-09-20 E4) /view is the expensive poll (the server parses the
+      // whole live snapshot). Never stack requests, and don't fetch what nobody
+      // can see: skip while another tick is in flight, while the Strategy tab is
+      // not the active panel, or while the window is hidden. Ticks resume on
+      // their own when the viewer is visible again; a finished job stops the
+      // timer (loadJobView / pollJobs call stopLiveView on a terminal status).
+      if (state.liveViewBusy || !viewerVisible()) return;
+      state.liveViewBusy = true;
       try {
         await loadJobView(state.currentJobId, { quiet: true, keepSelection: true, seq });
       } catch (_) {
         /* 409 until first snapshot */
+      } finally {
+        state.liveViewBusy = false;
       }
     }, 1500);
+  }
+
+  function viewerVisible() {
+    const panel = $("#panel-viewer");
+    return !document.hidden && !!panel && panel.classList.contains("active");
   }
 
   function stopLiveView() {
@@ -670,20 +786,93 @@
   }
 
   // ---------- strategy view ----------
-  async function loadJobView(jobId, opts = {}) {
-    state.viewSource = { type: "job", id: jobId };
-    if (!opts.keepSelection && !opts.quiet) {
-      state.pageOffset = 0;
-      state.selectedNodePath = null;
-      state.selectedSeat = null;
-    }
+  // (review 2026-09-20 JS races) Every view fetch takes a ticket. A response is
+  // rendered only if its ticket is still the newest — otherwise a slow reply
+  // for an OLD node/filter/page could land after a newer one and overwrite it.
+  function nextViewTicket() {
+    state.viewReqSeq = (state.viewReqSeq || 0) + 1;
+    return state.viewReqSeq;
+  }
+
+  function isStaleView(ticket) {
+    return ticket !== state.viewReqSeq;
+  }
+
+  // One param builder for every view request, so a live tick carries the same
+  // seat / hand filter as "Apply" (live ticks used to drop the hand filter and
+  // wipe a filtered table every 1.5 s).
+  function buildViewParams() {
     const params = new URLSearchParams({
       limit: String(state.pageLimit),
       offset: String(state.pageOffset),
     });
+    const seatSel = $("#v-seat");
+    const seat =
+      seatSel && seatSel.value !== ""
+        ? seatSel.value
+        : state.selectedSeat != null
+          ? String(state.selectedSeat)
+          : "";
+    if (seat !== "") params.set("seat", seat);
+    const handEl = $("#v-hand");
+    const hand = handEl ? handEl.value.trim() : "";
+    if (hand) params.set("hand_query", hand);
+    // (review 2026-09-20 E6) explicit runout pick; absent = server default
+    // (the most-visited runout for the selected node).
+    if (state.selectedRunout) params.set("runout", state.selectedRunout);
+    return params;
+  }
+
+  // Runout picker: only shown when the selected node exists on several boards.
+  function renderRunoutPicker(info) {
+    const wrap = $("#runout-wrap");
+    const sel = $("#v-runout");
+    if (!wrap || !sel) return;
+    const opts = (info && info.options) || [];
+    if (opts.length < 2) {
+      wrap.classList.add("hidden");
+      sel.innerHTML = "";
+      return;
+    }
+    wrap.classList.remove("hidden");
+    sel.innerHTML = "";
+    opts.forEach((o) => {
+      const el = document.createElement("option");
+      el.value = o.key;
+      el.textContent = `${o.label} · ${o.num_hands} hands`;
+      sel.appendChild(el);
+    });
+    sel.value = info.selected || opts[0].key;
+    const shown = opts.length;
+    wrap.title =
+      info.total > shown
+        ? `Showing the ${shown} most-visited of ${info.total} runouts`
+        : `${shown} runouts, most visited first`;
+  }
+
+  // A newly opened solution starts unfiltered: selection AND the seat / hand
+  // filter controls (buildViewParams reads them) are reset together.
+  function resetViewSelection() {
+    state.pageOffset = 0;
+    state.selectedNodePath = null;
+    state.selectedSeat = null;
+    state.selectedHandMix = null;
+    state.selectedClassId = null;
+    state.selectedRunout = null;
+    const seatSel = $("#v-seat");
+    if (seatSel) seatSel.value = "";
+    const handEl = $("#v-hand");
+    if (handEl) handEl.value = "";
+  }
+
+  async function loadJobView(jobId, opts = {}) {
+    state.viewSource = { type: "job", id: jobId };
+    if (!opts.keepSelection && !opts.quiet) resetViewSelection();
+    const params = buildViewParams();
     if (state.selectedNodePath != null) params.set("path", state.selectedNodePath);
-    if (state.selectedSeat != null) params.set("seat", String(state.selectedSeat));
+    const ticket = nextViewTicket();
     const data = await api(`/api/jobs/${jobId}/view?` + params.toString());
+    if (isStaleView(ticket)) return data;
     if (opts.seq != null && opts.seq !== state.liveViewSeq) return data;
     state.viewData = data;
     renderView(data, {
@@ -717,14 +906,12 @@
 
   async function loadFileView(path) {
     state.viewSource = { type: "file", path };
-    state.pageOffset = 0;
-    state.selectedNodePath = null;
-    const q = new URLSearchParams({
-      path,
-      limit: String(state.pageLimit),
-      offset: "0",
-    });
+    resetViewSelection();
+    const q = buildViewParams();
+    q.set("path", path);
+    const ticket = nextViewTicket();
     const data = await api("/api/view?" + q.toString());
+    if (isStaleView(ticket)) return;
     state.viewData = data;
     renderView(data);
     toast("Loaded " + path.split(/[/\\]/).pop(), "ok");
@@ -732,28 +919,25 @@
 
   async function refreshViewPage() {
     if (!state.viewSource) return;
-    const seat = $("#v-seat").value;
-    const hand = $("#v-hand").value.trim();
-    const params = new URLSearchParams({
-      limit: String(state.pageLimit),
-      offset: String(state.pageOffset),
-    });
-    if (seat !== "") params.set("seat", seat);
-    if (hand) params.set("hand_query", hand);
-    if (state.selectedNodePath != null) params.set("path", state.selectedNodePath);
+    const params = buildViewParams();
+    const source = state.viewSource;
+    const ticket = nextViewTicket();
     try {
       let data;
-      if (state.viewSource.type === "job") {
-        data = await api(`/api/jobs/${state.viewSource.id}/view?` + params.toString());
+      if (source.type === "job") {
+        if (state.selectedNodePath != null) params.set("path", state.selectedNodePath);
+        data = await api(`/api/jobs/${source.id}/view?` + params.toString());
       } else {
-        params.set("path", state.viewSource.path);
+        params.set("path", source.path);
         if (state.selectedNodePath != null) params.set("path_filter", state.selectedNodePath);
         data = await api("/api/view?" + params.toString());
       }
+      // A newer click / filter / page / live tick superseded this request.
+      if (isStaleView(ticket)) return;
       state.viewData = data;
       renderView(data, { keepDetail: true });
     } catch (e) {
-      toast(String(e.message || e), "error");
+      if (!isStaleView(ticket)) toast(String(e.message || e), "error");
     }
   }
 
@@ -761,13 +945,23 @@
     const p = String(path || "root");
     if (p === "root" || p === "open" || p === "") return "Open";
     if (/^\d{8,}$/.test(p)) return "Line " + p.slice(-4);
+    // (review 2026-09-20) Tokenize first, then shorten each token (mirrors
+    // humanize_path / action_short in strategy_view.py). Replacing "_" before
+    // CHECK_CALL / RAISE_500 turned them into "CHECK → CALL" / "RAISE → 500".
     return p
-      .replace(/_/g, " → ")
-      .replace(/,/g, " → ")
-      .replace(/RAISE_/g, "R")
-      .replace(/CHECK_CALL/g, "X/C")
-      .replace(/FOLD/g, "F")
-      .replace(/ALLIN/g, "AI");
+      .split(",")
+      .map((tok) => tok.trim())
+      .filter(Boolean)
+      .map((tok) => {
+        const up = tok.toUpperCase();
+        if (up === "FOLD") return "F";
+        if (up === "CHECK_CALL") return "X/C";
+        if (up === "ALLIN") return "AI";
+        const m = /^RAISE_(\d+)$/.exec(up);
+        if (m) return "R" + parseInt(m[1], 10) / 10 + "%";
+        return tok.replace(/_/g, " → "); // legacy "AI_F"-style separators
+      })
+      .join(" → ");
   }
 
   function renderView(data, opts = {}) {
@@ -818,6 +1012,7 @@
     renderQuality(sum.quality);
     state.lineNav = data.line_nav || null;
     state.chartPack = data.chart_pack || null;
+    renderRunoutPicker(data.runout);
     renderLineNav(data);
     renderLineTree(data.solution_tree);
     state.loadedPath = sum.source || (state.viewSource && state.viewSource.path) || null;
@@ -903,13 +1098,12 @@
 
   function tokenPretty(tok) {
     const t = String(tok || "");
-    if (t === "F") return "Fold";
-    if (t === "AI") return "All-in";
-    if (t === "XC" || t === "X" || t === "C") return "Check/Call";
-    if (t.startsWith("R") && t.length > 1) {
-      const pm = parseInt(t.slice(1), 10);
-      if (Number.isFinite(pm)) return `Bet ${pm / 10}%`;
-    }
+    // Chart packs use short tokens; native dumps use the solver's full labels.
+    if (t === "F" || t === "FOLD") return "Fold";
+    if (t === "AI" || t === "ALLIN") return "All-in";
+    if (t === "XC" || t === "X" || t === "C" || t === "CHECK_CALL") return "Check/Call";
+    const m = /^(?:RAISE_|R)(\d+)$/.exec(t);
+    if (m) return `Bet ${parseInt(m[1], 10) / 10}%`;
     return prettyPath(t);
   }
 
@@ -939,6 +1133,7 @@
     state.selectedSeat = n.seat;
     state.selectedHandMix = null;
     state.selectedClassId = null;
+    state.selectedRunout = null; // a runout belongs to one node; new node → its default
     const seatSel = $("#v-seat");
     if (seatSel) seatSel.value = String(n.seat);
     state.pageOffset = 0;
@@ -972,7 +1167,12 @@
     if (actorEl) {
       const hands = entry ? entry.num_hands : nodes.find((n) => normalizeLinePath(n.path) === path);
       const nHands = entry ? entry.num_hands : hands && hands.num_hands;
-      actorEl.textContent = `${actorLabel(entry, path)} to act${nHands ? " · " + nHands + " hands" : ""}`;
+      // (review 2026-09-20 E6) name the dealt card(s) this node is shown for.
+      const dealt = data && data.runout && data.runout.label;
+      actorEl.textContent =
+        `${actorLabel(entry, path)} to act` +
+        (nHands ? " · " + nHands + " hands" : "") +
+        (dealt ? " · dealt " + dealt : "");
       actorEl.classList.remove("muted");
     }
 
@@ -1092,6 +1292,7 @@
     }
     state.selectedNodePath = key;
     state.selectedHandMix = null;
+    state.selectedRunout = null;
     state.pageOffset = 0;
     refreshViewPage();
   }
@@ -1132,6 +1333,7 @@
       state.selectedNodePath = act.next_path;
       if (act.next_seat != null) state.selectedSeat = act.next_seat;
       state.selectedHandMix = null;
+      state.selectedRunout = null;
       state.pageOffset = 0;
       refreshViewPage();
       return;
@@ -1313,9 +1515,13 @@
       `<div class="strat-bars">` +
       strategy
         .map((s) => {
-          const w = Math.max(0, Math.round((s.prob || 0) * 100));
+          const w = Math.max(0, Math.round(floatOr(s.prob, 0) * 100));
           if (w <= 0) return "";
-          return `<div class="seg ${s.css || "act-other"}" style="width:${w}%" title="${s.short}: ${s.pct}%"></div>`;
+          // (review 2026-09-20 XSS) `short` is the raw action label for anything
+          // the server doesn't recognise, i.e. attacker-controlled text from an
+          // uploaded / loaded JSON — it was the one unescaped innerHTML sink.
+          const tip = `${escapeHtml(s.short || s.action || "")}: ${floatOr(s.pct, w)}%`;
+          return `<div class="seg ${escapeHtml(s.css || "act-other")}" style="width:${w}%" title="${tip}"></div>`;
         })
         .join("") +
       `</div>`
@@ -1359,7 +1565,8 @@
     fd.append("file", file, file.name);
     try {
       toast("Uploading " + file.name + "…");
-      const res = await fetch("/api/upload", { method: "POST", body: fd });
+      // multipart cannot be application/json → the token is what authorizes it
+      const res = await fetch("/api/upload", { method: "POST", body: fd, headers: authHeaders() });
       let body = null;
       const ct = res.headers.get("content-type") || "";
       if (ct.includes("application/json")) body = await res.json();
@@ -1491,14 +1698,23 @@
         $("#f-sizes").value = state.meta.size_presets[p].join(",");
       }
     });
+    ["#f-bb", "#f-ante"].forEach((sel) => $(sel).addEventListener("input", updateStackMin));
+    // Typing in the sizes box means "custom" — make the UI say so (see parseSizes).
+    $("#f-sizes").addEventListener("input", () => {
+      $("#f-size-preset").value = "custom";
+    });
     $("#btn-validate").addEventListener("click", async () => {
       try {
         const r = await api("/api/validate_root", {
           method: "POST",
           body: JSON.stringify(collectRoot()),
         });
-        if (r.ok) toast("Root OK: " + (r.root.root_id || "valid"), "ok");
-        else toast(r.error || "invalid", "error");
+        if (r.ok) {
+          // Say what the range text MEANS, not just that it parsed (E11).
+          const rg = r.ranges || {};
+          const bit = (n, x) => (x ? ` · ${n} ${x.full ? "100%" : x.combos + " combos"}` : "");
+          toast("Root OK: " + (r.root.root_id || "valid") + bit("OOP", rg.oop) + bit("IP", rg.ip), "ok");
+        } else toast(r.error || "invalid", "error");
       } catch (e) {
         toast(String(e.message || e), "error");
       }
@@ -1535,6 +1751,16 @@
       state.pageOffset += state.pageLimit;
       refreshViewPage();
     });
+    const runoutSel = $("#v-runout");
+    if (runoutSel) {
+      runoutSel.addEventListener("change", () => {
+        state.selectedRunout = runoutSel.value || null;
+        state.selectedHandMix = null;
+        state.selectedClassId = null;
+        state.pageOffset = 0;
+        refreshViewPage();
+      });
+    }
     $("#btn-show-matrix").addEventListener("click", () => setViewMode("matrix"));
     $("#btn-show-table").addEventListener("click", () => setViewMode("table"));
     $("#btn-refresh-lib").addEventListener("click", loadLibrary);
@@ -1553,8 +1779,11 @@
       $("#f-range-ip").value = "";
       syncRangeFromTextareas();
     });
-    $("#f-range-oop").addEventListener("change", syncRangeFromTextareas);
-    $("#f-range-ip").addEventListener("change", syncRangeFromTextareas);
+    ["oop", "ip"].forEach((which) => {
+      const box = rangeBox(which);
+      box.addEventListener("input", () => scheduleRangeRefresh(which)); // live, debounced
+      box.addEventListener("change", () => refreshRangeInfo(which));
+    });
 
     $("#btn-export").addEventListener("click", async () => {
       if (!state.loadedPath || state.loadedPath === "<memory>") {
@@ -1628,6 +1857,30 @@
     } catch (e) {
       toast("Failed to load meta: " + e.message, "error");
       renderBoardSlots();
+    }
+    await reattachActiveJob();
+  }
+
+  // (review 2026-09-20 JS races) The solve lives in the server, not the page. A
+  // reload (F5, webview refresh) used to come back "idle" with Play enabled
+  // while a job was still running — no Stop button, and Play just 409'd.
+  async function reattachActiveJob() {
+    try {
+      const data = await api("/api/jobs");
+      const active = data && data.active;
+      if (!active) return;
+      state.currentJobId = active.job_id;
+      updateJobBadges(active);
+      setTransportButtons(active.status);
+      if (["running", "queued", "paused"].includes(active.status)) {
+        startPolling();
+      } else {
+        showJobStats(active);
+        const btnView = $("#btn-view-job");
+        if (btnView && !isKuhnJob(active) && active.num_infosets > 0) btnView.disabled = false;
+      }
+    } catch (_) {
+      /* server not ready — stay idle */
     }
   }
 

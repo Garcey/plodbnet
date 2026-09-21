@@ -162,7 +162,25 @@ def test_badge_bootstrap_not_gto(tmp_path: Path):
     assert "bootstrap" in badge["note"].lower() or "Curriculum" in badge["label"]
 
 
+def _teacher_provenance() -> dict:
+    """``label_provenance`` as derive_training_provenance writes it for
+    verified rust_cfr labels under the 1.0 bb cap."""
+    return {
+        "derived_from_records": True,
+        "sources": {"rust_cfr_river": 1000},
+        "n_rows": 1000,
+        "n_unverified_expl": 0,
+        "max_label_expl_bb": 0.8,
+        "teacher_max_expl_bb": 1.0,
+    }
+
+
 def test_badge_validated_rust_cfr_gto(tmp_path: Path):
+    """rust_cfr source + record-derived provenance (train AND holdout) + probe.
+
+    (review 2026-09-20 F6) The probe pass alone used to be enough; the
+    negative cases live in test_review_gto_provenance.py.
+    """
     m = build_policy_net(hidden_dim=64, num_layers=1)
     path = tmp_path / "validated.pt"
     save_policy_checkpoint(
@@ -171,6 +189,7 @@ def test_badge_validated_rust_cfr_gto(tmp_path: Path):
         meta={
             "source": "rust_cfr",
             "n_train": 1000,
+            "label_provenance": _teacher_provenance(),
             "probe": {
                 "passed": True,
                 "report": {
@@ -179,6 +198,7 @@ def test_badge_validated_rust_cfr_gto(tmp_path: Path):
                     "pure_agree": 0.95,
                     "mean_gate_kl": 0.1,
                     "mean_gate_acc": 0.9,
+                    "holdout_provenance": {**_teacher_provenance(), "problem": None},
                 },
                 "gates": {},
                 "reasons": [],

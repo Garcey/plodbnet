@@ -176,6 +176,12 @@ def _probe_inflated(model, button: int) -> tuple[float, float, float]:
 
     obs_corrected = obs.copy()
     obs_corrected[_SCALARS_OFF + 0] = real_pot_chips * inv_bb
+    # Slot 3 is the max legal bet TOTAL. At a flop open with stacks that cover
+    # the pot it equals the pot-limit cap (= pot), which is why it is rewritten
+    # with the pot here. NOTE (review 2026-09-20 B3): under obs-semantics rev 2
+    # the slot is `street_commit[hero] + max_raise` (capped by hero's own
+    # stack); this diagnostic only holds for the deep-stack open it was written
+    # for — run it with PLO5BP_OBS_REV=1 to reproduce the original experiment.
     obs_corrected[_SCALARS_OFF + 3] = real_pot_chips * inv_bb
 
     pot_safe_chips = max(real_pot_chips, 1)

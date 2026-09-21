@@ -3,6 +3,12 @@
 pytesseract is a heavy optional dep; we import it lazily so that import of
 `plo5bp.ocr` doesn't fail when OCR extras aren't installed (matters for tests
 that only exercise `types`/`rois`).
+
+OpenCV gets the same treatment (review 2026-09-20 I12): `cv2` is imported
+inside the pixel helpers that need it, never at module top, so the pure
+string parser (`_parse_chip_text`) and its tests run without the `[ocr]`
+extras. `import cv2` inside a function is a `sys.modules` dict hit after the
+first call -- negligible next to a Tesseract invocation.
 """
 
 from __future__ import annotations
@@ -11,10 +17,12 @@ import os
 import re
 import shutil
 
-import cv2
 import numpy as np
 
-_DIGIT_RE = re.compile(r"[0-9][0-9,.]*")
+# One amount token: a run of digits/separators holding at least one digit.
+# Leading separators are allowed so ``.50`` keeps its decimal point (the old
+# ``[0-9][0-9,.]*`` started matching at the ``5`` and read $50).
+_DIGIT_RE = re.compile(r"[0-9.,]*[0-9][0-9.,]*")
 
 _TESSERACT_PATH_CANDIDATES = (
     r"C:\Program Files\Tesseract-OCR\tesseract.exe",
@@ -52,6 +60,8 @@ def _preprocess_chip_crop(bgr: np.ndarray) -> np.ndarray:
     """Upscale, gray-out, threshold to prep a chip-amount ROI for tesseract."""
     if bgr.size == 0:
         return bgr
+    import cv2
+
     # Upscale 3x for small digits.
     scaled = cv2.resize(bgr, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
     gray = cv2.cvtColor(scaled, cv2.COLOR_BGR2GRAY)
@@ -75,24 +85,37 @@ def _parse_chip_text(raw: str) -> int | None:
     and the stack collapses to $1.09. Heuristic: when the post-decimal
     fragment has three or more digits, the ``.`` is a misread ``,`` —
     reinterpret the token as a comma-grouped integer dollar amount.
+
+    One rule covers every case (review 2026-09-20 I11): after dropping
+    TRAILING separators, the LAST separator is the decimal point iff
+    exactly 1-2 digits follow it; every other separator is grouping.
+
+    * Trailing ``.``/``,`` is Tesseract punctuation noise, not a decimal
+      point. The old multi-dot collapse kept the LAST dot, so
+      ``"450.5."`` became ``"4505."`` = $4505 and ``"70.05."`` = $7005 —
+      a silent 10-100x stack (the intermittent "decimal-drop").
+    * 3+ digits after the last separator = grouping (the ``1.090`` case
+      above), unchanged.
+    * ``,`` gets the same treatment as ``.``: a comma followed by 1-2
+      final digits cannot be a thousands separator, so ``"450,5"`` is
+      $450.50, not $4505.
+    * ``".50"`` is 50 cents, not $50.
+
+    Returns None when the text holds no digit at all; a genuine ``"0"``
+    stays 0 — callers rely on the None-vs-0 distinction.
     """
     match = _DIGIT_RE.search(raw.replace(" ", ""))
     if not match:
         return None
-    token = match.group(0).replace(",", "")
-    if token.count(".") > 1:
-        last = token.rfind(".")
-        token = token[:last].replace(".", "") + token[last:]
-    try:
-        if "." in token:
-            dollars, cents = token.split(".", 1)
-            if len(cents) >= 3:
-                return int((dollars + cents) or "0") * 100
-            cents = (cents + "00")[:2]
-            return int(dollars or "0") * 100 + int(cents)
-        return int(token) * 100
-    except ValueError:
-        return None
+    # The token holds a digit, so stripping trailing separators cannot
+    # empty it.
+    token = match.group(0).rstrip(".,")
+    last = max(token.rfind("."), token.rfind(","))
+    cents = ""
+    if last >= 0 and 1 <= len(token) - last - 1 <= 2:
+        token, cents = token[:last], token[last + 1 :]
+    dollars = token.replace(".", "").replace(",", "")
+    return int(dollars or "0") * 100 + int((cents + "00")[:2])
 
 
 def _ocr_chip_token(prep: np.ndarray) -> int | None:
@@ -126,6 +149,8 @@ def _cyan_text_bbox(bgr: np.ndarray, pad: int = 3) -> tuple[int, int, int, int] 
     """
     if bgr.size == 0 or bgr.ndim != 3:
         return None
+    import cv2
+
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, np.array([80, 60, 140]), np.array([110, 255, 255]))
     ys, xs = np.where(mask)
@@ -168,6 +193,8 @@ def _preprocess_seat_commit_crop(bgr: np.ndarray) -> np.ndarray:
     """
     if bgr.size == 0:
         return bgr
+    import cv2
+
     scaled = cv2.resize(bgr, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
     hsv = cv2.cvtColor(scaled, cv2.COLOR_BGR2HSV)
     neutral = hsv[:, :, 1] < 80
@@ -204,6 +231,8 @@ def _has_pot_chip_overlay(bgr: np.ndarray) -> bool:
     """
     if bgr.size == 0 or bgr.shape[0] < 10:
         return False
+    import cv2
+
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     top = hsv[: bgr.shape[0] // 5, :]
     white = (top[:, :, 1] < 50) & (top[:, :, 2] > 180)
@@ -225,6 +254,8 @@ def read_button_marker(bgr: np.ndarray) -> bool:
     """
     if bgr.size == 0:
         return False
+    import cv2
+
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     # Gold/amber hue range in OpenCV HSV (H=0..179).
     lower = np.array([15, 120, 120], dtype=np.uint8)

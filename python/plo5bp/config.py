@@ -19,6 +19,18 @@ VARIANT_NLH = "nlh_single"
 
 _VARIANTS = (VARIANT_PLO5, VARIANT_PLO4, VARIANT_PLO6, VARIANT_NLH)
 
+#: Hole cards per seat (mirrors Rust ``Variant::hole_count``).
+_HOLE_COUNT = {VARIANT_PLO4: 4, VARIANT_PLO5: 5, VARIANT_PLO6: 6, VARIANT_NLH: 2}
+#: Boards per hand (mirrors Rust ``Variant::num_boards``).
+_NUM_BOARDS = {VARIANT_PLO4: 2, VARIANT_PLO5: 2, VARIANT_PLO6: 2, VARIANT_NLH: 1}
+
+#: Table-size bounds every consumer is built for: the observation encoders
+#: lay out 8 seat slots (``encoding._MAX_SEATS``) and the engine needs two
+#: seats to play a hand.
+MIN_SEATS = 2
+MAX_SEATS = 8
+_DECK_SIZE = 52
+
 
 @dataclass(frozen=True)
 class GameConfig:
@@ -45,10 +57,42 @@ class GameConfig:
             raise ValueError(
                 f"unknown variant {self.variant!r} (expected one of {_VARIANTS})"
             )
-        if self.starting_stacks is not None and len(self.starting_stacks) != self.num_seats:
+        # Reject what the engine / encoders cannot represent HERE, as a
+        # ValueError (review 2026-09-20 B8/C4). These used to surface as
+        # Rust panics — pyo3's PanicException is a BaseException, so
+        # `except Exception` never saw them (1 seat; PLO5 at 9 / PLO6 at 8
+        # seats overrunning the deck) — or, worse, not at all: 9+ seats
+        # silently corrupted the observation (seat 8's active flag lands in
+        # the all-in block) and the critic only has 5 opponent slots.
+        if not MIN_SEATS <= self.num_seats <= MAX_SEATS:
             raise ValueError(
-                f"starting_stacks length {len(self.starting_stacks)} != num_seats {self.num_seats}"
+                f"num_seats must be in {MIN_SEATS}..{MAX_SEATS}, got {self.num_seats}"
             )
+        hole, boards = _HOLE_COUNT[self.variant], _NUM_BOARDS[self.variant]
+        cards_needed = self.num_seats * hole + 5 * boards
+        if cards_needed > _DECK_SIZE:
+            raise ValueError(
+                f"{self.variant} cannot deal {self.num_seats} seats from one deck: "
+                f"{self.num_seats} x {hole} hole + {5 * boards} board = {cards_needed} "
+                f"cards (max {(_DECK_SIZE - 5 * boards) // hole} seats)"
+            )
+        if self.bb <= 0:
+            raise ValueError(f"bb must be positive, got {self.bb}")
+        if self.ante < 0:
+            raise ValueError(f"ante must be >= 0, got {self.ante}")
+        if self.sb < 0:
+            raise ValueError(f"sb must be >= 0, got {self.sb}")
+        if self.starting_stacks is not None:
+            if len(self.starting_stacks) != self.num_seats:
+                raise ValueError(
+                    f"starting_stacks length {len(self.starting_stacks)} != num_seats {self.num_seats}"
+                )
+            if any(s < 0 for s in self.starting_stacks):
+                raise ValueError(
+                    f"starting_stacks must be >= 0, got {tuple(self.starting_stacks)}"
+                )
+        elif self.starting_stack < 0:
+            raise ValueError(f"starting_stack must be >= 0, got {self.starting_stack}")
 
     @classmethod
     def nlh_default(
@@ -74,12 +118,7 @@ class GameConfig:
     def hole_count(self) -> int:
         """Hole cards per seat for this variant (mirrors Rust
         ``Variant::hole_count``)."""
-        return {
-            VARIANT_PLO4: 4,
-            VARIANT_PLO5: 5,
-            VARIANT_PLO6: 6,
-            VARIANT_NLH: 2,
-        }[self.variant]
+        return _HOLE_COUNT[self.variant]
 
     @property
     def resolved_stacks(self) -> tuple[int, ...]:
@@ -261,8 +300,9 @@ class TrainingConfig:
     # needs re-tuning) and for the "critic-weight lift" A/B.
     value_loss_coef: float = 0.5
     # KL-to-EMA-reference regularizer. 0.0 = off (no EMA model built).
-    # The reference re-initializes to current weights on every (re)start
-    # — it is NOT persisted in checkpoints.
+    # The reference IS persisted: train.py saves it as ckpt["model_ema"] and
+    # restores it on warm-start; absent that key it re-initializes to the
+    # loaded weights and ramps in over ~1/(1-ema) updates.
     kl_anchor_coef: float = 0.0
     kl_anchor_ema: float = 0.999
 
@@ -303,5 +343,12 @@ class TrainingConfig:
     # they drove the update-52+ violence. Applied identically in the
     # serial and batched collectors.
     adv_clip: float = 8.0
+
+    # Drain in-flight hands at rollout end (review 2026-09-20 A6). When True the
+    # collectors stop re-dealing once the row target is reached and keep stepping
+    # until every live hand finishes, instead of discarding hands in flight (which
+    # under-samples long hands by ~len/W). PRODUCTION BEHAVIOR CHANGE vs the
+    # legacy truncation; `train.py --no-drain-inflight` restores it.
+    drain_inflight: bool = True
 
     device: str = "cpu"

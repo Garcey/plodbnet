@@ -104,6 +104,42 @@ impl DealRng for Lcg {
     }
 }
 
+/// External-sampling step at a **non-traverser** node: accumulate the ACTING
+/// player's average strategy with its current strategy, then sample one action.
+///
+/// (review 2026-09-20 D6) The average strategy must be weighted by the acting
+/// player's OWN reach. Under external sampling a non-traverser node is reached
+/// with probability `π_actor · π_chance` (the traverser's actions are all
+/// enumerated, so they contribute a t-independent multiplicity), so
+/// `strategy_sum += σ` here is the own-reach-weighted update (Lanctot et al.
+/// 2009, Alg. 1). The accumulation used to sit in the `actor == traverser`
+/// branch, where the node is reached with the OPPONENTS' sampled reach — the
+/// sum was opponent-reach-weighted, which is not the CFR average strategy and
+/// stalls/diverges in any tree where a player acts twice.
+///
+/// With 3+ seats the node is also reached through the OTHER sampled seats'
+/// actions, so the weight is own reach × their reach (the same convention as
+/// OpenSpiel's ES-MCCFR); multiway has no convergence guarantee either way.
+///
+/// RNG consumption is unchanged (exactly one `next_f64` per sampled node), so
+/// for a given seed the sampled deals/actions and the regrets are identical to
+/// the pre-fix solver; only the accumulated averages differ.
+fn es_sample_opponent_action(node: &mut Infoset, strategy: &[f64], rng: &mut Lcg) -> usize {
+    for (s, &p) in node.strategy_sum.iter_mut().zip(strategy.iter()) {
+        *s += p;
+    }
+    let mut t = rng.next_f64();
+    let mut idx = 0;
+    for (i, &p) in strategy.iter().enumerate() {
+        t -= p;
+        idx = i;
+        if t <= 0.0 {
+            break;
+        }
+    }
+    idx
+}
+
 /// Sample a full 5-card board not colliding with hole cards.
 fn sample_board5(rng: &mut Lcg, blocked: &[u8]) -> [u8; 5] {
     let mut used = [false; 52];
@@ -123,6 +159,84 @@ fn sample_board5(rng: &mut Lcg, blocked: &[u8]) -> [u8; 5] {
     board
 }
 
+/// Validated HU preflop root (seat 0 = BB, seat 1 = BTN/SB, BTN first).
+///
+/// (review 2026-09-20 E1) `effective_stack_bb <= ante + bb` used to build a
+/// state where both seats held 0 chips without being flagged all-in; the BTN's
+/// 0-chip "call" never matched the blind, so it was re-selected as the next
+/// actor forever → unbounded recursion → native stack overflow that killed
+/// the host process (stack 0.5/1.0 bb with default blinds/ante). Such sub-blind
+/// stacks have no real preflop decision tree in this abstraction (blinds are
+/// accounted at full size), so they are refused with an ordinary error.
+/// `PublicState::can_act` separately guarantees a chipless seat can never be
+/// handed the action, so no other hand-built root can recurse either.
+pub(crate) fn hu_preflop_root(root: &RootSpec) -> Result<PublicState, CfrError> {
+    let (bb, sb, ante) = (root.bb_chips, root.sb_chips, root.ante_chips);
+    let pot0 = root.pot_chips()?;
+    let stack0 = root.effective_stack_chips()?;
+    if sb > bb {
+        return Err(CfrError::InvalidRoot(format!(
+            "sb_chips {sb} > bb_chips {bb}"
+        )));
+    }
+    let need = ante.saturating_add(bb);
+    if stack0 <= need {
+        return Err(CfrError::InvalidRoot(format!(
+            "HU preflop needs effective_stack_bb > ante + big blind \
+             ({stack0} chips <= {need}): a sub-blind stack is all-in from the posts \
+             and leaves no decision tree to solve"
+        )));
+    }
+    let posted = ante.saturating_mul(2).saturating_add(sb).saturating_add(bb);
+    if pot0 < posted {
+        return Err(CfrError::InvalidRoot(format!(
+            "pot_bb is {pot0} chips but the posted antes+blinds are {posted}; \
+             HU preflop pot_bb must be >= (2*ante + sb + bb) / bb"
+        )));
+    }
+    let st = PublicState::preflop_root(&[stack0, stack0], bb, sb, ante, pot0 - posted)?;
+    require_root_decision(&st, &root.raise_sizes_pm, root.allin_atom)?;
+    Ok(st)
+}
+
+/// Validated multiway preflop root (seats `0..n-3` UTG.., `n-2` SB, `n-1` BB).
+/// The pot is rebuilt from the actual posts; `root.pot_bb` is ignored.
+pub(crate) fn mw_preflop_root(root: &RootSpec) -> Result<PublicState, CfrError> {
+    let stacks = root.seat_stacks_chips()?;
+    if root.sb_chips > root.bb_chips {
+        return Err(CfrError::InvalidRoot(format!(
+            "sb_chips {} > bb_chips {}",
+            root.sb_chips, root.bb_chips
+        )));
+    }
+    let st = PublicState::preflop_root(&stacks, root.bb_chips, root.sb_chips, root.ante_chips, 0)?;
+    require_root_decision(&st, &root.raise_sizes_pm, root.allin_atom)?;
+    Ok(st)
+}
+
+/// Run-time refuse-to-OOM (review 2026-09-20 F14): sampled solvers cannot
+/// bound their table up front (it grows with what gets visited), so the loop
+/// stops with `early_stop=memory_budget` once the live table passes the budget.
+fn table_over_memory_budget(n_infosets: usize) -> bool {
+    n_infosets as u64 * super::memory::BYTES_PER_INFOSET_BASE
+        > super::memory::DEFAULT_RAM_BUDGET_BYTES
+}
+
+/// A root with nobody to act (everyone all-in from the posts) is not a game.
+/// It used to "solve" to 0 infosets and exploitability 0.0 (review 2026-09-20 E1).
+fn require_root_decision(
+    st: &PublicState,
+    raise_pm: &[u32],
+    allin: bool,
+) -> Result<(), CfrError> {
+    if st.actor.is_none() || legal_actions(st, raise_pm, allin).is_empty() {
+        return Err(CfrError::InvalidRoot(
+            "degenerate root: no seat has a decision (stacks do not cover the antes/blinds)".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Preflop HU MCCFR: 169 classes, external sampling, **real equity** via
 /// sampled runouts at showdown (MC equity, not class_id proxy).
 pub fn solve_preflop_mccfr(root: &RootSpec, config: &SolveConfig) -> Result<SolveReport, CfrError> {
@@ -134,16 +248,20 @@ pub fn solve_preflop_mccfr(root: &RootSpec, config: &SolveConfig) -> Result<Solv
         ));
     }
 
-    let pot0 = (root.pot_bb * root.bb_chips as f64).round() as u64;
-    let stack0 = (root.effective_stack_bb * root.bb_chips as f64).round() as u64;
     let bb = root.bb_chips;
-    let mut infosets: HashMap<InfosetKey, Infoset> = HashMap::new();
-    let mut rng = Lcg::new(config.seed);
     let raise_pm = root.raise_sizes_pm.clone();
     let allin = root.allin_atom;
+    // Faithful HU preflop: blinds in street_commit, BTN/SB (seat 1) first.
+    // Built ONCE and validated (review 2026-09-20 E1) — see `hu_preflop_root`.
+    let st = hu_preflop_root(root)?;
+    let mut infosets: HashMap<InfosetKey, Infoset> = HashMap::new();
+    let mut rng = Lcg::new(config.seed);
     let start = std::time::Instant::now();
     let mut stop_reason: Option<&'static str> = None;
     let mut iterations_run = 0u32;
+    // Only "dcfr" discounts the sampled regrets (every 10th iteration); every
+    // other tag is plain ES-MCCFR. Reported truthfully in the notes.
+    let discount_dcfr = config.discounting() == super::types::Discounting::Dcfr;
 
     // Concrete holes for equity (not just class)
     let iter_limit = config.iter_limit();
@@ -159,23 +277,6 @@ pub fn solve_preflop_mccfr(root: &RootSpec, config: &SolveConfig) -> Result<Solv
             PreflopHandClass::from_cards(h0.0, h0.1).id(),
             PreflopHandClass::from_cards(h1.0, h1.1).id(),
         ];
-        // Faithful HU preflop: blinds in street_commit, BTN first.
-        let sb = root.sb_chips;
-        let ante = root.ante_chips;
-        let mut st = PublicState::hu_postflop_root(pot0, stack0, &[0, 1, 2], bb).unwrap();
-        st.street = 0;
-        st.board_len = 0;
-        st.board = [0; 5];
-        st.stacks[0] = stack0.saturating_sub(ante + bb); // BB
-        st.stacks[1] = stack0.saturating_sub(ante + sb); // BTN/SB
-        st.street_commit[0] = bb;
-        st.street_commit[1] = sb;
-        st.total_commit[0] = ante + bb;
-        st.total_commit[1] = ante + sb;
-        st.bet_to_call = bb;
-        st.last_raise_size = bb;
-        st.actor = Some(1);
-        st.button = 1;
 
         let board = sample_board5(&mut rng, &[h0.0, h0.1, h1.0, h1.1]);
 
@@ -194,12 +295,16 @@ pub fn solve_preflop_mccfr(root: &RootSpec, config: &SolveConfig) -> Result<Solv
             );
         }
 
-        if config.algorithm == "dcfr" && it % 10 == 0 {
+        if discount_dcfr && it % 10 == 0 {
             for node in infosets.values_mut() {
                 node.apply_dcfr_discount(it);
             }
         }
         iterations_run = it;
+        if it % poll == 0 && table_over_memory_budget(infosets.len()) {
+            stop_reason = Some("memory_budget");
+            break;
+        }
         if (it % poll == 0 || it == 1) && !config.progress_file.is_empty() {
             // 169-class strategy is small — dump full average for live viewer.
             let mut snap = Vec::new();
@@ -211,19 +316,30 @@ pub fn solve_preflop_mccfr(root: &RootSpec, config: &SolveConfig) -> Result<Solv
             }
             snap.sort_by(|a, b| a.infoset_id.cmp(&b.infoset_id));
             let strat = Strategy::new(root.root_id.clone(), snap);
-            config.write_progress(it, None, infosets.len(), Some(&strat), &root.root_id, false);
+            config.write_progress(
+                it,
+                None,
+                None,
+                infosets.len(),
+                Some(&strat),
+                &root.root_id,
+                false,
+            );
         }
     }
     if iterations_run == 0 {
         iterations_run = 1; // avoid empty export edge case
     }
 
-    // Real preflop MC expl with holes + sampled board rebound per sample
+    // (review 2026-09-20 D10) This is a PERFECT-INFORMATION deal-BR: the
+    // "best responder" sees the opponent's hole cards and the sampled board,
+    // so the number is an upward-biased proxy that does not shrink with more
+    // iterations (2.71 → 3.11 bb from 20k → 1M iters in the review). It is
+    // reported for continuity but labelled `expl_kind=mc_br_proxy`, like the
+    // multiway paths — never a Nash certificate.
     let expl = {
         let mut total = 0.0;
         let samples = 32u32;
-        let sb = root.sb_chips;
-        let ante = root.ante_chips;
         for _ in 0..samples {
             let (h0, h1) = deal_holes_hu(&mut rng);
             let holes = [h0, h1];
@@ -232,20 +348,6 @@ pub fn solve_preflop_mccfr(root: &RootSpec, config: &SolveConfig) -> Result<Solv
                 PreflopHandClass::from_cards(h1.0, h1.1).id(),
             ];
             let board = sample_board5(&mut rng, &[h0.0, h0.1, h1.0, h1.1]);
-            let mut st = PublicState::hu_postflop_root(pot0, stack0, &[0, 1, 2], bb).unwrap();
-            st.street = 0;
-            st.board_len = 0;
-            st.board = [0; 5];
-            st.stacks[0] = stack0.saturating_sub(ante + bb);
-            st.stacks[1] = stack0.saturating_sub(ante + sb);
-            st.street_commit[0] = bb;
-            st.street_commit[1] = sb;
-            st.total_commit[0] = ante + bb;
-            st.total_commit[1] = ante + sb;
-            st.bet_to_call = bb;
-            st.last_raise_size = bb;
-            st.actor = Some(1);
-            st.button = 1;
             for br_player in 0..2 {
                 let v = pf_avg_value(
                     &infosets, &st, &[], classes, holes, board, br_player, &raise_pm, allin,
@@ -274,6 +376,17 @@ pub fn solve_preflop_mccfr(root: &RootSpec, config: &SolveConfig) -> Result<Solv
         "preflop_tree=SB/BB street_commit + BTN first".into(),
         format!("infosets={}", infosets.len()),
         format!("classes={NUM_PREFLOP_CLASSES}"),
+        format!(
+            "algorithm={} discount={}",
+            config.algorithm,
+            if discount_dcfr { "dcfr_every_10_iters" } else { "none" }
+        ),
+        "avg_strategy=own_reach (accumulated at sampled opponent nodes)".into(),
+        format!("expl_kind=mc_br_proxy samples=32 mc_br_proxy_bb={expl}"),
+        "exploitability_bb field is a perfect-information deal-BR proxy (BR sees villain's \
+         hole cards + board): upward-biased, NOT a Nash certificate and not expected to \
+         shrink with more iterations"
+            .into(),
         format!("wall_secs={:.1}", start.elapsed().as_secs_f64()),
     ];
     if let Some(why) = stop_reason {
@@ -311,20 +424,11 @@ pub fn solve_multiway_preflop_mccfr(
     config.validate()?;
 
     let n = root.num_seats as usize;
-    let bb = root.bb_chips;
-    let sb = root.sb_chips;
-    let ante = root.ante_chips;
-    // Pot = n*ante + sb + bb (multiway blinds only SB/BB seats). pot_bb ignored.
-    let pot0 = root.multiway_preflop_pot_chips();
-    let stacks: Vec<u64> = if root.stacks_bb.len() == n {
-        root.stacks_bb
-            .iter()
-            .map(|&s| (s * bb as f64).round() as u64)
-            .collect()
-    } else {
-        let s0 = (root.effective_stack_bb * bb as f64).round() as u64;
-        vec![s0; n]
-    };
+    // Public preflop root: seats 0..n-3 UTG+, n-2 = SB, n-1 = BB, UTG first.
+    // Pot = the actual posts (n*ante + sb + bb for covering stacks); pot_bb is
+    // ignored. Built once + validated (review 2026-09-20 E1).
+    let st = mw_preflop_root(root)?;
+    let pot0 = st.pot;
     // Empty raise_sizes + allin_atom = pure push/fold (Monker AoF tree).
     // Validation already rejects empty menu without allin_atom — no silent default.
     let raise_pm = root.raise_sizes_pm.clone();
@@ -369,39 +473,6 @@ pub fn solve_multiway_preflop_mccfr(
             sample_board5(&mut rng, &blocked)
         };
 
-        // Public preflop: seat 0 = UTG (first to act multiway preflop after BB),
-        // last seats post SB/BB. Our convention: seats 0..n-3 UTG+, n-2=SB, n-1=BB.
-        let mut st = PublicState::postflop_root(
-            root.num_seats,
-            pot0,
-            &stacks,
-            &[0, 1, 2], // dummy board for constructor
-            bb,
-            1,
-        )?;
-        st.street = 0;
-        st.board_len = 0;
-        st.board = [0; 5];
-        // Post blinds on last two seats
-        let sb_seat = n - 2;
-        let bb_seat = n - 1;
-        for i in 0..n {
-            st.stacks[i] = stacks[i].saturating_sub(ante);
-            st.total_commit[i] = ante;
-        }
-        let sb_pay = sb.min(st.stacks[sb_seat]);
-        st.stacks[sb_seat] -= sb_pay;
-        st.street_commit[sb_seat] = sb_pay;
-        st.total_commit[sb_seat] += sb_pay;
-        let bb_pay = bb.min(st.stacks[bb_seat]);
-        st.stacks[bb_seat] -= bb_pay;
-        st.street_commit[bb_seat] = bb_pay;
-        st.total_commit[bb_seat] += bb_pay;
-        st.bet_to_call = bb;
-        st.last_raise_size = bb;
-        st.actor = Some(0); // UTG first multiway preflop
-        st.button = (n - 3) as u8; // rough
-
         for trav in 0..n {
             mw_preflop_traverse(
                 &st,
@@ -418,6 +489,10 @@ pub fn solve_multiway_preflop_mccfr(
             );
         }
         iterations_run = it;
+        if it % poll == 0 && table_over_memory_budget(infosets.len()) {
+            stop_reason = Some("memory_budget");
+            break;
+        }
         if (it % poll == 0 || it == 1) && !config.progress_file.is_empty() {
             // Multiway preflop: dump average strategy for live viewer.
             let mut snap = Vec::new();
@@ -433,7 +508,15 @@ pub fn solve_multiway_preflop_mccfr(
             }
             snap.sort_by(|a, b| a.infoset_id.cmp(&b.infoset_id));
             let strat = Strategy::new(root.root_id.clone(), snap);
-            config.write_progress(it, None, infosets.len(), Some(&strat), &root.root_id, false);
+            config.write_progress(
+                it,
+                None,
+                None,
+                infosets.len(),
+                Some(&strat),
+                &root.root_id,
+                false,
+            );
         }
     }
     if iterations_run == 0 {
@@ -455,19 +538,7 @@ pub fn solve_multiway_preflop_mccfr(
 
     // Push/fold trees are small; raised-size multiway BR is exponential — cap samples.
     let expl_samples = if raise_pm.is_empty() && allin { 24 } else { 4 };
-    let expl = mw_preflop_mc_expl(
-        &infosets,
-        &raise_pm,
-        allin,
-        n,
-        pot0,
-        &stacks,
-        bb,
-        sb,
-        ante,
-        &mut rng,
-        expl_samples,
-    );
+    let expl = mw_preflop_mc_expl(&infosets, &raise_pm, allin, &st, &mut rng, expl_samples);
 
     let mut notes_extra = vec![format!("wall_secs={:.1}", start.elapsed().as_secs_f64())];
     if let Some(why) = stop_reason {
@@ -487,7 +558,9 @@ pub fn solve_multiway_preflop_mccfr(
                 "showdown=real NLH equity sampled board".into(),
                 "population_eq=honest (multiway NE non-unique)".into(),
                 format!("mc_br_proxy_bb={expl}"),
+                format!("expl_kind=mc_br_proxy samples={expl_samples}"),
                 "exploitability_bb field is MC BR proxy (not tight multiway Nash cert)".into(),
+                "avg_strategy=own_reach (accumulated at sampled opponent nodes)".into(),
                 if raise_pm.is_empty() && allin {
                     "tree=push_fold (FOLD|ALLIN only)".into()
                 } else {
@@ -509,18 +582,16 @@ fn mw_preflop_mc_expl(
     infosets: &HashMap<InfosetKey, Infoset>,
     raise_pm: &[u32],
     allin: bool,
-    n: usize,
-    pot0: u64,
-    stacks: &[u64],
-    bb: u64,
-    sb: u64,
-    ante: u64,
+    root_state: &PublicState,
     rng: &mut Lcg,
     samples: u32,
 ) -> f64 {
+    let n = root_state.n();
+    let bb = root_state.bb;
     if bb == 0 || samples == 0 {
         return 0.0;
     }
+    let st = root_state;
     let mut total = 0.0;
     for _ in 0..samples {
         let mut used = [false; 52];
@@ -543,31 +614,10 @@ fn mw_preflop_mc_expl(
             .collect();
         let blocked: Vec<u8> = holes.iter().flat_map(|&(a, b)| [a, b]).collect();
         let board = sample_board5(rng, &blocked);
-        let mut st = PublicState::postflop_root(n as u8, pot0, stacks, &[0, 1, 2], bb, 1).unwrap();
-        st.street = 0;
-        st.board_len = 0;
-        st.board = [0; 5];
-        let sb_seat = n - 2;
-        let bb_seat = n - 1;
-        for i in 0..n {
-            st.stacks[i] = stacks[i].saturating_sub(ante);
-            st.total_commit[i] = ante;
-        }
-        let sb_pay = sb.min(st.stacks[sb_seat]);
-        st.stacks[sb_seat] -= sb_pay;
-        st.street_commit[sb_seat] = sb_pay;
-        st.total_commit[sb_seat] += sb_pay;
-        let bb_pay = bb.min(st.stacks[bb_seat]);
-        st.stacks[bb_seat] -= bb_pay;
-        st.street_commit[bb_seat] = bb_pay;
-        st.total_commit[bb_seat] += bb_pay;
-        st.bet_to_call = bb;
-        st.last_raise_size = bb;
-        st.actor = Some(0);
         for br_player in 0..n {
             let v = mw_avg(
                 infosets,
-                &st,
+                st,
                 &[],
                 &classes,
                 &holes,
@@ -660,23 +710,15 @@ fn mw_preflop_traverse(
             );
             node_util += strategy[i] * utils[i];
         }
+        // Regrets only at traverser nodes; the average strategy is accumulated
+        // at non-traverser nodes (review 2026-09-20 D6).
         let node = infosets.get_mut(&key).unwrap();
         for i in 0..acts.len() {
             node.regret[i] += utils[i] - node_util;
-            node.strategy_sum[i] += strategy[i];
         }
         node_util
     } else {
-        let mut t = rng.next_f64();
-        let mut idx = 0;
-        for (i, &p) in strategy.iter().enumerate() {
-            t -= p;
-            if t <= 0.0 {
-                idx = i;
-                break;
-            }
-            idx = i;
-        }
+        let idx = es_sample_opponent_action(infosets.get_mut(&key).unwrap(), &strategy, rng);
         let mut child = state.clone();
         let _ = apply_abstract(&mut child, acts[idx]);
         let mut h2 = history.to_vec();
@@ -707,20 +749,17 @@ pub fn solve_multiway_mccfr(root: &RootSpec, config: &SolveConfig) -> Result<Sol
     config.validate()?;
 
     let n = root.num_seats as usize;
-    let pot0 = (root.pot_bb * root.bb_chips as f64).round() as u64;
+    // (review 2026-09-20 E1) chips via the checked converters: a pot/stack that
+    // rounds to 0 chips is an error, not an `unwrap()` panic / 0-stack "solve".
+    let pot0 = root.pot_chips()?;
     let bb = root.bb_chips;
-    let stacks: Vec<u64> = if root.stacks_bb.len() == n {
-        root.stacks_bb
-            .iter()
-            .map(|&s| (s * bb as f64).round() as u64)
-            .collect()
-    } else {
-        let stack0 = (root.effective_stack_bb * bb as f64).round() as u64;
-        vec![stack0; n]
-    };
+    let stacks = root.seat_stacks_chips()?;
     let board = root.board.clone();
     let street = root.street as u8;
     let use_combo_view = root.street == StreetRoot::River || config.card_abstraction == "none";
+    // Identical every iteration — build (and validate) once.
+    let st = PublicState::postflop_root(root.num_seats, pot0, &stacks, &board, bb, street)?;
+    require_root_decision(&st, &root.raise_sizes_pm, root.allin_atom)?;
 
     let mut infosets: HashMap<InfosetKey, Infoset> = HashMap::new();
     let mut rng = Lcg::new(config.seed);
@@ -771,8 +810,6 @@ pub fn solve_multiway_mccfr(root: &RootSpec, config: &SolveConfig) -> Result<Sol
             }
         }
 
-        let st = PublicState::postflop_root(root.num_seats, pot0, &stacks, &board, bb, street)?;
-
         for trav in 0..n {
             multi_traverse_es(
                 &st,
@@ -788,6 +825,10 @@ pub fn solve_multiway_mccfr(root: &RootSpec, config: &SolveConfig) -> Result<Sol
             );
         }
         iterations_run = it;
+        if it % poll == 0 && table_over_memory_budget(infosets.len()) {
+            stop_reason = Some("memory_budget");
+            break;
+        }
         if (it % poll == 0 || it == 1) && !config.progress_file.is_empty() {
             // Multiway postflop: dump average strategy for live viewer.
             let mut snap = Vec::new();
@@ -799,7 +840,15 @@ pub fn solve_multiway_mccfr(root: &RootSpec, config: &SolveConfig) -> Result<Sol
             }
             snap.sort_by(|a, b| a.infoset_id.cmp(&b.infoset_id));
             let strat = Strategy::new(root.root_id.clone(), snap);
-            config.write_progress(it, None, infosets.len(), Some(&strat), &root.root_id, false);
+            config.write_progress(
+                it,
+                None,
+                None,
+                infosets.len(),
+                Some(&strat),
+                &root.root_id,
+                false,
+            );
         }
     }
     if iterations_run == 0 {
@@ -812,12 +861,8 @@ pub fn solve_multiway_mccfr(root: &RootSpec, config: &SolveConfig) -> Result<Sol
         &infosets,
         &raise_pm,
         root.allin_atom,
-        n,
-        pot0,
-        &stacks,
+        &st,
         &board,
-        bb,
-        street,
         use_combo_view,
         &mut rng,
         32,
@@ -851,12 +896,17 @@ pub fn solve_multiway_mccfr(root: &RootSpec, config: &SolveConfig) -> Result<Sol
                 format!("MCCFR multiway n={n} ES + sidepot showdown"),
                 format!("infosets={}", infosets.len()),
                 format!("mc_br_proxy_bb={expl}"),
+                "expl_kind=mc_br_proxy samples=32".into(),
                 "exploitability_bb field is MC BR proxy (not tight multiway Nash cert)".into(),
+                "avg_strategy=own_reach (accumulated at sampled opponent nodes)".into(),
                 "infoset_key=actions+board+street (distinct runouts)".into(),
                 if use_combo_view {
                     "private_view=combo".into()
                 } else {
-                    "private_view=preflop169".into()
+                    // Honest label (review 2026-09-20 F8): the 169 preflop class is
+                    // blind to suits-vs-board, so flop/turn infosets cannot tell a
+                    // flush draw from air. Quality limitation, not redesigned here.
+                    "private_view=preflop169 (board-blind: coarse on flop/turn)".into()
                 },
                 if root.stacks_bb.len() == n {
                     "unequal_stacks".into()
@@ -925,24 +975,16 @@ fn mccfr_traverse(
             );
             node_util += strategy[i] * utils[i];
         }
+        // Regrets only here; average strategy accumulates at the sampled
+        // (non-traverser) branch below (review 2026-09-20 D6).
         let node = infosets.get_mut(&key).unwrap();
         for i in 0..acts.len() {
             node.regret[i] += utils[i] - node_util;
-            node.strategy_sum[i] += strategy[i];
         }
         node_util
     } else {
-        // External sample opponent action
-        let mut t = rng.next_f64();
-        let mut idx = 0;
-        for (i, &p) in strategy.iter().enumerate() {
-            t -= p;
-            if t <= 0.0 {
-                idx = i;
-                break;
-            }
-            idx = i;
-        }
+        // External sample opponent action (+ own-reach average-strategy update)
+        let idx = es_sample_opponent_action(infosets.get_mut(&key).unwrap(), &strategy, rng);
         let act = acts[idx];
         let mut child = state.clone();
         let _ = apply_abstract(&mut child, act);
@@ -1031,24 +1073,16 @@ fn multi_traverse_es(
             );
             node_util += strategy[i] * utils[i];
         }
+        // Regrets only here; average strategy accumulates at the sampled
+        // (non-traverser) branch below (review 2026-09-20 D6).
         let node = infosets.get_mut(&key).unwrap();
         for i in 0..acts.len() {
             node.regret[i] += utils[i] - node_util;
-            node.strategy_sum[i] += strategy[i];
         }
         node_util
     } else {
-        // External sample
-        let mut t = rng.next_f64();
-        let mut idx = 0;
-        for (i, &p) in strategy.iter().enumerate() {
-            t -= p;
-            if t <= 0.0 {
-                idx = i;
-                break;
-            }
-            idx = i;
-        }
+        // External sample (+ own-reach average-strategy update)
+        let idx = es_sample_opponent_action(infosets.get_mut(&key).unwrap(), &strategy, rng);
         let mut child = state.clone();
         let _ = apply_abstract(&mut child, acts[idx]);
         let mut h2 = history.to_vec();
@@ -1286,16 +1320,14 @@ fn multiway_mc_exploitability(
     infosets: &HashMap<InfosetKey, Infoset>,
     raise_pm: &[u32],
     allin: bool,
-    n: usize,
-    pot0: u64,
-    stacks: &[u64],
+    root_state: &PublicState,
     board: &[u8],
-    bb: u64,
-    street: u8,
     use_combo_view: bool,
     rng: &mut Lcg,
     samples: u32,
 ) -> f64 {
+    let n = root_state.n();
+    let bb = root_state.bb;
     if bb == 0 || samples == 0 {
         return 0.0;
     }
@@ -1333,7 +1365,7 @@ fn multiway_mc_exploitability(
                 i += 1;
             }
         }
-        let root = PublicState::postflop_root(n as u8, pot0, stacks, board, bb, street).unwrap();
+        let root = root_state;
         let privates: Vec<u32> = holes
             .iter()
             .map(|&(a, b)| {
@@ -1347,7 +1379,7 @@ fn multiway_mc_exploitability(
         for br_player in 0..n {
             let v = mw_avg(
                 infosets,
-                &root,
+                root,
                 &[],
                 &privates,
                 &holes,
@@ -1355,11 +1387,11 @@ fn multiway_mc_exploitability(
                 br_player,
                 raise_pm,
                 allin,
-                use_combo_view,
+                true,
             );
             let br = mw_br(
                 infosets,
-                &root,
+                root,
                 &[],
                 &privates,
                 &holes,
@@ -1367,7 +1399,7 @@ fn multiway_mc_exploitability(
                 br_player,
                 raise_pm,
                 allin,
-                use_combo_view,
+                true,
             );
             total += (br - v).max(0.0);
         }
@@ -1375,6 +1407,14 @@ fn multiway_mc_exploitability(
     (total / samples as f64) / n as f64 / bb as f64
 }
 
+/// On-policy (average strategy) value of `player` on one sampled deal.
+///
+/// `deal_runouts`: postflop roots deal the remaining board cards and keep
+/// betting; PREFLOP roots must pass `false` — the trained preflop game ends at
+/// the close of the preflop round (showdown on the sampled board). (review
+/// 2026-09-20, found while fixing E1: the preflop evaluator used to walk into
+/// phantom 1-/2-card "streets" that the solver never trained, forcing jams
+/// under the push/fold menu whenever two covering stacks were still live.)
 fn mw_avg(
     infosets: &HashMap<InfosetKey, Infoset>,
     state: &PublicState,
@@ -1385,9 +1425,9 @@ fn mw_avg(
     player: usize,
     raise_pm: &[u32],
     allin: bool,
-    use_combo_view: bool,
+    deal_runouts: bool,
 ) -> f64 {
-    if state.needs_runout() {
+    if deal_runouts && state.needs_runout() {
         let mut child = state.clone();
         child.deal_board_card(board[state.board_len as usize]);
         return mw_avg(
@@ -1400,7 +1440,7 @@ fn mw_avg(
             player,
             raise_pm,
             allin,
-            use_combo_view,
+            deal_runouts,
         );
     }
     if state.is_terminal() || state.actor.is_none() {
@@ -1435,7 +1475,7 @@ fn mw_avg(
             player,
             raise_pm,
             allin,
-            use_combo_view,
+            deal_runouts,
         );
     }
     v
@@ -1451,9 +1491,9 @@ fn mw_br(
     br_player: usize,
     raise_pm: &[u32],
     allin: bool,
-    use_combo_view: bool,
+    deal_runouts: bool,
 ) -> f64 {
-    if state.needs_runout() {
+    if deal_runouts && state.needs_runout() {
         let mut child = state.clone();
         child.deal_board_card(board[state.board_len as usize]);
         return mw_br(
@@ -1466,7 +1506,7 @@ fn mw_br(
             br_player,
             raise_pm,
             allin,
-            use_combo_view,
+            deal_runouts,
         );
     }
     if state.is_terminal() || state.actor.is_none() {
@@ -1496,7 +1536,7 @@ fn mw_br(
                 br_player,
                 raise_pm,
                 allin,
-                use_combo_view,
+                deal_runouts,
             );
             if v > best {
                 best = v;
@@ -1532,7 +1572,7 @@ fn mw_br(
                 br_player,
                 raise_pm,
                 allin,
-                use_combo_view,
+                deal_runouts,
             );
         }
         v
@@ -1758,6 +1798,507 @@ mod tests {
         }
         // 14 public nodes × 169 ≈ 2366 at high iters; smoke may be less
         assert!(rep.strategy.infosets.len() > 100);
+    }
+
+    // ------------------------------------------------------------------
+    // (review 2026-09-20 D6) exact-BR harness on a toy HU game driven
+    // through the PRODUCTION traversal (`multi_traverse_es`).
+    //
+    // Chance is an explicit list of equiprobable deals (holes + full board),
+    // so the test owns the game exactly; the betting tree is the real
+    // PublicState tree and the solver is the production ES traversal.
+    // ------------------------------------------------------------------
+    #[derive(Clone, Copy)]
+    struct ToyDeal {
+        holes: [(u8, u8); 2],
+        board: [u8; 5],
+    }
+
+    struct ToyGame {
+        deals: Vec<ToyDeal>,
+        root: PublicState,
+        raise_pm: Vec<u32>,
+        allin: bool,
+    }
+
+    const TOY_BB: u64 = 10_000;
+
+    /// Leduc-shaped two-street game (turn root → river): three hands J/Q/K
+    /// (kicker 4, never plays), dealt without replacement; the river either
+    /// pairs one of the three ranks (that hand then wins) or is a blank.
+    /// Both players act on both streets ⇒ own reach at river infosets varies
+    /// strongly across iterations — the regime where the D6 bug bites.
+    fn toy_leduc_like_game() -> ToyGame {
+        // Turn: 2c 7d 3h 8s (no straight/flush reachable with these holes).
+        let turn = [0u8, 21, 6, 27];
+        // 4c Jc | 4d Qd | 4h Kh
+        let hands = [(8u8, 36u8), (9u8, 41u8), (10u8, 46u8)];
+        // Js, Qs, Ks, 2s (blank)
+        let rivers = [39u8, 43, 47, 3];
+        let mut deals = Vec::new();
+        for i in 0..3 {
+            for j in 0..3 {
+                if i == j {
+                    continue;
+                }
+                for &r in &rivers {
+                    deals.push(ToyDeal {
+                        holes: [hands[i], hands[j]],
+                        board: [turn[0], turn[1], turn[2], turn[3], r],
+                    });
+                }
+            }
+        }
+        let root =
+            PublicState::postflop_root(2, 20_000, &[100_000, 100_000], &turn, TOY_BB, 2).unwrap();
+        ToyGame {
+            deals,
+            root,
+            raise_pm: vec![1000],
+            allin: false,
+        }
+    }
+
+    /// Preflop-style push/fold tree (each player acts exactly once): seat 1
+    /// (SB) jams or folds into seat 0 (BB), who calls or folds. Six hands of
+    /// strictly ordered strength on a fixed board, dealt without replacement.
+    fn toy_push_fold_game() -> ToyGame {
+        // Board 2c 3d 4h 5s 7c. T-high < Q-high < K-high < 88 < 99 < KK.
+        let board = [0u8, 5, 10, 15, 20];
+        let hands = [
+            (25u8, 32u8),
+            (37u8, 40u8),
+            (41u8, 44u8),
+            (26u8, 27u8),
+            (30u8, 31u8),
+            (46u8, 47u8),
+        ];
+        let mut deals = Vec::new();
+        for i in 0..hands.len() {
+            for j in 0..hands.len() {
+                if i != j {
+                    deals.push(ToyDeal {
+                        holes: [hands[i], hands[j]],
+                        board,
+                    });
+                }
+            }
+        }
+        let mut root =
+            PublicState::postflop_root(2, 15_000, &[60_000, 60_000], &board, TOY_BB, 3).unwrap();
+        root.street = 0; // push/fold "no limp" rule is preflop-only
+        root.stacks[0] = 50_000;
+        root.stacks[1] = 55_000;
+        root.street_commit[0] = 10_000;
+        root.street_commit[1] = 5_000;
+        root.total_commit[0] = 10_000;
+        root.total_commit[1] = 5_000;
+        root.bet_to_call = 10_000;
+        root.actor = Some(1);
+        ToyGame {
+            deals,
+            root,
+            raise_pm: vec![],
+            allin: true,
+        }
+    }
+
+    /// Per-deal weighted values for `player`: best response (infoset-
+    /// consistent, backward induction over reach-weighted deals) or the
+    /// dumped average strategy. `w[d]` = chance × opponent average reach.
+    fn toy_values(
+        infosets: &HashMap<InfosetKey, Infoset>,
+        game: &ToyGame,
+        state: &PublicState,
+        history: &[AbstractAction],
+        player: usize,
+        best_response: bool,
+        w: &[f64],
+    ) -> Vec<f64> {
+        let nd = game.deals.len();
+        if state.needs_runout() {
+            // Chance node: split the deals by the next public card.
+            let idx = state.board_len as usize;
+            let mut cards: Vec<u8> = game.deals.iter().map(|dl| dl.board[idx]).collect();
+            cards.sort_unstable();
+            cards.dedup();
+            let mut out = vec![0.0; nd];
+            for c in cards {
+                let mut child = state.clone();
+                child.deal_board_card(c);
+                let w2: Vec<f64> = (0..nd)
+                    .map(|d| if game.deals[d].board[idx] == c { w[d] } else { 0.0 })
+                    .collect();
+                let vals = toy_values(infosets, game, &child, history, player, best_response, &w2);
+                for d in 0..nd {
+                    out[d] += vals[d];
+                }
+            }
+            return out;
+        }
+        if state.is_terminal() || state.actor.is_none() {
+            return (0..nd)
+                .map(|d| {
+                    let dl = &game.deals[d];
+                    w[d] * multi_terminal_real(state, &dl.holes, dl.board, player)
+                })
+                .collect();
+        }
+        let actor = state.actor.unwrap() as usize;
+        let acts = legal_actions(state, &game.raise_pm, game.allin);
+        assert!(!acts.is_empty());
+        let hhash = history_hash_state(history, state);
+        let strat_of = |d: usize| -> Vec<f64> {
+            let (a, b) = game.deals[d].holes[actor];
+            let key = InfosetKey::new(
+                actor as u8,
+                hhash,
+                crate::cfr::range::cards_to_combo(a, b) as u32,
+            );
+            infosets
+                .get(&key)
+                .map(|n| n.average_strategy())
+                .unwrap_or_else(|| vec![1.0 / acts.len() as f64; acts.len()])
+        };
+        let mut child_vals: Vec<Vec<f64>> = Vec::with_capacity(acts.len());
+        for (i, &act) in acts.iter().enumerate() {
+            let mut child = state.clone();
+            apply_abstract(&mut child, act).unwrap();
+            let mut h2 = history.to_vec();
+            h2.push(act);
+            let w2: Vec<f64> = if actor == player {
+                w.to_vec()
+            } else {
+                (0..nd).map(|d| w[d] * strat_of(d)[i]).collect()
+            };
+            child_vals.push(toy_values(
+                infosets,
+                game,
+                &child,
+                &h2,
+                player,
+                best_response,
+                &w2,
+            ));
+        }
+        let mut out = vec![0.0; nd];
+        if actor != player {
+            for cv in &child_vals {
+                for d in 0..nd {
+                    out[d] += cv[d];
+                }
+            }
+            return out;
+        }
+        if !best_response {
+            for d in 0..nd {
+                let s = strat_of(d);
+                for (i, cv) in child_vals.iter().enumerate() {
+                    out[d] += s[i] * cv[d];
+                }
+            }
+            return out;
+        }
+        // BR: one action per infoset (= own hole), maximizing the summed
+        // counterfactual value of the deals in that infoset.
+        let mut groups: HashMap<(u8, u8), Vec<usize>> = HashMap::new();
+        for d in 0..nd {
+            groups.entry(game.deals[d].holes[player]).or_default().push(d);
+        }
+        for members in groups.values() {
+            let mut best_i = 0;
+            let mut best_v = f64::NEG_INFINITY;
+            for (i, cv) in child_vals.iter().enumerate() {
+                let v: f64 = members.iter().map(|&d| cv[d]).sum();
+                if v > best_v {
+                    best_v = v;
+                    best_i = i;
+                }
+            }
+            for &d in members {
+                out[d] = child_vals[best_i][d];
+            }
+        }
+        out
+    }
+
+    /// Exact exploitability (NashConv/2) in bb.
+    fn toy_exploitability_bb(infosets: &HashMap<InfosetKey, Infoset>, game: &ToyGame) -> f64 {
+        let w0 = vec![1.0 / game.deals.len() as f64; game.deals.len()];
+        let mut nashconv = 0.0;
+        for p in 0..2 {
+            let br: f64 = toy_values(infosets, game, &game.root, &[], p, true, &w0)
+                .iter()
+                .sum();
+            let v: f64 = toy_values(infosets, game, &game.root, &[], p, false, &w0)
+                .iter()
+                .sum();
+            assert!(br >= v - 1e-6, "BR {br} below on-policy value {v}");
+            nashconv += br - v;
+        }
+        nashconv / 2.0 / TOY_BB as f64
+    }
+
+    /// Pre-fix ES traversal (average strategy accumulated at TRAVERSER
+    /// nodes). Kept ONLY as the regression reference for D6.
+    fn legacy_traverse_es(
+        game: &ToyGame,
+        state: &PublicState,
+        history: &[AbstractAction],
+        deal: &ToyDeal,
+        traverser: usize,
+        infosets: &mut HashMap<InfosetKey, Infoset>,
+        rng: &mut Lcg,
+    ) -> f64 {
+        let holes = &deal.holes;
+        if state.needs_runout() {
+            let mut child = state.clone();
+            child.deal_board_card(deal.board[state.board_len as usize]);
+            return legacy_traverse_es(game, &child, history, deal, traverser, infosets, rng);
+        }
+        if state.is_terminal() || state.actor.is_none() {
+            return multi_terminal_real(state, holes, deal.board, traverser);
+        }
+        let actor = state.actor.unwrap() as usize;
+        let acts = legal_actions(state, &game.raise_pm, game.allin);
+        let private = crate::cfr::range::cards_to_combo(holes[actor].0, holes[actor].1) as u32;
+        let key = InfosetKey::new(actor as u8, history_hash_state(history, state), private);
+        let strategy = infosets
+            .entry(key)
+            .or_insert_with(|| Infoset::new(acts.clone()))
+            .current_strategy();
+        if actor == traverser {
+            let mut utils = vec![0.0; acts.len()];
+            let mut node_util = 0.0;
+            for (i, &act) in acts.iter().enumerate() {
+                let mut child = state.clone();
+                apply_abstract(&mut child, act).unwrap();
+                let mut h2 = history.to_vec();
+                h2.push(act);
+                utils[i] = legacy_traverse_es(game, &child, &h2, deal, traverser, infosets, rng);
+                node_util += strategy[i] * utils[i];
+            }
+            let node = infosets.get_mut(&key).unwrap();
+            for i in 0..acts.len() {
+                node.regret[i] += utils[i] - node_util;
+                node.strategy_sum[i] += strategy[i]; // <- the D6 bug
+            }
+            node_util
+        } else {
+            let mut t = rng.next_f64();
+            let mut idx = 0;
+            for (i, &p) in strategy.iter().enumerate() {
+                t -= p;
+                idx = i;
+                if t <= 0.0 {
+                    break;
+                }
+            }
+            let mut child = state.clone();
+            apply_abstract(&mut child, acts[idx]).unwrap();
+            let mut h2 = history.to_vec();
+            h2.push(acts[idx]);
+            legacy_traverse_es(game, &child, &h2, deal, traverser, infosets, rng)
+        }
+    }
+
+    /// Run `iters` ES-MCCFR iterations; returns exact expl at each checkpoint.
+    fn toy_run(game: &ToyGame, iters: u32, seed: u64, legacy: bool, checkpoints: &[u32]) -> Vec<f64> {
+        let mut infosets: HashMap<InfosetKey, Infoset> = HashMap::new();
+        let mut rng = Lcg::new(seed);
+        let mut out = Vec::new();
+        for it in 1..=iters {
+            let deal = game.deals[rng.gen_range(game.deals.len())];
+            for trav in 0..2 {
+                if legacy {
+                    legacy_traverse_es(game, &game.root, &[], &deal, trav, &mut infosets, &mut rng);
+                } else {
+                    multi_traverse_es(
+                        &game.root,
+                        &[],
+                        &deal.holes,
+                        deal.board,
+                        trav,
+                        &game.raise_pm,
+                        game.allin,
+                        true,
+                        &mut infosets,
+                        &mut rng,
+                    );
+                }
+            }
+            if checkpoints.contains(&it) {
+                out.push(toy_exploitability_bb(&infosets, game));
+            }
+        }
+        out
+    }
+
+    /// (review 2026-09-20 D6) In a tree where players act twice the fixed
+    /// (own-reach) average converges; the pre-fix (opponent-reach) one does not.
+    #[test]
+    fn es_average_strategy_is_own_reach_weighted() {
+        let game = toy_leduc_like_game();
+        // Sanity: the tree really has second decisions (x/b → OOP again, and
+        // a river street after the turn closes).
+        let mut s = game.root.clone();
+        apply_abstract(&mut s, AbstractAction::CheckCall).unwrap();
+        apply_abstract(&mut s, AbstractAction::RaisePm(1000)).unwrap();
+        assert_eq!(s.actor, Some(0), "OOP must act again after x/b");
+        apply_abstract(&mut s, AbstractAction::CheckCall).unwrap();
+        assert!(s.needs_runout(), "turn call must lead to a river street");
+        let cps = [2_500u32, 40_000];
+        for seed in [1u64, 2, 3] {
+            let fixed = toy_run(&game, 40_000, seed, false, &cps);
+            let legacy = toy_run(&game, 40_000, seed, true, &cps);
+            eprintln!("seed {seed}: fixed={fixed:?} legacy={legacy:?}");
+            assert!(
+                fixed[1] < fixed[0],
+                "seed {seed}: expl must decrease with iterations: {fixed:?}"
+            );
+            // Measured 2026-09-20 (2 bb pot): fixed 0.040-0.048 bb, legacy
+            // 0.28-0.56 bb at 40k iterations.
+            assert!(
+                fixed[1] < 0.10,
+                "seed {seed}: own-reach average should be near-Nash, got {} bb",
+                fixed[1]
+            );
+            assert!(
+                3.0 * fixed[1] < legacy[1],
+                "seed {seed}: fixed {} bb should clearly beat legacy {} bb",
+                fixed[1],
+                legacy[1]
+            );
+        }
+    }
+
+    /// (review 2026-09-20 D6) All THREE production traversals: one traversal
+    /// leaves the traverser's infosets without average-strategy mass and adds
+    /// exactly one unit (Σσ = 1) at every sampled opponent infoset.
+    #[test]
+    fn es_average_accumulates_only_at_non_traverser_nodes() {
+        fn check(infosets: &HashMap<InfosetKey, Infoset>, trav: usize, what: &str) {
+            let (mut own, mut opp) = (0, 0);
+            for (key, node) in infosets {
+                let mass: f64 = node.strategy_sum.iter().sum();
+                if key.player as usize == trav {
+                    assert_eq!(mass, 0.0, "{what}: traverser node got average mass");
+                    own += 1;
+                } else {
+                    assert!((mass - 1.0).abs() < 1e-12, "{what}: opponent node mass {mass}");
+                    opp += 1;
+                }
+            }
+            assert!(own > 0 && opp > 0, "{what}: own={own} opp={opp}");
+        }
+        let mut rng = Lcg::new(3);
+
+        // HU preflop (`mccfr_traverse`).
+        let root = RootSpec::preflop_hu(20.0, 10_000, 5_000, 5_000);
+        let st = hu_preflop_root(&root).unwrap();
+        let (h0, h1) = deal_holes_hu(&mut rng);
+        let classes = [
+            PreflopHandClass::from_cards(h0.0, h0.1).id(),
+            PreflopHandClass::from_cards(h1.0, h1.1).id(),
+        ];
+        let board = sample_board5(&mut rng, &[h0.0, h0.1, h1.0, h1.1]);
+        for trav in 0..2 {
+            let mut infosets = HashMap::new();
+            mccfr_traverse(
+                &st, &[], classes, [h0, h1], board, trav, &root.raise_sizes_pm, true,
+                &mut infosets, &mut rng,
+            );
+            check(&infosets, trav, "mccfr_traverse");
+        }
+
+        // Multiway preflop (`mw_preflop_traverse`), sized tree so seats act twice.
+        let mut mw = RootSpec::preflop_hu(20.0, 10_000, 5_000, 0);
+        mw.num_seats = 3;
+        mw.raise_sizes_pm = vec![1000];
+        let st = mw_preflop_root(&mw).unwrap();
+        let holes = vec![(0u8, 1u8), (20, 21), (40, 41)];
+        let classes: Vec<u32> = holes
+            .iter()
+            .map(|&(a, b)| PreflopHandClass::from_cards(a, b).id())
+            .collect();
+        let board = [8u8, 13, 26, 31, 50];
+        for trav in 0..3 {
+            let mut infosets = HashMap::new();
+            let mut labels = HashMap::new();
+            mw_preflop_traverse(
+                &st, &[], &classes, &holes, board, trav, &mw.raise_sizes_pm, true,
+                &mut infosets, &mut labels, &mut rng,
+            );
+            check(&infosets, trav, "mw_preflop_traverse");
+        }
+
+        // Multiway postflop (`multi_traverse_es`).
+        let st = PublicState::postflop_root(
+            3, 30_000, &[100_000, 100_000, 100_000], &board, 10_000, 3,
+        )
+        .unwrap();
+        for trav in 0..3 {
+            let mut infosets = HashMap::new();
+            multi_traverse_es(
+                &st, &[], &holes, board, trav, &[1000], true, true, &mut infosets, &mut rng,
+            );
+            check(&infosets, trav, "multi_traverse_es");
+        }
+    }
+
+    /// (review 2026-09-20 D11) 3-way push/fold with stacks [30, 10, 10] bb: the
+    /// covering UTG stack's ALLIN is a real raise to 10 bb in the solved tree
+    /// (it used to be a limp, so SB "faced" a 0.5 bb completion).
+    #[test]
+    fn pushfold_three_way_covering_stack_jams() {
+        let mut root = RootSpec::preflop_hu(10.0, 10_000, 5_000, 0);
+        root.num_seats = 3;
+        root.raise_sizes_pm = vec![];
+        root.allin_atom = true;
+        root.stacks_bb = vec![30.0, 10.0, 10.0];
+        root.root_id = "pf3_cover".into();
+        let mut cfg = SolveConfig::default();
+        cfg.max_iterations = 300;
+        cfg.algorithm = "mccfr_es".into();
+        cfg.seed = 2;
+        let rep = solve_multiway_preflop_mccfr(&root, &cfg).unwrap();
+        let sb_vs_jam: Vec<_> = rep
+            .strategy
+            .infosets
+            .iter()
+            .filter(|i| i.actor == Some(1) && i.path.as_deref() == Some(&["ALLIN".to_string()][..]))
+            .collect();
+        assert!(!sb_vs_jam.is_empty());
+        for is in sb_vs_jam {
+            assert_eq!(is.actions, ["FOLD", "ALLIN"]);
+            // Facing a jam to 10 bb with 0.5 bb posted: 9.5 bb to call, pot 11.5 bb.
+            assert_eq!(is.to_call_chips, Some(95_000), "UTG's ALLIN was not a raise");
+            assert_eq!(is.pot_chips, Some(115_000));
+            assert_eq!(is.stacks_chips.as_deref(), Some(&[200_000u64, 95_000, 90_000][..]));
+        }
+        // The evaluator plays the same (single-street) game the solver trained.
+        assert!(rep.exploitability_bb.unwrap().is_finite());
+    }
+
+    /// (review 2026-09-20 D6) Push/fold trees (each player acts once) are not
+    /// hurt by the fix: the production rule still converges there.
+    #[test]
+    fn es_average_push_fold_tree_still_converges() {
+        let game = toy_push_fold_game();
+        let acts = legal_actions(&game.root, &game.raise_pm, game.allin);
+        assert_eq!(acts, vec![AbstractAction::Fold, AbstractAction::AllIn]);
+        for seed in [1u64, 2] {
+            let fixed = toy_run(&game, 20_000, seed, false, &[20_000]);
+            let legacy = toy_run(&game, 20_000, seed, true, &[20_000]);
+            eprintln!("pushfold seed {seed}: fixed={fixed:?} legacy={legacy:?}");
+            assert!(fixed[0] < 0.02, "push/fold expl {} bb", fixed[0]);
+            assert!(
+                fixed[0] <= legacy[0] + 0.02,
+                "push/fold: fixed {} vs legacy {}",
+                fixed[0],
+                legacy[0]
+            );
+        }
     }
 
     /// Multiway flop solve notes board+street key (runout-safe).

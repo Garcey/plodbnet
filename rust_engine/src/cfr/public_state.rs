@@ -124,6 +124,9 @@ impl PublicState {
         if stacks.len() != n {
             return Err(CfrError::InvalidRoot("stacks len != num_seats".into()));
         }
+        if pot_chips == 0 || bb == 0 {
+            return Err(CfrError::InvalidRoot("pot and bb must be > 0".into()));
+        }
         let need = match street {
             1 => 3,
             2 => 4,
@@ -175,6 +178,82 @@ impl PublicState {
         for i in 0..n {
             s.stacks[i] = stacks[i];
         }
+        // A seat that arrives with no chips is already all-in (review 2026-09-20 E1).
+        s.seal_root();
+        Ok(s)
+    }
+
+    /// Preflop root: antes (dead) + SB/BB (live `street_commit`) posted, short
+    /// posts go all-in, `bet_to_call` is the NOMINAL big blind (engine rule).
+    ///
+    /// Seat convention: HU → seat 0 = BB, seat 1 = BTN/SB (acts first);
+    /// 3+ seats → seats `0..n-3` UTG.., `n-2` = SB, `n-1` = BB, seat 0 first.
+    ///
+    /// `extra_dead_chips` is added to the pot on top of the posts (HU preflop
+    /// passes `pot_bb − posts`, normally 0).
+    ///
+    /// (review 2026-09-20 E1) One validated constructor instead of four
+    /// hand-rolled copies that posted blinds with `saturating_sub` and no
+    /// all-in flag.
+    pub fn preflop_root(
+        stacks: &[u64],
+        bb: u64,
+        sb: u64,
+        ante: u64,
+        extra_dead_chips: u64,
+    ) -> Result<Self, CfrError> {
+        let n = stacks.len();
+        if !(2..=MAX_SEATS).contains(&n) {
+            return Err(CfrError::InvalidRoot(format!(
+                "num_seats {n} out of 2..{MAX_SEATS}"
+            )));
+        }
+        if bb == 0 {
+            return Err(CfrError::InvalidRoot("bb must be > 0".into()));
+        }
+        if stacks.iter().any(|&s| s == 0) {
+            return Err(CfrError::InvalidRoot("preflop stacks must be > 0 chips".into()));
+        }
+        let (sb_seat, bb_seat, first, button) = if n == 2 {
+            (1usize, 0usize, 1u8, 1u8)
+        } else {
+            (n - 2, n - 1, 0u8, (n - 3) as u8)
+        };
+        let mut s = Self {
+            num_seats: n as u8,
+            pot: extra_dead_chips,
+            stacks: [0; MAX_SEATS],
+            street_commit: [0; MAX_SEATS],
+            total_commit: [0; MAX_SEATS],
+            bet_to_call: bb,
+            last_raise_size: bb,
+            last_aggression_was_full_raise: true,
+            street_level_acted: [0; MAX_SEATS],
+            acted_this_street: [false; MAX_SEATS],
+            actor: Some(first),
+            folded: [false; MAX_SEATS],
+            all_in: [false; MAX_SEATS],
+            board: [0; 5],
+            board_len: 0,
+            button,
+            bb,
+            last_aggressor: None,
+            street: 0,
+        };
+        for i in 0..n {
+            let ante_pay = ante.min(stacks[i]);
+            s.stacks[i] = stacks[i] - ante_pay;
+            s.total_commit[i] = ante_pay;
+            s.pot += ante_pay;
+        }
+        for (seat, blind) in [(sb_seat, sb), (bb_seat, bb)] {
+            let pay = blind.min(s.stacks[seat]);
+            s.stacks[seat] -= pay;
+            s.street_commit[seat] = pay;
+            s.total_commit[seat] += pay;
+            s.pot += pay;
+        }
+        s.seal_root();
         Ok(s)
     }
 
@@ -293,16 +372,18 @@ impl PublicState {
         let current_commit = self.street_commit[actor];
         let stack = self.stacks[actor];
         let to_call_raw = self.bet_to_call.saturating_sub(current_commit);
+        // Saturating like the engine's sizing (`engine_bridge::raise_pm_chips`):
+        // an absurd per-mille from Python must not overflow-panic.
         let raise_over = if self.bet_to_call == 0 {
-            self.pot * (pm as u64) / 1000
+            self.pot.saturating_mul(pm as u64) / 1000
         } else {
-            let pot_after_call = self.pot + to_call_raw;
-            pot_after_call * (pm as u64) / 1000
+            let pot_after_call = self.pot.saturating_add(to_call_raw);
+            pot_after_call.saturating_mul(pm as u64) / 1000
         };
         let target_total = if self.bet_to_call == 0 {
             raise_over
         } else {
-            self.bet_to_call + raise_over
+            self.bet_to_call.saturating_add(raise_over)
         };
         let min_total = self.min_bet_total();
         let max_total = self.max_bet_total();
@@ -433,7 +514,7 @@ impl PublicState {
         let n = self.n();
         let mut actor = None;
         for i in 0..n {
-            if !self.folded[i] && !self.all_in[i] {
+            if self.can_act(i) {
                 actor = Some(i as u8);
                 break;
             }
@@ -456,12 +537,46 @@ impl PublicState {
         (0..52u8).filter(|&c| !used[c as usize]).collect()
     }
 
+    /// A seat that can still make a decision: not folded, not all-in, and
+    /// holding chips.
+    ///
+    /// (review 2026-09-20 E1) `stacks == 0` counts as all-in even when the flag
+    /// was never set. Solver roots build states by hand (blinds/antes posted
+    /// with `saturating_sub`), and a chipless seat whose `street_commit` is
+    /// below `bet_to_call` used to be handed the action forever: its only
+    /// legal move is a 0-chip call that never matches the bet, so
+    /// `find_next_actor` returned it again → unbounded recursion → native
+    /// stack overflow (HU preflop with stack <= ante + bb killed the process).
+    #[inline]
+    pub fn can_act(&self, seat: usize) -> bool {
+        !self.folded[seat] && !self.all_in[seat] && self.stacks[seat] > 0
+    }
+
+    /// Flag every chipless live seat all-in and, if the current actor cannot
+    /// act, move the action to the next seat that can (or close the street).
+    /// Call after hand-building a root (blinds/antes posted manually).
+    pub fn seal_root(&mut self) {
+        for i in 0..self.n() {
+            if !self.folded[i] && self.stacks[i] == 0 {
+                self.all_in[i] = true;
+            }
+        }
+        if let Some(a) = self.actor {
+            let a = a as usize;
+            if !self.can_act(a) {
+                // Same order as play: next seat clockwise that still owes a decision.
+                let prev = (a + self.n() - 1) % self.n();
+                self.actor = self.find_next_actor(prev).map(|s| s as u8);
+            }
+        }
+    }
+
     fn find_next_actor(&self, after: usize) -> Option<usize> {
         let n = self.n();
         let start = (after + 1) % n;
         for i in 0..n {
             let s = (start + i) % n;
-            if self.folded[s] || self.all_in[s] {
+            if !self.can_act(s) {
                 continue;
             }
             if !self.acted_this_street[s] || self.street_commit[s] < self.bet_to_call {
@@ -547,6 +662,58 @@ mod tests {
         assert_eq!(s.stacks[0], 100_000);
         assert_eq!(s.stacks[3], 40_000);
         assert_eq!(s.pot, 20_000);
+    }
+
+    /// (review 2026-09-20 E1) a chipless seat is never handed the action, even
+    /// when nobody set its all-in flag — this was the unbounded recursion.
+    #[test]
+    fn chipless_seat_never_gets_the_action() {
+        // Hand-built state exactly like the old HU preflop root at stack 1 bb:
+        // both stacks saturate to 0, flags unset, SB owes half a blind.
+        let mut s = PublicState::hu_postflop_root(25_000, 10_000, &[0, 1, 2], 10_000).unwrap();
+        s.street = 0;
+        s.board_len = 0;
+        s.stacks = [0; MAX_SEATS];
+        s.street_commit[0] = 10_000;
+        s.street_commit[1] = 5_000;
+        s.bet_to_call = 10_000;
+        s.actor = Some(1);
+        assert!(!s.can_act(0) && !s.can_act(1));
+        // Old behaviour: apply_check_call() re-selected seat 1 forever.
+        let mut steps = 0;
+        while s.actor.is_some() && steps < 10 {
+            s.apply_check_call();
+            steps += 1;
+        }
+        assert!(s.actor.is_none(), "action kept cycling on a chipless seat");
+        assert!(steps <= 1);
+        // seal_root() does the same up front.
+        let mut t = PublicState::hu_postflop_root(25_000, 10_000, &[0, 1, 2], 10_000).unwrap();
+        t.stacks = [0; MAX_SEATS];
+        t.seal_root();
+        assert!(t.actor.is_none() && t.all_in[0] && t.all_in[1]);
+    }
+
+    #[test]
+    fn preflop_root_posts_blinds_and_flags_short_all_ins() {
+        // HU 100bb, ante 0.5bb: seat 0 = BB, seat 1 = BTN/SB first to act.
+        let s = PublicState::preflop_root(&[1_000_000, 1_000_000], 10_000, 5_000, 5_000, 0).unwrap();
+        assert_eq!((s.actor, s.button, s.street, s.board_len), (Some(1), 1, 0, 0));
+        assert_eq!(s.pot, 25_000);
+        assert_eq!(&s.stacks[..2], &[985_000, 990_000]);
+        assert_eq!(&s.street_commit[..2], &[10_000, 5_000]);
+        assert_eq!(&s.total_commit[..2], &[15_000, 10_000]);
+        assert_eq!(s.to_call_chips(), 5_000);
+        // 4-handed: UTG first, SB/BB on the last two seats, BTN = seat 1.
+        let s = PublicState::preflop_root(&[100_000; 4], 10_000, 5_000, 0, 0).unwrap();
+        assert_eq!((s.actor, s.button, s.pot), (Some(0), 1, 15_000));
+        assert_eq!(&s.stacks[..4], &[100_000, 100_000, 95_000, 90_000]);
+        // Short BB: posts what it has and is all-in; chips are conserved.
+        let s = PublicState::preflop_root(&[100_000, 100_000, 6_000], 10_000, 5_000, 0, 0).unwrap();
+        assert!(s.all_in[2] && s.stacks[2] == 0 && s.street_commit[2] == 6_000);
+        assert_eq!(s.bet_to_call, 10_000, "callers still owe the nominal blind");
+        assert_eq!(s.pot + s.stacks[..3].iter().sum::<u64>(), 206_000);
+        assert!(PublicState::preflop_root(&[100_000, 0], 10_000, 5_000, 0, 0).is_err());
     }
 
     /// deal_board_card advances board_len and street on flop→turn.

@@ -12,18 +12,25 @@ Run with: `uvicorn plo5bp.ui.server:app --port 8765`.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import inspect
 import logging
+import math
 import os
+import re
 import threading
 import time
 from pathlib import Path
 from typing import Any, Literal
 
+import anyio.to_thread
 import numpy as np
 import torch
 import torch.nn.functional as F
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -39,6 +46,7 @@ from plo5bp.config import GameConfig, VARIANT_NLH, VARIANT_PLO5
 # UI-only format id: same engine rules as PLO5 double-board bomb pot, but
 # serves the minimal-obs ablation stem (vMin1). Not a GameConfig.variant.
 FORMAT_EXPERIMENTAL = "experimental"
+import plo5bp.encoding as _encoding  # module handle: OBS_SEMANTICS_REV is read late
 from plo5bp.encoding import encode_observation
 from plo5bp.env import BombPotEnv
 from plo5bp.encoding import OBS_DIM, OBS_DIM_MINIMAL
@@ -70,6 +78,7 @@ from plo5bp.ui.common import (
     STREET_NAMES,
     anchor_label as _anchor_label,
     anchor_label_spec as _spec_anchor_label,
+    effective_button as _effective_button,
     position_name as _common_position_name,
 )
 
@@ -171,6 +180,70 @@ def _random_init_model(variant: str) -> ActorCritic:
     return ActorCritic(hidden_dim=128, num_layers=2)
 
 
+# --- Observation-semantics revision ------------------------------------------
+# (review 2026-09-20) The observation feature fixes from this review change
+# VALUES, not the layout: same width, different numbers in the corrected
+# dims. `plo5bp.encoding.OBS_SEMANTICS_REV` (env `PLO5BP_OBS_REV`; 2 = the
+# corrected features, 1 = the exact pre-review values) says which semantics
+# this PROCESS encodes; train.py stamps `obs_rev` into new checkpoints, and a
+# checkpoint without the key was trained on rev 1. A model served on the
+# other revision gets inputs it never saw, silently — so a mismatch is
+# reported loudly and surfaced per format, but never refused: the operator
+# picks the revision, the UI keeps serving.
+
+#: variant -> {"obs_rev": int, "obs_rev_mismatch": bool} for the checkpoint
+#: `_load_model` last loaded for that format.
+_OBS_REV_INFO: dict[str, dict[str, Any]] = {}
+#: (checkpoint path, checkpoint rev, process rev) already warned about.
+_OBS_REV_WARNED: set[tuple[str, int, int]] = set()
+
+
+def _process_obs_rev() -> int:
+    """The obs-semantics revision this process encodes. Read late (and with a
+    default) so it works before the encoder-side switch lands."""
+    return int(getattr(_encoding, "OBS_SEMANTICS_REV", 2))
+
+
+def _note_checkpoint_obs_rev(
+    variant: str, ckpt: Any, ckpt_path: Path, loaded: bool
+) -> None:
+    process_rev = _process_obs_rev()
+    if not loaded:
+        # A random-init placeholder was trained on nothing: never a mismatch.
+        _OBS_REV_INFO[variant] = {
+            "obs_rev": process_rev, "obs_rev_mismatch": False,
+        }
+        return
+    raw = ckpt.get("obs_rev", 1) if isinstance(ckpt, dict) else 1
+    try:
+        ckpt_rev = int(raw)
+    except (TypeError, ValueError):
+        ckpt_rev = 1
+    mismatch = ckpt_rev != process_rev
+    _OBS_REV_INFO[variant] = {"obs_rev": ckpt_rev, "obs_rev_mismatch": mismatch}
+    key = (str(ckpt_path), ckpt_rev, process_rev)
+    if mismatch and key not in _OBS_REV_WARNED:
+        _OBS_REV_WARNED.add(key)
+        logger.warning(
+            "OBS-REV MISMATCH: checkpoint %s (%s) was trained on observation "
+            "semantics rev %d, but this process encodes rev %d — the model is "
+            "being fed feature values it never saw. Still serving it; set "
+            "PLO5BP_OBS_REV=%d and restart to serve it exactly as trained.",
+            ckpt_path, variant, ckpt_rev, process_rev, ckpt_rev,
+        )
+
+
+def _obs_rev_entry(variant: str) -> dict[str, Any]:
+    """The `FORMATS` fields describing the checkpoint just loaded for
+    ``variant`` (call right after `_load_model`)."""
+    return dict(
+        _OBS_REV_INFO.get(
+            variant,
+            {"obs_rev": _process_obs_rev(), "obs_rev_mismatch": False},
+        )
+    )
+
+
 def _load_model(variant: str = VARIANT_PLO5) -> tuple[ActorCritic, bool]:
     """Load the format's promoted checkpoint. Returns (model, loaded) —
     loaded=False means a random-init placeholder is being served."""
@@ -181,11 +254,13 @@ def _load_model(variant: str = VARIANT_PLO5) -> tuple[ActorCritic, bool]:
             "checkpoint %s not found — using random-init model (%s)",
             ckpt_path, variant,
         )
+        _note_checkpoint_obs_rev(variant, None, ckpt_path, loaded=False)
         return _random_init_model(variant).to(device).eval(), False
     try:
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     except Exception as e:
         logger.warning("failed to load %s (%s) — using random init", ckpt_path, e)
+        _note_checkpoint_obs_rev(variant, None, ckpt_path, loaded=False)
         return _random_init_model(variant).to(device).eval(), False
     if isinstance(ckpt, dict) and "model" in ckpt:
         state_dict = ckpt["model"]
@@ -238,7 +313,40 @@ def _load_model(variant: str = VARIANT_PLO5) -> tuple[ActorCritic, bool]:
         "loaded checkpoint %s (%s, hidden_dim=%d, num_layers=%d, device=%s)",
         ckpt_path, type(model).__name__, hidden_dim, num_layers, device,
     )
+    _note_checkpoint_obs_rev(variant, ckpt, ckpt_path, loaded)
     return model, loaded
+
+
+#: Distributional-critic readout hyperparameters that are NOT sniffable from
+#: the state dict (no parameters — pure forward-path semantics) but change
+#: the served V: a critic trained at a non-default symlog support decodes to
+#: the wrong "true EV" when rebuilt at the default.
+_CRITIC_VALUE_KWARGS = ("value_support", "value_hlgauss_sigma")
+
+
+def _critic_value_kwargs(ckpt: Any) -> dict[str, float]:
+    """Keyword args for ``build_critic_from_state_dict`` taken from the
+    checkpoint's ``config`` block.
+
+    (review 2026-09-20) The builder is gaining optional ``value_support`` /
+    ``value_hlgauss_sigma`` kwargs; pass the run's stamped values when the
+    checkpoint carries them, but only the ones the installed builder
+    actually accepts — signature-guarded so this works before and after
+    that change lands.
+    """
+    cfg_block = ckpt.get("config") if isinstance(ckpt, dict) else None
+    if not isinstance(cfg_block, dict):
+        return {}
+    try:
+        accepted = inspect.signature(build_critic_from_state_dict).parameters
+    except (TypeError, ValueError):
+        return {}
+    out: dict[str, float] = {}
+    for key in _CRITIC_VALUE_KWARGS:
+        value = cfg_block.get(key)
+        if key in accepted and value is not None:
+            out[key] = float(value)
+    return out
 
 
 def _load_critic(device: torch.device, variant: str = VARIANT_PLO5) -> CentralCritic | None:
@@ -264,7 +372,9 @@ def _load_critic(device: torch.device, variant: str = VARIANT_PLO5) -> CentralCr
         # Dims (obs width, hidden, residual depth) are sniffed from the
         # state dict — NLH critics are 995-wide, PLO 991, and constructing
         # at the PLO default used to shape-fail every NLH load.
-        critic = build_critic_from_state_dict(ckpt["critic"])
+        critic = build_critic_from_state_dict(
+            ckpt["critic"], **_critic_value_kwargs(ckpt)
+        )
     except Exception as e:
         logger.warning(
             "checkpoint %s critic incompatible (%s) — true-EV disabled",
@@ -321,6 +431,8 @@ FORMATS: dict[str, dict[str, Any]] = {
         "adapter": OBS_ADAPT,
         "loaded": MODEL_LOADED,
         "engine_variant": VARIANT_PLO5,
+        # obs_rev / obs_rev_mismatch — see "Observation-semantics revision".
+        **_obs_rev_entry(VARIANT_PLO5),
     },
     VARIANT_NLH: {
         "label": "NLH 5/10 ($5 ante)",
@@ -329,6 +441,7 @@ FORMATS: dict[str, dict[str, Any]] = {
         "adapter": obs_adapter(NLH_MODEL),
         "loaded": NLH_MODEL_LOADED,
         "engine_variant": VARIANT_NLH,
+        **_obs_rev_entry(VARIANT_NLH),
     },
     FORMAT_EXPERIMENTAL: {
         "label": "experimental",
@@ -339,6 +452,7 @@ FORMATS: dict[str, dict[str, Any]] = {
         # Same table rules as PLO5; only the policy/obs differ.
         "engine_variant": VARIANT_PLO5,
         "_ckpt_path": str(_format_ckpt_path(FORMAT_EXPERIMENTAL)),
+        **_obs_rev_entry(FORMAT_EXPERIMENTAL),
     },
 }
 
@@ -366,6 +480,7 @@ def _maybe_reload_experimental() -> None:
     entry["adapter"] = obs_adapter(model)
     entry["loaded"] = loaded
     entry["_ckpt_path"] = str(path)
+    entry.update(_obs_rev_entry(FORMAT_EXPERIMENTAL))
     logger.info("experimental format now serving %s (loaded=%s)", path, loaded)
 
 
@@ -426,8 +541,12 @@ class Session:
     last_obs: np.ndarray | None = None
     last_info: Any = None
 
-    # Action log contains only action entries: {"gate": int, "chips": int}.
-    # Street transitions are inferred during replay from engine state.
+    # Action log contains only action entries: {"gate": int, "chips": int}
+    # plus an optional "seat" (the seat the entry was attributed to when it
+    # was recorded; absent on count-attributed reconcile entries). Replay
+    # still applies each entry to the ENGINE's current actor — "seat" is
+    # diagnostic only (see _build_env). Street transitions are inferred
+    # during replay from engine state.
     # (Created per-instance in __init__ — mutable, must not be shared.)
     action_log: list[dict[str, Any]]
 
@@ -506,6 +625,20 @@ class Session:
     # the candidate filter excludes.
     _pending_mask_additions: frozenset[int] = frozenset()
     _pending_mask_additions_ticks: int = 0
+
+    # StreetReveal fold-reconcile debounce (OCR path only). Seats that read
+    # visually folded on the reveal tick but have no FOLD yet; they are only
+    # reconciled if they STILL read folded on the following tick, so a
+    # one-frame card-back miss on the reveal frame can't retire a live seat.
+    # `_pending_reveal_target` carries the reveal's target street to that
+    # follow-up tick (None = no follow-up pending). (review 2026-09-20 F11)
+    _pending_reveal_folds: frozenset[int] = frozenset()
+    _pending_reveal_target: int | None = None
+
+    # (log index, recorded seat, engine actor) triples already warned about
+    # by the replay seat-attribution check, so a persistent mismatch logs
+    # once per hand instead of once per tick. (review 2026-09-20 F15)
+    _replay_mismatch_warned: frozenset[tuple[int, int, int]] = frozenset()
 
     # Snapshots captured at first-time street reveal during replay.
     # Compared against current card spec to flag "modified since reveal".
@@ -657,8 +790,21 @@ def _lock_filled_card_slots() -> None:
                 locks[i] = True
 
 
+def _card_held_by_other_slot(attr: str, idx: int, card: int) -> bool:
+    """True when ``card`` already sits in a spec slot other than (attr, idx)."""
+    for other_attr, _ in _card_spec_attrs():
+        for j, c in enumerate(getattr(session, other_attr)):
+            if c is not None and int(c) == int(card) and (other_attr, j) != (attr, idx):
+                return True
+    return False
+
+
 def _ocr_apply_card_slot(
-    attr: str, idx: int, ocr_card_idx: int | None, debounce: bool = False
+    attr: str,
+    idx: int,
+    ocr_card_idx: int | None,
+    debounce: bool = False,
+    reject_duplicates: bool | None = None,
 ) -> None:
     """Write an OCR-detected card into the spec slot if it isn't locked.
 
@@ -666,11 +812,24 @@ def _ocr_apply_card_slot(
     identically for ``_CARD_STABLE_TICKS`` consecutive ticks before it commits
     and locks — so a transient mid-reveal misread can't latch. ``debounce=False``
     (manual rescan, explicit edits) commits immediately, as before.
+
+    ``reject_duplicates`` refuses to commit a card that another slot already
+    holds: a stable misread that duplicated a card used to lock, after which
+    ``_pad_all`` 400'd every tick and the session was wedged until a manual
+    edit. The slot stays empty + unlocked so a later correct read (or the
+    user) can still fill it. Default (None) = on for the debounced automatic
+    mirror, off for immediate commits; the PokerNow mirror opts in, manual
+    rescan stays off on purpose — its duplicate path is the pinned
+    400 + rollback. (review 2026-09-20 H7)
     """
+    if reject_duplicates is None:
+        reject_duplicates = debounce
     if session._card_slot_locked[attr][idx]:
         return
     if not debounce:
         if ocr_card_idx is None:
+            return
+        if reject_duplicates and _card_held_by_other_slot(attr, idx, ocr_card_idx):
             return
         getattr(session, attr)[idx] = ocr_card_idx
         session._card_slot_locked[attr][idx] = True
@@ -685,9 +844,15 @@ def _ocr_apply_card_slot(
     count = prev[1] + 1 if (prev is not None and prev[0] == ocr_card_idx) else 1
     pending[idx] = (ocr_card_idx, count)
     if count >= _CARD_STABLE_TICKS:
+        pending[idx] = None
+        if reject_duplicates and _card_held_by_other_slot(attr, idx, ocr_card_idx):
+            logger.info(
+                "ocr: %s[%d] read card %d, already held by another slot — "
+                "not committing", attr, idx, ocr_card_idx,
+            )
+            return
         getattr(session, attr)[idx] = ocr_card_idx
         session._card_slot_locked[attr][idx] = True
-        pending[idx] = None
 
 
 def _new_session_defaults() -> None:
@@ -713,6 +878,9 @@ def _new_session_defaults() -> None:
     session._pending_hero_hole_rotation_ticks = 0
     session._last_observed_button = None
     session._button_stable_ticks = 0
+    session._pending_reveal_folds = frozenset()
+    session._pending_reveal_target = None
+    session._replay_mismatch_warned = frozenset()
     session._card_slot_locked = {
         attr: [False] * n for attr, n in _card_spec_attrs()
     }
@@ -726,6 +894,45 @@ def _clear_hand_state_keep_cards() -> None:
     session.snapshot_at_river = None
     session.last_obs = None
     session.last_info = None
+    session._replay_mismatch_warned = frozenset()
+
+
+def _reset_live_tracking() -> None:
+    """Forget everything the live hand-start machine has accumulated.
+
+    `_new_session_defaults` deliberately keeps the cross-hand debounce state
+    (`_pending_*`, `last_hero_hole`, observed stacks/pot) because
+    `_begin_new_hand` calls it mid-stream. A user-level reset is different:
+    after `/reset`, `/format`, an OCR (re)start or a live-source switch the
+    old `_pending_anchor_fs` is a frame from a hand that no longer exists,
+    and the still-"stable" tick counter let the very next tick fire
+    `_begin_new_hand` with that stale anchor — seeding stacks and the
+    reconstructor baseline from minutes-old reads. Clearing the counters
+    makes the next hand-start debounce from scratch on fresh frames.
+    (review 2026-09-20 F10)
+    """
+    session._pending_button = None
+    session._pending_sitting_out = None
+    session._pending_stable_ticks = 0
+    session._pending_anchor_fs = None
+    session.last_hero_hole = None
+    session.observed_stacks = ()
+    session.observed_pot = None
+    session.sitting_out_seats = frozenset()
+    session.hand_in_hand_mask = frozenset()
+    session.folded_this_hand = frozenset()
+    session._pending_mask_additions = frozenset()
+    session._pending_mask_additions_ticks = 0
+    session._ticks_since_hand_start = 0
+    session._pending_hero_hole_rotation = None
+    session._pending_hero_hole_rotation_ticks = 0
+    session._last_observed_button = None
+    session._button_stable_ticks = 0
+    session._pending_reveal_folds = frozenset()
+    session._pending_reveal_target = None
+    # The mask decides who the engine deals in, so the env built with it is
+    # stale now. Callers rebuild right away or let the next reader do it.
+    session.env = None
 
 
 def _current_total_commit(num_seats: int, ante: int) -> list[int]:
@@ -736,31 +943,54 @@ def _current_total_commit(num_seats: int, ante: int) -> list[int]:
     Falls back to `[ante] * num_seats` when no env exists yet (cold
     start) or the seat-count just changed.
     """
-    if session.env is not None:
+    commits = _current_engine_seat_array("total_commit")
+    if commits is not None and len(commits) == num_seats:
+        return commits
+    return [int(ante)] * num_seats
+
+
+def _current_behind_stacks() -> list[int] | None:
+    """Per-seat chips behind at the current replay end (None if no env)."""
+    return _current_engine_seat_array("stacks")
+
+
+def _current_engine_seat_array(key: str) -> list[int] | None:
+    if session.env is None:
+        # A live hand-start invalidates the env and a fresh per-user Session
+        # has none yet; rebuild so callers see real commits (NLH blinds
+        # included) instead of their ante-only fallback. Best-effort: a
+        # session whose current state can't rebuild falls through.
         try:
-            raw = dict(session.env._rs.observation_dict())
-            tc = raw.get("total_commit") or []
-            commits = [int(x) for x in tc]
-            if len(commits) == num_seats:
-                return commits
+            _rebuild_env()
         except Exception:
             pass
-    return [int(ante)] * num_seats
+    if session.env is not None:
+        try:
+            raw = session.env._rs.observation_dict(skip_outcome_mc=True)
+            return [int(x) for x in (raw.get(key) or [])]
+        except Exception:
+            pass
+    return None
 
 
 # --- Card padding -----------------------------------------------------------
 
-def _pad_all() -> dict[str, list[int]]:
-    """Resolve nullable card spec to a fully-padded 11+4 deck slice.
+def _pad_cards(
+    hero_hole: list[int | None],
+    flop_a: list[int | None],
+    flop_b: list[int | None],
+    turn_cards: list[int | None],
+    river_cards: list[int | None],
+) -> dict[str, list[int]]:
+    """Resolve a nullable card spec to a fully-padded 11+4 deck slice.
 
     User-entered cards go in first; nulls are filled by scanning 0..51
     and taking the lowest unused index. Raises HTTP 400 on duplicates.
+    Pure — reads nothing from the session, so handlers can run it on a
+    CANDIDATE spec before committing it.
     """
     user_cards: list[int] = []
-    for spec in (
-        session.hero_hole, session.flop_a, session.flop_b,
-        session.turn_cards, session.river_cards,
-    ):
+    for spec in (hero_hole, flop_a, flop_b, turn_cards, river_cards):
         for c in spec:
             if c is not None:
                 user_cards.append(int(c))
@@ -785,26 +1015,103 @@ def _pad_all() -> dict[str, list[int]]:
         return out
 
     return {
-        "hero_hole": pad(session.hero_hole),
-        "flop_a": pad(session.flop_a),
-        "flop_b": pad(session.flop_b),
-        "turn": pad(session.turn_cards),
-        "river": pad(session.river_cards),
+        "hero_hole": pad(hero_hole),
+        "flop_a": pad(flop_a),
+        "flop_b": pad(flop_b),
+        "turn": pad(turn_cards),
+        "river": pad(river_cards),
     }
 
 
+def _pad_all() -> dict[str, list[int]]:
+    """`_pad_cards` over the session's current card spec."""
+    return _pad_cards(
+        session.hero_hole, session.flop_a, session.flop_b,
+        session.turn_cards, session.river_cards,
+    )
+
+
 # --- Rebuild env (canonical path) -------------------------------------------
+#
+# (review 2026-09-20 H7) The rebuild is split into a PURE build step and a
+# commit step so request handlers can validate-then-commit: `_build_env`
+# constructs + replays an env from an explicit `_EnvSpec` without touching
+# the session, and only `_commit_env_build` writes. `/cards`, `/seats`,
+# `/config`, `/action` and `/undo` build their CANDIDATE spec first, so a
+# rejected request (duplicate card, engine refusal, absurd stacks) leaves the
+# session exactly as it was — previously the bad state was stored first and
+# every later rebuild 400/500'd. `_rebuild_env()` remains the one canonical
+# path for everything else: build from the session as-is, then commit.
 
-def _rebuild_env() -> None:
-    """Rebuild env from session state by padding + replaying action_log.
 
-    Updates snapshot_at_turn / snapshot_at_river when replay reaches those
-    streets for the first time. If a previous replay reached a later
-    street but this one doesn't (e.g. after /undo), clears the stale
-    snapshot so the "modified" indicator stops showing.
+@dataclasses.dataclass(frozen=True)
+class _EnvSpec:
+    """The replayable state an env is built from: a snapshot of the session,
+    or a handler's candidate for it."""
+
+    cfg: GameConfig
+    is_nlh: bool
+    num_seats: int
+    button_seat: int
+    hero_seat: int
+    hand_in_hand_mask: frozenset[int]
+    hero_hole: list[int | None]
+    flop_a: list[int | None]
+    flop_b: list[int | None]
+    turn_cards: list[int | None]
+    river_cards: list[int | None]
+    action_log: list[dict[str, Any]]
+
+
+@dataclasses.dataclass
+class _EnvBuild:
+    """Result of `_build_env`, handed to `_commit_env_build`."""
+
+    env: BombPotEnv
+    # Entries the engine accepted, in order (same dict objects as the spec's).
+    kept_log: list[dict[str, Any]]
+    # True when replay dropped at least one entry the engine rejected.
+    dropped_entries: bool
+    reached_turn: bool
+    reached_river: bool
+    # (log index, recorded seat, engine actor) where an entry's recorded
+    # "seat" differed from the actor it was actually applied to.
+    seat_mismatches: list[tuple[int, int, int]]
+
+
+def _session_env_spec(**overrides: Any) -> _EnvSpec:
+    """Snapshot the session's replayable state; ``overrides`` swap in a
+    handler's candidate values."""
+    spec = _EnvSpec(
+        cfg=session.game_config,
+        is_nlh=_engine_variant() == VARIANT_NLH,
+        num_seats=int(session.num_seats),
+        button_seat=int(session.button_seat),
+        hero_seat=int(session.hero_seat),
+        hand_in_hand_mask=frozenset(session.hand_in_hand_mask),
+        hero_hole=list(session.hero_hole),
+        flop_a=list(session.flop_a),
+        flop_b=list(session.flop_b),
+        turn_cards=list(session.turn_cards),
+        river_cards=list(session.river_cards),
+        action_log=list(session.action_log),
+    )
+    return dataclasses.replace(spec, **overrides) if overrides else spec
+
+
+def _build_env(spec: _EnvSpec) -> _EnvBuild:
+    """Build an env from ``spec`` by padding cards + replaying its action log.
+
+    Pure with respect to the session. Raises HTTP 400 when the spec cannot
+    produce a legal engine state (duplicate/out-of-range card, engine refusal
+    at reset, stacks the engine can't represent).
     """
-    padded = _pad_all()
-    cfg = session.game_config
+    padded = _pad_cards(
+        spec.hero_hole, spec.flop_a, spec.flop_b,
+        spec.turn_cards, spec.river_cards,
+    )
+    cfg = spec.cfg
+    hero_seat = int(spec.hero_seat)
 
     # Build the in-hand mask from the locked hand-start membership. When the
     # session has not yet committed a hand-start (mask is empty) we pass
@@ -813,38 +1120,41 @@ def _rebuild_env() -> None:
     # seats no longer post antes (engine-side); this collapses the inflated
     # 6-seat pot down to the real heads-up/3-way pot the OCR sees.
     in_hand_mask: list[bool] | None
-    if session.hand_in_hand_mask:
+    if spec.hand_in_hand_mask:
         in_hand_mask = [
-            i in session.hand_in_hand_mask for i in range(session.num_seats)
+            i in spec.hand_in_hand_mask for i in range(spec.num_seats)
         ]
-        if int(session.hero_seat) not in session.hand_in_hand_mask:
+        if hero_seat not in spec.hand_in_hand_mask:
             in_hand_mask = None
         elif sum(in_hand_mask) < 2:
             in_hand_mask = None
     else:
         in_hand_mask = None
 
-    is_nlh = _engine_variant() == VARIANT_NLH
-    env = BombPotEnv(cfg)
+    is_nlh = spec.is_nlh
     try:
+        env = BombPotEnv(cfg)
         if is_nlh:
             # NLH study starts PREFLOP with a 2-card hole; blinds post in
             # the engine. No in-hand mask (live capture is PLO-only).
             env.reset_study_nlh(
-                button=int(session.button_seat),
-                hero_seat=int(session.hero_seat),
+                button=int(spec.button_seat),
+                hero_seat=hero_seat,
                 hero_hole=list(padded["hero_hole"]),
             )
         else:
             env.reset_study(
-                button=int(session.button_seat),
-                hero_seat=int(session.hero_seat),
+                button=int(spec.button_seat),
+                hero_seat=hero_seat,
                 hero_hole=list(padded["hero_hole"]),
                 flop_a=list(padded["flop_a"]),
                 flop_b=list(padded["flop_b"]),
                 in_hand_mask=in_hand_mask,
             )
-    except ValueError as e:
+    except (ValueError, OverflowError) as e:
+        # OverflowError: stacks numpy can't pack into the engine's u64 array
+        # (negative / >= 2**64). Handlers bound their inputs; this keeps an
+        # out-of-band bad config a 400 rather than a 500.
         raise HTTPException(status_code=400, detail=str(e)) from e
 
     reached_turn = False
@@ -897,14 +1207,22 @@ def _rebuild_env() -> None:
         benign action; when a real bet lands later, the next pass folds
         them for real. Streets may advance as a result, so we interleave
         with `_advance_streets`.
+
+        (review 2026-09-20 I8) Hero is NEVER auto-acted, even when the
+        anchor frame missed hero (hero outside the mask ⇒ the engine deals
+        every seat in). Auto-checking/folding hero silently burned hero's
+        turn, so the UI never waited on hero and produced no recommendation
+        all hand; hero's actions must always be explicit log entries.
         """
-        if not session.hand_in_hand_mask:
+        if not spec.hand_in_hand_mask:
             return
-        all_seats = frozenset(range(session.num_seats))
-        structurally_sitting = all_seats - session.hand_in_hand_mask
+        all_seats = frozenset(range(spec.num_seats))
+        structurally_sitting = (
+            all_seats - spec.hand_in_hand_mask - {hero_seat}
+        )
         if not structurally_sitting:
             return
-        for _ in range(session.num_seats * 4):
+        for _ in range(spec.num_seats * 4):
             _advance_streets()
             actor = env.current_actor()
             if actor is None or int(actor) not in structurally_sitting:
@@ -924,11 +1242,23 @@ def _rebuild_env() -> None:
     # in sync with the current hand and the dropped event surfaces as a
     # warning.
     kept: list[dict[str, Any]] = []
-    for entry in session.action_log:
+    seat_mismatches: list[tuple[int, int, int]] = []
+    for log_idx, entry in enumerate(spec.action_log):
         _advance_streets()
         _auto_fold_sitting_out()
         gate = int(entry["gate"])
         chips = int(entry["chips"])
+        # (review 2026-09-20 F15) Entries are applied to the ENGINE's current
+        # actor, whoever recorded them. When the recorder (OCR walk / manual
+        # click) attributed the entry to a different seat, the log and the
+        # table have diverged — surface it; replay semantics are unchanged.
+        recorded_seat = entry.get("seat")
+        if recorded_seat is not None:
+            actor_now = env.current_actor()
+            if actor_now is not None and int(actor_now) != int(recorded_seat):
+                seat_mismatches.append(
+                    (log_idx, int(recorded_seat), int(actor_now))
+                )
         # Clamp an over-effective-stack bet to the engine's max raise instead of
         # dropping it. A live site (PokerNow) lets a deep player bet more than a
         # short opponent can cover — e.g. $50 into a $15 effective stack. The
@@ -953,13 +1283,38 @@ def _rebuild_env() -> None:
             logger.warning(
                 "rebuild_env skipping illegal action %s: %s", entry, e
             )
-    if len(kept) != len(session.action_log):
-        session.action_log = kept
 
     _advance_streets()
     _auto_fold_sitting_out()
 
-    if reached_turn:
+    return _EnvBuild(
+        env=env,
+        kept_log=kept,
+        dropped_entries=len(kept) != len(spec.action_log),
+        reached_turn=reached_turn,
+        reached_river=reached_river,
+        seat_mismatches=seat_mismatches,
+    )
+
+
+def _commit_env_build(build: _EnvBuild) -> None:
+    """Install a finished build as the session's env.
+
+    The session's card spec / config / action log must already hold the
+    state the build was made from (a handler commits its candidate fields
+    first, then calls this).
+
+    Updates snapshot_at_turn / snapshot_at_river when replay reaches those
+    streets for the first time. If a previous replay reached a later
+    street but this one doesn't (e.g. after /undo), clears the stale
+    snapshot so the "modified" indicator stops showing.
+    """
+    # Entries the engine rejected are dropped for future ticks (see the
+    # replay loop). Only replace the list when something was dropped.
+    if build.dropped_entries:
+        session.action_log = build.kept_log
+
+    if build.reached_turn:
         if session.snapshot_at_turn is None:
             session.snapshot_at_turn = {
                 "flop_a": list(session.flop_a),
@@ -968,7 +1323,7 @@ def _rebuild_env() -> None:
     else:
         session.snapshot_at_turn = None
 
-    if reached_river:
+    if build.reached_river:
         if session.snapshot_at_river is None:
             session.snapshot_at_river = {
                 "flop_a": list(session.flop_a),
@@ -978,8 +1333,69 @@ def _rebuild_env() -> None:
     else:
         session.snapshot_at_river = None
 
-    session.env = env
+    session.env = build.env
     _refresh_obs()
+
+    fresh = [
+        m for m in build.seat_mismatches
+        if m not in session._replay_mismatch_warned
+    ]
+    if fresh:
+        session._replay_mismatch_warned = frozenset(
+            session._replay_mismatch_warned | set(fresh)
+        )
+        for log_idx, recorded_seat, actor_now in fresh:
+            logger.warning(
+                "replay: action_log[%d] was recorded for seat %d but the "
+                "engine applied it to seat %d — log and table have diverged",
+                log_idx, recorded_seat, actor_now,
+            )
+
+    _sync_folds_with_engine()
+
+
+def _rebuild_env() -> None:
+    """Rebuild env from session state by padding + replaying action_log.
+
+    The canonical path: build from the session exactly as it stands, then
+    commit. Raises (HTTP 400) without touching ``session.env`` when the
+    current state can't produce a legal engine state.
+    """
+    _commit_env_build(_build_env(_session_env_spec()))
+
+
+def _sync_folds_with_engine() -> None:
+    """Make ``folded_this_hand`` agree with the engine after a rebuild.
+
+    (review 2026-09-20 F9/F11) ``folded_this_hand`` is written when a FOLD is
+    *recorded*, but the engine is what the walk, the UI and the next replay
+    actually follow. They diverged two ways: (1) a recorded FOLD the engine
+    rejected (no bet to face) was dropped from the log yet left the seat in
+    ``folded_this_hand`` ⇒ ``EngineView.sitting_out`` skipped a seat the
+    engine was still waiting on, and every later action landed one seat off;
+    (2) ``/undo`` of an OCR fold popped the log entry but the seat stayed
+    folded. So after every rebuild the set is re-derived from the engine's
+    folded flags over the seats dealt into the hand. This is the ONE place
+    the set may shrink mid-hand, and only when the engine says the seat is
+    live. Live mode only — without a hand-start mask (plain study) the set
+    and ``sitting_out_seats`` stay untouched.
+    """
+    mask = session.hand_in_hand_mask
+    env = session.env
+    if not mask or env is None:
+        return
+    info = session.last_info
+    if info is not None and getattr(info, "raw_obs", None) is not None:
+        flags = info.raw_obs["folded"]
+    else:
+        flags = env._rs.observation_dict(skip_outcome_mc=True)["folded"]
+    engine_folded = frozenset(
+        i for i in mask if i < len(flags) and bool(flags[i])
+    )
+    if engine_folded != session.folded_this_hand:
+        session.folded_this_hand = engine_folded
+    all_seats = frozenset(range(session.num_seats))
+    session.sitting_out_seats = (all_seats - mask) | session.folded_this_hand
 
 
 def _refresh_obs() -> None:
@@ -1009,16 +1425,33 @@ class CardsRequest(BaseModel):
     river: list[int | None] = Field(default_factory=lambda: [None, None])
 
 
+#: Upper bound for any chip quantity a request may set (per-seat stack, the
+#: table total, bb, ante). The engine carries chips as u64 and sums commits
+#: into the pot: six seats at 2**62 each silently wrapped the pot mod 2**64,
+#: and anything negative / above 2**64 raised OverflowError inside numpy ⇒
+#: every later rebuild 500'd. (review 2026-09-20 H7)
+_MAX_CHIPS = 2**62
+#: Sanity ceiling for "$ per big blind". Finite-but-absurd values (1e308)
+#: overflow the cents↔chips conversions the live path runs every tick.
+_MAX_DOLLARS_PER_BB = 1_000_000.0
+
+
 class SeatsRequest(BaseModel):
     num_seats: int | None = Field(default=None, ge=2, le=6)
     button_seat: int | None = Field(default=None, ge=0, le=5)
     starting_stacks: list[int] | None = None
+    # `starting_stacks` historically carries the client's "chips behind" per
+    # seat. True = the list is ENGINE STARTING stacks, used verbatim. See
+    # `seats()` for how an unflagged list is treated on a seat/button change.
+    stacks_are_starting: bool = False
 
 
 class ConfigRequest(BaseModel):
-    bb_chips: int | None = Field(default=None, ge=1)
-    ante_chips: int | None = Field(default=None, ge=0)
-    dollars_per_bb: float | None = Field(default=None, gt=0)
+    bb_chips: int | None = Field(default=None, ge=1, le=_MAX_CHIPS)
+    ante_chips: int | None = Field(default=None, ge=0, le=_MAX_CHIPS)
+    dollars_per_bb: float | None = Field(
+        default=None, gt=0, le=_MAX_DOLLARS_PER_BB, allow_inf_nan=False
+    )
     starting_stacks: list[int] | None = None
 
 
@@ -1049,11 +1482,23 @@ def _ocr_cents_to_engine_chips(cents: int) -> int:
     live in ``_reset_for_new_hand`` (raw_cents + cfg.ante_chips) is a
     bug; always run cents through this helper first.
     """
-    cfg = session.game_config
+    scale = _chips_per_cent()
+    if scale is None:
+        return int(cents)
+    # Same single multiply + round as `ocr.events.cents_to_engine_chips`, on
+    # the same `chips_per_cent` the EngineView carries, so a stack seeded here
+    # and a bet converted by the reconstructor can never round differently
+    # (the old `cents * bb / (100 * dpb)` op order could be 1 chip off at
+    # non-integer scales).
+    return int(round(int(cents) * scale))
+
+
+def _chips_per_cent() -> float | None:
+    """Engine chips per OCR cent (None when $/bb is unusable)."""
     dpb = float(session.dollars_per_bb)
     if dpb <= 0:
-        return int(cents)
-    return int(round(int(cents) * float(cfg.bb) / (100.0 * dpb)))
+        return None
+    return float(session.game_config.bb) / (100.0 * dpb)
 
 
 def _seat_action_to_log_entry(ev: Any) -> dict[str, int]:
@@ -1061,15 +1506,21 @@ def _seat_action_to_log_entry(ev: Any) -> dict[str, int]:
 
     ``SeatAction.chips`` is already a raise-by delta in engine-chips
     (the reconstructor converts OCR cents at its boundary); no unit
-    fixup needed here.
+    fixup needed here. ``seat`` records who the walk attributed the
+    action to (diagnostic only — see the replay loop in `_build_env`).
     """
-    return {"gate": int(_GATE_NAME_TO_IDX[ev.gate]), "chips": int(ev.chips)}
+    return {
+        "gate": int(_GATE_NAME_TO_IDX[ev.gate]),
+        "chips": int(ev.chips),
+        "seat": int(ev.seat),
+    }
 
 
-def _reconcile_missed_folds_on_street_reveal(fs: Any) -> None:
+def _reconcile_missed_folds_on_street_reveal(fs: Any, exact: bool = False) -> bool:
     """Append FOLD entries for in-hand seats the walk missed (Fix K).
 
-    Triggered only when a ``StreetReveal`` fires. The guard is that
+    Triggered when a ``StreetReveal`` fires (and, on the OCR path, once more
+    on the following tick — see below). The guard is that
     ``StreetReveal`` already requires both board_a and board_b to
     show 4+ cards (see ocr.events), which rules out the bomb-pot
     intro animation flicker.
@@ -1081,10 +1532,24 @@ def _reconcile_missed_folds_on_street_reveal(fs: Any) -> None:
     missed folds — if a call had sat between them, the engine
     would have advanced past those seats before the missed folds
     reached the front of the queue.
+
+    (review 2026-09-20 F11) ``exact=False`` (ClubGG OCR): ``folded`` is a
+    noisy pixel read, and this used to trust the single reveal frame — one
+    missed card-back on exactly that frame retired a live seat for the rest
+    of the hand. A seat is now reconciled only when it reads folded on TWO
+    consecutive ticks: the first sighting is parked in
+    ``_pending_reveal_folds`` and confirmed (or dropped) by the caller's
+    follow-up call on the next tick. ``exact=True`` (PokerNow: the DOM
+    ``fold`` class is authoritative) reconciles immediately — it must,
+    because the forced CHECK_CALL fill that runs right after treats every
+    unreconciled seat as a caller.
+
+    Returns True when FOLD entries were appended.
     """
     in_hand = session.hand_in_hand_mask
     if not in_hand:
-        return
+        session._pending_reveal_folds = frozenset()
+        return False
     fs_by_seat = {s.seat: s for s in fs.seats}
     visually_folded = frozenset(
         seat
@@ -1092,8 +1557,12 @@ def _reconcile_missed_folds_on_street_reveal(fs: Any) -> None:
         if fs_by_seat.get(seat) is not None and fs_by_seat[seat].folded
     )
     missing = visually_folded - session.folded_this_hand
+    if not exact:
+        confirmed = missing & session._pending_reveal_folds
+        session._pending_reveal_folds = frozenset(missing - confirmed)
+        missing = confirmed
     if not missing:
-        return
+        return False
     for _ in missing:
         session.action_log.append({"gate": int(GATE_FOLD), "chips": 0})
     session.folded_this_hand = frozenset(
@@ -1109,6 +1578,7 @@ def _reconcile_missed_folds_on_street_reveal(fs: Any) -> None:
         len(missing),
         sorted(missing),
     )
+    return True
 
 
 def _reconcile_missed_checks_on_street_reveal(
@@ -1296,6 +1766,10 @@ def _network_obs() -> np.ndarray | None:
 
     raw = dict(env._rs.observation_dict())
     proj = dict(raw)
+    # Every per-seat array the encoder indexes by seat must be projected.
+    # (review 2026-09-20 B9) `acted_this_street` (STK-1's pending-opponent
+    # rule, obs ≥ 1024 wide) was left in PHYSICAL seat order, so the encoder
+    # read another seat's acted bit for every short-handed live hand.
     for key in (
         "folded",
         "all_in",
@@ -1303,12 +1777,22 @@ def _network_obs() -> np.ndarray | None:
         "eff_stack_cap",
         "street_commit",
         "total_commit",
+        "acted_this_street",
     ):
-        proj[key] = [raw[key][p] for p in comp_to_phys]
+        if raw.get(key) is not None:
+            proj[key] = [raw[key][p] for p in comp_to_phys]
     proj["actor"] = 0
     raw_agg = int(raw.get("last_aggressor", -1))
     proj["last_aggressor"] = phys_to_comp.get(raw_agg, -1) if raw_agg >= 0 else -1
-    proj["button"] = phys_to_comp.get(int(raw["button"]), 0)
+    # (review 2026-09-20 B9) A dead button (parked on a seat that wasn't
+    # dealt in) has no compressed index; the old `.get(..., 0)` fallback
+    # encoded HERO as the button. Map it to the in-hand seat that actually
+    # acts last — the first one counter-clockwise from the physical button.
+    proj["button"] = phys_to_comp[
+        _effective_button(
+            int(raw["button"]), cfg.num_seats, session.hand_in_hand_mask
+        )
+    ]
     proj["history"] = [
         (phys_to_comp[s], a, c, st)
         for (s, a, c, st) in raw["history"]
@@ -1320,19 +1804,92 @@ def _network_obs() -> np.ndarray | None:
     proj["hero_category_a"] = int(env._rs.hero_category(raw_actor, 0))
     proj["hero_category_b"] = int(env._rs.hero_category(raw_actor, 1))
 
-    compressed_cfg = GameConfig(
+    compressed_cfg = dataclasses.replace(
+        cfg,
         num_seats=n,
-        starting_stack=cfg.starting_stack,
-        ante=cfg.ante,
-        bb=cfg.bb,
         starting_stacks=tuple(int(cfg.resolved_stacks[p]) for p in comp_to_phys),
     )
     return encode_observation(proj, compressed_cfg)
 
 
 
-def _recommendation_from_nodedist(nd, info) -> dict[str, Any]:
-    """Build study recommendation payload from StrategyBackend NodeDist."""
+def _anchors_payload(
+    spec: Any, anchor_probs: Any, anchor_chips: Any, anchor_legal: Any
+) -> list[dict[str, Any]]:
+    """Legal-only anchor rows for the client's bet curve, built from
+    spec-length parallel arrays (probability, raise-by chips, legality).
+
+    ONE builder for every recommendation source — the format's PPO heads and
+    the strategy host — so the client never reconstructs rows (pot fractions,
+    labels, the ALL-IN atom) from raw arrays.
+    """
+    top = spec.count - 1
+    return [
+        {
+            "k": int(k),
+            # Pot fraction of the anchor; None for the ALL-IN atom (its
+            # chips are max_raise, not a pot fraction).
+            "frac": (
+                None
+                if (spec.allin_atom and k == top)
+                else spec.fracs_pm[k] / 1000.0
+            ),
+            "label": _spec_anchor_label(spec, int(k)),
+            "prob": round(float(anchor_probs[k]), 4),
+            "chips": int(anchor_chips[k]),
+            "chips_bb": round(_chips_to_bb(int(anchor_chips[k])), 4),
+        }
+        for k in range(spec.count)
+        if bool(anchor_legal[k])
+    ]
+
+
+def _dealt_in_seat_count() -> int:
+    """Seats dealt into the current hand — i.e. the seat count of the
+    observation `_network_obs` serves (it compresses the table to the
+    hand-start mask when one is locked and includes hero; NLH study never
+    has a mask, so this is the table size there)."""
+    mask = session.hand_in_hand_mask
+    if mask and int(session.hero_seat) in mask:
+        return len(mask)
+    return int(session.game_config.num_seats)
+
+
+def _gto_host_covers_node(host: Any, info: Any) -> bool:
+    """Whether the strategy host was TRAINED on this node's table shape and
+    street.
+
+    (review 2026-09-20 F11) `PolicyNetHost.supports` answers from the
+    checkpoint's recorded training coverage (e.g. heads-up rivers only;
+    preflop never counts). Study used to serve the host on every NLH node, so
+    a river-only teacher produced preflop / multiway "recommendations" from
+    inputs it never saw. ``seats`` is the table shape of the observation the
+    host would be fed, which is what its coverage records — NOT the number of
+    players still live: a 6-max hand that got heads-up is still a 6-seat obs.
+    A host without the method predates the coverage API and keeps the old
+    behaviour; a check that fails is treated as "not covered".
+    """
+    supports = getattr(host, "supports", None)
+    if not callable(supports):
+        return True
+    try:
+        raw = getattr(info, "raw_obs", None) or {}
+        street = raw.get("street")
+        if street is None:
+            street = session.env._rs.observation_dict(skip_outcome_mc=True)["street"]
+        return bool(supports(seats=_dealt_in_seat_count(), street=int(street)))
+    except Exception:
+        logger.exception(
+            "strategy host supports() failed — serving the format's PPO model"
+        )
+        return False
+
+
+def _recommendation_from_nodedist(nd, info, spec: Any = None) -> dict[str, Any]:
+    """Build study recommendation payload from StrategyBackend NodeDist.
+
+    ``spec`` is the anchor spec of the host's model; with it the payload
+    carries the same ready-made ``anchors`` rows as a PPO recommendation."""
     d = nd.as_dict()
     gate = int(d["rec_gate"])
     chips = int(d["rec_chips"]) if gate == GATE_RAISE else None
@@ -1360,6 +1917,20 @@ def _recommendation_from_nodedist(nd, info) -> dict[str, Any]:
         out["anchor_chips"] = list(d.get("anchor_chips") or [])
         out["anchor_legal"] = list(d.get("anchor_legal") or [])
         out["pot_ref_chips"] = d.get("pot_ref_chips")
+        # Ready-made rows from the same builder as the PPO path, so the
+        # client stops reconstructing them from the raw arrays above (which
+        # stay, additively). Skipped when the arrays don't line up with the
+        # spec — the client's own fallback still covers that.
+        if spec is not None and (
+            len(d["anchor_probs"])
+            == len(out["anchor_chips"])
+            == len(out["anchor_legal"])
+            == spec.count
+        ):
+            out["anchors"] = _anchors_payload(
+                spec, d["anchor_probs"], out["anchor_chips"], out["anchor_legal"]
+            )
+            out["anchor_count"] = int(spec.count)
     return out
 
 
@@ -1384,14 +1955,37 @@ def _compute_recommendation() -> dict[str, Any] | None:
     if obs_np is None:
         return None
     fmt = _fmt()
-    # NLH + GTO host: serve PolicyNet (Mode 0) instead of PPO placeholder.
+    # NLH + GTO host: serve PolicyNet (Mode 0) instead of PPO placeholder —
+    # but only on nodes inside the checkpoint's recorded training coverage
+    # (see `_gto_host_covers_node`). Anything else falls back to the format's
+    # PPO model, and the payload says so: `mode: "ppo"` keeps the client from
+    # treating it as strategy-host output (so an untrained placeholder is
+    # still badged as one) and `gto_unsupported` tells it why.
     if (
         _engine_variant() == VARIANT_NLH
         and GTO_HOST is not None
         and info is not None
     ):
-        nd = GTO_HOST.node_distribution(obs_np, info)
-        return _recommendation_from_nodedist(nd, info)
+        if _gto_host_covers_node(GTO_HOST, info):
+            nd = GTO_HOST.node_distribution(obs_np, info)
+            return _recommendation_from_nodedist(
+                nd,
+                info,
+                spec=getattr(
+                    getattr(GTO_HOST, "model", None), "anchor_spec", NLH_ANCHOR_SPEC
+                ),
+            )
+        rec = _format_model_recommendation(fmt, obs_np, info)
+        rec["mode"] = "ppo"
+        rec["gto_unsupported"] = True
+        return rec
+    return _format_model_recommendation(fmt, obs_np, info)
+
+
+def _format_model_recommendation(
+    fmt: dict[str, Any], obs_np: np.ndarray, info: Any
+) -> dict[str, Any]:
+    """Recommendation from the active format's own (PPO) model."""
     model = fmt["model"]
     obs_t = torch.from_numpy(fmt["adapter"](obs_np)).unsqueeze(0).to(MODEL_DEVICE)
     gm_t = torch.from_numpy(info.gate_mask).unsqueeze(0).to(MODEL_DEVICE)
@@ -1469,23 +2063,7 @@ def _recommendation_v2(
         refine_np = refine.squeeze(0).float().cpu().numpy()  # (interior, 2)
 
     grid = anchor_grid_np(sizing[0], sizing[1], sizing[2], sizing[3], spec)
-    is_allin_atom = lambda k: spec.allin_atom and k == spec.count - 1  # noqa: E731
-    anchors = [
-        {
-            "k": int(k),
-            # Pot fraction of the anchor; None for the ALL-IN atom (its
-            # chips are max_raise, not a pot fraction).
-            "frac": (
-                None if is_allin_atom(k) else spec.fracs_pm[k] / 1000.0
-            ),
-            "label": _spec_anchor_label(spec, int(k)),
-            "prob": round(float(anchor_probs[k]), 4),
-            "chips": int(grid.chips[k]),
-            "chips_bb": round(_chips_to_bb(int(grid.chips[k])), 4),
-        }
-        for k in range(spec.count)
-        if bool(grid.legal[k])
-    ]
+    anchors = _anchors_payload(spec, anchor_probs, grid.chips, grid.legal)
     refine_block = None
     if bool(grid.refine_ok[rec_anchor]) and rec_anchor < len(spec.fracs_pm):
         alpha, beta = refine_np[rec_anchor - 1]
@@ -1590,6 +2168,13 @@ def _modified_cards() -> list[dict[str, Any]]:
 
 def _state_dict() -> dict[str, Any]:
     env = session.env
+    if env is None:
+        # No env yet: a fresh per-user Session (public build) or a live
+        # hand-start that just invalidated it. Build on demand instead of
+        # asserting — `POST /format` with the unchanged format on a fresh
+        # session used to 500 here. (review 2026-09-20 F13)
+        _rebuild_env()
+        env = session.env
     assert env is not None
     raw = dict(env._rs.observation_dict())
 
@@ -1738,7 +2323,41 @@ def _validate_card_list(xs: list[int | None], length: int, name: str) -> list[in
 
 # --- FastAPI app ------------------------------------------------------------
 
-app = FastAPI(title="PLO5 Bomb-Pot Study Tool")
+# (review 2026-09-20 F1) The public build ships no interactive docs / schema:
+# `/openapi.json` listed every route — the hidden home-games API and the
+# admin API included — to any signed-in free user.
+app = FastAPI(
+    title="PLO5 Bomb-Pot Study Tool",
+    **(
+        {"docs_url": None, "redoc_url": None, "openapi_url": None}
+        if PLO5BP_PUBLIC
+        else {}
+    ),
+)
+
+
+def _json_safe(value: Any) -> Any:
+    """Replace non-finite floats (JSON has no Infinity/NaN) by their repr."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return repr(value)
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def _request_validation_error(request: Request, exc: RequestValidationError):
+    """FastAPI's stock 422, minus one crash: it echoes the offending input,
+    and a body like `{"dollars_per_bb": Infinity}` (which `json.loads`
+    accepts) made the 422 itself unserializable ⇒ 500. (review 2026-09-20 H7)
+    """
+    return JSONResponse(
+        status_code=422,
+        content={"detail": _json_safe(jsonable_encoder(exc.errors()))},
+    )
+
 
 # Trainer mode rides on the same app/model under /trainer/*. Import here
 # (not at top) so trainer.py never needs to import server.py back.
@@ -1777,6 +2396,10 @@ app.include_router(
         MODEL_DEVICE,
         nlh_ckpt_name=_format_ckpt_path(VARIANT_NLH).name,
         gto_model=(GTO_HOST.model if GTO_HOST is not None else None),
+        # The HOST (not just its model) carries coverage + obs-form metadata:
+        # Ranges serves the teacher only where `supports()` says yes and on
+        # its canonical obs, else the PPO NLH model (review 2026-09-20 D3).
+        gto_host=GTO_HOST,
     )
 )
 
@@ -1788,20 +2411,103 @@ def state() -> dict[str, Any]:
     return {"state": _state_dict()}
 
 
+def _checked_stacks(stacks: tuple[int, ...], what: str) -> tuple[int, ...]:
+    """Bound a per-seat chip tuple (see `_MAX_CHIPS`); HTTP 400 otherwise."""
+    for s in stacks:
+        if not (0 <= int(s) <= _MAX_CHIPS):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{what}: {s} out of range [0, {_MAX_CHIPS}]",
+            )
+    if sum(int(s) for s in stacks) > _MAX_CHIPS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{what}: table total exceeds {_MAX_CHIPS} chips",
+        )
+    return stacks
+
+
+def _request_stacks(raw: list[int], num_seats: int) -> tuple[int, ...]:
+    stacks = tuple(int(s) for s in raw)
+    if len(stacks) != num_seats:
+        raise HTTPException(
+            status_code=400,
+            detail=f"starting_stacks length {len(stacks)} != num_seats {num_seats}",
+        )
+    return _checked_stacks(stacks, "starting_stacks")
+
+
+def _make_config(cfg: GameConfig, **changes: Any) -> GameConfig:
+    """`dataclasses.replace` on a GameConfig with its validation errors
+    (seat-count / deck-feasibility bounds) surfaced as HTTP 400."""
+    try:
+        return dataclasses.replace(cfg, **changes)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+def _splice_starting_stacks(
+    starting: tuple[int, ...],
+    behind_now: list[int] | None,
+    client_behinds: tuple[int, ...] | None,
+    new_n: int,
+) -> tuple[int, ...]:
+    """Resize per-seat STARTING stacks for a seat-count change.
+
+    The client describes the edit only through its spliced "chips behind"
+    list, so that list is used to LOCATE the seat (compare against the
+    server's own behind list), never for its values. An inserted seat copies
+    its clockwise-previous neighbour (the client's own default). When the
+    seat can't be located (no list, stale client, multi-seat jump) the table
+    is truncated / padded at the end.
+    """
+    old_n = len(starting)
+    out = list(starting)
+    located = (
+        client_behinds is not None
+        and behind_now is not None
+        and len(behind_now) == old_n
+    )
+    if located and new_n == old_n - 1:
+        # Hero (seat 0) can't be removed; first match wins on ties.
+        for i in range(1, old_n):
+            if tuple(behind_now[:i] + behind_now[i + 1:]) == client_behinds:
+                del out[i]
+                return tuple(out)
+    if located and new_n == old_n + 1:
+        # The client inserts the copy AFTER its source seat, so on a tie
+        # (copy == source) the inserted slot is the LAST matching index.
+        for i in range(new_n - 1, 0, -1):
+            if list(client_behinds[:i] + client_behinds[i + 1:]) == list(behind_now):
+                out.insert(i, out[i - 1])
+                return tuple(out)
+    if new_n < old_n:
+        return tuple(out[:new_n])
+    return tuple(out + [out[-1]] * (new_n - old_n))
+
+
 @app.post("/cards")
 def cards(req: CardsRequest) -> dict[str, Any]:
     lens = dict(_card_spec_attrs())
-    session.hero_hole = _validate_card_list(
-        req.hero_hole, lens["hero_hole"], "hero_hole"
-    )
-    session.flop_a = _validate_card_list(req.flop_a, lens["flop_a"], "flop_a")
-    session.flop_b = _validate_card_list(req.flop_b, lens["flop_b"], "flop_b")
-    session.turn_cards = _validate_card_list(req.turn, lens["turn_cards"], "turn")
-    session.river_cards = _validate_card_list(
-        req.river, lens["river_cards"], "river"
-    )
+    candidate = {
+        "hero_hole": _validate_card_list(
+            req.hero_hole, lens["hero_hole"], "hero_hole"
+        ),
+        "flop_a": _validate_card_list(req.flop_a, lens["flop_a"], "flop_a"),
+        "flop_b": _validate_card_list(req.flop_b, lens["flop_b"], "flop_b"),
+        "turn_cards": _validate_card_list(req.turn, lens["turn_cards"], "turn"),
+        "river_cards": _validate_card_list(
+            req.river, lens["river_cards"], "river"
+        ),
+    }
+    # Validate-then-commit (review 2026-09-20 H7): a duplicate used to 400
+    # AFTER the bad spec was stored and its slots locked, so every later
+    # request 400'd too.
+    build = _build_env(_session_env_spec(**candidate))
+    for attr, value in candidate.items():
+        setattr(session, attr, value)
     _lock_filled_card_slots()
-    _rebuild_env()
+    _commit_env_build(build)
     return {"state": _state_dict()}
 
 
@@ -1815,47 +2521,75 @@ def seats(req: SeatsRequest) -> dict[str, Any]:
     seats_or_button_changed = (
         new_num_seats != cfg.num_seats or new_button != session.button_seat
     )
+    client_stacks = (
+        _request_stacks(req.starting_stacks, new_num_seats)
+        if req.starting_stacks is not None
+        else None
+    )
 
-    if req.starting_stacks is not None:
-        behinds = tuple(int(s) for s in req.starting_stacks)
-        if len(behinds) != new_num_seats:
-            raise HTTPException(
-                status_code=400,
-                detail=f"starting_stacks length {len(behinds)} != num_seats {new_num_seats}",
-            )
-        # When seat count changes, the existing env's total_commit
-        # has the wrong shape; the helper returns [ante]*new_num_seats
-        # in that case, which matches a fresh-hand conversion.
-        if seats_or_button_changed:
-            commits = [int(cfg.ante)] * new_num_seats
+    # (review 2026-09-20 H6) A seat/button change restarts the hand, so the
+    # stacks that carry over are the STARTING stacks the session already
+    # holds. The client's list is "chips behind" — what is left AFTER this
+    # hand's antes, blinds and bets — and the old `behind + [ante] * n`
+    # conversion silently lost every blind/bet on each seat op (NLH: SB/BB
+    # eroded by 0.5/1bb per click). So on a seat op an unflagged list only
+    # locates which seat was spliced; its values are ignored. A caller that
+    # really wants to set stacks alongside a seat op sends
+    # `stacks_are_starting: true`. Without a seat op the list keeps its
+    # historical meaning (behind + this hand's commits), same as /config.
+    if client_stacks is not None and req.stacks_are_starting:
+        new_cfg = _make_config(
+            cfg,
+            num_seats=new_num_seats,
+            starting_stack=client_stacks[0],
+            starting_stacks=client_stacks,
+        )
+    elif seats_or_button_changed:
+        if new_num_seats == cfg.num_seats:
+            new_cfg = cfg
+        elif cfg.starting_stacks is None:
+            new_cfg = _make_config(cfg, num_seats=new_num_seats)
         else:
-            commits = _current_total_commit(new_num_seats, int(cfg.ante))
-        engine_stacks = tuple(b + commits[i] for i, b in enumerate(behinds))
-        session.game_config = GameConfig(
-            num_seats=new_num_seats,
-            starting_stack=engine_stacks[0],
-            ante=cfg.ante,
-            bb=cfg.bb,
-            starting_stacks=engine_stacks,
-            sb=cfg.sb,
-            variant=cfg.variant,
+            new_cfg = _make_config(
+                cfg,
+                num_seats=new_num_seats,
+                starting_stacks=_splice_starting_stacks(
+                    cfg.starting_stacks,
+                    _current_behind_stacks(),
+                    client_stacks,
+                    new_num_seats,
+                ),
+            )
+    elif client_stacks is not None:
+        commits = _current_total_commit(new_num_seats, int(cfg.ante))
+        engine_stacks = _checked_stacks(
+            tuple(b + commits[i] for i, b in enumerate(client_stacks)),
+            "starting_stacks",
         )
-    elif new_num_seats != cfg.num_seats:
-        session.game_config = GameConfig(
-            num_seats=new_num_seats,
-            starting_stack=cfg.starting_stack,
-            ante=cfg.ante,
-            bb=cfg.bb,
-            sb=cfg.sb,
-            variant=cfg.variant,
+        new_cfg = _make_config(
+            cfg, starting_stack=engine_stacks[0], starting_stacks=engine_stacks
         )
+    else:
+        new_cfg = cfg
+
+    # Validate-then-commit (review 2026-09-20 H7).
+    build = _build_env(
+        _session_env_spec(
+            cfg=new_cfg,
+            num_seats=new_num_seats,
+            button_seat=new_button,
+            hero_seat=0,
+            **({"action_log": []} if seats_or_button_changed else {}),
+        )
+    )
+    session.game_config = new_cfg
     session.num_seats = new_num_seats
     session.button_seat = new_button
     # Hero stays at seat 0 internally; UI rotates so it lands at south.
     session.hero_seat = 0
     if seats_or_button_changed:
         _clear_hand_state_keep_cards()
-    _rebuild_env()
+    _commit_env_build(build)
     return {"state": _state_dict()}
 
 
@@ -1904,14 +2638,21 @@ def action(req: ActionRequest) -> dict[str, Any]:
                 detail=f"chips {chips} out of raise range [{lo}, {hi}]",
             )
 
-    session.action_log.append(
-        {"gate": int(gate_idx), "chips": int(chips)}
+    # "seat" = who this entry was recorded for (diagnostic; review F15).
+    entry = {"gate": int(gate_idx), "chips": int(chips), "seat": int(actor)}
+    # Validate-then-commit (review 2026-09-20 H7): replay the candidate log
+    # first. The old append → rebuild → pop-on-Exception dance left the entry
+    # behind when the rebuild died with a non-Exception (a PyO3 panic is a
+    # BaseException), wedging every later request.
+    build = _build_env(
+        _session_env_spec(action_log=[*session.action_log, entry])
     )
-    try:
-        _rebuild_env()
-    except Exception:
-        session.action_log.pop()
-        raise
+    if not build.kept_log or build.kept_log[-1] is not entry:
+        raise HTTPException(
+            status_code=400, detail="action rejected by the engine"
+        )
+    session.action_log.append(entry)
+    _commit_env_build(build)
     return {"state": _state_dict()}
 
 
@@ -1919,14 +2660,21 @@ def action(req: ActionRequest) -> dict[str, Any]:
 def undo() -> dict[str, Any]:
     if not session.action_log:
         raise HTTPException(status_code=400, detail="nothing to undo")
-    session.action_log.pop()
-    _rebuild_env()
+    remaining = session.action_log[:-1]
+    build = _build_env(_session_env_spec(action_log=remaining))
+    session.action_log = remaining
+    # `_commit_env_build` re-derives `folded_this_hand` from the engine, so
+    # undoing an OCR-recorded FOLD un-folds the seat. (review 2026-09-20 F11)
+    _commit_env_build(build)
     return {"state": _state_dict()}
 
 
 @app.post("/reset")
 def reset() -> dict[str, Any]:
     _new_session_defaults()
+    # Also drop the live hand-start debounce state, or the next OCR tick
+    # re-seeds the "new" hand from a stale anchor. (review 2026-09-20 F10)
+    _reset_live_tracking()
     _rebuild_env()
     return {"state": _state_dict()}
 
@@ -1943,6 +2691,10 @@ def formats() -> dict[str, Any]:
                 "id": vid,
                 "label": f["label"],
                 "model_loaded": bool(f["loaded"]),
+                # True = the served checkpoint was trained on a different
+                # observation-semantics revision than this process encodes
+                # (see `_note_checkpoint_obs_rev`). Additive key.
+                "obs_rev_mismatch": bool(f.get("obs_rev_mismatch", False)),
                 "locked": _format_locked(vid),
                 # Betting cap class: pot-limit formats cap raises at pot
                 # (the client's b100 preset is "pot" and nothing larger
@@ -1984,11 +2736,16 @@ def set_format(req: FormatRequest) -> dict[str, Any]:
         session.button_seat = 0
         session.hero_seat = 0
         _new_session_defaults()
+        # A format switch is a hard reset for the live hand-start machine
+        # too (stale anchor / mask from the previous game). (review F10)
+        _reset_live_tracking()
         try:
             trainer_router.set_format(req.format)
         except Exception:
             logger.exception("trainer format sync failed")
         _rebuild_env()
+    # Unchanged format: `_state_dict` builds the env on demand, so a fresh
+    # per-user Session (env None) no longer 500s here. (review F13)
     return {"state": _state_dict()}
 
 
@@ -1997,52 +2754,61 @@ def config(req: ConfigRequest) -> dict[str, Any]:
     cfg = session.game_config
     bb = int(req.bb_chips) if req.bb_chips is not None else cfg.bb
     ante = int(req.ante_chips) if req.ante_chips is not None else cfg.ante
+    # NLH keeps sb = bb/2 (the 5/10 structure scales with the unit).
+    sb = bb // 2 if cfg.variant == VARIANT_NLH else cfg.sb
     if req.starting_stacks is not None:
-        behinds = tuple(int(s) for s in req.starting_stacks)
-        if len(behinds) != session.num_seats:
-            raise HTTPException(
-                status_code=400,
-                detail=f"starting_stacks length {len(behinds)} != num_seats {session.num_seats}",
-            )
+        behinds = _request_stacks(req.starting_stacks, session.num_seats)
         # `req.starting_stacks` carries "current chips behind" per
         # seat; convert to engine starting_stack via total_commit at
         # the current replay end. Hand-start collapses to behind +
         # ante (engine deducts the ante on hand init).
         commits = _current_total_commit(session.num_seats, ante)
-        engine_stacks = tuple(b + commits[i] for i, b in enumerate(behinds))
-        # NLH keeps sb = bb/2 (the 5/10 structure scales with the unit).
-        sb = bb // 2 if cfg.variant == VARIANT_NLH else cfg.sb
-        new_cfg = GameConfig(
-            num_seats=session.num_seats,
-            starting_stack=engine_stacks[0],
-            ante=ante,
-            bb=bb,
-            starting_stacks=engine_stacks,
-            sb=sb,
-            variant=cfg.variant,
+        engine_stacks = _checked_stacks(
+            tuple(b + commits[i] for i, b in enumerate(behinds)),
+            "starting_stacks",
         )
+        starting_stack = engine_stacks[0]
     else:
-        sb = bb // 2 if cfg.variant == VARIANT_NLH else cfg.sb
-        new_cfg = GameConfig(
-            num_seats=session.num_seats,
-            starting_stack=cfg.starting_stack,
-            ante=ante,
-            bb=bb,
-            sb=sb,
-            variant=cfg.variant,
+        # (review 2026-09-20 H6) No stacks in the request ⇒ keep the ones the
+        # session has. Rebuilding the config without them silently reset
+        # every per-seat stack to the uniform default — changing only
+        # "$ / bb" kept the action log and replayed it against different
+        # stacks.
+        engine_stacks = (
+            cfg.starting_stacks
+            if cfg.starting_stacks is not None
+            and len(cfg.starting_stacks) == session.num_seats
+            else None
         )
-    session.game_config = new_cfg
-    if req.dollars_per_bb is not None:
-        session.dollars_per_bb = float(req.dollars_per_bb)
+        starting_stack = cfg.starting_stack
+    new_cfg = _make_config(
+        cfg,
+        num_seats=session.num_seats,
+        starting_stack=starting_stack,
+        ante=ante,
+        bb=bb,
+        starting_stacks=engine_stacks,
+        sb=sb,
+    )
     # Stack-only edits preserve action_log; bb/ante changes invalidate
     # prior actions (chip math depends on the unit).
     bb_or_ante_changed = (
         (req.bb_chips is not None and int(req.bb_chips) != cfg.bb)
         or (req.ante_chips is not None and int(req.ante_chips) != cfg.ante)
     )
+    # Validate-then-commit (review 2026-09-20 H7).
+    build = _build_env(
+        _session_env_spec(
+            cfg=new_cfg,
+            **({"action_log": []} if bb_or_ante_changed else {}),
+        )
+    )
+    session.game_config = new_cfg
+    if req.dollars_per_bb is not None:
+        session.dollars_per_bb = float(req.dollars_per_bb)
     if bb_or_ante_changed:
         _clear_hand_state_keep_cards()
-    _rebuild_env()
+    _commit_env_build(build)
     return {"state": _state_dict()}
 
 
@@ -2194,12 +2960,10 @@ class OcrRunner:
         # so OCR output shape matches the engine state regardless of how
         # many seats were configured for non-OCR study.
         if session.num_seats != 6:
-            cfg = session.game_config
-            session.game_config = GameConfig(
-                num_seats=6,
-                starting_stack=cfg.starting_stack,
-                ante=cfg.ante,
-                bb=cfg.bb,
+            # `replace` carries variant/sb (and any future field) — the
+            # hand-written copy dropped them. (review 2026-09-20 I10)
+            session.game_config = dataclasses.replace(
+                session.game_config, num_seats=6, starting_stacks=None
             )
             session.num_seats = 6
             if session.button_seat >= 6:
@@ -2207,6 +2971,12 @@ class OcrRunner:
             session.hero_seat = 0
             _clear_hand_state_keep_cards()
             _rebuild_env()
+
+        # A capture (re)start is a fresh live session: drop the previous
+        # source's mask / debounce state so its stale anchor can't seed the
+        # first hand. (review 2026-09-20 F10)
+        _note_live_source("ocr")
+        _reset_live_tracking()
 
         self._reconstructor = EventReconstructor(num_seats=session.num_seats)
         _set_active_reconstructor(self._reconstructor)
@@ -2246,6 +3016,25 @@ class OcrRunner:
         if was_running:
             self.window_match = None
             self.window_title = None
+        self._retire_reconstructor()
+
+    def _retire_reconstructor(self) -> None:
+        """Unregister this runner's reconstructor as the live one.
+
+        (review 2026-09-20 I9) It used to stay registered after OCR stopped,
+        so a PokerNow session that followed had `_begin_new_hand` rebaseline
+        the dead ClubGG reconstructor instead of its own — PokerNow's stayed
+        on the pre-flop ante frame and emitted a phantom ante RAISE/CALL
+        every hand.
+        """
+        if _LIVE_RECONSTRUCTOR is self._reconstructor:
+            _set_active_reconstructor(None)
+        self._reconstructor = None
+        # Only give up the source if it is ours: a stray /ocr/stop while
+        # PokerNow is driving must not make its next frame look like a
+        # source switch (which resets the live hand).
+        if _LIVE_SOURCE == "ocr":
+            _note_live_source(None)
 
     async def _handle_window_closed(self) -> None:
         """Auto-stop path: the captured window was destroyed.
@@ -2262,6 +3051,7 @@ class OcrRunner:
         self._hwnd = None
         self.window_match = None
         self.window_title = None
+        self._retire_reconstructor()
 
     async def _loop(self) -> None:
         from plo5bp.ocr import live as ocr_live
@@ -2312,6 +3102,18 @@ class OcrRunner:
         # first tick after start; skip silently and try again next poll.
         if img is None:
             return
+        # Live capture only understands the PLO5 double-board table. If the
+        # user flips the study format while the runner is up, idle instead of
+        # mirroring a 5-card/2-board frame into an NLH-shaped card spec
+        # (IndexError every tick). (review 2026-09-20 I10)
+        if not _live_capture_allowed():
+            self.last_error = _LIVE_FORMAT_ERROR
+            return
+        # `stop()` clears the reconstructor; a tick already running on its
+        # worker thread must not trip over that.
+        reconstructor = self._reconstructor
+        if reconstructor is None:
+            return
 
         fs = extract_frame_state(
             img, num_seats=session.num_seats, cache=self._ocr_read_cache
@@ -2324,8 +3126,17 @@ class OcrRunner:
         _mirror_observable_state(fs)
 
         if not session.simple_ocr_mode:
-            engine_view = _engine_view_from_session()
-            events = self._reconstructor.step(fs, engine_view)
+            # `_begin_new_hand` invalidates the env, so on a hand-start tick
+            # this view is rebuilt from the NEW hand (button, mask, stacks)
+            # rather than describing the previous one. (review I5)
+            try:
+                engine_view = _engine_view_from_session()
+            except HTTPException as e:
+                self.last_error = f"rebuild failed: {e.detail}"
+                logger.warning("ocr rebuild failed: %s", e.detail)
+                self.last_tick_at = time.time()
+                return
+            events = reconstructor.step(fs, engine_view)
 
             for ev in events:
                 if isinstance(ev, HeroHoleRevealed):
@@ -2356,12 +3167,24 @@ class OcrRunner:
                     logger.warning("ocr: %s", ev.message)
 
             street_reveals = [ev for ev in events if isinstance(ev, StreetReveal)]
+            # Fold reconcile needs the seat to read folded on TWO consecutive
+            # ticks (review 2026-09-20 F11): the reveal tick parks first
+            # sightings, the very next tick confirms them and only then runs
+            # the check fill that was blocked behind the missing fold.
+            followup_target = session._pending_reveal_target
+            session._pending_reveal_target = None
             if street_reveals:
-                _reconcile_missed_folds_on_street_reveal(fs)
                 target_street = max(
                     2 if ev.street == "turn" else 3 for ev in street_reveals
                 )
+                _reconcile_missed_folds_on_street_reveal(fs)
                 _reconcile_missed_checks_on_street_reveal(target_street)
+                if session._pending_reveal_folds:
+                    session._pending_reveal_target = target_street
+            elif followup_target is not None:
+                if _reconcile_missed_folds_on_street_reveal(fs):
+                    _reconcile_missed_checks_on_street_reveal(followup_target)
+                session._pending_reveal_folds = frozenset()
 
         try:
             _rebuild_env()
@@ -2439,6 +3262,11 @@ def _mirror_observable_state(fs: Any) -> None:
     call :func:`_begin_new_hand` to re-seed `cfg.starting_stacks` from
     the current OCR numbers and rebaseline the reconstructor.
     """
+    # PLO5-only (review 2026-09-20 I10): a 5-card / two-board frame does not
+    # fit any other format's card spec. Entry points refuse earlier; this
+    # keeps a stray call a no-op instead of an IndexError.
+    if not _live_capture_allowed():
+        return
     for i, c in enumerate(fs.hero_hole):
         _ocr_apply_card_slot("hero_hole", i, _card_idx(c), debounce=True)
     for i, c in enumerate(fs.board_a[:3]):
@@ -2487,6 +3315,19 @@ def _mirror_observable_state(fs: Any) -> None:
     hero_hole_indices: tuple[int, ...] | None = None
     if all(c is not None for c in fs.hero_hole):
         hero_hole_indices = tuple(int(_card_idx(c)) for c in fs.hero_hole)
+
+    # (review 2026-09-20 I1) Adopt hero's first full read of the hand as the
+    # rotation baseline. Hands usually start (button move) while hero's cards
+    # are still hidden, so `_begin_new_hand` has nothing to record and the
+    # baseline is None; without adopting here it stayed on the PREVIOUS
+    # hand's cards, and the anti-collusion reveal then looked like a
+    # permanent "hole rotated" signal waiting for one bad frame to fire.
+    if (
+        hero_hole_indices is not None
+        and session.last_hero_hole is None
+        and session.hand_in_hand_mask
+    ):
+        session.last_hero_hole = hero_hole_indices
 
     # Debounce the button + participant snapshot over 2 consecutive
     # ticks so a glitched frame can't trigger a false hand-start. The
@@ -2577,7 +3418,16 @@ def _mirror_observable_state(fs: Any) -> None:
     # in-hand mask) and the debounce is ready, seed the hand. This is
     # how we bootstrap when OCR starts mid-hand — there's no button
     # change to trigger on since session.button_seat was at its default.
-    first_commit = committed_ready and not session.hand_in_hand_mask
+    # (review 2026-09-20 F10) ...but only when the anchor actually has
+    # someone in the hand. Between hands every seat reads folded, the commit
+    # produced an EMPTY mask, and an empty mask re-armed `first_commit` —
+    # `_begin_new_hand` re-fired on every tick until cards were dealt.
+    anchor_for_commit = session._pending_anchor_fs or fs
+    first_commit = (
+        committed_ready
+        and not session.hand_in_hand_mask
+        and any(not s.folded for s in anchor_for_commit.seats)
+    )
 
     # Hand-start triggers: real hand-boundary events (button rotation,
     # hero-hole rotation) plus the very first commit after OCR start.
@@ -2596,12 +3446,28 @@ def _mirror_observable_state(fs: Any) -> None:
     # any meaningful `session.button_seat`. We only check that the
     # button has moved off its prior seat, not that it landed on the
     # next clockwise seat: with <6 active players the button can skip.
+    # (review 2026-09-20 I1) The move must be POSITIVELY read on this frame:
+    # an unreadable button (None) confirms nothing. It used to skip the
+    # guard, so with `hero_hole_rotated` latched, ONE occluded-button frame
+    # restarted a live hand (log wiped, locks cleared, stacks re-seeded).
+    # `button_changed` can't be true on such a frame, so only the hero-hole
+    # trigger is affected.
     if trigger_fired and not first_commit:
         if (
-            fs.button_seat is not None
-            and int(fs.button_seat) == int(session.button_seat)
+            fs.button_seat is None
+            or int(fs.button_seat) == int(session.button_seat)
         ):
             trigger_fired = False
+            # A confirmed hole rotation while the button is positively read
+            # on its hand-start seat means the BASELINE was stale (recorded
+            # from the previous hand's still-visible cards), not that a hand
+            # began. Adopt the cards so the rotation can't stay latched —
+            # latched, it bypassed the button debounce: a single misread
+            # button frame would have fired it.
+            if hero_hole_rotated and fs.button_seat is not None:
+                session.last_hero_hole = hero_hole_indices
+                session._pending_hero_hole_rotation = None
+                session._pending_hero_hole_rotation_ticks = 0
 
     if os.environ.get("PLO5BP_OCR_DEBUG_HANDSTART"):
         logger.info(
@@ -2632,11 +3498,15 @@ def _mirror_observable_state(fs: Any) -> None:
     # mask never shrinks here. Late-rebuy players are safe because
     # they read `folded=True` (no cards/banner/commit/timer-bar);
     # already-folded players are excluded via `folded_this_hand`.
+    # (review 2026-09-20 I8) Hero is a candidate like everyone else. Hero
+    # was excluded here, so an anchor frame that landed before hero's card
+    # backs rendered locked hero out for the whole hand: `_rebuild_env`
+    # dropped the mask (six antes) and hero got no recommendation. Hero's
+    # `folded` comes from the same multi-signal rule as the other seats.
     if session.hand_in_hand_mask:
         candidate_additions = frozenset(
             i for i, s in enumerate(fs.seats)
-            if (i != session.hero_seat
-                and not s.folded
+            if (not s.folded
                 and i not in session.hand_in_hand_mask
                 and i not in session.folded_this_hand)
         )
@@ -2651,6 +3521,9 @@ def _mirror_observable_state(fs: Any) -> None:
             )
             session._pending_mask_additions = frozenset()
             session._pending_mask_additions_ticks = 0
+            # The mask decides who the engine deals in; the env built with
+            # the old mask must not feed this tick's EngineView. (review I5)
+            session.env = None
 
     # Refresh the live sitting-out set every tick from the sticky mask
     # plus any folds the reconstructor has emitted. This makes a
@@ -2666,11 +3539,38 @@ def _mirror_observable_state(fs: Any) -> None:
         )
 
 
+def _pre_street_frame(fs: Any) -> Any:
+    """``fs`` as it stood before the current street's bets: every visible
+    commit moved back behind (stack + commit), nothing committed.
+
+    The walk only accepts a commit a matching stack drop (or bet banner)
+    corroborates, measured against the reconstructor's baseline. Rebaselining
+    on this frame lets it re-derive, from an EXACT source's per-seat commits,
+    bets that were already on the table when the baseline had to be reset.
+    """
+    return dataclasses.replace(
+        fs,
+        seats=tuple(
+            dataclasses.replace(
+                s,
+                stack_chips=(
+                    None
+                    if s.stack_chips is None
+                    else int(s.stack_chips) + int(s.committed_chips or 0)
+                ),
+                committed_chips=None,
+            )
+            for s in fs.seats
+        ),
+    )
+
+
 def _begin_new_hand(
     fs: Any,
     *,
     button_seat: int,
     hero_hole_indices: tuple[int, ...] | None,
+    exact_commits: bool = False,
 ) -> None:
     """Seed session state for a newly-observed hand.
 
@@ -2681,6 +3581,10 @@ def _begin_new_hand(
     diff-based action inference starts from a clean slate, and records
     the hero-hole snapshot so a future rewind can distinguish "same hand
     again" from "new hand".
+
+    ``exact_commits`` (PokerNow): the frame's per-seat ``committed_chips``
+    are authoritative, so a hand-start that lands mid-street accounts for
+    the chips already in front of each seat (see the seeding loop).
     """
     _new_session_defaults()
     session.button_seat = int(button_seat)
@@ -2715,25 +3619,48 @@ def _begin_new_hand(
             continue
         if cents is None:
             continue
-        merged[i] = _ocr_cents_to_engine_chips(int(cents)) + int(cfg.ante)
+        # (review 2026-09-20 I9) starting = behind + this street's visible
+        # commit + ante. When the anchor lands mid-street (source attached
+        # mid-hand, hand-start signal arriving after a bet) the chips already
+        # in front of the seat are NOT in its stack read; seeding
+        # `behind + ante` alone meant the walk re-derived that bet as an
+        # action and deducted it a second time. Exact sources only: a pixel
+        # `committed_chips` read is too noisy to fold into a stack.
+        committed_cents = fs.seats[i].committed_chips if exact_commits else None
+        committed = (
+            _ocr_cents_to_engine_chips(int(committed_cents))
+            if committed_cents is not None and int(committed_cents) > 0
+            else 0
+        )
+        merged[i] = (
+            _ocr_cents_to_engine_chips(int(cents)) + committed + int(cfg.ante)
+        )
     if tuple(merged) != tuple(existing):
-        session.game_config = GameConfig(
-            num_seats=cfg.num_seats,
-            starting_stack=cfg.starting_stack,
-            ante=cfg.ante,
-            bb=cfg.bb,
-            starting_stacks=tuple(merged),
+        # `replace` keeps variant/sb (review 2026-09-20 I10).
+        session.game_config = dataclasses.replace(
+            cfg, starting_stacks=tuple(merged)
         )
 
-    if hero_hole_indices is not None:
-        session.last_hero_hole = hero_hole_indices
+    # (review 2026-09-20 I1) Unconditional: when hero's cards aren't readable
+    # at hand start (the usual case — dealt face-down until hero's turn) the
+    # baseline must become None, NOT stay on the previous hand's cards.
+    # `_mirror_observable_state` adopts the first full read of this hand.
+    session.last_hero_hole = hero_hole_indices
 
     # Rebaseline whichever live source is currently driving the session
     # (ClubGG OCR or PokerNow ingest). Both runners register their
-    # reconstructor as the active one when they start.
+    # reconstructor as the active one when they start. With exact commits
+    # the baseline is the frame as it stood BEFORE this street's bets, so
+    # the walk re-derives them (matching the stacks seeded above).
     recon = _active_reconstructor()
     if recon is not None:
-        recon.rebaseline(fs)
+        recon.rebaseline(_pre_street_frame(fs) if exact_commits else fs)
+
+    # (review 2026-09-20 I5) The env still describes the PREVIOUS hand. Both
+    # runners build their EngineView right after this returns; invalidate so
+    # it is rebuilt from the new button / mask / stacks (every reader of
+    # `session.env` rebuilds on None).
+    session.env = None
 
 
 def _engine_view_from_session(exact_folds: bool = False) -> Any:
@@ -2753,13 +3680,12 @@ def _engine_view_from_session(exact_folds: bool = False) -> Any:
     assert env is not None
     raw = dict(env._rs.observation_dict())
     n = session.num_seats
+    hero_seat = int(session.hero_seat)
     actor_raw = raw.get("actor")
     actor = int(actor_raw) if actor_raw is not None else None
     cfg = session.game_config
-    dpb = float(session.dollars_per_bb)
-    chips_per_cent = (
-        float(cfg.bb) / (100.0 * dpb) if dpb > 0 else 1.0
-    )
+    # One definition of the scale, shared with `_ocr_cents_to_engine_chips`.
+    chips_per_cent = _chips_per_cent() or 1.0
     # Noise floor: 1 bb in cents. Any stack-delta smaller than this must
     # be OCR jitter — no legal bet is under 1 bb.
     min_bet_cents = int(round(float(cfg.bb) / chips_per_cent)) if chips_per_cent > 0 else 0
@@ -2776,7 +3702,15 @@ def _engine_view_from_session(exact_folds: bool = False) -> Any:
         bet_to_call=int(raw.get("bet_to_call", 0)),
         chips_per_cent=chips_per_cent,
         min_bet_cents=min_bet_cents,
-        sitting_out=tuple(i in session.sitting_out_seats for i in range(n)),
+        # `sitting_out` tells the walk which seats the ENGINE retires on its
+        # own (`_auto_fold_sitting_out`). Hero is never auto-acted (review
+        # 2026-09-20 I8), so hero is never reported here even while outside
+        # the mask — otherwise the walk would skip a seat the engine is
+        # waiting on and attribute the next action to the wrong player. A
+        # hero who really folded is covered by the engine's `folded` flag.
+        sitting_out=tuple(
+            i in session.sitting_out_seats and i != hero_seat for i in range(n)
+        ),
         exact_folds=exact_folds,
     )
 
@@ -2806,6 +3740,51 @@ def _set_active_reconstructor(recon: Any) -> None:
     _LIVE_RECONSTRUCTOR = recon
 
 
+#: Which live source last drove the session: "ocr", "pokernow" or None.
+_LIVE_SOURCE: str | None = None
+
+
+def _note_live_source(name: str | None) -> None:
+    """Record the driving live source; a SWITCH to another source resets the
+    hand-start machine so the previous source's mask / anchor / hero-hole
+    baseline can't leak into the new one's first hand. (review 2026-09-20 F10)
+    """
+    global _LIVE_SOURCE
+    if name == _LIVE_SOURCE:
+        return
+    _LIVE_SOURCE = name
+    if name is not None:
+        _reset_live_tracking()
+
+
+# --- Live capture is PLO5-only ----------------------------------------------
+# (review 2026-09-20 I10) Both live sources read a 5-card-hole, double-board
+# bomb-pot table and mirror it into the session's card spec. Under the NLH
+# study format the spec is 2-card / single-board and the game config carries
+# blinds: one PokerNow POST used to replace that config with a PLO one while
+# `session.variant` stayed NLH, bricking the study session (every rebuild
+# 400'd, /reset included) until a format flip. Live entry points therefore
+# refuse — before touching any state — unless the engine variant is PLO5.
+
+_LIVE_FORMAT_ERROR = (
+    "live capture needs the PLO5 double-board format — switch the format "
+    "back to PLO5 to use ClubGG OCR / PokerNow"
+)
+
+#: Engine seat ceiling (`GameConfig` validates 2..8; PLO5 double-board can't
+#: even deal a 9th seat: 9*5 + 10 board cards > 52). PokerNow tables seat 10.
+_MAX_ENGINE_SEATS = 8
+
+
+def _live_capture_allowed() -> bool:
+    return _engine_variant() == VARIANT_PLO5
+
+
+def _require_live_capture_format() -> None:
+    if not _live_capture_allowed():
+        raise HTTPException(status_code=409, detail=_LIVE_FORMAT_ERROR)
+
+
 # --- PokerNow DOM ingest ----------------------------------------------------
 
 def _count_prefix(cards: tuple[Any, ...]) -> int:
@@ -2818,21 +3797,31 @@ def _count_prefix(cards: tuple[Any, ...]) -> int:
     return n
 
 
-def _pokernow_set_seat_count(n: int) -> None:
+def _pokernow_set_seat_count(n: int) -> bool:
     """Reconfigure the session for an ``n``-seat PokerNow table.
 
     PokerNow tables vary in size hand-to-hand; unlike ClubGG (fixed 6),
     the engine seat count must track the players actually dealt in. Hero
     stays engine seat 0 (the mapper rotates the table so hero is first).
+
+    Returns False — leaving the session untouched — when the engine can't
+    represent the table: PokerNow seats up to 10, the engine 2..8
+    (`GameConfig` rejects the rest; a 9-handed PLO5 double board doesn't
+    even fit the deck). The caller surfaces that as a status message
+    instead of crashing the ingest loop. (review 2026-09-20 B8 contract)
     """
-    cfg = session.game_config
-    session.game_config = GameConfig(
-        num_seats=n,
-        starting_stack=cfg.starting_stack,
-        ante=cfg.ante,
-        bb=cfg.bb,
-    )
-    session.num_seats = n
+    if not (2 <= int(n) <= _MAX_ENGINE_SEATS):
+        return False
+    try:
+        # `replace` keeps variant/sb (review 2026-09-20 I10).
+        new_cfg = dataclasses.replace(
+            session.game_config, num_seats=int(n), starting_stacks=None
+        )
+    except ValueError as e:
+        logger.warning("pokernow: %d-seat table rejected by GameConfig: %s", n, e)
+        return False
+    session.game_config = new_cfg
+    session.num_seats = int(n)
     session.hero_seat = 0
     if session.button_seat >= n:
         session.button_seat = 0
@@ -2841,6 +3830,35 @@ def _pokernow_set_seat_count(n: int) -> None:
     session.folded_this_hand = frozenset()
     session.sitting_out_seats = frozenset()
     session.last_hero_hole = None
+    # (review 2026-09-20 I5/F14) The env still has the OLD seat count. The
+    # very next thing the runner does is build an EngineView from it:
+    # `num_seats` from the session, per-seat arrays from the stale env ⇒
+    # IndexError on every frame, i.e. /pokernow/ingest 500'd forever after a
+    # player sat down or left. Invalidate; readers rebuild on None.
+    session.env = None
+    return True
+
+
+def _commits_are_lingering_antes(fs: Any) -> bool:
+    """True when every live seat shows a commit of exactly one ante.
+
+    PokerNow renders the bomb-pot ante as a per-seat bet before the flop and
+    normally clears it by the first flop frame. Should a frame still show
+    them, they must not be mistaken for flop bets (the engine posts antes
+    itself): the hand-start then seeds and rebaselines exactly as it always
+    did. A real all-seats-matched bet of precisely one ante is swept to the
+    pot the instant it closes, so misreading one costs at worst the old
+    behaviour.
+    """
+    ante = int(session.game_config.ante)
+    live = [s for s in fs.seats if not s.folded]
+    if ante <= 0 or not live:
+        return False
+    return all(
+        s.committed_chips is not None
+        and _ocr_cents_to_engine_chips(int(s.committed_chips)) == ante
+        for s in live
+    )
 
 
 def _pokernow_mirror_cards(fs: Any) -> None:
@@ -2852,16 +3870,23 @@ def _pokernow_mirror_cards(fs: Any) -> None:
     Villain cards stay hidden (PokerNow only reveals them at showdown),
     so only hero + community cards are mirrored, exactly like the OCR path.
     """
+    # reject_duplicates: DOM reads are exact, but a slot the user overrode via
+    # /cards can collide with one — never lock a duplicate (review H7).
+    def put(attr: str, idx: int, card: Any) -> None:
+        _ocr_apply_card_slot(
+            attr, idx, _card_idx(card), debounce=False, reject_duplicates=True
+        )
+
     for i, c in enumerate(fs.hero_hole):
-        _ocr_apply_card_slot("hero_hole", i, _card_idx(c), debounce=False)
+        put("hero_hole", i, c)
     for i, c in enumerate(fs.board_a[:3]):
-        _ocr_apply_card_slot("flop_a", i, _card_idx(c), debounce=False)
+        put("flop_a", i, c)
     for i, c in enumerate(fs.board_b[:3]):
-        _ocr_apply_card_slot("flop_b", i, _card_idx(c), debounce=False)
-    _ocr_apply_card_slot("turn_cards", 0, _card_idx(fs.board_a[3]), debounce=False)
-    _ocr_apply_card_slot("turn_cards", 1, _card_idx(fs.board_b[3]), debounce=False)
-    _ocr_apply_card_slot("river_cards", 0, _card_idx(fs.board_a[4]), debounce=False)
-    _ocr_apply_card_slot("river_cards", 1, _card_idx(fs.board_b[4]), debounce=False)
+        put("flop_b", i, c)
+    put("turn_cards", 0, fs.board_a[3])
+    put("turn_cards", 1, fs.board_b[3])
+    put("river_cards", 0, fs.board_a[4])
+    put("river_cards", 1, fs.board_b[4])
 
 
 class PokerNowRunner:
@@ -2994,7 +4019,59 @@ class PokerNowRunner:
         self._last_payload_key = key
         return False
 
+    def _apply_button_correction(self, fs: Any) -> None:
+        """Move the button of the CURRENT hand (cards, mask, stacks, locks and
+        the hero-hole baseline all stay) and rebuild under it.
+
+        The acting order hangs off the button, so actions the walk recorded
+        under the stale button may now replay onto the wrong seats. Each
+        entry carries the seat it was recorded for: when the replay under the
+        corrected button contradicts those stamps (or the engine rejects an
+        entry) the log is provably mis-ordered and is dropped, and the walk —
+        run on this same frame — re-derives the street from PokerNow's exact
+        per-seat commits. For that the reconstructor is rebaselined on the
+        frame as it stood BEFORE the street's bets (stack + commit behind,
+        nothing committed): the walk only accepts a commit that a matching
+        stack drop corroborates. A log that still replays consistently is
+        kept as is.
+        """
+        session.button_seat = int(fs.button_seat)
+        session.env = None
+        if not session.action_log:
+            return
+        try:
+            build = _build_env(_session_env_spec())
+        except HTTPException:
+            return
+        if not (build.seat_mismatches or build.dropped_entries):
+            return
+        logger.warning(
+            "pokernow: button corrected to seat %d mid-hand; re-deriving %d "
+            "action(s) recorded under the stale acting order",
+            session.button_seat, len(session.action_log),
+        )
+        session.action_log = []
+        session.folded_this_hand = frozenset()
+        session._replay_mismatch_warned = frozenset()
+        if self._reconstructor is not None:
+            self._reconstructor.rebaseline(_pre_street_frame(fs))
+
+    def _skip_frame(self, reason: str) -> None:
+        """Ignore a frame the session can't represent, without mutating it.
+        The reason shows up in /pokernow/status; logged once per change."""
+        if self.last_error != reason:
+            logger.warning("pokernow: %s", reason)
+        self.last_error = reason
+        self.last_tick_at = time.time()
+
     def handle_payload(self, payload: dict) -> None:
+        # PLO5-only (review 2026-09-20 I10) — checked before anything is
+        # imported or touched. The HTTP/WS endpoints 409 first; this covers
+        # direct callers and a format flip while frames are in flight.
+        if not _live_capture_allowed():
+            self._skip_frame(_LIVE_FORMAT_ERROR)
+            return
+
         from plo5bp.ocr.events import (
             OcrWarning,
             SeatAction,
@@ -3003,7 +4080,13 @@ class PokerNowRunner:
         from plo5bp.ocr.events import EventReconstructor
         from plo5bp.ocr.pokernow import map_payload
 
-        pf = map_payload(payload)
+        try:
+            pf = map_payload(payload)
+        except ValueError as e:
+            # A malformed snapshot (the mapper raises a ValueError subclass)
+            # is the sender's error, not ours: 400, session untouched.
+            self._skip_frame(str(e))
+            raise HTTPException(status_code=400, detail=str(e)) from e
         fs = pf.frame
         n = pf.num_seats
         # Between hands PokerNow can briefly show <2 in-hand seats; skip
@@ -3015,6 +4098,19 @@ class PokerNowRunner:
         self.bomb_pot = pf.bomb_pot
         self.variant = pf.variant
         self.table_seats = n
+
+        # PokerNow seats up to 10; the engine tops out at 8. Keep the
+        # previous config and say so rather than crash-looping the ingest.
+        if n > _MAX_ENGINE_SEATS:
+            self._skip_frame(
+                f"PokerNow hand has {n} players; the engine supports at most "
+                f"{_MAX_ENGINE_SEATS} — frame ignored"
+            )
+            return
+
+        # First PokerNow frame after ClubGG OCR (or ever): reset the shared
+        # hand-start machine so nothing from the other source leaks in.
+        _note_live_source("pokernow")
 
         _pn_reconf = n != session.num_seats
         _pn_raw_seats = [
@@ -3031,11 +4127,20 @@ class PokerNowRunner:
         # Track the table size; reconfigure + rebuild the reconstructor
         # when it changes (player joined/left between hands).
         if n != session.num_seats:
-            _pokernow_set_seat_count(n)
+            if not _pokernow_set_seat_count(n):
+                self._skip_frame(
+                    f"PokerNow hand has {n} players; the engine can't "
+                    "represent that table — frame ignored"
+                )
+                return
             self._reconstructor = None
         if self._reconstructor is None or self._reconstructor.num_seats != session.num_seats:
             self._reconstructor = EventReconstructor(num_seats=session.num_seats)
-            _set_active_reconstructor(self._reconstructor)
+        # (review 2026-09-20 I9) Register on EVERY payload, not only when a
+        # new reconstructor is created: after a ClubGG session at the same
+        # seat count nothing re-registered PokerNow's, so `_begin_new_hand`
+        # kept rebaselining the dead OCR reconstructor.
+        _set_active_reconstructor(self._reconstructor)
 
         _pokernow_mirror_cards(fs)
         session.observed_stacks = tuple(s.stack_chips for s in fs.seats)
@@ -3065,7 +4170,25 @@ class PokerNowRunner:
             or set(hero_indices) != set(session.last_hero_hole)
         )
         first_commit = not session.hand_in_hand_mask
-        new_hand = first_commit or hero_changed or button_changed
+        # (review 2026-09-20 I9) A button change while hero still holds the
+        # SAME cards is not a new hand — it is the lagging dealer-button DOM
+        # catching up after the hand already started (on the hero-card
+        # signal) under the previous button. Treating it as a hand-start
+        # wiped the live hand mid-street and re-seeded stacks from a frame
+        # with chips already in front of the seats. It is a correction to
+        # the current hand instead. (Hero cards unreadable ⇒ the button is
+        # the only new-hand signal left, so that case still starts a hand.)
+        button_correction = (
+            button_changed
+            and not first_commit
+            and not hero_changed
+            and hero_indices is not None
+        )
+        new_hand = (
+            first_commit
+            or hero_changed
+            or (button_changed and not button_correction)
+        )
 
         # Defer the hand-start to the flop so the anchor frame carries
         # post-ante stacks + cleared street commits (see class docstring).
@@ -3079,10 +4202,20 @@ class PokerNowRunner:
                 if fs.button_seat is not None
                 else int(session.button_seat)
             )
-            _begin_new_hand(fs, button_seat=btn, hero_hole_indices=hero_indices)
+            _begin_new_hand(
+                fs,
+                button_seat=btn,
+                hero_hole_indices=hero_indices,
+                # Commits on the anchor are real flop bets (the hand-start
+                # signal arrived mid-street) — unless they are just the ante
+                # bets still on display, which the engine posts itself.
+                exact_commits=not _commits_are_lingering_antes(fs),
+            )
             # _begin_new_hand wiped the card spec via _new_session_defaults;
             # re-mirror this frame so the flop/hero cards survive the reset.
             _pokernow_mirror_cards(fs)
+        elif button_correction:
+            self._apply_button_correction(fs)
 
         _pn_dbg = os.environ.get("PLO5BP_PN_DEBUG")
         _street_before = None
@@ -3097,7 +4230,16 @@ class PokerNowRunner:
         events: list = []
         street_reveals: list = []
         if flop_present and session.hand_in_hand_mask:
-            engine_view = _engine_view_from_session(exact_folds=True)
+            # The hand-start / seat-count paths above invalidated the env, so
+            # this view is rebuilt from the CURRENT hand. A state that can't
+            # rebuild (e.g. a user card override colliding with the DOM) is
+            # reported, never raised: an exception here used to 500 every
+            # ingest POST from then on. (review 2026-09-20 I5/F14)
+            try:
+                engine_view = _engine_view_from_session(exact_folds=True)
+            except HTTPException as e:
+                self._skip_frame(f"rebuild failed: {e.detail}")
+                return
             events = self._reconstructor.step(fs, engine_view)
             for ev in events:
                 if isinstance(ev, SeatAction):
@@ -3120,7 +4262,10 @@ class PokerNowRunner:
 
             street_reveals = [ev for ev in events if isinstance(ev, StreetReveal)]
             if street_reveals:
-                _reconcile_missed_folds_on_street_reveal(fs)
+                # exact=True: the DOM fold flag is authoritative — no 2-tick
+                # confirmation (the forced call fill below depends on folds
+                # having been reconciled first).
+                _reconcile_missed_folds_on_street_reveal(fs, exact=True)
                 target_street = max(
                     2 if ev.street == "turn" else 3 for ev in street_reveals
                 )
@@ -3196,6 +4341,9 @@ async def pokernow_ingest(ws: WebSocket) -> None:
     if ocr_runner.running:
         await ws.close(code=1008, reason="ClubGG OCR is active")
         return
+    if not _live_capture_allowed():
+        await ws.close(code=1008, reason="live capture requires the PLO5 format")
+        return
     pokernow_runner.on_connect()
     try:
         while True:
@@ -3207,8 +4355,13 @@ async def pokernow_ingest(ws: WebSocket) -> None:
             pokernow_runner.note_post()
             if pokernow_runner.is_duplicate(payload):
                 continue
-            async with pokernow_runner._tick_lock:
-                await asyncio.to_thread(pokernow_runner.handle_payload, payload)
+            try:
+                async with pokernow_runner._tick_lock:
+                    await asyncio.to_thread(pokernow_runner.handle_payload, payload)
+            except HTTPException:
+                # One rejected frame (malformed payload; reason is already in
+                # status().last_error) must not tear the collector's socket down.
+                continue
     except WebSocketDisconnect:
         pass
     except Exception as e:  # noqa: BLE001 — surface, don't crash the socket loop
@@ -3231,6 +4384,8 @@ async def pokernow_ingest_http(payload: dict) -> dict[str, Any]:
     """
     if ocr_runner.running:
         raise HTTPException(status_code=409, detail="ClubGG OCR is active")
+    # PLO5-only; refuse before any session state is touched (review I10).
+    _require_live_capture_format()
     # Game-lock first (before dedup) so the active game's heartbeats keep the
     # lock fresh even when they dedupe away. Foreign frames (a second open
     # PokerNow tab) are ignored so they can't interleave into the live hand.
@@ -3271,6 +4426,8 @@ def ocr_windows() -> dict[str, Any]:
 
 @app.post("/ocr/start")
 async def ocr_start(req: OcrStartRequest) -> dict[str, Any]:
+    # PLO5-only; refuse before `start` reshapes the session (review I10).
+    _require_live_capture_format()
     await ocr_runner.start(req.window_match, req.poll_ms)
     return {"ok": True, "status": ocr_runner.status()}
 
@@ -3297,6 +4454,8 @@ async def ocr_rescan(req: OcrRescanRequest) -> dict[str, Any]:
     and rebuilds the engine. `action_log`, `button_seat`, participant
     mask, observed stacks/pot all survive untouched.
     """
+    # PLO5-only (review I10): the rescan groups are PLO5 card-spec slots.
+    _require_live_capture_format()
     if not ocr_runner.running:
         raise HTTPException(status_code=400, detail="OCR not running")
     async with ocr_runner._tick_lock:
@@ -3403,15 +4562,29 @@ def ocr_save_frame() -> dict[str, Any]:
 # their routes so every /ocr/* and /pokernow/* path 404s. Trainer + Study are
 # untouched (they never call these). Stripping post-registration avoids
 # wrapping ~1000 lines of handlers in a conditional.
+def _public_route_kept(route: Any) -> bool:
+    """Drop OCR / PokerNow / Ranges from the public app.
+
+    FastAPI 0.141 wraps ``include_router`` as ``_IncludedRouter`` with
+    ``path is None``; the prefix lives on the inner APIRouter's routes.
+    OCR/PokerNow are still registered directly on ``app`` so ``.path``
+    matches. Ranges is an included router and would leak without the
+    inner-route check.
+    """
+    path = str(getattr(route, "path", "") or "")
+    if path.startswith(("/ocr", "/pokernow", "/ranges")):
+        return False
+    inner = getattr(route, "original_router", None)
+    for sub in getattr(inner, "routes", None) or ():
+        sp = str(getattr(sub, "path", "") or "")
+        if sp.startswith(("/ocr", "/pokernow", "/ranges")):
+            return False
+    return True
+
+
 if PLO5BP_PUBLIC:
     _n_before = len(app.router.routes)
-    app.router.routes[:] = [
-        r
-        for r in app.router.routes
-        if not str(getattr(r, "path", "")).startswith(
-            ("/ocr", "/pokernow", "/ranges")
-        )
-    ]
+    app.router.routes[:] = [r for r in app.router.routes if _public_route_kept(r)]
     logger.info(
         "PUBLIC build: dropped %d live route(s); /ocr and /pokernow disabled",
         _n_before - len(app.router.routes),
@@ -3421,11 +4594,7 @@ if PLO5BP_PUBLIC:
 # --- Static frontend --------------------------------------------------------
 
 
-class NoCacheStaticFiles(StaticFiles):
-    async def get_response(self, path, scope):
-        resp = await super().get_response(path, scope)
-        resp.headers["Cache-Control"] = "no-store, must-revalidate"
-        return resp
+_NO_CACHE = {"Cache-Control": "no-store, must-revalidate"}
 
 
 def _strip_wglive(text: str) -> str:
@@ -3435,9 +4604,7 @@ def _strip_wglive(text: str) -> str:
     inside these markers; the public build serves the assets with the whole
     region removed — a public visitor's copy contains no trace (names,
     selectors, endpoints) of the live subsystems, inspectable or otherwise."""
-    import re as _re
-
-    return _re.sub(r"[^\n]*WGLIVE:START.*?WGLIVE:END[^\n]*\n?", "", text, flags=_re.S)
+    return re.sub(r"[^\n]*WGLIVE:START.*?WGLIVE:END[^\n]*\n?", "", text, flags=re.S)
 
 
 def _strip_wgapp(text: str) -> str:
@@ -3449,37 +4616,126 @@ def _strip_wgapp(text: str) -> str:
     of the empty app and means there is nothing to reveal by deleting the
     overlay in devtools — the markup simply isn't sent.
     """
-    import re as _re
+    return re.sub(r"[^\n]*WGAPP:START.*?WGAPP:END[^\n]*\n?", "", text, flags=re.S)
 
-    return _re.sub(r"[^\n]*WGAPP:START.*?WGAPP:END[^\n]*\n?", "", text, flags=_re.S)
+
+def _strip_local_only_scripts(html: str) -> str:
+    """Drop the <script> tags of assets the public static mount refuses, so
+    a public page never requests (and console-404s on) them."""
+    return re.sub(
+        r"[^\n]*<script\s+src=\"/static/ranges\.js\"\s*>\s*</script>[^\n]*\n?",
+        "",
+        html,
+    )
+
+
+#: Public-build policy for files under STATIC_DIR, keyed by file name and
+#: enforced on the RESOLVED file (see NoCacheStaticFiles):
+#:   "strip" — served with the WGLIVE regions removed;
+#:   "deny"  — 404 from the static mount. Every one of these has a proper,
+#:             gated home: index.html is `/` (which also applies the
+#:             signed-out WGAPP strip), the home-games assets are
+#:             `/games/static/{name}` + `/games`, admin.html is `/admin`,
+#:             and ranges.js belongs to the local-only /ranges feature.
+_PUBLIC_STATIC_POLICY: dict[str, str] = {
+    "app.js": "strip",
+    "style.css": "strip",
+    "index.html": "deny",
+    "ranges.js": "deny",
+    "games.js": "deny",
+    "games.table.js": "deny",
+    "games.ui.js": "deny",
+    "games.play.js": "deny",
+    "games.sound.js": "deny",
+    "games.css": "deny",
+    "games.html": "deny",
+    "admin.html": "deny",
+}
+_STRIPPED_MEDIA_TYPES = {".js": "text/javascript", ".css": "text/css"}
+
+
+class NoCacheStaticFiles(StaticFiles):
+    """The /static mount: no-store headers, plus the public-build file policy.
+
+    (review 2026-09-20 F1) The public build used to shadow the mount with
+    exact-path routes (`/static/app.js`, `/static/style.css`) and rely on the
+    access middleware's exact-path blocklist for the hidden home-games
+    assets. Both compare the RAW url, while the mount normalizes it — so
+    `/static//app.js` served the unstripped OCR/PokerNow client,
+    `/static//games.js` and `/static/games.js/` served the hidden home-games
+    client, and `/static/index.html` the raw WGLIVE/WGAPP markup, all to
+    anonymous visitors. The policy now lives HERE, on the file the request
+    actually resolves to, so no spelling of the path (doubled or trailing
+    slashes, `.` segments, case on a case-insensitive filesystem, 8.3 names,
+    links) can reach a protected file around it.
+    """
+
+    def __init__(self, *args: Any, public: bool = False, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._public_policy = dict(_PUBLIC_STATIC_POLICY) if public else {}
+        # name -> ((mtime_ns, size), stripped text)
+        self._stripped_cache: dict[str, tuple[tuple[int, int], str]] = {}
+
+    def _policy_for(self, path: str) -> tuple[str | None, str, Any]:
+        """(policy name | None, resolved path, stat) for a mount-relative path."""
+        full_path, stat_result = self.lookup_path(path)
+        if stat_result is None:
+            return None, full_path, None
+        resolved = os.path.normcase(os.path.realpath(full_path))
+        for name in self._public_policy:
+            target = os.path.join(str(self.directory), name)
+            try:
+                target_stat = os.stat(target)
+            except OSError:
+                continue
+            same = os.path.normcase(os.path.realpath(target)) == resolved
+            if not same and stat_result.st_ino and target_stat.st_ino:
+                same = os.path.samestat(stat_result, target_stat)
+            if same:
+                return name, full_path, stat_result
+        return None, full_path, stat_result
+
+    def _stripped(self, name: str, full_path: str, stat_result: Any) -> str:
+        key = (int(stat_result.st_mtime_ns), int(stat_result.st_size))
+        cached = self._stripped_cache.get(name)
+        if cached is None or cached[0] != key:
+            text = Path(full_path).read_text(encoding="utf-8")
+            cached = (key, _strip_wglive(text))
+            self._stripped_cache[name] = cached
+        return cached[1]
+
+    async def get_response(self, path, scope):
+        if self._public_policy and scope["method"] in ("GET", "HEAD"):
+            try:
+                name, full_path, stat_result = await anyio.to_thread.run_sync(
+                    self._policy_for, path
+                )
+            except (OSError, ValueError):
+                # Unresolvable path (too long, NUL byte…): let the stock
+                # handler produce its usual 404.
+                name = None
+            if name is not None:
+                if self._public_policy[name] == "deny":
+                    raise HTTPException(status_code=404)
+                body = await anyio.to_thread.run_sync(
+                    self._stripped, name, full_path, stat_result
+                )
+                return Response(
+                    body,
+                    media_type=_STRIPPED_MEDIA_TYPES[os.path.splitext(name)[1]],
+                    headers=_NO_CACHE,
+                )
+        resp = await super().get_response(path, scope)
+        resp.headers["Cache-Control"] = "no-store, must-revalidate"
+        return resp
 
 
 if STATIC_DIR.exists():
-    if PLO5BP_PUBLIC:
-        # Serve stripped app.js / style.css via explicit routes that shadow
-        # the mount below (Starlette matches routes in registration order).
-        # Computed once at import; a code deploy restarts the service anyway.
-        _APP_JS_PUBLIC = _strip_wglive(
-            (STATIC_DIR / "app.js").read_text(encoding="utf-8")
-        )
-        _STYLE_PUBLIC = _strip_wglive(
-            (STATIC_DIR / "style.css").read_text(encoding="utf-8")
-        )
-        _NO_CACHE = {"Cache-Control": "no-store, must-revalidate"}
-
-        @app.get("/static/app.js")
-        def _public_app_js() -> Response:
-            return Response(
-                _APP_JS_PUBLIC, media_type="text/javascript", headers=_NO_CACHE
-            )
-
-        @app.get("/static/style.css")
-        def _public_style_css() -> Response:
-            return Response(
-                _STYLE_PUBLIC, media_type="text/css", headers=_NO_CACHE
-            )
-
-    app.mount("/static", NoCacheStaticFiles(directory=STATIC_DIR), name="static")
+    app.mount(
+        "/static",
+        NoCacheStaticFiles(directory=STATIC_DIR, public=PLO5BP_PUBLIC),
+        name="static",
+    )
 
     @app.get("/")
     def index(request: Request) -> HTMLResponse:
@@ -3487,7 +4743,7 @@ if STATIC_DIR.exists():
         # paint; in the public build also strip the WGLIVE markup regions.
         html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
         if PLO5BP_PUBLIC:
-            html = _strip_wglive(html)
+            html = _strip_local_only_scripts(_strip_wglive(html))
             # Signed-out visitors get the landing page ONLY — the app chrome
             # is stripped server-side so it can't flash on load or be revealed
             # by deleting the overlay. session.uid is set at login (public.py).

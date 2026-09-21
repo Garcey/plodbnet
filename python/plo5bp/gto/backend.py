@@ -45,6 +45,11 @@ class NodeDist:
     anchor_legal: list[bool] | None = None
     anchor_lo: list[int] | None = None
     anchor_hi: list[int] | None = None
+    # UNCLAMPED bracket chips per anchor (the axis the policy samples ``u``
+    # on) — the trainer's scorer inverts chips -> u over these. Optional:
+    # absent on dicts from older producers.
+    anchor_lo_raw: list[int] | None = None
+    anchor_hi_raw: list[int] | None = None
     refine_ok: list[bool] | None = None
     refine_params: list[list[float]] | None = None
     rec_anchor: int | None = None
@@ -80,6 +85,9 @@ class NodeDist:
             d["anchor_legal"] = list(self.anchor_legal or [])
             d["anchor_lo"] = list(self.anchor_lo or [])
             d["anchor_hi"] = list(self.anchor_hi or [])
+            if self.anchor_lo_raw is not None and self.anchor_hi_raw is not None:
+                d["anchor_lo_raw"] = list(self.anchor_lo_raw)
+                d["anchor_hi_raw"] = list(self.anchor_hi_raw)
             d["refine_ok"] = list(self.refine_ok or [])
             d["refine_params"] = list(self.refine_params or [])
             d["rec_anchor"] = self.rec_anchor
@@ -106,6 +114,8 @@ class NodeDist:
             anchor_legal=d.get("anchor_legal"),
             anchor_lo=d.get("anchor_lo"),
             anchor_hi=d.get("anchor_hi"),
+            anchor_lo_raw=d.get("anchor_lo_raw"),
+            anchor_hi_raw=d.get("anchor_hi_raw"),
             refine_ok=d.get("refine_ok"),
             refine_params=d.get("refine_params"),
             rec_anchor=d.get("rec_anchor"),

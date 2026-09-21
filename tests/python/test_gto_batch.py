@@ -25,7 +25,11 @@ def _combo_label(hole: list[int], gate: list[float]) -> LabelRecord:
     lab.hero_hole = hole
     lab.gate_probs = gate
     lab.notes = {"aggregate": False}
-    lab.board = [48, 44, 12, 8, 4]
+    # Must not share a card with any hole used below (0..22, 47..51). The old
+    # board [48, 44, 12, 8, 4] collided with 9 of the 24 holes; those labels
+    # could not be rebuilt by the engine and silently trained on the LOSSY
+    # synthetic obs — now excluded + reported (review 2026-09-20 D16).
+    lab.board = [44, 40, 36, 32, 28]
     lab.street = 3
     lab.pot_chips = 100_000
     lab.to_call_chips = 0
@@ -60,7 +64,10 @@ def test_labels_to_rows_and_train(tmp_path: Path):
     labs = [
         _combo_label([51, 50], [0.0, 0.9, 0.1]),
         _combo_label([48, 47], [0.0, 0.2, 0.8]),
-        _combo_label([12, 8], [0.05, 0.9, 0.05]),
+        # to_call == 0 here, so FOLD is illegal: a label may not carry fold
+        # mass (it used to be renormalized away silently; now it raises —
+        # see test_review_gto_export.py).
+        _combo_label([12, 8], [0.0, 0.95, 0.05]),
         _combo_label([0, 4], [0.0, 0.6, 0.4]),
     ]
     # pad to a few more

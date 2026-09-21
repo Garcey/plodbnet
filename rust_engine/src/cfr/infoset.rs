@@ -132,14 +132,30 @@ impl Infoset {
     /// DCFR discount on positive regrets / strategy sum (Brown & Sandholm).
     /// α=1.5, β=0, γ=2 common defaults; applied once per iteration end.
     pub fn apply_dcfr_discount(&mut self, iteration: u32) {
-        // iteration is 1-based
+        self.apply_discount(iteration, 1.5, 0.0, 2.0);
+    }
+
+    /// General DCFR(α, β, γ) discount; Linear CFR is α=β=γ=1.
+    /// (review 2026-09-20, latent: `algorithm="linear"` used to run the DCFR
+    /// parameters under a "linear" label.)
+    pub fn apply_discount(&mut self, iteration: u32, alpha: f64, beta: f64, gamma: f64) {
+        let (pos, neg, strat) = Self::discount_scales(iteration, alpha, beta, gamma);
+        self.apply_scales(pos, neg, strat);
+    }
+
+    /// `(positive-regret, negative-regret, strategy-sum)` multipliers for a
+    /// 1-based `iteration`. They depend only on the iteration, so table-wide
+    /// discounting computes them ONCE instead of 3 `powf` per infoset.
+    pub fn discount_scales(iteration: u32, alpha: f64, beta: f64, gamma: f64) -> (f64, f64, f64) {
         let t = iteration as f64;
-        let alpha = 1.5;
-        let beta = 0.0;
-        let gamma = 2.0;
-        let pos_scale = t.powf(alpha) / (t.powf(alpha) + 1.0);
-        let neg_scale = t.powf(beta) / (t.powf(beta) + 1.0);
-        let strat_scale = (t / (t + 1.0)).powf(gamma);
+        (
+            t.powf(alpha) / (t.powf(alpha) + 1.0),
+            t.powf(beta) / (t.powf(beta) + 1.0),
+            (t / (t + 1.0)).powf(gamma),
+        )
+    }
+
+    pub fn apply_scales(&mut self, pos_scale: f64, neg_scale: f64, strat_scale: f64) {
         for r in &mut self.regret {
             if *r > 0.0 {
                 *r *= pos_scale;

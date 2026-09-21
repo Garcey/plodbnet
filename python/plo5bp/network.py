@@ -715,6 +715,18 @@ class ActorCriticV4(ActorCriticV2):
         return gate_logits, size_params, refine, value
 
     def _anchor_dist(self, size_params: torch.Tensor, grid):
+        # PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 A2): upcast the raw
+        # head output to fp32 BEFORE the logistic math. Under CUDA bf16
+        # autocast the head Linear emits bf16, and tanh/sigmoid/sub/div are
+        # on neither autocast list, so the whole CDF differencing below ran
+        # in bf16 during the PPO evaluate() while rollout log-probs were
+        # fp32. bf16 resolves ~0.004 near CDF=1 but is fine near 0, so the
+        # error was ASYMMETRIC: sampled anchors ABOVE mu collapsed to the
+        # 1e-9 floor (|dlogp| up to ~15, outside the clip band at zero policy
+        # change) while anchors below mu did not — a small directional
+        # (passive-sizing) bias plus inflated klA. No-op on fp32 inputs (CPU
+        # runs, rollout act(), the KL-anchor path which already upcast).
+        size_params = size_params.float()
         # mu on the index axis: center (count-1)/2, ranging +/-((count-1)/2 + 2)
         # so it reaches BEYOND [0, count-1] and an end anchor can carry the
         # majority of the mass. s floored (no spike) and soft-capped (not flat).
@@ -840,6 +852,12 @@ class ActorCriticV5(ActorCriticV4):
         index axis, per-component scales, and the FLOORED mixture weights.
         The canonical consumer is `_anchor_dist`; exposed for training
         logs (component diagnostics, Hw) and the UI `mixture` payload."""
+        # PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 A2): fp32 upcast
+        # before tanh/sigmoid — same asymmetric bf16-autocast CDF error as
+        # ActorCriticV4._anchor_dist (see the note there). This is the ONE
+        # entry point for the mixture head's raw output, so the per-component
+        # logistics in `_anchor_dist` below all run in fp32.
+        mix_params = mix_params.float()
         k = self._mixture_k
         c = (self._anchor_count - 1) / 2.0
         mu = c + (c + 2.0) * torch.tanh(mix_params[..., 0:k])
@@ -880,6 +898,14 @@ def obs_adapter(model: nn.Module):
 
     Minimal-obs ablation models (OBS_DIM_MINIMAL = 796) are NOT a prefix —
     they gather non-contiguous table-visible dims via `project_obs_minimal`.
+
+    The returned function VALIDATES the incoming width (review 2026-09-20
+    A20): it accepts the model's own width (identity) or a known PLO
+    full-layout superset (projected), and raises ValueError on anything
+    else. Every projection above is a PLO-layout fact, so an NLH model
+    (OBS_DIM_NLH = 995 — which sits INSIDE the PLO prefix range) accepts
+    only its own width: the old code silently prefix-sliced a 1171-wide PLO
+    observation down to 995 and fed an NLH model garbage.
     """
     import numpy as np
 
@@ -895,13 +921,39 @@ def obs_adapter(model: nn.Module):
     first = model.torso[0]
     lin = first[0] if isinstance(first, nn.Sequential) else first
     w = int(lin.in_features)
-    if w == OBS_DIM_MINIMAL:
-        return project_obs_minimal
-    if w == OBS_DIM_V1:
-        return downgrade_obs_to_v1
-    if OBS_DIM_V2 <= w < OBS_DIM:
-        return lambda obs: np.ascontiguousarray(obs[..., :w])
-    return lambda obs: obs
+    # PLO full layouts, oldest first — each a pure tail append of the last
+    # (991 v2/v4, 1020 v5/v6 obs-v2 tail, OBS_DIM current). Historical
+    # constants: a checkpoint's trained width never changes.
+    plo_layouts = (OBS_DIM_V2, 1020, OBS_DIM)
+    spec = getattr(model, "anchor_spec", None)
+    is_nlh = spec is not None and spec.name == NLH_ANCHOR_SPEC.name
+    project = None
+    supersets: tuple[int, ...] = ()
+    if is_nlh:
+        pass  # no NLH layout history yet: its own width only
+    elif w == OBS_DIM_MINIMAL:
+        project, supersets = project_obs_minimal, plo_layouts
+    elif w == OBS_DIM_V1:
+        project, supersets = downgrade_obs_to_v1, plo_layouts
+    elif OBS_DIM_V2 <= w < OBS_DIM:
+        project = lambda obs: np.ascontiguousarray(obs[..., :w])  # noqa: E731
+        supersets = tuple(x for x in plo_layouts if x > w)
+
+    def adapt(obs):
+        n = int(obs.shape[-1])
+        if n == w:
+            return obs
+        if n in supersets:
+            return project(obs)
+        raise ValueError(
+            f"obs width {n} does not fit this "
+            f"{'nlh' if is_nlh else 'plo'} model (input width {w}; "
+            f"accepted: {w}"
+            + (f" or a PLO layout in {supersets}" if supersets else "")
+            + ") — wrong variant's observation, or an unknown layout"
+        )
+
+    return adapt
 
 
 def model_class_for_state_dict(state_dict: dict) -> type:
@@ -983,13 +1035,20 @@ def build_actor_from_state_dict(
 
 def opp_holes_multihot(holes: torch.Tensor) -> torch.Tensor:
     """Expand compact (B, 5, hole_w) uint8/int hole-card indices (255 =
-    empty slot) into the (B, 260) multi-hot the CentralCritic consumes."""
+    empty slot) into the (B, 260) multi-hot the CentralCritic consumes.
+
+    Pads scatter into a 53rd SPILL column that is sliced off (review
+    2026-09-20 A16). The old form clamped 255 -> 51 and scattered
+    `valid.float()`, so a pad sharing a slot with a GENUINE card 51 wrote a
+    0 over its 1 (CPU: last write wins; CUDA: duplicate-index scatter_ is
+    nondeterministic) — 22/408 rows wrong on the width-5-padded NLH serial
+    path. Now the only duplicate indices are pads -> column 52, all writing
+    the same constant, so the result is deterministic on every device."""
     b = holes.shape[0]
-    holes_l = holes.long()
-    valid = holes_l < 52
-    out = torch.zeros(b, 5, 52, dtype=torch.float32, device=holes.device)
-    out.scatter_(2, holes_l.clamp(max=51), valid.float())
-    return out.view(b, 5 * 52)
+    idx = holes.long().clamp(max=52)  # every pad / out-of-deck index -> spill
+    out = torch.zeros(b, 5, 53, dtype=torch.float32, device=holes.device)
+    out.scatter_(2, idx, 1.0)
+    return out[..., :52].reshape(b, 5 * 52)
 
 
 class CentralCritic(nn.Module):
@@ -1184,6 +1243,9 @@ def build_critic_from_state_dict(
     state_dict: dict,
     q_fold_zero: bool = False,
     q_base_raw: bool = False,
+    *,
+    value_support: float | None = None,
+    value_hlgauss_sigma: float | None = None,
 ) -> CentralCritic:
     """Build the CentralCritic a checkpoint's ``critic`` block was saved
     from: obs width, hidden width, and residual depth are sniffed from the
@@ -1194,7 +1256,18 @@ def build_critic_from_state_dict(
     semantics, no parameters — same class as the mixture ε floor): callers
     that consume Q must pass the values the run trained with (stamped in
     ``ckpt["config"]``). V-only consumers (UI review EV) can ignore them —
-    the V readout is identical either way."""
+    the V readout is identical either way.
+
+    ``value_support`` / ``value_hlgauss_sigma`` (review 2026-09-20 A19):
+    the distributional head's persisted buffers (`_value_centers`,
+    `_value_edges`) restore from the state dict, so V is exact regardless —
+    but `_raw_value_centers` (the `q_base_raw` dueling base, NOT persisted)
+    and `hlgauss_sigma` are derived from the CONSTRUCTOR's support. Rebuilt
+    at the 1500 default, a support-3000 + q_base_raw critic read Q off by up
+    to ~113bb while V stayed exact. Q / loss consumers must pass the trained
+    values (``ckpt["config"]["value_support"]`` /
+    ``["value_hlgauss_sigma"]``); None keeps the constructor defaults
+    (1500 / 0.75 — exact for every default-support checkpoint)."""
     w = state_dict["torso.0.0.weight"]
     hidden_dim = int(w.shape[0])
     obs_dim = int(w.shape[1]) - 5 * 52
@@ -1206,6 +1279,11 @@ def build_critic_from_state_dict(
         q_actions = int(state_dict["adv_head.weight"].shape[0])
     vb = int(state_dict["value_head.weight"].shape[0])
     value_bins = vb if vb > 1 else 0  # scalar head is shape (1, hidden)
+    support_kwargs: dict = {}
+    if value_support is not None:
+        support_kwargs["value_support"] = float(value_support)
+    if value_hlgauss_sigma is not None:
+        support_kwargs["hlgauss_sigma"] = float(value_hlgauss_sigma)
     critic = CentralCritic(
         obs_dim=obs_dim,
         hidden_dim=hidden_dim,
@@ -1215,6 +1293,7 @@ def build_critic_from_state_dict(
         value_bins=value_bins,
         q_fold_zero=q_fold_zero,
         q_base_raw=q_base_raw,
+        **support_kwargs,
     )
     critic.load_state_dict(state_dict)
     return critic

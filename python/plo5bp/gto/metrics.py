@@ -98,9 +98,10 @@ def smoke_metric_pass(summary: MetricSummary) -> bool:
     """
     if summary.n <= 0:
         return False
-    if summary.mean_gate_kl is None or summary.mean_gate_kl > 1e-9:
+    # ``not (x <= cap)`` so a NaN fails (``nan > cap`` is False) — review D4.
+    if summary.mean_gate_kl is None or not (summary.mean_gate_kl <= 1e-9):
         return False
-    if summary.pure_node_agree is not None and summary.pure_node_agree < 1.0:
+    if summary.pure_node_agree is not None and not (summary.pure_node_agree >= 1.0):
         return False
     return True
 

@@ -1044,9 +1044,11 @@ body.trainer-mode.trainer-pick #card-grid-panel {
 #ts-cancel:hover { background: var(--panel-3); }
 
 /* Toast */
+/* Above every overlay (landing / paywall 1000, mobile card picker 1100): an
+   error toast raised while one of those is open used to paint underneath it. */
 #toast-container {
   position: fixed; bottom: 16px; right: 16px;
-  display: flex; flex-direction: column; gap: 6px; z-index: 1000;
+  display: flex; flex-direction: column; gap: 6px; z-index: 1200;
 }
 .toast {
   background: #161c26;
@@ -1286,6 +1288,14 @@ body.trainer-mode.trainer-pick #card-grid-panel {
 .l-hero .gate-google { display: inline-flex; padding: 11px 22px; }
 .l-note { margin: 14px 0 0; font-size: 13px; color: var(--muted); }
 .l-note s { opacity: 0.75; }
+/* Failed sign-in notice (/?login=failed), shown above the sign-in button. */
+.l-login-error {
+  margin: 0 0 16px; padding: 9px 14px; max-width: 640px;
+  font-size: 13.5px; line-height: 1.5; color: var(--text);
+  background: #161c26; border: 1px solid var(--border-strong);
+  border-left: 3px solid var(--danger); border-radius: var(--radius-sm);
+}
+.l-login-error[hidden] { display: none; }
 .l-price { color: var(--accent); font-weight: 700; }
 .l-hero #dev-login-row { margin-top: 14px; max-width: 380px; }
 

@@ -64,7 +64,10 @@ def _report(
     rep: dict = {
         "status": "ok",
         "iterations_run": 10,
-        "notes": [],
+        # A FINAL estimator note, as every full-length solver run carries:
+        # without it the number is unverified and teacher export skips the root
+        # (review 2026-09-20 D8 — see test_review_gto_provenance.py).
+        "notes": ["expl_kind=infoset_br samples=128"],
         "root": {
             "street": 3,
             "pot_bb": 10.0,
@@ -106,7 +109,8 @@ def test_high_expl_root_rejected_at_batch(tmp_path: Path, monkeypatch):
             strategy={"root_id": root.root_id, "infosets": []},
             iterations_run=3,
             exploitability_bb=5.0,
-            notes=[],
+            # final estimator → the 5.0 is a VERIFIED number and may be judged
+            notes=["expl_kind=infoset_br samples=128"],
         )
 
     monkeypatch.setattr("plo5bp.gto.cfr_batch.solve", fake_solve)

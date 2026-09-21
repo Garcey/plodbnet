@@ -36,10 +36,24 @@ from plo5bp.config import VARIANT_NLH, GameConfig
 from plo5bp.encoding import (
     OBS_DIM,
     OBS_DIM_MINIMAL,
+    OBS_SEMANTICS_REV,
     encode_observation_minimal,
     encode_observation,
 )
 from plo5bp.encoding_nlh import OBS_DIM_NLH, encode_observation_nlh
+
+
+def _engine_obs_rev_kwargs(engine_cls) -> dict[str, int]:
+    """Pin the Rust engine to the SAME observation-semantics revision the
+    Python encoders read at import (review 2026-09-20): both sides parse
+    `PLO5BP_OBS_REV`, but the engine reads it at construction, so an env var
+    changed after import would otherwise let the fused Rust encoder and the
+    numpy encoders disagree silently. A binary built before the switch has no
+    `obs_rev` argument and only implements rev 1 (encoding.py warns at
+    import) — pass nothing so it keeps constructing."""
+    if hasattr(engine_cls, "obs_semantics_rev"):
+        return {"obs_rev": int(OBS_SEMANTICS_REV)}
+    return {}
 
 
 @dataclass
@@ -98,6 +112,7 @@ class BombPotEnv:
             starting_stacks=stacks,
             variant=self.config.variant,
             sb=self.config.sb,
+            **_engine_obs_rev_kwargs(_RustGameState),
         )
         # Per-variant observation layout: PLO full 1171 / minimal 796, NLH 995.
         if self.config.variant == VARIANT_NLH:
@@ -198,8 +213,13 @@ class BombPotEnv:
         return self._rs.study_terminal()
 
     def _read_total_commit(self) -> np.ndarray:
+        # Bookkeeping read (twice per step): skip the 1024-sample opp-outcome
+        # MC that `observation_dict()` runs by default — only `_pack_obs`
+        # needs those features (review 2026-09-20 C8). Same dict, the
+        # outcome slots are just zeros.
         return np.asarray(
-            self._rs.observation_dict()["total_commit"], dtype=np.int64
+            self._rs.observation_dict(skip_outcome_mc=True)["total_commit"],
+            dtype=np.int64,
         )
 
     def _finalize_step(
@@ -211,20 +231,14 @@ class BombPotEnv:
         commit_delta = post_total_commit - pre_total_commit
         done = bool(self._rs.is_terminal())
         if done:
-            if self._ev_runout_samples > 0:
-                ev_seed = (
-                    self._reset_seed ^ 0x9E3779B97F4A7C15
-                ) & ((1 << 64) - 1)
-                rewards = np.asarray(
-                    self._rs.payouts_ev(self._ev_runout_samples, ev_seed),
-                    dtype=np.float32,
-                )
-            else:
-                rewards = np.asarray(self._rs.payouts(), dtype=np.float32)
+            rewards = self.terminal_rewards()
             obs_vec = np.zeros(self._obs_dim, dtype=np.float32)
             mask = np.zeros(NUM_ACTIONS, dtype=bool)
             gate_mask = np.zeros(GATE_ACTIONS, dtype=bool)
-            raw = dict(self._rs.observation_dict())
+            # Terminal: no actor, so the outcome slots are zeros with or
+            # without the flag (same keys, same values) — it just keeps the
+            # no-MC intent explicit, like `_read_total_commit`.
+            raw = dict(self._rs.observation_dict(skip_outcome_mc=True))
             info = StepInfo(
                 legal_mask=mask,
                 gate_mask=gate_mask,
@@ -244,6 +258,22 @@ class BombPotEnv:
         info.commit_delta = commit_delta
         info.total_commit = post_total_commit
         return obs_vec, rewards, False, info
+
+    def terminal_rewards(self) -> np.ndarray:
+        """Per-seat chip deltas of the finished hand (EV-marginalised over
+        the undealt runout when `ev_runout_samples > 0`, same seed contract
+        as `_finalize_step`). Public because a hand can be terminal AT DEAL
+        (fewer than two seats able to act — review 2026-09-20 C1), where no
+        `step` ever returns the rewards. Zeros while the hand is live."""
+        if self._ev_runout_samples > 0:
+            ev_seed = (
+                self._reset_seed ^ 0x9E3779B97F4A7C15
+            ) & ((1 << 64) - 1)
+            return np.asarray(
+                self._rs.payouts_ev(self._ev_runout_samples, ev_seed),
+                dtype=np.float32,
+            )
+        return np.asarray(self._rs.payouts(), dtype=np.float32)
 
     def step(
         self, action: int
@@ -334,7 +364,11 @@ class BombPotEnv:
             min_raise_chips=min_raise,
             max_raise_chips=max_raise,
             actor=actor,
-            terminal=False,
+            # A hand can be terminal AT DEAL (fewer than two seats able to act
+            # after posting — review 2026-09-20 C1): no actor and not a study
+            # street boundary. Every `while not info.terminal:` driver relies
+            # on this; rewards for such a hand come from `terminal_rewards()`.
+            terminal=actor is None and raw.get("awaiting_next_street") is None,
             raw_obs=raw,
             commit_delta=np.zeros(n, dtype=np.int64),
             total_commit=total_commit,

@@ -165,6 +165,74 @@ def test_refinement_pdf_ratio_within_bracket():
     assert near_edge["size_q"] == pytest.approx(expected, rel=1e-3)
 
 
+def test_u_is_inverted_over_the_unclamped_bracket():
+    """Review 2026-09-20 H1. The policy maps u over the UNCLAMPED bracket and
+    clamps the chips afterwards, so the scorer must invert over
+    `anchor_lo_raw/hi_raw` when the dict carries them. Min-raise 580 clips
+    anchor 5's bracket [550, 650] to [580, 650]; the Beta(5,5) mean (u=0.5)
+    is 600 chips. (Real-engine coverage: test_review_trainer_scoring.py.)"""
+    chips = [580] * 5 + [600, 700, 800, 900, 1000, 1100]
+    legal = [True, False, False, False, False] + [True] * 6
+    refine_ok = [False] * 11
+    refine_ok[5] = True
+    refine_params = [[1.0, 1.0]] * 9
+    refine_params[4] = [5.0, 5.0]
+    probs = [0.0] * 11
+    probs[5] = 1.0
+    lo = list(chips)
+    hi = list(chips)
+    lo[5], hi[5] = 580, 650          # clamped (AnchorGrid.lo/hi)
+    lo_raw, hi_raw = list(lo), list(hi)
+    lo_raw[5] = 550                  # what the policy's u axis spans
+    d = _dist(
+        gate_probs=[0.1, 0.7, 0.2],  # rec gate = call: no `chips == rec` shortcut
+        anchor_probs=probs, anchor_chips=chips, anchor_legal=legal,
+        refine_ok=refine_ok, refine_params=refine_params,
+        anchor_lo=lo, anchor_hi=hi,
+    )
+    # Legacy dict (no raw keys): falls back to the clamped bracket — the
+    # pre-fix reading, u = 20/70, well off the mean.
+    old = score_move_v2(d, GATE_RAISE, 600)
+    assert old["user_anchor"] == 5
+    assert old["size_q"] == pytest.approx(((20 / 70) * (50 / 70) / 0.25) ** 4)
+    # With the unclamped bracket the same 600 chips IS the mean: full credit.
+    d["anchor_lo_raw"], d["anchor_hi_raw"] = lo_raw, hi_raw
+    new = score_move_v2(d, GATE_RAISE, 600)
+    assert new["user_anchor"] == 5
+    assert new["size_q"] == pytest.approx(1.0)
+    # A min-raise (580) sits on the clip: u ranges over [0, 0.3], whose point
+    # nearest the mean is 0.3 -> Beta(5,5) density ratio (0.3*0.7/0.25)^4.
+    clip = score_move_v2(d, GATE_RAISE, 580)
+    assert clip["user_anchor"] == 5
+    assert clip["size_q"] == pytest.approx((0.3 * 0.7 / 0.25) ** 4)
+
+
+def test_exact_rec_chips_always_take_the_rec_anchor():
+    """Review 2026-09-20 H1. Chips equal to the recommendation's chips ARE the
+    recommended (anchor, u): top score even when another anchor is nearer by
+    chips (the pre-fix snap sent a clipped rec to the min atom, t5_snap)."""
+    chips = [580] * 5 + [600, 700, 800, 900, 1000, 1100]
+    legal = [True, False, False, False, False] + [True] * 6
+    refine_ok = [False] * 11
+    refine_ok[5] = True
+    refine_params = [[1.0, 1.0]] * 9
+    refine_params[4] = [1.2, 6.0]    # mean u = 1/6 -> 567 raw -> clipped to 580
+    probs = [0.02] + [0.0] * 4 + [0.9] + [0.016] * 5
+    lo, hi = list(chips), list(chips)
+    lo[5], hi[5] = 580, 650
+    d = _dist(
+        anchor_probs=probs, anchor_chips=chips, anchor_legal=legal,
+        refine_ok=refine_ok, refine_params=refine_params,
+        anchor_lo=lo, anchor_hi=hi,
+    )
+    d["rec_chips"] = 580             # the clipped recommendation == min-raise
+    assert d["rec_anchor"] == 5 and d["rec_gate"] == GATE_RAISE
+    sc = score_move_v2(d, GATE_RAISE, 580)
+    assert sc["user_anchor"] == 5
+    assert sc["score"] == pytest.approx(100.0)
+    assert sc["category"] == "best"
+
+
 def test_candidates_equal_v2(trainer_factory):
     from plo5bp.ui.trainer import DecisionRecord
 

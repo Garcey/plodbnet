@@ -7,8 +7,18 @@ Does NOT change TEACHER_MAX_EXPL_BB (stays 1.0).
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT / "python") not in sys.path:
+    sys.path.insert(0, str(_ROOT / "python"))
+
+from plo5bp.gto.cfr_batch import _atomic_write_text  # noqa: E402
+
+# NOTE (review 2026-09-20 F6): labels exported from roots accepted here carry
+# ``teacher_max_expl_bb`` = whatever cap the EXPORT is run with. A checkpoint
+# trained on a 5.0 bb teacher can never pass the GTO badge (bar: 1.0 bb).
 ONE_OFF = 5.0
 
 
@@ -26,7 +36,7 @@ def main() -> None:
             continue
         rep = d["report"]
         dest = strat / f"{rid}.json"
-        dest.write_text(json.dumps(rep, indent=2) + "\n", encoding="utf-8")
+        _atomic_write_text(dest, json.dumps(rep, indent=2) + "\n")
         (out / "markers" / f"{rid}.done").write_text(
             "ok-oneoff-max-expl-5.0\n", encoding="utf-8"
         )
@@ -57,9 +67,7 @@ def main() -> None:
         "accepted": accepted,
         "rejected_at_1_0": True,
     }
-    (out / "manifest_oneoff5.json").write_text(
-        json.dumps(man, indent=2) + "\n", encoding="utf-8"
-    )
+    _atomic_write_text(out / "manifest_oneoff5.json", json.dumps(man, indent=2) + "\n")
     print(f"[step6] accepted {len(accepted)}", flush=True)
 
 

@@ -209,8 +209,11 @@ def test_stk_v3_serial_batched_parity():
     street_commit = [15000, 0, 15000]
     pot = 120000.0
     btc = 15000.0
-    min_bet = 45000.0
-    max_bet = 150000.0
+    # LEGAL raise deltas (review 2026-09-20 B1): call 15000 + a 15000 raise up
+    # to hero's 50000 stack. (Was min_bet/max_bet TOTALS 45000/150000 — a
+    # "max raise" three times hero's stack, the exact bug B1 fixed.)
+    min_raise = 30000.0
+    max_raise = 50000.0
     to_call = max(btc - street_commit[hero], 0.0)
     hero_stack = eff[hero]
     eff_to_call = min(to_call, hero_stack)
@@ -221,7 +224,8 @@ def test_stk_v3_serial_batched_parity():
         out_s, config=cfg, hero=hero, num_seats=S,
         folded=folded, all_in=all_in, eff_per_seat=eff,
         total_commit=total_commit, street_commit=street_commit,
-        pot=pot, btc=btc, min_bet=min_bet, max_bet=max_bet,
+        pot=pot, btc=btc,
+        window=E._RaiseWindow(True, min_raise, max_raise, min_raise),
         to_call=to_call, eff_to_call=eff_to_call, hero_stack=hero_stack,
         inv_bb=inv_bb, street_idx=2,
     )
@@ -236,8 +240,12 @@ def test_stk_v3_serial_batched_parity():
         street_commit=np.array([street_commit], dtype=np.float64),
         pot=np.array([pot], dtype=np.float64),
         bet_to_call=np.array([btc], dtype=np.float64),
-        min_bet=np.array([min_bet], dtype=np.float64),
-        max_bet=np.array([max_bet], dtype=np.float64),
+        window=E._RaiseWindow(
+            np.array([True]),
+            np.array([min_raise], dtype=np.float64),
+            np.array([max_raise], dtype=np.float64),
+            np.array([min_raise], dtype=np.float64),
+        ),
         to_call=np.array([to_call], dtype=np.float64),
         inv_bb=inv_bb, street=np.array([2], dtype=np.int64),
     )
@@ -252,7 +260,8 @@ def test_stk10_ante_and_bloat_values():
         folded=[False, False, False], all_in=[False, False, False],
         eff_per_seat=[90000.0, 90000.0, 90000.0],
         total_commit=[30000, 30000, 30000], street_commit=[0, 0, 0],
-        pot=120000.0, btc=0.0, min_bet=120000.0, max_bet=180000.0,
+        pot=120000.0, btc=0.0,
+        window=E._RaiseWindow(True, 10000.0, 90000.0, 10000.0),
         to_call=0.0, eff_to_call=0.0, hero_stack=90000.0,
         inv_bb=1.0 / cfg.bb, street_idx=1,
     )
@@ -269,7 +278,8 @@ def test_stk_allin_hero_geometric_zero():
         folded=[False, False], all_in=[True, False],
         eff_per_seat=[0.0, 100000.0],
         total_commit=[200000, 45000], street_commit=[0, 0],
-        pot=245000.0, btc=0.0, min_bet=0.0, max_bet=0.0,
+        pot=245000.0, btc=0.0,
+        window=E._RaiseWindow(False, 0.0, 0.0, 0.0),
         to_call=0.0, eff_to_call=0.0, hero_stack=0.0,
         inv_bb=1.0 / cfg.bb, street_idx=1,
     )

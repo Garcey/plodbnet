@@ -11,14 +11,20 @@ pub const FLOP_BUCKETS: usize = 200;
 /// Private-view encoding: `OCHS_BUCKET_BASE + bucket_id` (avoids combo 0..1325).
 pub const OCHS_BUCKET_BASE: u32 = 2_000_000;
 
-/// Assign each unblocked combo a bucket 0..FLOP_BUCKETS-1 by EHS vs
-/// random opponent on this flop (MC with fixed seed samples).
-/// OCHS-style flop buckets: hand strength histogram vs a fixed set of
-/// opponent reference clusters, then quantile over the HS vector norm.
+/// Assign each unblocked combo a bucket 0..FLOP_BUCKETS-1 on this flop.
 ///
-/// Not full published OCHS training, but uses **~200** opponent-relative
-/// strength features (vs 12 MC samples of pure EHS) so flop infosets are
-/// compressed to `FLOP_BUCKETS` (200) rather than exact 1326.
+/// What it really is (review 2026-09-20 F8 — the old text oversold it): a
+/// QUANTILE of one scalar score per combo. The score is `10·mean + L2` of the
+/// combo's Monte-Carlo equity (`samples` runouts, fixed seed) against 16
+/// random reference combos. It is "OCHS-flavoured" only in that the equities
+/// are opponent-relative; it is not the published OCHS clustering, and there
+/// are 16 features, not ~200 — `FLOP_BUCKETS` (200) is the number of BUCKETS.
+///
+/// The bucket is computed ONCE from the flop and the solver keeps using it on
+/// the turn and river, so later-street infosets cannot see how the runout
+/// changed the hand (a made flush and a missed draw share an infoset if they
+/// shared a flop bucket). Reports label this
+/// `card_abs=… (… fixed at the flop …; coarse abstraction)`.
 pub fn flop_equity_buckets(board3: &[u8; 3], samples: u32, seed: u64) -> Vec<u16> {
     let mut out = vec![u16::MAX; NUM_COMBOS];
     let mut blocked = [false; 52];
@@ -151,12 +157,22 @@ impl PrivateView {
     }
 }
 
-/// Suit isomorphism: map a hole combo relative to a public board so that
-/// isomorphic suit assignments share one infoset key.
+/// Suit relabelling: map a hole combo relative to a public board so that
+/// suit-permuted (board, hand) PAIRS share one key across different boards.
 ///
 /// Algorithm: build a suit permutation that maps the board's suits to a
 /// canonical order (first-seen suit → 0,1,2,3), then apply the same map to
 /// hole cards and re-encode the combo id.
+///
+/// (review 2026-09-20 D15) Two facts callers must respect:
+/// - For any FIXED board the map is a permutation of the suits, hence a
+///   bijection on combos: it merges NOTHING within one public board (a solve
+///   of a fixed river board gets no infoset reduction from it — the reports
+///   say `iso=noop_on_fixed_board`). Hands that are strategically identical on
+///   a board (e.g. AdKh / AhKs on a mono-club flop) are NOT merged.
+/// - `board` must be the PUBLIC board dealt so far. Passing cards that are not
+///   public yet (a sampled future river) makes the key depend on hidden
+///   information: the first-seen order of a new suit changes the map.
 pub fn iso_combo_id(combo: usize, board: &[u8]) -> u32 {
     let (c0, c1) = combo_cards(combo);
     let map = suit_map_for_board(board);
@@ -223,6 +239,32 @@ mod iso_tests {
             "suit-isomorphic (board,hand) pairs must share infoset key"
         );
         let _ = (aa_hd, aa_hs);
+    }
+
+    /// (review 2026-09-20 D15) on one fixed board the relabel is a bijection —
+    /// no two combos ever share a key, so it cannot shrink a fixed-board solve.
+    #[test]
+    fn iso_is_a_bijection_on_a_fixed_board() {
+        for board in [vec![0u8, 4, 8], vec![0, 5, 10, 15], vec![3, 17, 22, 40, 51]] {
+            let mut seen = std::collections::HashSet::new();
+            for combo in 0..NUM_COMBOS {
+                assert!(seen.insert(iso_combo_id(combo, &board)), "collision on {board:?}");
+            }
+            assert_eq!(seen.len(), NUM_COMBOS);
+        }
+    }
+
+    /// A not-yet-public card must not be passed in: a new suit on the river
+    /// changes the map (this is exactly the leak D15 removed from the solver).
+    #[test]
+    fn iso_key_depends_on_every_card_it_is_given() {
+        let combo = super::super::range::cards_to_combo(50, 47); // Ah Ks
+        let turn = [0u8, 4, 9, 13]; // suits c, c, d, d
+        let with_heart_river = iso_combo_id(combo, &[0, 4, 9, 13, 22]);
+        let with_spade_river = iso_combo_id(combo, &[0, 4, 9, 13, 23]);
+        assert_ne!(with_heart_river, with_spade_river);
+        // The public-board key is one value, whatever comes later.
+        assert_eq!(iso_combo_id(combo, &turn), iso_combo_id(combo, &turn));
     }
 
     #[test]

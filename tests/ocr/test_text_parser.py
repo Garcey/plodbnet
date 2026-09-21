@@ -70,3 +70,67 @@ def test_strips_leading_currency_symbol():
 def test_whitespace_tolerated():
     assert _parse_chip_text("  1,090  ") == 109000
     assert _parse_chip_text("1 090") == 109000
+
+
+# --- review 2026-09-20 I11: trailing separators / leading dot -----------
+
+import pytest  # noqa: E402  (kept next to the table it serves)
+
+# (raw tesseract text, expected cents). The "was" column in the comments is
+# what the pre-fix parser returned.
+_I11_CASES = [
+    # A trailing "." / "," is punctuation noise, NOT a decimal point. The old
+    # multi-dot collapse kept the LAST dot: "450.5." -> "4505." -> $4505.
+    ("450.5.", 45_050),         # was 450_500  (the HANDOFF 450.5 -> 4505 drop)
+    ("70.05.", 7_005),          # was 700_500
+    ("1,755.59.", 175_559),     # was 17_555_900
+    ("580.03,", 58_003),
+    ("12.", 1_200),
+    ("180 .", 18_000),
+    # Last separator + 1-2 digits = decimal point.
+    ("580.03", 58_003),
+    ("1,755.59", 175_559),
+    ("1.755.59", 175_559),
+    ("1455.1", 145_510),
+    ("0.50", 50),
+    (".50", 50),                # was 5_000 (regex started at the "5")
+    ("$.5", 50),
+    # ... and the same for a comma misread of the decimal point.
+    ("450,5", 45_050),          # was 450_500
+    ("70,05", 7_005),           # was 700_500
+    # 3+ digits after the last separator = a (mis)read thousands comma.
+    ("1.090", 109_000),
+    ("1,090", 109_000),
+    ("12.345", 1_234_500),
+    ("1.234.567", 123_456_700),
+    # Plain integers.
+    ("74", 7_400),
+    ("1455", 145_500),
+    # None-vs-0: no digit at all -> None; a real zero -> 0.
+    ("", None),
+    ("$", None),
+    (",", None),
+    (".", None),
+    ("All In", None),
+    ("0", 0),
+    ("$0", 0),
+    ("0.00", 0),
+]
+
+
+@pytest.mark.parametrize("raw, expected", _I11_CASES)
+def test_parse_chip_text_table(raw, expected):
+    got = _parse_chip_text(raw)
+    assert got == expected
+    # `0 == False`-style accidents: None and 0 must stay distinguishable.
+    assert (got is None) == (expected is None)
+
+
+def test_trailing_separator_never_inflates_the_amount():
+    """Property form of I11: appending "."/"," to any clean amount must not
+    change its value (it used to multiply it by 10-100)."""
+    for clean in ("5", "74", "180", "450.5", "70.05", "580.03", "1,090",
+                  "1,755.59", "12,345.6", "0", "0.5"):
+        want = _parse_chip_text(clean)
+        for junk in (".", ",", "..", ".,", " ."):
+            assert _parse_chip_text(clean + junk) == want, (clean, junk)

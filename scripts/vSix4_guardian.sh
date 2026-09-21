@@ -23,6 +23,12 @@ launch(){  # $1 = optional checkpoint to warm-load (empty = newest vSix4_*)
   export PATH="$HOME/.cargo/bin:$PATH"
   # Full Rust obs encoder (OBS_DIM 1171) — main expected wall-clock win.
   export PLO5_RUST_ENCODER=1
+  # This stem was trained on the pre-2026-09-20 observation VALUES (review
+  # B1/B2/B3/B5). train.py refuses a warm start across an obs-semantics change,
+  # so pin rev 1 for byte-compatible resumes. To migrate the stem to the
+  # corrected features instead, drop this line and pass --allow-obs-rev-change
+  # ONCE (PRODUCTION BEHAVIOR CHANGE; expect a transient).
+  export PLO5BP_OBS_REV=1
   local load=""
   [ -n "${1:-}" ] && load="--load-checkpoint $1"
   setsid nohup .venv/bin/python -u scripts/train.py \
@@ -37,11 +43,25 @@ launch(){  # $1 = optional checkpoint to warm-load (empty = newest vSix4_*)
     --lr 1.5e-4 --lr-warmup-updates 0 --clip-room-mid 0.07 \
     --target-kl 0.5 --kl-hard 10.0 --adv-clip 8 --cpu-threads 32 \
     --snapshot-every 5 \
+    --no-drain-inflight \
     $load --checkpoint checkpoints/vSix4.pt \
     --num-updates 100000000 >> "$LOG" 2>&1 < /dev/null &
   disown 2>/dev/null || true
 }
 
+# (review 2026-09-20 A7) A stop flag left over from the last clean stop must be
+# cleared by hand: launching and THEN exiting on it (the loop's first check)
+# would leave a trainer running with no guardian.
+if [ -f "$STOPFLAG" ]; then
+  log "stop flag present at start -> not launching (rm $STOPFLAG to run)"
+  echo "vSix4 guardian: $STOPFLAG exists -> not launching (remove it to run)" >&2
+  exit 0
+fi
+
+# NOTE: train.py's rolling optimizer sidecar is checkpoints/vSix4.optim.pt —
+# deliberately NOT matched by the vSix4_*.pt glob below (it is rewritten at
+# every save, so it would always be the newest "checkpoint"). Checkpoints are
+# written atomically (<name>.pt.tmp + rename), so the newest match is complete.
 if [ -z "$(train_pid)" ]; then
   L=$(ls -t checkpoints/vSix4_*.pt 2>/dev/null | head -1)
   if [ -n "${L:-}" ]; then
@@ -64,7 +84,12 @@ while true; do
   [ -f "$STOPFLAG" ] && { log "stop flag present -> exiting"; exit 0; }
   sleep "$POLL"
   PID=$(train_pid)
-  NUPD=$(grep -cE "update +[0-9]" "$LOG" 2>/dev/null || echo 0)
+  # `grep -c` PRINTS 0 and exits 1 on no match, so the old `|| echo 0` yielded
+  # "0<newline>0" and the -ge test below died with "integer expression
+  # expected" (review 2026-09-20 A7). Take grep's own count; default only when
+  # it printed nothing (missing log) or something non-numeric.
+  NUPD=$(grep -cE "update +[0-9]" "$LOG" 2>/dev/null | head -1)
+  case "${NUPD:-}" in ''|*[!0-9]*) NUPD=0 ;; esac
   LASTHG=$(grep -E "update +[0-9]" "$LOG" 2>/dev/null | tail -1 | grep -oE "Hg/Ha/Hb=[0-9.]+" | head -1 | sed 's#.*=##')
   COLL=$(grep -E "update +[0-9]" "$LOG" 2>/dev/null | tail -8 | grep -oE "Hg/Ha/Hb=[0-9.]+" | sed 's#.*=##' | awk '{if($1+0<0.15)c++} END{print c+0}')
 
@@ -72,6 +97,11 @@ while true; do
     sleep 15; PID=$(train_pid)
     if [ -z "$PID" ]; then
       if [ "$restarts" -ge "$MAX_RESTARTS" ]; then log "DEAD; restart cap ($MAX_RESTARTS) hit -> STOP"; touch "$STOPFLAG"; exit 0; fi
+      # Re-check the stop flag RIGHT before relaunching (A7): the documented
+      # clean stop (touch the flag, kill the trainer) usually lands inside the
+      # POLL sleep above, and the loop-top check is a full POLL away — the
+      # guardian used to resurrect the run the operator had just stopped.
+      [ -f "$STOPFLAG" ] && { log "process DEAD and stop flag present -> NOT relaunching; exiting"; exit 0; }
       restarts=$((restarts+1))
       L=$(ls -t checkpoints/vSix4_*.pt 2>/dev/null | head -1)
       WARM="${L:-checkpoints/vSix3_60.pt}"

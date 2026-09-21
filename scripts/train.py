@@ -21,7 +21,9 @@ Time-based persistence (coexist with update-count flags):
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
+import math
 import os
 import re
 import signal
@@ -257,6 +259,7 @@ from plo5bp.config import (
     GameConfig,
     TrainingConfig,
 )
+import plo5bp.encoding as _encoding
 from plo5bp.encoding import OBS_DIM, OBS_DIM_MINIMAL
 from plo5bp.encoding_nlh import OBS_DIM_NLH
 from plo5bp.network import (
@@ -279,11 +282,23 @@ from plo5bp.selfplay import (
 )
 
 
-def _parse_seats_range(spec: str) -> tuple[int, ...]:
+def _parse_seats_range(spec: str, variant: str = VARIANT_PLO5) -> tuple[int, ...]:
     parts = [p.strip() for p in spec.split(",") if p.strip()]
     out = tuple(int(p) for p in parts)
     if not out or any(n < 2 for n in out):
         raise SystemExit(f"--num-seats-range must list ints ≥ 2, got {spec!r}")
+    # The obs layout has 8 hero-rotated seat slots and the deck must cover
+    # every seat's hole cards plus the boards (PLO6: 7 seats max). GameConfig
+    # raises on these too (review 2026-09-20 B8) — fail at arg-parse time with
+    # the flag named instead of mid-run on the first unlucky seat draw.
+    probe = GameConfig(num_seats=2, variant=variant)
+    boards = 5 if variant == VARIANT_NLH else 10
+    max_seats = min(8, (52 - boards) // probe.hole_count)
+    if any(n > max_seats for n in out):
+        raise SystemExit(
+            f"--num-seats-range: {variant} supports at most {max_seats} seats, "
+            f"got {spec!r}"
+        )
     return out
 
 
@@ -311,6 +326,22 @@ _VALID_STACK_DISTS = (
     "uniform", "clubgg", "clubgg_deep", "clubgg_mix",
     "agro_deep", "deep", "full_mix",
 )
+# Every name `_sample_game_config` implements (the --stack-dist choices).
+# --mix-tiers is validated against this, and the sampler itself raises on
+# anything else (review 2026-09-20 A12): an unknown name used to fall through
+# to the uniform --stack-range branch, so a `clubg_deep` typo silently trained
+# on uniform 1-300bb (median 155bb instead of 52bb).
+_KNOWN_STACK_DISTS = _VALID_STACK_DISTS + ("nlh_topoff",)
+
+
+def _parse_mix_tiers(spec: str) -> list[str]:
+    tiers = [t.strip() for t in spec.split(",") if t.strip()]
+    bad = [t for t in tiers if t not in _KNOWN_STACK_DISTS]
+    if bad:
+        raise SystemExit(
+            f"--mix-tiers: unknown tier(s) {bad} — valid: {_KNOWN_STACK_DISTS}"
+        )
+    return tiers
 
 
 def _parse_block_rotation(spec: str) -> list[tuple[str, float]]:
@@ -358,6 +389,214 @@ def _anneal_due(update: int, block_size: int, start_update: int) -> bool:
     return (update + 1) % block_size == 0 and (update + 1) > start_update
 
 
+# ---- checkpoint I/O (review 2026-09-20 A7 / A3 / A14) ----------------------
+def _atomic_torch_save(obj: object, path: Path) -> None:
+    """torch.save to `<name>.tmp` in the SAME directory, then os.replace.
+
+    A disk-full / OOM / kill mid-`torch.save` used to leave a truncated
+    NEWEST file; the guardians resume from `ls -t <stem>_*.pt | head -1`, so
+    every relaunch loaded it, crashed, and burned MAX_RESTARTS. os.replace is
+    atomic on POSIX and Windows (same volume), so a reader sees the old file
+    or the complete new one, never a partial. `<name>.pt.tmp` does not match
+    the guardians' `<stem>_*.pt` glob or `discover_checkpoint_family`."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
+def _optimizer_sidecar_path(ckpt_path: Path) -> Path:
+    """`<dir>/<family base>.optim.pt` for a checkpoint of that family
+    (`vSix4_65.pt` and `vSix4.pt` -> `vSix4.optim.pt`).
+
+    Deliberately NOT `<base>_optim.pt`: that matches `<base>_*.pt`, which is
+    how the guardians pick the newest checkpoint to resume from, how
+    vMin1's pick_warm and pod_prune_disk.sh enumerate a stem, and how the UI
+    resolves the experimental format's model (`_latest_vmin1_ckpt`) — the
+    sidecar is rewritten at every save, so it would usually BE the newest
+    match and get warm-loaded / served as a model."""
+    m = re.match(r"^(?P<base>.+)_\d+\.pt$", ckpt_path.name)
+    base = m.group("base") if m else ckpt_path.stem
+    return ckpt_path.with_name(f"{base}.optim.pt")
+
+
+_SIDECAR_ENTRY_KEYS = (
+    "optimizer_state", "param_shapes", "update_counter", "same_state_counters",
+)
+
+
+def _save_optimizer_sidecar(
+    trainer: PPOTrainer,
+    checkpoint_path: Path,
+    update_counter: int,
+    same_state_counters: "tuple[int, ...]" = (),
+    keep_counter: "int | None" = None,
+) -> None:
+    """Rewrite the ONE rolling sidecar for this stem: Adam moments + the
+    l2-init reference tensors + the `update_counter` of the checkpoint it was
+    written with (`same_state_counters`: other checkpoints stamped from this
+    exact optimizer state).
+
+    `keep_counter` (the FINAL save only): carry the entry the file currently
+    holds for that numbered checkpoint along as `previous`. A clean stop
+    writes `<stem>.pt` a few updates past the newest `<stem>_<N>.pt`, but the
+    guardians resume from the NUMBERED file — overwriting its moments here
+    would make every stop/restart a cold-Adam start, the very thing the
+    sidecar exists to prevent. The next mid save drops `previous` again."""
+    path = _optimizer_sidecar_path(checkpoint_path)
+    side = trainer.optimizer_sidecar_state()
+    side["update_counter"] = int(update_counter)
+    side["same_state_counters"] = [int(c) for c in same_state_counters]
+    if keep_counter is not None and path.exists():
+        try:
+            prev = torch.load(path, map_location="cpu", weights_only=False)
+            if int(prev["update_counter"]) == int(keep_counter):
+                side["previous"] = {k: prev[k] for k in _SIDECAR_ENTRY_KEYS}
+        except Exception as e:  # noqa: BLE001 - best effort, never block a save
+            print(f"[optim] could not carry the u{keep_counter} sidecar entry: {e!r}")
+    _atomic_torch_save(side, path)
+
+
+def _restore_optimizer_sidecar(
+    trainer: PPOTrainer, ckpt_path: Path, ckpt_update: "int | None"
+) -> "dict[str, bool]":
+    """PRODUCTION BEHAVIOR CHANGE — resume dynamics (review 2026-09-20 A3 +
+    A14). On a warm start, restore from the loaded checkpoint's sidecar:
+
+      - Adam MOMENTS, only when the sidecar was written with THIS checkpoint
+        (its update_counter matches) and every shape matches; moments from a
+        different point of the run are not applied to these weights.
+      - the l2-init REFERENCES, whenever names+shapes match, regardless of
+        the counter: they are the stem's original init and never change, so
+        a rollback to an older checkpoint still decays toward the true init.
+
+    Every outcome prints exactly one line per item — a cold Adam start or a
+    re-anchored init is never silent. Expected effect: the first update after
+    a relaunch takes a normal step (measured KL ~0.04) instead of a fresh-Adam
+    ~lr*sign(g) step (KL ~1.08 -> KLSTOP, and a rollback livelock if it clears
+    kl_hard), and decay-to-init stops drifting to the relaunch point."""
+    out = {"moments": False, "l2_init": False}
+    path = _optimizer_sidecar_path(ckpt_path)
+    if not path.exists():
+        print(
+            f"[optim] no sidecar {path.name} — Adam starts COLD"
+            + (
+                "; l2-init re-anchors at the loaded weights"
+                if trainer._l2_init_pairs else ""
+            )
+        )
+        return out
+    try:
+        side = torch.load(path, map_location="cpu", weights_only=False)
+        if not isinstance(side, dict):
+            raise ValueError("not a sidecar dict")
+    except Exception as e:  # noqa: BLE001 - a bad sidecar must never kill a resume
+        print(f"[optim] sidecar {path.name} unreadable ({e!r}) — Adam starts COLD")
+        return out
+    # The entry written WITH the loaded checkpoint: the file's own, or the
+    # numbered-save entry a final save carried along as `previous`.
+    entry = next(
+        (
+            e for e in (side, side.get("previous"))
+            if isinstance(e, dict) and ckpt_update is not None
+            and int(ckpt_update)
+            in {e.get("update_counter"), *e.get("same_state_counters", [])}
+        ),
+        None,
+    )
+    if entry is None:
+        print(
+            f"[optim] sidecar {path.name} is from update "
+            f"{side.get('update_counter')}, the loaded checkpoint from "
+            f"{ckpt_update} — Adam starts COLD (moments not applied)"
+        )
+    else:
+        ok, why = trainer.load_optimizer_moments(entry)
+        out["moments"] = ok
+        print(
+            f"[optim] restored Adam moments from {path.name} (u{ckpt_update}, {why})"
+            if ok else
+            f"[optim] sidecar {path.name} refused ({why}) — Adam starts COLD"
+        )
+    if trainer._l2_init_pairs:
+        ok, why = trainer.load_l2_init_refs(side)
+        out["l2_init"] = ok
+        print(
+            f"[optim] restored the ORIGINAL l2-init references from {path.name} ({why})"
+            if ok else
+            f"[optim] l2-init references NOT restored ({why}) — decay-to-init "
+            "re-anchors at the loaded weights"
+        )
+    return out
+
+
+# ---- live control file hardening (review 2026-09-20 A13 / A20) -------------
+# One message per DISTINCT problem: the control file is re-read every update,
+# so anything keyed on its content would otherwise spam the log forever.
+_CONTROL_WARNED: set[str] = set()
+
+
+def _warn_once(msg: str) -> None:
+    if msg not in _CONTROL_WARNED:
+        _CONTROL_WARNED.add(msg)
+        print(msg)
+
+
+def _read_control_text(path: Path) -> str | None:
+    """Text of a live-control file (anneal_control.json / threads.txt), or
+    None when it cannot be read. NEVER raises: the read sites used to catch
+    only OSError, so a UTF-16 file (what Windows PowerShell 5.1 `>` /
+    Out-File writes) raised UnicodeDecodeError — a ValueError — killed the
+    run, and crash-looped every guardian relaunch on the same file.
+    `utf-8-sig` also strips a UTF-8 BOM, which used to make the JSON
+    unparseable and the file silently ignored forever."""
+    try:
+        return path.read_text(encoding="utf-8-sig")
+    except (OSError, ValueError) as e:  # UnicodeDecodeError is a ValueError
+        _warn_once(
+            f"[control] cannot read {path}: {e!r} — IGNORED (save it as "
+            "UTF-8; PowerShell 5.1 `>`/Out-File writes UTF-16)"
+        )
+        return None
+
+
+# key -> (lo, hi, lo_is_exclusive). Outside the range = a typo, not a tuning
+# choice (`true` -> lr 1.0, a dropped exponent, a sign slip): reject it.
+_CONTROL_BOUNDS: dict[str, tuple[float, float, bool]] = {
+    "step": (0.0, 1.0, False),
+    "target_kl": (0.0, 1e6, False),            # 0 = guard off
+    "kl_hard": (0.0, 1e6, False),              # 0 = guard off
+    "lr": (0.0, 0.1, True),
+    "sizing_entropy_scale": (0.0, 1e3, False),
+    "entropy_coef": (0.0, 10.0, False),
+    "entropy_coef_deep": (0.0, 10.0, False),
+    "clip_room_mid": (0.0, 1.0, True),
+    "clip_room_ext": (0.0, 1.0, True),
+    "q_fold_sup_coef": (0.0, 1e6, False),
+}
+_TIER_ENT_BOUNDS = (0.0, 10.0, False)
+
+
+def _control_number(
+    key: str, value: object, bounds: tuple[float, float, bool]
+) -> tuple[float | None, str | None]:
+    """(validated float, None) or (None, why-not). JSON `true` is a Python
+    bool — an int subclass, so float(True) == 1.0 used to become lr 1.0."""
+    lo, hi, lo_open = bounds
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None, f"{key}={value!r} is not a number"
+    try:
+        x = float(value)
+    except OverflowError:  # a 400-digit int literal
+        return None, f"{key} overflows a float"
+    if not math.isfinite(x):
+        return None, f"{key}={x} is not finite"
+    if x < lo or x > hi or (lo_open and x == lo):
+        rng = f"{'(' if lo_open else '['}{lo:g}, {hi:g}]"
+        return None, f"{key}={x:g} is outside {rng}"
+    return x, None
+
+
 def _apply_anneal_control(
     raw: str | None,
     last_raw: str | None,
@@ -367,6 +606,7 @@ def _apply_anneal_control(
     live_ent: float,
     live_ent_deep: float,
     trainer=None,
+    broadcast_entropy: bool = False,
 ) -> tuple[float, str | None, float, float, float]:
     """Apply a live `runs/anneal_control.json` edit without pausing
     training. Returns (anneal_step, applied_content, live_lr, live_ent,
@@ -379,8 +619,11 @@ def _apply_anneal_control(
       {"step": 0.003}                     — change the per-block decrement
       {"tier_ent": {"deep": 0.08}}        — manually set a tier's coef
       {"entropy_coef": 0.38}              — FLAT coef (non-tier runs: NLH /
-                                            plain --stack-dist; ignored by
-                                            the tiered branches)
+                                            plain --stack-dist). Under
+                                            --mix-configs
+                                            (`broadcast_entropy`) it sets
+                                            EVERY tier not named by a
+                                            `tier_ent` in the same write
       {"entropy_coef_deep": 0.1}          — the deep-dist flat variant
       {"target_kl": 2.0}                  — retune the soft KL early-stop
       {"kl_hard": 12.0}                   — retune the hard rollback level
@@ -396,64 +639,103 @@ def _apply_anneal_control(
 
     A manual tier_ent set is one-shot: the anneal keeps lowering from
     the new level afterwards. The lr set is the BASE lr — the per-update
-    warmup scale still multiplies it. Malformed JSON is ignored (and
-    retried on the next loop, so a half-written save is harmless)."""
+    warmup scale still multiplies it.
+
+    An edit is applied ATOMICALLY or not at all, and never silently
+    (review 2026-09-20 A13 / A20): malformed JSON / a non-object / a
+    non-object `tier_ent` / any value that is a bool, non-numeric, negative,
+    non-finite or out of `_CONTROL_BOUNDS` makes the WHOLE edit a no-op
+    (returned content unchanged, so a half-written save is simply retried
+    on the next loop) with ONE log line per distinct content. Unknown keys
+    and unknown tier names are logged once and skipped; the rest applies."""
     if raw is None or raw == last_raw:
         return step, last_raw, live_lr, live_ent, live_ent_deep
+    unchanged = (step, last_raw, live_lr, live_ent, live_ent_deep)
+    snippet = raw.strip().replace("\n", " ")[:160]
     try:
         ctrl = json.loads(raw)
-        if not isinstance(ctrl, dict):
-            # C1: valid JSON but not an object (a list, bare string, or number
-            # from a live-tune typo). The except below catches decode + scalar
-            # errors, but ctrl.get()/.items() on a non-dict raises AttributeError,
-            # which was NOT caught → the live trainer crashed within one update of
-            # the bad save. Treat as malformed and ignore, per the docstring.
-            return step, last_raw, live_lr, live_ent, live_ent_deep
-        new_step = float(ctrl["step"]) if "step" in ctrl else step
-        new_tiers = {
-            tier: float(v)
-            for tier, v in (ctrl.get("tier_ent") or {}).items()
-            if tier in tier_ent
-        }
-        new_target_kl = (
-            float(ctrl["target_kl"]) if "target_kl" in ctrl else None
+    except ValueError:
+        _warn_once(f"[anneal-control] malformed JSON IGNORED: {snippet}")
+        return unchanged
+    tiers_raw = ctrl.get("tier_ent") if isinstance(ctrl, dict) else None
+    if not isinstance(ctrl, dict) or not isinstance(tiers_raw, (dict, type(None))):
+        # C1: valid JSON but not an object (a list, bare string, or number
+        # from a live-tune typo), or a non-object tier_ent. Treat as
+        # malformed and ignore, per the docstring.
+        _warn_once(f"[anneal-control] not a JSON object — IGNORED: {snippet}")
+        return unchanged
+
+    errors: list[str] = []
+    vals: dict[str, float] = {}
+    for key, bounds in _CONTROL_BOUNDS.items():
+        if key in ctrl:
+            x, why = _control_number(key, ctrl[key], bounds)
+            if why is not None:
+                errors.append(why)
+            else:
+                vals[key] = x
+    new_tiers: dict[str, float] = {}
+    unknown_tiers: list[str] = []
+    for tier, v in (tiers_raw or {}).items():
+        if tier not in tier_ent:
+            unknown_tiers.append(str(tier))
+            continue
+        x, why = _control_number(f"tier_ent[{tier}]", v, _TIER_ENT_BOUNDS)
+        if why is not None:
+            errors.append(why)
+        else:
+            new_tiers[tier] = x
+    if errors:
+        _warn_once(
+            "[anneal-control] edit IGNORED, NOTHING applied — "
+            + "; ".join(errors) + f" | content: {snippet}"
         )
-        new_kl_hard = float(ctrl["kl_hard"]) if "kl_hard" in ctrl else None
-        new_lr = float(ctrl["lr"]) if "lr" in ctrl else None
-        new_sizing_scale = (
-            float(ctrl["sizing_entropy_scale"])
-            if "sizing_entropy_scale" in ctrl
-            else None
+        return unchanged
+    unknown_keys = sorted(set(ctrl) - set(_CONTROL_BOUNDS) - {"tier_ent"})
+    if unknown_keys:
+        _warn_once(
+            f"[anneal-control] unknown key(s) {unknown_keys} skipped "
+            f"(valid: {sorted(_CONTROL_BOUNDS) + ['tier_ent']})"
         )
-        new_ent = (
-            float(ctrl["entropy_coef"]) if "entropy_coef" in ctrl else None
+    if unknown_tiers:
+        _warn_once(
+            f"[anneal-control] unknown tier_ent tier(s) {sorted(unknown_tiers)} "
+            f"skipped (this run's tiers: {sorted(tier_ent)})"
         )
-        new_ent_deep = (
-            float(ctrl["entropy_coef_deep"])
-            if "entropy_coef_deep" in ctrl
-            else None
-        )
-        new_clip_mid = (
-            float(ctrl["clip_room_mid"]) if "clip_room_mid" in ctrl else None
-        )
-        new_clip_ext = (
-            float(ctrl["clip_room_ext"]) if "clip_room_ext" in ctrl else None
-        )
-        new_q_fold_sup = (
-            float(ctrl["q_fold_sup_coef"])
-            if "q_fold_sup_coef" in ctrl
-            else None
-        )
-    except (ValueError, TypeError, AttributeError):
-        # AttributeError backstop: a non-dict `tier_ent` value (e.g.
-        # {"tier_ent": ["deep", 0.08]}) makes .items() raise; ignore it too.
-        return step, last_raw, live_lr, live_ent, live_ent_deep
+
+    new_step = vals.get("step", step)
+    new_target_kl = vals.get("target_kl")
+    new_kl_hard = vals.get("kl_hard")
+    new_lr = vals.get("lr")
+    new_sizing_scale = vals.get("sizing_entropy_scale")
+    new_ent = vals.get("entropy_coef")
+    new_ent_deep = vals.get("entropy_coef_deep")
+    new_clip_mid = vals.get("clip_room_mid")
+    new_clip_ext = vals.get("clip_room_ext")
+    new_q_fold_sup = vals.get("q_fold_sup_coef")
     if new_step != step:
         print(f"[anneal-control] step {step} -> {new_step}")
     for tier, v in new_tiers.items():
         if tier_ent[tier] != v:
             print(f"[anneal-control] tier_ent[{tier}] {tier_ent[tier]} -> {v}")
         tier_ent[tier] = v
+    # Mix-configs consumes tier_ent (per-row coefs), not the flat coef — an
+    # `entropy_coef` edit used to be a silent no-op there (V5_DESIGN.md B5).
+    # Broadcast it to every tier so the natural key works in both modes; a
+    # tier NAMED by `tier_ent` in this same write keeps its explicit value.
+    # Keyed on the key's PRESENCE, not on the flat value changing (A20): the
+    # flat coef goes stale under mixing (nothing reads it), so re-sending the
+    # launch value to undo per-tier edits compared equal and did nothing.
+    if broadcast_entropy and new_ent is not None:
+        for tier in tier_ent:
+            if tier in new_tiers:
+                continue
+            if tier_ent[tier] != new_ent:
+                print(
+                    f"[anneal-control] tier_ent[{tier}] {tier_ent[tier]} "
+                    f"-> {new_ent} (entropy_coef broadcast)"
+                )
+            tier_ent[tier] = new_ent
     if new_target_kl is not None and trainer is not None:
         if trainer.target_kl != new_target_kl:
             print(
@@ -536,20 +818,35 @@ def _anneal_decision(
 
       - No baseline yet (first block of this tier): record it, leave ent.
       - All three streets HELD within `tol` (each >= baseline - tol): lower ent
-        by `step` (clamped at `floor`) and ADVANCE the baseline to now_ftr — so
-        each successive cut must keep paying for the aggression it had.
+        by `step` (clamped at `floor`) and RATCHET the baseline UP — per
+        street `max(old, now)` — so each successive cut must keep paying for
+        the best aggression the tier has shown.
       - Any street DROPPED: HOLD ent and KEEP the old baseline. The next block
         must recover to the pre-drop level before lowering resumes; this stops
         the anneal from chasing F/T/R downward into passivity.
+
+    PRODUCTION BEHAVIOR CHANGE, block-anneal mode only (review 2026-09-20
+    A15): a held block used to REPLACE the baseline with now_ftr, so a slip
+    inside the tolerance also lowered the bar for the next block. F/T/R
+    sliding 0.9/block (< tol 1.0) read as "held" forever: 30 -> 20.1 over 11
+    blocks with entropy cut on every one — exactly the downward chase the
+    drop rule exists to stop. The tolerance now absorbs block-to-block NOISE
+    around a bar that only moves up. Expected effect: fewer entropy cuts on
+    tiers whose aggression is drifting down; identical on tiers that hold.
     """
     if baseline is None:
         return ent, (now_ftr[0], now_ftr[1], now_ftr[2]), "record-baseline"
     held = all(now_ftr[s] >= baseline[s] - tol for s in range(3))
     if held:
+        ratchet = (
+            max(baseline[0], now_ftr[0]),
+            max(baseline[1], now_ftr[1]),
+            max(baseline[2], now_ftr[2]),
+        )
         if ent > floor:
             new_ent = max(floor, ent - step)
-            return new_ent, (now_ftr[0], now_ftr[1], now_ftr[2]), "lowered"
-        return floor, (now_ftr[0], now_ftr[1], now_ftr[2]), "held@floor"
+            return new_ent, ratchet, "lowered"
+        return floor, ratchet, "held@floor"
     return ent, baseline, "drop:hold"
 
 
@@ -668,6 +965,16 @@ def _sample_clubgg_seats(
     return int(rng.choice(seats_choices, p=probs))
 
 
+# Stack re-draws before `_sample_game_config` gives up and clamps (A1).
+_STACK_RESAMPLE_TRIES = 32
+
+# Consecutive rolled-back updates before (and between) livelock alarms (A3).
+_ROLLBACK_ALARM_AFTER = 5
+
+# The files python/plo5bp/ui/server.py serves by default (FORMATS registry).
+_UI_SERVED_CHECKPOINTS = frozenset({"stub.pt", "nlh_stub.pt"})
+
+
 def _sample_game_config(
     seats_choices: tuple[int, ...],
     stack_lo_bb: float,
@@ -689,6 +996,11 @@ def _sample_game_config(
     else:
         n_seats = int(rng.choice(seats_choices))
 
+    if stack_dist not in _KNOWN_STACK_DISTS:
+        # A12: never fall through to the uniform branch on a typo.
+        raise ValueError(
+            f"unknown stack_dist {stack_dist!r} — valid: {_KNOWN_STACK_DISTS}"
+        )
     effective_stack_dist = stack_dist
     if stack_dist == "clubgg_mix":
         effective_stack_dist = "clubgg_deep" if rng.random() < 0.5 else "clubgg"
@@ -697,30 +1009,65 @@ def _sample_game_config(
             rng.choice(("clubgg", "clubgg_deep", "deep"))
         )
 
-    if effective_stack_dist == "clubgg":
-        depths_bb = np.array(
-            [_sample_clubgg_stack_bb(stack_lo_bb, stack_hi_bb, rng) for _ in range(n_seats)]
-        )
-    elif effective_stack_dist == "clubgg_deep":
-        depths_bb = np.array(
-            [
-                _sample_clubgg_stack_bb(
-                    stack_lo_bb, stack_hi_bb, rng, bands=_CLUBGG_DEEP_STACK_BANDS
-                )
-                for _ in range(n_seats)
-            ]
-        )
-    elif effective_stack_dist == "nlh_topoff":
-        depths_bb = np.array(
-            [_sample_nlh_topoff_stack_bb(rng) for _ in range(n_seats)]
-        )
-    elif effective_stack_dist in ("agro_deep", "deep"):
-        depths_bb = rng.uniform(100.0, 250.0, size=n_seats)
-    elif stack_lo_bb == stack_hi_bb:
-        depths_bb = np.full(n_seats, stack_lo_bb)
+    def _draw_depths_bb() -> np.ndarray:
+        if effective_stack_dist == "clubgg":
+            return np.array(
+                [_sample_clubgg_stack_bb(stack_lo_bb, stack_hi_bb, rng) for _ in range(n_seats)]
+            )
+        if effective_stack_dist == "clubgg_deep":
+            return np.array(
+                [
+                    _sample_clubgg_stack_bb(
+                        stack_lo_bb, stack_hi_bb, rng, bands=_CLUBGG_DEEP_STACK_BANDS
+                    )
+                    for _ in range(n_seats)
+                ]
+            )
+        if effective_stack_dist == "nlh_topoff":
+            return np.array(
+                [_sample_nlh_topoff_stack_bb(rng) for _ in range(n_seats)]
+            )
+        if effective_stack_dist in ("agro_deep", "deep"):
+            return rng.uniform(100.0, 250.0, size=n_seats)
+        if stack_lo_bb == stack_hi_bb:
+            return np.full(n_seats, stack_lo_bb)
+        return rng.uniform(stack_lo_bb, stack_hi_bb, size=n_seats)
+
+    # A hand needs at least TWO seats that can still act after posting, or
+    # there is nothing to decide: a seat with stack <= ante is all-in on the
+    # ante (NLH: <= ante + bb — it may also owe the big blind). With fewer
+    # than two such seats the hand runs out at deal, and a config where that
+    # is ALWAYS so gives the collector no row, ever — the batched loop span
+    # forever on it (review 2026-09-20 A1; ~6e-5 per update with the clubgg
+    # 1-20bb band, i.e. ~6% per 1,000 updates, silent under the guardians).
+    # Exactly one live seat is the same problem in a milder form: a whole
+    # sub-rollout of forced single-action rows. Resample the stacks (the
+    # tier draw above is kept); the FIRST draw is the pre-fix one, so every
+    # config that was already playable is byte-identical.
+    live_floor = ante + (bb if variant == VARIANT_NLH else 0)
+    for _ in range(_STACK_RESAMPLE_TRIES):
+        depths_bb = _draw_depths_bb()
+        stacks = tuple(int(round(float(d) * bb)) for d in depths_bb)
+        if sum(s > live_floor for s in stacks) >= 2:
+            break
     else:
-        depths_bb = rng.uniform(stack_lo_bb, stack_hi_bb, size=n_seats)
-    stacks = tuple(int(round(float(d) * bb)) for d in depths_bb)
+        # The distribution itself sits at/below the ante (e.g. a fixed
+        # --stack-range under 3bb): resampling cannot help. Lift the two
+        # deepest seats to one bb behind after posting, loudly, rather than
+        # hand the collector a config it must refuse.
+        lift = sorted(range(n_seats), key=lambda i: stacks[i], reverse=True)[:2]
+        stacks = tuple(
+            max(s, live_floor + bb) if i in lift else s
+            for i, s in enumerate(stacks)
+        )
+        _warn_once(
+            f"[config] stack_dist={effective_stack_dist!r} range "
+            f"{stack_lo_bb:g}:{stack_hi_bb:g}bb cannot seat two players with "
+            f"more than {live_floor / bb:g}bb (ante"
+            + ("+bb" if variant == VARIANT_NLH else "")
+            + f") after {_STACK_RESAMPLE_TRIES} draws — CLAMPED the two "
+            f"deepest seats to {(live_floor + bb) / bb:g}bb"
+        )
     cfg = GameConfig(
         num_seats=n_seats,
         starting_stack=stacks[0],
@@ -827,7 +1174,10 @@ def main() -> None:
         default=0.2,
         help="PPO clipped-value-loss radius in RAW bb (V5_DESIGN.md B4: 0.2 "
         "against ±250bb returns rate-limits the critic; A/B {2, 10, 1e9} on "
-        "a throwaway stem before changing production runs).",
+        "a throwaway stem before changing production runs). <= 0 DISABLES "
+        "value clipping (plain MSE) — before 2026-09-20 a literal 0 was a "
+        "zero-width radius that froze the critic. Ignored by the "
+        "distributional head (--value-bins > 0), which has no clip.",
     )
     parser.add_argument(
         "--q-aux-coef",
@@ -1250,6 +1600,20 @@ def main() -> None:
         help="Optional warm-start: load model weights from this .pt before training.",
     )
     parser.add_argument(
+        "--allow-obs-rev-change",
+        action="store_true",
+        help="Permit --load-checkpoint across an observation-SEMANTICS "
+        "revision change (checkpoint `obs_rev` != this process's "
+        "plo5bp.encoding.OBS_SEMANTICS_REV, env PLO5BP_OBS_REV; an unstamped "
+        "checkpoint counts as rev 1 = trained before the 2026-09-20 feature "
+        "fixes). PRODUCTION BEHAVIOR CHANGE: the stem migrates to the new "
+        "feature values at unchanged widths — dims 186/187, 800/802, "
+        "999-1006, 1024-1029, 1040-1041 change meaning under the loaded "
+        "weights; expect a transient. Refused without this flag; to continue "
+        "a stem byte-compatibly set PLO5BP_OBS_REV=<checkpoint rev> instead. "
+        "Older-rev siblings are not seeded into the warm-start pool.",
+    )
+    parser.add_argument(
         "--warmstart-pool",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1286,9 +1650,11 @@ def main() -> None:
         type=float,
         default=0.0,
         help="KL-to-EMA-reference regularizer coefficient. 0 disables "
-        "(no EMA model is built). The reference is NOT persisted in "
-        "checkpoints — on (re)start it re-initializes to the current "
-        "weights and ramps in over ~1/(1-ema) updates.",
+        "(no EMA model is built). The reference IS persisted: every "
+        "checkpoint carries it as `model_ema` and a warm start restores it, "
+        "so the magnet's memory survives relaunches (it only re-initializes "
+        "to the loaded weights, ramping in over ~1/(1-ema) updates, when the "
+        "checkpoint predates the key). PLO5BP_SERVE_EMA=1 serves it in the UI.",
     )
     parser.add_argument(
         "--lr",
@@ -1366,7 +1732,46 @@ def main() -> None:
         help="If > 0, save a mid-run <stem>_<updates>.pt on this wall-clock cadence.",
     )
     parser.add_argument(
-        "--checkpoint", type=Path, default=Path("checkpoints/stub.pt")
+        "--checkpoint",
+        type=Path,
+        default=Path("checkpoints/train_run.pt"),
+        help="Final-save path; mid-run saves are <stem>_<update>.pt beside it "
+        "and the optimizer sidecar <stem>.optim.pt. Default "
+        "checkpoints/train_run.pt — it used to be checkpoints/stub.pt, the "
+        "file the UI SERVES, so a bare smoke / --profile-one-update run "
+        "overwrote the live PLO5 model at its final save (review 2026-09-20 "
+        "A11). Promote deliberately: cp <run>.pt checkpoints/stub.pt.",
+    )
+    parser.add_argument(
+        "--allow-overwrite-stub",
+        action="store_true",
+        help="Permit --checkpoint to name a UI-served file (stub.pt / "
+        "nlh_stub.pt). Refused otherwise.",
+    )
+    parser.add_argument(
+        "--optimizer-sidecar",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Persist Adam moments + the l2-init reference tensors in ONE "
+        "rolling <stem>.optim.pt next to the checkpoints (rewritten at every "
+        "save) and restore them on --load-checkpoint, so a relaunch resumes "
+        "with warm Adam instead of a first step of ~lr*sign(g), and "
+        "decay-to-init keeps pulling toward the stem's ORIGINAL init. Moments "
+        "restore only when the sidecar's update_counter equals the loaded "
+        "checkpoint's. --no-optimizer-sidecar = the pre-2026-09-20 behavior "
+        "(nothing written, nothing read: cold Adam, init = relaunch point).",
+    )
+    parser.add_argument(
+        "--drain-inflight",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Once the rollout row target is reached, stop re-dealing and "
+        "play every in-flight hand to completion so it lands in the batch "
+        "(unbiased in hand length). The batch then runs ~n_envs x one hand's "
+        "rows PAST --rollout-length (+2.5-8%% at the vSix4 ratio) — size GPU "
+        "memory / --rollout-length accordingly. --no-drain-inflight = the "
+        "pre-2026-09-20 collector, byte-identical: exit at the target and "
+        "DROP the in-flight hands (long hands under-sampled by ~len/W).",
     )
     parser.add_argument(
         "--log-every",
@@ -1430,6 +1835,16 @@ def main() -> None:
         "run; changes no training numbers (per-env deterministic MC seeds).",
     )
     args = parser.parse_args()
+
+    # A11: never let a training run's FINAL save land on a file the UI
+    # serves unless that is explicitly what was asked for.
+    if args.checkpoint.name in _UI_SERVED_CHECKPOINTS and not args.allow_overwrite_stub:
+        raise SystemExit(
+            f"error: --checkpoint {args.checkpoint} is a UI-served model file "
+            f"({sorted(_UI_SERVED_CHECKPOINTS)}); the final save would overwrite "
+            "it. Train to another path and promote with `cp`, or pass "
+            "--allow-overwrite-stub if you really mean it."
+        )
 
     # --v6 preset resolution (C2): sentinel defaults + _apply_v6_preset (module
     # level, above main) — explicit flags win FOR REAL now, including ones
@@ -1500,7 +1915,8 @@ def main() -> None:
             f"cycle: {rotation_summary}"
         )
 
-    mix_tiers = [t.strip() for t in args.mix_tiers.split(",") if t.strip()]
+    # Validated even when --mix-configs is off: a typo is a typo (A12).
+    mix_tiers = _parse_mix_tiers(args.mix_tiers)
     if args.mix_configs:
         if not args.batched:
             raise SystemExit("--mix-configs requires --batched")
@@ -1600,10 +2016,28 @@ def main() -> None:
     # asserts a few lines downstream.
     torch.distributions.Distribution.set_default_validate_args(False)
 
-    seats_choices = _parse_seats_range(args.num_seats_range)
+    seats_choices = _parse_seats_range(args.num_seats_range, args.variant)
     stack_lo, stack_hi = _parse_stack_range(args.stack_range)
 
+    # A6 drain_inflight plumbing. The flag's home is a TrainingConfig field
+    # (so it rides in every checkpoint's `config` stamp), but config.py is
+    # owned by another workstream in the 2026-09-20 fix pass: set the field
+    # only if the dataclass HAS it, and ALWAYS hand the value to the
+    # collectors as an explicit kwarg (they resolve kwarg > config field >
+    # True), so --no-drain-inflight works either way. The checkpoint also
+    # stamps it top-level (`drain_inflight`).
+    drain_inflight = bool(args.drain_inflight)
+    _tc_extra: dict = {}
+    if "drain_inflight" in {f.name for f in dataclasses.fields(TrainingConfig)}:
+        _tc_extra["drain_inflight"] = drain_inflight
+    if not drain_inflight:
+        print(
+            "[rollout] --no-drain-inflight: LEGACY collection — hands in "
+            "flight at the row target are dropped (long hands under-sampled)"
+        )
+
     train_cfg = TrainingConfig(
+        **_tc_extra,
         lr=args.lr,
         num_updates=args.num_updates,
         hidden_dim=args.hidden_dim,
@@ -1682,6 +2116,16 @@ def main() -> None:
         f"(head_version={model.head_version}) variant={args.variant} "
         f"obs_dim={obs_dim} obs_mode={args.obs_mode} anchors={anchor_spec.count} ({anchor_spec.name})"
     )
+    # Observation-SEMANTICS revision (2026-09-20): same widths, different
+    # feature VALUES. Env PLO5BP_OBS_REV via plo5bp.encoding — unset/2 = the
+    # corrected features, 1 = the exact pre-fix values. Read through getattr
+    # so this works on a tree where the switch has not landed yet (-> 2).
+    obs_rev = int(getattr(_encoding, "OBS_SEMANTICS_REV", 2))
+    print(
+        f"[obs-rev] observation semantics rev = {obs_rev} "
+        f"(PLO5BP_OBS_REV={os.environ.get('PLO5BP_OBS_REV', '')!r}; "
+        "stamped into every checkpoint as `obs_rev`)"
+    )
     model.to(train_cfg.device)
     # v5 stems build the critic WITH the dueling Q head from day one
     # (zero-init; Q == V until --q-aux-coef trains it) so the VRPO
@@ -1730,6 +2174,7 @@ def main() -> None:
     restored_baseline: dict | None = None
     restored_block_acc: dict | None = None
     restored_pool_updates: list | None = None
+    restored_control_applied: str | None = None
     if args.load_checkpoint is not None:
         ckpt = torch.load(args.load_checkpoint, map_location="cpu", weights_only=False)
         ckpt_variant = str(ckpt.get("variant", VARIANT_PLO5))
@@ -1816,6 +2261,70 @@ def main() -> None:
                     "Q surface's meaning; warm-starting across a flip is "
                     "refused — start a fresh stem (or deliberately convert)."
                 )
+        # obs_rev guard — AFTER the structural guards above (a checkpoint of
+        # the wrong variant/head/shape should say so, not talk about revs).
+        # The layout (widths) is identical across revs, so
+        # NOTHING downstream would notice weights trained on rev-1 feature
+        # values being fed rev-2 ones. Absent stamp = 1 (every checkpoint
+        # written before the 2026-09-20 fixes).
+        ckpt_obs_rev = int(ckpt.get("obs_rev", 1))
+        if ckpt_obs_rev != obs_rev:
+            if not args.allow_obs_rev_change:
+                raise SystemExit(
+                    f"obs_rev mismatch: checkpoint={ckpt_obs_rev} vs this "
+                    f"process={obs_rev} (plo5bp.encoding.OBS_SEMANTICS_REV). "
+                    "The observation WIDTH is the same but the feature values "
+                    "at dims 186/187, 800/802, 999-1006, 1024-1029, 1040-1041 "
+                    "differ, so these weights would read inputs they were not "
+                    f"trained on. Either set PLO5BP_OBS_REV={ckpt_obs_rev} to "
+                    "continue this stem byte-compatibly, or pass "
+                    "--allow-obs-rev-change to DELIBERATELY migrate it to rev "
+                    f"{obs_rev} (a production behavior change — expect a "
+                    "transient)."
+                )
+            print(
+                f"!!! [obs-rev] PRODUCTION BEHAVIOR CHANGE: migrating this "
+                f"stem from obs_rev {ckpt_obs_rev} to {obs_rev} "
+                "(--allow-obs-rev-change) — dims 186/187, 800/802, 999-1006, "
+                "1024-1029, 1040-1041 change meaning under the loaded weights; "
+                "expect a transient. Older-rev siblings are NOT seeded into "
+                "the opponent pool."
+            )
+        # A19: the distributional head's grid rides in the critic state dict
+        # (`_value_centers` / `_value_edges` are persisted buffers), so the
+        # CHECKPOINT's support always wins for V no matter what the flags
+        # say — but `_raw_value_centers` (the q_base_raw dueling base) and
+        # `hlgauss_sigma` are derived from the constructor's arguments. A
+        # relaunch with a different --value-support / --value-hlgauss-sigma
+        # would train Q and the HL-Gauss targets on a grid that disagrees
+        # with V's. Rebuild the critic at the trained values instead.
+        if train_cfg.value_bins > 0:
+            _trained = {
+                k: float(ckpt_cfg[k])
+                for k in ("value_support", "value_hlgauss_sigma")
+                if ckpt_cfg.get(k) is not None
+                and float(ckpt_cfg[k]) != float(getattr(train_cfg, k))
+            }
+            if _trained:
+                print(
+                    f"[critic] checkpoint was trained with {_trained}; the "
+                    "flags differ — keeping the CHECKPOINT's values (its "
+                    "persisted value grid wins regardless)"
+                )
+                train_cfg = dataclasses.replace(train_cfg, **_trained)
+                critic = CentralCritic(
+                    obs_dim=obs_dim,
+                    hidden_dim=train_cfg.critic_hidden_dim,
+                    num_blocks=train_cfg.critic_num_blocks,
+                    q_actions=critic_q_actions,
+                    torso_layernorm=train_cfg.torso_layernorm,
+                    value_bins=train_cfg.value_bins,
+                    value_support=train_cfg.value_support,
+                    hlgauss_sigma=train_cfg.value_hlgauss_sigma,
+                    q_fold_zero=train_cfg.q_fold_zero,
+                    q_base_raw=train_cfg.q_base_raw,
+                )
+                critic.to(train_cfg.device)
         model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt)
         crit_sd = ckpt["critic"]
         ck_adv = crit_sd.get("adv_head.weight")
@@ -1851,6 +2360,7 @@ def main() -> None:
         restored_baseline = ckpt.get("anneal_baseline")
         restored_block_acc = ckpt.get("anneal_block_acc")
         restored_pool_updates = ckpt.get("pool_member_updates")
+        restored_control_applied = ckpt.get("anneal_control_applied")
 
     # Per-tier entropy-anneal state. `tier_ent` is always seeded from the
     # --block-rotation initial values and is what the loop reads for the entropy
@@ -1911,6 +2421,16 @@ def main() -> None:
         if ema_sd:
             trainer.load_ref_state_dict(ema_sd)
             print("[kl-anchor] restored EMA reference from checkpoint")
+    # A3 + A14: warm Adam + the original l2-init references from the rolling
+    # sidecar (PRODUCTION BEHAVIOR CHANGE — see _restore_optimizer_sidecar).
+    if args.load_checkpoint is not None:
+        if args.optimizer_sidecar:
+            _restore_optimizer_sidecar(trainer, args.load_checkpoint, restored_update)
+        else:
+            print(
+                "[optim] --no-optimizer-sidecar: LEGACY resume — Adam starts "
+                "COLD, l2-init re-anchors at the loaded weights"
+            )
     pool = OpponentPool(capacity=train_cfg.opponent_pool_size, seed=args.seed)
     rng = np.random.default_rng(args.seed)
 
@@ -1945,6 +2465,7 @@ def main() -> None:
                 model.state_dict(),
                 preferred=restored_pool_updates,
                 directory=args.warmstart_pool_dir,
+                expected_obs_rev=obs_rev,
             )
             if seeded:
                 print(
@@ -1982,12 +2503,69 @@ def main() -> None:
     # --entropy-coef via tier_ent, --target-kl, ...). Only edits made AFTER
     # startup take effect. A stale {"lr": 3e-4} once forced 3e-4 onto three runs
     # that launched with a lower --lr before this guard (2026-06-24).
+    #
+    # ...EXCEPT the one case where ignoring it silently loses tuning (review
+    # 2026-09-20 A4): a crash + guardian relaunch of a run that HAD applied
+    # this very content. Nothing applied used to be persisted, so the relaunch
+    # fell back to the launch flags (lr, target_kl, kl_hard, clip rooms,
+    # q_fold_sup_coef, sizing_entropy_scale, entropy coefs) while the file
+    # still showed the tuned values — with no log line. Every checkpoint now
+    # stamps the last APPLIED content (`anneal_control_applied`):
+    #   file == the loaded checkpoint's stamp -> RE-APPLY it (logged);
+    #   file exists but differs / no stamp    -> ignored as before, LOUDLY.
     last_anneal_control: str | None = None
+    # What THIS lineage has actually applied — the checkpoint stamp. Distinct
+    # from `last_anneal_control` (the change-detection baseline), which also
+    # holds an IGNORED stale file's text: stamping that would get it "re"-
+    # applied on the next relaunch although it never took effect.
+    anneal_control_applied: str | None = None
     if anneal_control_file.exists():
-        try:
-            last_anneal_control = anneal_control_file.read_text()
-        except OSError:
-            last_anneal_control = None
+        _pre_raw = _read_control_text(anneal_control_file)
+        if _pre_raw is not None and _pre_raw == restored_control_applied:
+            print(
+                f"[anneal-control] {anneal_control_file} matches the loaded "
+                "checkpoint's applied stamp — RE-APPLYING it (live tuning "
+                f"survives the relaunch): {_pre_raw.strip()[:300]}"
+            )
+            (
+                live_anneal_step,
+                last_anneal_control,
+                live_lr,
+                live_entropy_coef,
+                live_entropy_coef_deep,
+            ) = _apply_anneal_control(
+                _pre_raw, None, tier_ent, live_anneal_step,
+                live_lr, live_entropy_coef, live_entropy_coef_deep,
+                trainer=trainer, broadcast_entropy=args.mix_configs,
+            )
+            if last_anneal_control is None:
+                last_anneal_control = _pre_raw  # rejected now: don't retry forever
+            else:
+                anneal_control_applied = _pre_raw
+            if args.anneal_entropy and restored_tier_ent:
+                # A manual tier_ent set is ONE-SHOT: the anneal kept lowering
+                # from it, and those annealed coefs rode in the checkpoint.
+                # They are newer than the file's — put them back on top.
+                tier_ent.update(
+                    {k: float(v) for k, v in restored_tier_ent.items() if k in tier_ent}
+                )
+                print(f"[anneal-control] annealed tier_ent kept: {tier_ent}")
+        else:
+            last_anneal_control = _pre_raw
+            print(
+                f"[anneal-control] !!! PRE-EXISTING {anneal_control_file} IGNORED "
+                "— this run starts on its LAUNCH FLAGS. "
+                + (
+                    "Its content differs from the loaded checkpoint's applied "
+                    "stamp"
+                    if restored_control_applied is not None
+                    else "No applied-control stamp to match it against (cold "
+                    "start, or a checkpoint older than the stamp)"
+                )
+                + ". To apply it, re-save the file with ANY content change "
+                "(e.g. add a space) after startup. Content: "
+                + ("<unreadable>" if _pre_raw is None else _pre_raw.strip()[:300])
+            )
 
     collector = collect_rollout_batched if args.batched else collect_rollout
     time_budget = float(args.train_seconds)
@@ -1995,8 +2573,13 @@ def main() -> None:
     t_start = time.time()
     last_snapshot_sec = t_start
     last_ckpt_sec = t_start
+    # Loop index of the last update a numbered checkpoint was written for
+    # (None = none yet) — lets the final save tell the sidecar when it holds
+    # the very same optimizer state as that numbered file.
+    last_mid_saved_update: int | None = None
 
     def _save_mid(update_idx: int) -> None:
+        nonlocal last_mid_saved_update
         # `update_idx` is the LOCAL loop counter; numbered checkpoints are named
         # and stamped on the GLOBAL update axis (base_update + local). Without
         # this, an anneal-off warm relaunch (which resets the loop counter to 0)
@@ -2028,8 +2611,7 @@ def main() -> None:
                 "(never overwritten)"
             )
             return
-        mid_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
+        _atomic_torch_save(
             {
                 "model": model.state_dict(),
                 "critic": critic.state_dict(),
@@ -2039,6 +2621,13 @@ def main() -> None:
                 "gate_count": GATE_ACTIONS,
                 "variant": args.variant,
                 "anchor_count": model._anchor_count,
+                # NOTE (review 2026-09-20 A20, documented, deliberately left
+                # alone): a MID save stamps the 0-based index of the update
+                # that just finished, the FINAL save stamps the COUNT of
+                # updates done — so the same weights read N here and N+1
+                # there. Consumers (pool seeding, the anneal resume, the
+                # optimizer sidecar match) treat both as "this file's update";
+                # unifying them would shift every stem's numbering.
                 "update_counter": global_idx,
                 # Metadata only (update indices, not weights): lets a
                 # warm-start reconstruct the exact pool membership from
@@ -2059,9 +2648,20 @@ def main() -> None:
                 # survives relaunches. Doubles as the smoother serving
                 # actor (promote model_ema instead of the last iterate).
                 "model_ema": trainer.ref_state_dict(),
+                # A4: raw text of the last APPLIED runs/anneal_control.json
+                # (None = none applied); a relaunch re-applies the file only
+                # when it still matches this.
+                "anneal_control_applied": anneal_control_applied,
+                "drain_inflight": drain_inflight,
+                # Observation-semantics revision these weights trained on
+                # (the warm-start guard + pool seeding key off it).
+                "obs_rev": obs_rev,
             },
             mid_path,
         )
+        if args.optimizer_sidecar:
+            _save_optimizer_sidecar(trainer, args.checkpoint, global_idx)
+        last_mid_saved_update = update_idx
 
     # Restore the update counter only when annealing, so the block cycle
     # continues across a relaunch instead of resetting to block 1 (which
@@ -2129,6 +2729,7 @@ def main() -> None:
         )
         resource_sampler.start()
 
+    consecutive_rollbacks = 0
     while True:
         if stop_requested["flag"]:
             break
@@ -2139,14 +2740,20 @@ def main() -> None:
         # _concat_batches copy is CPU-side even when the learner is on GPU
         # (8becc82 de-gated it; the cap matters MOST on CUDA).
         if threads_file.exists():
+            _threads_raw = _read_control_text(threads_file)
             try:
-                desired = int(threads_file.read_text().strip())
-                if desired > 0 and desired != current_threads:
-                    torch.set_num_threads(desired)
-                    current_threads = desired
-                    print(f"[threads] set torch threads -> {desired}")
-            except (ValueError, OSError):
-                pass
+                desired = int((_threads_raw or "").strip())
+            except ValueError:
+                desired = 0
+                if _threads_raw is not None:
+                    _warn_once(
+                        f"[threads] {threads_file} is not an integer — "
+                        f"IGNORED: {_threads_raw.strip()[:80]!r}"
+                    )
+            if desired > 0 and desired != current_threads:
+                torch.set_num_threads(desired)
+                current_threads = desired
+                print(f"[threads] set torch threads -> {desired}")
 
         if use_time_budget:
             if time.time() - t_start >= time_budget:
@@ -2159,12 +2766,8 @@ def main() -> None:
         # 2026-07-04, which made NLH entropy steps require a restart).
         # The startup-seeded baseline still guards against stale files.
         if anneal_control_file.exists():
-            try:
-                control_raw = anneal_control_file.read_text()
-            except OSError:
-                control_raw = None
-            _prev_live_ent = live_entropy_coef
-            _pre_tier_ent = dict(tier_ent)
+            control_raw = _read_control_text(anneal_control_file)
+            _prev_control = last_anneal_control
             (
                 live_anneal_step,
                 last_anneal_control,
@@ -2175,27 +2778,14 @@ def main() -> None:
                 control_raw, last_anneal_control, tier_ent, live_anneal_step,
                 live_lr, live_entropy_coef, live_entropy_coef_deep,
                 trainer=trainer,
+                # Mix-configs consumes tier_ent (per-row coefs), not the flat
+                # coef: `entropy_coef` broadcasts to the tiers (inside the
+                # helper since 2026-09-20 — see its comment).
+                broadcast_entropy=args.mix_configs,
             )
-            # Mix-configs consumes tier_ent (per-row coefs), not
-            # live_entropy_coef — an `entropy_coef` control edit used to be
-            # a silent no-op here (V5_DESIGN.md B5). Broadcast it to every
-            # tier so the natural key works in both modes, but SKIP any
-            # tier an explicit `tier_ent` edit changed in this SAME write
-            # (that override wins — otherwise a combined
-            # {"tier_ent":{"deep":X},"entropy_coef":Y} write would clobber
-            # deep with Y). Order-independent: `_pre_tier_ent` is the
-            # pre-call snapshot, so a tier changed by tier_ent this pass
-            # differs from it and is left alone.
-            if args.mix_configs and live_entropy_coef != _prev_live_ent:
-                for _t in tier_ent:
-                    if tier_ent[_t] != _pre_tier_ent[_t]:
-                        continue  # explicit tier_ent edit this write — keep it
-                    if tier_ent[_t] != live_entropy_coef:
-                        print(
-                            f"[anneal-control] tier_ent[{_t}] {tier_ent[_t]} "
-                            f"-> {live_entropy_coef} (entropy_coef broadcast)"
-                        )
-                    tier_ent[_t] = live_entropy_coef
+            if last_anneal_control != _prev_control:
+                # The helper only advances this on a fully APPLIED edit.
+                anneal_control_applied = last_anneal_control
 
         if args.mix_configs:
             # vThree: every update mixes `configs_per_tier` (seats,stacks) draws
@@ -2266,15 +2856,22 @@ def main() -> None:
             batch = collect_rollout_multiconfig(
                 model, pool, mix_cfgs, train_cfg, rng, critic=critic,
                 config_tiers=mix_cfg_tiers, tier_ent=tier_ent,
+                drain_inflight=drain_inflight,
             )
             update_entropy_coef = tier_ent.get(mix_tiers[0], args.entropy_coef)
         elif blocks:
-            batch = collector(model, pool, sampled_game_cfg, train_cfg, rng, critic=critic)
+            batch = collector(
+                model, pool, sampled_game_cfg, train_cfg, rng, critic=critic,
+                drain_inflight=drain_inflight,
+            )
             # tier_ent[tier] == the static block value when --anneal-entropy is
             # off (it is never mutated then), so this is identical to today.
             update_entropy_coef = tier_ent[active_tier]
         else:
-            batch = collector(model, pool, sampled_game_cfg, train_cfg, rng, critic=critic)
+            batch = collector(
+                model, pool, sampled_game_cfg, train_cfg, rng, critic=critic,
+                drain_inflight=drain_inflight,
+            )
             update_entropy_coef = (
                 live_entropy_coef_deep
                 if sampled_eff_dist == "deep"
@@ -2324,6 +2921,29 @@ def main() -> None:
 
         assert not np.isnan(stats.policy_loss), "NaN in policy loss"
         assert not np.isnan(stats.value_loss), "NaN in value loss"
+
+        # Livelock alarm (review 2026-09-20 A3). A hard rollback restores the
+        # pre-update params AND Adam state, so if the FIRST minibatch of every
+        # update clears kl_hard (cold Adam after a relaunch: the first step is
+        # ~lr*sign(g)) or is non-finite (A8), every update is a no-op and the
+        # run burns GPU forever while the guardians — which watch only PID +
+        # entropy — report "ok". Entropy does not move in that state either.
+        if stats.rolled_back or not math.isfinite(stats.kl_stop):
+            consecutive_rollbacks += 1
+            if consecutive_rollbacks >= _ROLLBACK_ALARM_AFTER and (
+                consecutive_rollbacks % _ROLLBACK_ALARM_AFTER == 0
+            ):
+                print(
+                    f"!!! [ALARM] {consecutive_rollbacks} CONSECUTIVE updates "
+                    "rolled back / refused (last: "
+                    f"mb{stats.kl_stopped_at}, kl={stats.kl_stop:+.3g}) — NO "
+                    "parameter has moved since; this is a LIVELOCK, not "
+                    "training. Fix live via runs/anneal_control.json (lower "
+                    '{"lr": ...} or raise {"kl_hard": ...}), or relaunch '
+                    "with --lr-warmup-updates > 0."
+                )
+        else:
+            consecutive_rollbacks = 0
 
         now = time.time()
 
@@ -2515,8 +3135,7 @@ def main() -> None:
         resource_sampler.summarize()
         resource_sampler = None
 
-    args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
+    _atomic_torch_save(
         {
             "model": model.state_dict(),
             "critic": critic.state_dict(),
@@ -2526,6 +3145,8 @@ def main() -> None:
             "gate_count": GATE_ACTIONS,
             "variant": args.variant,
             "anchor_count": model._anchor_count,
+            # COUNT of updates done — one more than the index a mid save of
+            # the same weights stamps (see the note in _save_mid).
             "update_counter": base_update + update,
             "pool_member_updates": list(pool.tags),
             "anneal_tier_ent": tier_ent,
@@ -2537,9 +3158,27 @@ def main() -> None:
                 int(args.configs_per_tier) if args.mix_configs else None
             ),
             "model_ema": trainer.ref_state_dict(),
+            "anneal_control_applied": anneal_control_applied,
+            "drain_inflight": drain_inflight,
+            "obs_rev": obs_rev,
         },
         args.checkpoint,
     )
+    if args.optimizer_sidecar:
+        # When no update ran since the last numbered save, that file holds
+        # these exact weights under the mid-save stamp (one lower): the
+        # sidecar is valid for it too — which is what a guardian resumes from.
+        _mid = (
+            None if last_mid_saved_update is None
+            else base_update + last_mid_saved_update
+        )
+        _current = _mid is not None and last_mid_saved_update == update - 1
+        _save_optimizer_sidecar(
+            trainer, args.checkpoint, base_update + update,
+            same_state_counters=(_mid,) if _current else (),
+            # Updates ran since that numbered save: keep ITS moments too.
+            keep_counter=None if (_current or _mid is None) else _mid,
+        )
     elapsed = time.time() - t_start
     print(
         f"Saved checkpoint to {args.checkpoint} after {update} updates this run "

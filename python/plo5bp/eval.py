@@ -105,7 +105,14 @@ def run_match(
     seed: int = 0,
 ) -> MatchStats:
     """Play `num_hands` hands. Hero seat rotates; return hero's mean chip delta
-    in bb."""
+    in bb.
+
+    A hand that is already over AT DEAL (every seat all-in on the ante /
+    blinds) has no decision for either policy, so it is skipped — it carries
+    no information about them and `num_hands` in the result counts PLAYED
+    hands. (`reset()` reports `terminal=False` even then, so the loop below
+    used to ask a policy to act on an empty gate mask and crash — the serial
+    twin of the batched-rollout hang, review 2026-09-20 A1.)"""
     env = BombPotEnv(game_config)
     rng = np.random.default_rng(seed)
     rewards: list[float] = []
@@ -115,6 +122,8 @@ def run_match(
         button = int(rng.integers(0, game_config.num_seats))
         hand_seed = int(rng.integers(0, 2**63 - 1))
         obs, info = env.reset(hand_seed, button)
+        if env.is_terminal():
+            continue
         while not info.terminal:
             actor = info.actor
             pol = hero_policy if actor == hero_seat else opponent_policy
@@ -123,6 +132,11 @@ def run_match(
             if done:
                 rewards.append(float(rs[hero_seat]) * reward_norm)
                 break
+    if num_hands > 0 and not rewards:
+        raise RuntimeError(
+            f"run_match: all {num_hands} hands were terminal at deal — "
+            f"{game_config!r} cannot produce a hand with a decision"
+        )
     arr = np.asarray(rewards, dtype=np.float64)
     return MatchStats(
         hero_reward_mean=float(arr.mean()),

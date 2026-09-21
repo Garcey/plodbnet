@@ -17,25 +17,29 @@ from starlette.testclient import TestClient
 
 ADMIN_EMAIL = "themilesgarcia@icloud.com"
 FREE_HANDS = 3  # lower than prod's 5 to keep the test fast
+HOMEGAME_ME = {"href": "/games", "label": "Home games"}
 
 _ENV = {
     "PLO5BP_PUBLIC": "1",
     "PLO5BP_DEV_LOGIN": "1",
+    # Starlette's TestClient reports client host "testclient", which the dev
+    # login no longer treats as loopback unless a test opts in (review F4).
+    "PLO5BP_DEV_LOGIN_TESTCLIENT": "1",
+    "PLO5BP_BASE_URL": "http://127.0.0.1:8770",
     "PLO5BP_FREE_HANDS": str(FREE_HANDS),
     "PLO5BP_ADMIN_EMAILS": ADMIN_EMAIL,
 }
-_UI_MODULES = ("plo5bp.ui.server", "plo5bp.ui.public", "plo5bp.ui.trainer")
 
 
 @pytest.fixture(scope="module")
-def server(tmp_path_factory):
+def server(tmp_path_factory, ui_purge):
     tmp = tmp_path_factory.mktemp("public_svc")
     old = {k: os.environ.get(k) for k in (*_ENV, "PLO5BP_DB", "PLO5BP_TRAINER_STATS")}
     os.environ.update(_ENV)
     os.environ["PLO5BP_DB"] = str(tmp / "public.db")
     os.environ["PLO5BP_TRAINER_STATS"] = str(tmp / "default_stats.json")
-    for m in _UI_MODULES:
-        sys.modules.pop(m, None)
+    # J3: pop the ui modules AND the stale `plo5bp.ui.<name>` package attrs.
+    ui_purge()
     mod = importlib.import_module("plo5bp.ui.server")
     yield mod
     for k, v in old.items():
@@ -43,8 +47,7 @@ def server(tmp_path_factory):
             os.environ.pop(k, None)
         else:
             os.environ[k] = v
-    for m in _UI_MODULES:
-        sys.modules.pop(m, None)
+    ui_purge()
 
 
 @pytest.fixture(scope="module")
@@ -89,6 +92,11 @@ def test_me_shape(clients):
     assert me["free"]["limit"] == FREE_HANDS
     admin_me = adm.get("/me").json()
     assert admin_me["is_admin"] is True and admin_me["sub"]["active"] is True
+    # Home games: admin always has it; a normal user does not even see the key.
+    # Contract (review 2026-09-20 F1): the payload carries href + label so the
+    # frontend never ships those literals to users without access.
+    assert admin_me.get("homegame") == HOMEGAME_ME
+    assert "homegame" not in me
 
 
 def test_free_limit_and_headers(clients):
@@ -272,6 +280,11 @@ def test_webhook_requires_settled_payment(server, clients, monkeypatch):
                 "type": "checkout.session.completed",
                 "data": {
                     "object": {
+                        # Real checkout.session events always carry `mode`;
+                        # activation now requires a SUBSCRIPTION checkout
+                        # (review 2026-09-20 F3 — see the billing tests in
+                        # test_review_public_billing.py).
+                        "mode": "subscription",
                         "client_reference_id": str(uid),
                         "payment_status": payment_status,
                         "subscription": "sub_test",
@@ -298,3 +311,45 @@ def test_webhook_requires_settled_payment(server, clients, monkeypatch):
     me = c.get("/me").json()
     assert me["sub"]["active"] is True
     assert me["sub"]["source"] == "stripe"
+
+
+def test_homegame_hidden_without_grant(clients):
+    """The games page 404s for signed-out, free, and subscribed users.
+    Comp does not grant it. Admin grant is a separate column."""
+    a, _, adm = clients
+    unsigned = TestClient(adm.app)
+    assert unsigned.get("/games").status_code == 404
+    assert unsigned.get("/games/api/tables").status_code == 404
+    assert unsigned.get("/static/games.js").status_code == 404
+    # Alice is signed in (and may or may not be entitled after earlier tests).
+    assert a.get("/games").status_code == 404
+    assert a.get("/games/api/tables").status_code == 404
+    assert a.get("/static/games.js").status_code == 404
+    assert "homegame" not in a.get("/me").json()
+    # Comp subscription does not unlock games.
+    users = adm.get("/admin/api/users").json()["users"]
+    alice = next(u for u in users if u["email"] == "alice@example.com")
+    adm.post("/admin/api/grant", json={"user_id": alice["id"], "action": "grant"})
+    assert a.get("/state").status_code == 200
+    assert a.get("/games").status_code == 404
+    assert alice["id"]
+    # Admin sees the flag off, then grant unlocks, revoke re-hides.
+    assert alice["homegame_access"] is False
+    r = adm.post(
+        "/admin/api/games_access",
+        json={"user_id": alice["id"], "action": "grant"},
+    )
+    assert r.status_code == 200
+    assert a.get("/me").json().get("homegame") == HOMEGAME_ME
+    assert a.get("/games").status_code == 200
+    assert "Home games" in a.get("/games").text
+    assert a.get("/games/api/tables").status_code == 200
+    adm.post(
+        "/admin/api/games_access",
+        json={"user_id": alice["id"], "action": "revoke"},
+    )
+    assert a.get("/games").status_code == 404
+    assert "homegame" not in a.get("/me").json()
+    # Admin themselves can always open it.
+    assert adm.get("/games").status_code == 200
+    assert adm.get("/me").json().get("homegame") == HOMEGAME_ME

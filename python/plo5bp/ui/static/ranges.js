@@ -12,10 +12,14 @@
 
 const RG = {
   line: [],        // [{t:"a",gate,chips_bb?} | {t:"cards",cards:[..]}]
+                   // chips_bb is the engine's raise-BY delta (what the server
+                   // replays); everything DISPLAYED or TYPED is a raise-TO
+                   // total = delta + the actor's street commit.
   node: null,      // viewed prefix length; null = live end
   seats: 6,
   stackBb: 100,
   data: null,      // last response
+  good: null,      // {line,node,seats,stackBb} behind RG.data (the render)
   busy: false,
   pick: null,      // {need, street, chosen:[]} while the card modal is open
   enabled: false,  // format == nlh_single && local build
@@ -25,11 +29,33 @@ const RG_RANKS = "AKQJT98765432";
 const RG_SUIT_GLYPH = { c: "♣", d: "♦", h: "♥", s: "♠" };
 const RG_GATE_LABEL = { fold: "Fold", check_call: "Call", raise: "Raise" };
 
+// --- helpers -----------------------------------------------------------------
+
+// Server strings (checkpoint file name, labels) go through innerHTML below:
+// escape them. The checkpoint name comes from a file path / env var.
+function rgEsc(v) {
+  return String(v ?? "").replace(/[&<>"']/g, (ch) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[ch]));
+}
+
+function rgClone(v) { return JSON.parse(JSON.stringify(v)); }
+
+// 4-decimal bb amounts (chips are integers, 1bb = 10000 chips) — kills the
+// float dust of raise-to minus commit before it goes on the wire.
+function rgRound4(v) { return Math.round(v * 1e4) / 1e4; }
+
+// Raise-TO total to show for an anchor / strip entry / size row. Falls back
+// to the raw delta for a server that predates `to_bb`.
+function rgToBb(x) {
+  return (x.to_bb !== null && x.to_bb !== undefined) ? x.to_bb : x.chips_bb;
+}
+
 // --- data ------------------------------------------------------------------
 
 let RG_SEQ = 0;
 
-async function rgQuery(prevLine) {
+async function rgQuery() {
   // Never drop a query: every call fires, the LATEST response wins
   // (superseded ones are discarded). Dropping-when-busy desyncs the
   // line from the rendered node when clicks arrive mid-flight.
@@ -50,17 +76,41 @@ async function rgQuery(prevLine) {
     });
     if (!res.ok) {
       let msg = `ranges query failed (${res.status})`;
-      try { msg = (await res.json()).detail || msg; } catch (_) {}
+      try {
+        // 400s carry a string detail; pydantic 422s carry [{msg, ...}].
+        const det = (await res.json()).detail;
+        if (typeof det === "string" && det) msg = det;
+        else if (Array.isArray(det) && det[0] && det[0].msg) msg = String(det[0].msg);
+      } catch (_) {}
       throw new Error(msg);
     }
     const data = await res.json();
     if (seq !== RG_SEQ) return; // superseded by a newer query
     RG.data = data;
+    // The state this render belongs to — what a failed query rolls back to.
+    RG.good = {
+      line: rgClone(RG.line), node: RG.node,
+      seats: RG.seats, stackBb: RG.stackBb,
+    };
     rgRender();
   } catch (e) {
     if (seq !== RG_SEQ) return;
     if (typeof showToast === "function") showToast(e.message);
-    if (prevLine) { RG.line = prevLine; RG.node = null; }
+    // Roll back to the state BEHIND THE CURRENT RENDER — line AND viewed
+    // node (and table config). The old rollback restored the line but reset
+    // node to null, so after a failed rebranch from a viewed past node the
+    // screen still showed that node while the next click appended at the
+    // live end instead of truncating there (review 2026-09-20 H5).
+    if (RG.good) {
+      RG.line = rgClone(RG.good.line);
+      RG.node = RG.good.node;
+      RG.seats = RG.good.seats;
+      RG.stackBb = RG.good.stackBb;
+      const seatsEl = document.getElementById("rg-seats");
+      const stackEl = document.getElementById("rg-stack");
+      if (seatsEl) seatsEl.value = String(RG.seats);
+      if (stackEl) stackEl.value = String(RG.stackBb);
+    }
   } finally {
     if (seq === RG_SEQ) {
       RG.busy = false;
@@ -76,13 +126,12 @@ function rgMutate(fn) {
   // viewing a past node truncates the line there (GTO-Wizard-style
   // rebranching), then appends.
   if (RG.busy) return;
-  const prev = JSON.parse(JSON.stringify(RG.line));
   if (RG.node !== null && RG.node < RG.line.length) {
     RG.line = RG.line.slice(0, RG.node);
   }
   fn();
   RG.node = null;
-  rgQuery(prev);
+  rgQuery(); // a failure restores RG.good (line + viewed node)
 }
 
 // --- rendering -------------------------------------------------------------
@@ -226,18 +275,19 @@ function rgRenderStrips() {
   );
   for (const e of d.sequence || []) {
     if (e.t === "a") {
-      const size = e.chips_bb !== null && e.chips_bb !== undefined
-        ? ` ${e.chips_bb}bb` : "";
+      // Raise-TO total (what the table shows), not the raise-by delta.
+      const to = rgToBb(e);
+      const size = to !== null && to !== undefined ? ` ${to}bb` : "";
       const chip = rgChip(
-        `<b>${e.position}</b> ${RG_GATE_LABEL[e.gate] || e.gate}${size}`,
-        `act gate-${e.gate}`,
+        `<b>${rgEsc(e.position)}</b> ${rgEsc(RG_GATE_LABEL[e.gate] || e.gate)}${size}`,
+        `act gate-${rgEsc(e.gate)}`,
         () => { RG.node = e.i; rgQuery(); }
       );
       if (viewed === e.i) chip.classList.add("viewing");
       wrap.appendChild(chip);
     } else {
       const chip = rgChip(
-        `<b>${e.street}</b> ${rgCardsLabel(e.cards)}`,
+        `<b>${rgEsc(e.street)}</b> ${rgCardsLabel(e.cards)}`,
         "cards",
         () => { RG.node = e.i + 1; rgQuery(); }
       );
@@ -263,7 +313,7 @@ function rgRenderActions() {
   }
   if (d.awaiting) {
     const btn = rgChip(
-      `Pick the ${d.awaiting} (${d.need} card${d.need > 1 ? "s" : ""})`,
+      `Pick the ${rgEsc(d.awaiting)} (${d.need} card${d.need > 1 ? "s" : ""})`,
       "pick-cards",
       () => rgOpenCardModal(d.awaiting, d.need, d.board || [])
     );
@@ -276,7 +326,7 @@ function rgRenderActions() {
   head.className = "rg-node-head";
   const toCall = st.to_call_bb > 0 ? ` · to call ${st.to_call_bb}bb` : "";
   head.innerHTML =
-    `<b>${st.position}</b> to act · ${st.street} · pot ${st.pot_bb}bb${toCall}`;
+    `<b>${rgEsc(st.position)}</b> to act · ${rgEsc(st.street)} · pot ${st.pot_bb}bb${toCall}`;
   box.appendChild(head);
 
   const row = document.createElement("div");
@@ -296,8 +346,10 @@ function rgRenderActions() {
     const sizes = document.createElement("div");
     sizes.className = "rg-action-row rg-sizes-row";
     for (const a of st.anchors || []) {
+      // Label = raise-TO total; the line entry keeps the server's exact
+      // raise-BY delta (chips_bb) so nothing is re-derived client-side.
       sizes.appendChild(
-        rgChip(`${a.label} <i>${a.chips_bb}bb</i>`, "gate-raise", () =>
+        rgChip(`${rgEsc(a.label)} <i>${rgToBb(a)}bb</i>`, "gate-raise", () =>
           rgMutate(() =>
             RG.line.push({ t: "a", gate: "raise", chips_bb: a.chips_bb })
           ))
@@ -305,18 +357,27 @@ function rgRenderActions() {
     }
     box.appendChild(sizes);
 
+    // Custom size: the box is a raise-TO total (street commitment after the
+    // raise), like every poker client. The engine wants the raise-BY delta,
+    // so subtract the actor's street commit before sending — the old code
+    // sent the typed total AS the delta (BB typing "4" raised to 5bb).
+    const commit = st.actor_commit_bb || 0;
+    const minTo = st.min_raise_to_bb ?? rgRound4(st.min_raise_bb + commit);
+    const maxTo = st.max_raise_to_bb ?? rgRound4(st.max_raise_bb + commit);
+    const verb = (st.to_call_bb > 0 || commit > 0) ? "Raise to" : "Bet";
     const custom = document.createElement("div");
     custom.className = "rg-action-row rg-custom";
     custom.innerHTML =
       `<input id="rg-custom-bb" type="number" step="0.1"` +
-      ` min="${st.min_raise_bb}" max="${st.max_raise_bb}"` +
-      ` placeholder="${st.min_raise_bb}–${st.max_raise_bb}bb" />` +
-      `<button id="rg-custom-go" type="button" class="rg-chip gate-raise">Raise to</button>`;
+      ` min="${minTo}" max="${maxTo}"` +
+      ` placeholder="${minTo}–${maxTo}bb" />` +
+      `<button id="rg-custom-go" type="button" class="rg-chip gate-raise">${verb}</button>`;
     box.appendChild(custom);
     custom.querySelector("#rg-custom-go").addEventListener("click", () => {
       const v = parseFloat(custom.querySelector("#rg-custom-bb").value);
       if (!Number.isFinite(v)) return;
-      rgMutate(() => RG.line.push({ t: "a", gate: "raise", chips_bb: v }));
+      const delta = rgRound4(v - commit);
+      rgMutate(() => RG.line.push({ t: "a", gate: "raise", chips_bb: delta }));
     });
   }
 }
@@ -355,8 +416,8 @@ function rgRenderSummary() {
     for (const s of d.sizes) {
       if (s.frac < 0.005) continue;
       sh +=
-        `<span class="rg-size-item">${s.label}` +
-        ` <i>${s.chips_bb}bb</i> <b>${(s.frac * 100).toFixed(0)}%</b></span>`;
+        `<span class="rg-size-item">${rgEsc(s.label)}` +
+        ` <i>${rgToBb(s)}bb</i> <b>${(s.frac * 100).toFixed(0)}%</b></span>`;
     }
     sh += `</div>`;
   }
@@ -366,9 +427,20 @@ function rgRenderSummary() {
 function rgRenderModel() {
   const el = document.getElementById("rg-model");
   const m = (RG.data && RG.data.model) || {};
+  // Which network produced THIS node's grid. With a GTO teacher configured
+  // the server serves it only on the nodes its training covers; everywhere
+  // else the PPO model answers and says so (backend "ppo_fallback" + reason).
+  let served = "";
+  if (m.backend === "ppo_fallback") {
+    served = ` <span class="rg-untrained" title="${rgEsc(m.reason || "")}">PPO fallback</span>`;
+  } else if (m.backend && m.backend !== "ppo") {
+    served = ` <span class="muted">· ${rgEsc(m.backend)}` +
+      `${m.obs_form === "canonical" ? " · canonical obs" : ""}</span>`;
+  }
+  // m.checkpoint is a file name from a path / env var — never raw HTML.
   el.innerHTML =
-    `model: <b>${m.checkpoint || "?"}</b>` +
-    (m.loaded ? "" : ` <span class="rg-untrained">untrained</span>`);
+    `model: <b>${rgEsc(m.checkpoint || "?")}</b>` +
+    (m.loaded ? "" : ` <span class="rg-untrained">untrained</span>`) + served;
 }
 
 function rgRender() {
@@ -482,16 +554,19 @@ function rgInit() {
   }, 300);
   setTimeout(() => clearInterval(poll), 15000);
 
+  // Table-config changes reset the line. RG.data / RG.good are left alone:
+  // if the query fails, rgQuery rolls the whole state (line, node, seats,
+  // stack + these two controls) back to the render still on screen.
   document.getElementById("rg-seats").addEventListener("change", (e) => {
     RG.seats = parseInt(e.target.value, 10);
-    RG.line = []; RG.node = null; RG.data = null;
+    RG.line = []; RG.node = null;
     rgQuery();
   });
   document.getElementById("rg-stack").addEventListener("change", (e) => {
     const v = parseFloat(e.target.value);
     if (Number.isFinite(v) && v > 1) {
       RG.stackBb = v;
-      RG.line = []; RG.node = null; RG.data = null;
+      RG.line = []; RG.node = null;
       rgQuery();
     }
   });
