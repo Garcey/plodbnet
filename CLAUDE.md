@@ -973,6 +973,29 @@ ALWAYS through `conftest.purge_ui_modules` / the `ui_purge` fixture: popping
 `sys.modules` alone leaves the stale module bound as an attribute of the
 `plo5bp.ui` package and `from plo5bp.ui import public` silently reuses it).
 
+**Free while the models are in development (2026-09-22):** `public.FREE_FOR_ALL`
+(`PLO5BP_FREE_FOR_ALL`, default ON) makes every SIGNED-IN user entitled — no
+daily trainer quota, Study unlocked, `/billing/checkout` answers 409, `/me`
+carries `free_for_all`, the account chip says FREE ACCESS and the landing page
+says so. Sign-in stays. The paywall / quota / Stripe code is untouched and still
+tested: `tests/python/conftest.py` defaults the test session to
+`PLO5BP_FREE_FOR_ALL=0`; `test_public_free_mode.py` boots production's way. Set
+the env var to `0` in `/etc/wrapgto/env` to bring the paywall back.
+
+**Workspace UI (2026-09-22):** Study / Trainer were re-skinned to sit next to the
+home games but stay a TOOL (flat panels, dense type, one accent). The card FACES
+are deliberately the old ones (owner's call) — do not swap in the home-games
+cards. Layout: slim `#top-bar` (mode tabs, format, units, account) + per-mode
+`#workbar` above the table (seats / $ per bb / ante / live controls / New Hand,
+trainer Settings / Repeat / New Hand) + `#side-rail` (Recommendation on top, the
+13 x 4 card matrix or the trainer stats under it). The redesign is the
+"WORKSPACE THEME v2" layer APPENDED to `style.css` — it wins by cascade order, so
+add new workspace styles after it. Card entry is continuous
+(`placeStudyCard` / `nextEmptySlot` in `app.js`): a placed card selects the next
+empty slot across groups (hole -> flop A -> flop B -> turn -> river), a card
+clicked with nothing selected fills the first empty slot, and cards can be typed
+(rank then suit, Backspace undoes).
+
 Service-layer rules (review 2026-09-20 — keep them):
 
 - The access middleware authorizes on a NORMALIZED `scope["path"]`

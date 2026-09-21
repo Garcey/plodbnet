@@ -1597,3 +1597,190 @@ body.ranges-mode .trainer-only { display: none !important; }
 }
 .rg-pick-card:disabled { opacity: 0.25; cursor: not-allowed; }
 .rg-pick-card.chosen { outline: 2px solid var(--accent); background: rgba(24, 210, 195, 0.12); }
+
+/* ==========================================================================
+   WORKSPACE THEME v2 (2026-09-22)
+   Appended LAST on purpose: it re-skins Study / Trainer / Ranges / the landing
+   page to sit next to the home-games design (same ink, same teal + gold, same
+   type) while staying a TOOL — flat panels, dense type, one accent, nothing
+   decorative. The card faces are deliberately untouched.
+   Layout: a slim top bar (mode, format, account) + a per-mode work bar over
+   the table; the right rail holds the OUTPUT (recommendation / stats) with the
+   13 x 4 card matrix under it, solver-style.
+   ========================================================================== */
+:root {
+  --bg: #070b11;
+  --panel: #0d131b;
+  --panel-2: #131b26;
+  --panel-3: #1a2432;
+  --border: rgba(255, 255, 255, 0.075);
+  --border-strong: rgba(255, 255, 255, 0.15);
+  --text: #dde4ed;
+  --text-bright: #ffffff;
+  --muted: #8794a6;
+  --gold: #ecc977;
+  --radius: 8px;
+  --radius-sm: 6px;
+  --shadow-1: none;
+}
+body { background: var(--bg); background-attachment: scroll; }
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.13); border: 2px solid transparent; background-clip: padding-box; border-radius: 9px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.24); background-clip: padding-box; border: 2px solid transparent; }
+kbd { font: 600 10.5px var(--mono); padding: 1px 5px; border-radius: 4px; border: 1px solid var(--border-strong); background: var(--panel-2); color: var(--text); margin-left: 2px; }
+
+/* ---- top bar: one slim row ------------------------------------------------ */
+#top-bar {
+  flex-wrap: nowrap; gap: 14px; padding: 0 14px; min-height: 48px;
+  background: #0a0f16; box-shadow: none; border-bottom: 1px solid var(--border);
+  overflow-x: auto; scrollbar-width: none;
+}
+#top-bar::-webkit-scrollbar { display: none; }
+.brand { margin-right: 4px; flex: none; }
+#mode-tabs { display: flex; align-self: stretch; gap: 2px; padding: 0; background: none; border: 0; border-radius: 0; flex: none; }
+.mode-tab {
+  position: relative; align-self: stretch; padding: 0 14px; border: 0; border-radius: 0; background: none;
+  color: var(--muted); font-size: 13px; font-weight: 600; letter-spacing: 0.2px; cursor: pointer; box-shadow: none;
+}
+.mode-tab:hover { color: var(--text-bright); background: rgba(255, 255, 255, 0.04); }
+.mode-tab.active { color: var(--text-bright); background: none; box-shadow: none; }
+.mode-tab.active::after { content: ""; position: absolute; left: 10px; right: 10px; bottom: 0; height: 2px; background: var(--accent); border-radius: 2px 2px 0 0; }
+.top-bar-item { flex: none; }
+.top-bar-item.top-bar-spacer { flex: 1 1 auto; }
+.top-bar-item label { font-size: 10.5px; letter-spacing: 0.9px; }
+#format-select, #unit-toggle, .top-bar-item input[type="number"], .seat-ctl {
+  height: 30px; background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+}
+#format-select { padding: 0 8px; }
+#unit-toggle { padding: 0 12px; font-family: var(--mono); }
+.top-bar-item input[type="number"] { padding: 0 8px; font-family: var(--mono); width: 78px; }
+.seat-ctl { padding: 0 2px; }
+#account-chip { gap: 6px; }
+.acct-pill { font-family: var(--mono); letter-spacing: 0.6px; }
+.acct-pill.pro { background: rgba(236, 201, 119, 0.12); color: var(--gold); border-color: rgba(236, 201, 119, 0.35); }
+.acct-btn { height: 28px; padding: 0 10px; border-radius: var(--radius-sm); background: transparent; border: 1px solid var(--border); color: var(--text); }
+.acct-btn:hover { background: var(--panel-3); border-color: var(--border-strong); }
+
+/* ---- work bar (per-mode controls, right above the table) ------------------ */
+#workbar {
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap; flex: none;
+  padding: 7px 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel);
+}
+#workbar .top-bar-spacer { flex: 1 1 auto; }
+#workbar .top-bar-item { gap: 7px; }
+#workbar button {
+  height: 30px; padding: 0 12px; border-radius: var(--radius-sm); border: 1px solid var(--border);
+  background: var(--panel-2); color: var(--text); font-size: 12.5px; font-weight: 600; cursor: pointer;
+}
+#workbar button:hover:not(:disabled) { background: var(--panel-3); border-color: var(--border-strong); }
+#workbar .seat-ctl button { height: 24px; width: 24px; padding: 0; border: 0; background: transparent; }
+#workbar #new-hand-btn, #workbar #trainer-new-hand-btn {
+  height: 32px; padding: 0 18px; border: 0; color: var(--on-accent); font-weight: 700; box-shadow: none;
+  background: var(--accent);
+}
+#workbar #new-hand-btn:hover, #workbar #trainer-new-hand-btn:hover { background: var(--accent-2); }
+#workbar .ocr-group { flex-wrap: wrap; }
+
+/* ---- workspace grid -------------------------------------------------------- */
+@media (min-width: 861px) {
+  main { grid-template-columns: minmax(0, 1fr) clamp(340px, 29vw, 460px); }
+  #table-area { padding: 10px 12px 12px; gap: 10px; }
+  /* The table is the workspace's anchor: it keeps its shape and a real minimum
+     size; the panels under it scroll, never the other way round. */
+  #table-wrap {
+    flex: none; width: 100%; aspect-ratio: 800 / 545; min-height: 300px; max-height: min(52vh, 760px);
+    padding: 4px; background: #0a0f16; border-radius: var(--radius);
+  }
+  #side-rail {
+    display: flex; flex-direction: column; min-height: 0; overflow-y: auto;
+    background: var(--panel); border-left: 1px solid var(--border);
+  }
+  #side-rail > #info-panel {
+    flex: none; border: 0; border-bottom: 1px solid var(--border); border-radius: 0; background: none;
+    padding: 14px 14px 16px; min-height: 250px; overflow: visible;
+  }
+  #side-rail > #card-grid-panel, body.trainer-mode #side-rail > #trainer-stats-panel {
+    border-left: 0; background: none; padding: 0 14px 14px; overflow: visible; flex: none;
+  }
+  /* Trainer: nothing to show while a hand is live — don't reserve the space. */
+  body.trainer-mode #side-rail > #info-panel { min-height: 0; }
+  .panels { grid-template-columns: minmax(0, 1fr); height: auto; min-height: 0; }
+  #action-panel { overflow: visible; }
+  #history { max-height: 220px; overflow-y: auto; }
+
+  /* 13 x 4 card matrix: ranks across (A -> 2), suits down. Same card faces. */
+  #card-grid {
+    grid-template-columns: none; grid-template-rows: repeat(4, auto);
+    grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 3px;
+  }
+  .card-btn { border-radius: 4px; box-shadow: none; }
+  .card-btn .corner-tl { top: 2px; left: 3px; gap: 0; }
+  .card-btn .corner-tl .corner-rank { font-size: 10.5px; }
+  .card-btn .corner-tl .corner-suit { font-size: 10px; }
+  .card-btn .corner-br { right: 3px; bottom: 2px; font-size: clamp(14px, 1.35vw, 20px); }
+  .card-btn:hover:not(:disabled):not(.used) { transform: translateY(-2px) scale(1.12); z-index: 2; }
+}
+.card-grid-header { background: none; border-bottom: 0; padding: 14px 0 8px; font-size: 11px; letter-spacing: 0.8px; text-transform: uppercase; color: var(--muted); }
+.card-grid-header > span:first-child { color: var(--muted); font-weight: 700; }
+.card-grid-header .kbd-hint { font-size: 11px; text-transform: none; letter-spacing: 0; white-space: nowrap; }
+#slot-hint { flex: 1; text-align: right; text-transform: none; letter-spacing: 0; color: var(--accent); font-weight: 600; }
+@media (max-width: 860px) {
+  .card-grid-header .kbd-hint { display: none; }
+  #side-rail { display: block; }
+  #workbar { gap: 10px; }
+  /* phones: the top bar wraps (nothing may hide behind a sideways scroll) */
+  #top-bar { flex-wrap: wrap; overflow: visible; min-height: 0; padding: 4px 10px 8px; gap: 8px 12px; }
+  .mode-tab { min-height: 40px; }
+  #side-rail > #info-panel { margin: 0 10px 10px; }
+}
+
+/* ---- panels ---------------------------------------------------------------- */
+.panel { border-radius: var(--radius); padding: 12px 14px; box-shadow: none; }
+.panel h3 { font-size: 10.5px; letter-spacing: 1px; margin-bottom: 10px; }
+.panel h3::before { width: 3px; height: 11px; border-radius: 1px; }
+.panel-head-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 6px; }
+.panel-head-row h3 { margin: 0; }
+#undo-btn {
+  height: 26px; padding: 0 10px; border-radius: var(--radius-sm); border: 1px solid var(--border);
+  background: var(--panel-2); color: var(--text); font-size: 12px; font-weight: 600; cursor: pointer;
+}
+#undo-btn:hover:not(:disabled) { background: var(--panel-3); border-color: var(--border-strong); }
+#undo-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+.actor-banner { border-radius: var(--radius); background: var(--panel); box-shadow: none; }
+
+/* ---- actions: big, fixed-order, colour = meaning ---------------------------- */
+#gate-buttons { gap: 8px; margin-bottom: 12px; }
+#gate-buttons button { min-height: 44px; font-size: 14px; font-weight: 700; border-radius: var(--radius); letter-spacing: 0.2px; }
+#gate-buttons button.fold { background: rgba(242, 86, 106, 0.1); }
+#gate-buttons button.call { background: rgba(53, 200, 120, 0.12); }
+.raise-input-row { gap: 8px; }
+#raise-input { height: 40px; font-family: var(--mono); font-size: 15px; font-weight: 600; border-radius: var(--radius-sm); }
+#raise-submit, .primary { min-height: 40px; border-radius: var(--radius-sm); box-shadow: none; background: var(--accent); border: 0; font-weight: 700; }
+#raise-submit:hover, .primary:hover { background: var(--accent-2); }
+.raise-shortcut { height: 28px; border-radius: var(--radius-sm); font-family: var(--mono); }
+
+/* ---- recommendation: the output, so it reads first -------------------------- */
+#recommendation { gap: 10px; }
+.rec-action { font-size: 22px; letter-spacing: -0.3px; }
+.rec-value, .rec-value-true { font-family: var(--mono); }
+.rec-dist-row { gap: 10px; }
+.rec-dist-name { font-family: var(--mono); font-size: 11px; letter-spacing: 0.8px; }
+.rec-dist-track { height: 9px; border-radius: 2px; background: rgba(255, 255, 255, 0.06); }
+.rec-dist-fill { border-radius: 2px; }
+.rec-dist-pct { font-family: var(--mono); font-weight: 700; }
+
+/* ---- table: calmer felt, thinner rim ----------------------------------------- */
+.table-rim { filter: none; }
+#table-svg text { font-family: var(--font); }
+
+/* ---- modals / toasts share the home-games chrome ---------------------------- */
+.modal-backdrop, .gate-overlay { backdrop-filter: blur(3px); }
+.gate-card, .modal-card, .ts-card { border-radius: 14px; border: 1px solid var(--border-strong); background: linear-gradient(180deg, #121a27, #0b111a); box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55); }
+
+/* ---- landing ---------------------------------------------------------------- */
+#login-overlay { background: radial-gradient(1200px 700px at 50% -10%, #13202f 0%, transparent 60%), var(--bg); }
+.l-announce { border-color: rgba(236, 201, 119, 0.35); background: rgba(236, 201, 119, 0.06); }
+.l-announce .l-kicker, .l-price, .l-badge { color: var(--gold); }
+.l-badge { background: rgba(236, 201, 119, 0.12); border-color: rgba(236, 201, 119, 0.35); }
+.l-price-big { color: var(--gold); }
+.l-card, .l-price-card, .l-stat { border-radius: 12px; background: var(--panel); border-color: var(--border); }

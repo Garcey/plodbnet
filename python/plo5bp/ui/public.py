@@ -69,6 +69,14 @@ ADMIN_EMAILS = {
     if e.strip()
 }
 FREE_HANDS_PER_DAY = int(os.environ.get("PLO5BP_FREE_HANDS", "5"))
+# (2026-09-22) The models are still in development, so for now the whole site
+# is FREE: every signed-in user is entitled — no daily hand quota, Study is
+# unlocked, checkout is closed. Sign-in stays (per-user sessions, abuse
+# control). PLO5BP_FREE_FOR_ALL=0 brings the paywall back unchanged; the
+# billing code and its tests are all still here.
+FREE_FOR_ALL = os.environ.get("PLO5BP_FREE_FOR_ALL", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
 PRICE_CENTS = int(os.environ.get("PLO5BP_PRICE_CENTS", "1000"))  # $10/mo
 
 
@@ -643,7 +651,7 @@ def _entitled(user: sqlite3.Row | None) -> bool:
     May block on Stripe (see ``_entitlement_needs_stripe``)."""
     if user is None:
         return False
-    if _is_admin(user):
+    if FREE_FOR_ALL or _is_admin(user):
         return True
     if user["sub_status"] != "active":
         return False
@@ -1088,6 +1096,8 @@ def install(
             },
             "billing_configured": bool(STRIPE_SECRET_KEY),
             "price_cents": PRICE_CENTS,
+            # Everyone has full access while the models are in development.
+            "free_for_all": FREE_FOR_ALL,
         }
         # Only present when granted so a /me dump from a normal subscriber
         # does not advertise that a private games page exists. The href +
@@ -1125,6 +1135,12 @@ def install(
 
     @app.post("/billing/checkout")
     def billing_checkout(request: Request):
+        if FREE_FOR_ALL:
+            # Nobody should be able to start paying for something that is free.
+            raise HTTPException(
+                status_code=409,
+                detail="WrapGTO is free while the models are in development — there is nothing to buy right now.",
+            )
         user = _require_user(request)
         if not STRIPE_SECRET_KEY:
             raise HTTPException(

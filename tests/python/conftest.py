@@ -65,6 +65,12 @@ def ui_purge():
 
 
 PUBLIC_TEST_ADMIN = "themilesgarcia@icloud.com"
+# The site is free-for-all by default (public.FREE_FOR_ALL, 2026-09-22). The
+# paywall / quota / Stripe code is still there and still has to work, so the
+# test session runs with the paywall ON unless a test opts into free mode
+# (tests/python/test_public_free_mode.py).
+os.environ.setdefault("PLO5BP_FREE_FOR_ALL", "0")
+
 _PUBLIC_TEST_ENV = {
     "PLO5BP_PUBLIC": "1",
     "PLO5BP_DEV_LOGIN": "1",

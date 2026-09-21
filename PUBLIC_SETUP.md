@@ -131,7 +131,8 @@ base URL is https. A real deploy (Docker etc.) is the next slice.
 | `PLO5BP_BASE_URL` | `http://127.0.0.1:8770` | External URL for OAuth/Stripe redirects |
 | `PLO5BP_DB` | `data/public.db` | SQLite path |
 | `PLO5BP_ADMIN_EMAILS` | `themilesgarcia@icloud.com` | Comma-separated admin allowlist |
-| `PLO5BP_FREE_HANDS` | `5` | Free trainer hands per UTC day |
+| `PLO5BP_FREE_FOR_ALL` | `1` | **1 = the whole site is free** for every signed-in user while the models are in development (no quota, Study unlocked, checkout closed). Set `0` to bring the paywall back |
+| `PLO5BP_FREE_HANDS` | `5` | Free trainer hands per UTC day (only when `PLO5BP_FREE_FOR_ALL=0`) |
 | `PLO5BP_PRICE_CENTS` | `1000` | Monthly price (before first checkout) |
 | `PLO5BP_DEV_LOGIN` | unset | 1 = loopback fake sign-in (testing only). The route is only registered when `PLO5BP_BASE_URL`'s host is loopback, and it rejects any request carrying a forwarding header (XFF, CF-Connecting-IP, Forwarded, …) |
 | `PLO5BP_DEV_LOGIN_TESTCLIENT` | unset | 1 = also accept Starlette's `testclient` host (the test fixtures set it; never in a real deployment) |

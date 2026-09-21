@@ -2401,19 +2401,105 @@ function onGridCardClick(cardInt) {
     postTrainer("whatif", body);
     return;
   }
-  const sel = UI.selectedSlot;
-  if (!sel) { showToast("Click a slot first"); return; }
-  const used = collectUsedCards(s);
-  if (used.has(cardInt)) return;
-  const spec = s.card_spec[sel.key];
-  spec[sel.index] = cardInt;
-  const nextIndex = spec.findIndex((v, i) => v === null && i > sel.index);
-  if (nextIndex >= 0) {
-    UI.selectedSlot = { key: sel.key, index: nextIndex };
-  } else {
-    UI.selectedSlot = null;
+  placeStudyCard(cardInt);
+}
+
+// --- Continuous card entry (study) -------------------------------------------
+// Cards are entered in dealing order: hero hole -> board A flop -> board B flop
+// -> turn -> river. Placing a card moves the selection to the NEXT EMPTY slot —
+// across groups, not just inside one (it used to stop after the fifth hole
+// card, so every street needed another click on the table). With nothing
+// selected a card goes to the first empty slot, so a whole spot can be entered
+// by clicking (or typing) cards one after another.
+const SLOT_ORDER = ["hero_hole", "flop_a", "flop_b", "turn", "river"];
+
+function nextEmptySlot(s, after) {
+  let started = !after;
+  for (const key of SLOT_ORDER) {
+    const arr = (s.card_spec && s.card_spec[key]) || [];
+    for (let i = 0; i < arr.length; i++) {
+      if (!started) {
+        if (key === after.key && i === after.index) started = true;
+        continue;
+      }
+      if (arr[i] === null || arr[i] === undefined) return { key, index: i };
+    }
   }
+  return null;
+}
+
+function placeStudyCard(cardInt) {
+  const s = UI.lastState;
+  if (!s || s.trainer || UI.mode !== "study") return false;
+  const sel = UI.selectedSlot || nextEmptySlot(s, null);
+  if (!sel) { showToast("Every card slot is filled — double-click a card to clear it"); return false; }
+  if (collectUsedCards(s).has(cardInt)) { showToast("That card is already on the table"); return false; }
+  const spec = s.card_spec[sel.key];
+  if (!spec || sel.index >= spec.length) return false;
+  spec[sel.index] = cardInt;
+  UI.selectedSlot = nextEmptySlot(s, sel);
   commitLocalCards();
+  return true;
+}
+
+// Keyboard entry: a rank (2-9 T J Q K A) then a suit (c d h s) places that card;
+// Backspace takes back the most recent card; Escape drops the selection.
+const KEY_RANKS = "23456789TJQKA";
+const KEY_SUITS = "cdhs";
+let pendingRankKey = null;
+
+function lastFilledSlot(s) {
+  let last = null;
+  for (const key of SLOT_ORDER) {
+    const arr = (s.card_spec && s.card_spec[key]) || [];
+    arr.forEach((v, i) => { if (v !== null && v !== undefined) last = { key, index: i }; });
+  }
+  return last;
+}
+
+function setupCardKeyboard() {
+  document.addEventListener("keydown", (e) => {
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    const t = e.target;
+    const tag = t && t.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (t && t.isContentEditable)) return;
+    const s = UI.lastState;
+    if (!s || s.trainer || UI.mode !== "study" || UI.settingsOpen) return;
+    if (document.body.classList.contains("ranges-mode")) return;
+    const k = e.key;
+    const rank = KEY_RANKS.indexOf(k.toUpperCase());
+    if (k.length === 1 && rank >= 0) {  // (no letter is both a rank and a suit)
+      pendingRankKey = rank;
+      const hint = document.getElementById("slot-hint");
+      if (hint) hint.textContent = `${KEY_RANKS[rank]}… now a suit: c d h s`;
+      e.preventDefault();
+      return;
+    }
+    const suit = k.length === 1 ? KEY_SUITS.indexOf(k.toLowerCase()) : -1;
+    if (suit >= 0 && pendingRankKey !== null) {
+      const cardInt = pendingRankKey * 4 + suit;
+      pendingRankKey = null;
+      placeStudyCard(cardInt);
+      e.preventDefault();
+      return;
+    }
+    if (e.key === "Backspace") {
+      pendingRankKey = null;
+      const last = lastFilledSlot(s);
+      if (last) {
+        s.card_spec[last.key][last.index] = null;
+        UI.selectedSlot = last;
+        commitLocalCards();
+      }
+      e.preventDefault();
+      return;
+    }
+    if (e.key === "Escape" && (UI.selectedSlot || pendingRankKey !== null)) {
+      pendingRankKey = null;
+      UI.selectedSlot = null;
+      render(s);
+    }
+  });
 }
 
 // --- Dealer-button drag -----------------------------------------------------
@@ -2723,9 +2809,15 @@ function renderAccountChip() {
   }
   const me = UI.me;
   el.style.display = "flex";
-  const pill = me.sub.active
-    ? `<span class="acct-pill pro">${me.sub.source === "comp" ? "COMP" : me.sub.source === "admin" ? "ADMIN" : "PRO"}</span>`
-    : `<span class="acct-pill free">${me.free.left}/${me.free.limit} free today</span>`;
+  // While the models are in development the whole site is free (/me.free_for_all):
+  // no quota pill, no Upgrade button — just say so.
+  const pill = me.is_admin
+    ? `<span class="acct-pill pro">ADMIN</span>`
+    : me.free_for_all
+      ? `<span class="acct-pill pro" title="WrapGTO is free while the models are in development">FREE ACCESS</span>`
+      : me.sub.active
+        ? `<span class="acct-pill pro">${me.sub.source === "comp" ? "COMP" : "PRO"}</span>`
+        : `<span class="acct-pill free">${me.free.left}/${me.free.limit} free today</span>`;
   // /me fields are account data (OAuth profile): escape before innerHTML, and
   // only ever load an http(s) avatar (review 2026-09-20 F17).
   const avatar = typeof me.picture === "string" && /^https?:\/\//i.test(me.picture)
@@ -2825,9 +2917,8 @@ function showLoginOverlay(show) {
   g.style.display = me.auth_configured === false ? "none" : "flex";
   const devRow = document.getElementById("dev-login-row");
   devRow.style.display = me.dev_login ? "flex" : "none";
-  if (UI.me && UI.me.free) {
-    document.getElementById("gate-free-hands").textContent = UI.me.free.limit;
-  }
+  const freeHands = document.getElementById("gate-free-hands");
+  if (freeHands && UI.me && UI.me.free) freeHands.textContent = UI.me.free.limit;
 }
 
 function showPaywall(body) {
@@ -3411,6 +3502,8 @@ function setupTrainerControls() {
     }
   });
 }
+
+setupCardKeyboard();
 
 function setupRaiseInput() {
   const input = document.getElementById("raise-input");

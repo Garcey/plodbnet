@@ -35,60 +35,12 @@
         <label for="format-select">Format</label>
         <select id="format-select"></select>
       </div>
-      <div class="top-bar-item study-only">
-        <label>Seats</label>
-        <div class="seat-ctl">
-          <button id="seats-dec" type="button" aria-label="Fewer seats">−</button>
-          <span id="seats-count">6</span>
-          <button id="seats-inc" type="button" aria-label="More seats">+</button>
-        </div>
-      </div>
+      <div class="top-bar-item top-bar-spacer"></div>
       <div class="top-bar-item">
         <label for="unit-toggle">Units</label>
         <button id="unit-toggle" type="button">bb</button>
       </div>
-      <div class="top-bar-item study-only">
-        <label for="dpb-input">$ / bb</label>
-        <input id="dpb-input" type="number" step="0.01" min="0.01" value="20.00" />
-      </div>
-      <div class="top-bar-item study-only">
-        <label for="ante-input">Ante</label>
-        <input id="ante-input" type="number" step="0.01" min="0" value="3.00" />
-      </div>
-      <div class="top-bar-item top-bar-spacer"></div>
-      <div class="top-bar-item trainer-only">
-        <button id="trainer-settings-btn" type="button" title="Trainer settings">Settings</button>
-        <button id="trainer-repeat-btn" type="button" title="Re-deal the same hand (excluded from stats)">Repeat</button>
-        <button id="trainer-new-hand-btn" type="button">New Hand</button>
-      </div>
       <div class="top-bar-item" id="account-chip" style="display:none"></div>
-      <!-- WGLIVE:START -->
-      <div class="top-bar-item ocr-group study-only">
-        <label for="source-toggle">Live</label>
-        <button id="source-toggle" type="button"
-                title="Switch the live-capture source between ClubGG (pixel OCR) and PokerNow (browser DOM)">Source: ClubGG</button>
-        <span id="clubgg-controls">
-          <div class="ocr-window-picker">
-            <button id="ocr-window-button" type="button" aria-haspopup="listbox"
-                    aria-expanded="false" title="Pick the window to screen-read">— pick window —</button>
-          </div>
-          <button id="ocr-toggle" type="button" aria-pressed="false">Off</button>
-          <button id="ocr-simple-toggle" type="button" aria-pressed="true"
-                  title="Skip OCR action inference; manual action entry only">Simple: On</button>
-          <button id="ocr-save-frame" type="button"
-                  title="Save the current OCR frame to screenrecords/frames/">Save frame</button>
-          <span id="ocr-status" class="muted"></span>
-        </span>
-        <span id="pokernow-controls" style="display:none">
-          <button id="pokernow-help" type="button"
-                  title="How to connect the PokerNow browser bridge">Install bridge</button>
-          <span id="pokernow-status" class="muted">waiting for browser…</span>
-        </span>
-      </div>
-      <!-- WGLIVE:END -->
-      <div class="top-bar-item study-only">
-        <button id="new-hand-btn" type="button">New Hand</button>
-      </div>
     </header>
 
     <main>
@@ -131,6 +83,57 @@
         </div>
       </section>
       <section id="table-area">
+        <div id="workbar">
+      <div class="top-bar-item study-only">
+        <label>Seats</label>
+        <div class="seat-ctl">
+          <button id="seats-dec" type="button" aria-label="Fewer seats">−</button>
+          <span id="seats-count">6</span>
+          <button id="seats-inc" type="button" aria-label="More seats">+</button>
+        </div>
+      </div>
+      <div class="top-bar-item study-only">
+        <label for="dpb-input">$ / bb</label>
+        <input id="dpb-input" type="number" step="0.01" min="0.01" value="20.00" />
+      </div>
+      <div class="top-bar-item study-only">
+        <label for="ante-input">Ante</label>
+        <input id="ante-input" type="number" step="0.01" min="0" value="3.00" />
+      </div>
+      <!-- WGLIVE:START -->
+      <div class="top-bar-item ocr-group study-only">
+        <label for="source-toggle">Live</label>
+        <button id="source-toggle" type="button"
+                title="Switch the live-capture source between ClubGG (pixel OCR) and PokerNow (browser DOM)">Source: ClubGG</button>
+        <span id="clubgg-controls">
+          <div class="ocr-window-picker">
+            <button id="ocr-window-button" type="button" aria-haspopup="listbox"
+                    aria-expanded="false" title="Pick the window to screen-read">— pick window —</button>
+          </div>
+          <button id="ocr-toggle" type="button" aria-pressed="false">Off</button>
+          <button id="ocr-simple-toggle" type="button" aria-pressed="true"
+                  title="Skip OCR action inference; manual action entry only">Simple: On</button>
+          <button id="ocr-save-frame" type="button"
+                  title="Save the current OCR frame to screenrecords/frames/">Save frame</button>
+          <span id="ocr-status" class="muted"></span>
+        </span>
+        <span id="pokernow-controls" style="display:none">
+          <button id="pokernow-help" type="button"
+                  title="How to connect the PokerNow browser bridge">Install bridge</button>
+          <span id="pokernow-status" class="muted">waiting for browser…</span>
+        </span>
+      </div>
+      <!-- WGLIVE:END -->
+      <div class="top-bar-item top-bar-spacer"></div>
+      <div class="top-bar-item trainer-only">
+        <button id="trainer-settings-btn" type="button" title="Trainer settings">Settings</button>
+        <button id="trainer-repeat-btn" type="button" title="Re-deal the same hand (excluded from stats)">Repeat</button>
+        <button id="trainer-new-hand-btn" type="button">New Hand</button>
+      </div>
+      <div class="top-bar-item study-only">
+        <button id="new-hand-btn" type="button">New Hand</button>
+      </div>
+        </div>
         <div id="table-wrap">
           <svg id="table-svg" viewBox="0 0 800 560" xmlns="http://www.w3.org/2000/svg">
             <defs>
@@ -259,9 +262,6 @@
         <div class="panels">
           <div id="action-panel" class="panel">
             <h3>Actions</h3>
-            <div class="panel-controls">
-              <button id="undo-btn" disabled>Undo</button>
-            </div>
             <div id="gate-buttons"></div>
             <div id="raise-section" hidden>
               <div class="raise-bounds muted" id="raise-bounds-label"></div>
@@ -275,23 +275,28 @@
             <div id="terminal-pane" hidden>
               <div id="terminal-message"></div>
             </div>
-            <h3>History</h3>
+            <div class="panel-head-row">
+              <h3>History</h3>
+              <button id="undo-btn" disabled title="Take back the last action">Undo</button>
+            </div>
             <div id="history"></div>
           </div>
 
-          <div id="info-panel" class="panel">
-            <h3>Recommendation</h3>
-            <div id="recommendation">
-              <p class="muted">Place hero's 5 hole cards to see network output.</p>
-            </div>
-          </div>
         </div>
       </section>
 
+      <div id="side-rail">
+        <div id="info-panel" class="panel">
+          <h3>Recommendation</h3>
+          <div id="recommendation">
+            <p class="muted">Place hero's 5 hole cards to see network output.</p>
+          </div>
+        </div>
       <aside id="card-grid-panel">
         <div class="card-grid-header">
           <span>Cards</span>
           <span id="slot-hint" class="muted">Click a slot to place cards</span>
+          <span class="kbd-hint muted" title="Type a rank then a suit, e.g. A then S for the ace of spades. Backspace clears the last card.">or type <kbd>A</kbd><kbd>s</kbd></span>
         </div>
         <div id="card-grid"></div>
       </aside>
@@ -301,6 +306,7 @@
         <div id="stats-session" class="stats-block"></div>
         <div id="stats-lifetime" class="stats-block"></div>
       </aside>
+      </div>
     </main>
     <!-- WGAPP:END -->
 
@@ -411,12 +417,11 @@
           <button type="button" class="landing-signin l-top-cta">Sign in</button>
         </header>
 
-        <aside class="l-announce" role="status" aria-label="Model update">
-          <p class="l-kicker">Model update</p>
-          <h2 class="l-announce-title">Version&nbsp;2 is live as of 7/14/2026&nbsp;— and already stronger than Version&nbsp;1.</h2>
-          <p class="l-announce-body">We’ve promoted a new model to WrapGTO. Internally this is a full architecture generation jump; on the site we’re calling it <b>Version&nbsp;2</b>, because it’s the second model family we’ve shipped for public study. We’re releasing it now because, on the spots that matter, <b>its preferred decisions already surpass Version&nbsp;1</b>.</p>
-          <p class="l-announce-body"><b>Training is still in progress.</b> Strength has a lot of room to improve. As the run continues, we’ll promote regular model updates to the website — same study tool, better weights over time.</p>
-          <p class="l-announce-body"><b>How to read the output right now:</b> even though the network’s <b>top choice</b> is stronger than Version&nbsp;1’s, the <b>mixing frequencies are currently worse</b> — the policy is still relatively soft, so secondary sizes and lines can show more weight than they should. <b>Treat the preferred action (the highest-ranked line) as the main signal</b> for study. As training continues and the model concentrates, this will matter less and less.</p>
+        <aside class="l-announce" role="status" aria-label="Free while in development">
+          <p class="l-kicker">Free for now</p>
+          <h2 class="l-announce-title">The models are still in development &mdash; so the whole site is free.</h2>
+          <p class="l-announce-body">The neural networks behind WrapGTO get stronger with every training run, but they are <b>not yet at the level I&rsquo;d be comfortable charging for</b>. Until they are, everything is open to the public at no cost: unlimited trainer hands, full Study mode, every format. Sign in and use it.</p>
+          <p class="l-announce-body"><b>How to read the output right now:</b> the network&rsquo;s <b>preferred action</b> (the highest-ranked line) is the main signal. The mixing frequencies are still soft, so secondary sizes and lines can show more weight than they should. That improves as training continues, and new weights are promoted to the site regularly.</p>
         </aside>
 
         <section class="l-hero">
@@ -425,15 +430,14 @@
           <p class="l-sub">A self-play model with over <b>800 million hands</b> — more
             than eight billion decisions — and counting, wrapped in a GTO-style
             trainer: drill random spots against the network, get every decision graded,
-            and review the EV of every line you didn't take. More formats are on the way
-            — with bundle subscriptions for the games you actually play.</p>
+            and review the EV of every line you didn't take. More formats are on the way.</p>
           <p id="login-error" class="l-login-error" role="alert" hidden></p>
           <button id="google-signin-btn" type="button" class="gate-google">
             <svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
             Sign in with Google
           </button>
-          <p class="l-note"><span id="gate-free-hands">5</span> free trainer hands every day
-            · <s>$50</s> <b class="l-price">$10/month</b> for early users — 80% off, locked in for life</p>
+          <p class="l-note"><b class="l-price">Free for everyone</b> while the models are in development
+            &middot; no card, no trial, no daily limit</p>
           <div id="dev-login-row" style="display:none">
             <input id="dev-login-email" type="email" placeholder="dev login email" />
             <button id="dev-login-btn" type="button">Dev sign-in</button>
@@ -492,31 +496,29 @@
             who wanted to study double-board bomb pots and found that nothing for the format
             existed — no solver, no trainer, no library. So I built the model, the engine,
             and this site to study against myself.</p>
-          <p class="l-body">It's priced to cover GPU time, not to turn a profit — each new
-            format is weeks of training at around $50 a day, funded straight out of my own
-            poker winnings. What you pay goes back into the next run: PLO4 and PLO6, single
-            board, hi-lo variants, and whatever the games spread next. A tool like this —
-            expensive to build, for a format only a few people play — could command far more
-            than it does. It doesn't, because I didn't build it to profit: I built it for
-            myself, and charging a little just helps offset what is, honestly, an expensive
-            hobby. I'd be running it either way.</p>
+          <p class="l-body">Right now it costs nothing. The models aren't strong enough yet
+            for me to feel right about selling them, so the site stays free while they train.
+            When that changes it will be priced to cover GPU time, not to turn a profit &mdash;
+            each new format is weeks of training at around $50 a day, funded out of my own
+            poker winnings &mdash; and anyone using it today will hear about it well in advance.
+            I'd be running it either way.</p>
         </section>
 
         <section class="l-section l-pricing">
           <p class="l-kicker">Pricing</p>
           <div class="l-price-card">
-            <div class="l-badge">Early user — locked for life</div>
-            <div class="l-price-row"><s>$50</s><span class="l-price-big">$10</span><span class="l-price-per">/ month</span></div>
-            <p class="l-price-note">80% off the standard rate. The price you join at is
-              the price you keep, for as long as you stay subscribed.</p>
+            <div class="l-badge">While the models are in development</div>
+            <div class="l-price-row"><span class="l-price-big">Free</span><span class="l-price-per">for now</span></div>
+            <p class="l-price-note">No subscription, no card, no limits. If that ever changes,
+              you'll know long before it does.</p>
             <ul class="l-list">
               <li>Unlimited trainer hands, graded move by move</li>
-              <li>Full Study mode — set up any spot, replay any line</li>
+              <li>Full Study mode &mdash; set up any spot, replay any line</li>
               <li>EV-loss review on every decision</li>
-              <li>New formats as they ship (choose-your-format bundles later)</li>
+              <li>New formats and stronger weights as they ship</li>
             </ul>
-            <button type="button" class="gate-primary landing-signin">Start with 5 free hands a day</button>
-            <p class="l-fine">No card required to try. Cancel anytime.</p>
+            <button type="button" class="gate-primary landing-signin">Sign in and start</button>
+            <p class="l-fine">A Google sign-in keeps your hands and stats yours. Nothing else is asked for.</p>
           </div>
         </section>
 
