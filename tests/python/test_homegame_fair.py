@@ -15,7 +15,7 @@ from starlette.testclient import TestClient
 
 from plo5bp.ui import fairdeal as fd
 
-ADMIN_EMAIL = "themilesgarcia@icloud.com"
+ADMIN_EMAIL = "admin@tables.example"  # this module's own admin (PLO5BP_ADMIN_EMAILS below)
 NAMES = ["ann", "ben", "cat", "dov"]
 # fd.permutation("00" * 32): pinned — a change here is a change of the PUBLIC spec, and
 # games.fair.js (checked against the same numbers in the Node harness) must follow.
@@ -110,7 +110,7 @@ def test_an_unopened_commitment_gives_nothing_away():
 
 @pytest.fixture(scope="module")
 def server(boot_public_server):
-    return boot_public_server(PLO5BP_HOMEGAME_GRADING="1")
+    return boot_public_server(PLO5BP_HOMEGAME_GRADING="1", PLO5BP_ADMIN_EMAILS=ADMIN_EMAIL)
 
 
 @pytest.fixture(scope="module")

@@ -17,7 +17,7 @@ from starlette.testclient import TestClient
 
 from plo5bp.ui.runout import money_flows
 
-ADMIN_EMAIL = "themilesgarcia@icloud.com"
+ADMIN_EMAIL = "admin@tables.example"  # this module's own admin (PLO5BP_ADMIN_EMAILS below)
 NAMES = ["me", "jeff", "bob", "bill"]
 
 # card ints: rank * 4 + suit (c d h s), rank 0 = deuce ... 12 = ace
@@ -132,7 +132,7 @@ def test_flows_always_add_up_to_the_engines_payouts():
 
 @pytest.fixture(scope="module")
 def server(boot_public_server):
-    return boot_public_server(PLO5BP_HOMEGAME_GRADING="1")
+    return boot_public_server(PLO5BP_HOMEGAME_GRADING="1", PLO5BP_ADMIN_EMAILS=ADMIN_EMAIL)
 
 
 @pytest.fixture(scope="module")

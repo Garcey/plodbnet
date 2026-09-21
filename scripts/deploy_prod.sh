@@ -9,12 +9,14 @@
 # the tables deal the old way, shown as "unverified") — so a failed rebuild is
 # a warning here, never a broken site.
 #
-#   scripts/deploy_prod.sh            ship + rebuild + restart + health check
-#   SKIP_ENGINE=1 scripts/deploy_prod.sh   ship + restart only
-#   WRAPGTO_HOST=user@host scripts/deploy_prod.sh
+#   WRAPGTO_HOST=root@<server> scripts/deploy_prod.sh    ship + rebuild + restart + health check
+#   SKIP_ENGINE=1 WRAPGTO_HOST=... scripts/deploy_prod.sh   ship + restart only
+#
+# The server's address is deliberately NOT in this file: pass WRAPGTO_HOST, or put
+# a `Host wrapgto-prod` entry in ~/.ssh/config (the default below).
 set -euo pipefail
 
-HOST="${WRAPGTO_HOST:-root@87.99.132.209}"
+HOST="${WRAPGTO_HOST:-wrapgto-prod}"
 APP="${WRAPGTO_APP:-/opt/wrapgto/app}"
 cd "$(dirname "$0")/.."
 
