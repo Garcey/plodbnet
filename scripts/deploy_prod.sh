@@ -87,7 +87,8 @@ dirty=$(git status --porcelain --untracked-files=no | grep -v '^ M .grok/' | wc 
 echo "== $MODE: $(git rev-parse --short HEAD) on $(git rev-parse --abbrev-ref HEAD) -> $HOST:$APP"
 [ "$dirty" = "0" ] || echo "   note: $dirty tracked file(s) have uncommitted changes — they ship too"
 pack
-echo "   archive: $(du -h "$TARBALL" | cut -f1)"
+SUM=$(sha256sum "$TARBALL" | cut -d' ' -f1)
+echo "   archive: $(du -h "$TARBALL" | cut -f1)  sha256 ${SUM:0:12}…"
 remote "cat > /tmp/wrapgto-ship.tgz" < "$TARBALL"
 
 # The server-side half travels as a FILE, not on stdin: a script fed on stdin gets
@@ -100,6 +101,9 @@ TS=$(date +%Y%m%d-%H%M%S)
 PRE=/tmp/wrapgto-preflight-$TS
 cleanup() { rm -rf "$PRE" /tmp/wrapgto-wheels /tmp/wrapgto-whl-x /tmp/wrapgto-ship.tgz; }
 trap cleanup EXIT
+
+echo "$SUM  /tmp/wrapgto-ship.tgz" | sha256sum -c --quiet || { echo "!! the upload is corrupted (checksum mismatch). Nothing was changed."; exit 2; }
+echo "== [server] upload verified"
 
 echo "== [server] database backup"
 if [ -x /etc/cron.daily/wrapgto-backup ]; then
@@ -181,7 +185,7 @@ else
 fi
 REMOTE
 remote "cat > /tmp/wrapgto-deploy.sh" < "$TMPDIR_SHIP/remote.sh"
-remote "APP='$APP' MODE='$MODE' SKIP_ENGINE='${SKIP_ENGINE:-0}' bash /tmp/wrapgto-deploy.sh; rc=\$?; rm -f /tmp/wrapgto-deploy.sh; exit \$rc"
+remote "APP='$APP' MODE='$MODE' SKIP_ENGINE='${SKIP_ENGINE:-0}' SUM='$SUM' bash /tmp/wrapgto-deploy.sh; rc=\$?; rm -f /tmp/wrapgto-deploy.sh; exit \$rc"
 
 if [ "$MODE" = "deploy" ]; then
   remote "cd '$APP' && sudo -u wrapgto -H .venv/bin/python -c 'from plo5bp import env; print(\"   verifiable shuffle — engine support on the live site:\", hasattr(env._RustGameState, \"reset_with_deck\"))'" || true
