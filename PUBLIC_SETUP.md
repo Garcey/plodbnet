@@ -59,6 +59,10 @@ ssh root@87.99.132.209 systemctl restart wrapgto
      `tar | ssh` from PowerShell. `scripts/deploy_prod.sh pack` shows, offline,
      exactly what would ship.
   To revoke a machine: delete its line from `authorized_keys`.
+- **After every deploy** glance at `journalctl -u wrapgto -n 40`: an `OBS-REV
+  MISMATCH` line means the served model and the encoder disagree (see
+  `PLO5BP_OBS_REV` below); `scripts/deploy_prod.sh` prints the app's own health
+  but does not read the model warnings.
 - Scale-up path: Hetzner console → resize to CCX23 (4 vCPU/16GB), ~1 min
   downtime, nothing else changes.
 
@@ -165,6 +169,7 @@ base URL is https. A real deploy (Docker etc.) is the next slice.
 | `PLO5BP_DB` | `data/public.db` | SQLite path |
 | `PLO5BP_ADMIN_EMAILS` | `themilesgarcia@icloud.com` | Comma-separated admin allowlist |
 | `PLO5BP_FREE_FOR_ALL` | `1` | **1 = the whole site is free** for every signed-in user while the models are in development (no quota, Study unlocked, checkout closed). Set `0` to bring the paywall back |
+| `PLO5BP_OBS_REV` | `2` | **Production sets `1`** (added to `/etc/wrapgto/env` on 2026-09-22): the checkpoints on the server predate the 2026-09-20 observation-semantics fix and must be served with the semantics they were trained on. Without it the log says `OBS-REV MISMATCH` at startup and every recommendation / home-game grade is slightly off. Drop it only when a checkpoint trained at rev 2 is promoted |
 | `PLO5BP_HOMEGAME_FAIR` | `1` | Home games' verifiable shuffle (sealed deck + the players' cut). `0` = deal the old way. Also off by itself when the engine on this machine predates `reset_with_deck` — rebuild it (`scripts/deploy_prod.sh`) |
 | `PLO5BP_HOMEGAME_GRADING` | `1` | Background network grading of every home-game action (`0` = off) |
 | `PLO5BP_FREE_HANDS` | `5` | Free trainer hands per UTC day (only when `PLO5BP_FREE_FOR_ALL=0`) |
