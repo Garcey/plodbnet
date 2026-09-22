@@ -94,7 +94,7 @@ from plo5bp.config import VARIANT_PLO5, GameConfig
 from plo5bp.env import BombPotEnv, StepInfo
 from plo5bp.ui.common import STREET_NAMES, position_name
 from plo5bp.ui.hand_describe import describe_made_hand
-from plo5bp.ui.runout import AWARD_SECS, board_equities, build_awards, money_flows
+from plo5bp.ui.runout import AWARD_SECS, board_equities, build_awards, money_flows, pot_layers
 from plo5bp.ui import fairdeal
 from plo5bp.ui import public as pub
 
@@ -222,7 +222,8 @@ CREATE TABLE IF NOT EXISTS homegames (
   topup_target_cents INTEGER NOT NULL DEFAULT 0,
   topup_below_cents INTEGER NOT NULL DEFAULT 0,
   show_grades INTEGER NOT NULL DEFAULT 1,
-  excluded INTEGER NOT NULL DEFAULT 0
+  excluded INTEGER NOT NULL DEFAULT 0,
+  allow_rathole INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS homegame_hands (
   game_id TEXT NOT NULL,
@@ -336,6 +337,7 @@ def _ensure_schema() -> None:
             ("topup_below_cents", "INTEGER NOT NULL DEFAULT 0"),
             ("show_grades", "INTEGER NOT NULL DEFAULT 1"),
             ("excluded", "INTEGER NOT NULL DEFAULT 0"),
+            ("allow_rathole", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if col not in cols:
                 pub.DB._conn.execute(f"ALTER TABLE homegames ADD COLUMN {col} {ddl}")
@@ -503,6 +505,8 @@ class Seat:
     topup_target_cents: int = 0  # auto top-up: back up to this ...
     topup_below_cents: int = 0  # ... once the stack is below this (0 = target)
     queued_topup_cents: int = 0  # asked for mid-hand; lands when the hand ends
+    queued_remove_cents: int = 0  # chips to take OFF the table when the hand ends
+    leave_after_hand: bool = False  # finish this hand, then leave the seat
 
 
 @dataclass
@@ -538,6 +542,7 @@ class LiveTable:
     terminal_pot: int = 0
     terminal_commit: list[int] = field(default_factory=list)
     pot_awards: list[dict[str, Any]] = field(default_factory=list)
+    pots: list[dict[str, Any]] = field(default_factory=list)  # named layers, deepest first
     # (len_a, len_b) -> {seat: {"a": share, "b": share}}, computed ONCE per
     # all-in hand from the alive seats' holes (review 2026-09-20 G3).
     equity_by_len: dict[tuple[int, int], dict[int, dict[str, float]]] = field(
@@ -607,6 +612,9 @@ class LiveTable:
     # Accuracy marks on EVERYONE's actions in the replayer (a mark on a mucked
     # hand says a little about it). Off = players see marks on their own only.
     show_grades: bool = True
+    # Players may take chips OFF the table between hands ("ratholing"). Off by
+    # default: the usual table-stakes rule is that winnings stay in play.
+    allow_rathole: bool = False
     # What the background grader needs to replay the hand being played: the
     # deal seed and the exact engine inputs. In MEMORY only — the seed would
     # reveal every card, so it is never persisted and never served.
@@ -848,6 +856,7 @@ def _load_table(game_id: str) -> LiveTable:
         topup_all_target_cents=_row_int(row, "topup_target_cents", 0),
         topup_all_below_cents=_row_int(row, "topup_below_cents", 0),
         show_grades=bool(_row_int(row, "show_grades", 1)),
+        allow_rathole=bool(_row_int(row, "allow_rathole", 0)),
     )
 
 
@@ -870,7 +879,7 @@ def _persist_meta(t: LiveTable) -> None:
         "deal_delay_ms=?, time_bank_secs=?, min_buyin_cents=?, "
         "max_buyin_cents=?, listed=?, allow_rabbit=?, "
         "approve_buyins=?, topup_mode=?, topup_target_cents=?, topup_below_cents=?, "
-        "show_grades=?, "
+        "show_grades=?, allow_rathole=?, "
         "closed_at=CASE WHEN ?= 'closed' THEN COALESCE(closed_at, ?) ELSE closed_at END "
         "WHERE id=?",
         (
@@ -898,6 +907,7 @@ def _persist_meta(t: LiveTable) -> None:
             int(t.topup_all_target_cents or 0),
             int(t.topup_all_below_cents or 0),
             1 if t.show_grades else 0,
+            1 if t.allow_rathole else 0,
             t.status,
             pub._now(),
             t.game_id,
@@ -1459,10 +1469,16 @@ def _passive_choice(t: LiveTable) -> tuple[int, int]:
 
 
 def _actor_is_away(t: LiveTable, actor: int) -> bool:
-    """The seat to act has nobody who will act: sitting out (Away, or
-    leaving / being removed), or vacated."""
+    """The seat to act has nobody who will act: sitting out (Away, or being
+    removed), vacated — or leaving after this hand with the browser already
+    gone (a leaver plays the hand out as normal while they are here; once they
+    have closed the tab the clock must not wait on them, review G6)."""
     p = t.seats[actor] if 0 <= actor < len(t.seats) else None
-    return p is None or bool(p.sitting_out)
+    if p is None or bool(p.sitting_out):
+        return True
+    if p.leave_after_hand:
+        return time.monotonic() - t.seen.get(p.user_id, -1e9) > PRESENCE_WINDOW_S
+    return False
 
 
 def _start_clock_locked(t: LiveTable, *, restart: bool = False) -> None:
@@ -1882,7 +1898,7 @@ def _deal_ready(t: LiveTable, *, present_only: bool = False) -> bool:
     now = time.monotonic()
     n = 0
     for p in t.seats:
-        if p is None or p.sitting_out or p.sit_out_next or p.user_id in t.pending_kicks:
+        if p is None or p.sitting_out or p.sit_out_next or p.leave_after_hand or p.user_id in t.pending_kicks:
             continue
         if present_only and now - t.seen.get(p.user_id, -1e9) > PRESENCE_WINDOW_S:
             continue
@@ -1964,6 +1980,7 @@ def _settle_locked(t: LiveTable) -> None:
     the ledger would announce the result early (review 2026-09-20 G11).
     Called from the watchdog, every view, and before a deal; a failed
     cash-out stays pending and is retried."""
+    _apply_leaves_locked(t)
     if not t.pending_kicks or _hand_busy(t):
         return
     for uid in list(t.pending_kicks):
@@ -2125,7 +2142,8 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
             "hole": hole,
             "hand_desc": made,
             "auto_stack_cents": int(p.auto_stack_cents or 0) if p else 0,
-            "pending_remove": bool(p and p.user_id in t.pending_kicks),
+            "pending_remove": bool(p and (p.user_id in t.pending_kicks or p.leave_after_hand)),
+            "leaving": bool(p and p.leave_after_hand),
             "equity_a": None,
             "equity_b": None,
             "trusted": bool(p.trusted) if p else False,
@@ -2134,6 +2152,15 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
             # your own queued chips only — nobody else needs to see them
             "queued_topup_cents": (
                 int(p.queued_topup_cents or 0) if p and p.user_id == viewer_id else 0
+            ),
+            "queued_remove_cents": (
+                int(p.queued_remove_cents or 0) if p and p.user_id == viewer_id else 0
+            ),
+            # the host sees who is waiting on them, right on the seat
+            "request": (
+                next(({"id": r["id"], "kind": r["kind"], "amount_cents": r["amount_cents"]}
+                      for r in t.requests if p is not None and r["user_id"] == p.user_id), None)
+                if viewer_id == t.host_user_id else None
             ),
             "present": bool(p and now_seen - t.seen.get(p.user_id, -1e9) <= PRESENCE_WINDOW_S),
             "reserved_by": next(
@@ -2325,6 +2352,7 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
             "blocking": blocking,
         },
         "pot_awards": shown_awards,
+        "pots": list(t.pots or []) if t.runout_active else [],
         # --- 2026-09-21 ----------------------------------------------------
         "host_user_id": t.host_user_id,
         "settings": {
@@ -2336,6 +2364,7 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
             "allow_rabbit": bool(t.allow_rabbit),
             "approve_buyins": bool(t.approve_buyins),
             "show_grades": bool(t.show_grades),
+            "allow_rathole": bool(t.allow_rathole),
         },
         "auto_topup": {
             "mode": _norm_auto_mode(t.topup_mode),
@@ -2957,6 +2986,7 @@ def _capture_rabbit(t: LiveTable, played_len: int) -> None:
     t.terminal_pot = int(raw.get("pot") or 0)
     t.terminal_commit = [int(x) for x in (raw.get("total_commit") or [])]
     t.pot_awards = []
+    t.pots = []
     t.equity_by_len = {}
     t.runout_active = False
     if len(alive) <= 1:
@@ -2995,7 +3025,33 @@ def _capture_rabbit(t: LiveTable, played_len: int) -> None:
         full_b if len(full_b) >= 3 else full_b,
         t.button,
     )
+    # Name the pots the way the table talks about them (ClubGG-style award
+    # animation, 2026-09-22): the layers are already deepest-first; the LAST is
+    # the main pot, the ones before it side pots numbered from the main pot up.
+    layers = [ly for ly in pot_layers(commit[: t.num_seats], folded_full) if ly["chips"] > 0 and ly["eligible"]]
+    t.pots = [
+        {"index": k, "label": "Main pot" if k == len(layers) - 1 else f"Side pot {len(layers) - 1 - k}",
+         "chips": int(ly["chips"]), "eligible": list(ly["eligible"]), "level": int(ly["level"])}
+        for k, ly in enumerate(layers)
+    ]
+    _assign_award_pots(t.pot_awards, layers)
     _compute_runout_equities(t, {i: holes[i] for i in alive if holes[i]}, full_a, full_b)
+
+
+def _assign_award_pots(awards: list[dict[str, Any]], layers: list[dict[str, Any]]) -> None:
+    """Tag each award step with the pot (layer index, deepest first) it pays
+    from. ``build_awards`` walks the layers in order and emits up to two steps
+    (board a, board b) per layer, so steps pair up with layers by counting the
+    board-a steps: a layer without a board-a step (half_a == 0) can only be a
+    one-chip layer, which has no board-b step either."""
+    k = -1
+    for a in awards:
+        if a.get("uncontested") and len(layers) <= 1:
+            a["pot"] = max(0, len(layers) - 1)
+            continue
+        if a["board"] == "a" or k < 0:
+            k += 1
+        a["pot"] = min(k, max(0, len(layers) - 1))
 
 
 def _compute_runout_equities(
@@ -3323,14 +3379,23 @@ def _expire_requests_locked(t: LiveTable) -> None:
 
 
 def _resolve_request_locked(
-    t: LiveTable, uid: int, req_id: int, approve: bool, trust: bool
+    t: LiveTable, uid: int, req_id: int, approve: bool, trust: bool,
+    amount_cents: int | None = None,
 ) -> None:
+    """Approve / decline a buy-in request. ``amount_cents`` lets the host approve
+    a DIFFERENT amount than the one asked for (asked $150, seated with $80): the
+    player is told, and the usual buy-in limits apply to the new amount."""
     _require_open(t)
     if uid != t.host_user_id:
         raise HTTPException(status_code=400, detail="only the host can approve buy-ins")
     req = next((r for r in t.requests if r["id"] == int(req_id)), None)
     if req is None:
         raise HTTPException(status_code=404, detail="that request is gone")
+    cents = int(req["amount_cents"])
+    if approve and amount_cents is not None and int(amount_cents) != cents:
+        cents = int(amount_cents)
+        if cents < t.bb_cents or cents > MAX_CENTS:
+            raise HTTPException(status_code=400, detail="buy-in must be at least 1 bb")
     t.requests = [r for r in t.requests if r["id"] != req["id"]]
     t.rev += 1
     if not approve:
@@ -3339,12 +3404,14 @@ def _resolve_request_locked(
     user = pub._user_by_id(int(req["user_id"]))
     if user is None:
         raise HTTPException(status_code=404, detail="that player no longer exists")
+    if cents != int(req["amount_cents"]):
+        _emit(t, "request", f"Host approved {req['name']} for {_fmt_cents(cents)} (asked {_fmt_cents(int(req['amount_cents']))})")
     if req["kind"] == "sit":
-        _sit_locked(t, user, int(req["seat"]), int(req["amount_cents"]), trust=trust)
+        _sit_locked(t, user, int(req["seat"]), cents, trust=trust)
     else:
         if trust:
             _set_trust_locked(t, uid, int(req["user_id"]), True)
-        _topup_locked(t, int(req["user_id"]), int(req["amount_cents"]), queue_ok=True)
+        _topup_locked(t, int(req["user_id"]), cents, queue_ok=True)
 
 
 def _set_trust_locked(t: LiveTable, uid: int, target_uid: int, on: bool) -> None:
@@ -3399,13 +3466,79 @@ def _topup_locked(t: LiveTable, uid: int, amount_cents: int, *, queue_ok: bool) 
     _emit(t, "rebuy", f"{p.name} adds {_fmt_cents(amount_cents)} after this hand")
 
 
+def _remove_chips_locked(t: LiveTable, uid: int, amount_cents: int, *, queue_ok: bool) -> None:
+    """Take chips OFF the table (the host's "ratholing" switch). Whole cents;
+    the chips that leave are exactly those cents' worth, credited to the
+    player's leftover — the same move set-stack makes when it banks a surplus.
+    While the player holds cards it is queued for the end of the hand: chips
+    behind never change mid-hand. A player keeps at least an ante + 1 bb, so a
+    withdrawal never turns into a silent sit-out; leaving is a separate act."""
+    _require_open(t)
+    if not t.allow_rathole:
+        raise HTTPException(status_code=400, detail="the host does not allow taking chips off the table")
+    p = t.player(uid)
+    if p is None:
+        raise HTTPException(status_code=400, detail="not seated")
+    i = t.seat_of(uid)
+    amount_cents = int(amount_cents)
+    if amount_cents < t.bb_cents:
+        raise HTTPException(status_code=400, detail="take off at least 1 bb")
+    floor_cents = t.ante_cents + t.bb_cents
+    if _dealt_in(t, i):
+        if not queue_ok:
+            raise HTTPException(status_code=400, detail="wait for the hand to finish")
+        # (the hand may change the stack: the amount is re-checked when it lands)
+        p.queued_remove_cents = amount_cents
+        p.queued_topup_cents = 0
+        t.rev += 1
+        _emit(t, "cashout", f"{p.name} takes {_fmt_cents(amount_cents)} off the table after this hand", seat=i)
+        return
+    have = chips_to_cents(int(p.stack_chips), t.bb_cents)
+    if have - amount_cents < floor_cents:
+        raise HTTPException(
+            status_code=400,
+            detail=f"you can take off at most {_fmt_cents(max(0, have - floor_cents))} and stay seated — leave the table to cash out",
+        )
+    with _mutation(t):
+        p = t.player(uid)
+        assert p is not None
+        moved = min(cents_to_chips(amount_cents, t.bb_cents), int(p.stack_chips))
+        p.stack_chips -= moved
+        p.leftover_cents += amount_cents
+        _ledger_add(t, uid, "cashout", amount_cents)
+        _persist_player(t, i, p, True)
+    _sync_idle_stack(t, i)
+    _emit(t, "cashout", f"{p.name} took {_fmt_cents(amount_cents)} off the table", seat=i)
+
+
 def _apply_queued_topups_locked(t: LiveTable, *, force: bool = False) -> None:
-    """Land the top-ups that were asked for mid-hand, once the hand (and its
-    runout) is over."""
-    if not any(p is not None and p.queued_topup_cents for p in t.seats):
+    """Land the top-ups (and withdrawals) that were asked for mid-hand, once the
+    hand (and its runout) is over."""
+    if not any(p is not None and (p.queued_topup_cents or p.queued_remove_cents) for p in t.seats):
         return
     if _hand_busy(t) and not force:
         return
+    for p in t.seats:
+        if p is None or not p.queued_remove_cents:
+            continue
+        cents, p.queued_remove_cents = int(p.queued_remove_cents), 0
+        if not t.allow_rathole:
+            continue
+        have = chips_to_cents(int(p.stack_chips), t.bb_cents)
+        cents = min(cents, have - (t.ante_cents + t.bb_cents))
+        if cents < t.bb_cents:
+            _emit(t, "cashout", f"{p.name}'s withdrawal was skipped — not enough left on the table")
+            continue
+        try:
+            with _mutation(t):
+                moved = min(cents_to_chips(cents, t.bb_cents), int(p.stack_chips))
+                p.stack_chips -= moved
+                p.leftover_cents += cents
+                _ledger_add(t, p.user_id, "cashout", cents)
+                _persist_player(t, t.seat_of(p.user_id), p, True)
+            _emit(t, "cashout", f"{p.name} took {_fmt_cents(cents)} off the table")
+        except Exception:  # noqa: BLE001 — rolled back; nothing left the table
+            logger.exception("queued withdrawal failed (table %s)", t.game_id)
     for p in t.seats:
         if p is None or not p.queued_topup_cents:
             continue
@@ -3441,19 +3574,53 @@ def _defer_removal_locked(t: LiveTable, i: int) -> None:
         _resume_turn_locked(t)
 
 
-def _leave_locked(t: LiveTable, uid: int) -> None:
+def _leave_locked(t: LiveTable, uid: int, *, now: bool = False) -> None:
+    """Leave the seat. Holding cards: the hand is PLAYED OUT first (the player
+    keeps acting as normal) and the seat is cashed out when it ends — never a
+    forced fold. ``now`` is the old behaviour (out of the hand at once, away =
+    fold when facing a bet): what the host's Remove and a kicked player get."""
     i = t.seat_of(uid)
     if i is None:
         raise HTTPException(status_code=400, detail="not seated")
     dealt_in = bool(t.in_hand_mask and i < len(t.in_hand_mask) and t.in_hand_mask[i])
     if (t.phase == "in_hand" and dealt_in) or _runout_blocking(t):
-        # (review 2026-09-20 G6) Leaving mid-hand used to be refused
-        # outright; with an AFK opponent and no clock the only way out of
-        # the table was the host. Now: out of the hand immediately (away =
-        # fold when facing a bet), cashed out when the hand ends.
-        _defer_removal_locked(t, i)
+        if now:
+            # (review 2026-09-20 G6) with an AFK opponent and no clock the only
+            # way out of the table used to be the host
+            _defer_removal_locked(t, i)
+            return
+        p = t.seats[i]
+        assert p is not None
+        if not p.leave_after_hand:
+            p.leave_after_hand = True
+            p.sit_out_next = False
+            t.rev += 1
+            _emit(t, "leave", f"{p.name} leaves after this hand", seat=i)
         return
     _cash_out_seat(t, i)
+
+
+def _cancel_leave_locked(t: LiveTable, uid: int) -> None:
+    p = t.player(uid)
+    if p is None:
+        raise HTTPException(status_code=400, detail="not seated")
+    if p.leave_after_hand:
+        p.leave_after_hand = False
+        t.rev += 1
+        _emit(t, "back", f"{p.name} is staying", seat=t.seat_of(uid))
+
+
+def _apply_leaves_locked(t: LiveTable) -> None:
+    """Players who asked to leave after the hand: cash them out now that it is
+    over (the runout included — a cashed-out ledger row would spoil it)."""
+    if _hand_busy(t):
+        return
+    for i, p in enumerate(list(t.seats)):
+        if p is not None and p.leave_after_hand:
+            try:
+                _cash_out_seat(t, i)
+            except Exception:  # noqa: BLE001 — rolled back; retry next tick
+                logger.exception("leave-after-hand cash-out failed (table %s)", t.game_id)
 
 
 def _rebuy_locked(t: LiveTable, uid: int, amount_cents: int) -> None:
@@ -3790,6 +3957,8 @@ def _settings_locked(t: LiveTable, uid: int, body: dict) -> None:
             t.allow_rabbit = _parse_bool(body, "allow_rabbit", t.allow_rabbit)
         if body.get("show_grades") is not None:
             t.show_grades = _parse_bool(body, "show_grades", t.show_grades)
+        if body.get("allow_rathole") is not None:
+            t.allow_rathole = _parse_bool(body, "allow_rathole", t.allow_rathole)
         if body.get("approve_buyins") is not None:
             on = _parse_bool(body, "approve_buyins", t.approve_buyins)
             if on != t.approve_buyins:
@@ -4331,8 +4500,8 @@ def _create_table(user: Any, body: dict) -> LiveTable:
         if body.get("num_seats") is not None
         else TABLE_SEATS
     )
-    sb = _parse_cents(body, "sb_cents", 50)
     bb = _parse_cents(body, "bb_cents", 100)
+    sb = _parse_cents(body, "sb_cents", max(1, bb // 2))  # (nobody posts it: the chip unit is the bb)
     ante = _parse_cents(body, "ante_cents", 300)
     buyin = _parse_cents(body, "default_buyin_cents", 4000)
     secs = _valid_decision_secs(
@@ -4352,6 +4521,7 @@ def _create_table(user: Any, body: dict) -> LiveTable:
     delay = _valid_deal_delay(_parse_secs(body, "deal_delay_secs", 0.0))
     listed = _parse_bool(body, "listed", True)
     approve = _parse_bool(body, "approve_buyins", False)
+    rathole = _parse_bool(body, "allow_rathole", False)
     # (review 2026-09-20 G13) 50 tables in 0.32 s, none ever evicted.
     open_n = pub.DB.one(
         "SELECT COUNT(*) c FROM homegames WHERE host_user_id=? AND status='open'",
@@ -4387,6 +4557,7 @@ def _create_table(user: Any, body: dict) -> LiveTable:
         max_buyin_cents=hi,
         listed=listed,
         approve_buyins=approve,
+        allow_rathole=rathole,
     )
     # The table row and the host's seat land together or not at all.
     with pub.DB.transaction():
@@ -4394,11 +4565,11 @@ def _create_table(user: Any, body: dict) -> LiveTable:
             "INSERT INTO homegames(id,host_user_id,name,num_seats,sb_cents,bb_cents,"
             "ante_cents,default_buyin_cents,status,running,decision_secs,button,"
             "hand_no,created_at,deal_delay_ms,time_bank_secs,min_buyin_cents,"
-            "max_buyin_cents,listed,approve_buyins) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "max_buyin_cents,listed,approve_buyins,allow_rathole) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (gid, int(user["id"]), name, n, sb, bb, ante, buyin, "open", 0, secs,
              0, 0, pub._now(), int(round(delay * 1000)), bank, lo, hi,
-             1 if listed else 0, 1 if approve else 0),
+             1 if listed else 0, 1 if approve else 0, 1 if rathole else 0),
         )
         # Host sits seat 0 with the default buy-in so they can deal once a
         # second player sits.
@@ -4667,11 +4838,13 @@ def install(app: FastAPI, *, static_dir: Path) -> None:
             return _view(t, uid)
 
     @app.post("/games/api/tables/{game_id}/leave")
-    def api_leave(game_id: str):
+    def api_leave(game_id: str, body: dict = Body({})):
+        """Leave the seat. Holding cards: after this hand (the default) — or
+        ``now`` = out of the hand at once (folded when facing a bet)."""
         t = _table_for(game_id)
         uid = _uid()
         with t.lock:
-            _leave_locked(t, uid)
+            _leave_locked(t, uid, now=_parse_bool(body or {}, "now", False))
             return _view(t, uid)
 
     @app.post("/games/api/tables/{game_id}/sit_out")
@@ -4746,6 +4919,22 @@ def install(app: FastAPI, *, static_dir: Path) -> None:
     def api_player_hands(player_id: int, sort: str = "time", dir: str = "desc",
                          game: str | None = None, offset: int = 0, limit: int = 40):
         return _my_hands(_uid(), sort, dir, game, offset, limit, player_id=int(player_id))
+
+    @app.post("/games/api/tables/{game_id}/remove_chips")
+    def api_remove_chips(game_id: str, body: dict = Body({})):
+        t = _table_for(game_id)
+        uid = _uid()
+        with t.lock:
+            _remove_chips_locked(t, uid, _parse_cents(body, "amount_cents"), queue_ok=_parse_bool(body, "queue", False))
+            return _view(t, uid)
+
+    @app.post("/games/api/tables/{game_id}/stay")
+    def api_stay(game_id: str):
+        t = _table_for(game_id)
+        uid = _uid()
+        with t.lock:
+            _cancel_leave_locked(t, uid)
+            return _view(t, uid)
 
     @app.post("/games/api/tables/{game_id}/fair/commit")
     def api_fair_commit(game_id: str, body: dict = Body({})):
@@ -4862,6 +5051,7 @@ def install(app: FastAPI, *, static_dir: Path) -> None:
                 _resolve_request_locked(
                     t, uid, pub.body_int(body, "id"), action == "approve",
                     _parse_bool(body, "trust", False),
+                    amount_cents=_parse_cents(body, "amount_cents") if body.get("amount_cents") is not None else None,
                 )
             else:
                 raise HTTPException(status_code=400, detail="action must be approve, deny or cancel")

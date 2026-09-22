@@ -121,8 +121,10 @@ a { color: var(--accent); text-decoration: none; }
 }
 .input:focus, .field input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(24, 210, 195, 0.16); }
 .money { position: relative; }
-.money::before { content: "$"; position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: var(--tx-3); font-family: var(--mono); pointer-events: none; }
+.money::before { content: var(--sym, "$"); position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: var(--tx-3); font-family: var(--mono); pointer-events: none; }
 .money input { padding-left: 24px !important; font-family: var(--mono); }
+.money.unit-bb::before { content: "bb"; left: 10px; font-size: 11px; letter-spacing: 0.5px; }
+.money.unit-bb input { padding-left: 34px !important; }
 input[type="range"] { -webkit-appearance: none; appearance: none; width: 100%; height: 22px; background: transparent; cursor: pointer; }
 input[type="range"]::-webkit-slider-runnable-track { height: 6px; border-radius: 6px; background: linear-gradient(90deg, var(--accent) var(--fill, 0%), rgba(255, 255, 255, 0.13) var(--fill, 0%)); }
 input[type="range"]::-moz-range-track { height: 6px; border-radius: 6px; background: rgba(255, 255, 255, 0.13); }
@@ -261,7 +263,7 @@ input[type="range"]::-moz-range-thumb { width: 14px; height: 14px; border-radius
 .slot-card { width: var(--cw); height: calc(var(--cw) * 1.38); border-radius: calc(var(--cw) * 0.11); border: 1px dashed rgba(255, 255, 255, 0.1); position: relative; }
 .slot-card .card { position: absolute; inset: 0; --cw: inherit; width: 100%; height: 100%; }
 #street-tag { grid-column: 3; justify-self: start; font-size: max(9px, calc(var(--u) * 0.95)); letter-spacing: 2.2px; font-weight: 700; color: rgba(255, 255, 255, 0.5); text-transform: uppercase; white-space: nowrap; }
-#award-caption { position: absolute; left: 50%; bottom: 100%; transform: translate(-50%, calc(var(--u) * -0.8)); padding: calc(var(--u) * 0.5) calc(var(--u) * 1.4); border-radius: 999px; background: linear-gradient(180deg, rgba(40, 30, 6, 0.92), rgba(24, 18, 3, 0.92)); border: 1px solid rgba(236, 201, 119, 0.55); color: #ffe9b0; font-weight: 600; font-size: max(11px, calc(var(--u) * 1.25)); white-space: nowrap; box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5); animation: capin 0.35s var(--ease); max-width: 92vw; overflow: hidden; text-overflow: ellipsis; }
+#award-caption { position: absolute; left: 50%; top: 100%; transform: translate(-50%, calc(var(--u) * 0.9)); padding: calc(var(--u) * 0.5) calc(var(--u) * 1.4); border-radius: 999px; background: linear-gradient(180deg, rgba(40, 30, 6, 0.92), rgba(24, 18, 3, 0.92)); border: 1px solid rgba(236, 201, 119, 0.55); color: #ffe9b0; font-weight: 600; font-size: max(11px, calc(var(--u) * 1.25)); white-space: nowrap; box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5); animation: capin 0.35s var(--ease); max-width: 92vw; overflow: hidden; text-overflow: ellipsis; }
 @keyframes capin { from { opacity: 0; transform: translate(-50%, 0) scale(0.92); } }
 
 /* cards */
@@ -660,6 +662,7 @@ details.adv > div { display: flex; flex-direction: column; gap: 14px; margin-top
 #stage.wide #street-tag { display: none; }
 /* upright phone: the pot's row is short, the felt under the boards is not */
 #stage.portrait #street-tag { position: absolute; left: 50%; top: 100%; transform: translate(-50%, calc(var(--u) * 0.6)); }
+#stage.portrait #award-caption { transform: translate(-50%, calc(var(--u) * 2.9)); width: max-content; max-width: calc(var(--u) * 30); white-space: normal; text-align: center; line-height: 1.25; } /* under the street tag, between the side seats */
 /* desktop: a flat table — every unit of height between the far seat's bet and
    the hero's bet counts (games.table.js centres the block in what is left) */
 #stage:not(.portrait):not(.wide) #center { gap: calc(var(--u) * 0.7); }
@@ -841,3 +844,39 @@ td.mx-total { background: rgba(255, 255, 255, 0.05); }
 #rp-fair.ok { color: #7fe9b0; border-color: rgba(53, 200, 120, 0.45); }
 #rp-fair.bad { color: #fff; background: #b92b40; border-color: rgba(255, 255, 255, 0.35); }
 @media (max-width: 760px) { .pill.fair span { display: none; } }
+
+/* ==========================================================================
+   Table UX round 2 (2026-09-22)
+   ========================================================================== */
+/* the rabbit: a small button sitting in the gap the turn and river would fill */
+#boards { position: relative; }
+#rabbit-btn { position: absolute; z-index: 5; pointer-events: auto; transform: translate(-50%, -50%); display: inline-flex; align-items: center; gap: calc(var(--u) * 0.5); padding: calc(var(--u) * 0.55) calc(var(--u) * 1.1); border-radius: 999px; border: 1px solid rgba(255, 255, 255, 0.35); background: rgba(3, 8, 10, 0.72); color: #fff; font: 600 max(10.5px, calc(var(--u) * 1.15)) var(--font); white-space: nowrap; cursor: pointer; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45); backdrop-filter: blur(3px); animation: capin 0.35s var(--ease); }
+#rabbit-btn:hover { background: rgba(24, 210, 195, 0.22); border-color: var(--accent); }
+#rabbit-btn .ico { width: calc(var(--u) * 1.5); height: calc(var(--u) * 1.5); min-width: 12px; min-height: 12px; }
+/* the pots, side by side, while a showdown is being paid out */
+/* (they take the pot pill's row and its height, so the boards never move at showdown) */
+#pots { display: flex; align-items: center; justify-content: center; gap: calc(var(--u) * 0.8); }
+#pots[hidden] { display: none; }
+#pot-row.replaced { display: none; }
+.potc { display: inline-flex; align-items: center; gap: calc(var(--u) * 0.6); padding: calc(var(--u) * 0.45) calc(var(--u) * 1) calc(var(--u) * 0.45) calc(var(--u) * 0.6); border-radius: 999px; background: rgba(3, 8, 10, 0.62); border: 1px solid rgba(255, 255, 255, 0.12); box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35); backdrop-filter: blur(3px); transition: opacity 0.4s, transform 0.3s var(--ease), border-color 0.3s, box-shadow 0.3s; }
+.potc small { font-size: max(8.5px, calc(var(--u) * 0.85)); letter-spacing: 1px; text-transform: uppercase; color: rgba(255, 255, 255, 0.62); font-weight: 700; white-space: nowrap; }
+.potc b { font-family: var(--mono); font-size: max(11px, calc(var(--u) * 1.3)); color: var(--gold); }
+.potc .chips { width: calc(var(--u) * 1.7); height: calc(var(--u) * 1.7); min-width: 12px; min-height: 12px; }
+.potc.on { border-color: rgba(236, 201, 119, 0.75); box-shadow: 0 0 0 1.5px rgba(236, 201, 119, 0.5), 0 0 calc(var(--u) * 2.5) rgba(236, 201, 119, 0.35); transform: scale(1.06); }
+.potc.paid { opacity: 0.3; }
+#stage.portrait .potc small, #stage.wide .potc small { display: none; } /* (three pills must fit a phone: the caption names the pot) */
+/* a seat with a buy-in request waiting on the host */
+.seat.has-request .seat-plate { border-color: rgba(236, 201, 119, 0.7); }
+.seat.has-request .seat-plate::after { content: "$"; position: absolute; top: calc(var(--u) * -0.7); right: calc(var(--u) * -0.5); width: calc(var(--u) * 1.8); height: calc(var(--u) * 1.8); min-width: 14px; min-height: 14px; border-radius: 50%; background: var(--gold); color: #2a1d02; font: 800 max(9px, calc(var(--u) * 1.05)) var(--mono); display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5); animation: pulse 1.6s infinite; }
+.seat.reserved.host-review .seat-sit { cursor: pointer; border-color: rgba(236, 201, 119, 0.8); color: var(--gold); animation: pulse 1.6s infinite; }
+.seat.reserved.host-review .seat-sit:disabled { cursor: pointer; }
+/* the request dialog */
+.req-head { display: flex; align-items: center; gap: 12px; }
+.req-head b { color: var(--bright); font-size: 15px; }
+.req-head small { display: block; color: var(--tx-2); }
+/* the host's start / pause button in the top bar */
+#tb-run .ico { width: 14px; height: 14px; }
+#tb-run.start { color: var(--on-accent); background: var(--accent); border-color: transparent; }
+#tb-run.start:hover:not(:disabled) { background: var(--accent-2); }
+/* the ante line in the create dialog */
+.ante-eq { align-self: center; color: var(--tx-3); font-family: var(--mono); font-size: 12.5px; white-space: nowrap; padding-top: 22px; }

@@ -484,10 +484,13 @@ def test_g6_new_tables_have_a_clock_and_zero_stays_selectable(cast):
 
 
 def test_g6_leave_mid_hand_folds_now_and_cashes_out_after(cast, hg):
+    """``leave {now: true}`` = the G6 behaviour: out of the hand at once, cashed
+    out when it ends. (A plain ``leave`` mid-hand now plays the hand out first —
+    2026-09-22, see test_homegame_table_ux.py.)"""
     gid = _table(cast, 3)
     s = _start(cast, gid)
     leaver = (s["actor"] + 1) % 3  # NOT the actor
-    r = _post(cast["p"][leaver], gid, "leave")
+    r = _post(cast["p"][leaver], gid, "leave", {"now": True})
     assert r.status_code == 200, r.text  # used to be 400 "wait for the hand to finish"
     seat = r.json()["seats"][leaver]
     assert seat["empty"] is False and seat["pending_remove"] and seat["sitting_out"]
@@ -507,7 +510,7 @@ def test_g6_actor_leaving_is_acted_for_immediately(cast, hg):
     gid = _table(cast, 2)
     s = _start(cast, gid)
     actor = s["actor"]
-    r = _post(cast["p"][actor], gid, "leave")
+    r = _post(cast["p"][actor], gid, "leave", {"now": True})
     assert r.status_code == 200
     after = r.json()
     assert after["action_seq"] >= 1  # the away logic acted for them

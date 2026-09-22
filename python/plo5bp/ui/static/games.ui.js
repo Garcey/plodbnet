@@ -138,11 +138,7 @@
   }
 
   // ------------------------------------------------------------------- lobby
-  const STAKES = [
-    { l: "Micro", sb: 10, bb: 25, ante: 75, buy: 1000 },
-    { l: "Low", sb: 25, bb: 50, ante: 150, buy: 2000 },
-    { l: "Medium", sb: 50, bb: 100, ante: 300, buy: 4000 },
-    { l: "High", sb: 100, bb: 200, ante: 600, buy: 8000 },
+  const STAKES = [  // (lobby copy only — the create dialog takes a big blind and an ante)
   ];
 
   function miniFelt(t) {
@@ -168,7 +164,7 @@
       `<div class="tcard-host">Hosted by ${esc(t.host_name)}${t.is_host ? " (you)" : ""}</div></div>` +
       `<span class="pill ${t.running ? "live" : "paused"}">${t.running ? "Live" : "Paused"}</span></div>` +
       miniFelt(t) +
-      `<div class="tcard-meta"><span class="pill gold num">${d2(t.sb_cents)}/${d2(t.bb_cents)}</span>` +
+      `<div class="tcard-meta"><span class="pill gold num">${d2(t.bb_cents)} bb</span>` +
       `<span class="pill">${icon("i-users", "sm")}${t.seated}/${t.num_seats}</span>` +
       (t.hand_no ? `<span class="pill num">Hand #${t.hand_no}</span>` : "") +
       (t.listed ? "" : `<span class="pill">${icon("i-lock", "sm")}Link only</span>`) + "</div>";
@@ -202,7 +198,7 @@
     const sess = data.sessions || [];
     $("lb-sess-sec").hidden = !sess.length;
     $("lb-sessions").innerHTML = sess.map((x) =>
-      `<div class="sess" data-id="${esc(x.id)}" role="button" tabindex="0" title="Open this session: final ledger and every hand"><div><b>${esc(x.name)}</b><br><small>${d2(x.sb_cents)}/${d2(x.bb_cents)} · ante ${d2(x.ante_cents)}</small></div>` +
+      `<div class="sess" data-id="${esc(x.id)}" role="button" tabindex="0" title="Open this session: final ledger and every hand"><div><b>${esc(x.name)}</b><br><small>${d2(x.bb_cents)} bb · ante ${d2(x.ante_cents)}</small></div>` +
       `<small class="opt">${x.hands} hand${x.hands === 1 ? "" : "s"}</small><small class="opt">in for ${d2(x.buyin_cents)}</small>` +
       `<b class="num ${x.net_cents >= 0 ? "pos" : "neg"}">${x.net_cents >= 0 ? "+" : ""}${d2(x.net_cents)}</b></div>`).join("");
     wireSessions();
@@ -218,36 +214,38 @@
   }
 
   function openCreate() {
-    let pick = 2;
     const me = C().G.me || {};
     const body = h("div", { style: "display:flex;flex-direction:column;gap:16px" });
     body.innerHTML =
       `<label class="field"><span>Table name</span><input type="text" id="c-name" maxlength="60" value="${esc((me.name || "My").split(" ")[0])}'s game"/></label>` +
-      `<div class="field"><span>Stakes</span><div class="stake-grid" id="c-stakes">` +
-      STAKES.map((s, i) => `<button type="button" class="stake ${i === pick ? "on" : ""}" data-i="${i}"><b>${d2(s.sb)}/${d2(s.bb)}</b><small>${s.l} · ante ${d2(s.ante)}</small></button>`).join("") +
-      `</div><small>Blinds set the chip unit and the minimum bet. Nobody posts them — every hand is a bomb pot: all players ante and the action starts on the flop.</small></div>` +
-      `<div class="row3" style="grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto"><label class="field"><span>Ante</span>${moneyInput("c-ante", STAKES[pick].ante)}</label>` +
-      `<label class="field"><span>Your buy-in</span>${moneyInput("c-buyin", STAKES[pick].buy)}</label>` +
+      `<div class="row3" style="grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto;align-items:start">` +
+      `<label class="field"><span>Big blind</span>${moneyInput("c-bb", 100)}<small>The chip unit and the minimum bet</small></label>` +
+      `<label class="field"><span>Ante, in big blinds</span><div class="money unit-bb"><input class="input" id="c-ante-bb" inputmode="decimal" autocomplete="off" value="3"/></div><small id="c-ante-eq">= $3.00 per player, every hand</small></label>` +
       `<div class="field"><span>Seats</span><div class="seg" id="c-seats">${[2, 4, 6, 8].map((n) => `<button type="button" data-v="${n}" class="${n === 8 ? "on" : ""}">${n}</button>`).join("")}</div></div></div>` +
+      `<label class="field"><span>Your buy-in</span>${moneyInput("c-buyin", 4000)}<small>Nobody posts blinds — every hand is a bomb pot: everyone antes and the action starts on the flop.</small></label>` +
       `<details class="adv"><summary>More options</summary><div>` +
-      `<div class="row2"><label class="field"><span>Small blind</span>${moneyInput("c-sb", STAKES[pick].sb)}</label><label class="field"><span>Big blind</span>${moneyInput("c-bb", STAKES[pick].bb)}</label></div>` +
       `<div class="row2"><label class="field"><span>Min buy-in</span>${moneyInput("c-min", 0)}<small>0 = no minimum</small></label><label class="field"><span>Max buy-in</span>${moneyInput("c-max", 0)}<small>0 = no maximum</small></label></div>` +
       `<div class="field"><span>Decision time</span><div class="seg" id="c-clock">${[[0, "Off"], [15, "15s"], [20, "20s"], [30, "30s"], [45, "45s"], [60, "60s"]].map(([v, l]) => `<button type="button" data-v="${v}" class="${v === 30 ? "on" : ""}">${l}</button>`).join("")}</div></div>` +
       `<div class="field"><span>Time bank</span><div class="seg" id="c-bank">${[[0, "Off"], [30, "30s"], [60, "60s"], [120, "2 min"]].map(([v, l]) => `<button type="button" data-v="${v}" class="${v === 30 ? "on" : ""}">${l}</button>`).join("")}</div></div>` +
       `<div class="field"><span>Next hand</span><div class="seg" id="c-deal">${[[0, "Manual"], [3, "3s"], [5, "5s"], [8, "8s"], [12, "12s"]].map(([v, l]) => `<button type="button" data-v="${v}" class="${v === 5 ? "on" : ""}">${l}</button>`).join("")}</div></div>` +
       `<div class="setrow"><div><b>I approve every buy-in</b><small>Sit-downs and top-ups wait for your OK — you can trust regulars so they never wait</small></div><label class="switch"><input type="checkbox" id="c-approve"/><i></i></label></div>` +
+      `<div class="setrow"><div><b>Players may take chips off the table</b><small>Ratholing allowed: anyone can pocket part of their stack between hands</small></div><label class="switch"><input type="checkbox" id="c-rathole"/><i></i></label></div>` +
       `<div class="setrow"><div><b>List in the lobby</b><small>Off = only people with the link can find it</small></div><label class="switch"><input type="checkbox" id="c-listed" checked/><i></i></label></div>` +
       `</div></details>`;
     segWire(body);
-    const setMoney = (id, c) => { body.querySelector("#" + id).value = (c / 100).toFixed(2); };
-    body.querySelector("#c-stakes").addEventListener("click", (e) => {
-      const b = e.target.closest("button[data-i]");
-      if (!b) return;
-      pick = Number(b.dataset.i);
-      body.querySelectorAll(".stake").forEach((x) => x.classList.toggle("on", x === b));
-      const s = STAKES[pick];
-      setMoney("c-sb", s.sb); setMoney("c-bb", s.bb); setMoney("c-ante", s.ante); setMoney("c-buyin", s.buy);
-    });
+    const q = (id) => body.querySelector("#" + id);
+    const bbCents = () => Math.max(1, C().toCents(q("c-bb").value) || 0);
+    const anteBB = () => Math.max(0, Number(String(q("c-ante-bb").value).replace(",", ".")) || 0);
+    const anteCents = () => Math.round(bbCents() * anteBB());
+    let buyinTouched = false;
+    const sync = () => {
+      q("c-ante-eq").textContent = `= ${d2(anteCents())} per player, every hand`;
+      if (!buyinTouched) q("c-buyin").value = ((bbCents() * 40) / 100).toFixed(2);  // 40 bb until you say otherwise
+    };
+    q("c-bb").addEventListener("input", sync);
+    q("c-ante-bb").addEventListener("input", sync);
+    q("c-buyin").addEventListener("input", () => { buyinTouched = true; });
+    sync();
     openModal({
       title: "Host a table", sub: "You can change almost everything later from Manage table.", body,
       buttons: [
@@ -255,15 +253,16 @@
         {
           label: "Create table", cls: "gold",
           onClick: async () => {
-            const q = (id) => body.querySelector("#" + id);
+            const bb = bbCents();
+            if (anteBB() <= 0) { toast("The ante must be at least a fraction of a big blind", "err"); return false; }
             const payload = {
               name: q("c-name").value.trim() || "Home game",
-              sb_cents: C().toCents(q("c-sb").value), bb_cents: C().toCents(q("c-bb").value),
-              ante_cents: C().toCents(q("c-ante").value), default_buyin_cents: C().toCents(q("c-buyin").value),
+              bb_cents: bb, sb_cents: Math.max(1, Math.round(bb / 2)),
+              ante_cents: anteCents(), default_buyin_cents: C().toCents(q("c-buyin").value),
               min_buyin_cents: C().toCents(q("c-min").value) || 0, max_buyin_cents: C().toCents(q("c-max").value) || 0,
               num_seats: segVal(body, "c-seats"), decision_secs: segVal(body, "c-clock"),
               time_bank_secs: segVal(body, "c-bank"), deal_delay_secs: segVal(body, "c-deal"), listed: q("c-listed").checked,
-              approve_buyins: q("c-approve").checked,
+              approve_buyins: q("c-approve").checked, allow_rathole: q("c-rathole").checked,
             };
             try {
               const s = await C().j("/games/api/tables", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
@@ -336,7 +335,7 @@
     if (s.my_seat != null) return toast("You're already seated", "err");
     const lim = buyinLimits(s, 0), dflt = s.stakes.default_buyin_cents;
     moneyDialog({
-      title: `Take seat ${seat + 1}`, sub: `${s.name} · ${d2(s.stakes.sb_cents)}/${d2(s.stakes.bb_cents)} · ante ${d2(s.stakes.ante_cents)}`,
+      title: `Take seat ${seat + 1}`, sub: `${s.name} · ${d2(s.stakes.bb_cents)} bb · ante ${d2(s.stakes.ante_cents)}`,
       lo: lim.lo, hi: lim.hi, start: dflt, ante: s.stakes.ante_cents, step: s.stakes.bb_cents, okLabel: s.needs_approval ? "Request seat" : "Sit down",
       hint: (s.needs_approval ? "The host approves buy-ins here — your seat is held while they decide. " : "") + (lim.capped ? `Buy-in ${d2(lim.lo)} – ${d2(lim.hi)}. ` : "") + "Real money is settled between you — the ledger just keeps score.",
       presets: [{ label: "Min", cents: lim.lo }, { label: d2(dflt), cents: dflt }, { label: d2(dflt * 2), cents: dflt * 2 }, { label: "Max", cents: lim.hi }],
@@ -347,12 +346,25 @@
       },
     });
   }
-  function openTopUp() {
+  function openTopUp(mode) {
     const s = C().G.state;
     if (!s || s.my_seat == null) return;
     const me = s.seats[s.my_seat];
     // Table stakes: chips asked for while you hold cards land when the hand ends.
     const holding = me.in_hand && (s.phase === "in_hand" || (s.runout && s.runout.blocking));
+    const canRemove = !!(s.settings && s.settings.allow_rathole);
+    if (mode === "remove" && canRemove) return openRemoveChips(s, me, holding);
+    if (!mode && canRemove) {
+      // the host allows ratholing: ask which way the chips go
+      const floor = s.stakes.ante_cents + s.stakes.bb_cents;
+      const canTake = me.stack_cents - floor >= s.stakes.bb_cents;
+      const body = h("div", { class: "seg", style: "width:100%" });
+      body.innerHTML = `<button type="button" data-v="add" class="on">Add chips</button><button type="button" data-v="remove" ${canTake ? "" : "disabled"}>Take chips off</button>`;
+      let pick = "add";
+      body.addEventListener("click", (e) => { const b = e.target.closest("button[data-v]"); if (!b || b.disabled) return; pick = b.dataset.v; body.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b)); });
+      return openModal({ title: "Chips", sub: `Your stack is ${d2(me.stack_cents)}. This table lets players take chips off between hands.`, body, autofocus: false,
+        buttons: [{ label: "Cancel", cls: "ghost" }, { label: "Continue", cls: "primary", onClick: () => { setTimeout(() => openTopUp(pick === "remove" ? "remove" : "add"), 260); } }] });
+    }
     const lim = buyinLimits(s, me.stack_cents);
     if (lim.capped && lim.hi < s.stakes.bb_cents) return toast(`You're at the table maximum (${d2(s.settings.max_buyin_cents)})`);
     const dflt = Math.max(lim.lo, Math.min(lim.hi, s.stakes.default_buyin_cents - me.stack_cents > 0 ? s.stakes.default_buyin_cents - me.stack_cents : s.stakes.default_buyin_cents));
@@ -366,6 +378,22 @@
         if (out && out.my_request) toast("Request sent — waiting for the host", "ok");
         else if (holding) toast(`${d2(cents)} lands when this hand ends`, "ok");
         else HG.sound && HG.sound.play("chips");
+      },
+    });
+  }
+  function openRemoveChips(s, me, holding) {
+    const floor = s.stakes.ante_cents + s.stakes.bb_cents;  // what stays: an ante and a bet
+    const hi = me.stack_cents - floor, lo = s.stakes.bb_cents;
+    if (hi < lo) return toast(`Nothing to take off — you keep at least ${d2(floor)} to stay seated. Leave the table to cash out.`, "err");
+    moneyDialog({
+      title: "Take chips off the table", sub: `Your stack is ${d2(me.stack_cents)}.` + (holding ? " They come off when this hand ends." : ""), lo, hi, start: Math.min(hi, Math.max(lo, Math.round(hi / 2 / s.stakes.bb_cents) * s.stakes.bb_cents)),
+      ante: s.stakes.ante_cents, step: s.stakes.bb_cents, okLabel: "Take off",
+      hint: `They go back to your ledger as if you had cashed them out. You keep at least ${d2(floor)} on the table.`,
+      presets: [{ label: "Half", cents: Math.round(hi / 2) }, { label: d2(s.stakes.default_buyin_cents), cents: Math.max(lo, me.stack_cents - s.stakes.default_buyin_cents) }, { label: "Max", cents: hi }],
+      onOk: async (cents) => {
+        await C().tablePost("remove_chips", { amount_cents: cents, queue: holding });
+        toast(holding ? `${d2(cents)} comes off when this hand ends` : `${d2(cents)} taken off the table`, "ok");
+        HG.sound && HG.sound.play("chips");
       },
     });
   }
@@ -976,7 +1004,7 @@
       body.innerHTML = (data.is_admin ? `<p class="muted" style="font-size:12.5px;margin:0 0 12px">Excluding a session takes it out of everyone's stats, hand lists and head-to-head. Nothing is deleted — you can restore it here any time. An open table is closed first.</p>` : "") +
         (rows.length ? rows.map((x) =>
           `<div class="sess ${x.excluded ? "excluded" : ""}" data-id="${esc(x.id)}"><div><b>${esc(x.name)}</b>${x.open ? ` <span class="pill live">Open</span>` : ""}${x.excluded ? ` <span class="pill">Excluded</span>` : ""}<br>` +
-          `<small>${esc(String(x.created_at || "").slice(0, 10))} · ${d2(x.sb_cents)}/${d2(x.bb_cents)} · ante ${d2(x.ante_cents)}</small></div>` +
+          `<small>${esc(String(x.created_at || "").slice(0, 10))} · ${d2(x.bb_cents)} bb · ante ${d2(x.ante_cents)}</small></div>` +
           `<small class="opt">${x.hands} hand${x.hands === 1 ? "" : "s"}</small><small class="opt">${x.players} player${x.players === 1 ? "" : "s"}</small>` +
           `<span class="sess-act"><button class="btn sm" data-open="${esc(x.id)}" type="button">Open</button>` +
           (data.is_admin ? `<button class="btn sm ${x.excluded ? "" : "danger"}" data-ex="${esc(x.id)}" data-on="${x.excluded ? "0" : "1"}" type="button">${x.excluded ? "Restore" : "Exclude"}</button>` : "") + `</span></div>`).join("")
@@ -1047,18 +1075,19 @@
     if (U.drawerTab === "game") {
       html += `<div class="grp"><h4>Table</h4><label class="field"><span>Name</span><input type="text" id="m-name" maxlength="60" value="${esc(s.name)}"/></label>` +
         `<div class="row2"><label class="field"><span>Ante</span>${moneyInput("m-ante", st.ante_cents)}<small>Applies from the next hand</small></label>` +
-        `<div class="field"><span>Blinds (chip unit)</span><input type="text" class="input num" disabled value="${d2(st.sb_cents)} / ${d2(st.bb_cents)}"/><small>Fixed once a table is created</small></div></div>` +
+        `<div class="field"><span>Big blind (chip unit)</span><input type="text" class="input num" disabled value="${d2(st.bb_cents)}"/><small>Fixed once a table is created</small></div></div>` +
         `<div class="field"><span>Seats</span>${segHtml("m-seats", [2, 3, 4, 5, 6, 7, 8].map((n) => [n, String(n)]), s.num_seats)}<small>Between hands only — the higher seats must be empty to shrink</small></div></div>` +
         `<div class="grp"><h4>Buy-ins</h4><div class="row3"><label class="field"><span>Minimum</span>${moneyInput("m-min", set.min_buyin_cents)}</label><label class="field"><span>Default</span>${moneyInput("m-dflt", st.default_buyin_cents)}</label><label class="field"><span>Maximum</span>${moneyInput("m-max", set.max_buyin_cents)}</label></div><p>0 = no limit. The maximum also caps top-ups.</p></div>` +
         `<div class="grp"><h4>Privacy &amp; extras</h4><div class="setrow"><div><b>List in the lobby</b><small>Off = link only</small></div><label class="switch"><input type="checkbox" id="m-listed" ${set.listed ? "checked" : ""}/><i></i></label></div>` +
         `<div class="setrow"><div><b>Accuracy marks on everyone's actions</b><small>The replayer rates every decision against the network. Off = players only see marks on their own</small></div><label class="switch"><input type="checkbox" id="m-grades" ${set.show_grades ? "checked" : ""}/><i></i></label></div>` +
-        `<div class="setrow"><div><b>Rabbit hunting</b><small>Let players peek at the undealt streets after a fold-out</small></div><label class="switch"><input type="checkbox" id="m-rabbit" ${set.allow_rabbit ? "checked" : ""}/><i></i></label></div></div>`;
+        `<div class="setrow"><div><b>Rabbit hunting</b><small>Let players peek at the undealt streets after a fold-out</small></div><label class="switch"><input type="checkbox" id="m-rabbit" ${set.allow_rabbit ? "checked" : ""}/><i></i></label></div>` +
+        `<div class="setrow"><div><b>Players may take chips off the table</b><small>Ratholing allowed: anyone can pocket part of their stack between hands (a player always keeps an ante + 1 bb)</small></div><label class="switch"><input type="checkbox" id="m-rathole" ${set.allow_rathole ? "checked" : ""}/><i></i></label></div></div>`;
     } else if (U.drawerTab === "chips") {
       const modeSeg = (id, cur) => `<div class="seg as-modes" id="${id}">${[["off", "Off"], ["host", "Host sets"], ["player", "Players choose"]].map(([v, l]) => `<button type="button" data-v="${v}" class="${cur === v ? "on" : ""}">${l}</button>`).join("")}</div>`;
       html += `<div class="grp"><h4>Buy-in approval</h4><div class="setrow"><div><b>I approve every buy-in</b><small>Sit-downs and top-ups wait for your OK. Players you trust never wait.</small></div><label class="switch"><input type="checkbox" id="m-approve" ${set.approve_buyins ? "checked" : ""}/><i></i></label></div>` +
         (nReq ? (s.requests || []).map((r) =>
           `<div class="prow req" data-req="${r.id}">${avatar(r.name, r.name)}<div class="who"><b>${esc(r.name)}</b><small>${r.kind === "sit" ? `wants seat ${r.seat + 1} with ${d2(r.amount_cents)}` : `wants to add ${d2(r.amount_cents)}`}</small></div>` +
-          `<div class="acts"><button class="btn sm primary" data-ok="${r.id}">Approve</button><button class="btn sm gold" data-okt="${r.id}" title="Approve, and never ask again for this player">+ Trust</button><button class="icon-btn" data-no="${r.id}" title="Decline" style="color:#ff9aa6">${icon("i-x")}</button></div></div>`).join("")
+          `<div class="acts"><button class="btn sm primary" data-ok="${r.id}">Approve</button><button class="btn sm gold" data-okt="${r.id}" title="Approve, and never ask again for this player">+ Trust</button><button class="btn sm" data-edit="${r.id}" title="Change the amount, then approve">Edit</button><button class="icon-btn" data-no="${r.id}" title="Decline" style="color:#ff9aa6">${icon("i-x")}</button></div></div>`).join("")
           : (set.approve_buyins ? `<p>No one is waiting. Trust regulars from the Players tab so the game never stops for them.</p>` : "")) + `</div>` +
         `<div class="grp"><h4>Auto top-up</h4><p>When a stack drops below a threshold it is topped back up before the next hand. Winnings stay on the table — no ratholing.</p>${modeSeg("m-top", s.auto_topup.mode)}` +
         (s.auto_topup.mode === "host" ? `<div class="row2"><label class="field"><span>Top up to</span>${moneyInput("m-top-target", s.auto_topup.all_target_cents || st.default_buyin_cents)}</label><label class="field"><span>When below</span>${moneyInput("m-top-below", s.auto_topup.all_below_cents || s.auto_topup.all_target_cents || st.default_buyin_cents)}</label></div><button class="btn sm" id="m-top-apply">Apply to everyone</button><small class="muted">Per-player amounts: tap a player's seat.</small>` : "") + `</div>` +
@@ -1111,7 +1140,7 @@
           name: q("m-name").value, ante_cents: C().toCents(q("m-ante").value),
           min_buyin_cents: C().toCents(q("m-min").value) || 0, default_buyin_cents: C().toCents(q("m-dflt").value),
           max_buyin_cents: C().toCents(q("m-max").value) || 0, listed: q("m-listed").checked, allow_rabbit: q("m-rabbit").checked,
-          show_grades: q("m-grades").checked,
+          show_grades: q("m-grades").checked, allow_rathole: q("m-rathole").checked,
         };
         const seats = segVal(root, "m-seats");
         if (seats !== s.num_seats) patch.num_seats = seats;
@@ -1123,6 +1152,7 @@
       root.querySelectorAll("[data-ok]").forEach((b) => b.addEventListener("click", () => resolve(b.dataset.ok, "approve", false)));
       root.querySelectorAll("[data-okt]").forEach((b) => b.addEventListener("click", () => resolve(b.dataset.okt, "approve", true)));
       root.querySelectorAll("[data-no]").forEach((b) => b.addEventListener("click", () => resolve(b.dataset.no, "deny", false)));
+      root.querySelectorAll("[data-edit]").forEach((b) => b.addEventListener("click", () => { const r = (s.requests || []).find((x) => String(x.id) === b.dataset.edit); if (r) openRequestDialog(r); }));
       q("m-top").addEventListener("pick", async (e) => { try { await C().tablePost("auto_topup", { mode: e.detail }); } catch (_) { /* toasted */ } paintDrawer(C().G.state, true); });
       q("m-auto").addEventListener("pick", async (e) => { try { await C().tablePost("auto_stack", { mode: e.detail }); } catch (_) { /* toasted */ } paintDrawer(C().G.state, true); });
       const ta = q("m-top-apply");
@@ -1176,7 +1206,7 @@
     const row = (k, v) => `<div class="settle-row"><span class="muted">${k}</span><b style="color:var(--tx)">${v}</b></div>`;
     openModal({
       title: s.name, sub: "PLO5 double-board bomb pot", autofocus: false,
-      body: `<div>${row("Blinds (chip unit)", `${d2(st.sb_cents)} / ${d2(st.bb_cents)}`)}${row("Ante", d2(st.ante_cents))}` +
+      body: `<div>${row("Big blind (chip unit)", d2(st.bb_cents))}${row("Ante", `${d2(st.ante_cents)} (${(st.ante_cents / st.bb_cents).toFixed(st.ante_cents % st.bb_cents ? 1 : 0)} bb)`)}` +
         row("Buy-in", set.min_buyin_cents || set.max_buyin_cents ? `${set.min_buyin_cents ? d2(set.min_buyin_cents) : "any"} – ${set.max_buyin_cents ? d2(set.max_buyin_cents) : "any"}` : "No limits") +
         row("Seats", s.num_seats) + row("Decision time", s.decision_secs ? s.decision_secs + "s" : "No clock") + row("Time bank", set.time_bank_secs ? set.time_bank_secs + "s per player" : "Off") +
         row("Next hand", set.deal_delay_secs ? `dealt automatically after ${set.deal_delay_secs}s` : "dealt manually") + row("Rabbit hunt", set.allow_rabbit ? "Allowed" : "Off") + row("Lobby", set.listed ? "Listed" : "Link only") + `</div>` +
@@ -1198,10 +1228,69 @@
     const s = C().G.state;
     if (s) HG.table.render(s, s);
   }
+  // The host taps a reserved seat (or a seated player's "$" badge) and gets
+  // the request right there: approve as asked, approve a DIFFERENT amount
+  // ("asked $150 — seated with $80"), approve + trust, or decline.
+  function openRequest(seatIdx) {
+    const s = C().G.state;
+    if (!s || !s.is_host) return;
+    const seat = s.seats[seatIdx];
+    const r = (s.requests || []).find((q) => (q.kind === "sit" ? q.seat === seatIdx : seat && !seat.empty && q.user_id === seat.user_id));
+    if (!r) return toast("Nothing is waiting for you at that seat", "");
+    openRequestDialog(r);
+  }
+  function openRequestDialog(r) {
+    const s = C().G.state;
+    const st = s.stakes, set = s.settings || {};
+    const stackNow = r.kind === "rebuy" ? ((s.seats.find((x) => !x.empty && x.user_id === r.user_id) || {}).stack_cents || 0) : 0;
+    const lo = r.kind === "sit" ? Math.max(st.bb_cents, set.min_buyin_cents || 0) : st.bb_cents;
+    const hi = set.max_buyin_cents ? Math.max(lo, set.max_buyin_cents - stackNow) : Math.max(r.amount_cents * 2, lo * 4, st.default_buyin_cents * 5);
+    let cents = Math.max(lo, Math.min(hi, r.amount_cents));
+    const body = h("div", { style: "display:flex;flex-direction:column;gap:14px" });
+    body.innerHTML =
+      `<div class="req-head">${avatar(r.name, r.name)}<div><b>${esc(r.name)}</b><small>${r.kind === "sit" ? `wants seat ${r.seat + 1} with ${d2(r.amount_cents)}` : `wants to add ${d2(r.amount_cents)} (stack ${d2(stackNow)})`}</small></div></div>` +
+      `<div class="bigmoney"><span id="rq-big">${d2(cents)}</span><small id="rq-note"></small></div>` +
+      `<input type="range" id="rq-range" min="${lo}" max="${hi}" step="${Math.max(1, st.bb_cents)}" value="${cents}"/>` +
+      `<div class="sz-row"><div class="sz-presets" id="rq-presets"></div><div class="sz-amt">${moneyInput("rq-input", cents)}</div></div>` +
+      `<small class="muted">Change the amount if you like — they are told what you approved.${set.max_buyin_cents ? ` Table maximum ${d2(set.max_buyin_cents)}.` : ""}</small>`;
+    const q = (id) => body.querySelector("#" + id);
+    const sync = (from) => {
+      cents = Math.max(lo, Math.min(hi, cents));
+      q("rq-big").textContent = d2(cents);
+      q("rq-note").textContent = cents === r.amount_cents ? "as asked" : `asked ${d2(r.amount_cents)}`;
+      if (from !== "range") q("rq-range").value = String(cents);
+      if (from !== "input") q("rq-input").value = (cents / 100).toFixed(2);
+      q("rq-range").style.setProperty("--fill", (hi > lo ? ((cents - lo) / (hi - lo)) * 100 : 100) + "%");
+    };
+    [{ label: "As asked", cents: r.amount_cents }, { label: d2(st.default_buyin_cents), cents: st.default_buyin_cents }, { label: "Half", cents: Math.round(r.amount_cents / 2) }, { label: "Max", cents: hi }]
+      .filter((p, i, arr) => p.cents >= lo && p.cents <= hi && arr.findIndex((x) => x.cents === p.cents) === i)
+      .forEach((p) => { const b = h("button", { type: "button" }, esc(p.label)); b.addEventListener("click", () => { cents = p.cents; sync(); }); q("rq-presets").appendChild(b); });
+    q("rq-range").addEventListener("input", () => { cents = Number(q("rq-range").value); sync("range"); });
+    q("rq-input").addEventListener("input", () => { const c = C().toCents(q("rq-input").value); if (c != null) { cents = c; q("rq-big").textContent = d2(Math.max(lo, Math.min(hi, c))); } });
+    q("rq-input").addEventListener("change", () => sync());
+    sync();
+    const resolve = async (action, trust) => {
+      sync();
+      const body2 = { id: r.id, action, trust: !!trust };
+      if (action === "approve" && cents !== r.amount_cents) body2.amount_cents = cents;
+      await C().tablePost("request", body2);
+      if (action === "approve") { toast(`${r.name} ${r.kind === "sit" ? "is seated" : "topped up"} with ${d2(cents)}${trust ? " — trusted from now on" : ""}`, "ok"); HG.sound && HG.sound.play("sit"); }
+    };
+    openModal({
+      title: r.kind === "sit" ? "Buy-in request" : "Top-up request", body, autofocus: false,
+      buttons: [
+        { label: "Decline", cls: "ghost", onClick: () => resolve("deny", false) },
+        { label: "Approve & trust", cls: "gold", onClick: () => resolve("approve", true) },
+        { label: "Approve", cls: "primary", onClick: () => resolve("approve", false) },
+      ],
+    });
+  }
+
   function openPlayer(seatIdx) {
     const s = C().G.state;
     const x = s && s.seats[seatIdx];
     if (!x || x.empty) return;
+    if (s.is_host && x.request) return openRequestDialog(Object.assign({ user_id: x.user_id, name: x.name, seat: seatIdx }, x.request));
     const mine = x.user_id === s.my_user_id;
     const row = (s.ledger || []).find((r) => r.user_id === x.user_id) || {};
     const st = ((U.hands && U.hands.stats) || []).find((r) => r.name === x.name) || {};
@@ -1255,6 +1344,28 @@
     if (!U.hands && s.is_member) loadHands(s);
   }
 
+  function openLeave() {
+    const s = C().G.state;
+    if (!s || !Number.isInteger(s.my_seat)) return;
+    const me = s.seats[s.my_seat];
+    if (me.leaving) return C().tablePost("stay").catch(() => {});
+    const busy = me.in_hand && (s.phase === "in_hand" || (s.runout && s.runout.blocking));
+    if (!busy) {
+      confirmDialog({ title: "Leave your seat?", text: `You cash out ${d2(me.stack_cents)} and your seat opens up.`, okLabel: "Leave seat", danger: true })
+        .then((ok) => { if (ok) C().tablePost("leave").catch(() => {}); });
+      return;
+    }
+    openModal({
+      title: "Leave your seat?", sub: "You're in a hand. Play it out and leave when it ends — or leave right now (you are checked or folded for the rest of it).",
+      body: "", autofocus: false,
+      buttons: [
+        { label: "Cancel", cls: "ghost" },
+        { label: "Leave now (fold)", cls: "danger", onClick: () => C().tablePost("leave", { now: true }) },
+        { label: "Leave after this hand", cls: "primary", onClick: () => C().tablePost("leave").then(() => toast("You leave when this hand ends", "ok")) },
+      ],
+    });
+  }
+
   function seatMenu(anchor) {
     const s = C().G.state;
     if (!s) return;
@@ -1263,7 +1374,7 @@
     const busy = s.phase === "in_hand" || s.runout.blocking;
     const items = [{ header: seated ? `${me.name} · ${d2(me.stack_cents)}` : "Not seated" }];
     if (seated && s.status === "open") {
-      items.push({ icon: "i-pluscircle", label: s.needs_approval ? "Request chips" : "Add chips", onClick: openTopUp });
+      items.push({ icon: "i-pluscircle", label: s.needs_approval ? "Request chips" : (s.settings && s.settings.allow_rathole) ? "Add or take off chips" : "Add chips", onClick: () => openTopUp() });
       if (s.auto_stack.mode !== "off" || s.auto_topup.mode !== "off") items.push({ icon: "i-wallet", label: "Automatic chips…", onClick: openAutoChips });
       if (me.sitting_out) items.push({ icon: "i-play", label: "I'm back", onClick: () => C().tablePost("sit_out", { on: false }).catch(() => {}) });
       else {
@@ -1271,12 +1382,10 @@
         items.push({ icon: "i-clock", label: "Step away now", hint: "You are checked or folded until you come back", onClick: () => C().tablePost("sit_out", { on: true }).catch(() => {}) });
       }
       items.push("-");
-      items.push({
+      if (me.leaving) items.push({ icon: "i-play", label: "Stay — cancel leaving", onClick: () => C().tablePost("stay").catch(() => {}) });
+      else items.push({
         icon: "i-door", label: me.pending_remove ? "Leaving after this hand" : "Leave seat", danger: true, disabled: !!me.pending_remove,
-        onClick: async () => {
-          const ok = await confirmDialog({ title: "Leave your seat?", text: busy ? "You're out of this hand right away (checked or folded for you) and cashed out when it ends." : `You cash out ${d2(me.stack_cents)} and your seat opens up.`, okLabel: "Leave seat", danger: true });
-          if (ok) C().tablePost("leave").catch(() => {});
-        },
+        onClick: openLeave,
       });
     } else if (s.status === "open") items.push({ icon: "i-user", label: "Pick an open seat on the table", disabled: true, onClick: () => {} });
     items.push({ icon: "i-back", label: "Back to lobby", onClick: () => C().showLobby(false) });
@@ -1302,6 +1411,8 @@
     $("tb-back").addEventListener("click", () => C().showLobby(false));
     $("tb-invite").addEventListener("click", () => copyInvite(C().G.gameId));
     $("tb-manage").addEventListener("click", () => openDrawer(((C().G.state || {}).requests || []).length ? "chips" : null));
+    $("tb-run").addEventListener("click", () => { const s = C().G.state; if (s) C().tablePost("run", { running: !s.running }).catch(() => {}); });
+    $("rabbit-btn").addEventListener("click", () => C().tablePost("rabbit").catch(() => {}));
     $("tb-watch").addEventListener("click", (e) => {
       const s = C().G.state, names = (s && s.spectators) || [];
       openMenu(e.currentTarget, [{ header: `${names.length} watching` }].concat(names.map((n) => ({ icon: "i-eye", label: n, disabled: true, onClick: () => {} }))));
@@ -1357,7 +1468,7 @@
 
   function renderTop(s) {
     $("table-title").textContent = s.name;
-    $("table-sub").textContent = `PLO5 bomb pot · ${d2(s.stakes.sb_cents)}/${d2(s.stakes.bb_cents)} · ante ${d2(s.stakes.ante_cents)}`;
+    $("table-sub").textContent = `PLO5 bomb pot · ${d2(s.stakes.bb_cents)} bb · ante ${d2(s.stakes.ante_cents)}`;
     const st = $("tb-status");
     const label = s.status !== "open" ? "Closed" : s.running ? "Live" : "Paused";
     st.textContent = label;
@@ -1366,6 +1477,20 @@
     $("tb-hand").hidden = !s.hand_no;
     $("tb-hostpill").hidden = !s.is_host;
     $("tb-manage").hidden = !(s.is_host && s.status === "open");
+    const run = $("tb-run");
+    run.hidden = !(s.is_host && s.status === "open");
+    if (!run.hidden) {
+      const busy = s.phase === "in_hand" || (s.runout && s.runout.blocking);
+      const label = s.running ? (busy ? "Pause after hand" : "Pause") : "Start game";
+      const k = `${s.running}:${busy}:${s.eligible_count < 2}`;
+      if (run.dataset.k !== k) {
+        run.dataset.k = k;
+        run.className = "btn sm " + (s.running ? "" : "start");
+        run.innerHTML = icon(s.running ? "i-pause" : "i-play", "sm") + `<span>${label}</span>`;
+        run.disabled = !s.running && s.eligible_count < 2;
+        run.title = s.running ? "Pause the game (the current hand finishes first)" : s.eligible_count < 2 ? "Needs two players with more than the ante" : "Start dealing";
+      }
+    }
     const nReq = s.is_host ? (s.requests || []).length : 0;
     $("tb-req").hidden = !nReq; $("tb-req").textContent = String(nReq);
     const nw = (s.spectators || []).length;
@@ -1400,7 +1525,7 @@
 
   HG.ui = {
     init, render, renderLobby, showLobby, showTable, renderConn, toast, openModal, confirmDialog, openMenu, closeTop,
-    openSit, openTopUp, openAutoChips, openPlayer, openMyHands, noteFor, TAGS, openDrawer, openInfo, openPrefs, openHand, copyInvite, setRail, renderDock: (s) => HG.play && HG.play.render(s, s),
+    openSit, openTopUp, openAutoChips, openPlayer, openRequest, openLeave, openMyHands, noteFor, TAGS, openDrawer, openInfo, openPrefs, openHand, copyInvite, setRail, renderDock: (s) => HG.play && HG.play.render(s, s),
     onClock: (left, tm) => HG.play && HG.play.onClock(left, tm),
   };
 })();

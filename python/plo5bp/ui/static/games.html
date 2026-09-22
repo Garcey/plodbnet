@@ -121,6 +121,7 @@
         <span class="spacer"></span>
         <span class="conn" id="conn" title="Connection"><i></i><span>Live</span></span>
         <button class="btn sm" id="tb-invite" title="Copy the invite link"><svg class="ico sm"><use href="#i-link" /></svg><span>Invite</span></button>
+        <button class="btn sm" id="tb-run" hidden></button>
         <button class="btn sm gold" id="tb-manage" hidden title="Manage table"><svg class="ico sm"><use href="#i-crown" /></svg><span>Manage</span><i id="tb-req" hidden>0</i></button>
         <button class="icon-btn" id="tb-info" title="Table info" aria-label="Table info"><svg class="ico"><use href="#i-info" /></svg></button>
         <button class="icon-btn" id="tb-sound" title="Sound" aria-label="Sound"><svg class="ico"><use href="#i-vol" /></svg></button>
@@ -142,9 +143,11 @@
                   <div id="pot"><span class="chips" id="pot-chips"></span><small>Pot</small><span id="pot-amt">$0.00</span></div>
                   <div id="street-tag"></div>
                 </div>
+                <div id="pots" hidden></div>
                 <div id="boards">
                   <div class="board" id="board-a"><span class="board-tag">1</span></div>
                   <div class="board" id="board-b"><span class="board-tag">2</span></div>
+                  <button type="button" id="rabbit-btn" hidden title="See the turn and river that would have come"><svg class="ico sm"><use href="#i-eye" /></svg><span>Click to reveal</span></button>
                 </div>
               </div>
               <div id="seats"></div>

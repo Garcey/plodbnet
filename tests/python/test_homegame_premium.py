@@ -144,7 +144,7 @@ def test_create_options_land_in_the_view(cast):
     assert s["settings"] == {
         "deal_delay_secs": 5.0, "time_bank_secs": 30, "min_buyin_cents": 2000,
         "max_buyin_cents": 10000, "listed": False, "allow_rabbit": True,
-        "approve_buyins": False, "show_grades": True,
+        "approve_buyins": False, "show_grades": True, "allow_rathole": False,
     }
     assert s["seats"][0]["bank_left_secs"] == 30.0  # the host is seated with a full bank
 
@@ -223,7 +223,7 @@ def test_settings_survive_a_reload(cast, hg):
     assert s["settings"] == {
         "deal_delay_secs": 7.0, "time_bank_secs": 20, "min_buyin_cents": 500,
         "max_buyin_cents": 90000, "listed": False, "allow_rabbit": False,
-        "approve_buyins": False, "show_grades": True,
+        "approve_buyins": False, "show_grades": True, "allow_rathole": False,
     }
     assert all(x["bank_left_secs"] == 20.0 for x in s["seats"] if not x["empty"])
 

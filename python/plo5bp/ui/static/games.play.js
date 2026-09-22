@@ -159,6 +159,7 @@
     if (s.status !== "open") { msg = "<b>This table is closed.</b> The final ledger is in the side panel."; btns.push(["lobby", "Back to lobby", "primary"]); }
     else if (s.my_request) { msg = `Waiting for the host to approve your <b>${C().fmtAmt(s.my_request.amount_cents, s)}</b> ${s.my_request.kind === "sit" ? "buy-in" : "top-up"}…`; btns.push(["cancelreq", "Cancel request", ""]); }
     else if (!me) msg = s.seats.some((x) => x.empty) ? "<b>You're watching.</b> Pick an open seat on the table to join." : "<b>You're watching.</b> The table is full right now.";
+    else if (me.leaving) { msg = "<b>Leaving after this hand.</b> You play it out as normal."; btns.push(["stay", "Stay", ""]); }
     else if (me.pending_remove) msg = "You're leaving — you'll be cashed out when this hand ends.";
     else if (me.sitting_out) { msg = "<b>You're sitting out.</b>"; btns.push(["back", "I'm back", "primary"]); }
     else if (!(busy && me.in_hand) && me.stack_cents <= s.stakes.ante_cents) { msg = "<b>You're out of chips.</b> Reload to be dealt into the next hand."; btns.push(["topup", "Add chips", "gold"]); }
@@ -172,9 +173,9 @@
     else if (s.next_deal_in_secs != null) msg = `Next hand in <b class="num" id="deal-count">${Math.max(1, Math.ceil(s.next_deal_in_secs))}s</b>`;
     else if (s.can_deal) { msg = "Ready for the next hand."; btns.push(["deal", "Deal next hand", "primary"]); }
     if (s.can_show) btns.push(["show", "Show my cards", ""]);
-    if (s.can_rabbit && me) btns.push(["rabbit", "Rabbit hunt", ""]);
     if (s.can_deal && s.next_deal_in_secs != null && (s.is_host || me)) btns.push(["deal", "Deal now", ""]);
     if (me && me.queued_topup_cents) msg += (msg ? " · " : "") + `<span class="pos">+${C().fmtAmt(me.queued_topup_cents, s)} after this hand</span>`;
+    if (me && me.queued_remove_cents) msg += (msg ? " · " : "") + `<span class="neg">−${C().fmtAmt(me.queued_remove_cents, s)} off the table after this hand</span>`;
     // the countdown is ticked locally (the push only arrives when something changes)
     P.dealAt = s.next_deal_in_secs != null ? performance.now() + s.next_deal_in_secs * 1000 : null;
     const sig = msg.replace(/id="deal-count">\d+s/, "") + "|" + btns.map((b) => b[0]).join(",");
@@ -200,17 +201,24 @@
     else if (k === "show") C().tablePost("show", { hand_no: s.hand_no }).catch(() => {});
     else if (k === "rabbit") C().tablePost("rabbit").catch(() => {});
     else if (k === "cancelreq") C().tablePost("request", { action: "cancel" }).catch(() => {});
+    else if (k === "stay") C().tablePost("stay").catch(() => {});
   }
 
   function sides(s) {
     const me = Number.isInteger(s.my_seat) ? s.seats[s.my_seat] : null;
     const left = $("dock-left"), right = $("dock-right");
     const busy = s.phase === "in_hand" || s.runout.blocking;
-    const lsig = me && s.status === "open" ? `${me.sitting_out}:${me.sit_out_next}:${s.needs_approval}:${me.pending_remove}` : "none";
+    const lsig = me && s.status === "open" ? `${me.sitting_out}:${me.sit_out_next}:${s.needs_approval}:${me.pending_remove}:${me.leaving}:${!!(s.settings && s.settings.allow_rathole)}` : "none";
     if (lsig !== P.leftSig) {
       P.leftSig = lsig;
       left.innerHTML = "";
-      if (me && s.status === "open" && !me.pending_remove) {
+      if (me && s.status === "open" && me.leaving) {
+        const lv = document.createElement("button");
+        lv.type = "button"; lv.className = "btn sm gold"; lv.title = "You leave when this hand ends — tap to stay";
+        lv.innerHTML = icon("i-door", "sm") + "Leaving after this hand · Stay?";
+        lv.addEventListener("click", () => C().tablePost("stay").catch(() => {}));
+        left.appendChild(lv);
+      } else if (me && s.status === "open" && !me.pending_remove) {
         const lab = document.createElement("label");
         const on = me.sitting_out || me.sit_out_next;
         lab.className = "chk" + (on ? " on" : "");
@@ -220,10 +228,16 @@
         });
         left.appendChild(lab);
         const tu = document.createElement("button");
-        tu.type = "button"; tu.className = "btn sm"; tu.title = "Add chips to your stack (they land after the hand if you are in one)";
-        tu.innerHTML = icon("i-pluscircle", "sm") + (s.needs_approval ? "Request chips" : "Add chips");
+        const rat = !!(s.settings && s.settings.allow_rathole);
+        tu.type = "button"; tu.className = "btn sm"; tu.title = rat ? "Add chips, or take some off the table (either lands after the hand if you are in one)" : "Add chips to your stack (they land after the hand if you are in one)";
+        tu.innerHTML = icon("i-pluscircle", "sm") + (s.needs_approval ? "Request chips" : rat ? "Chips" : "Add chips");
         tu.addEventListener("click", () => HG.ui.openTopUp());
         left.appendChild(tu);
+        const lv = document.createElement("button");
+        lv.type = "button"; lv.className = "btn sm ghost"; lv.title = "Leave your seat — after this hand if you are in one";
+        lv.innerHTML = icon("i-door", "sm") + "Leave";
+        lv.addEventListener("click", () => HG.ui.openLeave());
+        left.appendChild(lv);
       }
     }
     const rsig = `${s.last_hand_no}:${!!me}:${s.is_member}`;

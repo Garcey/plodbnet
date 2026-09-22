@@ -129,6 +129,15 @@
     return [-px / d, -(py - c) / d];
   }
   const rOver = (a, b, m) => Math.max(0, Math.min(a[2], b[2] + m) - Math.max(a[0], b[0] - m)) * Math.max(0, Math.min(a[3], b[3] + m) - Math.max(a[1], b[1] - m));
+  // The award caption's height at this scale (font floors), measured on the real node.
+  function captionHeight(g) {
+    const cap = $("award-caption");
+    const was = { hidden: cap.hidden, text: cap.textContent, vis: cap.style.visibility };
+    cap.style.visibility = "hidden"; cap.hidden = false; cap.textContent = "Side pot 1 · Board 1 · Somebody wins $100.00 with a full house, As full of Qs";
+    const h = cap.getBoundingClientRect().height || g.u * 3;
+    cap.hidden = was.hidden; cap.textContent = was.text; cap.style.visibility = was.vis;
+    return h;
+  }
   // A bet pill's real size at this scale (font floors make it relatively bigger
   // on a small phone), measured once per layout on a throwaway twin.
   function pillSize(g) {
@@ -293,7 +302,9 @@
       // (a phone on its side seats every opponent along the top, whatever the count)
       const lo = (n % 2 === 0 || g.wide ? g.cy - H / 2 + seatBottom(g.u) + betRoom : g.fy + g.u * 2) + ch / 2;
       const cardsTop = g.wide ? g.h - g.u * (1 + g.heroCw * 1.38) : g.cy + H / 2 - g.u * (3.5 + g.heroCw * 1.38);
-      const hi = (T.seated ? cardsTop - betRoom : g.fy + g.fh - g.u * 2) - ch / 2;
+      // under the boards: the hero's bet, or (at showdown) the award caption — whichever is taller
+      const underRoom = Math.max(betRoom, captionHeight(g) + g.u * (g.portrait ? 3.4 : 1.4));
+      const hi = (T.seated ? cardsTop - underRoom : g.fy + g.fh - g.u * 2) - ch / 2;
       centerY = lo <= hi ? Math.max(lo, Math.min(hi, centerY)) : (lo + hi) / 2;
     }
     $("center").style.top = (centerY / g.h) * 100 + "%";
@@ -379,7 +390,12 @@
         '<div class="seat-badge"></div><div class="seat-hand"></div><div class="seat-eq"></div>';
       const sit = el("button", "seat-sit", `${icon("i-plus")}<span>Sit</span>`);
       sit.type = "button";
-      sit.addEventListener("click", () => HG.ui && HG.ui.openSit(i));
+      sit.addEventListener("click", () => {
+        const st = HG.core.G.state;
+        const held = st && st.seats[i] && st.seats[i].reserved_by;
+        if (held && st.is_host && HG.ui && HG.ui.openRequest) HG.ui.openRequest(i);
+        else if (HG.ui) HG.ui.openSit(i);
+      });
       e.querySelector(".seat-main").addEventListener("click", () => HG.ui && HG.ui.openPlayer(i));
       e.appendChild(sit);
       seatsEl.appendChild(e);
@@ -518,10 +534,12 @@
     const held = empty && !!seat.reserved_by;
     e.classList.toggle("locked", empty && !held && (s.my_seat != null || s.status !== "open"));
     e.classList.toggle("reserved", held);
+    e.classList.toggle("host-review", held && !!s.is_host);
+    e.classList.toggle("has-request", !empty && !!seat.request);
     if (empty) {
       const label = held ? seat.reserved_by : "Sit";
-      if (sv.sit.dataset.l !== label) { sv.sit.dataset.l = label; sv.sit.lastChild.textContent = label; sv.sit.title = held ? `Reserved for ${seat.reserved_by} — waiting for the host` : ""; }
-      sv.sit.disabled = held;
+      if (sv.sit.dataset.l !== label) { sv.sit.dataset.l = label; sv.sit.lastChild.textContent = label; sv.sit.title = held ? (s.is_host ? `${seat.reserved_by} asks to buy in — tap to review` : `Reserved for ${seat.reserved_by} — waiting for the host`) : ""; }
+      sv.sit.disabled = held && !s.is_host;  // (the host taps it to approve)
     }
     if (empty) {
       setSeatCards(sv, null, false, ctx);
@@ -822,16 +840,18 @@
 
     const names = {};
     s.seats.forEach((x) => { if (!x.empty) names[x.seat] = x.is_hero && s.my_seat === x.seat ? "You" : x.name; });
+    const pots = renderPots(s, step);
     let line = "";
     if (step) {
       const amt = fmt(chipsToCents(step.chips, s), s);
       const who = (step.winners || []).map((i) => names[i] || "Seat " + (i + 1));
       const b = step.board === "b" ? "2" : "1";
-      if (step.uncontested) line = `${who.join(" & ")} ${who[0] === "You" && who.length === 1 ? "take" : "takes"} ${amt} uncontested`;
-      else if (who.length > 1) line = `Board ${b} · ${who.join(" & ")} chop ${amt}`;
+      const potName = pots.length > 1 && s.pots[step.pot] ? s.pots[step.pot].label + " · " : "";
+      if (step.uncontested) line = `${potName}${who.join(" & ")} ${who[0] === "You" && who.length === 1 ? "take" : "takes"} ${amt} uncontested`;
+      else if (who.length > 1) line = `${potName}Board ${b} · ${who.join(" & ")} chop ${amt}`;
       else {
         const c = (step.combos || {})[step.winners[0]] || (step.combos || {})[String(step.winners[0])];
-        line = `Board ${b} · ${who[0]} ${who[0] === "You" ? "win" : "wins"} ${amt}${c && c.label ? " with " + c.label : ""}`;
+        line = `${potName}Board ${b} · ${who[0]} ${who[0] === "You" ? "win" : "wins"} ${amt}${c && c.label ? " with " + c.label : ""}`;
       }
     } else if (foldout && winners.size) {
       const i = [...winners][0];
@@ -842,7 +862,9 @@
 
     // chips: pot -> winners, once per award step / fold-out
     if (!ctx.animate) { T.awardKey = step ? `${s.hand_no}:${s.runout.award_index}` : T.awardKey; if (foldout) T.foldoutKey = s.hand_no; return; }
-    const pc = centerOf($("pot"));
+    // the chips leave the pot they belong to (side pots first, main pot last)
+    const potNode = step && pots.length > 1 && pots[step.pot] ? pots[step.pot] : $("pot");
+    const pc = centerOf(potNode);
     if (step) {
       const key = `${s.hand_no}:${s.runout.award_index}`;
       if (T.awardKey !== key) {
@@ -869,6 +891,52 @@
       });
       play(mine ? "win" : "pot");
     } else if (foldout) T.foldoutKey = s.hand_no;
+  }
+
+  // The pots of a showdown, side by side: "Side pot 2 · Side pot 1 · Main pot",
+  // each shrinking as its halves are paid (ClubGG-style). One pot = the plain
+  // pot pill does the job. Returns the pot nodes by index (empty when hidden).
+  function renderPots(s, step) {
+    const host = $("pots");
+    const pots = (s.runout && s.runout.active && s.runout.blocking && s.pots) || [];
+    if (pots.length < 2) { host.hidden = true; host.innerHTML = ""; host.dataset.k = ""; $("pot-row").classList.remove("replaced"); return []; }
+    const paid = {};
+    (s.pot_awards || []).forEach((a) => { paid[a.pot] = (paid[a.pot] || 0) + (a.chips || 0); });
+    const cur = step ? step.pot : -1;
+    const key = pots.map((p, k) => `${p.label}:${p.chips - (paid[k] || 0)}:${k === cur ? 1 : 0}`).join("|") + "|" + (s.hand_no || 0);
+    if (host.dataset.k !== key) {
+      host.dataset.k = key;
+      host.innerHTML = "";
+      pots.forEach((p, k) => {
+        const left = Math.max(0, p.chips - (paid[k] || 0));
+        const d = el("div", "potc" + (k === cur ? " on" : "") + (left <= 0 ? " paid" : ""));
+        d.innerHTML = `<small>${p.label}</small><span class="chips"></span><b class="num">${fmt(chipsToCents(left, s), s)}</b>`;
+        chipStack(d.querySelector(".chips"), chipsToCents(Math.max(left, 1), s), s);
+        host.appendChild(d);
+      });
+    }
+    host.hidden = false;
+    $("pot-row").classList.add("replaced");  // the split pots ARE the pot
+    return Array.from(host.children);
+  }
+
+  // The rabbit hunt: a small button in the gap the turn and river would fill.
+  function placeRabbit(s) {
+    const btn = $("rabbit-btn");
+    const me = Number.isInteger(s.my_seat);
+    const show = !!(s.can_rabbit && me && s.phase === "showdown");
+    btn.hidden = !show;
+    if (!show) return;
+    const bx = $("boards").getBoundingClientRect();
+    const empties = { a: [], b: [] };
+    for (const k of ["a", "b"]) T.boards[k].forEach((slot, j) => { if (!(T.boardCards[k] || [])[j] && j >= (T.boardCards[k] || []).length) empties[k].push(slot.getBoundingClientRect()); });
+    const box = (rs) => rs.length ? { l: Math.min(...rs.map((r) => r.left)), t: Math.min(...rs.map((r) => r.top)), r: Math.max(...rs.map((r) => r.right)), b: Math.max(...rs.map((r) => r.bottom)) } : null;
+    const A = box(empties.a), B = box(empties.b);
+    let target = A || B;
+    if (A && B && !(A.r < B.l || B.r < A.l)) target = { l: Math.min(A.l, B.l), t: Math.min(A.t, B.t), r: Math.max(A.r, B.r), b: Math.max(A.b, B.b) }; // stacked boards: centre the 2 x 2 gap
+    if (!target) { btn.hidden = true; return; }
+    btn.style.left = ((target.l + target.r) / 2 - bx.left) + "px";
+    btn.style.top = ((target.t + target.b) / 2 - bx.top) + "px";
   }
 
   // ------------------------------------------------------------------- timer
@@ -919,7 +987,7 @@
     const o = opts || {};
     if (!T.ready) {
       T.ready = true;
-      if (globalThis.ResizeObserver) { T.ro = new ResizeObserver(() => layout()); T.ro.observe($("stage-box")); }
+      if (globalThis.ResizeObserver) { T.ro = new ResizeObserver(() => { layout(); if (HG.core.G.state) placeRabbit(HG.core.G.state); }); T.ro.observe($("stage-box")); }
       else globalThis.addEventListener("resize", layout);
     }
     const rebuilt = T.tableId !== s.id || T.n !== s.num_seats || T.hero !== (s.hero_seat || 0) || T.seated !== (s.my_seat != null);
@@ -958,6 +1026,7 @@
     updateBoards(s, ctx);
     placeDealer(s.phase === "waiting" && !s.hand_no ? null : s.button_seat);
     updateAwards(s, prev, ctx);
+    placeRabbit(s);
     syncTimer(s);
 
     // chat bubbles + reactions over the seats

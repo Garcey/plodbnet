@@ -1217,6 +1217,34 @@ Premium tables pass (2026-09-21 — `tests/python/test_homegame_premium.py`):
   production ship MUST rebuild the engine (`scripts/deploy_prod.sh`). The spec
   is pinned by a known-answer permutation and a Node run of the browser verifier
   against Python transcripts; changing either side is a PUBLIC spec change.
+- **Table UX round 2 (2026-09-22 — `tests/python/test_homegame_table_ux.py`)**:
+  the create dialog takes a BIG BLIND and an ANTE IN BB (no stake presets, no
+  small blind — `sb_cents` is kept in the wire format/DB for the old rows and
+  defaults to half a bb; displays say "$1.00 bb · ante $3.00"). The host TAPS a
+  reserved seat (or a seated player's "$" badge / the Chips tab's Edit) and gets
+  the request dialog: approve as asked, approve a DIFFERENT amount
+  (`/request {amount_cents}` — validated like a buy-in, announced "approved for
+  $80 (asked $150)"), approve + trust, decline; the host's view carries
+  `seat.request`. `allow_rathole` (host switch, default off) lets a player TAKE
+  CHIPS OFF the table: `/remove_chips {amount_cents, queue}` — whole cents to
+  leftover + a `cashout` ledger row (the move set-stack makes), never below an
+  ante + 1 bb (that is leaving), queued while holding cards
+  (`queued_remove_cents`, re-checked when it lands). LEAVING mid-hand plays the
+  hand out — `leave_after_hand`, `seat.leaving`, `/stay` to cancel — and cashes
+  out when it ends (`_apply_leaves_locked` runs with the deferred work); the old
+  fold-now behaviour is `/leave {now: true}` (kicks/Remove use it); a leaver
+  whose browser is gone counts as away so the clock never waits on them. The
+  rabbit button lives ON THE FELT in the 2x2 gap of the undealt cards
+  (`placeRabbit`, "Click to reveal"), the host has Start/Pause in the top bar
+  (`#tb-run`). Award animation (ClubGG-style): `_capture_rabbit` names the pot
+  layers deepest-first ("Side pot N" … "Main pot", `t.pots`, served as `pots`
+  while the runout blocks) and tags each award step with its `pot`
+  (`_assign_award_pots`); the client shows the pots as inline pills that REPLACE
+  the pot pill (same height — the boards must not move at showdown), highlights
+  the active pot, counts each one down as its halves are paid, flies the chips
+  from THAT pot, prefixes the caption with the pot name, and the layout reserves
+  room under the boards for the caption (`captionHeight`) so it never lands on
+  the hero's cards (it wraps on portrait phones).
 - Preview harness (gitignored): `.claude/tools/games_preview/` — launch
   entry `games_preview` (public build + dev login + temp DB on :8772) and
   `bot.py` (scripted guests).
