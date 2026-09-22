@@ -83,7 +83,7 @@ case "$MODE" in
   *) echo "usage: $0 [check|pack|stage|deploy]"; exit 2 ;;
 esac
 
-dirty=$(git status --porcelain --untracked-files=no | grep -v '^ M .grok/' | wc -l | tr -d ' ')
+dirty=$( (git status --porcelain --untracked-files=no || true) | grep -vc '^ M .grok/' || true)  # (grep -c is 1 when the count is 0)
 echo "== $MODE: $(git rev-parse --short HEAD) on $(git rev-parse --abbrev-ref HEAD) -> $HOST:$APP"
 [ "$dirty" = "0" ] || echo "   note: $dirty tracked file(s) have uncommitted changes — they ship too"
 pack
