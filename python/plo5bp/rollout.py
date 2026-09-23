@@ -123,10 +123,25 @@ def _dead_config_error(where: str, game_config: GameConfig, n_dead: int) -> Runt
 
 
 
+try:  # Unix: kernel CPU time + page faults per step-timer region
+    import resource as _resource
+except ImportError:  # Windows
+    _resource = None
+
+
+def _rusage() -> tuple[float, int]:
+    """(system-CPU seconds, minor page faults) of the whole process so far —
+    all threads. (0.0, 0) where `resource` is unavailable (Windows)."""
+    if _resource is None:
+        return 0.0, 0
+    r = _resource.getrusage(_resource.RUSAGE_SELF)
+    return r.ru_stime, r.ru_minflt
+
+
 class _TimedRF:
     """record_function + optional wall timer (when PLO5BP_STEP_TIMERS=1)."""
 
-    __slots__ = ("_name", "_rf", "_t0", "_enabled")
+    __slots__ = ("_name", "_rf", "_t0", "_ru0", "_enabled")
 
     def __init__(self, name: str) -> None:
         self._name = name
@@ -139,16 +154,16 @@ class _TimedRF:
     def __enter__(self):
         self._rf.__enter__()
         if self._enabled:
+            self._ru0 = _rusage()
             self._t0 = time.perf_counter()
         return self
 
     def __exit__(self, *exc):
         global _ACTIVE_STEP_TIMERS
         if self._enabled and _ACTIVE_STEP_TIMERS is not None:
-            dt = time.perf_counter() - self._t0
-            t = _ACTIVE_STEP_TIMERS
-            t.totals[self._name] = t.totals.get(self._name, 0.0) + dt
-            t.counts[self._name] = t.counts.get(self._name, 0) + 1
+            _ACTIVE_STEP_TIMERS._add(
+                self._name, time.perf_counter() - self._t0, self._ru0
+            )
         return self._rf.__exit__(*exc)
 
 
@@ -160,10 +175,13 @@ class _StepTimers:
 
     Enabled when env ``PLO5BP_STEP_TIMERS=1`` (or truthy). Uses perf_counter
     around named regions; zero overhead when disabled. Safe under the
-    single-threaded rollout loop (no locks).
+    single-threaded rollout loop (no locks). Each region also accumulates the
+    process's kernel CPU time and minor page faults spent inside it (Unix;
+    `_rusage`) — a region that stalls in the kernel (page faults, memory
+    compaction) shows up in those columns, not just in wall time.
     """
 
-    __slots__ = ("enabled", "totals", "counts", "_stack")
+    __slots__ = ("enabled", "totals", "counts", "sys", "faults", "_stack")
 
     def __init__(self) -> None:
         self.enabled = os.environ.get("PLO5BP_STEP_TIMERS", "").strip().lower() in (
@@ -171,19 +189,26 @@ class _StepTimers:
         )
         self.totals: dict[str, float] = {}
         self.counts: dict[str, int] = {}
-        self._stack: list[tuple[str, float]] = []
+        self.sys: dict[str, float] = {}
+        self.faults: dict[str, int] = {}
+        self._stack: list[tuple[str, float, tuple[float, int]]] = []
+
+    def _add(self, name: str, dt: float, ru0: tuple[float, int]) -> None:
+        sys1, flt1 = _rusage()
+        self.totals[name] = self.totals.get(name, 0.0) + dt
+        self.counts[name] = self.counts.get(name, 0) + 1
+        self.sys[name] = self.sys.get(name, 0.0) + (sys1 - ru0[0])
+        self.faults[name] = self.faults.get(name, 0) + (flt1 - ru0[1])
 
     def begin(self, name: str) -> None:
         if self.enabled:
-            self._stack.append((name, time.perf_counter()))
+            self._stack.append((name, time.perf_counter(), _rusage()))
 
     def end(self) -> None:
         if not self.enabled or not self._stack:
             return
-        name, t0 = self._stack.pop()
-        dt = time.perf_counter() - t0
-        self.totals[name] = self.totals.get(name, 0.0) + dt
-        self.counts[name] = self.counts.get(name, 0) + 1
+        name, t0, ru0 = self._stack.pop()
+        self._add(name, time.perf_counter() - t0, ru0)
 
     def report(self, label: str = "rollout") -> None:
         if not self.enabled or not self.totals:
@@ -191,12 +216,18 @@ class _StepTimers:
         grand = sum(self.totals.values())
         print(f"\n===== step timers ({label}) total_accounted={grand:.1f}s =====")
         rows = sorted(self.totals.items(), key=lambda kv: -kv[1])
-        print(f"  {'name':36s}  {'sec':>10s}  {'%':>6s}  {'n':>8s}  {'ms/call':>8s}")
+        print(
+            f"  {'name':36s}  {'sec':>10s}  {'%':>6s}  {'n':>8s}  {'ms/call':>8s}"
+            f"  {'sys_s':>7s}  {'faults_k':>8s}"
+        )
         for name, sec in rows:
             n = self.counts.get(name, 0)
             pct = 100.0 * sec / grand if grand > 0 else 0.0
             mspc = 1000.0 * sec / n if n else 0.0
-            print(f"  {name:36s}  {sec:10.1f}  {pct:5.1f}%  {n:8d}  {mspc:8.2f}")
+            print(
+                f"  {name:36s}  {sec:10.1f}  {pct:5.1f}%  {n:8d}  {mspc:8.2f}"
+                f"  {self.sys.get(name, 0.0):7.1f}  {self.faults.get(name, 0) / 1e3:8.1f}"
+            )
         print(f"[step-timers] accounted={grand:.1f}s across {sum(self.counts.values())} calls")
 
 
@@ -1283,6 +1314,72 @@ TRAIN_OPP_OUTCOME_MC = 384
 # doubles on demand up to MAX_STEPS_PER_SEAT (see `_grow_traj` there).
 _TRAJ_CAP_INIT = 32
 
+# Per-(env, seat, slot) trajectory arrays of the batched collector:
+# (name, per-slot tail shape, dtype, initial fill). `q_taken`/`vpi` exist only
+# for the VRPO estimator.
+_TRAJ_SPEC = (
+    ("obs_idx", (), np.int64, 0),   # absolute index into the step obs/gm pool
+    ("gate", (), np.int8, 0),
+    ("chips", (), np.int64, 0),
+    ("sizing", (4,), np.int64, 0),
+    ("anchor", (), np.int8, -1),
+    ("u", (), np.float32, 0),
+    ("log_p", (), np.float32, 0),
+    ("gate_lp", (), np.float32, 0),
+    ("anchor_lp", (), np.float32, 0),
+    ("value", (), np.float32, 0),
+    ("q_taken", (), np.float32, 0),  # VRPO: Q(s_t, a_t)
+    ("vpi", (), np.float32, 0),      # VRPO: V^pi(s_t) = sum_a pi(a) Q(s_t, a)
+    ("costs", (), np.float32, 0),    # per-step cost / pot / street
+    ("pots", (), np.float32, 0),
+    ("streets", (), np.int8, 0),
+)
+_TRAJ_VRPO_ONLY = frozenset({"q_taken", "vpi"})
+
+
+def _alloc_traj(
+    n_envs: int, n_seats: int, cap: int, use_vrpo: bool
+) -> dict[str, "np.ndarray | None"]:
+    out: dict[str, np.ndarray | None] = {}
+    for name, tail, dtype, fill in _TRAJ_SPEC:
+        if name in _TRAJ_VRPO_ONLY and not use_vrpo:
+            out[name] = None
+            continue
+        shape = (n_envs, n_seats, cap) + tail
+        out[name] = np.full(shape, fill, dtype=dtype) if fill else np.zeros(shape, dtype=dtype)
+    return out
+
+
+# Rollout buffers REUSED across sub-rollouts and updates (2026-09-23). The
+# batched collector used to allocate its trajectory arrays and per-step
+# observation pool afresh for every sub-rollout (30 per update) and
+# multiconfig its whole shared staging buffer every update — at vMin1's 44M
+# rows, ~50-65 GB of freshly faulted, kernel-zeroed memory per update, and on
+# the first RunPod host (fragmented memory) single updates stalled at 4x the
+# time of their neighbors in exactly those allocations. Reuse is EXACT: every
+# read of a trajectory slot / pool row / staging row is confined to what the
+# CURRENT collection wrote (flush masks, `_vrpo_advantage_scan`, `[:wcursor]`
+# views), and every buffer is created zero-filled, so a stale value is always
+# finite. Pinned by tests/python/test_buffer_reuse.py.
+_TRAJ_BUFFERS: dict[tuple, dict] = {}      # (n_envs, n_seats, vrpo) -> {"cap", <name>: array}
+_OBS_POOL_BUFFERS: dict[tuple, dict] = {}  # (obs_dim, layout) -> {"cap", "obs", "gm"}
+_STAGING_BUFFERS: dict[tuple, tuple] = {}  # (obs_dim, hole, pin, layout) -> (allocator, big, cap)
+
+
+def _clear_rollout_buffers() -> None:
+    """Drop every reused rollout buffer (tests; frees the memory)."""
+    _TRAJ_BUFFERS.clear()
+    _OBS_POOL_BUFFERS.clear()
+    _STAGING_BUFFERS.clear()
+
+
+def _reuse_staging(device: torch.device) -> bool:
+    """Multiconfig keeps its big host staging buffer across updates only where
+    the finished batch is COPIED off it (CUDA learner): on a CPU learner the
+    returned Batch tensors are views of the buffer itself, which the next
+    collection would overwrite under a caller still holding the batch."""
+    return device.type == "cuda"
+
 _SLAB_KEYS = (
     "gm", "ga", "rc", "sz", "an", "ru", "oh",
     "lp", "glp", "alp", "v", "ret", "adv", "last",
@@ -1805,63 +1902,55 @@ def collect_rollout_batched(
     # 192-slot allocation zero-filled ~735 MB per vMin1 sub-rollout
     # (7,333 envs x 6 seats x 192 x 87 B; ~2.4 s per 30-config update) for
     # slots that stay empty (2026-09-23).
-    traj_cap = min(_TRAJ_CAP_INIT, MAX_STEPS_PER_SEAT)
+    # The arrays are REUSED across sub-rollouts / updates with the same
+    # (n_envs, n_seats, estimator) — see _TRAJ_BUFFERS; only the per-seat
+    # lengths restart at zero (stale slots past them are never read).
+    traj_key = (int(n_envs), int(n_seats), bool(use_vrpo))
+    traj_buf = _TRAJ_BUFFERS.get(traj_key)
+    if traj_buf is None:
+        _cap0 = min(_TRAJ_CAP_INIT, MAX_STEPS_PER_SEAT)
+        traj_buf = {"cap": _cap0, **_alloc_traj(n_envs, n_seats, _cap0, use_vrpo)}
+        _TRAJ_BUFFERS[traj_key] = traj_buf
+    traj_cap = int(traj_buf["cap"])
     traj_lengths = np.zeros((n_envs, n_seats), dtype=np.int32)
-    # Absolute index into `step_obs_pool` / `step_gm_pool` per (env, seat, slot).
-    traj_obs_idx = np.zeros((n_envs, n_seats, traj_cap), dtype=np.int64)
-    traj_gate = np.zeros((n_envs, n_seats, traj_cap), dtype=np.int8)
-    traj_chips = np.zeros((n_envs, n_seats, traj_cap), dtype=np.int64)
-    traj_sizing = np.zeros((n_envs, n_seats, traj_cap, 4), dtype=np.int64)
-    traj_anchor = np.full((n_envs, n_seats, traj_cap), -1, dtype=np.int8)
-    traj_u = np.zeros((n_envs, n_seats, traj_cap), dtype=np.float32)
-    traj_log_p = np.zeros((n_envs, n_seats, traj_cap), dtype=np.float32)
-    traj_gate_lp = np.zeros((n_envs, n_seats, traj_cap), dtype=np.float32)
-    traj_anchor_lp = np.zeros((n_envs, n_seats, traj_cap), dtype=np.float32)
-    traj_value = np.zeros((n_envs, n_seats, traj_cap), dtype=np.float32)
-    # VRPO: Q(s_t, a_t) and V^π(s_t)=Σ_a π(a)Q(s_t,a) per learner step, laid
-    # out like traj_value; the Expected-SARSA(λ) scan consumes them. None when
-    # the estimator is GAE (never indexed in that path).
-    traj_q_taken = (
-        np.zeros((n_envs, n_seats, traj_cap), dtype=np.float32)
-        if use_vrpo else None
-    )
-    traj_vpi = (
-        np.zeros((n_envs, n_seats, traj_cap), dtype=np.float32)
-        if use_vrpo else None
-    )
-    # Per-step cost / pot / street parallel arrays, mirrored shape.
-    costs_arr = np.zeros((n_envs, n_seats, traj_cap), dtype=np.float32)
-    pots_arr = np.zeros((n_envs, n_seats, traj_cap), dtype=np.float32)
-    streets_arr = np.zeros((n_envs, n_seats, traj_cap), dtype=np.int8)
+
+    def _bind_traj() -> None:
+        nonlocal traj_obs_idx, traj_gate, traj_chips, traj_sizing, traj_anchor
+        nonlocal traj_u, traj_log_p, traj_gate_lp, traj_anchor_lp, traj_value
+        nonlocal traj_q_taken, traj_vpi, costs_arr, pots_arr, streets_arr
+        b = traj_buf
+        # Absolute index into `step_obs_pool` / `step_gm_pool` per (env, seat, slot).
+        traj_obs_idx, traj_gate, traj_chips = b["obs_idx"], b["gate"], b["chips"]
+        traj_sizing, traj_anchor, traj_u = b["sizing"], b["anchor"], b["u"]
+        traj_log_p, traj_gate_lp = b["log_p"], b["gate_lp"]
+        traj_anchor_lp, traj_value = b["anchor_lp"], b["value"]
+        # VRPO: Q(s_t, a_t) and V^π(s_t)=Σ_a π(a)Q(s_t,a) per learner step, laid
+        # out like traj_value; the Expected-SARSA(λ) scan consumes them. None
+        # when the estimator is GAE (never indexed in that path).
+        traj_q_taken, traj_vpi = b["q_taken"], b["vpi"]
+        # Per-step cost / pot / street parallel arrays, mirrored shape.
+        costs_arr, pots_arr, streets_arr = b["costs"], b["pots"], b["streets"]
+
+    traj_obs_idx = traj_gate = traj_chips = traj_sizing = traj_anchor = None
+    traj_u = traj_log_p = traj_gate_lp = traj_anchor_lp = traj_value = None
+    traj_q_taken = traj_vpi = costs_arr = pots_arr = streets_arr = None
+    _bind_traj()
 
     def _grow_traj(min_cap: int) -> None:
         """Re-allocate every per-(env, seat) trajectory array with at least
         `min_cap` slots (doubling, capped at MAX_STEPS_PER_SEAT), copying the
-        slots written so far; fresh slots get each array's initial fill."""
-        nonlocal traj_cap, traj_obs_idx, traj_gate, traj_chips, traj_sizing
-        nonlocal traj_anchor, traj_u, traj_log_p, traj_gate_lp, traj_anchor_lp
-        nonlocal traj_value, traj_q_taken, traj_vpi, costs_arr, pots_arr
-        nonlocal streets_arr
+        slots written so far; fresh slots get each array's initial fill. The
+        grown arrays replace the cached ones (later sub-rollouts start big)."""
+        nonlocal traj_cap
         new_cap = min(MAX_STEPS_PER_SEAT, max(int(min_cap), 2 * traj_cap))
-
-        def grown(a: np.ndarray | None, fill: int = 0) -> np.ndarray | None:
-            if a is None:
-                return None
-            shape = a.shape[:2] + (new_cap,) + a.shape[3:]
-            b = np.full(shape, fill, dtype=a.dtype) if fill else np.zeros(shape, dtype=a.dtype)
-            b[:, :, :traj_cap] = a
-            return b
-
-        traj_obs_idx, traj_gate = grown(traj_obs_idx), grown(traj_gate)
-        traj_chips, traj_sizing = grown(traj_chips), grown(traj_sizing)
-        traj_anchor = grown(traj_anchor, -1)
-        traj_u, traj_log_p = grown(traj_u), grown(traj_log_p)
-        traj_gate_lp, traj_anchor_lp = grown(traj_gate_lp), grown(traj_anchor_lp)
-        traj_value = grown(traj_value)
-        traj_q_taken, traj_vpi = grown(traj_q_taken), grown(traj_vpi)
-        costs_arr, pots_arr = grown(costs_arr), grown(pots_arr)
-        streets_arr = grown(streets_arr)
+        grown = _alloc_traj(n_envs, n_seats, new_cap, use_vrpo)
+        for name, arr in grown.items():
+            if arr is not None:
+                arr[:, :, :traj_cap] = traj_buf[name]
+            traj_buf[name] = arr
+        traj_buf["cap"] = new_cap
         traj_cap = new_cap
+        _bind_traj()
 
     # Flat pre-allocated obs / gate-mask pool. Each step appends
     # `learner_idx_np.size` rows at `pool_cursor`; trajectory slots
@@ -1890,8 +1979,19 @@ def collect_rollout_batched(
     # pool and the output slabs share the layout; multiconfig's shared staging
     # uses the same resolver, so the `out_slabs` it hands over match too.
     obs_layout = _resolve_obs_layout(train_config, game_config.variant)
-    step_obs_pool = _alloc_obs_pool(pool_cap, env.obs_dim, obs_layout)
-    step_gm_pool = np.empty((pool_cap, GATE_ACTIONS), dtype=bool)
+    # The pool is REUSED across sub-rollouts / updates (_OBS_POOL_BUFFERS);
+    # only rows below `pool_cursor` — this collection's — are ever read.
+    pool_key = (int(env.obs_dim), obs_layout.name if obs_layout is not None else "dense")
+    pool_buf = _OBS_POOL_BUFFERS.get(pool_key)
+    if pool_buf is None or pool_buf["cap"] < pool_cap:
+        pool_buf = {
+            "cap": pool_cap,
+            "obs": _alloc_obs_pool(pool_cap, env.obs_dim, obs_layout),
+            "gm": np.empty((pool_cap, GATE_ACTIONS), dtype=bool),
+        }
+        _OBS_POOL_BUFFERS[pool_key] = pool_buf
+    pool_cap = int(pool_buf["cap"])
+    step_obs_pool, step_gm_pool = pool_buf["obs"], pool_buf["gm"]
     pool_cursor = 0
 
     def _grow_pool(min_rows: int) -> None:
@@ -1903,6 +2003,7 @@ def collect_rollout_batched(
             new_obs[key][:pool_cursor] = arr[:pool_cursor]
         new_gm[:pool_cursor] = step_gm_pool[:pool_cursor]
         step_obs_pool, step_gm_pool, pool_cap = new_obs, new_gm, new_cap
+        pool_buf.update(cap=new_cap, obs=new_obs, gm=new_gm)
 
     # Pre-allocated output slabs (`_slab_keys` layout). Eliminates the
     # `np.stack` over millions of small arrays at finalize time. `wcursor`
@@ -2512,12 +2613,14 @@ def collect_rollout_batched(
         # Vectorized trajectory snapshot: one bulk obs/gm copy into the
         # flat pool, plus fancy-index writes into the per-(env, seat)
         # arrays. The (env, seat, slot) -> pool index map is one int.
-        step_timers.begin("step3c/traj_snapshot")
         if learner_idx_np.size:
             k_step = learner_idx_np.size
             pool_end = pool_cursor + k_step
             if pool_end > pool_cap:
+                step_timers.begin("step3c/pool_grow")
                 _grow_pool(pool_end)
+                step_timers.end()  # step3c/pool_grow
+            step_timers.begin("step3c/obs_pack")
             if obs_layout is None:
                 step_obs_pool["obs"][pool_cursor:pool_end] = obs[learner_idx_np]
             else:
@@ -2527,6 +2630,7 @@ def collect_rollout_batched(
                     pool_cursor,
                 )
             step_gm_pool[pool_cursor:pool_end] = gate_masks[learner_idx_np]
+            step_timers.end()  # step3c/obs_pack
             pool_indices = np.arange(pool_cursor, pool_end, dtype=np.int64)
             pool_cursor = pool_end
 
@@ -2538,8 +2642,11 @@ def collect_rollout_batched(
                     f"MAX_STEPS_PER_SEAT={MAX_STEPS_PER_SEAT}"
                 )
             if int(slots.max()) >= traj_cap:
+                step_timers.begin("step3c/traj_grow")
                 _grow_traj(int(slots.max()) + 1)
+                step_timers.end()  # step3c/traj_grow
 
+            step_timers.begin("step3c/traj_writes")
             l_gates = gates_per_env[learner_idx_np]
             l_chips = chips_per_env[learner_idx_np]
             traj_obs_idx[learner_idx_np, learner_actors, slots] = pool_indices
@@ -2575,7 +2682,7 @@ def collect_rollout_batched(
                 traj_vpi[learner_idx_np, learner_actors, slots] = (
                     vpi_per_env[learner_idx_np]
                 )
-        step_timers.end()  # step3c/traj_snapshot
+            step_timers.end()  # step3c/traj_writes
 
         # Short-shove redirect: rows where the network emitted GATE_RAISE
         # but the engine zeroed `min_raise` (sub-min-raise stack with
@@ -3268,8 +3375,22 @@ def collect_rollout_multiconfig(
             and os.environ.get("PLO5BP_PIN_ROLLOUT", "0") == "1"
         )
         obs_layout = _resolve_obs_layout(train_config, configs[0].variant)
-        staging = _SlabAllocator(obs_dim, hole_count, _pin, layout=obs_layout)
-        big = staging.alloc(total_cap)
+        # Reused across updates on a CUDA learner (_STAGING_BUFFERS /
+        # _reuse_staging): the finished batch is copied to the GPU at the end
+        # of this call, so the next collection may overwrite the buffer.
+        reuse = _reuse_staging(device)
+        stage_key = (
+            int(obs_dim), int(hole_count), bool(_pin),
+            obs_layout.name if obs_layout is not None else "dense",
+        )
+        cached = _STAGING_BUFFERS.get(stage_key) if reuse else None
+        if cached is not None and cached[2] >= total_cap:
+            staging, big, total_cap = cached
+        else:
+            staging = _SlabAllocator(obs_dim, hole_count, _pin, layout=obs_layout)
+            big = staging.alloc(total_cap)
+            if reuse:
+                _STAGING_BUFFERS[stage_key] = (staging, big, total_cap)
         base = 0
 
         def _grow(used_rows: int, min_rows: int) -> dict[str, np.ndarray]:
@@ -3281,6 +3402,8 @@ def collect_rollout_multiconfig(
                 base + int(min_rows), total_cap + max(total_cap // 4, 1)
             )
             big = staging.grow(big, base + int(used_rows), total_cap)
+            if reuse:
+                _STAGING_BUFFERS[stage_key] = (staging, big, total_cap)
             return {key: arr[base:] for key, arr in big.items()}
 
         # Per-sub scalar diagnostics only: a sub's tensors are VIEWS of `big`,

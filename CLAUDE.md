@@ -186,9 +186,22 @@ anchor` = v2 (head_version 2), `logistic` = v4 (3), `mixture` = v5 (4).
     per finished hand): same distribution, different RNG stream.
   - Trajectory arrays start at 32 slots per seat and double on demand up to
     192 (was a fixed 192: ~735 MB zero-filled per vMin1 sub-rollout).
+  - **Rollout buffers are REUSED** across sub-rollouts and updates
+    (`rollout._TRAJ_BUFFERS` / `_OBS_POOL_BUFFERS` / `_STAGING_BUFFERS`):
+    the trajectory arrays, the per-step obs pool, and multiconfig's shared
+    staging (CUDA learners only — on a CPU learner the returned batch IS a
+    view of the staging; `_reuse_staging`). Fresh allocations 30x per update
+    stalled the first RunPod host (fragmented memory: one update ran 4x its
+    neighbors, all of it inside those allocations). Exact — every read is
+    confined to what the current collection wrote (pinned by
+    `test_buffer_reuse.py`, dirty vs fresh buffers). `_clear_rollout_buffers()`
+    for tests that must start fresh.
   - Step timers also cover `step0/setup`, `step0/prestep`,
-    `step3a/opp_holes_rot`, `step3c/traj_snapshot` (the per-step obs staging
-    copy — the largest item that used to be untimed).
+    `step3a/opp_holes_rot` and the per-step snapshot split into
+    `step3c/obs_pack`, `step3c/traj_writes` (+ `step3c/pool_grow` /
+    `step3c/traj_grow` when a buffer grows); every region also reports the
+    kernel CPU time (`sys_s`) and minor page faults (`faults_k`) spent in it
+    (Linux; zeros on Windows) — a kernel stall shows up there.
 
 ### v5 (2026-07-06, IMPLEMENTED, not yet trained — V5_DESIGN.md canonical)
 
@@ -308,7 +321,10 @@ v2 specifics:
 Pod stem families: `optimized<N>` (v1, retired — `launch_auto.sh` /
 `watchdog_auto.sh`), `vTwo<N>`/`vFour<N>`/`vFive<N>` (PLO5 v2/v4/v5 —
 guardian scripts per stem), the current `vSix<N>` (`--v6`,
-`vSix4_guardian.sh`) and `vMin1` (minimal obs, `vMin1_guardian.sh`), and
+`vSix4_guardian.sh`), `vMin1` (minimal obs, `vMin1_guardian.sh`), `vMin2`
+(fresh minimal-obs stem on rev-2 values, compact storage, 44M rows,
+`vMin2_guardian.sh` — started 2026-09-23 as the size sweep's 128x3 baseline),
+and
 `nlh<N>` (NLH v4 PPO — RETIRED 2026-07-16, `nlh_guardian.sh` now exits 1;
 do NOT prune `checkpoints/vFour4_*.pt` on the pod). Guardians resume from
 the newest `<stem>_*.pt`; the `<stem>.optim.pt` sidecar and `.pt.tmp`

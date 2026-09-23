@@ -22,6 +22,9 @@ BB = 10_000
 
 def _collect(monkeypatch, init_cap: int):
     monkeypatch.setattr(rollout_mod, "_TRAJ_CAP_INIT", init_cap)
+    # The arrays are reused across collections (_TRAJ_BUFFERS): start each run
+    # fresh so this one really begins at `init_cap`.
+    rollout_mod._clear_rollout_buffers()
     torch.manual_seed(1)
     model = ActorCriticV2(hidden_dim=32, obs_dim=OBS_DIM_MINIMAL)
     critic = CentralCritic(obs_dim=OBS_DIM_MINIMAL, hidden_dim=32, num_blocks=1)
