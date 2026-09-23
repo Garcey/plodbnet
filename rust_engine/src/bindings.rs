@@ -2740,8 +2740,7 @@ impl PyBatchedEngine {
         let out_s = out.as_slice_mut()?;
         let sinks = packed_slices(&mut out_bits, &mut out_real)?;
         let (packed, legal_mask, res) = py.allow_threads(|| {
-            let packed = self.pack_observation_minimal_indexed(&idx, self.config.num_seats);
-            let legal_mask = self.legal_masks_indexed(&idx);
+            let (packed, legal_mask) = self.pack_minimal_with_legal(&idx, self.config.num_seats);
             let rows = pick_rows(out_s, obs_layout_minimal::OBS_DIM_MINIMAL, &idx);
             let sinks = sinks.zip(plan.as_ref()).map(|((b, r), pl)| {
                 (pl, pick_rows(b, pl.nb, &idx), pick_rows(r, pl.nr, &idx))
@@ -2788,8 +2787,7 @@ impl PyBatchedEngine {
         let out_s = out.as_slice_mut()?;
         let sinks = packed_slices(&mut out_bits, &mut out_real)?;
         let (packed, legal_mask, res) = py.allow_threads(|| {
-            let packed = self.pack_observation_minimal_indexed(&idx, self.config.num_seats);
-            let legal_mask = self.legal_masks_indexed(&idx);
+            let (packed, legal_mask) = self.pack_minimal_with_legal(&idx, self.config.num_seats);
             let rows = pick_rows(out_s, obs_layout_minimal::OBS_DIM_MINIMAL, &idx);
             let sinks = sinks.zip(plan.as_ref()).map(|((b, r), pl)| {
                 (pl, pick_rows(b, pl.nb, &idx), pick_rows(r, pl.nr, &idx))
@@ -3476,8 +3474,7 @@ impl PyBatchedEngine {
         let s = self.config.num_seats;
 
         let (obs_vec, packed, legal_mask) = py.allow_threads(|| {
-            let packed = self.pack_observation_minimal_indexed(idx, s);
-            let legal_mask = self.legal_masks_indexed(idx);
+            let (packed, legal_mask) = self.pack_minimal_with_legal(idx, s);
             let mut obs_vec = vec![0f32; n * obs_layout_minimal::OBS_DIM_MINIMAL];
             let rows: Vec<&mut [f32]> = obs_vec
                 .chunks_exact_mut(obs_layout_minimal::OBS_DIM_MINIMAL)
@@ -3536,26 +3533,6 @@ impl PyBatchedEngine {
         Ok(())
     }
 
-    /// Legal-action masks for the envs in `idx` (rows of terminal or empty
-    /// envs stay all-False), one row per env, computed in parallel -- every
-    /// row depends only on its own state.
-    fn legal_masks_indexed(&self, idx: &[usize]) -> Array2<bool> {
-        let mut legal_mask = Array2::<bool>::default((idx.len(), NUM_ACTIONS));
-        legal_mask
-            .as_slice_mut()
-            .expect("a fresh Array2 is contiguous")
-            .par_chunks_mut(NUM_ACTIONS)
-            .zip(idx.par_iter())
-            .for_each(|(row, &i)| {
-                if let Some(state) = self.states[i].as_ref() {
-                    if !state.is_terminal() {
-                        row.copy_from_slice(&state.legal_action_mask());
-                    }
-                }
-            });
-        legal_mask
-    }
-
     /// Zero, then encode, row j of `packed` into `rows[j]` (in parallel) for
     /// every j with `keep(j)`; rows with `keep(j) == false` are only zeroed.
     /// Zero-then-encode is exactly what encoding into a fresh `vec![0f32; ..]`
@@ -3611,12 +3588,18 @@ impl PyBatchedEngine {
     /// Lean pack for minimal obs: table-visible fields only. Skips
     /// opp-outcome MC, hero_board_v3, board_draw_v3, acted_this_street,
     /// last_aggressor, blind seats — none of which the 796 layout reads.
-    fn pack_observation_minimal_indexed(
+    ///
+    /// Also returns the legal-action masks of the same envs (rows of terminal
+    /// or empty envs stay all-False), filled in the SAME parallel pass: one
+    /// worker wake-up instead of two per call -- on a busy host the wake-ups,
+    /// not the work, dominate these small passes.
+    fn pack_minimal_with_legal(
         &self,
         idx: &[usize],
         s: usize,
-    ) -> PackedMinimalObservation {
+    ) -> (PackedMinimalObservation, Array2<bool>) {
         let n = idx.len();
+        let mut legal_mask = Array2::<bool>::default((n, NUM_ACTIONS));
         let hole_w = self.config.variant.hole_count();
         let hist_cap = history_cap(self.config.variant);
         let mut hero_hole = Array2::<u8>::from_elem((n, hole_w), 255u8);
@@ -3668,6 +3651,7 @@ impl PyBatchedEngine {
             history_chips: *mut u64,
             history_street: *mut i8,
             history_len: *mut u8,
+            legal: *mut bool,
         }
         unsafe impl Send for OutPtrs {}
         unsafe impl Sync for OutPtrs {}
@@ -3696,6 +3680,7 @@ impl PyBatchedEngine {
             history_chips: history_chips.as_mut_ptr(),
             history_street: history_street.as_mut_ptr(),
             history_len: history_len.as_mut_ptr(),
+            legal: legal_mask.as_mut_ptr(),
         };
 
         (0..n).into_par_iter().for_each(|i| {
@@ -3705,6 +3690,14 @@ impl PyBatchedEngine {
                 None => return,
             };
             unsafe {
+                if !state.is_terminal() {
+                    let m = state.legal_action_mask();
+                    std::ptr::copy_nonoverlapping(
+                        m.as_ptr(),
+                        ptrs.legal.add(i * NUM_ACTIONS),
+                        NUM_ACTIONS,
+                    );
+                }
                 *ptrs.street.add(i) = state.street.index() as u8;
                 *ptrs.pot.add(i) = state.pot;
                 *ptrs.bet_to_call.add(i) = state.bet_to_call;
@@ -3757,31 +3750,34 @@ impl PyBatchedEngine {
             }
         });
 
-        PackedMinimalObservation {
-            hero_hole,
-            board_a,
-            board_b,
-            street,
-            pot,
-            stacks,
-            folded,
-            all_in,
-            bet_to_call,
-            street_commit,
-            total_commit,
-            min_bet,
-            max_bet,
-            min_raise,
-            max_raise,
-            eff_stack_cap,
-            actor,
-            button,
-            history_seat,
-            history_action,
-            history_chips,
-            history_street,
-            history_len,
-        }
+        (
+            PackedMinimalObservation {
+                hero_hole,
+                board_a,
+                board_b,
+                street,
+                pot,
+                stacks,
+                folded,
+                all_in,
+                bet_to_call,
+                street_commit,
+                total_commit,
+                min_bet,
+                max_bet,
+                min_raise,
+                max_raise,
+                eff_stack_cap,
+                actor,
+                button,
+                history_seat,
+                history_action,
+                history_chips,
+                history_street,
+                history_len,
+            },
+            legal_mask,
+        )
     }
 }
 
