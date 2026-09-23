@@ -2181,25 +2181,26 @@ impl PyBatchedEngine {
         }
         let seeds_vec: Vec<u64> = seeds_slice.to_vec();
         let states_ref = &self.states;
-        let arr: Array2<i64> = py.allow_threads(move || {
-            let rows: Vec<Vec<i64>> = states_ref
-                .par_iter()
-                .enumerate()
-                .map(|(i, state_opt)| match state_opt.as_ref() {
-                    Some(state) if state.is_terminal() => {
-                        state.payouts_ev(num_samples, seeds_vec[i])
-                    }
-                    _ => vec![0i64; s],
-                })
-                .collect();
-            let mut arr = Array2::<i64>::zeros((n, s));
-            for (i, row) in rows.iter().enumerate() {
-                for k in 0..s {
-                    arr[[i, k]] = row[k];
-                }
-            }
-            arr
-        });
+        // Rows written in place (non-terminal envs stay zero) — no per-env
+        // Vec for the ~all envs that are not terminal this step.
+        let mut arr = Array2::<i64>::zeros((n, s));
+        {
+            let out = arr
+                .as_slice_mut()
+                .expect("freshly allocated Array2 is contiguous");
+            py.allow_threads(|| {
+                out.par_chunks_mut(s)
+                    .zip(states_ref.par_iter())
+                    .zip(seeds_vec.par_iter())
+                    .for_each(|((row, state_opt), &seed)| {
+                        if let Some(state) = state_opt.as_ref() {
+                            if state.is_terminal() {
+                                row.copy_from_slice(&state.payouts_ev(num_samples, seed));
+                            }
+                        }
+                    });
+            });
+        }
         Ok(arr.into_pyarray(py))
     }
 

@@ -12,6 +12,70 @@
 use crate::cards::Card;
 use crate::hand_eval::{evaluate_nlh, evaluate_plo5, HandRank};
 
+/// Most seats a [`PotLayers`] bitmask holds (the engine's tables are far smaller).
+const MAX_LAYER_SEATS: usize = 32;
+
+/// The side-pot structure of a settled hand. It depends only on who folded and
+/// how much each seat committed — not on the cards — so an EV runout
+/// (`GameState::payouts_ev`) builds it ONCE and replays it for every sampled
+/// board pair instead of re-sorting the commit levels per sample.
+pub struct PotLayers {
+    /// Fold-out: the lone survivor (no showdown, boards never inspected).
+    single_survivor: Option<usize>,
+    /// Contested (or orphaned) layers in ascending commit order.
+    layers: Vec<PotLayer>,
+}
+
+#[derive(Clone, Copy)]
+struct PotLayer {
+    level: u64,
+    layer_each: u64,
+    chips: u64,
+    /// Bit `i` set = seat `i` contests the layer (commit >= level, not
+    /// folded). 0 = orphan layer (refunded to its contributors).
+    eligible: u32,
+}
+
+impl PotLayers {
+    /// Same layer construction as the original per-call loop: unique commit
+    /// levels ascending, a 0 level skipped, `prev_level` advanced before an
+    /// empty layer is skipped.
+    pub fn new(folded: &[bool], total_commit: &[u64]) -> Self {
+        let n = total_commit.len();
+        assert_eq!(folded.len(), n);
+        assert!(n <= MAX_LAYER_SEATS, "PotLayers supports at most {MAX_LAYER_SEATS} seats");
+        let mut alive = (0..n).filter(|&i| !folded[i]);
+        if let (Some(only), None) = (alive.next(), alive.next()) {
+            return Self { single_survivor: Some(only), layers: Vec::new() };
+        }
+        let mut levels: Vec<u64> = total_commit.to_vec();
+        levels.sort_unstable();
+        levels.dedup();
+        let mut layers = Vec::with_capacity(levels.len());
+        let mut prev_level = 0u64;
+        for &level in &levels {
+            if level == 0 {
+                continue;
+            }
+            let contributors: u64 = total_commit.iter().filter(|&&c| c >= level).count() as u64;
+            let layer_each = level - prev_level;
+            let chips = layer_each * contributors;
+            prev_level = level;
+            if chips == 0 {
+                continue;
+            }
+            let mut eligible = 0u32;
+            for i in 0..n {
+                if total_commit[i] >= level && !folded[i] {
+                    eligible |= 1 << i;
+                }
+            }
+            layers.push(PotLayer { level, layer_each, chips, eligible });
+        }
+        Self { single_survivor: None, layers }
+    }
+}
+
 /// Distribute chips across seats via side-pot layers + double-board split.
 ///
 /// Returns chips *won* per seat (not deltas — caller computes deltas vs
@@ -28,49 +92,138 @@ pub fn double_board_payout(
     let n = hole_cards.len();
     assert_eq!(folded.len(), n);
     assert_eq!(total_commit.len(), n);
+    let layers = PotLayers::new(folded, total_commit);
     let mut result = vec![0u64; n];
-
-    // Fold-out: single survivor takes every matched chip (no showdown).
-    let alive: Vec<usize> = (0..n).filter(|&i| !folded[i]).collect();
-    if alive.len() == 1 {
-        award_single_survivor(&mut result, alive[0], total_commit);
-        return result;
-    }
-
-    // Sorted unique commitment levels, ascending.
-    let mut levels: Vec<u64> = total_commit.iter().copied().collect();
-    levels.sort_unstable();
-    levels.dedup();
-
-    let mut prev_level = 0u64;
-    for &level in &levels {
-        if level == 0 {
-            continue;
-        }
-        let contributors: u64 = total_commit.iter().filter(|&&c| c >= level).count() as u64;
-        let layer_each = level - prev_level;
-        let layer_chips = layer_each * contributors;
-        prev_level = level;
-        if layer_chips == 0 {
-            continue;
-        }
-
-        let eligible: Vec<usize> = (0..n)
-            .filter(|&i| total_commit[i] >= level && !folded[i])
-            .collect();
-
-        if eligible.is_empty() {
-            refund_orphan_layer(&mut result, total_commit, level, layer_each);
-            continue;
-        }
-
-        let half_a = layer_chips / 2;
-        let half_b = layer_chips - half_a;
-        award_half(&mut result, &eligible, hole_cards, board_a, half_a, button);
-        award_half(&mut result, &eligible, hole_cards, board_b, half_b, button);
-    }
-
+    double_board_payout_layers(
+        &layers, hole_cards, folded, total_commit, board_a, board_b, button, &mut result,
+    );
     result
+}
+
+/// [`double_board_payout`] over a prebuilt [`PotLayers`], writing chips won
+/// per seat into `out` (overwritten). Each alive seat's hand is evaluated at
+/// most ONCE per board — lazily, the first time a layer on that board has
+/// chips to award — and every layer re-selects its winners from those ranks.
+/// The original evaluated every eligible seat again for every layer (up to
+/// n(n+1)/2 PLO evaluations per board for n distinct stacks); winners,
+/// odd-chip order and totals are identical.
+#[allow(clippy::too_many_arguments)]
+pub fn double_board_payout_layers(
+    layers: &PotLayers,
+    hole_cards: &[Vec<Card>],
+    folded: &[bool],
+    total_commit: &[u64],
+    board_a: &[Card; 5],
+    board_b: &[Card; 5],
+    button: usize,
+    out: &mut [u64],
+) {
+    let n = hole_cards.len();
+    out.fill(0);
+    if let Some(only) = layers.single_survivor {
+        award_single_survivor(out, only, total_commit);
+        return;
+    }
+    let mut ranks_a = [0 as HandRank; MAX_LAYER_SEATS];
+    let mut ranks_b = [0 as HandRank; MAX_LAYER_SEATS];
+    let (mut have_a, mut have_b) = (false, false);
+    for layer in &layers.layers {
+        if layer.eligible == 0 {
+            refund_orphan_layer(out, total_commit, layer.level, layer.layer_each);
+            continue;
+        }
+        let half_a = layer.chips / 2;
+        let half_b = layer.chips - half_a;
+        if half_a > 0 {
+            if !have_a {
+                rank_alive(&mut ranks_a, hole_cards, folded, board_a, n);
+                have_a = true;
+            }
+            award_half_ranked(out, layer.eligible, &ranks_a, half_a, button);
+        }
+        if half_b > 0 {
+            if !have_b {
+                rank_alive(&mut ranks_b, hole_cards, folded, board_b, n);
+                have_b = true;
+            }
+            award_half_ranked(out, layer.eligible, &ranks_b, half_b, button);
+        }
+    }
+}
+
+fn rank_alive(
+    ranks: &mut [HandRank; MAX_LAYER_SEATS],
+    hole_cards: &[Vec<Card>],
+    folded: &[bool],
+    board: &[Card; 5],
+    n: usize,
+) {
+    for i in 0..n {
+        if !folded[i] {
+            ranks[i] = evaluate_plo5(&hole_cards[i], board);
+        }
+    }
+}
+
+/// `award_half` over precomputed ranks: `half` chips to the best hand(s)
+/// among the `eligible` seats (bitmask).
+fn award_half_ranked(
+    out: &mut [u64],
+    eligible: u32,
+    ranks: &[HandRank; MAX_LAYER_SEATS],
+    half: u64,
+    button: usize,
+) {
+    let mut best: Option<HandRank> = None;
+    let mut bits = eligible;
+    while bits != 0 {
+        let i = bits.trailing_zeros() as usize;
+        best = Some(best.map_or(ranks[i], |b| b.max(ranks[i])));
+        bits &= bits - 1;
+    }
+    let best = best.expect("award_half_ranked: no eligible seat");
+    let mut winners = 0u32;
+    let mut bits = eligible;
+    while bits != 0 {
+        let i = bits.trailing_zeros() as usize;
+        if ranks[i] == best {
+            winners |= 1 << i;
+        }
+        bits &= bits - 1;
+    }
+    distribute_evenly_mask(out, winners, half, button);
+}
+
+/// [`distribute_evenly`] for a bitmask of recipients: even split, odd-chip
+/// remainder clockwise from `button + 1`.
+fn distribute_evenly_mask(result: &mut [u64], recipients: u32, amount: u64, button: usize) {
+    if amount == 0 || recipients == 0 {
+        return;
+    }
+    let count = recipients.count_ones() as u64;
+    let share = amount / count;
+    let remainder = amount - share * count;
+    let mut bits = recipients;
+    while bits != 0 {
+        let i = bits.trailing_zeros() as usize;
+        result[i] += share;
+        bits &= bits - 1;
+    }
+    if remainder == 0 {
+        return;
+    }
+    let n = result.len();
+    let mut given = 0u64;
+    for step in 1..=(2 * n) {
+        let i = (button + step) % n;
+        if recipients & (1 << i) != 0 {
+            result[i] += 1;
+            given += 1;
+            if given >= remainder {
+                return;
+            }
+        }
+    }
 }
 
 /// Distribute chips across seats via side-pot layers on a single board
@@ -185,7 +338,9 @@ fn refund_orphan_layer(result: &mut [u64], total_commit: &[u64], level: u64, lay
     }
 }
 
-/// Award `half` chips on one board to the best hand(s) among `eligible`.
+/// Award `half` chips on one board to the best hand(s) among `eligible`
+/// (the original per-layer evaluation; kept for the equivalence test).
+#[cfg(test)]
 fn award_half(
     result: &mut [u64],
     eligible: &[usize],
@@ -245,6 +400,99 @@ fn distribute_evenly(result: &mut [u64], recipients: &[usize], amount: u64, butt
 mod tests {
     use super::*;
     use crate::cards::Card;
+
+    /// The pre-2026-09-23 implementation, verbatim: per-call layer build,
+    /// every eligible seat re-evaluated per layer. Reference for the
+    /// equivalence test below.
+    fn double_board_payout_reference(
+        hole_cards: &[Vec<Card>],
+        folded: &[bool],
+        total_commit: &[u64],
+        board_a: &[Card; 5],
+        board_b: &[Card; 5],
+        button: usize,
+    ) -> Vec<u64> {
+        let n = hole_cards.len();
+        let mut result = vec![0u64; n];
+        let alive: Vec<usize> = (0..n).filter(|&i| !folded[i]).collect();
+        if alive.len() == 1 {
+            award_single_survivor(&mut result, alive[0], total_commit);
+            return result;
+        }
+        let mut levels: Vec<u64> = total_commit.iter().copied().collect();
+        levels.sort_unstable();
+        levels.dedup();
+        let mut prev_level = 0u64;
+        for &level in &levels {
+            if level == 0 {
+                continue;
+            }
+            let contributors: u64 = total_commit.iter().filter(|&&c| c >= level).count() as u64;
+            let layer_each = level - prev_level;
+            let layer_chips = layer_each * contributors;
+            prev_level = level;
+            if layer_chips == 0 {
+                continue;
+            }
+            let eligible: Vec<usize> = (0..n)
+                .filter(|&i| total_commit[i] >= level && !folded[i])
+                .collect();
+            if eligible.is_empty() {
+                refund_orphan_layer(&mut result, total_commit, level, layer_each);
+                continue;
+            }
+            let half_a = layer_chips / 2;
+            let half_b = layer_chips - half_a;
+            award_half(&mut result, &eligible, hole_cards, board_a, half_a, button);
+            award_half(&mut result, &eligible, hole_cards, board_b, half_b, button);
+        }
+        result
+    }
+
+    #[test]
+    fn rank_once_layers_match_the_reference_on_random_hands() {
+        // Deterministic xorshift so the sweep is reproducible without rand.
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        };
+        for case in 0..20_000 {
+            let n = 2 + next(5) as usize; // 2..=6 seats
+            let hole_w = 4 + next(3) as usize; // PLO4/5/6
+            let mut deck: Vec<u8> = (0..52).collect();
+            for i in (1..52).rev() {
+                let j = next(i as u64 + 1) as usize;
+                deck.swap(i, j);
+            }
+            let mut it = deck.into_iter().map(Card::from_index);
+            let hole: Vec<Vec<Card>> = (0..n).map(|_| (&mut it).take(hole_w).collect()).collect();
+            let mut board_a = [Card(0); 5];
+            let mut board_b = [Card(0); 5];
+            for k in 0..5 {
+                board_a[k] = it.next().unwrap();
+                board_b[k] = it.next().unwrap();
+            }
+            let mut folded: Vec<bool> = (0..n).map(|_| next(4) == 0).collect();
+            if case % 7 == 0 {
+                // fold-outs and single survivors too
+                for f in folded.iter_mut() {
+                    *f = true;
+                }
+                folded[next(n as u64) as usize] = false;
+            }
+            // few distinct levels, some shared, odd sizes, the odd zero
+            let commit: Vec<u64> = (0..n)
+                .map(|_| if next(10) == 0 { 0 } else { 1 + next(6) * 997 + next(3) })
+                .collect();
+            let button = next(n as u64) as usize;
+            let want = double_board_payout_reference(&hole, &folded, &commit, &board_a, &board_b, button);
+            let got = double_board_payout(&hole, &folded, &commit, &board_a, &board_b, button);
+            assert_eq!(got, want, "case {case}: folded {folded:?} commit {commit:?} button {button}");
+        }
+    }
 
     fn c(rank: u8, suit: u8) -> Card {
         Card::new(rank, suit)

@@ -2,7 +2,9 @@
 
 use crate::actions::{Action, NUM_ACTIONS};
 use crate::cards::{Card, Deck};
-use crate::double_board::{double_board_payout, single_board_payout};
+use crate::double_board::{
+    double_board_payout, double_board_payout_layers, single_board_payout, PotLayers,
+};
 use crate::state::{
     ActionRecord, GameConfig, GameState, Street, StudyError, StudyTerminal, Variant,
 };
@@ -1062,6 +1064,10 @@ impl GameState {
 
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let mut totals: Vec<i128> = vec![0i128; n];
+        // The side-pot structure is the same for every sampled runout: build
+        // it once, and reuse one output buffer (double-board variants).
+        let layers = (num_boards == 2).then(|| PotLayers::new(&self.folded, &self.total_commit));
+        let mut won_buf = vec![0u64; n];
 
         for _ in 0..num_samples {
             // Partial Fisher-Yates: shuffle only the first `draw_per_sample` cards.
@@ -1072,29 +1078,31 @@ impl GameState {
             for i in 0..missing {
                 full_a[close_len + i] = deck[i];
             }
-            let won = if num_boards == 2 {
+            if let Some(layers) = layers.as_ref() {
                 for i in 0..missing {
                     full_b[close_len + i] = deck[missing + i];
                 }
-                double_board_payout(
+                double_board_payout_layers(
+                    layers,
                     &self.hole_cards,
                     &self.folded,
                     &self.total_commit,
                     &full_a,
                     &full_b,
                     self.button,
-                )
+                    &mut won_buf,
+                );
             } else {
-                single_board_payout(
+                won_buf = single_board_payout(
                     &self.hole_cards,
                     &self.folded,
                     &self.total_commit,
                     &full_a,
                     self.button,
-                )
-            };
+                );
+            }
             for i in 0..n {
-                totals[i] += won[i] as i128;
+                totals[i] += won_buf[i] as i128;
             }
         }
 
