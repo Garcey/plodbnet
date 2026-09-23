@@ -241,6 +241,20 @@ anchor` = v2 (head_version 2), `logistic` = v4 (3), `mixture` = v5 (4).
     --critic-num-blocks 1 --num-envs 480 --rollout-length 24000
     --mix-configs --configs-per-tier 2 --seed 1234 --num-updates 3`, then
     SHA-256 every tensor of every checkpoint (+ `.optim.pt`), old vs new.
+    **On CUDA give both runs ONE private `TORCHINDUCTOR_CACHE_DIR`**:
+    Inductor autotunes the compiled PPO kernels by timing and caches the
+    choice, so a shared cache written by other runs (e.g. under GPU
+    contention) changes the numerics — the untouched old code hashed
+    differently before and after a same-shaped sweep run compiled. Within
+    one cache state the runs are deterministic (pod: `/root/gpu_digest.sh`).
+  - Env keeps a PACKED copy of its observations (`BatchedBombPotEnv.
+    enable_packed_obs` / `packed_obs`): the in-place encoders pack each row
+    right after encoding it (`MINIMAL_INTO_PACKED`), and the rollout's GPU
+    uploads gather those 456-byte rows instead of re-reading and packing the
+    3.2 KB dense ones (packing ~5k rows cost ~1.8 ms/step on the pod). Only
+    passed when the upload's source array IS `env._obs`; any refresh path
+    that can't keep the copy in step drops it (then rows are packed on the
+    fly). `pack_obs_rows` also packs run-by-run now (same bytes).
 
 ### v5 (2026-07-06, IMPLEMENTED, not yet trained — V5_DESIGN.md canonical)
 

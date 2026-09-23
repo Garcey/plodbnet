@@ -225,3 +225,84 @@ def test_into_argument_validation(monkeypatch) -> None:
         be.observation_encoded_minimal_subset_into(
             np.asarray([0, 2], dtype=np.int64), np.zeros((5, d + 1), dtype=np.float32)
         )
+
+
+# --------------------------------------------------------------------------
+# Packed outputs (2026-09-23): the in-place encoders can pack each row right
+# after encoding it; BatchedBombPotEnv.enable_packed_obs keeps that packed copy
+# of `_obs`, which the rollout's uploads gather instead of packing again.
+# --------------------------------------------------------------------------
+
+from plo5bp.compact_obs import MINIMAL_LAYOUT, pack_rows_np  # noqa: E402
+
+_needs_packed = pytest.mark.skipif(
+    not getattr(BatchedEngine, "MINIMAL_INTO_PACKED", False),
+    reason="engine without packed in-place outputs",
+)
+
+
+def _assert_packed_copy(env: BatchedBombPotEnv, ctx: str) -> None:
+    bits, real = pack_rows_np(env._obs, np.arange(env.n), MINIMAL_LAYOUT)
+    assert np.array_equal(env._obs_bits, bits), f"{ctx}: bits"
+    assert np.array_equal(_bits(env._obs_real), _bits(real)), f"{ctx}: reals"
+
+
+@_needs_packed
+@pytest.mark.parametrize("seats,n,seed", [(2, 24, 21), (6, 40, 22)])
+def test_env_packed_copy_tracks_every_refresh(seats, n, seed, monkeypatch) -> None:
+    cfg = GameConfig(num_seats=seats, starting_stack=400000, ante=30000, bb=10000)
+    env = _minimal_env(n, cfg, monkeypatch, into=True)
+    rng = np.random.default_rng(seed)
+    env.reset_batch(
+        rng.integers(0, 2**63 - 1, size=n, dtype=np.int64).astype(np.uint64),
+        rng.integers(0, seats, size=n).astype(np.uint8),
+    )
+    assert env.enable_packed_obs(MINIMAL_LAYOUT) and env.packed_obs() is not None
+    _assert_packed_copy(env, "enable")
+    for step in range(50):
+        gates, chips = _legal_actions(env, rng)
+        nt = np.asarray(env._be.apply_hybrid_batch(gates, chips), dtype=bool)
+        if step % 7 == 3:
+            env._refresh(encode_mask=np.zeros(n, dtype=bool))  # all-skipped branch
+        else:
+            env._refresh(encode_mask=~nt)
+        _assert_packed_copy(env, f"step {step} refresh")
+        if nt.any():
+            env._be.reset_terminal_batch(
+                rng.integers(0, 2**63 - 1, size=n, dtype=np.int64).astype(np.uint64),
+                rng.integers(0, seats, size=n).astype(np.uint8), nt,
+            )
+            env._refresh_subset(nt)
+            _assert_packed_copy(env, f"step {step} refresh_subset")
+    env.reconfigure(GameConfig(num_seats=seats, starting_stack=200000, ante=30000, bb=10000))
+    _assert_packed_copy(env, "reconfigure")
+    # A refresh path that cannot keep the copy in step turns it off.
+    env._rust_minimal_into = False
+    env._refresh()
+    assert env.packed_obs() is None
+
+
+@_needs_packed
+def test_packed_outputs_validation(monkeypatch) -> None:
+    cfg = GameConfig(num_seats=3, starting_stack=300000, ante=30000, bb=10000)
+    env = _minimal_env(5, cfg, monkeypatch, into=True)
+    env.reset_batch(np.arange(5, dtype=np.uint64) + 1, np.zeros(5, dtype=np.uint8))
+    lay = MINIMAL_LAYOUT
+    out = np.zeros((5, OBS_DIM_MINIMAL), dtype=np.float32)
+    bits = np.zeros((5, lay.n_bytes), dtype=np.uint8)
+    real = np.zeros((5, lay.n_real), dtype=np.float32)
+    with pytest.raises(ValueError, match="go together"):
+        env._be.observation_encoded_minimal_into(out, None, lay.flag_cols, lay.real_cols, bits)
+    with pytest.raises(ValueError, match="out_bits"):
+        env._be.observation_encoded_minimal_into(
+            out, None, lay.flag_cols, lay.real_cols, bits[:4], real)
+    with pytest.raises(ValueError, match="out_real"):
+        env._be.observation_encoded_minimal_into(
+            out, None, lay.flag_cols, lay.real_cols, bits, real[:, :-1])
+    # A layout that calls a real-valued column a flag is refused loudly.
+    wrong_flags = np.sort(np.concatenate([lay.flag_cols, lay.real_cols[:1]]))
+    wrong_reals = lay.real_cols[1:]
+    wb = np.zeros((5, (wrong_flags.size + 7) // 8), dtype=np.uint8)
+    wr = np.zeros((5, wrong_reals.size), dtype=np.float32)
+    with pytest.raises(ValueError, match="not a 0/1 flag"):
+        env._be.observation_encoded_minimal_into(out, None, wrong_flags, wrong_reals, wb, wr)

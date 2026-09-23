@@ -1235,6 +1235,67 @@ fn pack_obs_row(
     Ok(())
 }
 
+/// Maximal runs of consecutive columns in a column list: (first column,
+/// position of that column in the list, run length).
+fn column_runs(cols: &[usize]) -> Vec<(usize, usize, usize)> {
+    let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+    for (i, &c) in cols.iter().enumerate() {
+        match runs.last_mut() {
+            Some((c0, _, len)) if *c0 + *len == c => *len += 1,
+            _ => runs.push((c, i, 1)),
+        }
+    }
+    runs
+}
+
+/// [`pack_obs_row`] over precomputed column runs -- the same bytes, several
+/// times faster: each run of consecutive flag columns streams its values
+/// through a branch-free 64-bit accumulator (bit i of the flag stream lands
+/// at byte i >> 3, bit 7 - (i & 7): numpy `packbits` order), validity is
+/// folded into one flag, and real columns are copied run by run. Any
+/// non-0/1 flag falls back to [`pack_obs_row`], which reports the FIRST
+/// offending column exactly as before.
+fn pack_obs_row_runs(
+    row: &[f32],
+    flag_runs: &[(usize, usize, usize)],
+    real_runs: &[(usize, usize, usize)],
+    flag_cols: &[usize],
+    real_cols: &[usize],
+    out_bits: &mut [u8],
+    out_real: &mut [f32],
+) -> Result<(), (usize, f32)> {
+    let mut acc: u64 = 0;
+    let mut nacc: u32 = 0;
+    let mut byte = 0usize;
+    let mut ok = true;
+    for &(c0, _, len) in flag_runs {
+        for &x in &row[c0..c0 + len] {
+            let b = x.to_bits();
+            ok &= (b == 0) | (b == F32_ONE_BITS);
+            acc = (acc << 1) | u64::from(b == F32_ONE_BITS);
+            nacc += 1;
+            if nacc == 64 {
+                out_bits[byte..byte + 8].copy_from_slice(&acc.to_be_bytes());
+                byte += 8;
+                acc = 0;
+                nacc = 0;
+            }
+        }
+    }
+    if nacc > 0 {
+        let tail = (acc << (64 - nacc)).to_be_bytes();
+        let nb = (nacc as usize).div_ceil(8);
+        out_bits[byte..byte + nb].copy_from_slice(&tail[..nb]);
+    }
+    if !ok {
+        return pack_obs_row(row, flag_cols, real_cols, out_bits, out_real);
+    }
+    for &(c0, i0, len) in real_runs {
+        out_real[i0..i0 + len].copy_from_slice(&row[c0..c0 + len]);
+    }
+    Ok(())
+}
+
 /// Compact storage for rollout observations (python/plo5bp/compact_obs.py).
 /// Packs rows `rows` of the dense (N, D) f32 observation matrix `obs` into the
 /// caller's buffers at rows `out_offset .. out_offset + len(rows)`: the 0/1
@@ -1314,14 +1375,23 @@ pub fn pack_obs_rows(
         .map_err(|_| PyValueError::new_err("pack_obs_rows: out_real must be C-contiguous"))?;
     let bits_dst = &mut bits_s[out_offset * nb..(out_offset + k) * nb];
     let real_dst = &mut real_s[out_offset * nr..(out_offset + k) * nr];
+    let (flag_runs, real_runs) = (column_runs(&flags_v), column_runs(&reals_v));
     bits_dst
         .par_chunks_mut(nb)
         .zip(real_dst.par_chunks_mut(nr))
         .zip(rows_v.par_iter())
         .with_min_len(256)
         .try_for_each(|((b, r), &row)| {
-            pack_obs_row(&obs_s[row * d..(row + 1) * d], &flags_v, &reals_v, b, r)
-                .map_err(|(c, v)| (row, c, v))
+            pack_obs_row_runs(
+                &obs_s[row * d..(row + 1) * d],
+                &flag_runs,
+                &real_runs,
+                &flags_v,
+                &reals_v,
+                b,
+                r,
+            )
+            .map_err(|(c, v)| (row, c, v))
         })
         .map_err(|(row, c, v)| {
             PyValueError::new_err(format!(
@@ -2629,17 +2699,30 @@ impl PyBatchedEngine {
     /// state, so the buffer ends up bit-identical to "encode into a fresh
     /// zeroed array, copy, zero the skipped rows". Returns the aux dict of
     /// `observation_encoded_minimal_batch` without "obs".
-    #[pyo3(signature = (out, encode_mask=None))]
+    ///
+    /// With `flag_cols` / `real_cols` / `out_bits` / `out_real` (all four; the
+    /// compact layout of python/plo5bp/compact_obs.py) every row is ALSO
+    /// packed into `out_bits[j]` / `out_real[j]` right after it is encoded,
+    /// while it is still in cache -- the exact bytes `pack_obs_rows` would
+    /// write for that row (skipped rows pack to all-zero), so the rollout
+    /// uploads and stores packed rows without re-reading the dense ones.
+    #[pyo3(signature = (out, encode_mask=None, flag_cols=None, real_cols=None, out_bits=None, out_real=None))]
+    #[allow(clippy::too_many_arguments)]
     fn observation_encoded_minimal_into<'py>(
         &self,
         py: Python<'py>,
         mut out: PyReadwriteArray2<'_, f32>,
         encode_mask: Option<PyReadonlyArray1<'_, bool>>,
+        flag_cols: Option<PyReadonlyArray1<'_, i64>>,
+        real_cols: Option<PyReadonlyArray1<'_, i64>>,
+        mut out_bits: Option<PyReadwriteArray2<'_, u8>>,
+        mut out_real: Option<PyReadwriteArray2<'_, f32>>,
     ) -> PyResult<Bound<'py, PyDict>> {
         const WHAT: &str = "observation_encoded_minimal_into";
         self.require_plo_minimal(WHAT)?;
         let n = self.states.len();
         check_minimal_obs_out(&out, n, WHAT)?;
+        let plan = pack_plan_for(WHAT, n, flag_cols, real_cols, &out_bits, &out_real)?;
         let mask: Option<Vec<bool>> = match encode_mask {
             None => None,
             Some(m) => {
@@ -2655,15 +2738,19 @@ impl PyBatchedEngine {
         };
         let idx: Vec<usize> = (0..n).collect();
         let out_s = out.as_slice_mut()?;
-        let (packed, legal_mask) = py.allow_threads(|| {
+        let sinks = packed_slices(&mut out_bits, &mut out_real)?;
+        let (packed, legal_mask, res) = py.allow_threads(|| {
             let packed = self.pack_observation_minimal_indexed(&idx, self.config.num_seats);
             let legal_mask = self.legal_masks_indexed(&idx);
-            let rows: Vec<&mut [f32]> =
-                out_s.chunks_exact_mut(obs_layout_minimal::OBS_DIM_MINIMAL).collect();
+            let rows = pick_rows(out_s, obs_layout_minimal::OBS_DIM_MINIMAL, &idx);
+            let sinks = sinks.zip(plan.as_ref()).map(|((b, r), pl)| {
+                (pl, pick_rows(b, pl.nb, &idx), pick_rows(r, pl.nr, &idx))
+            });
             let keep = |j: usize| mask.as_ref().map_or(true, |m| m[j]);
-            self.encode_minimal_rows_into(&packed, rows, keep);
-            (packed, legal_mask)
+            let res = self.encode_minimal_rows_into(&packed, rows, sinks, keep);
+            (packed, legal_mask, res)
         });
+        res.map_err(|(j, c, v)| pack_encoder_error(WHAT, idx[j], c, v))?;
         minimal_aux_dict(py, packed, legal_mask)
     }
 
@@ -2674,16 +2761,24 @@ impl PyBatchedEngine {
     /// `out[indices] = observation_encoded_minimal_subset_batch(indices)["obs"]`.
     /// The returned aux arrays are compact (k = len(indices) rows), exactly as
     /// the non-in-place variant's.
+    /// Optional packed outputs as in `observation_encoded_minimal_into`.
+    #[pyo3(signature = (indices, out, flag_cols=None, real_cols=None, out_bits=None, out_real=None))]
+    #[allow(clippy::too_many_arguments)]
     fn observation_encoded_minimal_subset_into<'py>(
         &self,
         py: Python<'py>,
         indices: PyReadonlyArray1<'_, i64>,
         mut out: PyReadwriteArray2<'_, f32>,
+        flag_cols: Option<PyReadonlyArray1<'_, i64>>,
+        real_cols: Option<PyReadonlyArray1<'_, i64>>,
+        mut out_bits: Option<PyReadwriteArray2<'_, u8>>,
+        mut out_real: Option<PyReadwriteArray2<'_, f32>>,
     ) -> PyResult<Bound<'py, PyDict>> {
         const WHAT: &str = "observation_encoded_minimal_subset_into";
         self.require_plo_minimal(WHAT)?;
         let n = self.states.len();
         check_minimal_obs_out(&out, n, WHAT)?;
+        let plan = pack_plan_for(WHAT, n, flag_cols, real_cols, &out_bits, &out_real)?;
         let idx = checked_env_indices(indices.as_slice()?, n, WHAT)?;
         if idx.windows(2).any(|w| w[0] >= w[1]) {
             return Err(PyValueError::new_err(format!(
@@ -2691,31 +2786,132 @@ impl PyBatchedEngine {
             )));
         }
         let out_s = out.as_slice_mut()?;
-        let (packed, legal_mask) = py.allow_threads(|| {
+        let sinks = packed_slices(&mut out_bits, &mut out_real)?;
+        let (packed, legal_mask, res) = py.allow_threads(|| {
             let packed = self.pack_observation_minimal_indexed(&idx, self.config.num_seats);
             let legal_mask = self.legal_masks_indexed(&idx);
-            // Disjoint mutable rows of `out`, in `idx` order (idx is strictly
-            // increasing, so one forward walk picks them).
-            let mut rows: Vec<&mut [f32]> = Vec::with_capacity(idx.len());
-            let mut want = idx.iter().copied().peekable();
-            for (r, row) in out_s
-                .chunks_exact_mut(obs_layout_minimal::OBS_DIM_MINIMAL)
-                .enumerate()
-            {
-                match want.peek() {
-                    None => break,
-                    Some(&w) if w == r => {
-                        rows.push(row);
-                        want.next();
-                    }
-                    Some(_) => {}
-                }
-            }
-            self.encode_minimal_rows_into(&packed, rows, |_| true);
-            (packed, legal_mask)
+            let rows = pick_rows(out_s, obs_layout_minimal::OBS_DIM_MINIMAL, &idx);
+            let sinks = sinks.zip(plan.as_ref()).map(|((b, r), pl)| {
+                (pl, pick_rows(b, pl.nb, &idx), pick_rows(r, pl.nr, &idx))
+            });
+            let res = self.encode_minimal_rows_into(&packed, rows, sinks, |_| true);
+            (packed, legal_mask, res)
         });
+        res.map_err(|(j, c, v)| pack_encoder_error(WHAT, idx[j], c, v))?;
         minimal_aux_dict(py, packed, legal_mask)
     }
+
+    /// The in-place minimal encoders accept packed outputs (flag_cols /
+    /// real_cols / out_bits / out_real) -- a capability flag for Python.
+    #[classattr]
+    const MINIMAL_INTO_PACKED: bool = true;
+}
+
+/// Disjoint mutable `width`-wide rows of `buf` at the strictly increasing
+/// indices `idx` (one forward walk).
+fn pick_rows<'a, T>(buf: &'a mut [T], width: usize, idx: &[usize]) -> Vec<&'a mut [T]> {
+    let mut rows: Vec<&mut [T]> = Vec::with_capacity(idx.len());
+    let mut want = idx.iter().copied().peekable();
+    for (r, row) in buf.chunks_exact_mut(width).enumerate() {
+        match want.peek() {
+            None => break,
+            Some(&w) if w == r => {
+                rows.push(row);
+                want.next();
+            }
+            Some(_) => {}
+        }
+    }
+    rows
+}
+
+/// How the in-place encoders pack each row (see [`pack_obs_row_runs`]).
+struct PackPlan {
+    flags: Vec<usize>,
+    reals: Vec<usize>,
+    flag_runs: Vec<(usize, usize, usize)>,
+    real_runs: Vec<(usize, usize, usize)>,
+    nb: usize,
+    nr: usize,
+}
+
+/// Validate the optional packed-output arguments: all four or none; column
+/// indices inside the 796-wide row; outputs C-contiguous (n, nb) / (n, nr).
+fn pack_plan_for(
+    what: &str,
+    n: usize,
+    flag_cols: Option<PyReadonlyArray1<'_, i64>>,
+    real_cols: Option<PyReadonlyArray1<'_, i64>>,
+    out_bits: &Option<PyReadwriteArray2<'_, u8>>,
+    out_real: &Option<PyReadwriteArray2<'_, f32>>,
+) -> PyResult<Option<PackPlan>> {
+    let (flag_cols, real_cols, out_bits, out_real) = match (flag_cols, real_cols, out_bits, out_real) {
+        (None, None, None, None) => return Ok(None),
+        (Some(f), Some(r), Some(b), Some(o)) => (f, r, b, o),
+        _ => {
+            return Err(PyValueError::new_err(format!(
+                "{what}: flag_cols, real_cols, out_bits and out_real go together"
+            )))
+        }
+    };
+    let d = obs_layout_minimal::OBS_DIM_MINIMAL;
+    let cols = |v: &[i64]| -> PyResult<Vec<usize>> {
+        v.iter()
+            .map(|&x| {
+                if x < 0 || (x as usize) >= d {
+                    Err(PyValueError::new_err(format!("{what}: column {x} out of range [0, {d})")))
+                } else {
+                    Ok(x as usize)
+                }
+            })
+            .collect()
+    };
+    let flags = cols(flag_cols.as_slice()?)?;
+    let reals = cols(real_cols.as_slice()?)?;
+    let (nb, nr) = (flags.len().div_ceil(8), reals.len());
+    if nb == 0 || nr == 0 {
+        return Err(PyValueError::new_err(format!(
+            "{what}: the layout needs at least one flag and one real column"
+        )));
+    }
+    if !out_bits.is_c_contiguous() || out_bits.shape() != [n, nb] {
+        return Err(PyValueError::new_err(format!(
+            "{what}: out_bits must be a C-contiguous ({n}, {nb}) uint8 array; got {:?}",
+            out_bits.shape()
+        )));
+    }
+    if !out_real.is_c_contiguous() || out_real.shape() != [n, nr] {
+        return Err(PyValueError::new_err(format!(
+            "{what}: out_real must be a C-contiguous ({n}, {nr}) float32 array; got {:?}",
+            out_real.shape()
+        )));
+    }
+    Ok(Some(PackPlan {
+        flag_runs: column_runs(&flags),
+        real_runs: column_runs(&reals),
+        flags,
+        reals,
+        nb,
+        nr,
+    }))
+}
+
+/// The packed-output buffers as mutable slices (None when not requested).
+fn packed_slices<'a>(
+    out_bits: &'a mut Option<PyReadwriteArray2<'_, u8>>,
+    out_real: &'a mut Option<PyReadwriteArray2<'_, f32>>,
+) -> PyResult<Option<(&'a mut [u8], &'a mut [f32])>> {
+    match (out_bits.as_mut(), out_real.as_mut()) {
+        (Some(b), Some(r)) => Ok(Some((b.as_slice_mut()?, r.as_slice_mut()?))),
+        _ => Ok(None),
+    }
+}
+
+fn pack_encoder_error(what: &str, env: usize, col: usize, v: f32) -> PyErr {
+    PyValueError::new_err(format!(
+        "{what}: env {env} obs column {col} holds {v:?}, not a 0/1 flag -- the compact \
+         layout (python/plo5bp/compact_obs.py) no longer matches the encoder"
+    ))
 }
 
 /// Shared `out` check of the in-place minimal encoders: a C-contiguous
@@ -3286,7 +3482,8 @@ impl PyBatchedEngine {
             let rows: Vec<&mut [f32]> = obs_vec
                 .chunks_exact_mut(obs_layout_minimal::OBS_DIM_MINIMAL)
                 .collect();
-            self.encode_minimal_rows_into(&packed, rows, |_| true);
+            self.encode_minimal_rows_into(&packed, rows, None, |_| true)
+                .expect("no packing requested");
             (obs_vec, packed, legal_mask)
         });
 
@@ -3363,23 +3560,52 @@ impl PyBatchedEngine {
     /// every j with `keep(j)`; rows with `keep(j) == false` are only zeroed.
     /// Zero-then-encode is exactly what encoding into a fresh `vec![0f32; ..]`
     /// did, so the bits match whichever buffer the rows live in.
+    ///
+    /// With `sinks`, each row is then packed (while still in cache) into the
+    /// matching packed rows; an invalid flag value is reported as
+    /// (row j, column, value).
+    #[allow(clippy::type_complexity)]
     fn encode_minimal_rows_into(
         &self,
         packed: &PackedMinimalObservation,
         rows: Vec<&mut [f32]>,
+        sinks: Option<(&PackPlan, Vec<&mut [u8]>, Vec<&mut [f32]>)>,
         keep: impl Fn(usize) -> bool + Sync,
-    ) {
+    ) -> Result<(), (usize, usize, f32)> {
         let s = self.config.num_seats;
         let bb = self.config.bb;
         let obs_rev = self.obs_rev;
         let starting = &self.config.starting_stacks;
         let inv_bb = 1.0f64 / (bb as f64);
-        rows.into_par_iter().enumerate().for_each(|(j, row)| {
-            row.fill(0.0);
-            if keep(j) {
-                encode_obs_row_minimal(packed, j, s, inv_bb, bb, starting, obs_rev, row);
-            }
-        });
+        let Some((plan, bits, reals)) = sinks else {
+            rows.into_par_iter().enumerate().for_each(|(j, row)| {
+                row.fill(0.0);
+                if keep(j) {
+                    encode_obs_row_minimal(packed, j, s, inv_bb, bb, starting, obs_rev, row);
+                }
+            });
+            return Ok(());
+        };
+        rows.into_par_iter()
+            .zip(bits.into_par_iter())
+            .zip(reals.into_par_iter())
+            .enumerate()
+            .try_for_each(|(j, ((row, b), r))| {
+                row.fill(0.0);
+                if keep(j) {
+                    encode_obs_row_minimal(packed, j, s, inv_bb, bb, starting, obs_rev, row);
+                }
+                pack_obs_row_runs(
+                    row,
+                    &plan.flag_runs,
+                    &plan.real_runs,
+                    &plan.flags,
+                    &plan.reals,
+                    b,
+                    r,
+                )
+                .map_err(|(c, v)| (j, c, v))
+            })
     }
 
     /// Lean pack for minimal obs: table-visible fields only. Skips
@@ -5805,7 +6031,68 @@ mod encoder_port_tests {
 
 #[cfg(test)]
 mod pack_obs_tests {
-    use super::{pack_obs_row, unpack_obs_row};
+    use super::{column_runs, pack_obs_row, pack_obs_row_runs, unpack_obs_row};
+
+    /// The run-based packer writes exactly the bytes (and reports exactly the
+    /// errors) of the reference packer, whatever the column layout.
+    #[test]
+    fn run_packer_matches_the_reference_packer() {
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        };
+        for case in 0..3_000 {
+            let d = 1 + next(300) as usize;
+            // Random partition of 0..d into flag / real columns, in a random
+            // order half of the time (runs are only a speed-up).
+            let mut flags: Vec<usize> = Vec::new();
+            let mut reals: Vec<usize> = Vec::new();
+            for c in 0..d {
+                if next(3) != 0 { flags.push(c) } else { reals.push(c) }
+            }
+            if case % 2 == 1 {
+                for i in (1..flags.len()).rev() {
+                    let j = next(i as u64 + 1) as usize;
+                    flags.swap(i, j);
+                }
+            }
+            let mut row: Vec<f32> = (0..d)
+                .map(|_| if next(2) == 0 { 0.0 } else { 1.0 })
+                .collect();
+            for &c in &reals {
+                row[c] = (next(2000) as f32 - 1000.0) / 7.0;
+            }
+            if case % 5 == 0 && !flags.is_empty() {
+                let bad = [0.5f32, -0.0, 2.0, f32::NAN, -1.0][next(5) as usize];
+                row[flags[next(flags.len() as u64) as usize]] = bad;
+            }
+            let nb = flags.len().div_ceil(8);
+            let (mut b1, mut r1) = (vec![0xAAu8; nb], vec![f32::NAN; reals.len()]);
+            let (mut b2, mut r2) = (vec![0x55u8; nb], vec![f32::NAN; reals.len()]);
+            let want = pack_obs_row(&row, &flags, &reals, &mut b1, &mut r1);
+            let got = pack_obs_row_runs(
+                &row,
+                &column_runs(&flags),
+                &column_runs(&reals),
+                &flags,
+                &reals,
+                &mut b2,
+                &mut r2,
+            );
+            match (want, got) {
+                (Ok(()), Ok(())) => {
+                    assert_eq!(b1, b2, "case {case}");
+                    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                    assert_eq!(bits(&r1), bits(&r2), "case {case}");
+                }
+                (Err(a), Err(b)) => assert_eq!(a.0, b.0, "case {case}: first bad column"),
+                (a, b) => panic!("case {case}: {a:?} vs {b:?}"),
+            }
+        }
+    }
 
     #[test]
     fn unpack_is_the_exact_inverse_of_pack() {

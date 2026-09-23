@@ -132,6 +132,11 @@ class BatchedBombPotEnv:
                 "observation_encoded_minimal_subset_into",
             )
         )
+        # Packed copy of self._obs (compact_obs layout), kept in step by the
+        # in-place encoders when `enable_packed_obs` is on -- None otherwise.
+        self._obs_bits: np.ndarray | None = None
+        self._obs_real: np.ndarray | None = None
+        self._packed_layout = None
         if not getattr(BatchedBombPotEnv, "_encoder_log_once", False):
             BatchedBombPotEnv._encoder_log_once = True
             print(
@@ -255,6 +260,7 @@ class BatchedBombPotEnv:
         self._dones.fill(True)
         self._actors.fill(-1)
         self._obs.fill(0.0)
+        self._zero_packed_obs()
         self._reset_seeds.fill(0)
         self._pot.fill(0)
 
@@ -441,6 +447,7 @@ class BatchedBombPotEnv:
                         self._obs = np.zeros(
                             (self.n, self._obs_dim), dtype=np.float32
                         )
+                    self._zero_packed_obs()
                 with record_function("step1a_unpack/post"):
                     self._unpack_post(bundle)
                 return
@@ -453,10 +460,12 @@ class BatchedBombPotEnv:
                         self._obs_buffer(),
                         None if em is None or bool(em.all())
                         else np.ascontiguousarray(em),
+                        **self._packed_kwargs(),
                     )
                 with record_function("step1a_unpack/post"):
                     self._unpack_post(bundle)
                 return
+            self._drop_packed_obs()  # only the in-place path keeps it in step
             with record_function("step1a_bundle/obs_features_batch"):
                 if getattr(self, "_rust_minimal", False):
                     bundle = self._be.observation_encoded_minimal_batch()
@@ -479,6 +488,7 @@ class BatchedBombPotEnv:
                 self._unpack_post(bundle)
             return
 
+        self._drop_packed_obs()
         with record_function("step1a_bundle/obs_features_batch"):
             bundle = self._be.observation_and_features_batch()
         with record_function("step1a_unpack/actor"):
@@ -536,6 +546,64 @@ class BatchedBombPotEnv:
         with record_function("step1a_unpack/post"):
             self._unpack_post(bundle)
 
+
+    def enable_packed_obs(self, layout) -> bool:
+        """Keep a packed copy of the observations in `layout`
+        (compact_obs.CompactObsLayout of this env's obs width): the in-place
+        encoder packs every row right after encoding it, so a consumer that
+        wants packed rows (the rollout's GPU uploads + trajectory storage)
+        gathers `_obs_bits` / `_obs_real` instead of packing the dense rows
+        again. Bytes identical to `compact_obs.pack_rows_into(self._obs,
+        ...)`. Needs the in-place Rust encoder with packed outputs; returns
+        whether the packed copy is on (idempotent)."""
+        if layout is None or int(layout.obs_dim) != int(self._obs_dim):
+            return False
+        if not (
+            getattr(self, "_rust_minimal_into", False)
+            and getattr(BatchedEngine, "MINIMAL_INTO_PACKED", False)
+        ):
+            return False
+        if self._packed_layout is layout and self._obs_bits is not None:
+            return True
+        self._packed_layout = layout
+        self._obs_bits = np.zeros((self.n, layout.n_bytes), dtype=np.uint8)
+        self._obs_real = np.zeros((self.n, layout.n_real), dtype=np.float32)
+        # Bring the copy in step with the current rows (normally all zero).
+        from plo5bp.compact_obs import pack_rows_into
+
+        pack_rows_into(
+            self._obs, np.arange(self.n, dtype=np.int64), layout,
+            self._obs_bits, self._obs_real, 0,
+        )
+        return True
+
+    def packed_obs(self) -> "tuple[np.ndarray, np.ndarray] | None":
+        """(bits, real) packed copy of `_obs`, or None when it is off."""
+        if self._obs_bits is None:
+            return None
+        return self._obs_bits, self._obs_real
+
+    def _packed_kwargs(self) -> dict:
+        if self._obs_bits is None:
+            return {}
+        lay = self._packed_layout
+        return {
+            "flag_cols": lay.flag_cols,
+            "real_cols": lay.real_cols,
+            "out_bits": self._obs_bits,
+            "out_real": self._obs_real,
+        }
+
+    def _zero_packed_obs(self) -> None:
+        if self._obs_bits is not None:
+            self._obs_bits.fill(0)
+            self._obs_real.fill(0.0)
+
+    def _drop_packed_obs(self) -> None:
+        """A refresh path that cannot keep the packed copy in step turns it
+        off (consumers then pack from the dense rows)."""
+        self._obs_bits = self._obs_real = None
+        self._packed_layout = None
 
     def _obs_is_buffer(self) -> bool:
         """True iff the cached obs array is a C-contiguous, writeable
@@ -629,11 +697,12 @@ class BatchedBombPotEnv:
             # compact encode + scatter below); the aux arrays stay compact.
             with record_function("step1a_bundle/obs_features_subset"):
                 bundle = self._be.observation_encoded_minimal_subset_into(
-                    idx_i64, self._obs
+                    idx_i64, self._obs, **self._packed_kwargs()
                 )
             obs_sub = None
             actors_sub = np.asarray(bundle["actor"], dtype=np.int8)
         elif self._use_rust_encoder:
+            self._drop_packed_obs()
             with record_function("step1a_bundle/obs_features_subset"):
                 if getattr(self, "_rust_minimal", False):
                     bundle = self._be.observation_encoded_minimal_subset_batch(
@@ -651,6 +720,7 @@ class BatchedBombPotEnv:
                 obs_sub = project_obs_minimal(obs_sub)
             actors_sub = np.asarray(bundle["actor"], dtype=np.int8)
         else:
+            self._drop_packed_obs()
             with record_function("step1a_bundle/obs_features_subset"):
                 bundle = self._be.observation_and_features_subset_batch(idx_i64)
             with record_function("step1a_unpack/actor"):

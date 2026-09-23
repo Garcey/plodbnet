@@ -380,12 +380,15 @@ class _PinnedStepH2D:
         gm_arr: np.ndarray,
         sizing_arr: np.ndarray,
         slot: int = 0,
+        packed: "tuple[np.ndarray, np.ndarray] | None" = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """``upload(obs_arr[rows], gm_arr[rows], sizing_arr[rows], slot)``
         without the dense host gather: under a compact layout the rows are
         packed straight out of `obs_arr` into the pinned slot (Rust,
-        parallel), cross PCIe packed (~7x fewer bytes than float rows) and
-        are unpacked on the device into the IDENTICAL float32 rows
+        parallel) -- or, with `packed` = (bits, real), the packed copy of
+        `obs_arr` the env's encoder keeps (BatchedBombPotEnv.packed_obs),
+        simply gathered -- cross PCIe packed (~7x fewer bytes than float
+        rows) and are unpacked on the device into the IDENTICAL float32 rows
         (compact_obs.unpack is the exact inverse of the packer)."""
         rows = np.asarray(rows, dtype=np.int64)
         k = int(rows.size)
@@ -401,7 +404,7 @@ class _PinnedStepH2D:
                 obs_arr[rows], gm_arr[rows], sizing_arr[rows], slot=slot
             )
         return self._upload_packed(
-            obs_arr, rows, gm_arr[rows], sizing_arr[rows], slot
+            obs_arr, rows, gm_arr[rows], sizing_arr[rows], slot, packed
         )
 
     def _upload_packed(
@@ -411,14 +414,19 @@ class _PinnedStepH2D:
         b_gm: np.ndarray,
         b_sizing: np.ndarray,
         slot: int,
+        packed: "tuple[np.ndarray, np.ndarray] | None" = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         k = int(rows.size)
         s = int(slot) % self.n_slots
         self._packed_k[s] = None
-        pack_rows_into(
-            obs_arr, rows, self.layout,
-            self.bits_h[s].numpy(), self.real_h[s].numpy(), 0,
-        )
+        if packed is not None:
+            np.take(packed[0], rows, axis=0, out=self.bits_h[s].numpy()[:k], mode="clip")
+            np.take(packed[1], rows, axis=0, out=self.real_h[s].numpy()[:k], mode="clip")
+        else:
+            pack_rows_into(
+                obs_arr, rows, self.layout,
+                self.bits_h[s].numpy(), self.real_h[s].numpy(), 0,
+            )
         self._packed_k[s] = k
         self.gm_h[s].numpy()[:k] = np.asarray(b_gm, dtype=bool)
         self.sz_h[s].numpy()[:k] = np.asarray(b_sizing, dtype=np.int64)
@@ -2214,6 +2222,23 @@ def collect_rollout_batched(
     _step_h2d = _PinnedStepH2D(
         n_envs, env.obs_dim, device, n_slots=3, layout=obs_layout
     )
+    # The env packs every observation as it encodes it (same bytes as
+    # pack_rows_into), so the uploads below gather packed rows instead of
+    # re-reading and packing the dense ones.
+    _env_packed_on = bool(
+        _step_h2d.enabled
+        and _step_h2d.layout is not None
+        and hasattr(env, "enable_packed_obs")
+        and env.enable_packed_obs(_step_h2d.layout)
+    )
+
+    def _packed_for(obs_arr: np.ndarray):
+        """The env's packed copy when `obs_arr` IS its live obs buffer (the
+        copy describes exactly that buffer); None for anything else, e.g. a
+        prefetch snapshot -- those rows are packed on the fly."""
+        if _env_packed_on and obs_arr is env._obs:
+            return env.packed_obs()
+        return None
 
     def _act_to_host(_fw_out, o_t: torch.Tensor | None = None) -> tuple:
         """Coalesce device ActOut -> host numpy (one CUDA sync for the stacks).
@@ -2264,7 +2289,8 @@ def collect_rollout_batched(
         with _TimedRF("step2/learner_h2d"):
             _step_h2d.wait_slot(0)
             o_t, m_t, b_t = _step_h2d.upload_rows(
-                obs_arr, group, gate_mask_arr, sizing_arr, slot=0
+                obs_arr, group, gate_mask_arr, sizing_arr, slot=0,
+                packed=_packed_for(obs_arr),
             )
         with _TimedRF("step3/learner_forward"):
             with torch.inference_mode():
@@ -2296,7 +2322,8 @@ def collect_rollout_batched(
         slot = _opp_pin_slot[0]
         _step_h2d.wait_slot(slot)
         o_t, m_t, b_t = _step_h2d.upload_rows(
-            obs_arr, group, gate_mask_arr, sizing_arr, slot=slot
+            obs_arr, group, gate_mask_arr, sizing_arr, slot=slot,
+            packed=_packed_for(obs_arr),
         )
         _opp_pin_slot[0] = _next_opp_slot(slot)
         with torch.inference_mode():
@@ -2333,7 +2360,8 @@ def collect_rollout_batched(
         slot = _opp_pin_slot[0]
         _step_h2d.wait_slot(slot)
         o_t, m_t, b_t = _step_h2d.upload_rows(
-            obs_arr, rows, gate_mask_arr, sizing_arr, slot=slot
+            obs_arr, rows, gate_mask_arr, sizing_arr, slot=slot,
+            packed=_packed_for(obs_arr),
         )
         _opp_pin_slot[0] = _next_opp_slot(slot)
         g_t = torch.from_numpy(g).to(device)
