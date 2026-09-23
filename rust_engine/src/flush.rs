@@ -424,3 +424,88 @@ pub fn flush_trajectories<'py>(
     });
     Ok((n_new, bonus_steps, (by_street[0], by_street[1], by_street[2]), bonus_total))
 }
+
+/// The rollout's per-step trajectory record (python/plo5bp/rollout.py
+/// step3c/traj_writes) in one call: for every learner row i (env
+/// `learner_idx[i]`, flat trajectory slot `slot[i]`), copy that env's step
+/// values from the per-env arrays in `per_env` into the FLAT trajectory
+/// arrays in `traj` -- exactly the numpy assignments it replaces:
+/// obs_idx = pool_start + i, gate = u8 -> i8, chips = chips (u64 -> i64) on a
+/// raise else 0, sizing row, anchor = i64 -> i8, and u / log_p / gate_lp /
+/// anchor_lp / value (+ q_taken / vpi when `traj` has them) verbatim.
+#[pyfunction]
+pub fn record_learner_steps<'py>(
+    slot: PyReadonlyArray1<'py, i64>,
+    learner_idx: PyReadonlyArray1<'py, i64>,
+    pool_start: i64,
+    traj: &Bound<'py, PyDict>,
+    per_env: &Bound<'py, PyDict>,
+) -> PyResult<()> {
+    let err = |m: String| PyValueError::new_err(format!("record_learner_steps: {m}"));
+    let (slot, lidx) = (slot.as_slice()?, learner_idx.as_slice()?);
+    if slot.len() != lidx.len() {
+        return Err(err("slot / learner_idx lengths differ".into()));
+    }
+    let gates = get_ro::<u8>(per_env, "gate")?;
+    let chips = get_ro::<u64>(per_env, "chips")?;
+    let sizing = get_ro::<i64>(per_env, "sizing")?;
+    let anchors = get_ro::<i64>(per_env, "anchor")?;
+    let n = gates.len();
+    let f32_keys = ["u", "log_p", "gate_lp", "anchor_lp", "value", "q_taken", "vpi"];
+    let vrpo = traj.contains("q_taken")?;
+    let keys: &[&str] = if vrpo { &f32_keys } else { &f32_keys[..5] };
+    let mut src = Vec::with_capacity(keys.len());
+    for k in keys {
+        let a = get_ro::<f32>(per_env, k)?;
+        if a.len() != n {
+            return Err(err(format!("per-env '{k}' has {} rows, gate has {n}", a.len())));
+        }
+        src.push(a);
+    }
+    if chips.len() != n || anchors.len() != n || sizing.len() != 4 * n {
+        return Err(err("per-env gate / chips / anchor / sizing row counts differ".into()));
+    }
+    let mut t_obs = get_rw::<i64>(traj, "obs_idx")?;
+    let mut t_gate = get_rw::<i8>(traj, "gate")?;
+    let mut t_chips = get_rw::<i64>(traj, "chips")?;
+    let mut t_sizing = get_rw::<i64>(traj, "sizing")?;
+    let mut t_anchor = get_rw::<i8>(traj, "anchor")?;
+    let mut dst = Vec::with_capacity(keys.len());
+    for k in keys {
+        dst.push(get_rw::<f32>(traj, k)?);
+    }
+    let m = t_gate.len();
+    if t_obs.len() != m || t_chips.len() != m || t_anchor.len() != m || t_sizing.len() != 4 * m
+        || dst.iter().any(|a| a.len() != m)
+    {
+        return Err(err("flat trajectory arrays disagree on slots".into()));
+    }
+    for (&sl, &e) in slot.iter().zip(lidx) {
+        if sl < 0 || sl as usize >= m || e < 0 || e as usize >= n {
+            return Err(err(format!("slot {sl} / env {e} out of range ({m} slots, {n} envs)")));
+        }
+    }
+    let (g, c, sz, an) = (gates.as_slice()?, chips.as_slice()?, sizing.as_slice()?, anchors.as_slice()?);
+    let (to, tg, tc, ts, ta) = (
+        t_obs.as_slice_mut()?,
+        t_gate.as_slice_mut()?,
+        t_chips.as_slice_mut()?,
+        t_sizing.as_slice_mut()?,
+        t_anchor.as_slice_mut()?,
+    );
+    for (i, (&sl, &e)) in slot.iter().zip(lidx).enumerate() {
+        let (sl, e) = (sl as usize, e as usize);
+        to[sl] = pool_start + i as i64;
+        tg[sl] = g[e] as i8;
+        tc[sl] = if g[e] as i8 == GATE_RAISE { c[e] as i64 } else { 0 };
+        ts[sl * 4..sl * 4 + 4].copy_from_slice(&sz[e * 4..e * 4 + 4]);
+        ta[sl] = an[e] as i8;
+    }
+    for (s_arr, d_arr) in src.iter().zip(dst.iter_mut()) {
+        let (sv, dv) = (s_arr.as_slice()?, d_arr.as_slice_mut()?);
+        for (&sl, &e) in slot.iter().zip(lidx) {
+            dv[sl as usize] = sv[e as usize];
+        }
+    }
+    Ok(())
+}

@@ -108,7 +108,10 @@ def test_greedy_actions_equal_each_snapshots_own_act(cls, kw) -> None:
     obs, gm, sizing = _inputs(300)
     g, j, n_max = _slots(len(models), 300)
     with torch.inference_mode():
-        out = stack.act(obs, gm, sizing, g, j, n_max, deterministic=True)
+        out = stack.act(obs, gm, sizing, g, j, n_max, deterministic=True, need_log_probs=True)
+        lean = stack.act(obs, gm, sizing, g, j, n_max, deterministic=True)  # the rollout's call
+        assert lean.log_prob is None and lean.gate_log_prob is None
+        assert torch.equal(lean.gate, out.gate) and torch.equal(lean.chips, out.chips)
         for k, m in enumerate(models):
             rows = (g == k).nonzero().squeeze(-1)
             own = m.act(obs[rows], gm[rows], sizing[rows], deterministic=True)
@@ -161,3 +164,23 @@ def test_rollout_with_a_pool_uses_the_stack_only_when_enabled(monkeypatch, batch
     assert (calls["n"] > 0) == batched
     assert batch.obs.shape[0] >= tc.rollout_length
     assert torch.isfinite(batch.advantages).all() and torch.isfinite(batch.log_probs).all()
+
+
+@pytest.mark.parametrize("cls,kw", _ARCHS)
+def test_skipping_log_probs_keeps_the_samples(cls, kw) -> None:
+    """The rollout's opponents skip the log-prob tail; log-probs draw no
+    random numbers, so the SAME seed must give the same sampled actions."""
+    models = _snapshots(cls, kw)
+    stack = _StackedOpponents(models)
+    obs, gm, sizing = _inputs(300)
+    g, j, n_max = _slots(len(models), 300)
+    with torch.inference_mode():
+        torch.manual_seed(123)
+        full = stack.act(obs, gm, sizing, g, j, n_max, need_log_probs=True)
+        after_full = torch.rand(4)
+        torch.manual_seed(123)
+        lean = stack.act(obs, gm, sizing, g, j, n_max)
+        after_lean = torch.rand(4)
+    for f in ("gate", "anchor", "chips", "refine_u"):
+        assert torch.equal(getattr(full, f), getattr(lean, f)), f
+    assert torch.equal(after_full, after_lean)  # same RNG position afterwards

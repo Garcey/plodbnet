@@ -39,6 +39,7 @@ fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(crate::bindings::unpack_obs_rows, m)?)?;
     // Rollout trajectory flush (python/plo5bp/rollout.py step9b-9d).
     m.add_function(pyo3::wrap_pyfunction!(crate::flush::flush_trajectories, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(crate::flush::record_learner_steps, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(
         crate::bindings::straight_flush_features_batch,
         m

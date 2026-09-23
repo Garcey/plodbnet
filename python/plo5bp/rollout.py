@@ -36,6 +36,10 @@ try:  # engines built since 2026-09-23 flush finished hands in one Rust pass
     from plo5bp._engine import flush_trajectories as _rust_flush_trajectories  # type: ignore[attr-defined]
 except ImportError:  # older engine: the numpy flush below
     _rust_flush_trajectories = None
+try:  # ... and record each step's learner rows in one Rust call
+    from plo5bp._engine import record_learner_steps as _rust_record_learner_steps  # type: ignore[attr-defined]
+except ImportError:
+    _rust_record_learner_steps = None
 
 # Output slabs the Rust flush writes (compact observation storage only).
 _RUST_FLUSH_OUT_KEYS = (
@@ -1750,6 +1754,7 @@ class _StackedOpponents:
         slot_j: torch.Tensor,
         n_max: int,
         deterministic: bool = False,
+        need_log_probs: bool = False,
     ) -> ActOut:
         """Sample (or argmax, `deterministic`) the opponent rows `obs` /
         `gate_mask` / `sizing` (device tensors); row i belongs to snapshot
@@ -1760,8 +1765,11 @@ class _StackedOpponents:
         gm_pad = gate_mask.new_zeros((self.n, n_max, gate_mask.shape[-1]))
         gm_pad[slot_g, slot_j] = gate_mask
         heads = self._vforward(self.params, self.buffers, obs_pad, gm_pad)
+        # Opponent rows are never trained on: by default skip the log-prob
+        # tail (same samples and RNG stream -- see _act_from_heads).
         return self.template._act_from_heads(
-            *(h[slot_g, slot_j] for h in heads), sizing, deterministic=deterministic
+            *(h[slot_g, slot_j] for h in heads), sizing,
+            deterministic=deterministic, need_log_probs=need_log_probs,
         )
 
 
@@ -2243,11 +2251,35 @@ def collect_rollout_batched(
         and env.enable_packed_obs(_step_h2d.layout)
     )
 
+    def _record_steps_numpy(
+        tw, rows, pool_indices, gates, chips, sizing, anchors,
+        refine_u, log_probs, gate_logp, anchor_logp, values, q_taken, vpi,
+    ) -> None:
+        """Per-step trajectory record, numpy (fallback of the Rust call)."""
+        tf = traj_flat
+        l_gates = gates[rows]
+        tf["obs_idx"][tw] = pool_indices
+        tf["gate"][tw] = l_gates.astype(np.int8)
+        tf["chips"][tw] = np.where(
+            l_gates == GATE_RAISE, chips[rows].astype(np.int64), 0
+        )
+        tf["sizing"][tw] = sizing[rows]
+        tf["anchor"][tw] = anchors[rows].astype(np.int8)
+        tf["u"][tw] = refine_u[rows]
+        tf["log_p"][tw] = log_probs[rows]
+        tf["gate_lp"][tw] = gate_logp[rows]
+        tf["anchor_lp"][tw] = anchor_logp[rows]
+        tf["value"][tw] = values[rows]
+        if q_taken is not None:
+            tf["q_taken"][tw] = q_taken[rows]
+            tf["vpi"][tw] = vpi[rows]
+
+    _numpy_flush = os.environ.get("PLO5BP_NUMPY_FLUSH", "0") == "1"
     # The Rust flush reads the packed obs pool (compact storage) only.
     _flush_in_rust = bool(
         _rust_flush_trajectories is not None
         and obs_layout is not None
-        and os.environ.get("PLO5BP_NUMPY_FLUSH", "0") != "1"
+        and not _numpy_flush
     )
 
     def _packed_for(obs_arr: np.ndarray):
@@ -2836,28 +2868,38 @@ def collect_rollout_batched(
                 step_timers.end()  # step3c/traj_grow
 
             step_timers.begin("step3c/traj_writes")
-            l_gates = gates_per_env[learner_idx_np]
-            l_chips = chips_per_env[learner_idx_np]
             # One flat slot index for every per-(env, seat, slot) array
             # (after any _grow_traj above, so it uses the current capacity).
             tw = (learner_idx_np * n_seats + learner_actors) * traj_cap + slots
-            tf = traj_flat
-            tf["obs_idx"][tw] = pool_indices
-            tf["gate"][tw] = l_gates.astype(np.int8)
-            tf["chips"][tw] = np.where(
-                l_gates == GATE_RAISE, l_chips.astype(np.int64), 0
-            )
-            tf["sizing"][tw] = sizing_step[learner_idx_np]
-            tf["anchor"][tw] = anchors_per_env[learner_idx_np].astype(np.int8)
-            tf["u"][tw] = refine_u_per_env[learner_idx_np]
-            tf["log_p"][tw] = log_probs_per_env[learner_idx_np]
-            tf["gate_lp"][tw] = gate_logp_per_env[learner_idx_np]
-            tf["anchor_lp"][tw] = anchor_logp_per_env[learner_idx_np]
-            tf["value"][tw] = values_per_env[learner_idx_np]
-            if use_vrpo:
-                tf["q_taken"][tw] = q_taken_per_env[learner_idx_np]
-                tf["vpi"][tw] = vpi_per_env[learner_idx_np]
-            step_timers.end()  # step3c/traj_writes
+            if _rust_record_learner_steps is not None and not _numpy_flush:
+                # The same assignments as the numpy block below, one call.
+                per_env = {
+                    "gate": gates_per_env, "chips": chips_per_env,
+                    "sizing": sizing_step, "anchor": anchors_per_env,
+                    "u": refine_u_per_env, "log_p": log_probs_per_env,
+                    "gate_lp": gate_logp_per_env, "anchor_lp": anchor_logp_per_env,
+                    "value": values_per_env,
+                }
+                if use_vrpo:
+                    per_env["q_taken"] = q_taken_per_env
+                    per_env["vpi"] = vpi_per_env
+                _rust_record_learner_steps(
+                    tw.astype(np.int64, copy=False),
+                    learner_idx_np.astype(np.int64, copy=False),
+                    int(pool_indices[0]), traj_flat, per_env,
+                )
+                step_timers.end()  # step3c/traj_writes
+            else:
+                _record_steps_numpy(
+                    tw, learner_idx_np, pool_indices, gates_per_env,
+                    chips_per_env, sizing_step, anchors_per_env,
+                    refine_u_per_env, log_probs_per_env, gate_logp_per_env,
+                    anchor_logp_per_env, values_per_env,
+                    q_taken_per_env if use_vrpo else None,
+                    vpi_per_env if use_vrpo else None,
+                )
+                step_timers.end()  # step3c/traj_writes
+
 
         # Short-shove redirect: rows where the network emitted GATE_RAISE
         # but the engine zeroed `min_raise` (sub-min-raise stack with

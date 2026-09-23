@@ -469,6 +469,7 @@ class ActorCriticV2(nn.Module):
         sizing: torch.Tensor,
         deterministic: bool = False,
         return_marginal: bool = False,
+        need_log_probs: bool = True,
     ) -> ActOut:
         """Everything `act` does after the weight-dependent `forward`: the
         anchor grid, sampling, log-probs, chips. It reads only the head
@@ -476,7 +477,13 @@ class ActorCriticV2(nn.Module):
         scale/mixture settings) — never its weights — so the batched rollout
         can run ONE stacked forward for many same-shape pool snapshots and
         sample every opponent row here in one pass
-        (rollout._StackedOpponents). `act` is exactly forward + this."""
+        (rollout._StackedOpponents). `act` is exactly forward + this.
+
+        `need_log_probs=False` (the rollout's opponents, whose rows are never
+        trained on) skips the log-prob tail and returns None for `log_prob` /
+        `gate_log_prob` / `anchor_log_prob`. The samples and chips are
+        unchanged: log-probs draw no random numbers, so the RNG stream is the
+        same either way."""
         grid = anchor_grid_torch(sizing, self.anchor_spec)
 
         gate_dist = torch.distributions.Categorical(logits=gate_logits)
@@ -484,14 +491,14 @@ class ActorCriticV2(nn.Module):
             gate = gate_logits.argmax(dim=-1)
         else:
             gate = gate_dist.sample()
-        gate_log_prob = gate_dist.log_prob(gate)
+        gate_log_prob = gate_dist.log_prob(gate) if need_log_probs else None
 
         anchor_dist = self._anchor_dist(anchor_logits, grid)
         if deterministic:
             anchor = anchor_dist.probs.argmax(dim=-1)
         else:
             anchor = anchor_dist.sample()
-        anchor_log_prob = anchor_dist.log_prob(anchor)
+        anchor_log_prob = anchor_dist.log_prob(anchor) if need_log_probs else None
 
         alpha, beta = self._gather_refine(refine, anchor)
         beta_dist = torch.distributions.Beta(alpha, beta)
@@ -506,14 +513,16 @@ class ActorCriticV2(nn.Module):
         refined_chips = refine_chips_torch(anchor, u, sizing, self.anchor_spec)
         raise_chips = torch.where(refine_active, refined_chips, anchor_chips)
 
-        beta_log = beta_dist.log_prob(u)
-        sizing_log = anchor_log_prob + torch.where(
-            refine_active, beta_log, torch.zeros_like(beta_log)
-        )
         raise_mask = gate == GATE_RAISE
-        log_prob = gate_log_prob + torch.where(
-            raise_mask, sizing_log, torch.zeros_like(sizing_log)
-        )
+        log_prob = None
+        if need_log_probs:
+            beta_log = beta_dist.log_prob(u)
+            sizing_log = anchor_log_prob + torch.where(
+                refine_active, beta_log, torch.zeros_like(beta_log)
+            )
+            log_prob = gate_log_prob + torch.where(
+                raise_mask, sizing_log, torch.zeros_like(sizing_log)
+            )
         chips_out = torch.where(
             raise_mask, raise_chips, torch.zeros_like(raise_chips)
         )
