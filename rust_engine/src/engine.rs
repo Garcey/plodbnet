@@ -936,10 +936,7 @@ impl GameState {
         self.street_level_acted[actor] = self.bet_to_call;
 
         // Fold-out: single non-folded seat wins.
-        let alive: Vec<usize> = (0..self.config.num_seats)
-            .filter(|&i| !self.folded[i])
-            .collect();
-        if alive.len() == 1 {
+        if self.alive_count() == 1 {
             if self.study_mode {
                 self.study_terminal = Some(StudyTerminal::FoldOut);
             }
@@ -956,6 +953,13 @@ impl GameState {
 
     pub fn is_terminal(&self) -> bool {
         self.actor.is_none()
+    }
+
+    /// Number of seats that have not folded (no allocation: this runs on
+    /// every action of every hand).
+    #[inline]
+    fn alive_count(&self) -> usize {
+        self.folded.iter().filter(|&&f| !f).count()
     }
 
     pub fn current_actor(&self) -> Option<usize> {
@@ -1324,10 +1328,7 @@ impl GameState {
         self.commit_chips_as_raise(actor, chips, Action::BetPct100);
 
         // Round-close + next-actor logic identical to `apply`.
-        let alive: Vec<usize> = (0..self.config.num_seats)
-            .filter(|&i| !self.folded[i])
-            .collect();
-        if alive.len() == 1 {
+        if self.alive_count() == 1 {
             if self.study_mode {
                 self.study_terminal = Some(StudyTerminal::FoldOut);
             }
@@ -1935,8 +1936,7 @@ impl GameState {
         self.action_close_board_len = Some(self.board_a.len() as u8);
 
         // Fold-out handling is identical in both modes — single survivor.
-        let alive: Vec<usize> = (0..n).filter(|&i| !self.folded[i]).collect();
-        if alive.len() == 1 {
+        if self.alive_count() == 1 {
             if self.study_mode {
                 self.study_terminal = Some(StudyTerminal::FoldOut);
             }
@@ -1951,8 +1951,7 @@ impl GameState {
 
         loop {
             // If only one non-folded seat, finalize immediately.
-            let alive: Vec<usize> = (0..n).filter(|&i| !self.folded[i]).collect();
-            if alive.len() == 1 {
+            if self.alive_count() == 1 {
                 self.finalize_terminal();
                 return;
             }
@@ -1996,20 +1995,20 @@ impl GameState {
                 Street::Preflop => unreachable!(),
             }
 
-            // Reset per-street state.
-            self.street_commit = vec![0u64; n];
+            // Reset per-street state (in place: every per-seat vector is
+            // num_seats long for the whole hand).
+            debug_assert!(self.street_commit.len() == n && self.acted_this_street.len() == n);
+            self.street_commit.fill(0);
             self.bet_to_call = 0;
             self.last_raise_size = self.config.bb;
             self.last_aggression_was_full_raise = true;
-            self.street_level_acted = vec![0u64; n];
+            self.street_level_acted.fill(0);
             self.last_aggressor = None;
-            self.acted_this_street = vec![false; n];
+            self.acted_this_street.fill(false);
 
             // Does a new round start? Need >=2 non-folded non-all-in seats.
-            let can_act: Vec<usize> = (0..n)
-                .filter(|&i| !self.folded[i] && !self.all_in[i])
-                .collect();
-            if can_act.len() >= 2 {
+            let can_act = (0..n).filter(|&i| !self.folded[i] && !self.all_in[i]).count();
+            if can_act >= 2 {
                 self.actor = self.first_to_act_postflop();
                 return;
             }

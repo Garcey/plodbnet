@@ -66,6 +66,14 @@ launch(){
   export PLO5_RUST_ENCODER=1
   export PLO5BP_STEP_TIMERS=1
   export NUMPY_MADVISE_HUGEPAGE=0
+  # glibc malloc: keep freed memory for reuse instead of handing it back to
+  # the kernel and faulting it in again on the next step (the per-step numpy
+  # temporaries cost ~6M page faults per update). Fixed mmap threshold (32 MB,
+  # glibc's max) = no dynamic threshold; never trim; grow in 64 MB steps.
+  # Allocation policy only -- no effect on any computed value.
+  export MALLOC_MMAP_THRESHOLD_=33554432
+  export MALLOC_TRIM_THRESHOLD_=17179869184
+  export MALLOC_TOP_PAD_=67108864
   local load=""
   [ -n "${1:-}" ] && load="--load-checkpoint $1"
   setsid nohup $numa .venv/bin/python -u scripts/train.py \

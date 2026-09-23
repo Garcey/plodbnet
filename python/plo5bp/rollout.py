@@ -2401,6 +2401,8 @@ def collect_rollout_batched(
         }
 
     env_idx_range = np.arange(n_envs)
+    # Engines built since 2026-09-23 pay out a subset of envs (see step9a).
+    _payouts_subset = hasattr(env._be, "payouts_ev_subset")
 
     # PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 A6) — drain_inflight.
     # Phase 1 (`wcursor < rollout_target`) is the pre-fix loop verbatim:
@@ -2779,16 +2781,36 @@ def collect_rollout_batched(
                 _prefetch_queued = _queue_acts_for_mask(_nt_mask)
 
         if newly_terminal.any():
+            term_envs = np.nonzero(newly_terminal)[0]
             with _TimedRF("step9a/payouts"):
+                # Only the newly-terminal rows are read below. In the drain
+                # phase every env that finished on an EARLIER step is still
+                # terminal, and the whole-batch call re-ran all of their
+                # runouts each step; the subset call computes just these
+                # rows (same seeds -> the same values).
                 if env._ev_runout_samples > 0:
                     ev_seeds = env._reset_seeds ^ np.uint64(0x9E3779B97F4A7C15)
-                    payouts_f32 = np.asarray(
-                        env._be.payouts_ev_batch(env._ev_runout_samples, ev_seeds),
-                        dtype=np.float32,
-                    )
+                    if _payouts_subset:
+                        payouts_term = np.asarray(
+                            env._be.payouts_ev_subset(
+                                env._ev_runout_samples,
+                                ev_seeds[term_envs],
+                                term_envs.astype(np.int64),
+                            ),
+                            dtype=np.float32,
+                        )
+                    else:
+                        payouts_term = np.asarray(
+                            env._be.payouts_ev_batch(env._ev_runout_samples, ev_seeds),
+                            dtype=np.float32,
+                        )[term_envs]
                 else:
-                    payouts_f32 = np.asarray(env._be.payouts_batch(), dtype=np.float32)
-                won_f32 = payouts_f32 + post_total_commit.astype(np.float32)
+                    payouts_term = np.asarray(
+                        env._be.payouts_batch(), dtype=np.float32
+                    )[term_envs]
+                won_term = payouts_term + post_total_commit[term_envs].astype(
+                    np.float32
+                )
 
             reset_mask = newly_terminal
 
@@ -2806,7 +2828,6 @@ def collect_rollout_batched(
             # would cost ~GBs of allocation/zeroing traffic per flush
             # for slots that are empty by construction. Slots in
             # [L, MAX) are inactive, so the output is bit-identical.
-            term_envs = np.nonzero(newly_terminal)[0]
             T = int(term_envs.size)
             if T:
                 S = n_seats
@@ -2821,7 +2842,7 @@ def collect_rollout_batched(
 
                 # Retroactive bonus (vectorized over (T, S, L)).
                 with _TimedRF("step9b/retroactive_bonus"):
-                    payout_chips = np.rint(won_f32[term_envs]).astype(np.int64)  # (T, S)
+                    payout_chips = np.rint(won_term).astype(np.int64)  # (T, S)
                     total_pot_chips = post_total_commit[term_envs].astype(np.int64).sum(axis=1)  # (T,)
                     two_pay = 2 * payout_chips
                     share_eq = (two_pay == total_pot_chips[:, None]) & (
@@ -2861,7 +2882,7 @@ def collect_rollout_batched(
                 # GAE backward scan vectorized over (T, S).
                 with _TimedRF("step9c/gae_scan"):
                     vals_t = traj_value[term_envs, :, :L]                    # (T, S, L)
-                    won_bb = won_f32[term_envs].astype(np.float32) * np.float32(reward_norm)
+                    won_bb = won_term.astype(np.float32) * np.float32(reward_norm)
                     last_gae = np.zeros((T, S), dtype=np.float32)
                     advs_t = np.zeros((T, S, L), dtype=np.float32)
                     last_t_arr = (lengths.astype(np.int32) - 1)              # (T, S)

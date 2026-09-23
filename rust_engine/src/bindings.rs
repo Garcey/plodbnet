@@ -140,6 +140,56 @@ fn validate_table(num_seats: usize, variant: Variant, bb: u64) -> PyResult<()> {
     Ok(())
 }
 
+/// Minimum envs per rayon leaf for the cheap per-env passes (apply /
+/// validation): a few leaves keep the handful of woken workers busy instead
+/// of waking every worker for sub-microsecond slices of work.
+const APPLY_MIN_LEN: usize = 512;
+
+/// `apply_hybrid_batch`'s legality check for one env: `None` when env `i` may
+/// take `gate` (with `chips` for a raise) or is already terminal, else
+/// `(true = not reset -> RuntimeError, message)`.
+fn validate_hybrid_action(
+    i: usize,
+    state: Option<&GameState>,
+    gate: u8,
+    chips: u64,
+) -> Option<(bool, String)> {
+    let state = match state {
+        Some(s) => s,
+        None => {
+            return Some((
+                true,
+                format!("env {} not reset; call reset_batch/reset_terminal_batch first", i),
+            ))
+        }
+    };
+    if state.is_terminal() {
+        return None;
+    }
+    match gate {
+        0 => (!state.legal_action_mask()[Action::Fold as usize])
+            .then(|| (false, format!("gate Fold illegal at env {}", i))),
+        1 => (!state.legal_action_mask()[Action::CheckCall as usize])
+            .then(|| (false, format!("gate CheckCall illegal at env {}", i))),
+        2 => {
+            let min = state.min_raise_chips();
+            let max = state.max_raise_chips();
+            (min == 0 || chips < min || chips > max).then(|| {
+                (
+                    false,
+                    format!(
+                        "gate Raise chips {} out of range [{}, {}] at env {}",
+                        chips, min, max, i
+                    ),
+                )
+            })
+        }
+        3 => (!state.legal_action_mask()[Action::AllIn as usize])
+            .then(|| (false, format!("gate AllIn illegal at env {}", i))),
+        other => Some((false, format!("invalid gate {} at env {} (must be 0..=3)", other, i))),
+    }
+}
+
 /// Bounds-checked env indices for every `*_subset_batch(indices)` entry point
 /// (review 2026-09-20 C4): a negative index used to wrap to a huge `usize` and
 /// an out-of-range one indexed past `states`, both panicking mid-pack.
@@ -1050,6 +1100,7 @@ pub fn compute_aggression_bonus_batch<'py>(
     let per_env: Vec<(bool, f64, f64, i8, f64)> = py.allow_threads(|| {
         (0..n)
             .into_par_iter()
+            .with_min_len(APPLY_MIN_LEN)
             .map(|i| {
                 if dones_v[i] {
                     return (false, 0.0, 0.0, -1i8, 0.0);
@@ -1268,6 +1319,7 @@ pub fn pack_obs_rows(
         .par_chunks_mut(nb)
         .zip(real_dst.par_chunks_mut(nr))
         .zip(rows_v.par_iter())
+        .with_min_len(256)
         .try_for_each(|((b, r), &row)| {
             pack_obs_row(&obs_s[row * d..(row + 1) * d], &flags_v, &reals_v, b, r)
                 .map_err(|(c, v)| (row, c, v))
@@ -1925,74 +1977,35 @@ impl PyBatchedEngine {
                 n
             )));
         }
-        // Pre-validate all non-terminal envs.
-        for i in 0..n {
-            let state = match self.states[i].as_ref() {
-                Some(s) => s,
-                None => {
-                    return Err(PyRuntimeError::new_err(format!(
-                        "env {} not reset; call reset_batch/reset_terminal_batch first",
-                        i
-                    )));
-                }
-            };
-            if state.is_terminal() {
-                continue;
-            }
-            let g = gates_slice[i];
-            match g {
-                0 => {
-                    let m = state.legal_action_mask();
-                    if !m[Action::Fold as usize] {
-                        return Err(PyValueError::new_err(format!(
-                            "gate Fold illegal at env {}",
-                            i
-                        )));
-                    }
-                }
-                1 => {
-                    let m = state.legal_action_mask();
-                    if !m[Action::CheckCall as usize] {
-                        return Err(PyValueError::new_err(format!(
-                            "gate CheckCall illegal at env {}",
-                            i
-                        )));
-                    }
-                }
-                2 => {
-                    let min = state.min_raise_chips();
-                    let max = state.max_raise_chips();
-                    let c = chips_slice[i];
-                    if min == 0 || c < min || c > max {
-                        return Err(PyValueError::new_err(format!(
-                            "gate Raise chips {} out of range [{}, {}] at env {}",
-                            c, min, max, i
-                        )));
-                    }
-                }
-                3 => {
-                    let m = state.legal_action_mask();
-                    if !m[Action::AllIn as usize] {
-                        return Err(PyValueError::new_err(format!(
-                            "gate AllIn illegal at env {}",
-                            i
-                        )));
-                    }
-                }
-                other => {
-                    return Err(PyValueError::new_err(format!(
-                        "invalid gate {} at env {} (must be 0..=3)",
-                        other, i
-                    )));
-                }
-            }
+        // Pre-validate every non-terminal env -- in parallel, reporting the
+        // LOWEST offending env index exactly as the old serial loop did, and
+        // before any state is touched (all-or-nothing).
+        let states_ref = &self.states;
+        let bad = py.allow_threads(|| {
+            states_ref
+                .par_iter()
+                .enumerate()
+                .with_min_len(APPLY_MIN_LEN)
+                .find_map_first(|(i, st)| {
+                    validate_hybrid_action(i, st.as_ref(), gates_slice[i], chips_slice[i])
+                })
+        });
+        if let Some((not_reset, msg)) = bad {
+            return Err(if not_reset {
+                PyRuntimeError::new_err(msg)
+            } else {
+                PyValueError::new_err(msg)
+            });
         }
         let gates_vec: Vec<u8> = gates_slice.to_vec();
         let chips_vec: Vec<u64> = chips_slice.to_vec();
+        // Per-env work here is sub-microsecond: coarse leaves (few rayon
+        // wake-ups) beat splitting 7k tables across every worker.
         let term_vec: Vec<bool> = py.allow_threads(|| {
             self.states
                 .par_iter_mut()
                 .enumerate()
+                .with_min_len(APPLY_MIN_LEN)
                 .map(|(i, state_opt)| {
                     let state = state_opt.as_mut().expect("validated above");
                     if state.is_terminal() {
@@ -2180,26 +2193,48 @@ impl PyBatchedEngine {
             )));
         }
         let seeds_vec: Vec<u64> = seeds_slice.to_vec();
-        let states_ref = &self.states;
-        // Rows written in place (non-terminal envs stay zero) — no per-env
-        // Vec for the ~all envs that are not terminal this step.
+        let idx: Vec<usize> = (0..n).collect();
         let mut arr = Array2::<i64>::zeros((n, s));
         {
             let out = arr
                 .as_slice_mut()
                 .expect("freshly allocated Array2 is contiguous");
-            py.allow_threads(|| {
-                out.par_chunks_mut(s)
-                    .zip(states_ref.par_iter())
-                    .zip(seeds_vec.par_iter())
-                    .for_each(|((row, state_opt), &seed)| {
-                        if let Some(state) = state_opt.as_ref() {
-                            if state.is_terminal() {
-                                row.copy_from_slice(&state.payouts_ev(num_samples, seed));
-                            }
-                        }
-                    });
-            });
+            py.allow_threads(|| self.payouts_ev_rows(num_samples, &idx, &seeds_vec, out));
+        }
+        Ok(arr.into_pyarray(py))
+    }
+
+    /// `(k, num_seats)` i64 EV payouts for the envs in `indices` ONLY: row j
+    /// is env `indices[j]` sampled with `seeds[j]` (zeros if that env is not
+    /// terminal) -- identical to `payouts_ev_batch(num_samples, batch_seeds)
+    /// [indices]` whenever `seeds[j] == batch_seeds[indices[j]]`. The rollout
+    /// reads only the newly-terminal rows, and in the drain phase every env
+    /// that finished on an EARLIER step is still terminal: the whole-batch
+    /// call re-ran all of their runouts on every drain step.
+    fn payouts_ev_subset<'py>(
+        &self,
+        py: Python<'py>,
+        num_samples: u32,
+        seeds: PyReadonlyArray1<'_, u64>,
+        indices: PyReadonlyArray1<'_, i64>,
+    ) -> PyResult<Bound<'py, PyArray2<i64>>> {
+        let n = self.states.len();
+        let s = self.config.num_seats;
+        let idx = checked_env_indices(indices.as_slice()?, n, "payouts_ev_subset")?;
+        let seeds_vec: Vec<u64> = seeds.as_slice()?.to_vec();
+        if seeds_vec.len() != idx.len() {
+            return Err(PyValueError::new_err(format!(
+                "payouts_ev_subset: {} seeds for {} indices",
+                seeds_vec.len(),
+                idx.len()
+            )));
+        }
+        let mut arr = Array2::<i64>::zeros((idx.len(), s));
+        {
+            let out = arr
+                .as_slice_mut()
+                .expect("freshly allocated Array2 is contiguous");
+            py.allow_threads(|| self.payouts_ev_rows(num_samples, &idx, &seeds_vec, out));
         }
         Ok(arr.into_pyarray(py))
     }
@@ -2582,6 +2617,137 @@ impl PyBatchedEngine {
         )?;
         self.encode_indexed_minimal(py, &idx)
     }
+
+    /// In-place `observation_encoded_minimal_batch` (2026-09-23): encodes every
+    /// env's 796-dim row straight into `out` -- the env's cached (N, 796) f32
+    /// obs buffer -- instead of returning a fresh array that the caller then
+    /// copies (no 23 MB allocation + page faults + copy per rollout step).
+    /// Rows whose `encode_mask` entry is False are zero-filled (the skipped-row
+    /// convention of `BatchedBombPotEnv._refresh`); every other row is zeroed
+    /// and encoded by the same `encode_obs_row_minimal` from the same packed
+    /// state, so the buffer ends up bit-identical to "encode into a fresh
+    /// zeroed array, copy, zero the skipped rows". Returns the aux dict of
+    /// `observation_encoded_minimal_batch` without "obs".
+    #[pyo3(signature = (out, encode_mask=None))]
+    fn observation_encoded_minimal_into<'py>(
+        &self,
+        py: Python<'py>,
+        mut out: PyReadwriteArray2<'_, f32>,
+        encode_mask: Option<PyReadonlyArray1<'_, bool>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        const WHAT: &str = "observation_encoded_minimal_into";
+        self.require_plo_minimal(WHAT)?;
+        let n = self.states.len();
+        check_minimal_obs_out(&out, n, WHAT)?;
+        let mask: Option<Vec<bool>> = match encode_mask {
+            None => None,
+            Some(m) => {
+                let m = m.as_slice()?;
+                if m.len() != n {
+                    return Err(PyValueError::new_err(format!(
+                        "{WHAT}: encode_mask has {} entries, expected {n}",
+                        m.len()
+                    )));
+                }
+                Some(m.to_vec())
+            }
+        };
+        let idx: Vec<usize> = (0..n).collect();
+        let out_s = out.as_slice_mut()?;
+        let (packed, legal_mask) = py.allow_threads(|| {
+            let packed = self.pack_observation_minimal_indexed(&idx, self.config.num_seats);
+            let legal_mask = self.legal_masks_indexed(&idx);
+            let rows: Vec<&mut [f32]> =
+                out_s.chunks_exact_mut(obs_layout_minimal::OBS_DIM_MINIMAL).collect();
+            let keep = |j: usize| mask.as_ref().map_or(true, |m| m[j]);
+            self.encode_minimal_rows_into(&packed, rows, keep);
+            (packed, legal_mask)
+        });
+        minimal_aux_dict(py, packed, legal_mask)
+    }
+
+    /// In-place `observation_encoded_minimal_subset_batch`: re-packs and
+    /// re-encodes ONLY the envs in `indices` (strictly increasing, e.g. from
+    /// `np.nonzero`), writing each row straight into `out[indices[j]]`; every
+    /// other row of `out` is left untouched. Bit-identical to
+    /// `out[indices] = observation_encoded_minimal_subset_batch(indices)["obs"]`.
+    /// The returned aux arrays are compact (k = len(indices) rows), exactly as
+    /// the non-in-place variant's.
+    fn observation_encoded_minimal_subset_into<'py>(
+        &self,
+        py: Python<'py>,
+        indices: PyReadonlyArray1<'_, i64>,
+        mut out: PyReadwriteArray2<'_, f32>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        const WHAT: &str = "observation_encoded_minimal_subset_into";
+        self.require_plo_minimal(WHAT)?;
+        let n = self.states.len();
+        check_minimal_obs_out(&out, n, WHAT)?;
+        let idx = checked_env_indices(indices.as_slice()?, n, WHAT)?;
+        if idx.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(PyValueError::new_err(format!(
+                "{WHAT}: indices must be strictly increasing (unique, sorted)"
+            )));
+        }
+        let out_s = out.as_slice_mut()?;
+        let (packed, legal_mask) = py.allow_threads(|| {
+            let packed = self.pack_observation_minimal_indexed(&idx, self.config.num_seats);
+            let legal_mask = self.legal_masks_indexed(&idx);
+            // Disjoint mutable rows of `out`, in `idx` order (idx is strictly
+            // increasing, so one forward walk picks them).
+            let mut rows: Vec<&mut [f32]> = Vec::with_capacity(idx.len());
+            let mut want = idx.iter().copied().peekable();
+            for (r, row) in out_s
+                .chunks_exact_mut(obs_layout_minimal::OBS_DIM_MINIMAL)
+                .enumerate()
+            {
+                match want.peek() {
+                    None => break,
+                    Some(&w) if w == r => {
+                        rows.push(row);
+                        want.next();
+                    }
+                    Some(_) => {}
+                }
+            }
+            self.encode_minimal_rows_into(&packed, rows, |_| true);
+            (packed, legal_mask)
+        });
+        minimal_aux_dict(py, packed, legal_mask)
+    }
+}
+
+/// Shared `out` check of the in-place minimal encoders: a C-contiguous
+/// (n, 796) f32 array (`as_slice_mut` alone would also accept a
+/// Fortran-ordered one, whose memory is column-major).
+fn check_minimal_obs_out(out: &PyReadwriteArray2<'_, f32>, n: usize, what: &str) -> PyResult<()> {
+    let d = obs_layout_minimal::OBS_DIM_MINIMAL;
+    if !out.is_c_contiguous() || out.shape() != [n, d] {
+        return Err(PyValueError::new_err(format!(
+            "{what}: out must be a C-contiguous ({n}, {d}) float32 array; got shape {:?}",
+            out.shape()
+        )));
+    }
+    Ok(())
+}
+
+/// The aux fields every minimal encoder returns next to (or instead of) "obs".
+fn minimal_aux_dict<'py>(
+    py: Python<'py>,
+    packed: PackedMinimalObservation,
+    legal_mask: Array2<bool>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("actor", packed.actor.into_pyarray(py))?;
+    d.set_item("legal_mask", legal_mask.into_pyarray(py))?;
+    d.set_item("min_raise", packed.min_raise.into_pyarray(py))?;
+    d.set_item("max_raise", packed.max_raise.into_pyarray(py))?;
+    d.set_item("total_commit", packed.total_commit.into_pyarray(py))?;
+    d.set_item("bet_to_call", packed.bet_to_call.into_pyarray(py))?;
+    d.set_item("street_commit", packed.street_commit.into_pyarray(py))?;
+    d.set_item("street", packed.street.into_pyarray(py))?;
+    d.set_item("pot", packed.pot.into_pyarray(py))?;
+    Ok(d)
 }
 
 struct PackedObservation {
@@ -3108,64 +3274,111 @@ impl PyBatchedEngine {
         py: Python<'py>,
         idx: &[usize],
     ) -> PyResult<Bound<'py, PyDict>> {
-        if matches!(self.config.variant, Variant::NlhSingle) {
-            return Err(PyRuntimeError::new_err(
-                "observation_encoded_minimal_batch is PLO-only; NLH uses the \
-                 numpy batch encoder",
-            ));
-        }
+        self.require_plo_minimal("observation_encoded_minimal_batch")?;
         let n = idx.len();
         let s = self.config.num_seats;
-        let bb = self.config.bb;
-        let obs_rev = self.obs_rev;
-        let starting = self.config.starting_stacks.clone();
 
         let (obs_vec, packed, legal_mask) = py.allow_threads(|| {
             let packed = self.pack_observation_minimal_indexed(idx, s);
-
-            // Legal mask only (no hero categories — minimal layout drops them).
-            let mut legal_mask = Array2::<bool>::default((n, NUM_ACTIONS));
-            for j in 0..n {
-                let state = match self.states[idx[j]].as_ref() {
-                    Some(st) => st,
-                    None => continue,
-                };
-                if !state.is_terminal() {
-                    let mask = state.legal_action_mask();
-                    for t in 0..NUM_ACTIONS {
-                        legal_mask[[j, t]] = mask[t];
-                    }
-                }
-            }
-
-            let inv_bb = 1.0f64 / (bb as f64);
+            let legal_mask = self.legal_masks_indexed(idx);
             let mut obs_vec = vec![0f32; n * obs_layout_minimal::OBS_DIM_MINIMAL];
-            obs_vec
-                .par_chunks_exact_mut(obs_layout_minimal::OBS_DIM_MINIMAL)
-                .enumerate()
-                .for_each(|(j, row)| {
-                    encode_obs_row_minimal(&packed, j, s, inv_bb, bb, &starting, obs_rev, row);
-                });
-
+            let rows: Vec<&mut [f32]> = obs_vec
+                .chunks_exact_mut(obs_layout_minimal::OBS_DIM_MINIMAL)
+                .collect();
+            self.encode_minimal_rows_into(&packed, rows, |_| true);
             (obs_vec, packed, legal_mask)
         });
 
         let obs_arr =
             Array2::from_shape_vec((n, obs_layout_minimal::OBS_DIM_MINIMAL), obs_vec)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        let d = PyDict::new(py);
+        let d = minimal_aux_dict(py, packed, legal_mask)?;
         d.set_item("obs", obs_arr.into_pyarray(py))?;
-        d.set_item("actor", packed.actor.into_pyarray(py))?;
-        d.set_item("legal_mask", legal_mask.into_pyarray(py))?;
-        d.set_item("min_raise", packed.min_raise.into_pyarray(py))?;
-        d.set_item("max_raise", packed.max_raise.into_pyarray(py))?;
-        d.set_item("total_commit", packed.total_commit.into_pyarray(py))?;
-        d.set_item("bet_to_call", packed.bet_to_call.into_pyarray(py))?;
-        d.set_item("street_commit", packed.street_commit.into_pyarray(py))?;
-        d.set_item("street", packed.street.into_pyarray(py))?;
-        d.set_item("pot", packed.pot.into_pyarray(py))?;
         Ok(d)
+    }
+
+    /// Row j of `out` (num_seats wide) = EV payouts of env `idx[j]` sampled
+    /// with `seeds[j]`; rows of non-terminal envs are left as they are (the
+    /// callers pass zeros). Only terminal hands are dispatched, ONE hand per
+    /// rayon task: the hands that need a runout (all-in before the river,
+    /// `num_samples` full evaluations each) are few, expensive and scattered
+    /// through the batch, so coarse chunks of the whole batch left most
+    /// workers idle behind whichever chunk held several of them.
+    fn payouts_ev_rows(&self, num_samples: u32, idx: &[usize], seeds: &[u64], out: &mut [i64]) {
+        let s = self.config.num_seats;
+        let states = &self.states;
+        let term: Vec<(usize, usize)> = idx
+            .iter()
+            .enumerate()
+            .filter(|&(_, &i)| states[i].as_ref().is_some_and(|st| st.is_terminal()))
+            .map(|(j, &i)| (j, i))
+            .collect();
+        let rows: Vec<Vec<i64>> = term
+            .par_iter()
+            .with_max_len(1)
+            .map(|&(j, i)| {
+                states[i]
+                    .as_ref()
+                    .expect("filtered to Some above")
+                    .payouts_ev(num_samples, seeds[j])
+            })
+            .collect();
+        for (&(j, _), row) in term.iter().zip(rows) {
+            out[j * s..(j + 1) * s].copy_from_slice(&row);
+        }
+    }
+
+    /// The minimal (796) encoders are PLO-only; NLH uses the numpy encoder.
+    fn require_plo_minimal(&self, what: &str) -> PyResult<()> {
+        if matches!(self.config.variant, Variant::NlhSingle) {
+            return Err(PyRuntimeError::new_err(format!(
+                "{what} is PLO-only; NLH uses the numpy batch encoder"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Legal-action masks for the envs in `idx` (rows of terminal or empty
+    /// envs stay all-False), one row per env, computed in parallel -- every
+    /// row depends only on its own state.
+    fn legal_masks_indexed(&self, idx: &[usize]) -> Array2<bool> {
+        let mut legal_mask = Array2::<bool>::default((idx.len(), NUM_ACTIONS));
+        legal_mask
+            .as_slice_mut()
+            .expect("a fresh Array2 is contiguous")
+            .par_chunks_mut(NUM_ACTIONS)
+            .zip(idx.par_iter())
+            .for_each(|(row, &i)| {
+                if let Some(state) = self.states[i].as_ref() {
+                    if !state.is_terminal() {
+                        row.copy_from_slice(&state.legal_action_mask());
+                    }
+                }
+            });
+        legal_mask
+    }
+
+    /// Zero, then encode, row j of `packed` into `rows[j]` (in parallel) for
+    /// every j with `keep(j)`; rows with `keep(j) == false` are only zeroed.
+    /// Zero-then-encode is exactly what encoding into a fresh `vec![0f32; ..]`
+    /// did, so the bits match whichever buffer the rows live in.
+    fn encode_minimal_rows_into(
+        &self,
+        packed: &PackedMinimalObservation,
+        rows: Vec<&mut [f32]>,
+        keep: impl Fn(usize) -> bool + Sync,
+    ) {
+        let s = self.config.num_seats;
+        let bb = self.config.bb;
+        let obs_rev = self.obs_rev;
+        let starting = &self.config.starting_stacks;
+        let inv_bb = 1.0f64 / (bb as f64);
+        rows.into_par_iter().enumerate().for_each(|(j, row)| {
+            row.fill(0.0);
+            if keep(j) {
+                encode_obs_row_minimal(packed, j, s, inv_bb, bb, starting, obs_rev, row);
+            }
+        });
     }
 
     /// Lean pack for minimal obs: table-visible fields only. Skips

@@ -121,6 +121,17 @@ class BatchedBombPotEnv:
         else:
             self._use_rust_encoder = OBS_DIM == _RUST_ENCODER_OBS_DIM
             self._rust_minimal = False
+        # In-place minimal encoders (2026-09-23): the engine writes the rows
+        # straight into self._obs — no fresh (N, 796) array per step, no copy,
+        # no masked zeroing pass. Bit-identical buffer contents; capability-
+        # gated so an older engine keeps the copying path.
+        self._rust_minimal_into = bool(self._rust_minimal) and all(
+            hasattr(BatchedEngine, m)
+            for m in (
+                "observation_encoded_minimal_into",
+                "observation_encoded_minimal_subset_into",
+            )
+        )
         if not getattr(BatchedBombPotEnv, "_encoder_log_once", False):
             BatchedBombPotEnv._encoder_log_once = True
             print(
@@ -349,16 +360,29 @@ class BatchedBombPotEnv:
     def _post_apply(self, newly_terminal: np.ndarray) -> BatchedStep:
         rewards = np.zeros((self.n, self.num_seats), dtype=np.float32)
         if newly_terminal.any():
+            rows = np.nonzero(newly_terminal)[0]
             if self._ev_runout_samples > 0:
                 ev_seeds = self._reset_seeds ^ np.uint64(0x9E3779B97F4A7C15)
-                payouts = self._be.payouts_ev_batch(
-                    self._ev_runout_samples, ev_seeds
-                )
+                if hasattr(self._be, "payouts_ev_subset"):
+                    # Only the newly-terminal rows (same values as the
+                    # whole-batch call's rows; envs that finished earlier
+                    # are not re-run).
+                    rewards[rows] = np.asarray(
+                        self._be.payouts_ev_subset(
+                            self._ev_runout_samples,
+                            ev_seeds[rows],
+                            rows.astype(np.int64),
+                        ),
+                        dtype=np.float32,
+                    )
+                else:
+                    payouts = self._be.payouts_ev_batch(
+                        self._ev_runout_samples, ev_seeds
+                    )
+                    rewards[rows] = np.asarray(payouts, dtype=np.float32)[rows]
             else:
                 payouts = self._be.payouts_batch()
-            payouts_f32 = np.asarray(payouts, dtype=np.float32)
-            rows = np.nonzero(newly_terminal)[0]
-            rewards[rows] = payouts_f32[rows]
+                rewards[rows] = np.asarray(payouts, dtype=np.float32)[rows]
 
         self._refresh()
         return self._snapshot(rewards=rewards, newly_terminal=newly_terminal)
@@ -417,6 +441,19 @@ class BatchedBombPotEnv:
                         self._obs = np.zeros(
                             (self.n, self._obs_dim), dtype=np.float32
                         )
+                with record_function("step1a_unpack/post"):
+                    self._unpack_post(bundle)
+                return
+            if getattr(self, "_rust_minimal_into", False):
+                # Encode straight into the cached buffer; rows with a False
+                # mask entry come back zeroed (same bits as the copy + zero
+                # below).
+                with record_function("step1a_bundle/obs_features_batch"):
+                    bundle = self._be.observation_encoded_minimal_into(
+                        self._obs_buffer(),
+                        None if em is None or bool(em.all())
+                        else np.ascontiguousarray(em),
+                    )
                 with record_function("step1a_unpack/post"):
                     self._unpack_post(bundle)
                 return
@@ -500,6 +537,25 @@ class BatchedBombPotEnv:
             self._unpack_post(bundle)
 
 
+    def _obs_is_buffer(self) -> bool:
+        """True iff the cached obs array is a C-contiguous, writeable
+        (N, obs_dim) float32 buffer the in-place encoders can write into."""
+        o = self._obs
+        return (
+            o is not None
+            and o.shape == (self.n, self._obs_dim)
+            and o.dtype == np.float32
+            and bool(o.flags.c_contiguous)
+            and bool(o.flags.writeable)
+        )
+
+    def _obs_buffer(self) -> np.ndarray:
+        """The cached obs array, reallocated (zeros) when it is not a valid
+        in-place buffer. Only for FULL refreshes, which rewrite every row."""
+        if not self._obs_is_buffer():
+            self._obs = np.zeros((self.n, self._obs_dim), dtype=np.float32)
+        return self._obs
+
     def _maybe_project_obs(self) -> None:
         """Legacy no-op: minimal mode encodes 796-d directly.
 
@@ -564,7 +620,20 @@ class BatchedBombPotEnv:
         if idx.size == 0:
             return
         idx_i64 = idx.astype(np.int64)
-        if self._use_rust_encoder:
+        if (
+            self._use_rust_encoder
+            and getattr(self, "_rust_minimal_into", False)
+            and self._obs_is_buffer()
+        ):
+            # Rows go straight into self._obs[idx] (bit-identical to the
+            # compact encode + scatter below); the aux arrays stay compact.
+            with record_function("step1a_bundle/obs_features_subset"):
+                bundle = self._be.observation_encoded_minimal_subset_into(
+                    idx_i64, self._obs
+                )
+            obs_sub = None
+            actors_sub = np.asarray(bundle["actor"], dtype=np.int8)
+        elif self._use_rust_encoder:
             with record_function("step1a_bundle/obs_features_subset"):
                 if getattr(self, "_rust_minimal", False):
                     bundle = self._be.observation_encoded_minimal_subset_batch(
@@ -614,7 +683,8 @@ class BatchedBombPotEnv:
             # Scatter compact (k-row) results back into the full cached
             # arrays at the masked indices. Non-masked rows are left as-is
             # (still valid from the preceding full refresh).
-            self._obs[idx] = obs_sub
+            if obs_sub is not None:
+                self._obs[idx] = obs_sub
             self._legal[idx] = legal_sub
             self._gate_mask[idx] = gate_sub
             self._min_raise[idx] = min_raise_sub
