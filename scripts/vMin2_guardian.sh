@@ -30,7 +30,34 @@ log(){ echo "[vMin2-guardian $(date -u '+%m-%d %H:%M:%S')] $*" >> "$GLOG"; }
 # Match only THIS stem's train.py.
 train_pid(){ pgrep -f "python -u scripts/[t]rain.py .*--checkpoint checkpoints/vMin2.pt" | head -1; }
 
+# NUMA placement: run the trainer on ONE socket with its memory preferred there.
+# The first RunPod host had automatic NUMA balancing on and it migrated 4M of
+# the trainer's pages (16 GB) between sockets in 40 min — the Rust (rayon)
+# worker threads spent ~half their CPU in the kernel taking those faults. A
+# preferred-node memory policy also opts the process out of that balancing
+# (kernel >= 5.12). Node = the GPU's (fastest host<->GPU copies) when it has
+# >= 48 GB free, else the node with the most free memory. No numactl (apt-get
+# install numactl) -> unpinned, as before.
+numa_prefix(){
+  command -v numactl >/dev/null 2>&1 || return 0
+  local bus gpu_node d n free best=-1 bestfree=0 need=$((48 * 1024 * 1024))
+  bus=$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader 2>/dev/null | head -1 | tr 'A-F' 'a-f')
+  gpu_node=$(cat "/sys/bus/pci/devices/${bus: -12}/numa_node" 2>/dev/null || echo -1)
+  for d in /sys/devices/system/node/node[0-9]*; do
+    n=${d##*node}
+    free=$(awk '/MemFree/ {print $4}' "$d/meminfo")
+    if [ "$n" = "$gpu_node" ] && [ "$free" -ge "$need" ]; then
+      echo "numactl --cpunodebind=$n --preferred=$n"; return 0
+    fi
+    if [ "$free" -gt "$bestfree" ]; then best=$n; bestfree=$free; fi
+  done
+  [ "$best" -ge 0 ] && echo "numactl --cpunodebind=$best --preferred=$best"
+}
+
 launch(){
+  local numa
+  numa=$(numa_prefix)
+  log "numa placement: ${numa:-none (numactl missing)}"
   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
   export PATH="$HOME/.cargo/bin:$PATH"
   export PLO5_RUST_ENCODER=1
@@ -38,7 +65,7 @@ launch(){
   export NUMPY_MADVISE_HUGEPAGE=0
   local load=""
   [ -n "${1:-}" ] && load="--load-checkpoint $1"
-  setsid nohup .venv/bin/python -u scripts/train.py \
+  setsid nohup $numa .venv/bin/python -u scripts/train.py \
     --variant plo5_double_bomb \
     --v6 \
     --obs-mode minimal \
