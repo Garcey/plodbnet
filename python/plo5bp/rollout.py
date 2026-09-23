@@ -1463,6 +1463,19 @@ _OBS_POOL_BUFFERS: dict[tuple, dict] = {}  # (obs_dim, layout) -> {"cap", "obs",
 _STAGING_BUFFERS: dict[tuple, tuple] = {}  # (obs_dim, hole, pin, layout) -> (allocator, big, cap)
 
 
+# Called (no arguments) right before a finished rollout batch is copied to
+# the learner device. scripts/train.py --gpu-lock takes its cross-process lock
+# here so runs sharing one GPU never hold two batches + PPO working sets at
+# once (released after the update). None = no-op; never touches any value.
+GPU_PHASE_HOOK: "Callable[[], None] | None" = None
+
+
+def _enter_gpu_phase() -> None:
+    hook = GPU_PHASE_HOOK
+    if hook is not None:
+        hook()
+
+
 def _flat_traj_view(arr: np.ndarray) -> np.ndarray:
     """A (n_envs, n_seats, cap[, w]) trajectory array as a flat
     (n_envs * n_seats * cap[, w]) VIEW -- writes through it land in `arr`, so
@@ -3261,6 +3274,8 @@ def collect_rollout_batched(
     if os.environ.get("PLO5BP_STEP_TIMERS_OWNED", "1").strip() != "0":
         step_timers.report(label="collect_rollout_batched")
         _ACTIVE_STEP_TIMERS = None
+    if out_slabs is None:
+        _enter_gpu_phase()  # a standalone collection ships its batch now
     return _finalize_batch_arr(
         _obs_from_slabs(slabs, wcursor, obs_layout),
         slabs["gm"],
@@ -3636,6 +3651,7 @@ def collect_rollout_multiconfig(
     _parent_timers.report(label="collect_rollout_multiconfig")
     _ACTIVE_STEP_TIMERS = None
 
+    _enter_gpu_phase()
     return _batch_to_device(combined, device)
 
 

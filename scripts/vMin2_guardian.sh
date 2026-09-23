@@ -89,6 +89,7 @@ launch(){
     --lr 1.5e-4 --lr-warmup-updates 0 --clip-room-mid 0.07 \
     --target-kl 0.5 --kl-hard 10.0 --adv-clip 8 --cpu-threads 24 \
     --snapshot-every 5 --checkpoint-every 1 \
+    --gpu-lock runs/gpu_ppo.lock \
     $load --checkpoint checkpoints/vMin2.pt \
     --num-updates 100000000 >> "$LOG" 2>&1 < /dev/null &
   disown 2>/dev/null || true

@@ -1133,6 +1133,40 @@ def _apply_v6_preset(args) -> "tuple[dict, dict]":
     return applied, kept
 
 
+class _GpuPhaseLock:
+    """--gpu-lock: cross-process exclusive flock around the GPU-heavy part of
+    an update (batch copied to the GPU -> PPO -> batch dropped). `acquire` is
+    the rollout module's GPU_PHASE_HOOK (idempotent); `release` returns the
+    cached GPU memory to the driver before letting the next run in."""
+
+    def __init__(self, path: str) -> None:
+        import fcntl
+
+        self._fcntl = fcntl
+        self._path = path
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(path, "a+")
+        self.held = False
+
+    def acquire(self) -> None:
+        if self.held:
+            return
+        t0 = time.perf_counter()
+        self._fcntl.flock(self._fh.fileno(), self._fcntl.LOCK_EX)
+        self.held = True
+        waited = time.perf_counter() - t0
+        if waited > 1.0:
+            print(f"        [gpu-lock] waited {waited:.1f}s for {self._path}", flush=True)
+
+    def release(self) -> None:
+        if not self.held:
+            return
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        self._fcntl.flock(self._fh.fileno(), self._fcntl.LOCK_UN)
+        self.held = False
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-updates", type=int, default=100_000_000)
@@ -1407,6 +1441,17 @@ def main() -> None:
         default=0.0,
         help="If > 0, push opponent-pool snapshots on this wall-clock cadence "
         "(coexists with --snapshot-every).",
+    )
+    parser.add_argument(
+        "--gpu-lock",
+        type=str,
+        default="",
+        help="Share one GPU between concurrent runs (the network-size sweep): "
+        "an exclusive flock on this file is held from the moment a finished "
+        "rollout batch is copied to the GPU until the update is done and its "
+        "memory handed back (torch.cuda.empty_cache), so no two runs' batches "
+        "and PPO working sets are ever resident together. Waiting never "
+        "changes a value. Linux; empty = off.",
     )
     parser.add_argument("--pool-mix-prob", type=float, default=0.5)
     parser.add_argument("--pool-opp-seats", type=int, default=2)
@@ -2144,6 +2189,10 @@ def main() -> None:
     obs_rev = int(getattr(_encoding, "OBS_SEMANTICS_REV", 2))
     # Rollout observation STORAGE (not a feature change — bit-exact on unpack).
     from plo5bp import rollout as _rollout_mod
+    gpu_lock = _GpuPhaseLock(args.gpu_lock) if args.gpu_lock else None
+    if gpu_lock is not None:
+        _rollout_mod.GPU_PHASE_HOOK = gpu_lock.acquire
+        print(f"[gpu-lock] GPU phase of every update serialized on {args.gpu_lock}")
     _obs_layout = _rollout_mod._resolve_obs_layout(train_cfg, args.variant)
     if _obs_layout is None:
         print(f"[obs-storage] dense float32: {4 * obs_dim:,} B per stored observation")
@@ -3160,6 +3209,8 @@ def main() -> None:
         # blocks for the next collection. Bit-exact: nothing reads `batch` after
         # this point (the final save uses model/critic only).
         del batch
+        if gpu_lock is not None:
+            gpu_lock.release()  # frees this update's GPU memory first
 
         update += 1
 
