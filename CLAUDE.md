@@ -66,13 +66,32 @@ it's being run from `rust_engine/` instead of repo root.
 
 ## Training
 
-**Always use the 2048×4 network: pass `--hidden-dim 2048 --num-layers 4`
-on every training invocation.** The script defaults to 128×2 (legacy
-size); training at the default silently produces a smaller, weaker
-model — already cost a multi-day run mistaken for a 2048×4 result.
-There is no scenario in this project where 128×2 is the right
-architecture; if a flag is missing, add it. The same rule applies to
-`launch_vtwo.sh` (it hardcodes 2048×4).
+**Always name the network size explicitly: pass `--hidden-dim` and
+`--num-layers` on every training invocation.** The script defaults to
+128×2 (legacy); an unflagged run once trained the default for days and
+was mistaken for a 2048×4 result — the lesson is "never train a size by
+accident", not "only 2048×4". Sizes by lineage: the full-obs `vSix` stems
+use 2048×4 (`launch_vtwo.sh` hardcodes it too); the minimal-obs `vMin1`
+stem DELIBERATELY uses a small net (actor 128×3, critic 128×2 — see
+`scripts/vMin1_guardian.sh`). A network-size study (owner, 2026-08/09)
+found many unused neurons; 128×3 is the last size tested and the owner
+believes it is STILL too big (dead neurons/connections). The small net is
+what buys vMin1's much longer rollout (more data per update). Do not
+"correct" vMin1 up to 2048×4.
+
+**Longer rollouts are always better (owner, 2026-09-23).** PLO5
+double-board bomb pots stack an enormous space of hole/board card
+combinations on an effectively unbounded game tree, on top of a wide
+spread of seat/stack configurations, on top of massive variance. More rows
+per update means each update sees more near-identical spots AND how small
+differences between them shift the strategy — the precise, solver-like
+strategy this project wants. So memory/time saved anywhere in the loop
+should be spent on `--rollout-length`; prefer designs that let it grow.
+
+Roadmap (2026-09-23): (1) make the training loop more efficient (compact
+observation storage etc.), (2) real timing runs on RunPod, (3) a size
+sweep for BOTH actor and critic to find the optimal network size, (4) a
+full training run.
 
 `scripts/train.py` is **v2-family-only** (centralized critic; the
 critic's state rides in the checkpoint under `"critic"`). It refuses to
@@ -141,6 +160,35 @@ anchor` = v2 (head_version 2), `logistic` = v4 (3), `mixture` = v5 (4).
   solver (`rust_engine/src/cfr/`) → label export → supervised PolicyNet
   (`python/plo5bp/gto/`), served through `PolicyNetHost`; the desktop
   "CFR Solver" app is `python/plo5bp/cfr_app/`. See "NLH GTO teacher".
+- **Rollout efficiency pass (2026-09-23)** — exact unless noted:
+  - **Compact observation storage** (`python/plo5bp/compact_obs.py`; Rust
+    `pack_obs_rows` / `unpack_obs_rows`): the batched rollout keeps each
+    observation's exact-0/1 columns (cards, one-hots, seat masks, history
+    one-hots — `encoding.FLAG_MASK_MINIMAL` / `FLAG_MASK_FULL`) as bits and
+    the rest verbatim f32: 456 B per row on the minimal layout (dense 3,184,
+    7.0x), 1,956 B on full (2.4x) — host staging, the end-of-rollout H2D and
+    the GPU-resident batch all shrink, which is what lets `--rollout-length`
+    grow. `Batch.obs` is then a `PackedObs`; `iter_minibatches` unpacks each
+    minibatch on the learner device, bit-exact (pinned: compact vs dense
+    rollouts AND PPO updates are identical, `test_compact_obs.py`). Feeding a
+    whole `Batch.obs` to a network fails loudly — tests/diagnostics use
+    `compact_obs.as_dense`. The packer REJECTS any flag-column value other
+    than exactly 0.0/1.0, so an encoder change can't silently corrupt rows.
+    NLH stays dense. `--no-compact-obs` = the old dense rows. An engine built
+    before this has no packer: the rollout stores dense and says so once.
+  - **Batched opponents** (`rollout._StackedOpponents`): all pool snapshots'
+    opponent rows go through ONE vmapped forward + ONE sampling pass per step
+    (`ActorCriticV2._act_from_heads` = `act` minus `forward`; the learner's
+    `act` is bit-identical) instead of one `act()` per snapshot — each call is
+    mostly fixed GPU launch overhead with a small net. RNG stream changes
+    (same per-row policy; ~1e-6 logit rounding). `--no-batched-opponents`.
+  - **Pool-mix draws batched** (`rollout._draw_pool_mix`, was a Python loop
+    per finished hand): same distribution, different RNG stream.
+  - Trajectory arrays start at 32 slots per seat and double on demand up to
+    192 (was a fixed 192: ~735 MB zero-filled per vMin1 sub-rollout).
+  - Step timers also cover `step0/setup`, `step0/prestep`,
+    `step3a/opp_holes_rot`, `step3c/traj_snapshot` (the per-step obs staging
+    copy — the largest item that used to be untimed).
 
 ### v5 (2026-07-06, IMPLEMENTED, not yet trained — V5_DESIGN.md canonical)
 
@@ -431,7 +479,7 @@ preflop/multiway) → label export → supervised PolicyNet → `PolicyNetHost`
   (seat, path, runout) and weighted by `visit_mass`.
 
 ```bash
-# NLH training (2048×4 rule applies to real runs, same as PLO)
+# NLH training (name the size explicitly, same as PLO — see Training)
 .venv/Scripts/python scripts/train.py --variant nlh_single \
   --sizing-head logistic --hidden-dim 2048 --num-layers 4 \
   --stack-dist deep --num-seats-range "2,3,4,5,6"
@@ -595,9 +643,13 @@ Two drivers in `python/plo5bp/rollout.py`:
   probe, eval. Must stay bit-exact; don't refactor for speed.
 - `collect_rollout_batched` — Phase A-D: `BatchedBombPotEnv` wraps
   `PyBatchedEngine`, encoder is vectorized, opponents are grouped by
-  pool-snapshot index. Bit-exact parity vs serial is *not* asserted
-  (RNG-consumption order differs); parity is at the env level (see
-  `tests/python/test_env_batched.py`) and the training smoke.
+  pool-snapshot index (one stacked call for all of them since 2026-09-23).
+  Bit-exact parity vs serial is *not* asserted (RNG-consumption order
+  differs); parity is at the env level (see
+  `tests/python/test_env_batched.py`) and the training smoke. Its RNG stream
+  changed on 2026-09-23 (batched pool-mix draws + batched opponents): the
+  same seed does not reproduce pre-2026-09-23 batches — distributions are
+  unchanged. Stored observations may be compact (`compact_obs.PackedObs`).
 
 ## Determinism contracts (don't break these)
 
@@ -1303,6 +1355,7 @@ python/plo5bp/
   encoding.py, encoding_nlh.py  scalar + batch encoders, OBS_SEMANTICS_REV
   sizing.py                   canonical anchor-grid math (network/rollout/UI)
   rollout.py                  serial + batched + multiconfig rollout drivers
+  compact_obs.py              compact (bit-packed) rollout observation storage
   ppo.py, selfplay.py         training loop, opponent pool
   network.py                  ActorCritic v1/v2/v4/v5 + CentralCritic
   actions.py, config.py, masking.py, eval.py, exploit.py

@@ -13,6 +13,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from plo5bp.compact_obs import as_dense
 from plo5bp.config import GameConfig, TrainingConfig
 from plo5bp.network import ActorCriticV2, CentralCritic
 from plo5bp.ppo import PPOTrainer
@@ -293,7 +294,7 @@ def test_sizing_entropy_scale_gradient_behavior() -> None:
     def head_grads(scale):
         model.zero_grad(set_to_none=True)
         out = model.evaluate(
-            batch.obs, batch.gate_masks, batch.sizing,
+            as_dense(batch.obs), batch.gate_masks, batch.sizing,
             batch.gate_actions, batch.anchor_actions, batch.refine_u,
         )
         entropy, gate_h = out[1], out[3]

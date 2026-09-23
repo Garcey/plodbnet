@@ -28,6 +28,10 @@ SF/flush blocks, blockers, opp-outcome MC, per-board outcome, last aggressor,
 rel-pos, all v2/v7 engineered tails.
 
 ## Stem config (scripts/vMin1_guardian.sh)
+- **2026-09-23 correction (owner):** the guardian's **128×3 actor / 128×2 critic is
+  deliberate** — a later network-size study found even 128×3 leaves many neurons
+  unused (smaller may be viable), and the small net buys a much longer rollout.
+  The 1024×3 below is the ORIGINAL experiment plan, superseded.
 - `--obs-mode minimal`
 - actor **1024×3** + torso LN; critic **1024×2**
 - v6 preset (mixture, q_aux, etc.)

@@ -20,6 +20,7 @@ import torch
 
 from plo5bp.config import GameConfig, TrainingConfig
 from plo5bp.network import ActorCriticV2
+from plo5bp.compact_obs import as_dense
 from plo5bp.rollout import _BATCH_TENSOR_FIELDS, Batch, collect_rollout_multiconfig
 from plo5bp.selfplay import OpponentPool
 
@@ -57,7 +58,7 @@ def _assert_bit_identical(a: Batch, b: Batch) -> None:
         ta, tb = getattr(a, f), getattr(b, f)
         assert ta.dtype == tb.dtype, f"{f}: dtype {ta.dtype} vs {tb.dtype}"
         assert ta.shape == tb.shape, f"{f}: shape {ta.shape} vs {tb.shape}"
-        assert torch.equal(ta, tb), f"{f}: values differ"
+        assert torch.equal(as_dense(ta), as_dense(tb)), f"{f}: values differ"
     assert a.aggr_bonus_total_bb == b.aggr_bonus_total_bb
     assert a.aggr_steps_total == b.aggr_steps_total
     assert a.aggr_bonus_steps == b.aggr_bonus_steps

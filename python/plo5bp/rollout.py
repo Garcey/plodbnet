@@ -20,6 +20,7 @@ opponent seats do not store anything.
 
 from __future__ import annotations
 
+import copy
 import os
 import time
 from dataclasses import dataclass, replace
@@ -31,6 +32,13 @@ from torch.profiler import record_function
 
 from plo5bp._engine import compute_aggression_bonus_batch  # type: ignore[attr-defined]
 from plo5bp.actions import ALL_IN, GATE_ACTIONS, GATE_CHECK_CALL, GATE_RAISE
+from plo5bp.compact_obs import (
+    RUST_PACKER_AVAILABLE,
+    CompactObsLayout,
+    PackedObs,
+    layout_for,
+    pack_rows_into,
+)
 from plo5bp.config import GameConfig, TrainingConfig
 from plo5bp.encoding import OBS_DIM, OBS_DIM_MINIMAL
 from plo5bp.encoding_nlh import OBS_DIM_NLH
@@ -38,6 +46,7 @@ from plo5bp.env import BombPotEnv
 from plo5bp.env_batched import BatchedBombPotEnv
 from plo5bp.network import (
     ActorCritic,
+    ActOut,
     CentralCritic,
     build_actor_from_state_dict,
     opp_holes_multihot,
@@ -311,7 +320,9 @@ class _PinnedStepH2D:
 
 @dataclass
 class Batch:
-    obs: torch.Tensor           # (T, OBS_DIM) f32
+    # (T, OBS_DIM) f32 — or its compact storage (compact_obs.PackedObs), whose
+    # row indexing (obs[rows], as iter_minibatches does) yields dense f32 rows.
+    obs: "torch.Tensor | PackedObs"
     gate_masks: torch.Tensor    # (T, GATE_ACTIONS) bool
     gate_actions: torch.Tensor  # (T,) long — sampled gate index
     raise_chips: torch.Tensor   # (T,) long — chip delta (0 for non-Raise)
@@ -776,7 +787,7 @@ def _finalize_batch(
 
 
 def _finalize_batch_arr(
-    all_obs_arr: np.ndarray,
+    obs_host: "torch.Tensor | PackedObs",
     all_gm_arr: np.ndarray,
     all_ga_arr: np.ndarray,
     all_rc_arr: np.ndarray,
@@ -802,13 +813,15 @@ def _finalize_batch_arr(
 ) -> Batch:
     """Slab-based finalize: each `all_*_arr` is preallocated and written
     contiguously. Slice to `[:wcursor]` and copy once to `device` per
-    slab. No `np.stack` over millions of small arrays.
+    slab. No `np.stack` over millions of small arrays. `obs_host` is the
+    first `wcursor` stored observations, already a host view (dense tensor
+    or compact `PackedObs` — see `_obs_from_slabs`).
     """
     # When the source slabs are pinned (CUDA path) `non_blocking=True`
     # lets the H2D copies queue against the default stream and overlap
     # downstream compute; on CPU device the flag is a no-op.
     with _TimedRF("step11/finalize_h2d"):
-        obs_t = torch.from_numpy(all_obs_arr[:wcursor]).to(device, non_blocking=True)
+        obs_t = obs_host.to(device, non_blocking=True)
         gm_t = torch.from_numpy(all_gm_arr[:wcursor]).to(device, non_blocking=True)
         ga_t = torch.from_numpy(all_ga_arr[:wcursor]).to(device, non_blocking=True)
         rc_t = torch.from_numpy(all_rc_arr[:wcursor]).to(device, non_blocking=True)
@@ -1263,26 +1276,106 @@ TRAIN_OPP_OUTCOME_MC = 384
 # Output-slab layout — ONE definition for collect_rollout_batched's own slabs
 # and collect_rollout_multiconfig's shared staging buffer (they used to carry
 # two hand-synced 15-line allocation lists). Order is irrelevant; keys are the
-# `out_slabs` contract.
+# `out_slabs` contract. The observation is ONE dense float32 slab ("obs") or,
+# with compact storage (compact_obs.py), a bit slab plus a verbatim real-column
+# slab ("obs_bits", "obs_real"); `_slab_keys(layout)` is the full key set.
+# Initial per-(env, seat) trajectory capacity of the batched collector; it
+# doubles on demand up to MAX_STEPS_PER_SEAT (see `_grow_traj` there).
+_TRAJ_CAP_INIT = 32
+
 _SLAB_KEYS = (
-    "obs", "gm", "ga", "rc", "sz", "an", "ru", "oh",
+    "gm", "ga", "rc", "sz", "an", "ru", "oh",
     "lp", "glp", "alp", "v", "ret", "adv", "last",
 )
 
 
+def _obs_spec(
+    obs_dim: int, layout: CompactObsLayout | None
+) -> dict[str, tuple[tuple[int, ...], type, torch.dtype]]:
+    """Per-row shape + numpy/torch dtypes of the stored observation slab(s)."""
+    if layout is None:
+        return {"obs": ((int(obs_dim),), np.float32, torch.float32)}
+    assert layout.obs_dim == int(obs_dim), (layout.obs_dim, obs_dim)
+    return {
+        "obs_bits": ((layout.n_bytes,), np.uint8, torch.uint8),
+        "obs_real": ((layout.n_real,), np.float32, torch.float32),
+    }
+
+
+def _slab_keys(layout: CompactObsLayout | None) -> tuple[str, ...]:
+    return (("obs",) if layout is None else ("obs_bits", "obs_real")) + _SLAB_KEYS
+
+
+def _alloc_obs_pool(
+    cap: int, obs_dim: int, layout: CompactObsLayout | None
+) -> dict[str, np.ndarray]:
+    """The per-step observation pool (rows appended at decision time, gathered
+    into the output slabs at hand end), in the slabs' observation layout."""
+    return {
+        key: np.empty((int(cap), *shape), dtype=np_dtype)
+        for key, (shape, np_dtype, _td) in _obs_spec(obs_dim, layout).items()
+    }
+
+
+def _obs_from_slabs(
+    slabs: dict[str, np.ndarray], rows: int, layout: CompactObsLayout | None
+) -> "torch.Tensor | PackedObs":
+    """Host view (no copy) of the first `rows` stored observations."""
+    if layout is None:
+        return torch.from_numpy(slabs["obs"][:rows])
+    return PackedObs(
+        torch.from_numpy(slabs["obs_bits"][:rows]),
+        torch.from_numpy(slabs["obs_real"][:rows]),
+        layout,
+    )
+
+
+_WARNED_DENSE_FALLBACK = False
+
+
+def _resolve_obs_layout(
+    train_config: TrainingConfig, variant: str
+) -> CompactObsLayout | None:
+    """Compact observation storage for a collection (compact_obs.py), or None
+    = dense float32 rows. ONE resolver for the collector's own pool/slabs and
+    multiconfig's shared staging, so the two always agree. Storage only: the
+    rows unpack bit-exactly, so batches, RNG and training are unchanged."""
+    global _WARNED_DENSE_FALLBACK
+    if not bool(getattr(train_config, "compact_obs", True)):
+        return None
+    layout = layout_for(variant, str(getattr(train_config, "obs_mode", "full")))
+    if layout is not None and not RUST_PACKER_AVAILABLE:
+        if not _WARNED_DENSE_FALLBACK:
+            print(
+                "[obs-storage] WARNING: this engine build has no pack_obs_rows "
+                "(built before compact storage) -- storing observations DENSE. "
+                "Rebuild: .venv/Scripts/maturin develop --release",
+                flush=True,
+            )
+            _WARNED_DENSE_FALLBACK = True
+        return None
+    return layout
+
+
 class _SlabAllocator:
-    """Allocates / grows a `_SLAB_KEYS` dict of host output slabs, optionally
+    """Allocates / grows a `_slab_keys(layout)` dict of host output slabs, optionally
     in pinned memory (PLO5BP_PIN_ROLLOUT — see the pinning-tax note in
     collect_rollout_batched). `grow` is the A6 replacement for the old hard
     overflow error: a bigger set + one copy of the rows already written."""
 
-    def __init__(self, obs_dim: int, hole_count: int, pin: bool) -> None:
+    def __init__(
+        self,
+        obs_dim: int,
+        hole_count: int,
+        pin: bool,
+        layout: CompactObsLayout | None = None,
+    ) -> None:
         self._pin = bool(pin)
         # Pinned tensors own the memory behind their numpy views.
         self._keepalive: list[torch.Tensor] = []
         f32, i64 = (np.float32, torch.float32), (np.int64, torch.int64)
         self._spec: dict[str, tuple[tuple[int, ...], type, torch.dtype]] = {
-            "obs": ((int(obs_dim),), *f32),
+            **_obs_spec(obs_dim, layout),
             "gm": ((GATE_ACTIONS,), bool, torch.bool),
             "ga": ((), *i64),
             "rc": ((), *i64),
@@ -1298,7 +1391,8 @@ class _SlabAllocator:
             "adv": ((), *f32),
             "last": ((), bool, torch.bool),
         }
-        assert tuple(self._spec) == _SLAB_KEYS
+        self.keys = _slab_keys(layout)
+        assert tuple(self._spec) == self.keys
 
     def alloc(self, cap: int) -> dict[str, np.ndarray]:
         self._keepalive = []
@@ -1318,10 +1412,120 @@ class _SlabAllocator:
     ) -> dict[str, np.ndarray]:
         old_keepalive = self._keepalive
         new = self.alloc(new_cap)
-        for key in _SLAB_KEYS:
+        for key in self.keys:
             new[key][:used_rows] = slabs[key][:used_rows]
         del old_keepalive
         return new
+
+
+def _draw_pool_mix(
+    rng: np.random.Generator,
+    k: int,
+    n_seats: int,
+    pool_size: int,
+    pool_opp_seats: int,
+    pool_mix_prob: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Opponent assignment for `k` hands about to be dealt (batched collector):
+    returns (pool snapshot index per hand, -1 = pure self-play; (k, n_seats)
+    learner-seat mask).
+
+    Per hand this is the distribution the old per-env loop drew: with
+    probability `pool_mix_prob`, `pool_opp_seats` distinct seats chosen
+    uniformly go to ONE uniformly drawn pool snapshot and the rest stay learner
+    seats; otherwise every seat is a learner seat (pool empty / 0 opp seats /
+    prob <= 0: always self-play, no draws). PRODUCTION BEHAVIOR CHANGE
+    (2026-09-23), RNG stream only: the draws are batched (a few numpy calls per
+    step instead of ~3 per finished hand — the loop cost 4-10 ms/step at the
+    vMin1 table count), so the sequence of deals/assignments differs from the
+    pre-change collector; the distribution is identical. The uniform subset is
+    the first `pool_opp_seats` seats of a uniformly random permutation (argsort
+    of iid uniform keys)."""
+    snap = np.full(k, -1, dtype=np.int64)
+    mask = np.ones((k, n_seats), dtype=bool)
+    if k == 0 or pool_size == 0 or pool_opp_seats == 0 or pool_mix_prob <= 0.0:
+        return snap, mask
+    mixed = np.nonzero(rng.random(k) < pool_mix_prob)[0]
+    if mixed.size:
+        snap[mixed] = rng.integers(0, pool_size, size=mixed.size)
+        opp = np.argsort(rng.random((mixed.size, n_seats)), axis=1)[:, :pool_opp_seats]
+        mask[mixed[:, None], opp] = False
+    return snap, mask
+
+
+class _StackedOpponents:
+    """Every pool snapshot's actor as ONE batched call per step (2026-09-23).
+
+    The batched collector used to call each snapshot's `act()` separately every
+    step — up to `opponent_pool_size` (8) calls. With a small network each call
+    is almost pure GPU launch overhead (~200 small kernels, most of them in the
+    sampling tail), so a step paid it once per snapshot. Pool membership is
+    frozen for the whole update, so the snapshots' weights are stacked once per
+    sub-rollout and each step runs ONE `torch.func.vmap`'d forward (a batched
+    matmul per layer; each snapshot sees only its own rows, padded to the
+    largest group) and ONE `_act_from_heads` sampling pass over all opponent
+    rows.
+
+    PRODUCTION BEHAVIOR CHANGE (RNG stream only): batched matmuls round
+    differently from per-snapshot ones (~1e-6 on the logits) and the single
+    sampling pass draws the RNG in a different order, so trajectories are not
+    bit-identical to the per-snapshot path — but every opponent row still
+    samples its OWN snapshot's policy, and opponent rows are never trained on.
+    `--no-batched-opponents` restores the per-snapshot calls."""
+
+    def __init__(self, models: list) -> None:
+        self.template = models[0]
+        self.n = len(models)
+        self.params, self.buffers = torch.func.stack_module_state(models)
+        base = copy.deepcopy(models[0]).to("meta")  # structure only
+
+        def _forward(params, buffers, obs, gate_mask):
+            return torch.func.functional_call(base, (params, buffers), (obs, gate_mask))
+
+        self._vforward = torch.func.vmap(_forward)
+
+    @staticmethod
+    def supported(models: list) -> bool:
+        """One stack needs the same class, identical parameter/buffer shapes
+        and the same sampling constants in every snapshot — always true within
+        a run; a pool seeded from differently-shaped checkpoints (or a v1
+        pool, which has no `_act_from_heads`) keeps per-snapshot calls."""
+        if not models or not hasattr(models[0], "_act_from_heads"):
+            return False
+        m0 = models[0]
+        shapes = {k: tuple(v.shape) for k, v in m0.state_dict().items()}
+        consts = ("anchor_spec", "_size_floor", "_size_span", "_mix_floor", "_mixture_k")
+        for m in models[1:]:
+            if type(m) is not type(m0):
+                return False
+            if {k: tuple(v.shape) for k, v in m.state_dict().items()} != shapes:
+                return False
+            if any(getattr(m, c, None) != getattr(m0, c, None) for c in consts):
+                return False
+        return True
+
+    def act(
+        self,
+        obs: torch.Tensor,
+        gate_mask: torch.Tensor,
+        sizing: torch.Tensor,
+        slot_g: torch.Tensor,
+        slot_j: torch.Tensor,
+        n_max: int,
+        deterministic: bool = False,
+    ) -> ActOut:
+        """Sample (or argmax, `deterministic`) the opponent rows `obs` /
+        `gate_mask` / `sizing` (device tensors); row i belongs to snapshot
+        `slot_g[i]` at padded position `slot_j[i]` (< `n_max`). Padding rows
+        see an all-False gate mask and are dropped before sampling."""
+        obs_pad = obs.new_zeros((self.n, n_max, obs.shape[-1]))
+        obs_pad[slot_g, slot_j] = obs
+        gm_pad = gate_mask.new_zeros((self.n, n_max, gate_mask.shape[-1]))
+        gm_pad[slot_g, slot_j] = gate_mask
+        heads = self._vforward(self.params, self.buffers, obs_pad, gm_pad)
+        return self.template._act_from_heads(
+            *(h[slot_g, slot_j] for h in heads), sizing, deterministic=deterministic
+        )
 
 
 def collect_rollout_batched(
@@ -1386,6 +1590,9 @@ def collect_rollout_batched(
     else:
         step_timers = _StepTimers()
         _ACTIVE_STEP_TIMERS = step_timers
+    # Wall time from here to the first loop iteration: env build/reuse, the
+    # per-sub trajectory arrays + obs pool allocations, the first deal/refresh.
+    step_timers.begin("step0/setup")
     n_seats = game_config.num_seats
     reward_norm = 1.0 / float(game_config.bb)
     gamma = train_config.gamma
@@ -1468,32 +1675,15 @@ def collect_rollout_batched(
         snapshot_models[sd_idx] = m
         return m
 
-    learner_seats: list[set[int]] = [set(range(n_seats)) for _ in range(n_envs)]
     # (n_envs, n_seats) bool — `True` where seat is a learner seat in that
-    # env. Mirrors `learner_seats` (the source of truth) and is updated in
-    # lockstep by `_assign_pool_mix`. Enables vectorized "is this actor a
-    # learner seat?" lookups in the per-step hot loop.
+    # env (the only record of it: the per-env Python sets that used to mirror
+    # it were never read). Set per deal by `_draw_pool_mix`; enables the
+    # vectorized "is this actor a learner seat?" lookups in the hot loop.
     learner_seats_mask = np.ones((n_envs, n_seats), dtype=bool)
     # (n_envs,) i64 — pool snapshot index per env, or -1 for self-play.
     # Replaces the per-env Python list `env_snapshot_idx` so opp grouping
     # can be vectorized via `np.unique` over the masked column.
     env_snapshot_idx_arr = np.full(n_envs, -1, dtype=np.int64)
-
-    def _assign_pool_mix(env_idx: int) -> None:
-        if len(pool) == 0 or pool_opp_seats == 0 or rng.random() >= pool_mix_prob:
-            learner_seats[env_idx] = set(range(n_seats))
-            learner_seats_mask[env_idx] = True
-            env_snapshot_idx_arr[env_idx] = -1
-            return
-        sd_idx = int(rng.integers(0, len(pool.snapshots)))
-        env_snapshot_idx_arr[env_idx] = sd_idx
-        _get_snapshot_model(sd_idx)
-        opp_seats_arr = rng.choice(n_seats, size=pool_opp_seats, replace=False)
-        opp_set = set(opp_seats_arr.tolist())
-        learner_seats[env_idx] = set(range(n_seats)) - opp_set
-        row = np.ones(n_seats, dtype=bool)
-        row[opp_seats_arr] = False
-        learner_seats_mask[env_idx] = row
 
     # Eager-build every pool member once up front (cheap if snapshot_cache
     # already warm from multiconfig). Avoids first-use build mid-hand when a
@@ -1502,8 +1692,25 @@ def collect_rollout_batched(
     for _sd in range(len(pool.snapshots)):
         _get_snapshot_model(_sd)
 
-    for i in range(n_envs):
-        _assign_pool_mix(i)
+    def _assign_pool_mix(env_ids: np.ndarray) -> None:
+        """Opponent assignment for the hands about to be dealt in `env_ids`."""
+        snap, mask = _draw_pool_mix(
+            rng, int(env_ids.size), n_seats, len(pool.snapshots),
+            pool_opp_seats, pool_mix_prob,
+        )
+        env_snapshot_idx_arr[env_ids] = snap
+        learner_seats_mask[env_ids] = mask
+
+    _assign_pool_mix(np.arange(n_envs, dtype=np.int64))
+
+    # Batched opponents (_StackedOpponents): ONE stacked forward + ONE sampling
+    # pass for every pool snapshot per step. None = per-snapshot calls
+    # (--no-batched-opponents, an empty pool, or snapshots of mixed shape).
+    _stacked_opp: _StackedOpponents | None = None
+    if bool(getattr(train_config, "batched_opponents", True)) and len(pool.snapshots):
+        _snap_models = [_get_snapshot_model(i) for i in range(len(pool.snapshots))]
+        if _StackedOpponents.supported(_snap_models):
+            _stacked_opp = _StackedOpponents(_snap_models)
 
     init_seeds = rng.integers(0, 2**63 - 1, size=n_envs, dtype=np.int64).astype(
         np.uint64
@@ -1592,33 +1799,69 @@ def collect_rollout_batched(
     # below (growing on demand), NOT this capacity, and flush temporaries
     # are bounded by the actual max trajectory length per flush.
     MAX_STEPS_PER_SEAT = 192
+    # The arrays start at `_TRAJ_CAP_INIT` slots and DOUBLE on demand up to
+    # that cap (`_grow_traj`; exact — slots at or past a seat's length are
+    # never read). A hand uses < ~16 decisions per seat, so the old fixed
+    # 192-slot allocation zero-filled ~735 MB per vMin1 sub-rollout
+    # (7,333 envs x 6 seats x 192 x 87 B; ~2.4 s per 30-config update) for
+    # slots that stay empty (2026-09-23).
+    traj_cap = min(_TRAJ_CAP_INIT, MAX_STEPS_PER_SEAT)
     traj_lengths = np.zeros((n_envs, n_seats), dtype=np.int32)
     # Absolute index into `step_obs_pool` / `step_gm_pool` per (env, seat, slot).
-    traj_obs_idx = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.int64)
-    traj_gate = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.int8)
-    traj_chips = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.int64)
-    traj_sizing = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT, 4), dtype=np.int64)
-    traj_anchor = np.full((n_envs, n_seats, MAX_STEPS_PER_SEAT), -1, dtype=np.int8)
-    traj_u = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.float32)
-    traj_log_p = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.float32)
-    traj_gate_lp = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.float32)
-    traj_anchor_lp = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.float32)
-    traj_value = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.float32)
+    traj_obs_idx = np.zeros((n_envs, n_seats, traj_cap), dtype=np.int64)
+    traj_gate = np.zeros((n_envs, n_seats, traj_cap), dtype=np.int8)
+    traj_chips = np.zeros((n_envs, n_seats, traj_cap), dtype=np.int64)
+    traj_sizing = np.zeros((n_envs, n_seats, traj_cap, 4), dtype=np.int64)
+    traj_anchor = np.full((n_envs, n_seats, traj_cap), -1, dtype=np.int8)
+    traj_u = np.zeros((n_envs, n_seats, traj_cap), dtype=np.float32)
+    traj_log_p = np.zeros((n_envs, n_seats, traj_cap), dtype=np.float32)
+    traj_gate_lp = np.zeros((n_envs, n_seats, traj_cap), dtype=np.float32)
+    traj_anchor_lp = np.zeros((n_envs, n_seats, traj_cap), dtype=np.float32)
+    traj_value = np.zeros((n_envs, n_seats, traj_cap), dtype=np.float32)
     # VRPO: Q(s_t, a_t) and V^π(s_t)=Σ_a π(a)Q(s_t,a) per learner step, laid
     # out like traj_value; the Expected-SARSA(λ) scan consumes them. None when
     # the estimator is GAE (never indexed in that path).
     traj_q_taken = (
-        np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.float32)
+        np.zeros((n_envs, n_seats, traj_cap), dtype=np.float32)
         if use_vrpo else None
     )
     traj_vpi = (
-        np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.float32)
+        np.zeros((n_envs, n_seats, traj_cap), dtype=np.float32)
         if use_vrpo else None
     )
     # Per-step cost / pot / street parallel arrays, mirrored shape.
-    costs_arr = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.float32)
-    pots_arr = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.float32)
-    streets_arr = np.zeros((n_envs, n_seats, MAX_STEPS_PER_SEAT), dtype=np.int8)
+    costs_arr = np.zeros((n_envs, n_seats, traj_cap), dtype=np.float32)
+    pots_arr = np.zeros((n_envs, n_seats, traj_cap), dtype=np.float32)
+    streets_arr = np.zeros((n_envs, n_seats, traj_cap), dtype=np.int8)
+
+    def _grow_traj(min_cap: int) -> None:
+        """Re-allocate every per-(env, seat) trajectory array with at least
+        `min_cap` slots (doubling, capped at MAX_STEPS_PER_SEAT), copying the
+        slots written so far; fresh slots get each array's initial fill."""
+        nonlocal traj_cap, traj_obs_idx, traj_gate, traj_chips, traj_sizing
+        nonlocal traj_anchor, traj_u, traj_log_p, traj_gate_lp, traj_anchor_lp
+        nonlocal traj_value, traj_q_taken, traj_vpi, costs_arr, pots_arr
+        nonlocal streets_arr
+        new_cap = min(MAX_STEPS_PER_SEAT, max(int(min_cap), 2 * traj_cap))
+
+        def grown(a: np.ndarray | None, fill: int = 0) -> np.ndarray | None:
+            if a is None:
+                return None
+            shape = a.shape[:2] + (new_cap,) + a.shape[3:]
+            b = np.full(shape, fill, dtype=a.dtype) if fill else np.zeros(shape, dtype=a.dtype)
+            b[:, :, :traj_cap] = a
+            return b
+
+        traj_obs_idx, traj_gate = grown(traj_obs_idx), grown(traj_gate)
+        traj_chips, traj_sizing = grown(traj_chips), grown(traj_sizing)
+        traj_anchor = grown(traj_anchor, -1)
+        traj_u, traj_log_p = grown(traj_u), grown(traj_log_p)
+        traj_gate_lp, traj_anchor_lp = grown(traj_gate_lp), grown(traj_anchor_lp)
+        traj_value = grown(traj_value)
+        traj_q_taken, traj_vpi = grown(traj_q_taken), grown(traj_vpi)
+        costs_arr, pots_arr = grown(costs_arr), grown(pots_arr)
+        streets_arr = grown(streets_arr)
+        traj_cap = new_cap
 
     # Flat pre-allocated obs / gate-mask pool. Each step appends
     # `learner_idx_np.size` rows at `pool_cursor`; trajectory slots
@@ -1643,20 +1886,25 @@ def collect_rollout_batched(
     pool_cap = rollout_target + n_envs * _slack_per_env()
     # env.obs_dim, not the OBS_DIM constant: the batched env's layout is
     # per-variant (991 PLO / 995 NLH).
-    step_obs_pool = np.empty((pool_cap, env.obs_dim), dtype=np.float32)
+    # Compact observation storage (compact_obs.py; None = dense float32). The
+    # pool and the output slabs share the layout; multiconfig's shared staging
+    # uses the same resolver, so the `out_slabs` it hands over match too.
+    obs_layout = _resolve_obs_layout(train_config, game_config.variant)
+    step_obs_pool = _alloc_obs_pool(pool_cap, env.obs_dim, obs_layout)
     step_gm_pool = np.empty((pool_cap, GATE_ACTIONS), dtype=bool)
     pool_cursor = 0
 
     def _grow_pool(min_rows: int) -> None:
         nonlocal step_obs_pool, step_gm_pool, pool_cap
         new_cap = max(int(min_rows), pool_cap + max(pool_cap // 4, n_envs))
-        new_obs = np.empty((new_cap, env.obs_dim), dtype=np.float32)
+        new_obs = _alloc_obs_pool(new_cap, env.obs_dim, obs_layout)
         new_gm = np.empty((new_cap, GATE_ACTIONS), dtype=bool)
-        new_obs[:pool_cursor] = step_obs_pool[:pool_cursor]
+        for key, arr in step_obs_pool.items():
+            new_obs[key][:pool_cursor] = arr[:pool_cursor]
         new_gm[:pool_cursor] = step_gm_pool[:pool_cursor]
         step_obs_pool, step_gm_pool, pool_cap = new_obs, new_gm, new_cap
 
-    # Pre-allocated output slabs (`_SLAB_KEYS` layout). Eliminates the
+    # Pre-allocated output slabs (`_slab_keys` layout). Eliminates the
     # `np.stack` over millions of small arrays at finalize time. `wcursor`
     # tracks the count of transitions written so far across all terminal
     # flushes. On CUDA, back the slabs with pinned host memory so the finalize
@@ -1668,10 +1916,12 @@ def collect_rollout_batched(
         # with the same `_slack_per_env` helper and may hand over all of its
         # remaining buffer); the width asserts catch any variant/obs-dim
         # drift between the caller's allocation and this env.
-        slabs = {key: out_slabs[key] for key in _SLAB_KEYS}
-        assert slabs["obs"].shape[1] == env.obs_dim, (
-            f"out_slabs obs width {slabs['obs'].shape[1]} != env {env.obs_dim}"
-        )
+        slabs = {key: out_slabs[key] for key in _slab_keys(obs_layout)}
+        for key, (shape, np_dtype, _td) in _obs_spec(env.obs_dim, obs_layout).items():
+            assert slabs[key].shape[1:] == shape and slabs[key].dtype == np_dtype, (
+                f"out_slabs {key} {slabs[key].shape[1:]} {slabs[key].dtype} != "
+                f"env layout {shape} {np.dtype(np_dtype)}"
+            )
         assert slabs["oh"].shape[2] == game_config.hole_count, (
             f"out_slabs hole width {slabs['oh'].shape[2]} != "
             f"config {game_config.hole_count}"
@@ -1692,9 +1942,11 @@ def collect_rollout_batched(
              else str(device).startswith("cuda"))
             and os.environ.get("PLO5BP_PIN_ROLLOUT", "0") == "1"
         )
-        _slab_alloc = _SlabAllocator(env.obs_dim, game_config.hole_count, _pin)
+        _slab_alloc = _SlabAllocator(
+            env.obs_dim, game_config.hole_count, _pin, layout=obs_layout
+        )
         slabs = _slab_alloc.alloc(rollout_target + n_envs * _slack_per_env())
-    out_cap = int(slabs["obs"].shape[0])
+    out_cap = int(slabs["gm"].shape[0])
     wcursor = 0
 
     def _grow_slabs(min_rows: int) -> None:
@@ -1706,14 +1958,14 @@ def collect_rollout_batched(
             slabs = _slab_alloc.grow(slabs, wcursor, new_cap)
         elif out_slabs_grow is not None:
             grown = out_slabs_grow(wcursor, int(min_rows))
-            slabs = {key: grown[key] for key in _SLAB_KEYS}
+            slabs = {key: grown[key] for key in _slab_keys(obs_layout)}
         else:
             raise RuntimeError(
                 f"output slab overflow: {min_rows} > out_cap={out_cap} "
                 f"(rollout_target={rollout_target}, {n_envs} envs) and the "
                 "caller's out_slabs came without an out_slabs_grow callback"
             )
-        out_cap = int(slabs["obs"].shape[0])
+        out_cap = int(slabs["gm"].shape[0])
         assert out_cap >= min_rows, f"slab grow fell short: {out_cap} < {min_rows}"
 
     aggression_bonus_c = float(train_config.aggression_bonus_c)
@@ -1815,6 +2067,46 @@ def collect_rollout_batched(
         with torch.inference_mode():
             return model.act(o_t, m_t, b_t)
 
+    def _opp_acts(
+        is_opp: np.ndarray,
+        obs_arr: np.ndarray,
+        gate_mask_arr: np.ndarray,
+        sizing_arr: np.ndarray,
+    ) -> list[tuple[np.ndarray, object]]:
+        """Act every opponent row in `is_opp`, results left on device (no D2H):
+        [(env rows, ActOut)] — ONE entry covering every snapshot on the stacked
+        path (rows grouped by snapshot), one per snapshot group otherwise
+        (ascending snapshot index, the pre-2026-09-23 behavior)."""
+        snap_col = np.where(is_opp, env_snapshot_idx_arr, -1)
+        if _stacked_opp is None:
+            groups: list[tuple[np.ndarray, object]] = []
+            for sd_idx in np.unique(snap_col[snap_col >= 0]):
+                group = np.nonzero(snap_col == sd_idx)[0]
+                m = _get_snapshot_model(int(sd_idx))
+                groups.append(
+                    (group, _opp_upload_act(m, group, obs_arr, gate_mask_arr, sizing_arr))
+                )
+            return groups
+        rows = np.nonzero(snap_col >= 0)[0]
+        if rows.size == 0:
+            return []
+        order = np.argsort(snap_col[rows], kind="stable")
+        rows = rows[order]
+        g = snap_col[rows]
+        counts = np.bincount(g, minlength=_stacked_opp.n)
+        j = np.arange(rows.size) - (np.cumsum(counts) - counts)[g]
+        slot = _opp_pin_slot[0]
+        _step_h2d.wait_slot(slot)
+        o_t, m_t, b_t = _step_h2d.upload(
+            obs_arr[rows], gate_mask_arr[rows], sizing_arr[rows], slot=slot
+        )
+        _opp_pin_slot[0] = 1 - slot if _step_h2d.n_slots > 1 else 0
+        g_t = torch.from_numpy(g).to(device)
+        j_t = torch.from_numpy(j).to(device)
+        with torch.inference_mode():
+            fw = _stacked_opp.act(o_t, m_t, b_t, g_t, j_t, int(counts.max()))
+        return [(rows, fw)]
+
     # Attack #2 Phase 2: cross-iteration act prefetch under terminal host work.
     # Default OFF — enable with PLO5BP_ROLLOUT_OVERLAP=1 after parity confidence.
     _rollout_overlap = (
@@ -1897,18 +2189,7 @@ def collect_rollout_batched(
                         c_v = critic(l_o, opp_holes_multihot(h_t))
         o_groups: list[tuple[np.ndarray, object]] = []
         if is_opp.any():
-            snap_col = np.where(is_opp, env_snapshot_idx_arr, -1)
-            for sd_idx in np.unique(snap_col[snap_col >= 0]):
-                group = np.nonzero(snap_col == sd_idx)[0]
-                m = _get_snapshot_model(int(sd_idx))
-                o_groups.append(
-                    (
-                        group,
-                        _opp_upload_act(
-                            m, group, env._obs, env._gate_mask, sizing_q
-                        ),
-                    )
-                )
+            o_groups = _opp_acts(is_opp, env._obs, env._gate_mask, sizing_q)
         return {
             "learner_idx": l_idx,
             "learner_fw": l_fw,
@@ -2027,7 +2308,9 @@ def collect_rollout_batched(
     # loop runs until every env is done, i.e. every hand STARTED in phase 1 is
     # in the batch. With drain off the loop exits at the target exactly as
     # before (in-flight hands dropped) — byte-identical rows, order and RNG.
+    step_timers.end()  # step0/setup
     while wcursor < rollout_target or (drain and not env._dones.all()):
+        step_timers.begin("step0/prestep")
         obs = env._obs
         gate_masks = env._gate_mask
         min_raise = env._min_raise
@@ -2086,6 +2369,7 @@ def collect_rollout_batched(
             ],
             axis=-1,
         )
+        step_timers.end()  # step0/prestep
 
         # Attack #2 Phase 2: consume prefetched acts from prior iteration
         # (queued under terminal host work). Skip device act this iter.
@@ -2132,9 +2416,10 @@ def collect_rollout_batched(
                 # Host prep that does not need D2H: opp-hole rotation for critic
                 # can run while learner kernels finish (and before/during opp acts).
                 if critic is not None:
-                    _opp_block_np = _rotate_opp_holes_batch(
-                        holes_cache, learner_idx_np, safe_actors[learner_idx_np]
-                    )
+                    with _TimedRF("step3a/opp_holes_rot"):
+                        _opp_block_np = _rotate_opp_holes_batch(
+                            holes_cache, learner_idx_np, safe_actors[learner_idx_np]
+                        )
                     with _TimedRF("step3b/critic_forward"):
                         h_t = torch.from_numpy(_opp_block_np).to(
                             device, non_blocking=(device.type == "cuda")
@@ -2153,17 +2438,10 @@ def collect_rollout_batched(
             # act()s before any opp D2H; double-pin between groups.
             opp_groups: list[tuple[np.ndarray, object]] = []
             if is_opp_active.any():
-                opp_snap_col = np.where(is_opp_active, env_snapshot_idx_arr, -1)
-                sd_ids = np.unique(opp_snap_col[opp_snap_col >= 0])
                 with _TimedRF("step4a/opp_h2d_act"):
-                    for sd_idx in sd_ids:
-                        sd_idx_int = int(sd_idx)
-                        group = np.nonzero(opp_snap_col == sd_idx)[0]
-                        m = _get_snapshot_model(sd_idx_int)
-                        _fw_out = _opp_upload_act(
-                            m, group, obs, gate_masks, sizing_step,
-                        )
-                        opp_groups.append((group, _fw_out))
+                    opp_groups = _opp_acts(
+                        is_opp_active, obs, gate_masks, sizing_step
+                    )
 
             # Coalesced host pull: learner ActOut (+ critic) and all opp gates/chips.
             with _TimedRF("step5/action_d2h"):
@@ -2234,12 +2512,20 @@ def collect_rollout_batched(
         # Vectorized trajectory snapshot: one bulk obs/gm copy into the
         # flat pool, plus fancy-index writes into the per-(env, seat)
         # arrays. The (env, seat, slot) -> pool index map is one int.
+        step_timers.begin("step3c/traj_snapshot")
         if learner_idx_np.size:
             k_step = learner_idx_np.size
             pool_end = pool_cursor + k_step
             if pool_end > pool_cap:
                 _grow_pool(pool_end)
-            step_obs_pool[pool_cursor:pool_end] = obs[learner_idx_np]
+            if obs_layout is None:
+                step_obs_pool["obs"][pool_cursor:pool_end] = obs[learner_idx_np]
+            else:
+                pack_rows_into(
+                    obs, learner_idx_np, obs_layout,
+                    step_obs_pool["obs_bits"], step_obs_pool["obs_real"],
+                    pool_cursor,
+                )
             step_gm_pool[pool_cursor:pool_end] = gate_masks[learner_idx_np]
             pool_indices = np.arange(pool_cursor, pool_end, dtype=np.int64)
             pool_cursor = pool_end
@@ -2251,6 +2537,8 @@ def collect_rollout_batched(
                     f"per-seat trajectory length exceeded "
                     f"MAX_STEPS_PER_SEAT={MAX_STEPS_PER_SEAT}"
                 )
+            if int(slots.max()) >= traj_cap:
+                _grow_traj(int(slots.max()) + 1)
 
             l_gates = gates_per_env[learner_idx_np]
             l_chips = chips_per_env[learner_idx_np]
@@ -2287,6 +2575,7 @@ def collect_rollout_batched(
                 traj_vpi[learner_idx_np, learner_actors, slots] = (
                     vpi_per_env[learner_idx_np]
                 )
+        step_timers.end()  # step3c/traj_snapshot
 
         # Short-shove redirect: rows where the network emitted GATE_RAISE
         # but the engine zeroed `min_raise` (sub-min-raise stack with
@@ -2533,10 +2822,11 @@ def collect_rollout_batched(
                         glp_tsl = traj_gate_lp[term_envs, :, :L]
                         alp_tsl = traj_anchor_lp[term_envs, :, :L]
                         obs_idx = obs_idx_tsl.ravel()[sel]
-                        np.take(
-                            step_obs_pool, obs_idx, axis=0,
-                            out=slabs["obs"][wcursor:end],
-                        )
+                        for key, pool_arr in step_obs_pool.items():
+                            np.take(
+                                pool_arr, obs_idx, axis=0,
+                                out=slabs[key][wcursor:end],
+                            )
                         np.take(
                             step_gm_pool, obs_idx, axis=0,
                             out=slabs["gm"][wcursor:end],
@@ -2583,16 +2873,8 @@ def collect_rollout_batched(
                     0, n_seats, size=n_envs, dtype=np.int64
                 ).astype(np.uint8)
                 with _TimedRF("step9e/pool_mix"):
-                    # Attack #4: fast path when pool mix is inactive; else
-                    # preserve sequential term_envs order for RNG bit-exactness.
-                    if len(pool) == 0 or pool_opp_seats == 0 or pool_mix_prob <= 0.0:
-                        for i_int in term_envs.tolist():
-                            learner_seats[i_int] = set(range(n_seats))
-                        learner_seats_mask[term_envs] = True
-                        env_snapshot_idx_arr[term_envs] = -1
-                    else:
-                        for i_int in term_envs.tolist():
-                            _assign_pool_mix(int(i_int))
+                    # Batched draws for every re-dealt hand (see _draw_pool_mix).
+                    _assign_pool_mix(term_envs)
 
                 with _TimedRF("step9f/reset_terminal"):
                     env._be.reset_terminal_batch(new_seeds, new_buttons, reset_mask)
@@ -2709,7 +2991,7 @@ def collect_rollout_batched(
                 adv_t = adv_t.clamp(-_adv_clip, _adv_clip)
             np.copyto(adv_view, adv_t.cpu().numpy())
         return Batch(
-            obs=torch.from_numpy(slabs["obs"][:wcursor]),
+            obs=_obs_from_slabs(slabs, wcursor, obs_layout),
             gate_masks=torch.from_numpy(slabs["gm"][:wcursor]),
             gate_actions=torch.from_numpy(slabs["ga"][:wcursor]),
             raise_chips=torch.from_numpy(slabs["rc"][:wcursor]),
@@ -2741,7 +3023,7 @@ def collect_rollout_batched(
         step_timers.report(label="collect_rollout_batched")
         _ACTIVE_STEP_TIMERS = None
     return _finalize_batch_arr(
-        slabs["obs"],
+        _obs_from_slabs(slabs, wcursor, obs_layout),
         slabs["gm"],
         slabs["ga"],
         slabs["rc"],
@@ -2827,8 +3109,11 @@ def _concat_batches(batches: list[Batch], adv_clip: float) -> Batch:
     if len(batches) == 1:
         return batches[0]
 
-    def _cat(field: str) -> torch.Tensor:
-        return torch.cat([getattr(b, field) for b in batches], dim=0)
+    def _cat(field: str) -> "torch.Tensor | PackedObs":
+        parts = [getattr(b, field) for b in batches]
+        if isinstance(parts[0], PackedObs):
+            return PackedObs.cat(parts)
+        return torch.cat(parts, dim=0)
 
     adv = _cat("advantages")
     adv = (adv - adv.mean()) / adv.std().clamp(min=1e-8)
@@ -2982,7 +3267,8 @@ def collect_rollout_multiconfig(
             device.type == "cuda"
             and os.environ.get("PLO5BP_PIN_ROLLOUT", "0") == "1"
         )
-        staging = _SlabAllocator(obs_dim, hole_count, _pin)
+        obs_layout = _resolve_obs_layout(train_config, configs[0].variant)
+        staging = _SlabAllocator(obs_dim, hole_count, _pin, layout=obs_layout)
         big = staging.alloc(total_cap)
         base = 0
 
@@ -3048,7 +3334,7 @@ def collect_rollout_multiconfig(
             return (vals[0], vals[1], vals[2])
 
         combined = Batch(
-            obs=_t("obs"),
+            obs=_obs_from_slabs(big, total, obs_layout),
             gate_masks=_t("gm"),
             gate_actions=_t("ga"),
             raise_chips=_t("rc"),
@@ -3140,6 +3426,8 @@ def iter_minibatches(
     for start, stop in _minibatch_bounds(n, batch_size):
         sel = torch.from_numpy(idx[start:stop]).to(device)
         yield Batch(
+            # Compact storage unpacks HERE, per minibatch, on the learner
+            # device (PackedObs row indexing yields dense f32, bit-exact).
             obs=batch.obs[sel],
             gate_masks=batch.gate_masks[sel],
             gate_actions=batch.gate_actions[sel],

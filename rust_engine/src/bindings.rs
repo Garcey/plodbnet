@@ -4,7 +4,7 @@
 use numpy::ndarray::{Array1, Array2};
 use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2,
-    PyReadonlyArray3,
+    PyReadonlyArray3, PyReadwriteArray2, PyUntypedArrayMethods,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -1152,6 +1152,213 @@ pub fn compute_aggression_bonus_batch<'py>(
         Array1::from_vec(bonus_steps_by_street.to_vec()).into_pyarray(py),
     )?;
     Ok(d)
+}
+
+/// Bit pattern of 1.0f32 — the only non-zero value a compact-storage flag
+/// column may hold (see [`pack_obs_rows`]).
+const F32_ONE_BITS: u32 = 0x3F80_0000;
+
+/// One row of [`pack_obs_rows`]: the flag columns become MSB-first bits
+/// (numpy `packbits` order: flag i -> byte i/8, bit 7 - i%8), the real
+/// columns are copied verbatim. A flag must be exactly +0.0 or 1.0 by BIT
+/// PATTERN (so -0.0 and NaN are rejected too); otherwise returns the first
+/// offending (column, value).
+fn pack_obs_row(
+    row: &[f32],
+    flag_cols: &[usize],
+    real_cols: &[usize],
+    out_bits: &mut [u8],
+    out_real: &mut [f32],
+) -> Result<(), (usize, f32)> {
+    out_bits.fill(0);
+    for (i, &c) in flag_cols.iter().enumerate() {
+        let v = row[c];
+        match v.to_bits() {
+            0 => {}
+            F32_ONE_BITS => out_bits[i >> 3] |= 0x80u8 >> (i & 7),
+            _ => return Err((c, v)),
+        }
+    }
+    for (o, &c) in out_real.iter_mut().zip(real_cols.iter()) {
+        *o = row[c];
+    }
+    Ok(())
+}
+
+/// Compact storage for rollout observations (python/plo5bp/compact_obs.py).
+/// Packs rows `rows` of the dense (N, D) f32 observation matrix `obs` into the
+/// caller's buffers at rows `out_offset .. out_offset + len(rows)`: the 0/1
+/// `flag_cols` bit-packed into `out_bits` (ceil(F/8) bytes per row, numpy
+/// `packbits` order) and the `real_cols` copied verbatim into `out_real`.
+/// Storage only — unpacking reproduces every value bit-exactly. A flag column
+/// holding anything but exactly 0.0 / 1.0 is a ValueError, so an encoder
+/// change can never silently corrupt stored training rows.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+pub fn pack_obs_rows(
+    obs: PyReadonlyArray2<'_, f32>,
+    rows: PyReadonlyArray1<'_, i64>,
+    flag_cols: PyReadonlyArray1<'_, i64>,
+    real_cols: PyReadonlyArray1<'_, i64>,
+    mut out_bits: PyReadwriteArray2<'_, u8>,
+    mut out_real: PyReadwriteArray2<'_, f32>,
+    out_offset: usize,
+) -> PyResult<()> {
+    // as_slice() also accepts FORTRAN-contiguous arrays, whose memory is
+    // column-major: require row-major explicitly (inputs and outputs).
+    if !obs.is_c_contiguous() {
+        return Err(PyValueError::new_err("pack_obs_rows: obs must be C-contiguous"));
+    }
+    let (n, d) = (obs.shape()[0], obs.shape()[1]);
+    let obs_s = obs.as_slice()?;
+    fn checked(v: &[i64], bound: usize, what: &str) -> PyResult<Vec<usize>> {
+        v.iter()
+            .map(|&x| {
+                if x < 0 || (x as usize) >= bound {
+                    Err(PyValueError::new_err(format!(
+                        "pack_obs_rows: {what} index {x} out of range [0, {bound})"
+                    )))
+                } else {
+                    Ok(x as usize)
+                }
+            })
+            .collect()
+    }
+    let rows_v = checked(rows.as_slice()?, n, "row")?;
+    let flags_v = checked(flag_cols.as_slice()?, d, "flag column")?;
+    let reals_v = checked(real_cols.as_slice()?, d, "real column")?;
+    let (nb, nr, k) = (flags_v.len().div_ceil(8), reals_v.len(), rows_v.len());
+    if nb == 0 || nr == 0 {
+        return Err(PyValueError::new_err(
+            "pack_obs_rows: the layout needs at least one flag and one real column",
+        ));
+    }
+    let (bits_shape, real_shape) = (out_bits.shape().to_vec(), out_real.shape().to_vec());
+    if bits_shape[1] != nb || real_shape[1] != nr {
+        return Err(PyValueError::new_err(format!(
+            "pack_obs_rows: out_bits width {} / out_real width {} != layout {nb} / {nr}",
+            bits_shape[1], real_shape[1]
+        )));
+    }
+    if out_offset + k > bits_shape[0] || out_offset + k > real_shape[0] {
+        return Err(PyValueError::new_err(format!(
+            "pack_obs_rows: rows {out_offset}..{} overflow the output buffers ({} / {} rows)",
+            out_offset + k,
+            bits_shape[0],
+            real_shape[0]
+        )));
+    }
+    if !out_bits.is_c_contiguous() || !out_real.is_c_contiguous() {
+        return Err(PyValueError::new_err(
+            "pack_obs_rows: out_bits and out_real must be C-contiguous",
+        ));
+    }
+    if k == 0 {
+        return Ok(());
+    }
+    let bits_s = out_bits
+        .as_slice_mut()
+        .map_err(|_| PyValueError::new_err("pack_obs_rows: out_bits must be C-contiguous"))?;
+    let real_s = out_real
+        .as_slice_mut()
+        .map_err(|_| PyValueError::new_err("pack_obs_rows: out_real must be C-contiguous"))?;
+    let bits_dst = &mut bits_s[out_offset * nb..(out_offset + k) * nb];
+    let real_dst = &mut real_s[out_offset * nr..(out_offset + k) * nr];
+    bits_dst
+        .par_chunks_mut(nb)
+        .zip(real_dst.par_chunks_mut(nr))
+        .zip(rows_v.par_iter())
+        .try_for_each(|((b, r), &row)| {
+            pack_obs_row(&obs_s[row * d..(row + 1) * d], &flags_v, &reals_v, b, r)
+                .map_err(|(c, v)| (row, c, v))
+        })
+        .map_err(|(row, c, v)| {
+            PyValueError::new_err(format!(
+                "pack_obs_rows: obs row {row} column {c} holds {v:?}, not a 0/1 flag -- \
+                 the compact layout (python/plo5bp/compact_obs.py) no longer matches the encoder"
+            ))
+        })
+}
+
+/// One row of [`unpack_obs_rows`]: the exact inverse of [`pack_obs_row`].
+fn unpack_obs_row(
+    bits: &[u8],
+    real: &[f32],
+    flag_cols: &[usize],
+    real_cols: &[usize],
+    out: &mut [f32],
+) {
+    for (i, &c) in flag_cols.iter().enumerate() {
+        out[c] = ((bits[i >> 3] >> (7 - (i & 7))) & 1) as f32;
+    }
+    for (&v, &c) in real.iter().zip(real_cols.iter()) {
+        out[c] = v;
+    }
+}
+
+/// Inverse of [`pack_obs_rows`] for CPU training (compact_obs.unpack): writes
+/// the dense (k, D) f32 rows of `bits` / `real` into `out`. `flag_cols` and
+/// `real_cols` must partition 0..D (every output column written exactly
+/// once), so `out` may start uninitialized. Bit-exact: flags come back as
+/// 0.0 / 1.0, real columns are copied.
+#[pyfunction]
+pub fn unpack_obs_rows(
+    bits: PyReadonlyArray2<'_, u8>,
+    real: PyReadonlyArray2<'_, f32>,
+    flag_cols: PyReadonlyArray1<'_, i64>,
+    real_cols: PyReadonlyArray1<'_, i64>,
+    mut out: PyReadwriteArray2<'_, f32>,
+) -> PyResult<()> {
+    if !bits.is_c_contiguous() || !real.is_c_contiguous() || !out.is_c_contiguous() {
+        return Err(PyValueError::new_err(
+            "unpack_obs_rows: bits, real and out must be C-contiguous",
+        ));
+    }
+    let (k, d) = (out.shape()[0], out.shape()[1]);
+    let mut seen = vec![false; d];
+    let mut cols = |v: &[i64]| -> PyResult<Vec<usize>> {
+        v.iter()
+            .map(|&x| {
+                if x < 0 || (x as usize) >= d || seen[x as usize] {
+                    return Err(PyValueError::new_err(format!(
+                        "unpack_obs_rows: column {x} out of range or listed twice"
+                    )));
+                }
+                seen[x as usize] = true;
+                Ok(x as usize)
+            })
+            .collect()
+    };
+    let flags_v = cols(flag_cols.as_slice()?)?;
+    let reals_v = cols(real_cols.as_slice()?)?;
+    if flags_v.len() + reals_v.len() != d {
+        return Err(PyValueError::new_err(
+            "unpack_obs_rows: flag_cols + real_cols must cover every output column",
+        ));
+    }
+    let (nb, nr) = (flags_v.len().div_ceil(8), reals_v.len());
+    if nb == 0 || nr == 0 {
+        return Err(PyValueError::new_err(
+            "unpack_obs_rows: the layout needs at least one flag and one real column",
+        ));
+    }
+    if bits.shape() != [k, nb] || real.shape() != [k, nr] {
+        return Err(PyValueError::new_err(format!(
+            "unpack_obs_rows: bits {:?} / real {:?} do not match out ({k}, {d}) -> ({k}, {nb}) / ({k}, {nr})",
+            bits.shape(),
+            real.shape()
+        )));
+    }
+    if k == 0 {
+        return Ok(());
+    }
+    let (bits_s, real_s) = (bits.as_slice()?, real.as_slice()?);
+    out.as_slice_mut()?
+        .par_chunks_mut(d)
+        .zip(bits_s.par_chunks(nb))
+        .zip(real_s.par_chunks(nr))
+        .for_each(|((o, b), r)| unpack_obs_row(b, r, &flags_v, &reals_v, o));
+    Ok(())
 }
 
 /// Diagnostic hook: compute layered side-pot payouts for an arbitrary
@@ -5378,5 +5585,50 @@ mod encoder_port_tests {
         assert_eq!(struct_out[1], 0.0);  // double_paired (only Ks have c>=2)
         assert_eq!(struct_out[2], 1.0);  // tripled
         assert_eq!(struct_out[3], 1.0);  // quadded
+    }
+}
+
+#[cfg(test)]
+mod pack_obs_tests {
+    use super::{pack_obs_row, unpack_obs_row};
+
+    #[test]
+    fn unpack_is_the_exact_inverse_of_pack() {
+        let row: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0, 3.25, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, -7.5, 1.0];
+        let flags = [0usize, 1, 2, 3, 5, 6, 7, 8, 9, 10, 12];
+        let reals = [4usize, 11];
+        let (mut bits, mut vals) = ([0u8; 2], [0f32; 2]);
+        pack_obs_row(&row, &flags, &reals, &mut bits, &mut vals).unwrap();
+        let mut back = vec![f32::NAN; row.len()];
+        unpack_obs_row(&bits, &vals, &flags, &reals, &mut back);
+        let bits_of = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits_of(&back), bits_of(&row));
+    }
+
+    #[test]
+    fn packs_flags_msb_first_and_copies_reals_verbatim() {
+        // 10 flags (2 bytes, 6 pad bits) + 2 reals, interleaved in the row.
+        let row: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0, 3.25, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, -7.5, 1.0];
+        let flags = [0usize, 1, 2, 3, 5, 6, 7, 8, 9, 10];
+        let reals = [4usize, 11];
+        let mut bits = [0xFFu8; 2];
+        let mut out = [0f32; 2];
+        pack_obs_row(&row, &flags, &reals, &mut bits, &mut out).unwrap();
+        // flags: 1,0,0,1,1,1,0,0 | 0,1 -> 0b1001_1100, 0b0100_0000 (pad bits zeroed)
+        assert_eq!(bits, [0b1001_1100, 0b0100_0000]);
+        assert_eq!(out[0].to_bits(), 3.25f32.to_bits());
+        assert_eq!(out[1].to_bits(), (-7.5f32).to_bits());
+    }
+
+    #[test]
+    fn rejects_anything_but_exact_zero_or_one_in_a_flag_column() {
+        let flags = [0usize, 1];
+        let reals = [2usize];
+        for bad in [0.5f32, -0.0, 2.0, f32::NAN, -1.0] {
+            let row = [1.0f32, bad, 9.0];
+            let (mut bits, mut out) = ([0u8; 1], [0f32; 1]);
+            let err = pack_obs_row(&row, &flags, &reals, &mut bits, &mut out).unwrap_err();
+            assert_eq!(err.0, 1, "value {bad:?} must be rejected at column 1");
+        }
     }
 }

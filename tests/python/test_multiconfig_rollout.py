@@ -13,6 +13,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from plo5bp.compact_obs import as_dense
 from plo5bp.actions import GATE_ACTIONS
 from plo5bp.config import GameConfig, TrainingConfig
 from plo5bp.encoding import OBS_DIM
@@ -100,6 +101,6 @@ def test_collect_rollout_multiconfig_smoke() -> None:
     assert batch.obs.shape[0] >= train_cfg.rollout_length - 5
     assert batch.obs.device.type == "cpu"
     for f in ("obs", "advantages", "returns", "values", "log_probs"):
-        assert torch.isfinite(getattr(batch, f)).all(), f
+        assert torch.isfinite(as_dense(getattr(batch, f))).all(), f
     # Globally normalized advantages.
     assert abs(batch.advantages.mean().item()) < 1e-3

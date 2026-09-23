@@ -1151,6 +1151,24 @@ def main() -> None:
         help="Observation layout. full=OBS_DIM 1171 (default). minimal=bare table-visible 796 (cards, street, active/all-in, stacks, pot/to_call/min/max, commits, seat-exists, button, history). Cold-start only; no warm-start from full-obs checkpoints. Skips opp-outcome MC for speed.",
     )
     parser.add_argument(
+        "--no-compact-obs",
+        action="store_true",
+        help="Store rollout observations as dense float32 rows instead of the "
+        "compact layout (0/1 columns as bits, the rest verbatim f32 — "
+        "plo5bp/compact_obs.py). Compact storage is bit-exact (training is "
+        "unchanged) and ~7x smaller on --obs-mode minimal (2.4x full), which "
+        "lets --rollout-length grow; this flag exists for A/B and debugging.",
+    )
+    parser.add_argument(
+        "--no-batched-opponents",
+        action="store_true",
+        help="Call each opponent-pool snapshot separately every rollout step "
+        "instead of ONE stacked forward + ONE sampling pass for all of them "
+        "(rollout._StackedOpponents). Same per-row policy either way; the "
+        "stacked call saves up to pool-size x the fixed GPU launch cost per "
+        "step. For A/B and debugging.",
+    )
+    parser.add_argument(
         "--sizing-head",
         choices=["anchor", "logistic", "mixture"],
         default=None,  # C2 sentinel — resolved by _apply_v6_preset (legacy "anchor")
@@ -1828,11 +1846,12 @@ def main() -> None:
         type=int,
         default=0,
         help="Thread count for the Rust engine's rayon pool (opp-outcome MC + "
-        "obs encoder — the bulk of the update). Rayon otherwise defaults to the "
-        "host's ~192 logical cores, oversubscribing the pod's ~40-vCPU quota "
-        "~4.7x. 0 = leave rayon's default / any pre-set RAYON_NUM_THREADS "
-        "untouched. UNMEASURED: A/B 32/40/48 (lead 40 = the quota) on a throwaway "
-        "run; changes no training numbers (per-env deterministic MC seeds).",
+        "obs encoder). 0 = leave rayon's default / any pre-set RAYON_NUM_THREADS "
+        "untouched. MEASURED by the owner on the pod: a cap of 40 vs unset made "
+        "no meaningful difference (marginally slower) — rayon's default already "
+        "follows the container's CPU quota (Rust's available_parallelism is "
+        "cgroup-aware), so it never oversubscribed. Changes no training numbers "
+        "(per-env deterministic MC seeds).",
     )
     args = parser.parse_args()
 
@@ -1988,7 +2007,7 @@ def main() -> None:
     # writes reach Rust's std::env in-process. Default 0 leaves rayon's default /
     # any pre-set env untouched (byte-identical). Thread count changes no training
     # numbers (per-env deterministic outcome_seed + disjoint-row par writes).
-    # UNMEASURED — A/B 32/40/48 vs unset on a throwaway run before trusting one.
+    # Pod A/B (owner): 40 vs unset ≈ no difference — leave it unset by default.
     if int(args.rayon_threads or 0) > 0:
         os.environ["RAYON_NUM_THREADS"] = str(int(args.rayon_threads))
         print(
@@ -2043,6 +2062,8 @@ def main() -> None:
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         obs_mode=args.obs_mode,
+        compact_obs=not args.no_compact_obs,
+        batched_opponents=not args.no_batched_opponents,
         num_envs=args.num_envs,
         rollout_length=args.rollout_length,
         batch_size=args.batch_size,
@@ -2121,6 +2142,18 @@ def main() -> None:
     # corrected features, 1 = the exact pre-fix values. Read through getattr
     # so this works on a tree where the switch has not landed yet (-> 2).
     obs_rev = int(getattr(_encoding, "OBS_SEMANTICS_REV", 2))
+    # Rollout observation STORAGE (not a feature change — bit-exact on unpack).
+    from plo5bp import rollout as _rollout_mod
+    _obs_layout = _rollout_mod._resolve_obs_layout(train_cfg, args.variant)
+    if _obs_layout is None:
+        print(f"[obs-storage] dense float32: {4 * obs_dim:,} B per stored observation")
+    else:
+        print(
+            f"[obs-storage] compact ({_obs_layout.name}): {_obs_layout.n_flag} 0/1 "
+            f"columns as bits + {_obs_layout.n_real} verbatim f32 = "
+            f"{_obs_layout.row_bytes:,} B per stored observation (dense "
+            f"{4 * obs_dim:,} B, {4 * obs_dim / _obs_layout.row_bytes:.1f}x smaller)"
+        )
     print(
         f"[obs-rev] observation semantics rev = {obs_rev} "
         f"(PLO5BP_OBS_REV={os.environ.get('PLO5BP_OBS_REV', '')!r}; "

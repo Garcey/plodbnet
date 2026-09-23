@@ -453,7 +453,30 @@ class ActorCriticV2(nn.Module):
         (for the Expected-SARSA / VRPO advantage). Built from probs already
         computed in THIS forward — no extra network pass, no extra RNG draw,
         so trajectories are bit-identical whether or not it is requested."""
-        gate_logits, anchor_logits, refine, value = self.forward(obs, gate_mask)
+        return self._act_from_heads(
+            *self.forward(obs, gate_mask),
+            sizing,
+            deterministic=deterministic,
+            return_marginal=return_marginal,
+        )
+
+    def _act_from_heads(
+        self,
+        gate_logits: torch.Tensor,
+        anchor_logits: torch.Tensor,
+        refine: torch.Tensor,
+        value: torch.Tensor,
+        sizing: torch.Tensor,
+        deterministic: bool = False,
+        return_marginal: bool = False,
+    ) -> ActOut:
+        """Everything `act` does after the weight-dependent `forward`: the
+        anchor grid, sampling, log-probs, chips. It reads only the head
+        outputs and this model's CONSTANTS (anchor spec, head shapes, v4/v5
+        scale/mixture settings) — never its weights — so the batched rollout
+        can run ONE stacked forward for many same-shape pool snapshots and
+        sample every opponent row here in one pass
+        (rollout._StackedOpponents). `act` is exactly forward + this."""
         grid = anchor_grid_torch(sizing, self.anchor_spec)
 
         gate_dist = torch.distributions.Categorical(logits=gate_logits)

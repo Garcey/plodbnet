@@ -145,6 +145,18 @@ class TrainingConfig:
     # Observation layout: 'full' = OBS_DIM 1171; 'minimal' = bare
     # table-visible 796 (cards/history/stacks/commits/...). Cold-start only.
     obs_mode: str = "full"
+    # Compact rollout-observation STORAGE (compact_obs.py): the exact-0/1
+    # columns are kept as bits, the rest verbatim f32 — bit-exact on unpack,
+    # so training is unchanged; rows take ~7x less memory on the minimal
+    # layout (2.4x full), which is what lets rollout_length grow. False = the
+    # old dense float32 rows (A/B, debugging). NLH always stores dense.
+    compact_obs: bool = True
+    # Batched rollout: act every pool snapshot's opponent rows in ONE stacked
+    # forward + ONE sampling pass per step (rollout._StackedOpponents) instead
+    # of one act() per snapshot — on the GPU each call is mostly fixed launch
+    # overhead. Same per-row policy; the RNG stream differs from the
+    # per-snapshot path. False = per-snapshot calls (A/B, debugging).
+    batched_opponents: bool = True
     num_layers: int = 2
     num_updates: int = 1000
     opponent_pool_size: int = 8

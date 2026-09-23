@@ -22,6 +22,7 @@ import numpy as np
 import pytest
 import torch
 
+from plo5bp.compact_obs import as_dense
 from plo5bp.actions import GATE_RAISE
 from plo5bp.config import GameConfig, TrainingConfig
 from plo5bp.network import ActorCriticV2, CentralCritic, opp_holes_multihot
@@ -55,7 +56,7 @@ def test_evaluate_reproduces_stored_logprobs(collector) -> None:
     model, batch = _collect(collector, seed=0)
     with torch.no_grad():
         lp, ent, _val, gh, ah, bh, _glp, _alp, *_raw = model.evaluate(
-            batch.obs,
+            as_dense(batch.obs),
             batch.gate_masks,
             batch.sizing,
             batch.gate_actions,
@@ -115,7 +116,7 @@ def test_critic_values_reproducible_from_stored_inputs(collector) -> None:
     critic.eval()
     _model, batch = _collect(collector, seed=3, critic=critic)
     with torch.inference_mode():
-        v = critic(batch.obs, opp_holes_multihot(batch.opp_holes))
+        v = critic(as_dense(batch.obs), opp_holes_multihot(batch.opp_holes))
     assert torch.allclose(v, batch.values, atol=1e-4), (
         f"max |Δvalue| = {float((v - batch.values).abs().max())}"
     )

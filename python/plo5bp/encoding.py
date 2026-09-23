@@ -429,6 +429,34 @@ _M_HERO_BTN = 788
 assert _M_HERO_BTN + 8 == OBS_DIM_MINIMAL
 
 
+# ---- compact rollout storage: the exact-0/1 columns --------------------------
+# Training STORAGE only — no feature changes. The batched rollout keeps these
+# columns as bits and every other column verbatim (python/plo5bp/compact_obs.py
+# + Rust `pack_obs_rows`). They are 0.0/1.0 by construction in every PLO
+# encoder: the card multi-hots, the street one-hot, the active / all-in /
+# seat-exists masks, the hero-button one-hot, and each history slot's seat /
+# gate / street one-hots (a slot's chips and pot-fraction dims are real). The
+# Rust packer rejects any other value, so an encoder change cannot silently
+# corrupt stored rows.
+def _minimal_flag_mask() -> np.ndarray:
+    mask = np.zeros(OBS_DIM_MINIMAL, dtype=bool)
+    mask[_M_HOLE:_M_STACKS] = True  # hole + boards (156), street (4), active (8), all-in (8)
+    for slot in range(_HISTORY_DEPTH):
+        base = _M_HISTORY + slot * _HISTORY_SLOT_DIM
+        mask[base + _HISTORY_SEAT_OFF_REL : base + _HISTORY_CHIPS_OFF_REL] = True
+    mask[_M_SEAT_EXISTS:_M_TOTAL_COMMIT] = True
+    mask[_M_HERO_BTN:OBS_DIM_MINIMAL] = True
+    return mask
+
+
+FLAG_MASK_MINIMAL: np.ndarray = _minimal_flag_mask()
+# The same columns inside the full PLO layout (the minimal layout is an exact
+# gather of it); every other full-layout column is stored verbatim.
+FLAG_MASK_FULL: np.ndarray = np.zeros(OBS_DIM, dtype=bool)
+FLAG_MASK_FULL[_MINIMAL_INDEX[FLAG_MASK_MINIMAL]] = True
+assert int(FLAG_MASK_MINIMAL.sum()) == 704 and int(FLAG_MASK_FULL.sum()) == 704
+
+
 # ---- raise window (shared by every encoder) ---------------------------------
 # PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 B1/B3; OBS_SEMANTICS_REV 2):
 # the raise-window dims (scalars min/max, v7 STK-2, STK-5[2:4]) are derived

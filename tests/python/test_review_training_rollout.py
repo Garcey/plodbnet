@@ -26,6 +26,7 @@ from plo5bp.config import (
     GameConfig,
     TrainingConfig,
 )
+from plo5bp.compact_obs import as_dense
 from plo5bp.encoding_nlh import OBS_DIM_NLH
 from plo5bp.env_batched import BatchedBombPotEnv
 from plo5bp.network import (
@@ -254,11 +255,11 @@ def test_a6_drain_off_is_the_legacy_collector(collector):
     for f in _BATCH_TENSOR_FIELDS:
         if f == "advantages":  # normalized over the whole batch -> differs
             continue
-        assert torch.equal(getattr(off, f), getattr(on, f)[:n_off]), f
+        assert torch.equal(as_dense(getattr(off, f)), as_dense(getattr(on, f))[:n_off]), f
     # and a second legacy run with the same seed is bit-identical
     again = _collect(collector, False)
     for f in _BATCH_TENSOR_FIELDS:
-        assert torch.equal(getattr(off, f), getattr(again, f)), f
+        assert torch.equal(as_dense(getattr(off, f)), as_dense(getattr(again, f))), f
 
 
 def test_a6_slabs_and_pool_grow_instead_of_overflowing(monkeypatch):
@@ -299,7 +300,7 @@ def test_a6_slabs_and_pool_grow_instead_of_overflowing(monkeypatch):
     assert grown["n"] >= 2  # own slabs AND the shared staging buffer grew
     for a, b in ((roomy_single, tight_single), (roomy_multi, tight_multi)):
         for f in _BATCH_TENSOR_FIELDS:
-            assert torch.equal(getattr(a, f), getattr(b, f)), f
+            assert torch.equal(as_dense(getattr(a, f)), as_dense(getattr(b, f))), f
         assert torch.equal(a.is_terminal, b.is_terminal)
 
 
@@ -391,5 +392,5 @@ def test_a16_serial_critic_inputs_use_variant_hole_width(variant, hole_w):
     assert torch.equal(mh.sum(-1), torch.full((oh.shape[0],), 2.0 * hole_w))
     # The stored values ARE the critic's read of (obs, stored opp block).
     with torch.no_grad():
-        v = critic(batch.obs, mh)
+        v = critic(as_dense(batch.obs), mh)
     assert torch.allclose(v, batch.values, atol=1e-5)
