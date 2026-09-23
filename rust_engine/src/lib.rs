@@ -16,6 +16,7 @@ pub mod cards;
 pub mod cfr;
 pub mod double_board;
 pub mod engine;
+pub mod flush;
 pub mod hand_eval;
 pub mod state;
 
@@ -36,6 +37,8 @@ fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Compact rollout-observation storage (python/plo5bp/compact_obs.py).
     m.add_function(pyo3::wrap_pyfunction!(crate::bindings::pack_obs_rows, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(crate::bindings::unpack_obs_rows, m)?)?;
+    // Rollout trajectory flush (python/plo5bp/rollout.py step9b-9d).
+    m.add_function(pyo3::wrap_pyfunction!(crate::flush::flush_trajectories, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(
         crate::bindings::straight_flush_features_batch,
         m

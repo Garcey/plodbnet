@@ -31,6 +31,17 @@ import torch
 from torch.profiler import record_function
 
 from plo5bp._engine import compute_aggression_bonus_batch  # type: ignore[attr-defined]
+
+try:  # engines built since 2026-09-23 flush finished hands in one Rust pass
+    from plo5bp._engine import flush_trajectories as _rust_flush_trajectories  # type: ignore[attr-defined]
+except ImportError:  # older engine: the numpy flush below
+    _rust_flush_trajectories = None
+
+# Output slabs the Rust flush writes (compact observation storage only).
+_RUST_FLUSH_OUT_KEYS = (
+    "obs_bits", "obs_real", "gm", "ga", "rc", "sz", "an", "ru", "oh",
+    "lp", "glp", "alp", "v", "ret", "adv", "last",
+)
 from plo5bp.actions import ALL_IN, GATE_ACTIONS, GATE_CHECK_CALL, GATE_RAISE
 from plo5bp.compact_obs import (
     RUST_PACKER_AVAILABLE,
@@ -2232,6 +2243,13 @@ def collect_rollout_batched(
         and env.enable_packed_obs(_step_h2d.layout)
     )
 
+    # The Rust flush reads the packed obs pool (compact storage) only.
+    _flush_in_rust = bool(
+        _rust_flush_trajectories is not None
+        and obs_layout is not None
+        and os.environ.get("PLO5BP_NUMPY_FLUSH", "0") != "1"
+    )
+
     def _packed_for(obs_arr: np.ndarray):
         """The env's packed copy when `obs_arr` IS its live obs buffer (the
         copy describes exactly that buffer); None for anything else, e.g. a
@@ -2985,7 +3003,53 @@ def collect_rollout_batched(
             # for slots that are empty by construction. Slots in
             # [L, MAX) are inactive, so the output is bit-identical.
             T = int(term_envs.size)
-            if T:
+            if T and _flush_in_rust:
+                # Steps 9b-9d in ONE Rust pass (engine flush_trajectories):
+                # the same qualification counters, retroactive bonus, GAE /
+                # VRPO scans (numpy's exact f32 operation order) and slab rows
+                # (same order) as the numpy block below, which stays the
+                # fallback for dense observation storage / older engines.
+                with _TimedRF("step9d/flush_rust"):
+                    S = n_seats
+                    lengths = traj_lengths[term_envs]                   # (T, S) i32
+                    flush_mask = learner_seats_mask[term_envs] & (lengths > 0)
+                    n_new = int(lengths[flush_mask].sum())
+                    if n_new:
+                        payout_chips = np.rint(won_term).astype(np.int64)  # (T, S)
+                        total_pot_chips = post_total_commit[term_envs].astype(np.int64).sum(axis=1)
+                        two_pay = 2 * payout_chips
+                        share_eq = (two_pay == total_pot_chips[:, None]) & (
+                            total_pot_chips[:, None] > 0
+                        )
+                        share_gt = two_pay > total_pot_chips[:, None]
+                        won_bb = won_term.astype(np.float32) * np.float32(reward_norm)
+                        if wcursor + n_new > out_cap:
+                            _grow_slabs(wcursor + n_new)
+                        end = wcursor + n_new
+                        written, b_steps, b_street, b_total = _rust_flush_trajectories(
+                            term_envs.astype(np.int64, copy=False),
+                            np.ascontiguousarray(lengths, dtype=np.int32),
+                            flush_mask, won_bb, share_gt, share_eq,
+                            traj_flat, traj_cap,
+                            {
+                                "obs_bits": step_obs_pool["obs_bits"],
+                                "obs_real": step_obs_pool["obs_real"],
+                                "gm": step_gm_pool,
+                            },
+                            holes_rot_cache.reshape(n_envs * S, 5 * _hole_w),
+                            np.float32(gamma), np.float32(lam),
+                            np.float32(retroactive_bonus_c),
+                            {key: slabs[key][wcursor:end] for key in _RUST_FLUSH_OUT_KEYS},
+                        )
+                        assert written == n_new, (written, n_new)
+                        aggr_bonus_steps += int(b_steps)
+                        for s_idx in range(3):
+                            aggr_bonus_steps_by_street[s_idx] += int(b_street[s_idx])
+                        if retroactive_bonus_c != 0.0:
+                            aggr_bonus_total_bb += float(b_total)
+                        wcursor = end
+                traj_lengths[term_envs] = 0
+            elif T:
                 S = n_seats
                 lengths = traj_lengths[term_envs]                       # (T, S)
                 flush_mask = learner_seats_mask[term_envs] & (lengths > 0)  # (T, S)

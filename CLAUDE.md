@@ -255,6 +255,16 @@ anchor` = v2 (head_version 2), `logistic` = v4 (3), `mixture` = v5 (4).
     passed when the upload's source array IS `env._obs`; any refresh path
     that can't keep the copy in step drops it (then rows are packed on the
     fly). `pack_obs_rows` also packs run-by-run now (same bytes).
+  - The per-finished-hand flush (retroactive-bonus qualification + bonus,
+    GAE and VRPO backward scans, gathers into the output slabs) is ONE Rust
+    pass (`rust_engine/src/flush.rs::flush_trajectories`) reproducing
+    numpy's exact f32 operation order (no FMA); ~4 ms -> ~1 ms per step.
+    The numpy block remains the fallback (dense storage, older engines,
+    `PLO5BP_NUMPY_FLUSH=1`); `test_rust_flush.py` pins every Batch field
+    bitwise for GAE, GAE + bonus and VRPO. Only the logged bonus TOTAL is
+    summed in another order (a diagnostic; exactly 0 with the bonus off).
+    When a branch of the flush is added, remember `traj_lengths[term_envs]
+    = 0` — skipping it silently grows every trajectory across hands.
 
 ### v5 (2026-07-06, IMPLEMENTED, not yet trained — V5_DESIGN.md canonical)
 
