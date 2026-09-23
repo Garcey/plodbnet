@@ -3,7 +3,8 @@
 use crate::actions::{Action, NUM_ACTIONS};
 use crate::cards::{Card, Deck};
 use crate::double_board::{
-    double_board_payout, double_board_payout_layers, single_board_payout, PotLayers,
+    double_board_payout, double_board_payout_runout, single_board_payout, PotLayers,
+    RunoutRanker,
 };
 use crate::state::{
     ActionRecord, GameConfig, GameState, Street, StudyError, StudyTerminal, Variant,
@@ -857,10 +858,33 @@ impl GameState {
         mask
     }
 
+    /// `legal_action_mask()[Fold]` without building the mask: a seat is to
+    /// act and faces a bet.
+    #[inline]
+    pub fn fold_is_legal(&self) -> bool {
+        match self.actor {
+            Some(a) => self.bet_to_call > self.street_commit[a],
+            None => false,
+        }
+    }
+
+    /// `legal_action_mask()[CheckCall]` without building the mask: any seat
+    /// to act may check / call.
+    #[inline]
+    pub fn check_call_is_legal(&self) -> bool {
+        self.actor.is_some()
+    }
+
     /// Chip amount a given action contributes. `None` if illegal.
     pub fn action_to_chips(&self, action: Action) -> Option<u64> {
-        let mask = self.legal_action_mask();
-        if !mask[action.index() as usize] {
+        // Fold / CheckCall legality is two field reads (the mask's own
+        // rules for those bits); only sized actions need the full mask.
+        let legal = match action {
+            Action::Fold => self.fold_is_legal(),
+            Action::CheckCall => self.check_call_is_legal(),
+            _ => self.legal_action_mask()[action.index() as usize],
+        };
+        if !legal {
             return None;
         }
         let actor = self.actor?;
@@ -1069,8 +1093,18 @@ impl GameState {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let mut totals: Vec<i128> = vec![0i128; n];
         // The side-pot structure is the same for every sampled runout: build
-        // it once, and reuse one output buffer (double-board variants).
+        // it once, and reuse one output buffer (double-board variants). So
+        // are each hand's encoded hole pairs and its score on the board
+        // cards already out: the ranker holds both (identical ranks).
         let layers = (num_boards == 2).then(|| PotLayers::new(&self.folded, &self.total_commit));
+        // Next-card tables once the samples deal at least a deck's worth of
+        // cards (they cost one evaluation pass per deck card; same ranks).
+        let tables = (num_samples as usize) * missing >= deck_size;
+        let ranker = (num_boards == 2).then(|| {
+            RunoutRanker::new(
+                &self.hole_cards, &self.folded, &full_a, &full_b, close_len, &deck, tables,
+            )
+        });
         let mut won_buf = vec![0u64; n];
 
         for _ in 0..num_samples {
@@ -1082,12 +1116,13 @@ impl GameState {
             for i in 0..missing {
                 full_a[close_len + i] = deck[i];
             }
-            if let Some(layers) = layers.as_ref() {
+            if let (Some(layers), Some(ranker)) = (layers.as_ref(), ranker.as_ref()) {
                 for i in 0..missing {
                     full_b[close_len + i] = deck[missing + i];
                 }
-                double_board_payout_layers(
+                double_board_payout_runout(
                     layers,
+                    ranker,
                     &self.hole_cards,
                     &self.folded,
                     &self.total_commit,
@@ -4619,6 +4654,13 @@ mod review_2026_09_20_tests {
                 legal[Action::CheckCall as usize],
                 "{tag}: check/call illegal"
             );
+            // The mask-free fast paths agree with the mask at every node.
+            assert_eq!(g.fold_is_legal(), legal[Action::Fold as usize], "{tag}: fold fast path");
+            assert_eq!(
+                g.check_call_is_legal(),
+                legal[Action::CheckCall as usize],
+                "{tag}: check/call fast path"
+            );
             if legal[Action::Fold as usize] {
                 // No phantom bets: Fold is only ever offered against chips
                 // an alive opponent actually has in front of them.
@@ -4650,6 +4692,9 @@ mod review_2026_09_20_tests {
             steps += 1;
             assert!(steps < 400, "{tag}: hand did not terminate");
         }
+        let legal = g.legal_action_mask();
+        assert_eq!(g.fold_is_legal(), legal[Action::Fold as usize], "{tag}: terminal fold");
+        assert_eq!(g.check_call_is_legal(), legal[Action::CheckCall as usize], "{tag}: terminal call");
         g
     }
 

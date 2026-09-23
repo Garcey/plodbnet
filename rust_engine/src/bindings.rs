@@ -167,9 +167,8 @@ fn validate_hybrid_action(
         return None;
     }
     match gate {
-        0 => (!state.legal_action_mask()[Action::Fold as usize])
-            .then(|| (false, format!("gate Fold illegal at env {}", i))),
-        1 => (!state.legal_action_mask()[Action::CheckCall as usize])
+        0 => (!state.fold_is_legal()).then(|| (false, format!("gate Fold illegal at env {}", i))),
+        1 => (!state.check_call_is_legal())
             .then(|| (false, format!("gate CheckCall illegal at env {}", i))),
         2 => {
             let min = state.min_raise_chips();
@@ -1818,8 +1817,10 @@ impl PyBatchedEngine {
         let config = self.config.clone();
         let seeds_vec: Vec<u64> = seeds_slice.to_vec();
         let buttons_vec: Vec<u8> = buttons_slice.to_vec();
+        // Deals are independent: parallel (order-preserving collect).
         let new_states: Vec<GameState> = py.allow_threads(move || {
             (0..n)
+                .into_par_iter()
                 .map(|i| GameState::new_hand(config.clone(), seeds_vec[i], buttons_vec[i] as usize))
                 .collect()
         });
@@ -1859,30 +1860,30 @@ impl PyBatchedEngine {
                 )));
             }
         }
-        let config = self.config.clone();
-        let seeds_vec: Vec<u64> = seeds_slice.to_vec();
-        let buttons_vec: Vec<u8> = buttons_slice.to_vec();
-        let mask_vec: Vec<bool> = mask_slice.to_vec();
-        let new_states: Vec<Option<GameState>> = py.allow_threads(move || {
-            (0..n)
-                .into_par_iter()
-                .map(|i| {
-                    if mask_vec[i] {
-                        Some(GameState::new_hand(
+        // Deal the masked envs IN PLACE, in parallel (each worker also drops
+        // the finished hand it replaces). The old version built and moved a
+        // num_envs-long Vec<Option<GameState>> on every call -- the same
+        // deals, at several times the cost when ~1 table in 8 is re-dealt.
+        let config = &self.config;
+        let states = &mut self.states;
+        py.allow_threads(|| {
+            states
+                .par_iter_mut()
+                .enumerate()
+                .with_min_len(64)
+                .for_each(|(i, st)| {
+                    if mask_slice[i] {
+                        *st = Some(GameState::new_hand(
                             config.clone(),
-                            seeds_vec[i],
-                            buttons_vec[i] as usize,
-                        ))
-                    } else {
-                        None
+                            seeds_slice[i],
+                            buttons_slice[i] as usize,
+                        ));
                     }
-                })
-                .collect()
+                });
         });
         let cache = self.outcome_cache.get_mut().unwrap();
-        for (i, s) in new_states.into_iter().enumerate() {
-            if let Some(state) = s {
-                self.states[i] = Some(state);
+        for (i, &m) in mask_slice.iter().enumerate() {
+            if m {
                 cache.clear_env(i, num_seats);
             }
         }

@@ -10,7 +10,10 @@
 //! (review 2026-09-20 C1; unreachable on real lines, see the helpers).
 
 use crate::cards::Card;
-use crate::hand_eval::{evaluate_nlh, evaluate_plo5, HandRank};
+use crate::hand_eval::{
+    evaluate_nlh, evaluate_plo5, one_new_card_table, plo_best_ck, plo_rank_from_ck,
+    triple_masks, BoardTriples, HandRank, PloPairs, ALL_TRIPLES,
+};
 
 /// Most seats a [`PotLayers`] bitmask holds (the engine's tables are far smaller).
 const MAX_LAYER_SEATS: usize = 32;
@@ -118,6 +121,139 @@ pub fn double_board_payout_layers(
     button: usize,
     out: &mut [u64],
 ) {
+    payout_layers_inner(
+        layers, None, hole_cards, folded, total_commit, board_a, board_b, button, out,
+    );
+}
+
+/// [`double_board_payout_layers`] for one sampled runout of an EV payout,
+/// ranking hands through `ranker` (built once per hand) -- identical
+/// winners and chips, far fewer evaluator combos per sample.
+#[allow(clippy::too_many_arguments)]
+pub fn double_board_payout_runout(
+    layers: &PotLayers,
+    ranker: &RunoutRanker,
+    hole_cards: &[Vec<Card>],
+    folded: &[bool],
+    total_commit: &[u64],
+    board_a: &[Card; 5],
+    board_b: &[Card; 5],
+    button: usize,
+    out: &mut [u64],
+) {
+    payout_layers_inner(
+        layers,
+        Some(ranker),
+        hole_cards,
+        folded,
+        total_commit,
+        board_a,
+        board_b,
+        button,
+        out,
+    );
+}
+
+/// Per-hand ranking state for EV runouts. Every alive seat's hole pairs are
+/// encoded once; its best CK on each board over the triples made only of
+/// cards already out is scored once (identical in every sampled runout);
+/// and, with `next_card_tables`, so is its best CK over the triples holding
+/// exactly ONE card still to come -- per possible card (see
+/// `hand_eval::one_new_card_table`). A sample then evaluates only the
+/// triples holding two or more new cards (none after a turn all-in).
+/// Ranks equal `evaluate_plo5` exactly: every combo keeps its own CK, and
+/// the best of a hand is a min over the same set of combos.
+pub struct RunoutRanker {
+    pairs: Vec<PloPairs>,
+    fixed_a: Vec<u16>,
+    fixed_b: Vec<u16>,
+    /// Per seat, per next card (empty = no tables).
+    next_a: Vec<[u16; 52]>,
+    next_b: Vec<[u16; 52]>,
+    known: usize,
+    /// Triples evaluated per sample.
+    var_mask: u16,
+}
+
+impl RunoutRanker {
+    /// `board_a` / `board_b`: the runout boards with their first `known`
+    /// cards out (later positions may hold anything -- never read here).
+    /// `deck`: every card a runout may deal (the next-card tables cover
+    /// exactly these). The tables pay off once the samples deal at least as
+    /// many cards as the deck holds; the ranks are the same either way.
+    pub fn new(
+        hole_cards: &[Vec<Card>],
+        folded: &[bool],
+        board_a: &[Card; 5],
+        board_b: &[Card; 5],
+        known: usize,
+        deck: &[Card],
+        next_card_tables: bool,
+    ) -> Self {
+        let known = known.min(5);
+        let (fixed, _one, multi) = triple_masks(known);
+        let tables = next_card_tables && (1..5).contains(&known);
+        let (ta, tb) = (BoardTriples::new(board_a), BoardTriples::new(board_b));
+        let n = hole_cards.len();
+        let mut pairs = Vec::with_capacity(n);
+        let mut fixed_a = Vec::with_capacity(n);
+        let mut fixed_b = Vec::with_capacity(n);
+        let mut next_a = Vec::new();
+        let mut next_b = Vec::new();
+        for i in 0..n {
+            let p = if folded[i] { PloPairs::EMPTY } else { PloPairs::new(&hole_cards[i]) };
+            fixed_a.push(plo_best_ck(&p, &ta, fixed, u16::MAX));
+            fixed_b.push(plo_best_ck(&p, &tb, fixed, u16::MAX));
+            if tables {
+                if folded[i] {
+                    next_a.push([u16::MAX; 52]);
+                    next_b.push([u16::MAX; 52]);
+                } else {
+                    next_a.push(one_new_card_table(&p, &board_a[..known], deck));
+                    next_b.push(one_new_card_table(&p, &board_b[..known], deck));
+                }
+            }
+            pairs.push(p);
+        }
+        let var_mask = if tables { multi } else { ALL_TRIPLES & !fixed };
+        Self { pairs, fixed_a, fixed_b, next_a, next_b, known, var_mask }
+    }
+
+    fn rank_alive(
+        &self,
+        ranks: &mut [HandRank; MAX_LAYER_SEATS],
+        folded: &[bool],
+        board: &[Card; 5],
+        fixed: &[u16],
+        next: &[[u16; 52]],
+    ) {
+        let tri = BoardTriples::new(board);
+        for i in 0..folded.len() {
+            if !folded[i] {
+                let mut best = fixed[i];
+                if !next.is_empty() {
+                    for c in &board[self.known..] {
+                        best = best.min(next[i][c.index() as usize]);
+                    }
+                }
+                ranks[i] = plo_rank_from_ck(plo_best_ck(&self.pairs[i], &tri, self.var_mask, best));
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn payout_layers_inner(
+    layers: &PotLayers,
+    ranker: Option<&RunoutRanker>,
+    hole_cards: &[Vec<Card>],
+    folded: &[bool],
+    total_commit: &[u64],
+    board_a: &[Card; 5],
+    board_b: &[Card; 5],
+    button: usize,
+    out: &mut [u64],
+) {
     let n = hole_cards.len();
     out.fill(0);
     if let Some(only) = layers.single_survivor {
@@ -136,14 +272,20 @@ pub fn double_board_payout_layers(
         let half_b = layer.chips - half_a;
         if half_a > 0 {
             if !have_a {
-                rank_alive(&mut ranks_a, hole_cards, folded, board_a, n);
+                match ranker {
+                    Some(r) => r.rank_alive(&mut ranks_a, folded, board_a, &r.fixed_a, &r.next_a),
+                    None => rank_alive(&mut ranks_a, hole_cards, folded, board_a, n),
+                }
                 have_a = true;
             }
             award_half_ranked(out, layer.eligible, &ranks_a, half_a, button);
         }
         if half_b > 0 {
             if !have_b {
-                rank_alive(&mut ranks_b, hole_cards, folded, board_b, n);
+                match ranker {
+                    Some(r) => r.rank_alive(&mut ranks_b, folded, board_b, &r.fixed_b, &r.next_b),
+                    None => rank_alive(&mut ranks_b, hole_cards, folded, board_b, n),
+                }
                 have_b = true;
             }
             award_half_ranked(out, layer.eligible, &ranks_b, half_b, button);
@@ -491,6 +633,77 @@ mod tests {
             let want = double_board_payout_reference(&hole, &folded, &commit, &board_a, &board_b, button);
             let got = double_board_payout(&hole, &folded, &commit, &board_a, &board_b, button);
             assert_eq!(got, want, "case {case}: folded {folded:?} commit {commit:?} button {button}");
+        }
+    }
+
+    /// The EV-runout ranker (pairs encoded once, known-card triples scored
+    /// once) must rank every hand exactly like `evaluate_plo5`: same payout
+    /// for every sampled runout, whatever the number of cards already out.
+    #[test]
+    fn runout_ranker_matches_the_plain_evaluator() {
+        let mut x: u64 = 0xD1B5_4A32_D192_ED03;
+        let mut next = move |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        };
+        for case in 0..4_000 {
+            let n = 2 + next(5) as usize; // 2..=6 seats
+            let hole_w = 4 + next(3) as usize; // PLO4/5/6
+            let known = next(6) as usize; // 0..=5 board cards shared
+            let mut deck: Vec<u8> = (0..52).collect();
+            for i in (1..52).rev() {
+                let j = next(i as u64 + 1) as usize;
+                deck.swap(i, j);
+            }
+            let mut it = deck.into_iter().map(Card::from_index);
+            let hole: Vec<Vec<Card>> = (0..n).map(|_| (&mut it).take(hole_w).collect()).collect();
+            let rest: Vec<Card> = it.collect();
+            let mut folded: Vec<bool> = (0..n).map(|_| next(4) == 0).collect();
+            folded[next(n as u64) as usize] = false;
+            folded[(next(n as u64) as usize + 1) % n] = false;
+            let commit: Vec<u64> =
+                (0..n).map(|_| 1 + next(6) * 997 + next(3)).collect();
+            let button = next(n as u64) as usize;
+            // Known prefix fixed; the ranker sees junk in the unknown slots.
+            let mut board_a = [Card(0); 5];
+            let mut board_b = [Card(0); 5];
+            board_a[..known].copy_from_slice(&rest[..known]);
+            board_b[..known].copy_from_slice(&rest[known..2 * known]);
+            let pool = &rest[2 * known..];
+            let rankers = [
+                RunoutRanker::new(&hole, &folded, &board_a, &board_b, known, pool, false),
+                RunoutRanker::new(&hole, &folded, &board_a, &board_b, known, pool, true),
+            ];
+            let layers = PotLayers::new(&folded, &commit);
+            for sample in 0..6 {
+                let mut a = board_a;
+                let mut b = board_b;
+                let off = sample * 2;
+                for k in known..5 {
+                    a[k] = pool[(off + 2 * (k - known)) % pool.len()];
+                    b[k] = pool[(off + 2 * (k - known) + 1) % pool.len()];
+                }
+                // Distinct cards on the boards (runout draws never repeat).
+                let mut seen = [false; 52];
+                let dup = a.iter().chain(b.iter()).any(|c| {
+                    let d = seen[c.index() as usize];
+                    seen[c.index() as usize] = true;
+                    d
+                });
+                if dup {
+                    continue;
+                }
+                let want = double_board_payout(&hole, &folded, &commit, &a, &b, button);
+                for (t, ranker) in rankers.iter().enumerate() {
+                    let mut got = vec![0u64; n];
+                    double_board_payout_runout(
+                        &layers, ranker, &hole, &folded, &commit, &a, &b, button, &mut got,
+                    );
+                    assert_eq!(got, want, "case {case} sample {sample} known {known} tables {t}");
+                }
+            }
         }
     }
 

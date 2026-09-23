@@ -39,6 +39,7 @@ from plo5bp.compact_obs import (
     layout_for,
     pack_rows_into,
 )
+from plo5bp.compact_obs import unpack as _unpack_compact
 from plo5bp.config import GameConfig, TrainingConfig
 from plo5bp.encoding import OBS_DIM, OBS_DIM_MINIMAL
 from plo5bp.encoding_nlh import OBS_DIM_NLH
@@ -254,8 +255,9 @@ class _PinnedStepH2D:
     """
 
     __slots__ = (
-        "enabled", "device", "cap", "n_slots",
-        "obs_h", "gm_h", "sz_h", "_h2d_events",
+        "enabled", "device", "cap", "n_slots", "layout",
+        "obs_h", "bits_h", "real_h", "gm_h", "sz_h", "_h2d_events",
+        "_packed_k",
     )
 
     def __init__(
@@ -264,6 +266,7 @@ class _PinnedStepH2D:
         obs_dim: int,
         device: torch.device,
         n_slots: int = 2,
+        layout: CompactObsLayout | None = None,
     ) -> None:
         self.device = (
             device if isinstance(device, torch.device) else torch.device(device)
@@ -271,16 +274,35 @@ class _PinnedStepH2D:
         self.cap = int(capacity)
         self.n_slots = max(1, int(n_slots))
         self.enabled = self.device.type == "cuda" and self.cap > 0
+        # Compact transport (see upload_rows): the slots hold PACKED rows.
+        self.layout = (
+            layout if (layout is not None and RUST_PACKER_AVAILABLE) else None
+        )
         self._h2d_events: list = [None] * self.n_slots
+        # Row count of each slot's last PACKED upload (None = dense / none).
+        self._packed_k: list = [None] * self.n_slots
+        self.obs_h = self.bits_h = self.real_h = None  # type: ignore[assignment]
         if not self.enabled:
-            self.obs_h = self.gm_h = self.sz_h = None  # type: ignore[assignment]
+            self.gm_h = self.sz_h = None  # type: ignore[assignment]
             return
         # Shape (n_slots, cap, ...) — one pin bank per slot.
-        self.obs_h = torch.empty(
-            (self.n_slots, self.cap, obs_dim),
-            dtype=torch.float32,
-            pin_memory=True,
-        )
+        if self.layout is not None:
+            self.bits_h = torch.empty(
+                (self.n_slots, self.cap, self.layout.n_bytes),
+                dtype=torch.uint8,
+                pin_memory=True,
+            )
+            self.real_h = torch.empty(
+                (self.n_slots, self.cap, self.layout.n_real),
+                dtype=torch.float32,
+                pin_memory=True,
+            )
+        else:
+            self.obs_h = torch.empty(
+                (self.n_slots, self.cap, obs_dim),
+                dtype=torch.float32,
+                pin_memory=True,
+            )
         self.gm_h = torch.empty(
             (self.n_slots, self.cap, GATE_ACTIONS),
             dtype=torch.bool,
@@ -331,8 +353,13 @@ class _PinnedStepH2D:
                 torch.from_numpy(np.ascontiguousarray(b_gm)).to(self.device),
                 torch.from_numpy(np.ascontiguousarray(b_sizing)).to(self.device),
             )
-        s = int(slot) % self.n_slots
         obs_np = np.ascontiguousarray(b_obs, dtype=np.float32)
+        if self.layout is not None:
+            return self._upload_packed(
+                obs_np, np.arange(k, dtype=np.int64), b_gm, b_sizing, slot
+            )
+        s = int(slot) % self.n_slots
+        self._packed_k[s] = None
         gm_np = np.ascontiguousarray(b_gm, dtype=bool)
         sz_np = np.ascontiguousarray(b_sizing, dtype=np.int64)
         self.obs_h[s].numpy()[:k] = obs_np
@@ -345,6 +372,76 @@ class _PinnedStepH2D:
             self._h2d_events[s] = torch.cuda.Event()
         self._h2d_events[s].record()
         return o_t, m_t, b_t
+
+    def upload_rows(
+        self,
+        obs_arr: np.ndarray,
+        rows: np.ndarray,
+        gm_arr: np.ndarray,
+        sizing_arr: np.ndarray,
+        slot: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``upload(obs_arr[rows], gm_arr[rows], sizing_arr[rows], slot)``
+        without the dense host gather: under a compact layout the rows are
+        packed straight out of `obs_arr` into the pinned slot (Rust,
+        parallel), cross PCIe packed (~7x fewer bytes than float rows) and
+        are unpacked on the device into the IDENTICAL float32 rows
+        (compact_obs.unpack is the exact inverse of the packer)."""
+        rows = np.asarray(rows, dtype=np.int64)
+        k = int(rows.size)
+        if (
+            self.layout is None
+            or not self.enabled
+            or k == 0
+            or k > self.cap
+            or obs_arr.dtype != np.float32
+            or not obs_arr.flags.c_contiguous
+        ):
+            return self.upload(
+                obs_arr[rows], gm_arr[rows], sizing_arr[rows], slot=slot
+            )
+        return self._upload_packed(
+            obs_arr, rows, gm_arr[rows], sizing_arr[rows], slot
+        )
+
+    def _upload_packed(
+        self,
+        obs_arr: np.ndarray,
+        rows: np.ndarray,
+        b_gm: np.ndarray,
+        b_sizing: np.ndarray,
+        slot: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        k = int(rows.size)
+        s = int(slot) % self.n_slots
+        self._packed_k[s] = None
+        pack_rows_into(
+            obs_arr, rows, self.layout,
+            self.bits_h[s].numpy(), self.real_h[s].numpy(), 0,
+        )
+        self._packed_k[s] = k
+        self.gm_h[s].numpy()[:k] = np.asarray(b_gm, dtype=bool)
+        self.sz_h[s].numpy()[:k] = np.asarray(b_sizing, dtype=np.int64)
+        bits_t = self.bits_h[s, :k].to(self.device, non_blocking=True)
+        real_t = self.real_h[s, :k].to(self.device, non_blocking=True)
+        m_t = self.gm_h[s, :k].to(self.device, non_blocking=True)
+        b_t = self.sz_h[s, :k].to(self.device, non_blocking=True)
+        if self._h2d_events[s] is None:
+            self._h2d_events[s] = torch.cuda.Event()
+        self._h2d_events[s].record()
+        return _unpack_compact(bits_t, real_t, self.layout), m_t, b_t
+
+    def packed_rows(
+        self, slot: int, k: int
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """Host views of `slot`'s packed rows when its last upload was a
+        PACKED one of exactly `k` rows, else None -- the learner's act-time
+        rows, reused for trajectory storage (the packer's bytes, so storing
+        them equals packing the same rows again)."""
+        s = int(slot) % self.n_slots
+        if not self.enabled or self._packed_k[s] != int(k):
+            return None
+        return self.bits_h[s].numpy()[:k], self.real_h[s].numpy()[:k]
 
 
 
@@ -1366,6 +1463,17 @@ _OBS_POOL_BUFFERS: dict[tuple, dict] = {}  # (obs_dim, layout) -> {"cap", "obs",
 _STAGING_BUFFERS: dict[tuple, tuple] = {}  # (obs_dim, hole, pin, layout) -> (allocator, big, cap)
 
 
+def _flat_traj_view(arr: np.ndarray) -> np.ndarray:
+    """A (n_envs, n_seats, cap[, w]) trajectory array as a flat
+    (n_envs * n_seats * cap[, w]) VIEW -- writes through it land in `arr`, so
+    one precomputed slot index (env * n_seats + seat) * cap + slot replaces
+    three-array fancy indexing on every read and write."""
+    assert arr.flags.c_contiguous, "trajectory arrays are allocated C-contiguous"
+    v = arr.reshape((-1,) + arr.shape[3:])
+    assert v.ctypes.data == arr.ctypes.data  # a view, never a copy
+    return v
+
+
 def _clear_rollout_buffers() -> None:
     """Drop every reused rollout buffer (tests; frees the memory)."""
     _TRAJ_BUFFERS.clear()
@@ -1918,6 +2026,7 @@ def collect_rollout_batched(
         nonlocal traj_obs_idx, traj_gate, traj_chips, traj_sizing, traj_anchor
         nonlocal traj_u, traj_log_p, traj_gate_lp, traj_anchor_lp, traj_value
         nonlocal traj_q_taken, traj_vpi, costs_arr, pots_arr, streets_arr
+        nonlocal traj_flat
         b = traj_buf
         # Absolute index into `step_obs_pool` / `step_gm_pool` per (env, seat, slot).
         traj_obs_idx, traj_gate, traj_chips = b["obs_idx"], b["gate"], b["chips"]
@@ -1930,7 +2039,13 @@ def collect_rollout_batched(
         traj_q_taken, traj_vpi = b["q_taken"], b["vpi"]
         # Per-step cost / pot / street parallel arrays, mirrored shape.
         costs_arr, pots_arr, streets_arr = b["costs"], b["pots"], b["streets"]
+        traj_flat = {
+            name: _flat_traj_view(arr)
+            for name, arr in b.items()
+            if name != "cap" and arr is not None
+        }
 
+    traj_flat: dict[str, np.ndarray] = {}
     traj_obs_idx = traj_gate = traj_chips = traj_sizing = traj_anchor = None
     traj_u = traj_log_p = traj_gate_lp = traj_anchor_lp = traj_value = None
     traj_q_taken = traj_vpi = costs_arr = pots_arr = streets_arr = None
@@ -2080,7 +2195,12 @@ def collect_rollout_batched(
     aggr_bonus_steps_by_street: list[int] = [0, 0, 0]
 
     # P5 step H2D: long-lived pinned staging (CUDA). See _PinnedStepH2D.
-    _step_h2d = _PinnedStepH2D(n_envs, env.obs_dim, device)
+    # Slot 0 = the learner's act rows (kept intact until the trajectory store
+    # copies them, see step3c/obs_pack); opponents alternate slots 1 and 2.
+    # Compact layout -> rows cross PCIe packed and unpack on the device.
+    _step_h2d = _PinnedStepH2D(
+        n_envs, env.obs_dim, device, n_slots=3, layout=obs_layout
+    )
 
     def _act_to_host(_fw_out, o_t: torch.Tensor | None = None) -> tuple:
         """Coalesce device ActOut -> host numpy (one CUDA sync for the stacks).
@@ -2128,12 +2248,11 @@ def collect_rollout_batched(
         the step has one coalesced learner D2H instead of sync-per-stage.
         act() order unchanged (still before any opp act).
         """
-        b_obs = obs_arr[group]
-        b_gm = gate_mask_arr[group]
-        b_sizing = sizing_arr[group]
         with _TimedRF("step2/learner_h2d"):
             _step_h2d.wait_slot(0)
-            o_t, m_t, b_t = _step_h2d.upload(b_obs, b_gm, b_sizing, slot=0)
+            o_t, m_t, b_t = _step_h2d.upload_rows(
+                obs_arr, group, gate_mask_arr, sizing_arr, slot=0
+            )
         with _TimedRF("step3/learner_forward"):
             with torch.inference_mode():
                 if want_marginal:
@@ -2142,9 +2261,12 @@ def collect_rollout_batched(
                     _fw_out = learner.act(o_t, m_t, b_t)
         return _fw_out, o_t
 
-    # Double-pin opp path: alternate slots 0/1 so group i+1 H2D does not
+    # Double-pin opp path: alternate slots 1/2 so group i+1 H2D does not
     # wait for group i's H2D (only waits when reusing a slot = group i-2).
-    _opp_pin_slot: list = [0]
+    _opp_pin_slot: list = [1]
+
+    def _next_opp_slot(slot: int) -> int:
+        return 3 - slot if _step_h2d.n_slots > 2 else slot
 
     def _opp_upload_act(
         model: ActorCritic,
@@ -2158,13 +2280,12 @@ def collect_rollout_batched(
         Uses alternating ``_step_h2d`` pin slots. act() order is still
         unique(sd) ascending (same CUDA RNG as pre-#1).
         """
-        b_obs = obs_arr[group]
-        b_gm = gate_mask_arr[group]
-        b_sizing = sizing_arr[group]
         slot = _opp_pin_slot[0]
         _step_h2d.wait_slot(slot)
-        o_t, m_t, b_t = _step_h2d.upload(b_obs, b_gm, b_sizing, slot=slot)
-        _opp_pin_slot[0] = 1 - slot if _step_h2d.n_slots > 1 else 0
+        o_t, m_t, b_t = _step_h2d.upload_rows(
+            obs_arr, group, gate_mask_arr, sizing_arr, slot=slot
+        )
+        _opp_pin_slot[0] = _next_opp_slot(slot)
         with torch.inference_mode():
             return model.act(o_t, m_t, b_t)
 
@@ -2198,10 +2319,10 @@ def collect_rollout_batched(
         j = np.arange(rows.size) - (np.cumsum(counts) - counts)[g]
         slot = _opp_pin_slot[0]
         _step_h2d.wait_slot(slot)
-        o_t, m_t, b_t = _step_h2d.upload(
-            obs_arr[rows], gate_mask_arr[rows], sizing_arr[rows], slot=slot
+        o_t, m_t, b_t = _step_h2d.upload_rows(
+            obs_arr, rows, gate_mask_arr, sizing_arr, slot=slot
         )
-        _opp_pin_slot[0] = 1 - slot if _step_h2d.n_slots > 1 else 0
+        _opp_pin_slot[0] = _next_opp_slot(slot)
         g_t = torch.from_numpy(g).to(device)
         j_t = torch.from_numpy(j).to(device)
         with torch.inference_mode():
@@ -2275,9 +2396,7 @@ def collect_rollout_batched(
                 want_marginal=use_vrpo,
             )
             if critic is not None:
-                opp_blk = _rotate_opp_holes_batch(
-                    holes_cache, l_idx, safe_q[l_idx]
-                )
+                opp_blk = holes_rot_cache[l_idx, safe_q[l_idx]]
                 h_t = torch.from_numpy(opp_blk).to(
                     device, non_blocking=(device.type == "cuda")
                 )
@@ -2505,6 +2624,7 @@ def collect_rollout_batched(
         # then ONE coalesced D2H for learner (+ critic) and opp gates/chips.
         # act() call order unchanged: full learner batch, then opp groups in
         # unique(sd) order — bit-exact vs pre-#2 trajectories.
+        _learner_packed = None
         if not _used_prefetch:
             _learner_fw = None
             _learner_o_t = None
@@ -2516,13 +2636,18 @@ def collect_rollout_batched(
                     learner_idx_np, obs, gate_masks, sizing_step,
                     want_marginal=use_vrpo,
                 )
+                # Slot 0 now holds exactly these rows, packed (opponents
+                # upload through slots 1/2): step3c/obs_pack stores them.
+                _learner_packed = _step_h2d.packed_rows(0, learner_idx_np.size)
                 # Host prep that does not need D2H: opp-hole rotation for critic
                 # can run while learner kernels finish (and before/during opp acts).
                 if critic is not None:
                     with _TimedRF("step3a/opp_holes_rot"):
-                        _opp_block_np = _rotate_opp_holes_batch(
-                            holes_cache, learner_idx_np, safe_actors[learner_idx_np]
-                        )
+                        # = _rotate_opp_holes_batch(holes_cache, rows, actors):
+                        # the per-hand cache holds every seat's rotation.
+                        _opp_block_np = holes_rot_cache[
+                            learner_idx_np, safe_actors[learner_idx_np]
+                        ]
                     with _TimedRF("step3b/critic_forward"):
                         h_t = torch.from_numpy(_opp_block_np).to(
                             device, non_blocking=(device.type == "cuda")
@@ -2625,6 +2750,9 @@ def collect_rollout_batched(
             step_timers.begin("step3c/obs_pack")
             if obs_layout is None:
                 step_obs_pool["obs"][pool_cursor:pool_end] = obs[learner_idx_np]
+            elif _learner_packed is not None:
+                step_obs_pool["obs_bits"][pool_cursor:pool_end] = _learner_packed[0]
+                step_obs_pool["obs_real"][pool_cursor:pool_end] = _learner_packed[1]
             else:
                 pack_rows_into(
                     obs, learner_idx_np, obs_layout,
@@ -2651,39 +2779,25 @@ def collect_rollout_batched(
             step_timers.begin("step3c/traj_writes")
             l_gates = gates_per_env[learner_idx_np]
             l_chips = chips_per_env[learner_idx_np]
-            traj_obs_idx[learner_idx_np, learner_actors, slots] = pool_indices
-            traj_gate[learner_idx_np, learner_actors, slots] = l_gates.astype(np.int8)
-            traj_chips[learner_idx_np, learner_actors, slots] = np.where(
+            # One flat slot index for every per-(env, seat, slot) array
+            # (after any _grow_traj above, so it uses the current capacity).
+            tw = (learner_idx_np * n_seats + learner_actors) * traj_cap + slots
+            tf = traj_flat
+            tf["obs_idx"][tw] = pool_indices
+            tf["gate"][tw] = l_gates.astype(np.int8)
+            tf["chips"][tw] = np.where(
                 l_gates == GATE_RAISE, l_chips.astype(np.int64), 0
             )
-            traj_sizing[learner_idx_np, learner_actors, slots] = (
-                sizing_step[learner_idx_np]
-            )
-            traj_anchor[learner_idx_np, learner_actors, slots] = (
-                anchors_per_env[learner_idx_np].astype(np.int8)
-            )
-            traj_u[learner_idx_np, learner_actors, slots] = (
-                refine_u_per_env[learner_idx_np]
-            )
-            traj_log_p[learner_idx_np, learner_actors, slots] = (
-                log_probs_per_env[learner_idx_np]
-            )
-            traj_gate_lp[learner_idx_np, learner_actors, slots] = (
-                gate_logp_per_env[learner_idx_np]
-            )
-            traj_anchor_lp[learner_idx_np, learner_actors, slots] = (
-                anchor_logp_per_env[learner_idx_np]
-            )
-            traj_value[learner_idx_np, learner_actors, slots] = (
-                values_per_env[learner_idx_np]
-            )
+            tf["sizing"][tw] = sizing_step[learner_idx_np]
+            tf["anchor"][tw] = anchors_per_env[learner_idx_np].astype(np.int8)
+            tf["u"][tw] = refine_u_per_env[learner_idx_np]
+            tf["log_p"][tw] = log_probs_per_env[learner_idx_np]
+            tf["gate_lp"][tw] = gate_logp_per_env[learner_idx_np]
+            tf["anchor_lp"][tw] = anchor_logp_per_env[learner_idx_np]
+            tf["value"][tw] = values_per_env[learner_idx_np]
             if use_vrpo:
-                traj_q_taken[learner_idx_np, learner_actors, slots] = (
-                    q_taken_per_env[learner_idx_np]
-                )
-                traj_vpi[learner_idx_np, learner_actors, slots] = (
-                    vpi_per_env[learner_idx_np]
-                )
+                tf["q_taken"][tw] = q_taken_per_env[learner_idx_np]
+                tf["vpi"][tw] = vpi_per_env[learner_idx_np]
             step_timers.end()  # step3c/traj_writes
 
         # Short-shove redirect: rows where the network emitted GATE_RAISE
@@ -2750,9 +2864,10 @@ def collect_rollout_batched(
                 street_pre_arr = np.asarray(agg["street_pre"], dtype=np.int8)
                 valid_actors = safe_actors[valid_idx]
                 valid_slots = traj_lengths[valid_idx, valid_actors]
-                costs_arr[valid_idx, valid_actors, valid_slots] = cost_inc_arr[valid_idx]
-                pots_arr[valid_idx, valid_actors, valid_slots] = pot_pre_bb_arr[valid_idx]
-                streets_arr[valid_idx, valid_actors, valid_slots] = street_pre_arr[valid_idx]
+                vw = (valid_idx * n_seats + valid_actors) * traj_cap + valid_slots
+                traj_flat["costs"][vw] = cost_inc_arr[valid_idx]
+                traj_flat["pots"][vw] = pot_pre_bb_arr[valid_idx]
+                traj_flat["streets"][vw] = street_pre_arr[valid_idx]
                 traj_lengths[valid_idx, valid_actors] += 1
 
             aggr_bonus_total_bb += float(agg["total_bonus_bb"])
@@ -2939,17 +3054,18 @@ def collect_rollout_batched(
                             _grow_slabs(wcursor + n_new)
                         sel = np.nonzero(flat)[0]
                         end = wcursor + n_new
-                        # Single (T,S,L) window into traj storage.
-                        obs_idx_tsl = traj_obs_idx[term_envs, :, :L]
-                        gate_tsl = traj_gate[term_envs, :, :L]
-                        chips_tsl = traj_chips[term_envs, :, :L]
-                        sizing_tsl = traj_sizing[term_envs, :, :L]
-                        anchor_tsl = traj_anchor[term_envs, :, :L]
-                        u_tsl = traj_u[term_envs, :, :L]
-                        lp_tsl = traj_log_p[term_envs, :, :L]
-                        glp_tsl = traj_gate_lp[term_envs, :, :L]
-                        alp_tsl = traj_anchor_lp[term_envs, :, :L]
-                        obs_idx = obs_idx_tsl.ravel()[sel]
+                        # sel indexes the (T, S, L) flush window; map each
+                        # selected (t, s, l) straight to its trajectory slot
+                        # ((env * S + seat) * cap + l) and gather every field
+                        # from storage with it -- the same rows in the same
+                        # order, without (T, S, L) copies of every array.
+                        ts_idx = sel // L
+                        l_sel = sel - ts_idx * L
+                        t_sel = ts_idx // S
+                        es_sel = term_envs[t_sel] * S + (ts_idx - t_sel * S)
+                        tsel = es_sel * traj_cap + l_sel
+                        tf = traj_flat
+                        obs_idx = tf["obs_idx"][tsel]
                         for key, pool_arr in step_obs_pool.items():
                             np.take(
                                 pool_arr, obs_idx, axis=0,
@@ -2959,29 +3075,24 @@ def collect_rollout_batched(
                             step_gm_pool, obs_idx, axis=0,
                             out=slabs["gm"][wcursor:end],
                         )
-                        slabs["ga"][wcursor:end] = gate_tsl.ravel()[sel].astype(
-                            np.int64, copy=False
-                        )
-                        slabs["rc"][wcursor:end] = chips_tsl.ravel()[sel]
-                        slabs["sz"][wcursor:end] = sizing_tsl.reshape(-1, 4)[sel]
-                        slabs["an"][wcursor:end] = anchor_tsl.ravel()[sel].astype(
-                            np.int64, copy=False
-                        )
-                        slabs["ru"][wcursor:end] = u_tsl.ravel()[sel]
-                        # (T, S, 5, hole_w) already rotated; ts_idx = env*S+seat
-                        ts_idx = sel // L
-                        slabs["oh"][wcursor:end] = holes_rot_cache[term_envs].reshape(
-                            T * S, 5, _hole_w
-                        )[ts_idx]
-                        slabs["lp"][wcursor:end] = lp_tsl.ravel()[sel]
-                        slabs["glp"][wcursor:end] = glp_tsl.ravel()[sel]
-                        slabs["alp"][wcursor:end] = alp_tsl.ravel()[sel]
+                        slabs["ga"][wcursor:end] = tf["gate"][tsel]
+                        slabs["rc"][wcursor:end] = tf["chips"][tsel]
+                        slabs["sz"][wcursor:end] = tf["sizing"][tsel]
+                        slabs["an"][wcursor:end] = tf["anchor"][tsel]
+                        slabs["ru"][wcursor:end] = tf["u"][tsel]
+                        # Hero-rotated opp holes per (env, seat), filled on deal.
+                        slabs["oh"][wcursor:end] = holes_rot_cache.reshape(
+                            n_envs * S, 5, _hole_w
+                        )[es_sel]
+                        slabs["lp"][wcursor:end] = tf["log_p"][tsel]
+                        slabs["glp"][wcursor:end] = tf["gate_lp"][tsel]
+                        slabs["alp"][wcursor:end] = tf["anchor_lp"][tsel]
                         slabs["v"][wcursor:end] = vals_t.ravel()[sel]
                         slabs["ret"][wcursor:end] = rets_t.ravel()[sel]
                         slabs["adv"][wcursor:end] = adv_out_t.ravel()[sel]
                         slabs["last"][wcursor:end] = (
-                            t_idx[None, None, :] == last_t_arr[..., None]
-                        ).ravel()[sel]
+                            l_sel == last_t_arr.ravel()[ts_idx]
+                        )
                         wcursor = end
 
                 traj_lengths[term_envs] = 0

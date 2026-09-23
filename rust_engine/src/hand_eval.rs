@@ -1014,6 +1014,193 @@ pub fn evaluate_plo5(hole: &[Card], board: &[Card; 5]) -> HandRank {
     ck_to_hand_rank(safe_ck)
 }
 
+// ---------- PLO evaluation against many boards (EV runouts) ----------
+
+/// One PLO hole's C(hole, 2) two-card halves, Cactus-Kev encoded ONCE for a
+/// hand that is evaluated against many boards (an EV runout replays 64 board
+/// pairs). A 5-card combo's rank bitset, flush test and prime product are the
+/// OR / AND / product of its five encoded cards -- i.e. the pair's combined
+/// with the board triple's -- so [`plo_best_ck`] returns exactly the minimum
+/// CK that [`evaluate_plo5`] finds. (Five primes <= 41 multiply to at most
+/// 41^5 < 2^32: the regrouped u32 product is the same number.)
+#[derive(Clone, Copy)]
+pub struct PloPairs {
+    or: [u32; 15],
+    and: [u32; 15],
+    prod: [u32; 15],
+    n: usize,
+}
+
+impl PloPairs {
+    /// No pairs at all (a folded seat nobody ranks).
+    pub const EMPTY: PloPairs = PloPairs { or: [0; 15], and: [0; 15], prod: [0; 15], n: 0 };
+
+    pub fn new(hole: &[Card]) -> Self {
+        assert!(
+            (4..=6).contains(&hole.len()),
+            "PLO hole must have exactly 4 (PLO4), 5 (PLO5), or 6 (PLO6) cards"
+        );
+        let mut h = [0u32; 6];
+        for (i, c) in hole.iter().enumerate() {
+            h[i] = card_to_ck(*c);
+        }
+        let pairs: &[(usize, usize)] = match hole.len() {
+            4 => &PAIRS_4,
+            5 => &PAIRS_5,
+            _ => &PAIRS_6,
+        };
+        let mut out = Self { n: pairs.len(), ..Self::EMPTY };
+        for (k, &(a, b)) in pairs.iter().enumerate() {
+            out.or[k] = h[a] | h[b];
+            out.and[k] = h[a] & h[b];
+            out.prod[k] = (h[a] & 0xFF) * (h[b] & 0xFF);
+        }
+        out
+    }
+}
+
+/// The ten 3-card triples of a 5-card board (`TRIPLES_5` order), encoded
+/// like [`PloPairs`].
+#[derive(Clone, Copy)]
+pub struct BoardTriples {
+    or: [u32; 10],
+    and: [u32; 10],
+    prod: [u32; 10],
+}
+
+impl BoardTriples {
+    pub fn new(board: &[Card; 5]) -> Self {
+        let b = [
+            card_to_ck(board[0]),
+            card_to_ck(board[1]),
+            card_to_ck(board[2]),
+            card_to_ck(board[3]),
+            card_to_ck(board[4]),
+        ];
+        let mut out = Self { or: [0; 10], and: [0; 10], prod: [0; 10] };
+        for (j, &(x, y, z)) in TRIPLES_5.iter().enumerate() {
+            out.or[j] = b[x] | b[y] | b[z];
+            out.and[j] = b[x] & b[y] & b[z];
+            out.prod[j] = (b[x] & 0xFF) * (b[y] & 0xFF) * (b[z] & 0xFF);
+        }
+        out
+    }
+}
+
+/// Every one of the ten board triples.
+pub const ALL_TRIPLES: u16 = (1 << 10) - 1;
+
+/// Bit j set = `TRIPLES_5[j]` uses only board positions `0..known` -- the
+/// triples every runout of a board with `known` cards out shares.
+pub fn fixed_triples_mask(known: usize) -> u16 {
+    let mut m = 0u16;
+    for (j, &(x, y, z)) in TRIPLES_5.iter().enumerate() {
+        if x < known && y < known && z < known {
+            m |= 1 << j;
+        }
+    }
+    m
+}
+
+/// The ten triples of a board with `known` cards out, split by how many of
+/// their positions are still to come: (none, exactly one, two or more).
+pub fn triple_masks(known: usize) -> (u16, u16, u16) {
+    let (mut fixed, mut one, mut multi) = (0u16, 0u16, 0u16);
+    for (j, &(x, y, z)) in TRIPLES_5.iter().enumerate() {
+        match [x, y, z].iter().filter(|&&p| p >= known).count() {
+            0 => fixed |= 1 << j,
+            1 => one |= 1 << j,
+            _ => multi |= 1 << j,
+        }
+    }
+    (fixed, one, multi)
+}
+
+/// Per next card: the min CK over `pairs` x every triple made of two of the
+/// `known` board cards plus that card (u16::MAX where no combo counts; only
+/// the `deck` cards are filled). For any runout of the board, the min over
+/// its exactly-one-new-card triples is the min of this table over the new
+/// cards -- so a runout sample looks those up instead of evaluating them.
+pub fn one_new_card_table(pairs: &PloPairs, known: &[Card], deck: &[Card]) -> [u16; 52] {
+    let t = tables();
+    let kc: Vec<u32> = known.iter().map(|&c| card_to_ck(c)).collect();
+    let mut kp: Vec<(u32, u32, u32)> = Vec::with_capacity(10);
+    for a in 0..kc.len() {
+        for b in (a + 1)..kc.len() {
+            kp.push((kc[a] | kc[b], kc[a] & kc[b], (kc[a] & 0xFF) * (kc[b] & 0xFF)));
+        }
+    }
+    let mut table = [u16::MAX; 52];
+    for &c in deck {
+        let e = card_to_ck(c);
+        let mut best = u16::MAX;
+        for &(o, a, p) in &kp {
+            let (to, ta, tp) = (o | e, a & e, p * (e & 0xFF));
+            for k in 0..pairs.n {
+                let ck = ck_eval_parts(pairs.or[k] | to, pairs.and[k] & ta, pairs.prod[k] * tp, t);
+                if ck != 0 && ck < best {
+                    best = ck;
+                }
+            }
+        }
+        table[c.index() as usize] = best;
+    }
+    table
+}
+
+/// Min CK (lower = stronger; `u16::MAX` = none yet) over `pairs` x the
+/// board triples selected by `tmask`, folded into `best`. Degenerate combos
+/// (ck 0) are skipped exactly as in [`evaluate_plo5`], and a min is
+/// order-free, so splitting the triples across calls gives the same value.
+#[inline]
+pub fn plo_best_ck(pairs: &PloPairs, triples: &BoardTriples, tmask: u16, mut best: u16) -> u16 {
+    let t = tables();
+    for k in 0..pairs.n {
+        let (po, pa, pp) = (pairs.or[k], pairs.and[k], pairs.prod[k]);
+        let mut bits = tmask;
+        while bits != 0 {
+            let j = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let ck = ck_eval_parts(po | triples.or[j], pa & triples.and[j], pp * triples.prod[j], t);
+            if ck != 0 && ck < best {
+                best = ck;
+            }
+        }
+    }
+    best
+}
+
+/// The [`HandRank`] of a [`plo_best_ck`] result (the tail of
+/// [`evaluate_plo5`]: worst rank when every combo was degenerate).
+#[inline]
+pub fn plo_rank_from_ck(best: u16) -> HandRank {
+    ck_to_hand_rank(if best == u16::MAX { 7462 } else { best })
+}
+
+/// [`ck_eval_inline`] from a combo's OR / AND / prime product.
+#[inline]
+fn ck_eval_parts(or: u32, and: u32, prod: u32, t: &CkTables) -> u16 {
+    let q = (or >> 16) as usize;
+    if (and & 0xF000) != 0 {
+        return t.flushes[q];
+    }
+    let u = t.unique5[q];
+    if u != 0 {
+        return u;
+    }
+    let mut slot = (prod.wrapping_mul(0x9E3779B9) >> 18) as usize;
+    loop {
+        let (k, v) = t.paired_hash[slot];
+        if k == prod {
+            return v;
+        }
+        if k == 0 {
+            return 0;
+        }
+        slot = (slot + 1) & (PAIRED_HASH_CAP - 1);
+    }
+}
+
 // ---------- Naive reference evaluator (test oracle only) ----------
 
 #[cfg(test)]
@@ -1245,6 +1432,43 @@ mod tests {
         let board = [c(0, 0), c(2, 1), c(4, 2), c(6, 3), c(5, 0)];
         let r = evaluate_plo5(&hole, &board);
         assert!(category(r) < CAT_TRIPS);
+    }
+
+    // -------- Pair/triple (EV-runout) evaluator == evaluate_plo5 --------
+
+    #[test]
+    fn plo_best_ck_matches_evaluate_plo5() {
+        let mut rng = ChaCha8Rng::seed_from_u64(0x5EED_CAFE);
+        for case in 0..30_000 {
+            let hole_w = 4 + (case % 3);
+            let mut deck: [u8; 52] = std::array::from_fn(|i| i as u8);
+            for i in 0..(hole_w + 5) {
+                let j = rng.gen_range(i..52);
+                deck.swap(i, j);
+            }
+            let hole: Vec<Card> = deck[..hole_w].iter().map(|&c| Card(c)).collect();
+            let board: [Card; 5] = std::array::from_fn(|k| Card(deck[hole_w + k]));
+            let want = evaluate_plo5(&hole, &board);
+            let pairs = PloPairs::new(&hole);
+            let tri = BoardTriples::new(&board);
+            assert_eq!(
+                plo_rank_from_ck(plo_best_ck(&pairs, &tri, ALL_TRIPLES, u16::MAX)),
+                want,
+                "case {case}"
+            );
+            // Split at every "cards already out" count: same best CK.
+            for known in 0..=5 {
+                let fixed = fixed_triples_mask(known);
+                let pre = plo_best_ck(&pairs, &tri, fixed, u16::MAX);
+                let got = plo_best_ck(&pairs, &tri, ALL_TRIPLES & !fixed, pre);
+                assert_eq!(plo_rank_from_ck(got), want, "case {case} known {known}");
+            }
+        }
+        // Fixed triples: 3 cards out -> only the flop triple; 4 -> four; 5 -> all.
+        assert_eq!(fixed_triples_mask(2), 0);
+        assert_eq!(fixed_triples_mask(3).count_ones(), 1);
+        assert_eq!(fixed_triples_mask(4).count_ones(), 4);
+        assert_eq!(fixed_triples_mask(5), ALL_TRIPLES);
     }
 
     // -------- CK vs naive evaluator equivalence --------

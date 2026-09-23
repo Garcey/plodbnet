@@ -202,6 +202,45 @@ anchor` = v2 (head_version 2), `logistic` = v4 (3), `mixture` = v5 (4).
     `step3c/traj_grow` when a buffer grows); every region also reports the
     kernel CPU time (`sys_s`) and minor page faults (`faults_k`) spent in it
     (Linux; zeros on Windows) — a kernel stall shows up there.
+- **Second efficiency pass (2026-09-23, all BIT-EXACT)** — every change is
+  verified by training 3 small updates (CPU, and CUDA on the pod) and hashing
+  every tensor of the checkpoints + optimizer sidecar against the previous
+  commit: identical. From here on the rule is exactness (owner: "remains bit
+  exact") — no more RNG-stream changes. vMin2 went ~500-555 s -> ~342 s per
+  update (RTX PRO 6000 pod) before the last batch below.
+  - Engine: `payouts_ev` ranks double-board runouts through
+    `double_board::RunoutRanker` — hole pairs encoded once per hand, the
+    triples of cards already out scored once, and (flop/turn all-ins)
+    per-next-card tables for the triples holding one new card, so a sample
+    evaluates only triples with 2+ new cards (`hand_eval::plo_best_ck` /
+    `one_new_card_table`; same min over the same combos). 2.3-2.6x faster
+    all-in payouts. Pinned by `plo_best_ck_matches_evaluate_plo5` and
+    `runout_ranker_matches_the_plain_evaluator`.
+  - Engine: `payouts_ev_subset` (only the newly-finished rows — in the drain
+    phase the whole-batch call re-ran every earlier-finished hand's runouts
+    each step; one hand per rayon task), `observation_encoded_minimal_into` /
+    `_subset_into` (rows written straight into the env's obs buffer),
+    in-place parallel `reset_terminal_batch`, parallel `reset_batch`,
+    `apply_hybrid_batch` validation in parallel + mask-free Fold/CheckCall
+    legality (`GameState::fold_is_legal` / `check_call_is_legal`, pinned to
+    the mask in `play_random_hand`), no per-action heap allocation.
+  - Rollout: act-time rows cross PCIe PACKED (`_PinnedStepH2D.upload_rows`:
+    Rust-packed from `env._obs` into pinned memory, unpacked on the GPU —
+    ~7x fewer bytes, no dense host gather); the learner's packed rows (slot
+    0; opponents use slots 1/2) are copied into the trajectory obs pool
+    instead of packed twice; trajectory reads/writes use one flat slot index
+    (`_flat_traj_view`); the critic's rotated opponent holes come from the
+    per-hand `holes_rot_cache`.
+  - Guardian: glibc malloc keeps freed memory (`MALLOC_*_` env in
+    `vMin2_guardian.sh`). The ~6M page faults per update left in
+    `step9d/slab_copies` are the host's AutoNUMA hinting faults on the
+    reused 28 GB staging buffer (RSS is flat) — host setting, not fixable
+    from the container.
+  - Verify an exactness claim the same way: `scripts/train.py --device
+    {cpu,cuda} --hidden-dim 32 --num-layers 3 --critic-hidden-dim 32
+    --critic-num-blocks 1 --num-envs 480 --rollout-length 24000
+    --mix-configs --configs-per-tier 2 --seed 1234 --num-updates 3`, then
+    SHA-256 every tensor of every checkpoint (+ `.optim.pt`), old vs new.
 
 ### v5 (2026-07-06, IMPLEMENTED, not yet trained — V5_DESIGN.md canonical)
 
