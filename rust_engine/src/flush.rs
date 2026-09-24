@@ -507,7 +507,7 @@ pub fn record_learner_steps<'py>(
         dsts.push(a.as_slice_mut()?);
     }
     let ascending = slot.windows(2).all(|w| w[0] < w[1]);
-    if !ascending || slot.len() < 2 * REC_MIN_LEN {
+    if !ascending || slot.len() < REC_PAR_MIN_ROWS {
         for (i, (&sl, &e)) in slot.iter().zip(lidx).enumerate() {
             let (sl, e) = (sl as usize, e as usize);
             to[sl] = pool_start + i as i64;
@@ -555,6 +555,9 @@ pub fn record_learner_steps<'py>(
 
 /// Parallel `record_learner_steps` below this many rows per task.
 const REC_MIN_LEN: usize = 1024;
+/// ... and only from this many rows up: a step of a few thousand rows costs
+/// less sequentially than waking the pool's workers.
+const REC_PAR_MIN_ROWS: usize = 8192;
 
 struct RecOut {
     to: *mut i64,
@@ -567,62 +570,130 @@ struct RecOut {
 unsafe impl Send for RecOut {}
 unsafe impl Sync for RecOut {}
 
-/// Rows per rayon task in `gather_rows_into`.
-const GATHER_MIN_ROWS: usize = 512;
+/// Rows per rayon task in `gather_rows_multi`.
+const GATHER_BLOCK_ROWS: usize = 2048;
+/// Copies below this many bytes run on the calling thread: handing a job to
+/// the thread pool from Python wakes its sleeping workers (~0.2-0.4 ms on the
+/// pod), more than a small copy costs.
+const GATHER_PAR_MIN_BYTES: usize = 4 << 20;
 
-/// `dst[dst_start + i] = src[rows[i]]` for every i (`rows` None: `src[i]`),
+/// One array pair of a gather: source rows and the destination base pointer.
+struct GatherJob<'a> {
+    src: &'a [u8],
+    w: usize,
+    dst: *mut u8,
+}
+unsafe impl Send for GatherJob<'_> {}
+unsafe impl Sync for GatherJob<'_> {}
+
+/// `dsts[j][dst_start + i] = srcs[j][rows[i]]` for every pair j and row i
+/// (`rows` None: `srcs[j][i]`, with every source holding the same row count),
 /// rows of raw BYTES -- pass any C-contiguous 2-D array as `a.view(np.uint8)`.
 /// The rollout's per-step host copies (packed observation rows into the
-/// pinned upload slots and the trajectory pool, gate-mask rows) were
-/// single-threaded numpy gathers; this is the same bytes, copied in parallel.
+/// pinned upload slots and the trajectory pool, gate-mask and sizing rows)
+/// were single-threaded numpy gathers, one call per array; this is the same
+/// bytes for every array in one call, in parallel only when the copy is big.
 #[pyfunction]
-#[pyo3(signature = (src, dst, dst_start, rows=None))]
-pub fn gather_rows_into<'py>(
-    src: PyReadonlyArray2<'py, u8>,
-    mut dst: PyReadwriteArray2<'py, u8>,
+#[pyo3(signature = (srcs, dsts, dst_start, rows=None))]
+pub fn gather_rows_multi<'py>(
+    srcs: Vec<PyReadonlyArray2<'py, u8>>,
+    mut dsts: Vec<PyReadwriteArray2<'py, u8>>,
     dst_start: usize,
     rows: Option<PyReadonlyArray1<'py, i64>>,
 ) -> PyResult<()> {
-    let err = |m: String| PyValueError::new_err(format!("gather_rows_into: {m}"));
-    if !src.is_c_contiguous() || !dst.is_c_contiguous() {
-        return Err(err("src and dst must be C-contiguous".into()));
-    }
-    let (src_n, w) = (src.shape()[0], src.shape()[1]);
-    let (dst_n, dst_w) = (dst.shape()[0], dst.shape()[1]);
-    if dst_w != w {
-        return Err(err(format!("row widths differ: src {w} bytes, dst {dst_w} bytes")));
+    let err = |m: String| PyValueError::new_err(format!("gather_rows_multi: {m}"));
+    if srcs.len() != dsts.len() {
+        return Err(err(format!("{} sources but {} destinations", srcs.len(), dsts.len())));
     }
     let rows_arr = match rows.as_ref() {
         Some(r) => Some(r.as_slice()?),
         None => None,
     };
-    let k = rows_arr.map_or(src_n, |r| r.len());
-    if dst_start.checked_add(k).map_or(true, |end| end > dst_n) {
-        return Err(err(format!("{k} rows at {dst_start} overflow dst ({dst_n} rows)")));
-    }
-    if let Some(r) = rows_arr {
-        if let Some(&bad) = r.iter().find(|&&x| x < 0 || x as usize >= src_n) {
-            return Err(err(format!("row {bad} out of range ({src_n} rows)")));
+    let mut k: Option<usize> = rows_arr.map(|r| r.len());
+    let mut total_w = 0usize;
+    let mut jobs: Vec<GatherJob> = Vec::with_capacity(srcs.len());
+    for (src, dst) in srcs.iter().zip(dsts.iter_mut()) {
+        if !src.is_c_contiguous() || !dst.is_c_contiguous() {
+            return Err(err("sources and destinations must be C-contiguous".into()));
         }
+        let (src_n, w) = (src.shape()[0], src.shape()[1]);
+        let (dst_n, dst_w) = (dst.shape()[0], dst.shape()[1]);
+        if dst_w != w {
+            return Err(err(format!("row widths differ: src {w} bytes, dst {dst_w} bytes")));
+        }
+        let kk = match (rows_arr, k) {
+            (Some(r), _) => {
+                if let Some(&bad) = r.iter().find(|&&x| x < 0 || x as usize >= src_n) {
+                    return Err(err(format!("row {bad} out of range ({src_n} rows)")));
+                }
+                r.len()
+            }
+            (None, Some(prev)) if prev != src_n => {
+                return Err(err(format!("sources hold {prev} and {src_n} rows")));
+            }
+            (None, _) => src_n,
+        };
+        k = Some(kk);
+        if dst_start.checked_add(kk).map_or(true, |end| end > dst_n) {
+            return Err(err(format!("{kk} rows at {dst_start} overflow dst ({dst_n} rows)")));
+        }
+        total_w += w;
+        jobs.push(GatherJob {
+            src: src.as_slice()?,
+            w,
+            dst: dst.as_slice_mut()?.as_mut_ptr(),
+        });
     }
-    if k == 0 || w == 0 {
+    let k = k.unwrap_or(0);
+    if k == 0 || total_w == 0 {
         return Ok(());
     }
-    let sv = src.as_slice()?;
-    let dv = &mut dst.as_slice_mut()?[dst_start * w..(dst_start + k) * w];
-    match rows_arr {
-        Some(r) => dv
-            .par_chunks_mut(w)
-            .with_min_len(GATHER_MIN_ROWS)
-            .zip(r.par_iter())
-            .for_each(|(d, &ri)| {
-                let ri = ri as usize;
-                d.copy_from_slice(&sv[ri * w..(ri + 1) * w]);
-            }),
-        None => dv
-            .par_chunks_mut(w * GATHER_MIN_ROWS)
-            .zip(sv[..k * w].par_chunks(w * GATHER_MIN_ROWS))
-            .for_each(|(d, s)| d.copy_from_slice(s)),
+    let block = |lo: usize, hi: usize| {
+        for j in &jobs {
+            let w = j.w;
+            // SAFETY: rows [lo, hi) of every destination belong to this block
+            // alone, and every index was bounds-checked above.
+            unsafe {
+                match rows_arr {
+                    Some(r) => {
+                        for i in lo..hi {
+                            std::ptr::copy_nonoverlapping(
+                                j.src.as_ptr().add(r[i] as usize * w),
+                                j.dst.add((dst_start + i) * w),
+                                w,
+                            );
+                        }
+                    }
+                    None => std::ptr::copy_nonoverlapping(
+                        j.src.as_ptr().add(lo * w),
+                        j.dst.add((dst_start + lo) * w),
+                        (hi - lo) * w,
+                    ),
+                }
+            }
+        }
+    };
+    if k * total_w < GATHER_PAR_MIN_BYTES || k <= GATHER_BLOCK_ROWS {
+        block(0, k);
+    } else {
+        (0..k.div_ceil(GATHER_BLOCK_ROWS)).into_par_iter().for_each(|b| {
+            let lo = b * GATHER_BLOCK_ROWS;
+            block(lo, (lo + GATHER_BLOCK_ROWS).min(k));
+        });
     }
     Ok(())
+}
+
+/// `gather_rows_multi` for one array pair: `dst[dst_start + i] = src[rows[i]]`
+/// (`rows` None: `src[i]`).
+#[pyfunction]
+#[pyo3(signature = (src, dst, dst_start, rows=None))]
+pub fn gather_rows_into<'py>(
+    src: PyReadonlyArray2<'py, u8>,
+    dst: PyReadwriteArray2<'py, u8>,
+    dst_start: usize,
+    rows: Option<PyReadonlyArray1<'py, i64>>,
+) -> PyResult<()> {
+    gather_rows_multi(vec![src], vec![dst], dst_start, rows)
+        .map_err(|e| PyValueError::new_err(e.to_string().replace("gather_rows_multi", "gather_rows_into")))
 }

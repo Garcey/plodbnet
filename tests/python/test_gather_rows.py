@@ -1,12 +1,13 @@
 """Parallel per-step host copies (2026-09-24).
 
-`gather_rows_into` (the engine's parallel byte-row copy) must write exactly
-the bytes numpy's row gather / slice copy writes, for every dtype the rollout
-feeds it, and refuse bad shapes instead of writing out of bounds; the
-rollout's `_gather_rows` wrapper must give the same array on either path.
+`gather_rows_multi` / `gather_rows_into` (the engine's byte-row copy: small
+copies on the calling thread, big ones in parallel) must write exactly the
+bytes numpy's row gather / slice copy writes, for every dtype the rollout feeds
+it, and refuse bad shapes instead of writing out of bounds; the rollout's
+`_gather_rows` wrapper must give the same array on either path.
 `record_learner_steps` must write the numpy assignments' values whether it
-takes its parallel path (>= 2 * REC_MIN_LEN strictly increasing slots) or the
-sequential one (any other order).
+takes its parallel path (>= REC_PAR_MIN_ROWS strictly increasing slots) or the
+sequential one (fewer rows, or any other order).
 """
 
 from __future__ import annotations
@@ -124,10 +125,41 @@ def _record_reference(per_env, traj, keys, slot, lidx, pool_start):
 @pytest.mark.parametrize("vrpo", [True, False])
 def test_record_learner_steps_parallel_and_sequential(ascending: bool, vrpo: bool) -> None:
     rng = np.random.default_rng(3 + 2 * int(ascending) + int(vrpo))
-    per_env, traj, keys, slot, lidx = _record_case(rng, 12000, 6000, ascending, vrpo)
+    per_env, traj, keys, slot, lidx = _record_case(rng, 24000, 12000, ascending, vrpo)
     want = _record_reference(per_env, traj, keys, slot, lidx, 1234)
     got = {key: v.copy() for key, v in traj.items()}
     flat = {key: (v.reshape(-1, 4) if key == "sizing" else v) for key, v in got.items()}
     record_learner_steps(slot, lidx, 1234, flat, per_env)
     for key in want:
         assert np.array_equal(got[key], want[key], equal_nan=True), key
+
+
+@pytest.mark.parametrize("k", [300, 30000])  # on the calling thread / in parallel
+def test_gather_multi_matches_numpy(k: int) -> None:
+    from plo5bp._engine import gather_rows_multi
+
+    rng = np.random.default_rng(4)
+    arrs = _arrays(rng, 40000)
+    srcs = [arrs["u8"], arrs["f32"], arrs["bool"], arrs["i64"]]
+    rows = rng.integers(0, 40000, size=k).astype(np.int64)
+    dsts = [np.zeros((k + 9,) + s.shape[1:], dtype=s.dtype) for s in srcs]
+    gather_rows_multi([s.view(np.uint8) for s in srcs], [d.view(np.uint8) for d in dsts], 9, rows)
+    for s, d in zip(srcs, dsts):
+        assert np.array_equal(d[9:], s[rows]) and not d[:9].any()
+    # rows=None: the first len(src) rows of every source, in order.
+    parts = [s[:k] for s in srcs]
+    dsts2 = [np.zeros((k + 3,) + s.shape[1:], dtype=s.dtype) for s in srcs]
+    gather_rows_multi([p.view(np.uint8) for p in parts], [d.view(np.uint8) for d in dsts2], 3)
+    for p, d in zip(parts, dsts2):
+        assert np.array_equal(d[3:], p)
+
+
+def test_gather_multi_refuses_bad_input() -> None:
+    from plo5bp._engine import gather_rows_multi
+
+    a = np.zeros((10, 8), dtype=np.uint8)
+    b = np.zeros((12, 8), dtype=np.uint8)
+    with pytest.raises(ValueError, match="sources but"):
+        gather_rows_multi([a, a.copy()], [np.zeros((10, 8), np.uint8)], 0)
+    with pytest.raises(ValueError, match="hold 10 and 12 rows"):
+        gather_rows_multi([a, b], [np.zeros((20, 8), np.uint8), np.zeros((20, 8), np.uint8)], 0)

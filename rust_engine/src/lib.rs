@@ -41,6 +41,7 @@ fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(crate::flush::flush_trajectories, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(crate::flush::record_learner_steps, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(crate::flush::gather_rows_into, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(crate::flush::gather_rows_multi, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(
         crate::bindings::straight_flush_features_batch,
         m
