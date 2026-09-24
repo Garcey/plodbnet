@@ -2525,8 +2525,24 @@ def main() -> None:
                 "[optim] --no-optimizer-sidecar: LEGACY resume — Adam starts "
                 "COLD, l2-init re-anchors at the loaded weights"
             )
-    pool = OpponentPool(capacity=train_cfg.opponent_pool_size, seed=args.seed)
-    rng = np.random.default_rng(args.seed)
+    # A RESUMED run draws its own stream, derived from (seed, resume update).
+    # Re-seeding with the bare --seed made every relaunch replay the fresh
+    # run's first updates exactly -- the same table configs AND the same card
+    # deals, update after update (guardian restarts are routine). Fresh runs
+    # keep default_rng(seed) / the seed set above, byte-identical.
+    if restored_update is not None:
+        _resume_ss = np.random.SeedSequence([int(args.seed), int(restored_update)])
+        run_seed = int(_resume_ss.generate_state(1, dtype=np.uint64)[0] >> np.uint64(1))
+        torch.manual_seed(run_seed)
+        rng = np.random.default_rng(_resume_ss)
+        print(
+            f"[seed] resumed at update {restored_update}: stream seeded from "
+            f"(seed {args.seed}, update {restored_update})"
+        )
+    else:
+        run_seed = int(args.seed)
+        rng = np.random.default_rng(args.seed)
+    pool = OpponentPool(capacity=train_cfg.opponent_pool_size, seed=run_seed)
 
     # Warm-start pool reconstruction: refill the (ephemeral) opponent
     # pool from the loaded checkpoint's numbered siblings so a resumed
