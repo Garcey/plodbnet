@@ -24,6 +24,7 @@ import os
 from dataclasses import dataclass
 
 import numpy as np
+import torch
 from torch.profiler import record_function
 
 from plo5bp._engine import BatchedEngine  # type: ignore[attr-defined]
@@ -137,6 +138,10 @@ class BatchedBombPotEnv:
         self._obs_bits: np.ndarray | None = None
         self._obs_real: np.ndarray | None = None
         self._packed_layout = None
+        # False = PACKED-ONLY (enable_packed_obs(dense=False)): the encoders
+        # write only the packed copy and self._obs holds NaN (a tripwire for
+        # any reader of dense rows).
+        self._dense_obs = True
         if not getattr(BatchedBombPotEnv, "_encoder_log_once", False):
             BatchedBombPotEnv._encoder_log_once = True
             print(
@@ -262,7 +267,8 @@ class BatchedBombPotEnv:
         self._dones.fill(True)
         self._actors.fill(-1)
         if clear_obs:
-            self._obs.fill(0.0)
+            if self._dense_obs:
+                self._obs.fill(0.0)
             self._zero_packed_obs()
         self._reset_seeds.fill(0)
         self._pot.fill(0)
@@ -403,8 +409,18 @@ class BatchedBombPotEnv:
     def _snapshot(
         self, rewards: np.ndarray, newly_terminal: np.ndarray
     ) -> BatchedStep:
+        if self._dense_obs:
+            obs = self._obs.copy()
+        else:
+            from plo5bp.compact_obs import unpack
+
+            obs = unpack(
+                torch.from_numpy(self._obs_bits),
+                torch.from_numpy(self._obs_real),
+                self._packed_layout,
+            ).numpy()
         return BatchedStep(
-            obs=self._obs.copy(),
+            obs=obs,
             rewards=rewards,
             dones=self._dones.copy(),
             newly_terminal=newly_terminal,
@@ -448,7 +464,9 @@ class BatchedBombPotEnv:
                 with record_function("step1a_bundle/obs_features_batch"):
                     bundle = self._be.observation_and_features_batch()
                 with record_function("step1/encoder"):
-                    if self._obs.shape == (self.n, self._obs_dim):
+                    if not self._dense_obs:
+                        pass  # packed-only: the dense rows stay the NaN tripwire
+                    elif self._obs.shape == (self.n, self._obs_dim):
                         self._obs.fill(0.0)
                     else:
                         self._obs = np.zeros(
@@ -464,7 +482,7 @@ class BatchedBombPotEnv:
                 # below).
                 with record_function("step1a_bundle/obs_features_batch"):
                     bundle = self._be.observation_encoded_minimal_into(
-                        self._obs_buffer(),
+                        self._obs_buffer() if self._dense_obs else None,
                         None if em is None or bool(em.all())
                         else np.ascontiguousarray(em),
                         **self._packed_kwargs(),
@@ -554,7 +572,7 @@ class BatchedBombPotEnv:
             self._unpack_post(bundle)
 
 
-    def enable_packed_obs(self, layout) -> bool:
+    def enable_packed_obs(self, layout, dense: bool = True) -> bool:
         """Keep a packed copy of the observations in `layout`
         (compact_obs.CompactObsLayout of this env's obs width): the in-place
         encoder packs every row right after encoding it, so a consumer that
@@ -562,7 +580,14 @@ class BatchedBombPotEnv:
         gathers `_obs_bits` / `_obs_real` instead of packing the dense rows
         again. Bytes identical to `compact_obs.pack_rows_into(self._obs,
         ...)`. Needs the in-place Rust encoder with packed outputs; returns
-        whether the packed copy is on (idempotent)."""
+        whether the packed copy is on (idempotent).
+
+        `dense=False` (needs an engine with MINIMAL_INTO_PACKED_ONLY) stops
+        maintaining the dense rows altogether: every encode writes only the
+        packed copy -- (N, 796) floats per refresh are not written -- and
+        `self._obs` is filled with NaN so any reader of dense rows fails
+        loudly. Only for a consumer that reads nothing but the packed copy
+        (the rollout collector's CUDA upload path). `_snapshot` unpacks."""
         if layout is None or int(layout.obs_dim) != int(self._obs_dim):
             return False
         if not (
@@ -570,7 +595,11 @@ class BatchedBombPotEnv:
             and getattr(BatchedEngine, "MINIMAL_INTO_PACKED", False)
         ):
             return False
+        want_dense = bool(dense) or not getattr(
+            BatchedEngine, "MINIMAL_INTO_PACKED_ONLY", False
+        )
         if self._packed_layout is layout and self._obs_bits is not None:
+            self._set_dense_obs(want_dense)
             return True
         self._packed_layout = layout
         self._obs_bits = np.zeros((self.n, layout.n_bytes), dtype=np.uint8)
@@ -582,7 +611,27 @@ class BatchedBombPotEnv:
             self._obs, np.arange(self.n, dtype=np.int64), layout,
             self._obs_bits, self._obs_real, 0,
         )
+        self._set_dense_obs(want_dense)
         return True
+
+    def _set_dense_obs(self, dense: bool) -> None:
+        """Switch between dense+packed and packed-only upkeep. Entering
+        packed-only poisons the dense rows; leaving it rebuilds them from the
+        packed copy (exact inverse), so both stay coherent either way."""
+        if bool(dense) == self._dense_obs:
+            return
+        if dense:
+            from plo5bp.compact_obs import unpack
+
+            self._obs = unpack(
+                torch.from_numpy(self._obs_bits),
+                torch.from_numpy(self._obs_real),
+                self._packed_layout,
+            ).numpy()
+            self._dense_obs = True
+        else:
+            self._obs_buffer().fill(np.nan)
+            self._dense_obs = False
 
     def packed_obs(self) -> "tuple[np.ndarray, np.ndarray] | None":
         """(bits, real) packed copy of `_obs`, or None when it is off."""
@@ -609,6 +658,13 @@ class BatchedBombPotEnv:
     def _drop_packed_obs(self) -> None:
         """A refresh path that cannot keep the packed copy in step turns it
         off (consumers then pack from the dense rows)."""
+        if not self._dense_obs:
+            raise RuntimeError(
+                "BatchedBombPotEnv: a refresh path that cannot keep the packed "
+                "copy ran in packed-only mode -- the dense rows are not "
+                "maintained (enable_packed_obs(dense=False) needs the in-place "
+                "minimal encoder)"
+            )
         self._obs_bits = self._obs_real = None
         self._packed_layout = None
 
@@ -704,7 +760,9 @@ class BatchedBombPotEnv:
             # compact encode + scatter below); the aux arrays stay compact.
             with record_function("step1a_bundle/obs_features_subset"):
                 bundle = self._be.observation_encoded_minimal_subset_into(
-                    idx_i64, self._obs, **self._packed_kwargs()
+                    idx_i64,
+                    self._obs if self._dense_obs else None,
+                    **self._packed_kwargs(),
                 )
             obs_sub = None
             actors_sub = np.asarray(bundle["actor"], dtype=np.int8)

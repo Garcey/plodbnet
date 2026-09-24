@@ -2340,11 +2340,15 @@ def collect_rollout_batched(
     # The env packs every observation as it encodes it (same bytes as
     # pack_rows_into), so the uploads below gather packed rows instead of
     # re-reading and packing the dense ones.
+    # Nothing on this path reads the env's DENSE rows then (every upload
+    # gathers the packed copy), so the env stops writing them: packed-only
+    # encoding (no (N, 796) float write per refresh). The act prefetch
+    # (PLO5BP_ROLLOUT_OVERLAP) snapshots dense rows, so it keeps them.
     _env_packed_on = bool(
         _step_h2d.enabled
         and _step_h2d.layout is not None
         and hasattr(env, "enable_packed_obs")
-        and env.enable_packed_obs(_step_h2d.layout)
+        and env.enable_packed_obs(_step_h2d.layout, dense=_rollout_overlap_on())
     )
 
     def _record_steps_numpy(
@@ -2518,11 +2522,7 @@ def collect_rollout_batched(
 
     # Attack #2 Phase 2: cross-iteration act prefetch under terminal host work.
     # Default OFF — enable with PLO5BP_ROLLOUT_OVERLAP=1 after parity confidence.
-    _rollout_overlap = (
-        device.type == "cuda"
-        and os.environ.get("PLO5BP_ROLLOUT_OVERLAP", "0").strip().lower()
-        in ("1", "true", "yes", "on")
-    )
+    _rollout_overlap = device.type == "cuda" and _rollout_overlap_on()
     _act_prefetch: dict | None = None
 
     def _queue_acts_for_mask(active_mask: np.ndarray) -> dict:
@@ -3550,6 +3550,13 @@ def collect_rollout_batched(
 # collector: split → host-concat → a final pooled advantage re-normalization
 # which is numerically a NO-OP — advantages are effectively normalized PER
 # CONFIG (see the `_concat_batches` docstring; review 2026-09-20 A5).
+
+def _rollout_overlap_on() -> bool:
+    """PLO5BP_ROLLOUT_OVERLAP: the batched collector's act prefetch."""
+    return os.environ.get("PLO5BP_ROLLOUT_OVERLAP", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
 
 # Per-(env, seat) hero-rotated opponent-hole blocks, by (n_envs, n_seats,
 # hole width) -- reused like the trajectory buffers (collect_rollout_batched).

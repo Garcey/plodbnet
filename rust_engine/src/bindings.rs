@@ -2706,12 +2706,16 @@ impl PyBatchedEngine {
     /// while it is still in cache -- the exact bytes `pack_obs_rows` would
     /// write for that row (skipped rows pack to all-zero), so the rollout
     /// uploads and stores packed rows without re-reading the dense ones.
+    ///
+    /// `out=None` (with the packed outputs) is PACKED-ONLY: every row is
+    /// encoded into a scratch row, packed, and never stored dense -- the
+    /// same packed bytes without writing (N, 796) floats per call.
     #[pyo3(signature = (out, encode_mask=None, flag_cols=None, real_cols=None, out_bits=None, out_real=None))]
     #[allow(clippy::too_many_arguments)]
     fn observation_encoded_minimal_into<'py>(
         &self,
         py: Python<'py>,
-        mut out: PyReadwriteArray2<'_, f32>,
+        mut out: Option<PyReadwriteArray2<'_, f32>>,
         encode_mask: Option<PyReadonlyArray1<'_, bool>>,
         flag_cols: Option<PyReadonlyArray1<'_, i64>>,
         real_cols: Option<PyReadonlyArray1<'_, i64>>,
@@ -2721,8 +2725,11 @@ impl PyBatchedEngine {
         const WHAT: &str = "observation_encoded_minimal_into";
         self.require_plo_minimal(WHAT)?;
         let n = self.states.len();
-        check_minimal_obs_out(&out, n, WHAT)?;
+        if let Some(o) = out.as_ref() {
+            check_minimal_obs_out(o, n, WHAT)?;
+        }
         let plan = pack_plan_for(WHAT, n, flag_cols, real_cols, &out_bits, &out_real)?;
+        require_some_output(WHAT, out.is_some(), plan.is_some())?;
         let mask: Option<Vec<bool>> = match encode_mask {
             None => None,
             Some(m) => {
@@ -2737,11 +2744,14 @@ impl PyBatchedEngine {
             }
         };
         let idx: Vec<usize> = (0..n).collect();
-        let out_s = out.as_slice_mut()?;
+        let out_s = match out.as_mut() {
+            Some(o) => Some(o.as_slice_mut()?),
+            None => None,
+        };
         let sinks = packed_slices(&mut out_bits, &mut out_real)?;
         let (packed, legal_mask, res) = py.allow_threads(|| {
             let (packed, legal_mask) = self.pack_minimal_with_legal(&idx, self.config.num_seats);
-            let rows = pick_rows(out_s, obs_layout_minimal::OBS_DIM_MINIMAL, &idx);
+            let rows = out_s.map(|o| pick_rows(o, obs_layout_minimal::OBS_DIM_MINIMAL, &idx));
             let sinks = sinks.zip(plan.as_ref()).map(|((b, r), pl)| {
                 (pl, pick_rows(b, pl.nb, &idx), pick_rows(r, pl.nr, &idx))
             });
@@ -2767,7 +2777,7 @@ impl PyBatchedEngine {
         &self,
         py: Python<'py>,
         indices: PyReadonlyArray1<'_, i64>,
-        mut out: PyReadwriteArray2<'_, f32>,
+        mut out: Option<PyReadwriteArray2<'_, f32>>,
         flag_cols: Option<PyReadonlyArray1<'_, i64>>,
         real_cols: Option<PyReadonlyArray1<'_, i64>>,
         mut out_bits: Option<PyReadwriteArray2<'_, u8>>,
@@ -2776,19 +2786,25 @@ impl PyBatchedEngine {
         const WHAT: &str = "observation_encoded_minimal_subset_into";
         self.require_plo_minimal(WHAT)?;
         let n = self.states.len();
-        check_minimal_obs_out(&out, n, WHAT)?;
+        if let Some(o) = out.as_ref() {
+            check_minimal_obs_out(o, n, WHAT)?;
+        }
         let plan = pack_plan_for(WHAT, n, flag_cols, real_cols, &out_bits, &out_real)?;
+        require_some_output(WHAT, out.is_some(), plan.is_some())?;
         let idx = checked_env_indices(indices.as_slice()?, n, WHAT)?;
         if idx.windows(2).any(|w| w[0] >= w[1]) {
             return Err(PyValueError::new_err(format!(
                 "{WHAT}: indices must be strictly increasing (unique, sorted)"
             )));
         }
-        let out_s = out.as_slice_mut()?;
+        let out_s = match out.as_mut() {
+            Some(o) => Some(o.as_slice_mut()?),
+            None => None,
+        };
         let sinks = packed_slices(&mut out_bits, &mut out_real)?;
         let (packed, legal_mask, res) = py.allow_threads(|| {
             let (packed, legal_mask) = self.pack_minimal_with_legal(&idx, self.config.num_seats);
-            let rows = pick_rows(out_s, obs_layout_minimal::OBS_DIM_MINIMAL, &idx);
+            let rows = out_s.map(|o| pick_rows(o, obs_layout_minimal::OBS_DIM_MINIMAL, &idx));
             let sinks = sinks.zip(plan.as_ref()).map(|((b, r), pl)| {
                 (pl, pick_rows(b, pl.nb, &idx), pick_rows(r, pl.nr, &idx))
             });
@@ -2803,6 +2819,10 @@ impl PyBatchedEngine {
     /// real_cols / out_bits / out_real) -- a capability flag for Python.
     #[classattr]
     const MINIMAL_INTO_PACKED: bool = true;
+
+    /// ... and `out=None` (packed-only encoding, 2026-09-24).
+    #[classattr]
+    const MINIMAL_INTO_PACKED_ONLY: bool = true;
 }
 
 /// Disjoint mutable `width`-wide rows of `buf` at the strictly increasing
@@ -2903,6 +2923,17 @@ fn packed_slices<'a>(
         (Some(b), Some(r)) => Ok(Some((b.as_slice_mut()?, r.as_slice_mut()?))),
         _ => Ok(None),
     }
+}
+
+/// The in-place encoders need somewhere to write: the dense rows, the packed
+/// copy, or both.
+fn require_some_output(what: &str, dense: bool, packed: bool) -> PyResult<()> {
+    if dense || packed {
+        return Ok(());
+    }
+    Err(PyValueError::new_err(format!(
+        "{what}: out=None needs the packed outputs (flag_cols / real_cols / out_bits / out_real)"
+    )))
 }
 
 fn pack_encoder_error(what: &str, env: usize, col: usize, v: f32) -> PyErr {
@@ -3479,7 +3510,7 @@ impl PyBatchedEngine {
             let rows: Vec<&mut [f32]> = obs_vec
                 .chunks_exact_mut(obs_layout_minimal::OBS_DIM_MINIMAL)
                 .collect();
-            self.encode_minimal_rows_into(&packed, rows, None, |_| true)
+            self.encode_minimal_rows_into(&packed, Some(rows), None, |_| true)
                 .expect("no packing requested");
             (obs_vec, packed, legal_mask)
         });
@@ -3545,7 +3576,7 @@ impl PyBatchedEngine {
     fn encode_minimal_rows_into(
         &self,
         packed: &PackedMinimalObservation,
-        rows: Vec<&mut [f32]>,
+        rows: Option<Vec<&mut [f32]>>,
         sinks: Option<(&PackPlan, Vec<&mut [u8]>, Vec<&mut [f32]>)>,
         keep: impl Fn(usize) -> bool + Sync,
     ) -> Result<(), (usize, usize, f32)> {
@@ -3554,6 +3585,36 @@ impl PyBatchedEngine {
         let obs_rev = self.obs_rev;
         let starting = &self.config.starting_stacks;
         let inv_bb = 1.0f64 / (bb as f64);
+        let Some(rows) = rows else {
+            // Packed-only: each row is zeroed + encoded in a per-task scratch
+            // row (the same bits a dense row would hold), then packed.
+            let Some((plan, bits, reals)) = sinks else {
+                return Ok(());
+            };
+            return bits
+                .into_par_iter()
+                .zip(reals.into_par_iter())
+                .enumerate()
+                .try_for_each_init(
+                    || vec![0f32; obs_layout_minimal::OBS_DIM_MINIMAL],
+                    |row, (j, (b, r))| {
+                        row.fill(0.0);
+                        if keep(j) {
+                            encode_obs_row_minimal(packed, j, s, inv_bb, bb, starting, obs_rev, row);
+                        }
+                        pack_obs_row_runs(
+                            row,
+                            &plan.flag_runs,
+                            &plan.real_runs,
+                            &plan.flags,
+                            &plan.reals,
+                            b,
+                            r,
+                        )
+                        .map_err(|(c, v)| (j, c, v))
+                    },
+                );
+        };
         let Some((plan, bits, reals)) = sinks else {
             rows.into_par_iter().enumerate().for_each(|(j, row)| {
                 row.fill(0.0);

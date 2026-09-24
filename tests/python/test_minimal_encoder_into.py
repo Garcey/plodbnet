@@ -306,3 +306,104 @@ def test_packed_outputs_validation(monkeypatch) -> None:
     wr = np.zeros((5, wrong_reals.size), dtype=np.float32)
     with pytest.raises(ValueError, match="not a 0/1 flag"):
         env._be.observation_encoded_minimal_into(out, None, wrong_flags, wrong_reals, wb, wr)
+
+
+# --------------------------------------------------------------------------
+# Packed-only (2026-09-24): out=None writes only the packed copy; an env with
+# enable_packed_obs(dense=False) keeps the same packed bytes as a dense twin,
+# never writes dense rows (they hold NaN), and still snapshots correct obs.
+# --------------------------------------------------------------------------
+
+_needs_packed_only = pytest.mark.skipif(
+    not getattr(BatchedEngine, "MINIMAL_INTO_PACKED_ONLY", False),
+    reason="engine without packed-only encoding",
+)
+
+
+@_needs_packed_only
+@pytest.mark.parametrize("seats", [2, 6])
+def test_engine_packed_only_matches_dense_packing(seats, monkeypatch) -> None:
+    n = 40
+    cfg = GameConfig(num_seats=seats, starting_stack=400000, ante=30000, bb=10000)
+    env = _minimal_env(n, cfg, monkeypatch, into=True)
+    rng = np.random.default_rng(300 + seats)
+    env.reset_batch(
+        rng.integers(0, 2**63 - 1, size=n, dtype=np.int64).astype(np.uint64),
+        rng.integers(0, seats, size=n).astype(np.uint8),
+    )
+    be, lay = env._be, MINIMAL_LAYOUT
+    for step in range(10):
+        keep = rng.random(n) < 0.7
+        dense = np.zeros((n, OBS_DIM_MINIMAL), dtype=np.float32)
+        b0 = np.zeros((n, lay.n_bytes), np.uint8)
+        r0 = np.zeros((n, lay.n_real), np.float32)
+        aux0 = be.observation_encoded_minimal_into(dense, keep, lay.flag_cols, lay.real_cols, b0, r0)
+        b1 = np.full((n, lay.n_bytes), 7, np.uint8)
+        r1 = np.full((n, lay.n_real), np.nan, np.float32)
+        aux1 = be.observation_encoded_minimal_into(None, keep, lay.flag_cols, lay.real_cols, b1, r1)
+        assert np.array_equal(b0, b1) and np.array_equal(_bits(r0), _bits(r1)), step
+        _assert_aux_equal(aux0, aux1, f"packed-only step {step}")
+        idx = np.sort(rng.choice(n, size=int(rng.integers(1, n + 1)), replace=False)).astype(np.int64)
+        b2, r2 = b1.copy(), r1.copy()
+        be.observation_encoded_minimal_subset_into(idx, None, lay.flag_cols, lay.real_cols, b2, r2)
+        b3, r3 = b1.copy(), r1.copy()
+        be.observation_encoded_minimal_subset_into(
+            idx, np.zeros((n, OBS_DIM_MINIMAL), np.float32), lay.flag_cols, lay.real_cols, b3, r3)
+        assert np.array_equal(b2, b3) and np.array_equal(_bits(r2), _bits(r3)), step
+        gates, chips = _legal_actions(env, rng)
+        env.step_hybrid_batch(gates, chips)
+    with pytest.raises(ValueError, match="out=None needs the packed outputs"):
+        be.observation_encoded_minimal_into(None)
+
+
+@_needs_packed_only
+@pytest.mark.parametrize("seats,n,seed", [(2, 24, 31), (6, 40, 32)])
+def test_env_packed_only_tracks_dense_twin(seats, n, seed, monkeypatch) -> None:
+    cfg = GameConfig(num_seats=seats, starting_stack=400000, ante=30000, bb=10000)
+    lean = _minimal_env(n, cfg, monkeypatch, into=True)
+    twin = _minimal_env(n, cfg, monkeypatch, into=True)
+    rng = np.random.default_rng(seed)
+    seeds = rng.integers(0, 2**63 - 1, size=n, dtype=np.int64).astype(np.uint64)
+    buttons = rng.integers(0, seats, size=n).astype(np.uint8)
+    for e in (lean, twin):
+        e.reset_batch(seeds, buttons)
+    assert lean.enable_packed_obs(MINIMAL_LAYOUT, dense=False)
+    assert twin.enable_packed_obs(MINIMAL_LAYOUT)
+    assert np.isnan(lean._obs).all()
+
+    def same(ctx: str) -> None:
+        assert np.array_equal(lean._obs_bits, twin._obs_bits), f"{ctx}: bits"
+        assert np.array_equal(_bits(lean._obs_real), _bits(twin._obs_real)), f"{ctx}: reals"
+        for name in _CACHED:
+            assert np.array_equal(getattr(lean, name), getattr(twin, name)), f"{ctx}: {name}"
+        assert np.isnan(lean._obs).all(), f"{ctx}: dense rows were written"
+
+    same("enable")
+    for step in range(50):
+        gates, chips = _legal_actions(twin, rng)
+        nt = np.asarray(lean._be.apply_hybrid_batch(gates, chips), dtype=bool)
+        assert np.array_equal(nt, np.asarray(twin._be.apply_hybrid_batch(gates, chips), dtype=bool))
+        mask = np.zeros(n, dtype=bool) if step % 7 == 3 else ~nt
+        lean._refresh(encode_mask=mask)
+        twin._refresh(encode_mask=mask)
+        same(f"step {step} refresh")
+        if nt.any():
+            ns = rng.integers(0, 2**63 - 1, size=n, dtype=np.int64).astype(np.uint64)
+            nb = rng.integers(0, seats, size=n).astype(np.uint8)
+            for e in (lean, twin):
+                e._be.reset_terminal_batch(ns, nb, nt)
+                e._refresh_subset(nt)
+            same(f"step {step} refresh_subset")
+    # Snapshots unpack the packed copy: the dense twin's rows exactly.
+    s_lean = lean.reset_batch(seeds, buttons)
+    s_twin = twin.reset_batch(seeds, buttons)
+    assert np.array_equal(_bits(s_lean.obs), _bits(s_twin.obs))
+    same("reset_batch")
+    # Back to dense upkeep: the dense rows are rebuilt from the packed copy.
+    assert lean.enable_packed_obs(MINIMAL_LAYOUT, dense=True)
+    assert np.array_equal(_bits(lean._obs), _bits(twin._obs))
+    # A path that cannot keep the packed copy refuses to run packed-only.
+    assert lean.enable_packed_obs(MINIMAL_LAYOUT, dense=False)
+    lean._rust_minimal_into = False
+    with pytest.raises(RuntimeError, match="packed-only"):
+        lean._refresh()
