@@ -24,6 +24,17 @@ later on a healthy checkpoint.
 Usage:
     .venv/Scripts/python scripts/utilization_probe.py CKPT \
         [--rows 8192] [--threads 8] [--out runs/utilization_history.jsonl]
+        [--states flop|selfplay]
+
+`--states flop` (default, the original probe) uses fold-legal flop nodes after
+a pot raise on three fixed tables -- one narrow situation, on which every
+network's activations are nearly rank 1-2 whatever its width. `--states
+selfplay` (2026-09-23, the network-size sweep) instead lets the checkpoint's
+own actor play itself on table configs drawn exactly like training
+(scripts/train.py `_sample_game_config`: 2-6 seats, clubgg / clubgg_deep / deep
+stacks) and measures a uniform sample of ALL the decision states it meets --
+every street, position and stack depth -- so dead units and effective rank
+describe the capacity the policy actually uses.
 """
 
 from __future__ import annotations
@@ -144,6 +155,73 @@ def build_probe_batch(rows, obs_mode="full"):
     opp = np.concatenate(opp_list)[:rows]
     masks = np.concatenate(mask_list)[:rows]
     return obs, opp, masks
+
+
+def build_selfplay_batch(actor, rows, obs_mode="minimal", seed=0,
+                         variant="plo5_double_bomb", tables=256):
+    """Decision states from the checkpoint's own self-play (see module doc):
+    30 table configs (10 per training tier), `tables` hands each, played to
+    the end with the actor sampling its policy; returns a uniform sample of
+    `rows` (obs, rotated opponent holes, gate masks) over all states met."""
+    import importlib.util
+
+    from plo5bp.env_batched import BatchedBombPotEnv
+    from plo5bp.rollout import _rotate_opp_holes_batch
+
+    spec = importlib.util.spec_from_file_location(
+        "_train", Path(__file__).resolve().parent / "train.py"
+    )
+    train = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(train)
+    rng = np.random.default_rng(seed)
+    torch.manual_seed(seed)
+    obs_l, opp_l, mask_l = [], [], []
+    for tier in ("clubgg", "clubgg_deep", "deep"):
+        for _ in range(10):
+            cfg, _ = train._sample_game_config(
+                (2, 3, 4, 5, 6), 1.0, 300.0, BB, 3 * BB, rng,
+                stack_dist=tier, seats_dist="uniform", variant=variant, sb=0,
+            )
+            env = BatchedBombPotEnv(tables, cfg, opp_outcome_mc=0, obs_mode=obs_mode)
+            env.reset_batch(
+                rng.integers(0, 2**63 - 1, size=tables, dtype=np.int64).astype(np.uint64),
+                rng.integers(0, cfg.num_seats, size=tables).astype(np.uint8),
+            )
+            holes = np.asarray(env._be.all_hole_cards_batch(), dtype=np.uint8)
+            all_rows = np.arange(tables)
+            while not env._dones.all():
+                live = np.nonzero(~env._dones)[0]
+                actors = env._actors[live].astype(np.int64)
+                obs_l.append(env._obs[live].copy())
+                mask_l.append(env._gate_mask[live].copy())
+                opp_l.append(_rotate_opp_holes_batch(holes, live, actors))
+                safe = np.where(env._actors >= 0, env._actors, 0).astype(np.intp)
+                to_call = np.maximum(
+                    env._bet_to_call.astype(np.int64)
+                    - env._street_commit[all_rows, safe].astype(np.int64), 0,
+                )
+                sizing = np.stack(
+                    [env._min_raise.astype(np.int64), env._max_raise.astype(np.int64),
+                     env._pot.astype(np.int64), to_call], axis=-1,
+                )
+                gates = np.zeros(tables, dtype=np.uint8)
+                chips = np.zeros(tables, dtype=np.uint64)
+                with torch.no_grad():
+                    out = actor.act(
+                        torch.from_numpy(env._obs[live]),
+                        torch.from_numpy(env._gate_mask[live]),
+                        torch.from_numpy(sizing[live]),
+                    )
+                gates[live] = out.gate.numpy().astype(np.uint8)
+                chips[live] = np.maximum(out.chips.numpy(), 0).astype(np.uint64)
+                env.step_hybrid_batch(gates, chips)
+    obs = np.concatenate(obs_l)
+    opp = np.concatenate(opp_l)
+    masks = np.concatenate(mask_l)
+    pick = np.sort(rng.permutation(obs.shape[0])[: int(rows)])
+    print(f"  self-play: {obs.shape[0]} decision states over 30 configs; "
+          f"sampled {pick.size}")
+    return obs[pick], opp[pick], masks[pick]
 
 
 # --------------------------------------------------------------------------
@@ -330,7 +408,7 @@ def _layers_for_json(layers):
     return [{k: L[k] for k in _SCHEMA_KEYS} for L in layers]
 
 
-def build_record(ckpt_path, rows, actor_layers, critic_layers):
+def build_record(ckpt_path, rows, actor_layers, critic_layers, states="flop"):
     stem = Path(ckpt_path).stem
     m = re.search(r"_(\d+)$", stem)
     return {
@@ -338,6 +416,7 @@ def build_record(ckpt_path, rows, actor_layers, critic_layers):
         "update": int(m.group(1)) if m else None,
         "ts": time.time(),
         "rows": int(rows),
+        "states": states,
         "actor": {"layers": _layers_for_json(actor_layers)},
         "critic": {"layers": _layers_for_json(critic_layers)},
     }
@@ -378,6 +457,9 @@ def main(argv=None):
     ap.add_argument("--rows", type=int, default=8192)
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--out", default="runs/utilization_history.jsonl")
+    ap.add_argument("--states", choices=("flop", "selfplay"), default="flop",
+                    help="probe states: the original fixed flop nodes, or the "
+                    "checkpoint's own self-play over training-like configs")
     args = ap.parse_args(argv)
 
     torch.set_num_threads(int(args.threads))
@@ -394,8 +476,12 @@ def main(argv=None):
           f"q_actions={getattr(critic, 'q_actions', 0)}  "
           f"value_bins={getattr(critic, 'value_bins', 0)}")
 
-    print(f"building probe batch (target {args.rows} rows, obs_mode={obs_mode}) ...")
-    obs, opp, masks = build_probe_batch(args.rows, obs_mode=obs_mode)
+    print(f"building probe batch (target {args.rows} rows, obs_mode={obs_mode}, "
+          f"states={args.states}) ...")
+    if args.states == "selfplay":
+        obs, opp, masks = build_selfplay_batch(actor, args.rows, obs_mode=obs_mode)
+    else:
+        obs, opp, masks = build_probe_batch(args.rows, obs_mode=obs_mode)
     n_rows = int(obs.shape[0])
     print(f"probe rows: {n_rows}")
 
@@ -410,7 +496,7 @@ def main(argv=None):
         f"{critic.torso[0][0].out_features}", critic_layers)
     print_summary(actor_layers, critic_layers)
 
-    record = build_record(args.ckpt, n_rows, actor_layers, critic_layers)
+    record = build_record(args.ckpt, n_rows, actor_layers, critic_layers, args.states)
     write_record(record, args.out)
     print(f"\nappended history line -> {args.out}")
     print(f"wall time: {time.time() - t0:.1f}s")

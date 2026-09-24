@@ -5,7 +5,9 @@ each sweep stem with the reference stem at the SAME number of updates.
 For every checkpoint index N = every-1, 2*every-1, ... (i.e. after `every`,
 2*every, ... updates) at which both `<ref>_N.pt` and `<stem>_N.pt` exist:
   - strength: scripts/h2h_eval.py <stem>_N.pt <ref>_N.pt  (-> runs/h2h_history.jsonl)
-  - utilization: scripts/utilization_probe.py on each (-> runs/utilization_history.jsonl)
+  - utilization: scripts/utilization_probe.py on each, fixed flop states
+    (-> runs/utilization_history.jsonl) and self-play states
+    (-> runs/utilization_selfplay.jsonl)
 Finished (stem, N) pairs are remembered in runs/sweep_eval_done.json, so the
 driver can be re-run or left looping (--loop SECONDS) while the runs train.
 
@@ -40,6 +42,14 @@ def main() -> None:
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     stems = [s for s in args.stems.split(",") if s]
+
+    def probe(ckpt: Path) -> int:
+        # The original narrow probe (fixed flop nodes) AND the self-play one
+        # (the states the policy actually meets) -- see utilization_probe.py.
+        rc = run([py, "scripts/utilization_probe.py", str(ckpt)])
+        return rc | run([py, "scripts/utilization_probe.py", str(ckpt),
+                         "--states", "selfplay",
+                         "--out", "runs/utilization_selfplay.jsonl"])
     done_path = REPO / "runs" / "sweep_eval_done.json"
     done = set(json.loads(done_path.read_text())) if done_path.exists() else set()
     py = sys.executable
@@ -57,10 +67,10 @@ def main() -> None:
                 rc = run([py, "scripts/h2h_eval.py", str(cand), str(ref),
                           "--deals", str(args.deals), "--device", args.device,
                           "--seed", str(n)])
-                rc |= run([py, "scripts/utilization_probe.py", str(cand)])
+                rc |= probe(cand)
                 ref_key = f"{args.ref}@{n}"
                 if ref_key not in done:
-                    if run([py, "scripts/utilization_probe.py", str(ref)]) == 0:
+                    if probe(ref) == 0:
                         done.add(ref_key)
                 if rc == 0:
                     done.add(key)
