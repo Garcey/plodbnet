@@ -311,6 +311,17 @@ anchor` = v2 (head_version 2), `logistic` = v4 (3), `mixture` = v5 (4).
     copied the whole dense obs buffer — 186 MB per sub at 58k envs, 9 s per
     update at 1.76M envs), `reconfigure(clear_obs=False)`, reused
     hole-rotation buffer.
+  - **Packed-only observations** on the CUDA upload path: the in-place
+    minimal encoders take `out=None` (each row encoded into a per-task scratch
+    row and only PACKED), and `enable_packed_obs(layout, dense=False)` keeps
+    only the packed copy — `env._obs` then holds NaN as a tripwire, snapshots
+    unpack, `_drop_packed_obs` refuses. The collector uses it whenever every
+    upload gathers packed rows (not with `PLO5BP_ROLLOUT_OVERLAP`). At 58k
+    envs per sub the dense (N, 796) write was ~10 ms of an 11 ms refresh.
+  - `aggression_record_batch` (engine) = the aggression bonus AND its
+    trajectory record (cost / pre-step pot / street at the acting seat's slot,
+    slot count + 1) in one call; the numpy block is the fallback
+    (`PLO5BP_NUMPY_FLUSH=1`), pinned equal in `test_aggression_record.py`.
   - **`--batch-on-host`** (TrainingConfig.batch_on_host, multiconfig only):
     the rollout batch stays in host RAM; each PPO minibatch / micro-batch
     chunk is gathered on the CPU into pinned staging and copied over
