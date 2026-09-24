@@ -265,6 +265,29 @@ anchor` = v2 (head_version 2), `logistic` = v4 (3), `mixture` = v5 (4).
     summed in another order (a diagnostic; exactly 0 with the bonus off).
     When a branch of the flush is added, remember `traj_lengths[term_envs]
     = 0` — skipping it silently grows every trajectory across hands.
+- **Resumed runs draw their own random stream (2026-09-23)**: numpy, torch
+  and the pool are seeded from `SeedSequence((seed, resume update))` on
+  `--load-checkpoint`; before, every guardian relaunch re-seeded with the
+  bare `--seed` and replayed the fresh run's first updates — the same table
+  configs AND card deals. Fresh runs unchanged (`test_resume_seed.py`).
+- **`--micro-batch-rows N`** (default 0 = off, the exact old path): each PPO
+  minibatch is gathered/forwarded/backpropagated in chunks of <= N rows with
+  accumulated gradients (per-row means weighted by chunk share; the fold-
+  supervision term keeps its minibatch-wide denominator; L2-to-init and the
+  KL anchor sum once). Same step up to float order; lets the rollout grow
+  past one minibatch's GPU working set (~12 KB/row) — then the stored batch
+  (~590 B/row compact) bounds it. `test_ppo_microbatch.py`.
+- **Network-size sweep tooling (2026-09-23)**: `scripts/sweep_guardian.sh
+  STEM HD NL CHD CNB TARGET` (vMin2 recipe, only the size changed, stops at
+  TARGET updates; `NUMA_NODE=n` pins a socket), `train.py --gpu-lock FILE`
+  (several runs share one GPU: only one holds a batch + PPO working set at a
+  time; rollouts overlap), `scripts/h2h_eval.py A.pt B.pt` (duplicate deals,
+  seats swapped, EV payouts, train-tier configs; edge in bb/seat-hand +- se),
+  `scripts/utilization_probe.py --states selfplay` (dead units / effective
+  rank over the checkpoint's own self-play states — the original fixed-flop
+  probe calls units "dead" that are merely idle in that one spot: 76/384 vs
+  4/384 for the same 128-wide actor), `scripts/sweep_eval.py` (runs both
+  every N updates at equal update counts).
 
 ### v5 (2026-07-06, IMPLEMENTED, not yet trained — V5_DESIGN.md canonical)
 
