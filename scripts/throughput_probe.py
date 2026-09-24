@@ -67,7 +67,7 @@ def run_point(args, num_envs: int, rollout: int, micro: int, tag: str) -> dict:
     env = dict(
         os.environ,
         PLO5_RUST_ENCODER="1",
-        PLO5BP_STEP_TIMERS="0",
+        PLO5BP_STEP_TIMERS=os.environ.get("PLO5BP_STEP_TIMERS", "0"),
         PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True",
         NUMPY_MADVISE_HUGEPAGE="0",
         MALLOC_MMAP_THRESHOLD_="33554432",
