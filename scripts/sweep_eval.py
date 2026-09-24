@@ -10,8 +10,11 @@ For every checkpoint index N = every-1, 2*every-1, ... (i.e. after `every`,
     (-> runs/utilization_selfplay.jsonl)
 Finished (stem, N) pairs are remembered in runs/sweep_eval_done.json, so the
 driver can be re-run or left looping (--loop SECONDS) while the runs train.
+A second driver against another reference needs its own `--done` file (the
+keys do not name the reference).
 
     .venv/bin/python scripts/sweep_eval.py --ref vMin2 --stems sw64,sw32 --loop 600
+    .venv/bin/python scripts/sweep_eval.py --ref sw128 --stems sw64,sw32,vMin2         --done runs/sweep_eval_done_sw128.json --loop 600
 """
 
 from __future__ import annotations
@@ -40,6 +43,7 @@ def main() -> None:
     ap.add_argument("--deals", type=int, default=4096)
     ap.add_argument("--loop", type=float, default=0.0, help="re-check every N s (0 = once)")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--done", default="runs/sweep_eval_done.json")
     args = ap.parse_args()
     stems = [s for s in args.stems.split(",") if s]
 
@@ -50,7 +54,7 @@ def main() -> None:
         return rc | run([py, "scripts/utilization_probe.py", str(ckpt),
                          "--states", "selfplay",
                          "--out", "runs/utilization_selfplay.jsonl"])
-    done_path = REPO / "runs" / "sweep_eval_done.json"
+    done_path = REPO / args.done
     done = set(json.loads(done_path.read_text())) if done_path.exists() else set()
     py = sys.executable
     while True:
