@@ -287,7 +287,37 @@ anchor` = v2 (head_version 2), `logistic` = v4 (3), `mixture` = v5 (4).
   rank over the checkpoint's own self-play states — the original fixed-flop
   probe calls units "dead" that are merely idle in that one spot: 76/384 vs
   4/384 for the same 128-wide actor), `scripts/sweep_eval.py` (runs both
-  every N updates at equal update counts).
+  every N updates at equal update counts), `scripts/sweep_report.py` (one
+  table of every comparison + probe so far).
+- **Third efficiency pass (2026-09-24, BIT-EXACT, CPU + CUDA digests)**:
+  - **num_envs is the big lever.** The production shape (220k envs / 30
+    mixed configs = 7.3k envs per sub-rollout, ~8,600 steps per update) is
+    bound by FIXED per-step overhead (Python, kernel launches, and ~0.3 ms
+    per thread-pool wake-up on the pod). Uncontended pod, 128x3/128x2, 44M-row
+    target: 220k envs 227 s/update (201k rows/s), 440k 175 s (272k), 880k
+    145 s (353k), 1.76M 154 s (379k; 58M rows — the drain overshoot grows
+    ~8 rows per env). `scripts/bench_subrollout.py` (per-step cost by region
+    vs env count) and `scripts/throughput_probe.py` (full updates, peak GPU
+    memory + peak host RSS) measure it.
+  - Per-step host row copies run through ONE engine call
+    (`gather_rows_multi`: packed obs + gate-mask + sizing rows into the pinned
+    upload slot; the uploaded rows into the trajectory pool), on the calling
+    thread unless the copy is >= 4 MB — the first cut woke the thread pool per
+    array and made the production shape ~2 ms/step SLOWER. Rule for any new
+    engine call on the per-step path: a pool wake-up costs ~0.2-0.4 ms on the
+    pod, so small work stays on the calling thread and calls are fused.
+    `record_learner_steps` goes parallel from 8,192 rows.
+  - Sub-rollout setup: `reset_batch(snapshot=False)` (the discarded snapshot
+    copied the whole dense obs buffer — 186 MB per sub at 58k envs, 9 s per
+    update at 1.76M envs), `reconfigure(clear_obs=False)`, reused
+    hole-rotation buffer.
+  - **`--batch-on-host`** (TrainingConfig.batch_on_host, multiconfig only):
+    the rollout batch stays in host RAM; each PPO minibatch / micro-batch
+    chunk is gathered on the CPU into pinned staging and copied over
+    (`rollout.HostBatchLoader`), compact obs unpacked on the GPU. The CUDA
+    digest equals the device-resident batch's (also with
+    `--micro-batch-rows`), so the rollout is bounded by host RAM (~573 B/row
+    stored) instead of GPU memory. `test_host_batch.py`.
 
 ### v5 (2026-07-06, IMPLEMENTED, not yet trained — V5_DESIGN.md canonical)
 
