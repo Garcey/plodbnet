@@ -51,6 +51,16 @@ def main() -> None:
         "takes out checkpoint-to-checkpoint noise)",
     )
     ap.add_argument("--no-probe", action="store_true", help="head-to-heads only")
+    ap.add_argument(
+        "--ref-fixed", default="",
+        help="compare every stem checkpoint with THIS one fixed checkpoint (e.g. the "
+        "common warm start of a tuning wave: how far each candidate got) instead of "
+        "the --ref stem at the same update",
+    )
+    ap.add_argument("--greedy-a", action="store_true",
+                    help="candidates play their argmax action (h2h_eval --greedy-a)")
+    ap.add_argument("--seed-offset", type=int, default=0,
+                    help="added to the per-update h2h seed (independent deals)")
     args = ap.parse_args()
     stems = [s for s in args.stems.split(",") if s]
 
@@ -69,17 +79,26 @@ def main() -> None:
         for n in range(args.every - 1, args.max_updates, args.every):
             if n < args.from_update:
                 continue
-            ref = REPO / "checkpoints" / f"{args.ref}_{n}.pt"
+            ref = (
+                Path(args.ref_fixed) if args.ref_fixed
+                else REPO / "checkpoints" / f"{args.ref}_{n}.pt"
+            )
             if not ref.exists():
                 continue
             for stem in stems:
                 cand = REPO / "checkpoints" / f"{stem}_{n}.pt"
                 key = f"{stem}@{n}"
+                if args.ref_fixed or args.greedy_a:
+                    key += f"~{Path(args.ref_fixed).stem if args.ref_fixed else args.ref}"
+                    key += "~greedy" if args.greedy_a else ""
                 if key in done or not cand.exists():
                     continue
-                rc = run([py, "scripts/h2h_eval.py", str(cand), str(ref),
-                          "--deals", str(args.deals), "--device", args.device,
-                          "--seed", str(n)])
+                cmd = [py, "scripts/h2h_eval.py", str(cand), str(ref),
+                       "--deals", str(args.deals), "--device", args.device,
+                       "--seed", str(n + args.seed_offset)]
+                if args.greedy_a:
+                    cmd.append("--greedy-a")
+                rc = run(cmd)
                 if not args.no_probe:
                     rc |= probe(cand)
                     ref_key = f"{args.ref}@{n}"

@@ -42,11 +42,16 @@ def main() -> None:
     table: dict[tuple[str, str], dict[int, dict]] = defaultdict(dict)
     for r in rows:
         a, b = r["a"], r["b"]
-        if a.get("update") != b.get("update"):
-            key = (f"{_stem(a['path'])}@{a.get('update')}", f"{_stem(b['path'])}@{b.get('update')}")
-            table[key][-1] = r
+        if a.get("update") is None:
             continue
-        table[(_stem(a["path"]), _stem(b["path"]))][int(a["update"])] = r
+        # A fixed reference (e.g. a tuning wave's common warm start) is labelled
+        # with its update; a greedy-A comparison gets its own row.
+        ref = _stem(b["path"])
+        if b.get("update") != a.get("update"):
+            ref = f"{ref}@u{b.get('update')}"
+        if r.get("greedy_a"):
+            ref += " (A greedy)"
+        table[(_stem(a["path"]), ref)][int(a["update"])] = r
 
     print("== strength: candidate vs reference at equal updates (bb/seat-hand, + = candidate stronger)")
     for (cand, ref), by_k in sorted(table.items()):

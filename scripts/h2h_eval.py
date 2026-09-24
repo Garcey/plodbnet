@@ -69,7 +69,7 @@ def load_actor(path: str, device: torch.device, ema: bool):
     return model, meta
 
 
-def play_config(game_cfg, models, deals, obs_mode, device, rng, ev_samples):
+def play_config(game_cfg, models, deals, obs_mode, device, rng, ev_samples, greedy=(False, False)):
     """One table config: `deals` deals x 2 passes. Returns per-pair A net
     (chips, summed over A's seats in both passes) and seats played."""
     n_seats = game_cfg.num_seats
@@ -105,7 +105,9 @@ def play_config(game_cfg, models, deals, obs_mode, device, rng, ev_samples):
         )
         gates = np.zeros(n, dtype=np.uint8)
         chips = np.zeros(n, dtype=np.uint64)
-        for model, rows_mask in ((models[0], is_a), (models[1], live & ~is_a)):
+        for model, rows_mask, det in (
+            (models[0], is_a, greedy[0]), (models[1], live & ~is_a, greedy[1])
+        ):
             rows = np.nonzero(rows_mask)[0]
             if rows.size == 0:
                 continue
@@ -113,7 +115,7 @@ def play_config(game_cfg, models, deals, obs_mode, device, rng, ev_samples):
             m = torch.from_numpy(env._gate_mask[rows]).to(device)
             b = torch.from_numpy(sizing[rows]).to(device)
             with torch.inference_mode():
-                out = model.act(o, m, b)
+                out = model.act(o, m, b, deterministic=det)
             gates[rows] = out.gate.cpu().numpy().astype(np.uint8)
             chips[rows] = np.maximum(out.chips.cpu().numpy(), 0).astype(np.uint64)
         st = env.step_hybrid_batch(gates, chips)
@@ -137,6 +139,12 @@ def main() -> None:
     ap.add_argument("--ema", action="store_true", help="play the EMA actors")
     ap.add_argument("--ev-samples", type=int, default=64)
     ap.add_argument("--out", default="runs/h2h_history.jsonl")
+    ap.add_argument(
+        "--greedy-a", action="store_true",
+        help="A plays its most likely action (argmax gate / sizing mode) instead of "
+        "sampling: what A has LEARNED to prefer, apart from how much it still mixes "
+        "(compare runs trained at different entropy coefficients this way)",
+    )
     args = ap.parse_args()
 
     device = torch.device(args.device)
@@ -166,12 +174,13 @@ def main() -> None:
                 stack_dist=tier, seats_dist="uniform", variant=meta_a["variant"], sb=0,
             )
             pair_net, n_seats, _steps = play_config(
-                cfg, (model_a, model_b), args.deals, obs_mode, device, rng, args.ev_samples
+                cfg, (model_a, model_b), args.deals, obs_mode, device, rng, args.ev_samples,
+                greedy=(bool(args.greedy_a), False),
             )
             per_tier[tier].append(pair_net / bb / n_seats)   # bb per A seat-hand
     report = {"a": meta_a, "b": meta_b, "deals_per_config": args.deals,
               "configs_per_tier": args.configs_per_tier, "seed": args.seed,
-              "ema": bool(args.ema), "tiers": {}}
+              "ema": bool(args.ema), "greedy_a": bool(args.greedy_a), "tiers": {}}
     everything = []
     for tier in TIERS:
         x = np.concatenate(per_tier[tier]) if per_tier[tier] else np.zeros(0)
