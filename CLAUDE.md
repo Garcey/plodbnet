@@ -354,10 +354,15 @@ anchor` = v2 (head_version 2), `logistic` = v4 (3), `mixture` = v5 (4).
     12.8 GiB). Confirmed: a 349M-row target collected 362M rows in one update
     at 212 GiB peak (rollout 621k rows/s). Long rollouts collect faster
     (fixed per-step costs amortize).
+  - At long rollouts PIN the trainer's CPUs to one NUMA node (taskset):
+    unpinned, automatic NUMA balancing tripled the rollout's kernel time
+    (2.64M envs / 340M rows: 464k rows/s vs 621k pinned at 1.76M / 362M).
+    Host-batch PPO: 161 s for 340M rows after the fused gather (433 s before).
   - `scripts/vMin3_guardian.sh` = the full run on these settings (32x3 /
-    128x2, 2.64M envs, 320M-row default via `ROLLOUT_LENGTH`, host batch,
-    micro-batching); it refuses to start while any other trainer runs (their
-    RAM would push the container over its limit).
+    128x2, 1.76M envs pinned to the GPU's node, 330M-row default via
+    `ROLLOUT_LENGTH`, host batch, micro-batching); it refuses to start while
+    any other trainer runs (their RAM would push the container over its
+    limit).
 
 ### v5 (2026-07-06, IMPLEMENTED, not yet trained — V5_DESIGN.md canonical)
 
