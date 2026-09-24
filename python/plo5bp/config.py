@@ -323,6 +323,12 @@ class TrainingConfig:
     # when a CentralCritic owns the GAE values. Plain regression, no
     # clipping; small so it stays subordinate to the policy loss.
     display_value_coef: float = 0.125
+    # Learning rate of the centralized critic's own AdamW param group
+    # (2026-09-24 tuning). 0 = the actor's `lr` in ONE param group -- the exact
+    # path every stem to date trained with. The actor and critic share one
+    # optimizer, so without this the critic's regression and the policy step
+    # can only be tuned together.
+    critic_lr: float = 0.0
     # Weight on the centralized critic's value loss in the total loss. 0.5 = the
     # historical hardcoded value. Exposed for the distributional head (HL-Gauss
     # cross-entropy has a different magnitude than the old MSE, so the weight

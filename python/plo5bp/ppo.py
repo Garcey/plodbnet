@@ -243,8 +243,24 @@ class PPOTrainer:
         # (~1.5e-6 relative at lr 1.5e-4). Every stem to date trained with
         # it; setting it to 0 or exempting tensors is a production behavior
         # change for the owner to make at a stem boundary.
+        # critic_lr > 0: the critic gets its own param group at that rate (the
+        # parameter ORDER -- actor then critic -- is unchanged, so optimizer
+        # sidecars restore either way). 0 = one group at config.lr (exact).
+        critic_lr = float(getattr(config, "critic_lr", 0.0) or 0.0)
+        self._critic_lr_ratio = (
+            critic_lr / float(config.lr)
+            if critic_lr > 0.0 and self._critic_params
+            else None
+        )
+        if self._critic_lr_ratio is not None:
+            param_spec = [
+                {"params": self._actor_params},
+                {"params": self._critic_params, "lr": critic_lr},
+            ]
+        else:
+            param_spec = params
         self.optimizer = optim.AdamW(
-            params,
+            param_spec,
             lr=config.lr,
             betas=(0.9, float(getattr(config, "adam_b2", 0.999))),
             fused=self._cuda,
@@ -386,6 +402,14 @@ class PPOTrainer:
     # the "init" snapshot at the relaunch point. train.py persists both in
     # ONE rolling `<stem>.optim.pt` next to the numbered checkpoints (they
     # are ~3x the parameter bytes — too heavy to ride in every checkpoint).
+
+    def set_lr(self, lr: float) -> None:
+        """Set the base (actor) learning rate for the next update; a separate
+        critic group (critic_lr) follows at its configured ratio, so the
+        warmup ramp and live anneal_control lr edits scale both."""
+        for i, group in enumerate(self.optimizer.param_groups):
+            ratio = self._critic_lr_ratio if (i == 1 and self._critic_lr_ratio) else 1.0
+            group["lr"] = lr * ratio
 
     def optimizer_sidecar_state(self) -> dict:
         """CPU copy of everything the sidecar persists. `param_shapes`

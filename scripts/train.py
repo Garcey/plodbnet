@@ -1748,6 +1748,15 @@ def main() -> None:
         "warm restarts whose gate is fragile under the full default rate.",
     )
     parser.add_argument(
+        "--critic-lr",
+        type=float,
+        default=0.0,
+        help="Learning rate of the centralized critic in its own AdamW param "
+        "group (follows the warmup ramp and live lr edits at the same ratio "
+        "to --lr). 0 = the critic trains at --lr in the actor's group (the "
+        "exact original path).",
+    )
+    parser.add_argument(
         "--lr-warmup-updates",
         type=int,
         default=0,
@@ -2123,6 +2132,7 @@ def main() -> None:
     train_cfg = TrainingConfig(
         **_tc_extra,
         lr=args.lr,
+        critic_lr=float(args.critic_lr),
         num_updates=args.num_updates,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
@@ -3010,8 +3020,7 @@ def main() -> None:
         # on it). Checkpoint names/counters stay on the global axis either
         # way via base_update.
         lr_scale = _lr_warmup_scale(update, args.lr_warmup_updates)
-        for _pg in trainer.optimizer.param_groups:
-            _pg["lr"] = live_lr * lr_scale
+        trainer.set_lr(live_lr * lr_scale)
         if resource_sampler is not None:
             resource_sampler.set_phase("optimize", update=update)
         _t_opt0 = time.perf_counter()
