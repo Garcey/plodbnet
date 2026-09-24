@@ -11,7 +11,7 @@
 //! total (a log-line diagnostic) is summed in f64 instead of numpy's
 //! pairwise f32 order.
 
-use numpy::{PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
+use numpy::{PyReadonlyArray1, PyReadonlyArray2, PyReadwriteArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -433,6 +433,11 @@ pub fn flush_trajectories<'py>(
 /// obs_idx = pool_start + i, gate = u8 -> i8, chips = chips (u64 -> i64) on a
 /// raise else 0, sizing row, anchor = i64 -> i8, and u / log_p / gate_lp /
 /// anchor_lp / value (+ q_taken / vpi when `traj` has them) verbatim.
+///
+/// Rows are written in parallel when `slot` is strictly increasing (the
+/// rollout's case: learner envs ascend and each env's (seat, slot) block is
+/// its own) -- distinct slots, so the writes are disjoint and the result is
+/// the sequential one; any other order takes the sequential loop.
 #[pyfunction]
 pub fn record_learner_steps<'py>(
     slot: PyReadonlyArray1<'py, i64>,
@@ -493,19 +498,131 @@ pub fn record_learner_steps<'py>(
         t_sizing.as_slice_mut()?,
         t_anchor.as_slice_mut()?,
     );
-    for (i, (&sl, &e)) in slot.iter().zip(lidx).enumerate() {
-        let (sl, e) = (sl as usize, e as usize);
-        to[sl] = pool_start + i as i64;
-        tg[sl] = g[e] as i8;
-        tc[sl] = if g[e] as i8 == GATE_RAISE { c[e] as i64 } else { 0 };
-        ts[sl * 4..sl * 4 + 4].copy_from_slice(&sz[e * 4..e * 4 + 4]);
-        ta[sl] = an[e] as i8;
+    let mut srcs: Vec<&[f32]> = Vec::with_capacity(src.len());
+    for a in src.iter() {
+        srcs.push(a.as_slice()?);
     }
-    for (s_arr, d_arr) in src.iter().zip(dst.iter_mut()) {
-        let (sv, dv) = (s_arr.as_slice()?, d_arr.as_slice_mut()?);
-        for (&sl, &e) in slot.iter().zip(lidx) {
-            dv[sl as usize] = sv[e as usize];
+    let mut dsts: Vec<&mut [f32]> = Vec::with_capacity(dst.len());
+    for a in dst.iter_mut() {
+        dsts.push(a.as_slice_mut()?);
+    }
+    let ascending = slot.windows(2).all(|w| w[0] < w[1]);
+    if !ascending || slot.len() < 2 * REC_MIN_LEN {
+        for (i, (&sl, &e)) in slot.iter().zip(lidx).enumerate() {
+            let (sl, e) = (sl as usize, e as usize);
+            to[sl] = pool_start + i as i64;
+            tg[sl] = g[e] as i8;
+            tc[sl] = if g[e] as i8 == GATE_RAISE { c[e] as i64 } else { 0 };
+            ts[sl * 4..sl * 4 + 4].copy_from_slice(&sz[e * 4..e * 4 + 4]);
+            ta[sl] = an[e] as i8;
         }
+        for (sv, dv) in srcs.iter().zip(dsts.iter_mut()) {
+            for (&sl, &e) in slot.iter().zip(lidx) {
+                dv[sl as usize] = sv[e as usize];
+            }
+        }
+        return Ok(());
+    }
+    // Strictly increasing slots (all in range, checked above) are distinct:
+    // every row owns its own element of every destination array.
+    let o = RecOut {
+        to: to.as_mut_ptr(),
+        tg: tg.as_mut_ptr(),
+        tc: tc.as_mut_ptr(),
+        ts: ts.as_mut_ptr(),
+        ta: ta.as_mut_ptr(),
+        f: dsts.iter_mut().map(|d| d.as_mut_ptr()).collect(),
+    };
+    (0..slot.len()).into_par_iter().with_min_len(REC_MIN_LEN).for_each(|i| {
+        let o = &o;
+        let (sl, e) = (slot[i] as usize, lidx[i] as usize);
+        // SAFETY: `sl` < every destination's length (checked) and unique to
+        // row i (strictly increasing), so no two rows touch the same element.
+        unsafe {
+            *o.to.add(sl) = pool_start + i as i64;
+            let gi = g[e] as i8;
+            *o.tg.add(sl) = gi;
+            *o.tc.add(sl) = if gi == GATE_RAISE { c[e] as i64 } else { 0 };
+            std::ptr::copy_nonoverlapping(sz.as_ptr().add(e * 4), o.ts.add(sl * 4), 4);
+            *o.ta.add(sl) = an[e] as i8;
+            for (sv, dp) in srcs.iter().zip(o.f.iter()) {
+                *dp.add(sl) = sv[e];
+            }
+        }
+    });
+    Ok(())
+}
+
+/// Parallel `record_learner_steps` below this many rows per task.
+const REC_MIN_LEN: usize = 1024;
+
+struct RecOut {
+    to: *mut i64,
+    tg: *mut i8,
+    tc: *mut i64,
+    ts: *mut i64,
+    ta: *mut i8,
+    f: Vec<*mut f32>,
+}
+unsafe impl Send for RecOut {}
+unsafe impl Sync for RecOut {}
+
+/// Rows per rayon task in `gather_rows_into`.
+const GATHER_MIN_ROWS: usize = 512;
+
+/// `dst[dst_start + i] = src[rows[i]]` for every i (`rows` None: `src[i]`),
+/// rows of raw BYTES -- pass any C-contiguous 2-D array as `a.view(np.uint8)`.
+/// The rollout's per-step host copies (packed observation rows into the
+/// pinned upload slots and the trajectory pool, gate-mask rows) were
+/// single-threaded numpy gathers; this is the same bytes, copied in parallel.
+#[pyfunction]
+#[pyo3(signature = (src, dst, dst_start, rows=None))]
+pub fn gather_rows_into<'py>(
+    src: PyReadonlyArray2<'py, u8>,
+    mut dst: PyReadwriteArray2<'py, u8>,
+    dst_start: usize,
+    rows: Option<PyReadonlyArray1<'py, i64>>,
+) -> PyResult<()> {
+    let err = |m: String| PyValueError::new_err(format!("gather_rows_into: {m}"));
+    if !src.is_c_contiguous() || !dst.is_c_contiguous() {
+        return Err(err("src and dst must be C-contiguous".into()));
+    }
+    let (src_n, w) = (src.shape()[0], src.shape()[1]);
+    let (dst_n, dst_w) = (dst.shape()[0], dst.shape()[1]);
+    if dst_w != w {
+        return Err(err(format!("row widths differ: src {w} bytes, dst {dst_w} bytes")));
+    }
+    let rows_arr = match rows.as_ref() {
+        Some(r) => Some(r.as_slice()?),
+        None => None,
+    };
+    let k = rows_arr.map_or(src_n, |r| r.len());
+    if dst_start.checked_add(k).map_or(true, |end| end > dst_n) {
+        return Err(err(format!("{k} rows at {dst_start} overflow dst ({dst_n} rows)")));
+    }
+    if let Some(r) = rows_arr {
+        if let Some(&bad) = r.iter().find(|&&x| x < 0 || x as usize >= src_n) {
+            return Err(err(format!("row {bad} out of range ({src_n} rows)")));
+        }
+    }
+    if k == 0 || w == 0 {
+        return Ok(());
+    }
+    let sv = src.as_slice()?;
+    let dv = &mut dst.as_slice_mut()?[dst_start * w..(dst_start + k) * w];
+    match rows_arr {
+        Some(r) => dv
+            .par_chunks_mut(w)
+            .with_min_len(GATHER_MIN_ROWS)
+            .zip(r.par_iter())
+            .for_each(|(d, &ri)| {
+                let ri = ri as usize;
+                d.copy_from_slice(&sv[ri * w..(ri + 1) * w]);
+            }),
+        None => dv
+            .par_chunks_mut(w * GATHER_MIN_ROWS)
+            .zip(sv[..k * w].par_chunks(w * GATHER_MIN_ROWS))
+            .for_each(|(d, s)| d.copy_from_slice(s)),
     }
     Ok(())
 }

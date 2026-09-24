@@ -40,6 +40,46 @@ try:  # ... and record each step's learner rows in one Rust call
     from plo5bp._engine import record_learner_steps as _rust_record_learner_steps  # type: ignore[attr-defined]
 except ImportError:
     _rust_record_learner_steps = None
+try:  # engines built since 2026-09-24 copy per-step host rows in parallel
+    from plo5bp._engine import gather_rows_into as _rust_gather_rows  # type: ignore[attr-defined]
+except ImportError:
+    _rust_gather_rows = None
+
+# Below this many rows a per-step copy stays in numpy: handing a job to the
+# Rust thread pool from the Python thread costs a cross-thread wake-up that a
+# small copy does not repay.
+_GATHER_RUST_MIN_ROWS = 2048
+
+
+def _gather_rows(
+    src: np.ndarray, rows: "np.ndarray | None", dst: np.ndarray, start: int = 0
+) -> None:
+    """``dst[start:start + k] = src[rows]`` (``src[:k]``, k = len(src), when
+    `rows` is None) for 2-D arrays of one dtype -- the per-step host copies
+    (packed observation rows into the pinned upload slots and the trajectory
+    pool, gate-mask and sizing rows). Large copies go through the engine's
+    parallel byte-row copy; the bytes are the same either way."""
+    k = int(src.shape[0]) if rows is None else int(rows.shape[0])
+    if (
+        _rust_gather_rows is not None
+        and k >= _GATHER_RUST_MIN_ROWS
+        and src.dtype == dst.dtype
+        and src.ndim == 2
+        and dst.ndim == 2
+        and src.shape[1] == dst.shape[1]
+        and src.flags.c_contiguous
+        and dst.flags.c_contiguous
+    ):
+        _rust_gather_rows(
+            src.view(np.uint8),
+            dst.view(np.uint8),
+            int(start),
+            None if rows is None else np.ascontiguousarray(rows, dtype=np.int64),
+        )
+    elif rows is None:
+        dst[start : start + k] = src
+    else:
+        np.take(src, rows, axis=0, out=dst[start : start + k])
 
 # Output slabs the Rust flush writes (compact observation storage only).
 _RUST_FLUSH_OUT_KEYS = (
@@ -418,6 +458,10 @@ class _PinnedStepH2D:
             return self.upload(
                 obs_arr[rows], gm_arr[rows], sizing_arr[rows], slot=slot
             )
+        if gm_arr.dtype == np.bool_ and sizing_arr.dtype == np.int64:
+            return self._upload_packed(
+                obs_arr, rows, gm_arr, sizing_arr, slot, packed, aux_rows=rows
+            )
         return self._upload_packed(
             obs_arr, rows, gm_arr[rows], sizing_arr[rows], slot, packed
         )
@@ -430,21 +474,28 @@ class _PinnedStepH2D:
         b_sizing: np.ndarray,
         slot: int,
         packed: "tuple[np.ndarray, np.ndarray] | None" = None,
+        aux_rows: "np.ndarray | None" = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """`aux_rows` None: `b_gm` / `b_sizing` are the k rows already; else
+        they are the full per-env arrays and `aux_rows` picks the k rows."""
         k = int(rows.size)
         s = int(slot) % self.n_slots
         self._packed_k[s] = None
         if packed is not None:
-            np.take(packed[0], rows, axis=0, out=self.bits_h[s].numpy()[:k], mode="clip")
-            np.take(packed[1], rows, axis=0, out=self.real_h[s].numpy()[:k], mode="clip")
+            _gather_rows(packed[0], rows, self.bits_h[s].numpy())
+            _gather_rows(packed[1], rows, self.real_h[s].numpy())
         else:
             pack_rows_into(
                 obs_arr, rows, self.layout,
                 self.bits_h[s].numpy(), self.real_h[s].numpy(), 0,
             )
         self._packed_k[s] = k
-        self.gm_h[s].numpy()[:k] = np.asarray(b_gm, dtype=bool)
-        self.sz_h[s].numpy()[:k] = np.asarray(b_sizing, dtype=np.int64)
+        if aux_rows is not None:
+            _gather_rows(b_gm, aux_rows, self.gm_h[s].numpy())
+            _gather_rows(b_sizing, aux_rows, self.sz_h[s].numpy())
+        else:
+            self.gm_h[s].numpy()[:k] = np.asarray(b_gm, dtype=bool)
+            self.sz_h[s].numpy()[:k] = np.asarray(b_sizing, dtype=np.int64)
         bits_t = self.bits_h[s, :k].to(self.device, non_blocking=True)
         real_t = self.real_h[s, :k].to(self.device, non_blocking=True)
         m_t = self.gm_h[s, :k].to(self.device, non_blocking=True)
@@ -2842,15 +2893,15 @@ def collect_rollout_batched(
             if obs_layout is None:
                 step_obs_pool["obs"][pool_cursor:pool_end] = obs[learner_idx_np]
             elif _learner_packed is not None:
-                step_obs_pool["obs_bits"][pool_cursor:pool_end] = _learner_packed[0]
-                step_obs_pool["obs_real"][pool_cursor:pool_end] = _learner_packed[1]
+                _gather_rows(_learner_packed[0], None, step_obs_pool["obs_bits"], pool_cursor)
+                _gather_rows(_learner_packed[1], None, step_obs_pool["obs_real"], pool_cursor)
             else:
                 pack_rows_into(
                     obs, learner_idx_np, obs_layout,
                     step_obs_pool["obs_bits"], step_obs_pool["obs_real"],
                     pool_cursor,
                 )
-            step_gm_pool[pool_cursor:pool_end] = gate_masks[learner_idx_np]
+            _gather_rows(gate_masks, learner_idx_np, step_gm_pool, pool_cursor)
             step_timers.end()  # step3c/obs_pack
             pool_indices = np.arange(pool_cursor, pool_end, dtype=np.int64)
             pool_cursor = pool_end
