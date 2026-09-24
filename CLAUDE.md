@@ -361,9 +361,15 @@ anchor` = v2 (head_version 2), `logistic` = v4 (3), `mixture` = v5 (4).
   - `scripts/vMin3_guardian.sh` = the full run on these settings (32x3 /
     128x2, 1.76M envs pinned to the GPU's node, 330M-row default via
     `ROLLOUT_LENGTH`, host batch, micro-batching, entropy 0.07 from the tuning
-    below; warm start `WARM=checkpoints/t3ent07.pt`); it refuses to start while
-    any other trainer runs (their RAM would push the container over its
-    limit) — also stop leftover evaluators first (each holds a few GiB).
+    below, sizing-entropy scale 0.1; warm start `WARM=checkpoints/t3ent07.pt`);
+    it refuses to start while any other trainer runs (their RAM would push the
+    container over its limit) — also stop leftover evaluators first (each holds
+    a few GiB). It relaunches a dead trainer unless 4 restarts fall within 6 h
+    (a crash loop), so rare one-off crashes over weeks never end the run.
+    `scripts/run_watch.py --stem vMin3` runs beside it: every 5 updates one line
+    in `runs/vMin3_watch.log` = argmax vs argmax against the start
+    (`t3ent07.pt`) and vMin2 u150, the collapse/sizing probe, and the
+    trainer's latest v/H/KL.
 - **Hyperparameter tuning (2026-09-24, RunPod) — the vMin3 settings** (`t1*`-
   `t4*` stems; the KL-anchor magnet was deliberately NOT tuned — it stays off
   until late-stage training):
@@ -405,11 +411,21 @@ anchor` = v2 (head_version 2), `logistic` = v4 (3), `mixture` = v5 (4).
     owner chose 0.07 for vMin3 (2026-09-24)** — an explicit exception to the
     usual 0.1 floor, backed by these runs. Watch a long run with
     `policy_sharpness.py` on its checkpoints (same cached states).
-  - No gain (stay as they were): `--sizing-entropy-scale 0.5`, `--ppo-epochs 4`
-    (vs 2 at entropy 0.15), `--gae-lambda` 0.9 and 1.0 (flag added; 1.0's sampled
-    play was worse). Raise-size entropy did not move in ANY run (~1.98 of a
-    2.40 max): the pooled raise Q column gives sizes signal only through the
-    lambda-TD terms, so sizing sharpens slowly whatever the entropy.
+  - No gain (stay as they were): `--ppo-epochs 4` (vs 2 at entropy 0.15),
+    `--gae-lambda` 0.9 and 1.0 (flag added; 1.0's sampled play was worse).
+  - **Sizing-entropy scale 1.0 -> 0.1** (`t5sz*`, at entropy 0.07). With the
+    full sizing bonus raise sizes NEVER differentiated: size entropy rose from
+    ~1.8 at init to ~1.98 (of a 2.40 max) by u20 and stayed there — vMin2
+    through u150 included; the average spread was min-raise ~17%, every other
+    size 6-11%, pot ~6%. The size-specific advantage is a few % of the pot
+    against a whole-hand advantage scale (and the pooled raise Q column gives
+    sizes signal only through the lambda-TD terms), so the bonus wins. Scale
+    0.5 / 0.2 / 0.1 / 0: size entropy at u59 1.95 / 1.89 / 1.82 / 1.68 (still
+    falling), every tier moving toward SMALL bets (at 0: min-raise ~29%, pot
+    ~4.5%); argmax vs vMin2 u150's argmax: 1.0 +0.43, 0.1 +0.57, 0 +0.55
+    bb/seat-hand (deep tier +1.11 -> +1.42). At entropy 0.25 a 0.5 scale had
+    shown nothing (the sizing bonus was still 0.125). vMin3 uses 0.1 —
+    live-tunable (`{"sizing_entropy_scale": X}`); watch the size spread.
   - Not tested, kept (reasoned): gamma 1.0 (chips, no discount), v6 clip room
     (at KL ~0.0005/update the ratio band rarely binds; `clip` 0.2 is unused
     under v6), target_kl 0.5 / kl_hard 10 (guards that never trip at this lr),

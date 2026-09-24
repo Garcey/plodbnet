@@ -25,8 +25,13 @@
 #     0.25), plays far stronger, and its sharpness settles (no collapse through
 #     u79). 0.07 is below the owner's usual 0.1 floor BY THE OWNER'S DECISION
 #     (2026-09-24).
-#     lr 1.5e-4, 2 PPO epochs, GAE lambda 0.95, sizing-entropy scale 1.0 and the
-#     rest of the v6 preset were tested or checked and stay.
+#   - sizing-entropy scale 0.1 (was 1.0): with the full sizing bonus raise sizes
+#     stayed near-uniform in every run (vMin2 u20-u150 included); at 0.1 they
+#     start to differentiate (toward small bets, every tier) and the argmax edge
+#     over vMin2 u150 rose +0.43 -> +0.57 bb/seat-hand. Live-tunable:
+#     runs/anneal_control.json {"sizing_entropy_scale": X}.
+#     lr 1.5e-4, 2 PPO epochs, GAE lambda 0.95 and the rest of the v6 preset
+#     were tested or checked and stay.
 #   - everything else = the vMin2 recipe (v6 preset, minimal obs rev 2, 30 mixed
 #     configs, drain on, checkpoint every update).
 #   - warm start: WARM=checkpoints/t3ent07.pt = the tuning run at entropy 0.07
@@ -45,9 +50,10 @@ NUM_ENVS=${NUM_ENVS:-1760000}
 GLOG=runs/vMin3_guardian.log
 STOPFLAG=runs/vMin3.stop
 LOG=runs/vMin3.log
-MAX_RESTARTS=4
+MAX_RESTARTS=4          # crashes allowed within RESTART_WINDOW seconds
+RESTART_WINDOW=21600    # 6 h: a crash loop stops the run, rare one-off crashes over weeks do not
 POLL=300
-restarts=0
+restart_times=()
 
 log(){ echo "[vMin3-guardian $(date -u '+%m-%d %H:%M:%S')] $*" >> "$GLOG"; }
 train_pid(){ pgrep -f "python -u scripts/[t]rain.py .*--checkpoint checkpoints/vMin3.pt" | head -1; }
@@ -89,7 +95,7 @@ launch(){
     --batch-on-host --micro-batch-rows 1000000 \
     --num-minibatches 16 --ppo-epochs 2 \
     --mix-configs --configs-per-tier 10 --mix-tiers clubgg,clubgg_deep,deep \
-    --entropy-coef 0.07 --sizing-entropy-scale 1.0 \
+    --entropy-coef 0.07 --sizing-entropy-scale 0.1 \
     --lr 1.5e-4 --lr-warmup-updates 0 --clip-room-mid 0.07 \
     --target-kl 0.5 --kl-hard 10.0 --adv-clip 8 --cpu-threads 24 \
     --snapshot-every 5 --checkpoint-every 1 \
@@ -147,10 +153,17 @@ while true; do
     sleep 15; PID=$(train_pid)
     if [ -z "$PID" ]; then
       [ -f "$STOPFLAG" ] && { log "process gone and stop flag present -> exiting"; exit 0; }
-      if [ "$restarts" -ge "$MAX_RESTARTS" ]; then log "DEAD; restart cap hit -> STOP"; touch "$STOPFLAG"; exit 0; fi
-      restarts=$((restarts+1))
+      now=$(date +%s); keep=()
+      for t in ${restart_times[@]+"${restart_times[@]}"}; do
+        [ $((now - t)) -lt "$RESTART_WINDOW" ] && keep+=("$t")
+      done
+      restart_times=(${keep[@]+"${keep[@]}"})
+      if [ "${#restart_times[@]}" -ge "$MAX_RESTARTS" ]; then
+        log "DEAD; $MAX_RESTARTS restarts within $((RESTART_WINDOW / 3600)) h -> STOP"; touch "$STOPFLAG"; exit 0
+      fi
+      restart_times+=("$now")
       WARM_CKPT=$(pick_warm) || WARM_CKPT=""
-      log "process DEAD; relaunch #$restarts warm=${WARM_CKPT:-COLD}"
+      log "process DEAD; relaunch #${#restart_times[@]} in $((RESTART_WINDOW / 3600)) h warm=${WARM_CKPT:-COLD}"
       launch "$WARM_CKPT"; sleep 45
     fi
   fi
