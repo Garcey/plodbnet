@@ -1757,6 +1757,15 @@ def main() -> None:
         "exact original path).",
     )
     parser.add_argument(
+        "--gae-lambda",
+        type=float,
+        default=TrainingConfig.lam,
+        help="lambda of the advantage estimator (GAE(lambda), or VRPO's "
+        "Expected-SARSA(lambda) under --v6): how far back a later reward is "
+        "credited. 1.0 = the full hand's outcome, lower = lean on the critic "
+        "sooner. Default %(default)s (every stem to date).",
+    )
+    parser.add_argument(
         "--lr-warmup-updates",
         type=int,
         default=0,
@@ -2133,6 +2142,7 @@ def main() -> None:
         **_tc_extra,
         lr=args.lr,
         critic_lr=float(args.critic_lr),
+        lam=float(args.gae_lambda),
         num_updates=args.num_updates,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
