@@ -151,6 +151,13 @@ class TrainingConfig:
     # layout (2.4x full), which is what lets rollout_length grow. False = the
     # old dense float32 rows (A/B, debugging). NLH always stores dense.
     compact_obs: bool = True
+    # PPO micro-batching (2026-09-23): split each minibatch into chunks of at
+    # most this many rows, accumulating gradients (per-row means weighted by
+    # each chunk's share of rows; the fold-supervision term keeps its
+    # minibatch-wide denominator), so a minibatch -- and hence the rollout --
+    # can outgrow GPU memory. The same gradient mathematically, not
+    # bit-identical (float summation order). 0 = off (the exact old path).
+    micro_batch_rows: int = 0
     # Batched rollout: act every pool snapshot's opponent rows in ONE stacked
     # forward + ONE sampling pass per step (rollout._StackedOpponents) instead
     # of one act() per snapshot — on the GPU each call is mostly fixed launch

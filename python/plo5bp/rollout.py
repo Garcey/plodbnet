@@ -3824,37 +3824,51 @@ def _minibatch_bounds(n: int, batch_size: int) -> list[tuple[int, int]]:
 def iter_minibatches(
     batch: Batch, batch_size: int, rng: np.random.Generator
 ) -> Iterable[Batch]:
+    for sel in iter_minibatch_indices(batch, batch_size, rng):
+        yield gather_minibatch(batch, sel)
+
+
+def iter_minibatch_indices(
+    batch: Batch, batch_size: int, rng: np.random.Generator
+) -> Iterable[torch.Tensor]:
+    """The row indices (device tensor) of each minibatch of `iter_minibatches`
+    -- the same shuffle, bounds and RNG use -- without gathering the rows, so
+    a caller can gather a minibatch in chunks (PPO micro-batching)."""
     n = batch.obs.shape[0]
     idx = np.arange(n)
     rng.shuffle(idx)
     device = batch.obs.device
     for start, stop in _minibatch_bounds(n, batch_size):
-        sel = torch.from_numpy(idx[start:stop]).to(device)
-        yield Batch(
-            # Compact storage unpacks HERE, per minibatch, on the learner
-            # device (PackedObs row indexing yields dense f32, bit-exact).
-            obs=batch.obs[sel],
-            gate_masks=batch.gate_masks[sel],
-            gate_actions=batch.gate_actions[sel],
-            raise_chips=batch.raise_chips[sel],
-            sizing=batch.sizing[sel],
-            anchor_actions=batch.anchor_actions[sel],
-            refine_u=batch.refine_u[sel],
-            opp_holes=batch.opp_holes[sel],
-            log_probs=batch.log_probs[sel],
-            values=batch.values[sel],
-            returns=batch.returns[sel],
-            advantages=batch.advantages[sel],
-            old_gate_logp=batch.old_gate_logp[sel],
-            old_anchor_logp=batch.old_anchor_logp[sel],
-            is_terminal=(
-                batch.is_terminal[sel]
-                if batch.is_terminal is not None
-                else None
-            ),
-            ent_coef_rows=(
-                batch.ent_coef_rows[sel]
-                if batch.ent_coef_rows is not None
-                else None
-            ),
-        )
+        yield torch.from_numpy(idx[start:stop]).to(device)
+
+
+def gather_minibatch(batch: Batch, sel: torch.Tensor) -> Batch:
+    """The rows `sel` of `batch` as a Batch (compact observations unpacked)."""
+    return Batch(
+        # Compact storage unpacks HERE, per minibatch, on the learner
+        # device (PackedObs row indexing yields dense f32, bit-exact).
+        obs=batch.obs[sel],
+        gate_masks=batch.gate_masks[sel],
+        gate_actions=batch.gate_actions[sel],
+        raise_chips=batch.raise_chips[sel],
+        sizing=batch.sizing[sel],
+        anchor_actions=batch.anchor_actions[sel],
+        refine_u=batch.refine_u[sel],
+        opp_holes=batch.opp_holes[sel],
+        log_probs=batch.log_probs[sel],
+        values=batch.values[sel],
+        returns=batch.returns[sel],
+        advantages=batch.advantages[sel],
+        old_gate_logp=batch.old_gate_logp[sel],
+        old_anchor_logp=batch.old_anchor_logp[sel],
+        is_terminal=(
+            batch.is_terminal[sel]
+            if batch.is_terminal is not None
+            else None
+        ),
+        ent_coef_rows=(
+            batch.ent_coef_rows[sel]
+            if batch.ent_coef_rows is not None
+            else None
+        ),
+    )

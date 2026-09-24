@@ -32,9 +32,32 @@ from torch.profiler import record_function
 from plo5bp.actions import GATE_FOLD, GATE_RAISE
 from plo5bp.config import TrainingConfig
 from plo5bp.network import ActorCritic, CentralCritic, opp_holes_multihot
-from plo5bp.rollout import Batch, iter_minibatches
+from plo5bp.rollout import (  # noqa: F401 (iter_minibatches: re-export)
+    Batch,
+    gather_minibatch,
+    iter_minibatch_indices,
+    iter_minibatches,
+)
 from plo5bp.sizing import PLO_ANCHOR_SPEC, anchor_grid_torch
 import numpy as np
+
+
+def _merge_chunk_terms(acc: dict | None, tc: dict, w: float) -> dict:
+    """Accumulate one micro-batch chunk's terms (detached): per-row means
+    weighted by the chunk's share `w` (q_loss arrives weighted already), the
+    canary sums and the (already weighted) loss summed as they are."""
+    out = {} if acc is None else acc
+    for k, v in tc.items():
+        if v is None:
+            out.setdefault(k, None)
+            continue
+        v = v.detach().float()
+        if k in ("policy_loss", "value_loss", "display_loss", "entropy_loss",
+                 "kl_anchor_term", "kl", "gate_kl", "anchor_kl", "beta_kl",
+                 "gate_h", "anchor_h", "beta_h"):
+            v = w * v
+        out[k] = v if out.get(k) is None else out[k] + v
+    return out
 
 
 @dataclass
@@ -468,7 +491,12 @@ class PPOTrainer:
         )
 
     def _q_fold_sup_term(
-        self, mb: Batch, q_all: torch.Tensor, q_loss: torch.Tensor
+        self,
+        mb: Batch,
+        q_all: torch.Tensor,
+        q_loss: torch.Tensor,
+        fold_denom: torch.Tensor | None = None,
+        weight: float | None = None,
     ) -> torch.Tensor:
         """Dense fold-column supervision (TrainingConfig.q_fold_sup_coef):
         fold's forward return is exactly 0 (per-step-cost rewards, sunk
@@ -476,13 +504,317 @@ class PPOTrainer:
         every fold-LEGAL row — not just the ones where fold was taken.
         The bool mask is lifted to f32 so the reduction stays fp32 under
         autocast (562k-row sums are garbage in bf16)."""
+        if weight is not None:
+            # Micro-batch chunk: the MSE part is a per-row mean (weighted by
+            # the chunk's share), the fold part is normalized by the
+            # MINIBATCH's fold-legal count so the chunks sum to the original.
+            q_loss = weight * q_loss
         if self._q_fold_sup <= 0.0:
             return q_loss
         fold_ok = mb.gate_masks[..., GATE_FOLD].float()
         fold_mse = (q_all[..., GATE_FOLD].pow(2) * fold_ok).sum() / (
-            fold_ok.sum().clamp_min(1.0)
+            fold_ok.sum().clamp_min(1.0) if fold_denom is None else fold_denom
         )
         return q_loss + self._q_fold_sup * fold_mse
+
+    def _minibatch_terms(
+        self,
+        mb: Batch,
+        eff_entropy_coef: float,
+        display_coef: float,
+        value_coef: float,
+        device: torch.device,
+        weight: float | None = None,
+        fold_denom: torch.Tensor | None = None,
+    ) -> dict:
+        """One minibatch's (or, micro-batched, one chunk's) PPO loss terms --
+        the body of `update`'s minibatch loop up to the KL guard, moved here
+        verbatim. `weight` None = a whole minibatch (the exact original
+        expressions); else the chunk's share of the minibatch rows, with
+        `fold_denom` the minibatch-wide fold-legal row count."""
+        cfg = self.config
+        qf = qf_n = qt = qt_n = None
+        gate_kl = anchor_kl = beta_kl = None
+        with torch.autocast(
+            device_type="cuda",
+            dtype=torch.bfloat16,
+            enabled=self._cuda,
+        ):
+            with record_function("step12a/evaluate"):
+                if self.head_version >= 2:
+                    (
+                        log_prob, entropy, display_value,
+                        gate_h, anchor_h, beta_h,
+                        gate_lp_new, anchor_lp_new,
+                        cur_gate_logits, cur_anchor_out, cur_refine,
+                    ) = self._evaluate(
+                        mb.obs,
+                        mb.gate_masks,
+                        mb.sizing,
+                        mb.gate_actions,
+                        mb.anchor_actions,
+                        mb.refine_u,
+                    )
+                else:
+                    log_prob, entropy, display_value = self._evaluate(
+                        mb.obs,
+                        mb.gate_masks,
+                        mb.sizing[..., :2],
+                        mb.gate_actions,
+                        mb.raise_chips,
+                    )
+                    gate_h = anchor_h = beta_h = entropy
+
+            with record_function("step12b/loss"):
+                ratio = torch.exp(log_prob - mb.log_probs)
+                if self._clip_prob_dependent:
+                    clip_lo, clip_hi = self._gate_clip_bounds(
+                        mb.old_gate_logp
+                    )
+                else:
+                    clip_lo = 1.0 - cfg.clip
+                    clip_hi = 1.0 + cfg.clip
+                surr1 = ratio * mb.advantages
+                surr2 = (
+                    torch.clamp(ratio, clip_lo, clip_hi)
+                    * mb.advantages
+                )
+                policy_loss = -torch.min(surr1, surr2).mean()
+
+                # Value source: the centralized critic when
+                # present (buffer `values` came from it), else
+                # the actor's own head.
+                q_loss = torch.zeros((), device=device)
+                q_all = None
+                if self._distributional:
+                    # Distributional / HL-Gauss value head: one torso
+                    # pass gives V (=symexp(E[bins]), scalar), the
+                    # categorical logits, and the scalar dueling Q.
+                    # value loss = HL-Gauss cross-entropy — no MSE
+                    # clip (the categorical support IS the bound).
+                    value, value_logits, q_all = self._critic_train(
+                        mb.obs, opp_holes_multihot(mb.opp_holes)
+                    )
+                    if self._q_aux_coef > 0.0 and q_all is not None:
+                        q_taken = q_all.gather(
+                            -1, self._q_index(mb, q_all)[..., None]
+                        ).squeeze(-1)
+                        q_loss = (q_taken - mb.returns).pow(2).mean()
+                        q_loss = self._q_fold_sup_term(mb, q_all, q_loss, fold_denom, weight)
+                    value_loss = self.critic.hlgauss_value_loss(
+                        value_logits, mb.returns
+                    )
+                else:
+                    if (
+                        self._q_aux_coef > 0.0
+                        and self._critic_qv is not None
+                    ):
+                        # One critic forward yields V (identical to
+                        # forward()) AND the dueling Q row; the
+                        # taken action's Q regresses to the same
+                        # returns. Index: 0 Fold, 1 CheckCall,
+                        # 2+anchor Raise (or 2 = pooled Raise).
+                        value, q_all = self._critic_qv(
+                            mb.obs, opp_holes_multihot(mb.opp_holes)
+                        )
+                        q_taken = q_all.gather(
+                            -1, self._q_index(mb, q_all)[..., None]
+                        ).squeeze(-1)
+                        q_loss = (q_taken - mb.returns).pow(2).mean()
+                        q_loss = self._q_fold_sup_term(mb, q_all, q_loss, fold_denom, weight)
+                    elif self._critic_fwd is not None:
+                        value = self._critic_fwd(
+                            mb.obs, opp_holes_multihot(mb.opp_holes)
+                        )
+                    else:
+                        value = display_value
+                    v1 = (value - mb.returns).pow(2)
+                    if cfg.value_clip > 0.0:
+                        value_pred_clipped = mb.values + torch.clamp(
+                            value - mb.values,
+                            -cfg.value_clip,
+                            cfg.value_clip,
+                        )
+                        v2 = (value_pred_clipped - mb.returns).pow(2)
+                        value_loss = 0.5 * torch.max(v1, v2).mean()
+                    else:
+                        # value_clip <= 0 DISABLES clipping — plain
+                        # MSE (review 2026-09-20 A20). A literal 0
+                        # radius pinned value_pred_clipped to the
+                        # rollout values, so max(v1, v2) only ever
+                        # passed gradient where the critic was
+                        # already WORSE than its old self: "0 = off"
+                        # froze the critic instead of unclipping it.
+                        value_loss = 0.5 * v1.mean()
+
+                # Fold-column canary (audit 2026-07-11): the
+                # per-update mean of Q[FOLD] over fold-LEGAL
+                # rows, whose ground truth is exactly 0. f32
+                # accumulation (bf16 sums of ~500k rows are
+                # garbage); no_grad — diagnostics only.
+                if q_all is not None:
+                    with torch.no_grad():
+                        fold_ok_c = (
+                            mb.gate_masks[..., GATE_FOLD].float()
+                        )
+                        qf = (
+                            q_all[..., GATE_FOLD].float() * fold_ok_c
+                        ).sum()
+                        qf_n = fold_ok_c.sum()
+                        # Terminal-boundary canary (V7_DESIGN.md
+                        # WS1.3): qT = mean(return − Q(s,a)) over
+                        # NON-FOLD terminal rows. At a terminal
+                        # row the stored return IS the raw reward
+                        # (no future term), so this is the exact
+                        # boundary residual δ_terminal — the term
+                        # that paid the July fold subsidy.
+                        # Positive = terminal actions subsidized,
+                        # negative = taxed. Fold rows are the qF
+                        # canary's job (truth 0), so they are
+                        # excluded here.
+                        if mb.is_terminal is not None:
+                            term_ok = (
+                                mb.is_terminal
+                                & (mb.gate_actions != GATE_FOLD)
+                            ).float()
+                            q_sel = q_all.gather(
+                                -1,
+                                self._q_index(mb, q_all)[..., None],
+                            ).squeeze(-1)
+                            qt = (
+                                (mb.returns - q_sel).float()
+                                * term_ok
+                            ).sum()
+                            qt_n = term_ok.sum()
+
+                # Display head: plain regression (no clipping —
+                # buffer values belong to the critic), small
+                # coefficient so it stays subordinate.
+                if self._critic_fwd is not None:
+                    display_loss = (
+                        (display_value - mb.returns).pow(2).mean()
+                    )
+                else:
+                    display_loss = torch.zeros_like(value_loss)
+
+                # Sizing-entropy scale (v2): `entropy` is
+                # gate_h + p_raise.detach()*(anchor_h+beta_h), so
+                # (entropy - gate_h) is exactly the p_raise-weighted
+                # sizing-head entropy. Rescaling it boosts the
+                # anchor/beta entropy bonus while the gate-head
+                # gradient cancels between the two gate_h terms
+                # (gate weight stays 1, sizing weight = scale).
+                if (
+                    self.head_version >= 2
+                    and self.sizing_entropy_scale != 1.0
+                ):
+                    entropy_for_loss = gate_h + (
+                        self.sizing_entropy_scale * (entropy - gate_h)
+                    )
+                else:
+                    entropy_for_loss = entropy
+                entropy_loss = -entropy_for_loss.mean()
+                # Per-row coefs (mix-configs per-tier entropy,
+                # V5_DESIGN.md B5) override the scalar coef —
+                # each transition is paid its own tier's rate.
+                if mb.ent_coef_rows is not None:
+                    entropy_bonus = -(
+                        mb.ent_coef_rows * entropy_for_loss
+                    ).mean()
+                else:
+                    entropy_bonus = eff_entropy_coef * entropy_loss
+                if weight is None:
+                    loss = (
+                        policy_loss
+                        + value_coef * value_loss
+                        + display_coef * display_loss
+                        + entropy_bonus
+                        + self._q_aux_coef * q_loss
+                    )
+                else:
+                    # Micro-batch chunk: per-row means weighted by the chunk's
+                    # share of the minibatch rows (q_loss arrives weighted, its
+                    # fold term normalized minibatch-wide).
+                    loss = (
+                        weight * (
+                            policy_loss
+                            + value_coef * value_loss
+                            + display_coef * display_loss
+                            + entropy_bonus
+                        )
+                        + self._q_aux_coef * q_loss
+                    )
+
+        # KL anchor: reference forward in f32 outside autocast
+        # (lgamma/digamma); the current-model outputs are
+        # REUSED from evaluate above (no second forward-with-grad).
+        kl_anchor_term = torch.zeros((), device=device)
+        if self._ref is not None:
+            with record_function("step12b2/kl_anchor"):
+                cur_raw = (
+                    (cur_gate_logits, cur_anchor_out, cur_refine)
+                    if self.head_version >= 2 else None
+                )
+                kl_anchor_term = _kl_to_reference(
+                    self.model, self._ref, mb, cur=cur_raw
+                )
+                loss = loss + (
+                    self.kl_anchor_coef if weight is None
+                    else weight * self.kl_anchor_coef
+                ) * kl_anchor_term
+
+        # Weight-decay-to-init (torso LayerNorm companion): pull the
+        # trunk weights toward their run-start values. No-op unless
+        # l2_init_coef > 0. f32, outside autocast.
+        if self._l2_init_pairs:
+            l2_init = torch.zeros((), device=device)
+            for p, p0 in self._l2_init_pairs:
+                l2_init = l2_init + ((p - p0) ** 2).sum()
+            loss = loss + (
+                self._l2_init_coef if weight is None
+                else weight * self._l2_init_coef
+            ) * l2_init
+
+        with record_function("step12e/kl"):
+            with torch.no_grad():
+                kl = (mb.log_probs - log_prob).mean()
+                # Per-head KL decomposition (v2 only): gate
+                # and anchor (raise rows) computed directly,
+                # beta derived by the joint identity. Pure
+                # diagnostics — never feeds the loss or guard.
+                if self.head_version >= 2:
+                    gate_kl = (mb.old_gate_logp - gate_lp_new).mean()
+                    raise_m = (mb.gate_actions == GATE_RAISE)
+                    # C4: batch-mean normalization (sum/B, matching
+                    # gate_kl and kl) so klG+klA+klB is a true
+                    # additive decomposition — sum/n_raise made the
+                    # derived klB absorb the anchor term with
+                    # negative weight. See PPOStats for the
+                    # log-scale note vs pre-2026-07-10 runs.
+                    anchor_kl = (
+                        (mb.old_anchor_logp - anchor_lp_new) * raise_m
+                    ).sum() / raise_m.numel()
+                    beta_kl = kl - gate_kl - anchor_kl
+        return {
+            "loss": loss,
+            "policy_loss": policy_loss,
+            "value_loss": value_loss,
+            "display_loss": display_loss,
+            "entropy_loss": entropy_loss,
+            "q_loss": q_loss,
+            "kl_anchor_term": kl_anchor_term,
+            "kl": kl,
+            "gate_kl": gate_kl,
+            "anchor_kl": anchor_kl,
+            "beta_kl": beta_kl,
+            "gate_h": gate_h.detach().float().mean(),
+            "anchor_h": anchor_h.detach().float().mean(),
+            "beta_h": beta_h.detach().float().mean(),
+            "qf": qf,
+            "qf_n": qf_n,
+            "qt": qt,
+            "qt_n": qt_n,
+        }
 
     def update(
         self,
@@ -534,251 +866,60 @@ class PPOTrainer:
                     st["exp_avg"].clone() if "exp_avg" in st else None,
                     st["exp_avg_sq"].clone() if "exp_avg_sq" in st else None,
                 ))
+        micro = int(getattr(cfg, "micro_batch_rows", 0) or 0)
         with record_function("step12/inner_loop"):
             for _ in range(cfg.ppo_epochs):
                 if kl_stopped_at >= 0:
                     break
-                for mb in iter_minibatches(batch, cfg.batch_size, rng):
-                    with torch.autocast(
-                        device_type="cuda",
-                        dtype=torch.bfloat16,
-                        enabled=self._cuda,
-                    ):
-                        with record_function("step12a/evaluate"):
-                            if self.head_version >= 2:
-                                (
-                                    log_prob, entropy, display_value,
-                                    gate_h, anchor_h, beta_h,
-                                    gate_lp_new, anchor_lp_new,
-                                    cur_gate_logits, cur_anchor_out, cur_refine,
-                                ) = self._evaluate(
-                                    mb.obs,
-                                    mb.gate_masks,
-                                    mb.sizing,
-                                    mb.gate_actions,
-                                    mb.anchor_actions,
-                                    mb.refine_u,
-                                )
-                            else:
-                                log_prob, entropy, display_value = self._evaluate(
-                                    mb.obs,
-                                    mb.gate_masks,
-                                    mb.sizing[..., :2],
-                                    mb.gate_actions,
-                                    mb.raise_chips,
-                                )
-                                gate_h = anchor_h = beta_h = entropy
-
-                        with record_function("step12b/loss"):
-                            ratio = torch.exp(log_prob - mb.log_probs)
-                            if self._clip_prob_dependent:
-                                clip_lo, clip_hi = self._gate_clip_bounds(
-                                    mb.old_gate_logp
-                                )
-                            else:
-                                clip_lo = 1.0 - cfg.clip
-                                clip_hi = 1.0 + cfg.clip
-                            surr1 = ratio * mb.advantages
-                            surr2 = (
-                                torch.clamp(ratio, clip_lo, clip_hi)
-                                * mb.advantages
+                for sel in iter_minibatch_indices(batch, cfg.batch_size, rng):
+                    n_mb = int(sel.shape[0])
+                    chunked = micro > 0 and n_mb > micro
+                    if not chunked:
+                        mb = gather_minibatch(batch, sel)
+                        t = self._minibatch_terms(
+                            mb, eff_entropy_coef, display_coef, value_coef, device
+                        )
+                    else:
+                        # Micro-batching (TrainingConfig.micro_batch_rows):
+                        # gather, forward and backward the minibatch chunk by
+                        # chunk, accumulating gradients; every term weighted
+                        # to the minibatch mean, so the step is the same.
+                        self.optimizer.zero_grad()
+                        fold_denom = None
+                        if self._q_fold_sup > 0.0:
+                            fold_denom = (
+                                batch.gate_masks[sel][..., GATE_FOLD]
+                                .float()
+                                .sum()
+                                .clamp_min(1.0)
                             )
-                            policy_loss = -torch.min(surr1, surr2).mean()
-
-                            # Value source: the centralized critic when
-                            # present (buffer `values` came from it), else
-                            # the actor's own head.
-                            q_loss = torch.zeros((), device=device)
-                            q_all = None
-                            if self._distributional:
-                                # Distributional / HL-Gauss value head: one torso
-                                # pass gives V (=symexp(E[bins]), scalar), the
-                                # categorical logits, and the scalar dueling Q.
-                                # value loss = HL-Gauss cross-entropy — no MSE
-                                # clip (the categorical support IS the bound).
-                                value, value_logits, q_all = self._critic_train(
-                                    mb.obs, opp_holes_multihot(mb.opp_holes)
-                                )
-                                if self._q_aux_coef > 0.0 and q_all is not None:
-                                    q_taken = q_all.gather(
-                                        -1, self._q_index(mb, q_all)[..., None]
-                                    ).squeeze(-1)
-                                    q_loss = (q_taken - mb.returns).pow(2).mean()
-                                    q_loss = self._q_fold_sup_term(mb, q_all, q_loss)
-                                value_loss = self.critic.hlgauss_value_loss(
-                                    value_logits, mb.returns
-                                )
-                            else:
-                                if (
-                                    self._q_aux_coef > 0.0
-                                    and self._critic_qv is not None
-                                ):
-                                    # One critic forward yields V (identical to
-                                    # forward()) AND the dueling Q row; the
-                                    # taken action's Q regresses to the same
-                                    # returns. Index: 0 Fold, 1 CheckCall,
-                                    # 2+anchor Raise (or 2 = pooled Raise).
-                                    value, q_all = self._critic_qv(
-                                        mb.obs, opp_holes_multihot(mb.opp_holes)
-                                    )
-                                    q_taken = q_all.gather(
-                                        -1, self._q_index(mb, q_all)[..., None]
-                                    ).squeeze(-1)
-                                    q_loss = (q_taken - mb.returns).pow(2).mean()
-                                    q_loss = self._q_fold_sup_term(mb, q_all, q_loss)
-                                elif self._critic_fwd is not None:
-                                    value = self._critic_fwd(
-                                        mb.obs, opp_holes_multihot(mb.opp_holes)
-                                    )
-                                else:
-                                    value = display_value
-                                v1 = (value - mb.returns).pow(2)
-                                if cfg.value_clip > 0.0:
-                                    value_pred_clipped = mb.values + torch.clamp(
-                                        value - mb.values,
-                                        -cfg.value_clip,
-                                        cfg.value_clip,
-                                    )
-                                    v2 = (value_pred_clipped - mb.returns).pow(2)
-                                    value_loss = 0.5 * torch.max(v1, v2).mean()
-                                else:
-                                    # value_clip <= 0 DISABLES clipping — plain
-                                    # MSE (review 2026-09-20 A20). A literal 0
-                                    # radius pinned value_pred_clipped to the
-                                    # rollout values, so max(v1, v2) only ever
-                                    # passed gradient where the critic was
-                                    # already WORSE than its old self: "0 = off"
-                                    # froze the critic instead of unclipping it.
-                                    value_loss = 0.5 * v1.mean()
-
-                            # Fold-column canary (audit 2026-07-11): the
-                            # per-update mean of Q[FOLD] over fold-LEGAL
-                            # rows, whose ground truth is exactly 0. f32
-                            # accumulation (bf16 sums of ~500k rows are
-                            # garbage); no_grad — diagnostics only.
-                            if q_all is not None:
-                                with torch.no_grad():
-                                    fold_ok_c = (
-                                        mb.gate_masks[..., GATE_FOLD].float()
-                                    )
-                                    total_qf += (
-                                        q_all[..., GATE_FOLD].float() * fold_ok_c
-                                    ).sum()
-                                    total_qf_n += fold_ok_c.sum()
-                                    # Terminal-boundary canary (V7_DESIGN.md
-                                    # WS1.3): qT = mean(return − Q(s,a)) over
-                                    # NON-FOLD terminal rows. At a terminal
-                                    # row the stored return IS the raw reward
-                                    # (no future term), so this is the exact
-                                    # boundary residual δ_terminal — the term
-                                    # that paid the July fold subsidy.
-                                    # Positive = terminal actions subsidized,
-                                    # negative = taxed. Fold rows are the qF
-                                    # canary's job (truth 0), so they are
-                                    # excluded here.
-                                    if mb.is_terminal is not None:
-                                        term_ok = (
-                                            mb.is_terminal
-                                            & (mb.gate_actions != GATE_FOLD)
-                                        ).float()
-                                        q_sel = q_all.gather(
-                                            -1,
-                                            self._q_index(mb, q_all)[..., None],
-                                        ).squeeze(-1)
-                                        total_qt += (
-                                            (mb.returns - q_sel).float()
-                                            * term_ok
-                                        ).sum()
-                                        total_qt_n += term_ok.sum()
-
-                            # Display head: plain regression (no clipping —
-                            # buffer values belong to the critic), small
-                            # coefficient so it stays subordinate.
-                            if self._critic_fwd is not None:
-                                display_loss = (
-                                    (display_value - mb.returns).pow(2).mean()
-                                )
-                            else:
-                                display_loss = torch.zeros_like(value_loss)
-
-                            # Sizing-entropy scale (v2): `entropy` is
-                            # gate_h + p_raise.detach()*(anchor_h+beta_h), so
-                            # (entropy - gate_h) is exactly the p_raise-weighted
-                            # sizing-head entropy. Rescaling it boosts the
-                            # anchor/beta entropy bonus while the gate-head
-                            # gradient cancels between the two gate_h terms
-                            # (gate weight stays 1, sizing weight = scale).
-                            if (
-                                self.head_version >= 2
-                                and self.sizing_entropy_scale != 1.0
-                            ):
-                                entropy_for_loss = gate_h + (
-                                    self.sizing_entropy_scale * (entropy - gate_h)
-                                )
-                            else:
-                                entropy_for_loss = entropy
-                            entropy_loss = -entropy_for_loss.mean()
-                            # Per-row coefs (mix-configs per-tier entropy,
-                            # V5_DESIGN.md B5) override the scalar coef —
-                            # each transition is paid its own tier's rate.
-                            if mb.ent_coef_rows is not None:
-                                entropy_bonus = -(
-                                    mb.ent_coef_rows * entropy_for_loss
-                                ).mean()
-                            else:
-                                entropy_bonus = eff_entropy_coef * entropy_loss
-                            loss = (
-                                policy_loss
-                                + value_coef * value_loss
-                                + display_coef * display_loss
-                                + entropy_bonus
-                                + self._q_aux_coef * q_loss
+                        t = None
+                        for lo in range(0, n_mb, micro):
+                            sub_mb = gather_minibatch(batch, sel[lo : lo + micro])
+                            w = float(min(micro, n_mb - lo)) / float(n_mb)
+                            tc = self._minibatch_terms(
+                                sub_mb, eff_entropy_coef, display_coef, value_coef,
+                                device, weight=w, fold_denom=fold_denom,
                             )
-
-                    # KL anchor: reference forward in f32 outside autocast
-                    # (lgamma/digamma); the current-model outputs are
-                    # REUSED from evaluate above (no second forward-with-grad).
-                    kl_anchor_term = torch.zeros((), device=device)
-                    if self._ref is not None:
-                        with record_function("step12b2/kl_anchor"):
-                            cur_raw = (
-                                (cur_gate_logits, cur_anchor_out, cur_refine)
-                                if self.head_version >= 2 else None
-                            )
-                            kl_anchor_term = _kl_to_reference(
-                                self.model, self._ref, mb, cur=cur_raw
-                            )
-                            loss = loss + self.kl_anchor_coef * kl_anchor_term
-
-                    # Weight-decay-to-init (torso LayerNorm companion): pull the
-                    # trunk weights toward their run-start values. No-op unless
-                    # l2_init_coef > 0. f32, outside autocast.
-                    if self._l2_init_pairs:
-                        l2_init = torch.zeros((), device=device)
-                        for p, p0 in self._l2_init_pairs:
-                            l2_init = l2_init + ((p - p0) ** 2).sum()
-                        loss = loss + self._l2_init_coef * l2_init
-
-                    with record_function("step12e/kl"):
-                        with torch.no_grad():
-                            kl = (mb.log_probs - log_prob).mean()
-                            # Per-head KL decomposition (v2 only): gate
-                            # and anchor (raise rows) computed directly,
-                            # beta derived by the joint identity. Pure
-                            # diagnostics — never feeds the loss or guard.
-                            if self.head_version >= 2:
-                                gate_kl = (mb.old_gate_logp - gate_lp_new).mean()
-                                raise_m = (mb.gate_actions == GATE_RAISE)
-                                # C4: batch-mean normalization (sum/B, matching
-                                # gate_kl and kl) so klG+klA+klB is a true
-                                # additive decomposition — sum/n_raise made the
-                                # derived klB absorb the anchor term with
-                                # negative weight. See PPOStats for the
-                                # log-scale note vs pre-2026-07-10 runs.
-                                anchor_kl = (
-                                    (mb.old_anchor_logp - anchor_lp_new) * raise_m
-                                ).sum() / raise_m.numel()
-                                beta_kl = kl - gate_kl - anchor_kl
+                            with record_function("step12c/backward"):
+                                tc["loss"].backward()
+                            t = _merge_chunk_terms(t, tc, w)
+                            del sub_mb, tc
+                    loss = t["loss"]
+                    kl = t["kl"]
+                    policy_loss = t["policy_loss"]
+                    value_loss = t["value_loss"]
+                    display_loss = t["display_loss"]
+                    entropy_loss = t["entropy_loss"]
+                    q_loss = t["q_loss"]
+                    kl_anchor_term = t["kl_anchor_term"]
+                    gate_kl, anchor_kl, beta_kl = t["gate_kl"], t["anchor_kl"], t["beta_kl"]
+                    if t["qf"] is not None:
+                        total_qf += t["qf"]
+                        total_qf_n += t["qf_n"]
+                    if t["qt"] is not None:
+                        total_qt += t["qt"]
+                        total_qt_n += t["qt_n"]
 
                     # KL guard: checked BEFORE the optimizer step so the
                     # offending minibatch is never applied. Two thresholds:
@@ -821,6 +962,8 @@ class PPOTrainer:
                                 else float("nan")  # finite kl, non-finite loss
                             )
                             rolled_back_flag = snapshot is not None
+                            if chunked:
+                                self.optimizer.zero_grad()  # never applied
                             if snapshot is not None:
                                 with torch.no_grad():
                                     for p, (pd, m1, m2) in zip(
@@ -848,13 +991,16 @@ class PPOTrainer:
                         if self.target_kl > 0.0 and abs_kl > self.target_kl:
                             # SOFT early-stop: keep applied minibatches,
                             # do NOT touch the snapshot.
+                            if chunked:
+                                self.optimizer.zero_grad()  # never applied
                             kl_stopped_at = count
                             kl_stop_val = kl_now
                             break
 
-                    with record_function("step12c/backward"):
-                        self.optimizer.zero_grad()
-                        loss.backward()
+                    if not chunked:
+                        with record_function("step12c/backward"):
+                            self.optimizer.zero_grad()
+                            loss.backward()
                     with record_function("step12d/optimizer_step"):
                         # Per-tensor adaptive clip (opt-in) BEFORE the per-group
                         # split clip: tames heavy-tailed spikes tensor-by-tensor.
@@ -875,9 +1021,9 @@ class PPOTrainer:
                     total_kl += kl.float()
                     total_kl_anchor += kl_anchor_term.detach().float()
                     total_q += q_loss.detach().float()
-                    total_gate_h += gate_h.detach().float().mean()
-                    total_anchor_h += anchor_h.detach().float().mean()
-                    total_beta_h += beta_h.detach().float().mean()
+                    total_gate_h += t["gate_h"]
+                    total_anchor_h += t["anchor_h"]
+                    total_beta_h += t["beta_h"]
                     if self.head_version >= 2:
                         total_gate_kl += gate_kl.float()
                         total_anchor_kl += anchor_kl.float()

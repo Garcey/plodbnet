@@ -1418,6 +1418,17 @@ def main() -> None:
     parser.add_argument("--num-envs", type=int, default=1536)
     parser.add_argument("--rollout-length", type=int, default=262_144)
     parser.add_argument(
+        "--micro-batch-rows",
+        type=int,
+        default=0,
+        help="PPO micro-batching: process each minibatch in chunks of at most "
+        "this many rows, accumulating gradients (per-row means weighted by the "
+        "chunk's share), so --rollout-length can grow past what one "
+        "minibatch's working set allows in GPU memory at a fixed "
+        "--num-minibatches. The same gradient mathematically, not bit-identical "
+        "(float summation order). 0 = off (the exact original path).",
+    )
+    parser.add_argument(
         "--num-minibatches",
         type=int,
         default=32,
@@ -2108,6 +2119,7 @@ def main() -> None:
         num_layers=args.num_layers,
         obs_mode=args.obs_mode,
         compact_obs=not args.no_compact_obs,
+        micro_batch_rows=int(args.micro_batch_rows),
         batched_opponents=not args.no_batched_opponents,
         num_envs=args.num_envs,
         rollout_length=args.rollout_length,
