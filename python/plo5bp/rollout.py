@@ -3837,6 +3837,11 @@ def collect_rollout_multiconfig(
     _ACTIVE_STEP_TIMERS = None
 
     _enter_gpu_phase()
+    if getattr(train_config, "batch_on_host", False) and device.type != "cpu":
+        # PPO gathers every minibatch from these host rows (HostBatchLoader);
+        # nothing reads them after the update, before the next collection
+        # reuses the staging buffer.
+        return combined
     return _batch_to_device(combined, device)
 
 
@@ -3891,6 +3896,72 @@ def iter_minibatch_indices(
     device = batch.obs.device
     for start, stop in _minibatch_bounds(n, batch_size):
         yield torch.from_numpy(idx[start:stop]).to(device)
+
+
+class HostBatchLoader:
+    """Minibatches of a HOST-resident Batch on the learner device
+    (TrainingConfig.batch_on_host). Every field's rows are gathered on the
+    CPU (the engine's parallel byte-row copy) into pinned staging of
+    `capacity` rows and copied over asynchronously; compact observations
+    cross packed and are unpacked on the device. `gather(sel)` equals
+    `gather_minibatch` on a device-resident copy of the batch: the same rows,
+    the same bytes, unpacked by the same function."""
+
+    def __init__(self, batch: Batch, device: torch.device, capacity: int) -> None:
+        self.device = torch.device(device)
+        self.cap = max(1, int(capacity))
+        pin = self.device.type == "cuda"
+        self.layout = batch.obs.layout if isinstance(batch.obs, PackedObs) else None
+        # (field, host rows as a 2-D numpy view, pinned staging tensor)
+        self._fields: list[tuple[str, np.ndarray, torch.Tensor]] = []
+
+        def add(name: str, t: torch.Tensor) -> None:
+            if t.device.type != "cpu":
+                raise ValueError(f"HostBatchLoader: '{name}' is not on the host")
+            host = t.detach().contiguous()
+            stage = torch.empty(
+                (self.cap,) + tuple(host.shape[1:]), dtype=host.dtype, pin_memory=pin
+            )
+            self._fields.append((name, host.numpy().reshape(host.shape[0], -1), stage))
+
+        if self.layout is not None:
+            add("obs_bits", batch.obs.bits)
+            add("obs_real", batch.obs.real)
+        else:
+            add("obs", batch.obs)
+        for f in _BATCH_TENSOR_FIELDS[1:]:
+            add(f, getattr(batch, f))
+        if batch.is_terminal is not None:
+            add("is_terminal", batch.is_terminal)
+        if batch.ent_coef_rows is not None:
+            add("ent_coef_rows", batch.ent_coef_rows)
+        self._copied = None  # event: the last copies out of the staging are done
+
+    def gather(self, sel: torch.Tensor) -> Batch:
+        rows = np.ascontiguousarray(sel.detach().cpu().numpy(), dtype=np.int64)
+        k = int(rows.shape[0])
+        if k > self.cap:
+            raise ValueError(f"HostBatchLoader: {k} rows > capacity {self.cap}")
+        if self._copied is not None:
+            self._copied.synchronize()
+        out: dict[str, torch.Tensor] = {}
+        for name, src, stage in self._fields:
+            _gather_rows(src, rows, stage.numpy().reshape(self.cap, -1))
+            out[name] = stage[:k].to(self.device, non_blocking=True)
+        if self.device.type == "cuda":
+            ev = torch.cuda.Event()
+            ev.record()
+            self._copied = ev
+        if self.layout is not None:
+            obs = _unpack_compact(out.pop("obs_bits"), out.pop("obs_real"), self.layout)
+        else:
+            obs = out.pop("obs")
+        return Batch(
+            obs=obs,
+            **{f: out[f] for f in _BATCH_TENSOR_FIELDS[1:]},
+            is_terminal=out.get("is_terminal"),
+            ent_coef_rows=out.get("ent_coef_rows"),
+        )
 
 
 def gather_minibatch(batch: Batch, sel: torch.Tensor) -> Batch:

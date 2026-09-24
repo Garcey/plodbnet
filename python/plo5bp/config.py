@@ -158,6 +158,16 @@ class TrainingConfig:
     # can outgrow GPU memory. The same gradient mathematically, not
     # bit-identical (float summation order). 0 = off (the exact old path).
     micro_batch_rows: int = 0
+    # Keep the collected batch in HOST memory for PPO (2026-09-24): each
+    # minibatch (or micro-batch chunk) is gathered on the CPU, in parallel,
+    # into pinned staging and copied to the learner device -- compact
+    # observations still cross packed and are unpacked there. The device
+    # tensors are exactly the ones a device-resident batch yields, so the
+    # update is bit-identical; only where the batch lives changes, which
+    # bounds the rollout by host RAM instead of GPU memory (pair it with
+    # micro_batch_rows for very long rollouts). Mixed-config (multiconfig)
+    # collection only. False = the whole batch is copied to the device once.
+    batch_on_host: bool = False
     # Batched rollout: act every pool snapshot's opponent rows in ONE stacked
     # forward + ONE sampling pass per step (rollout._StackedOpponents) instead
     # of one act() per snapshot — on the GPU each call is mostly fixed launch

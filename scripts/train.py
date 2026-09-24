@@ -1429,6 +1429,15 @@ def main() -> None:
         "(float summation order). 0 = off (the exact original path).",
     )
     parser.add_argument(
+        "--batch-on-host",
+        action="store_true",
+        help="Keep the collected batch in host RAM for PPO: each minibatch "
+        "(or --micro-batch-rows chunk) is gathered on the CPU into pinned "
+        "staging and copied to the GPU. Bit-identical updates; the rollout "
+        "is then bounded by host RAM instead of GPU memory. Needs "
+        "--mix-configs.",
+    )
+    parser.add_argument(
         "--num-minibatches",
         type=int,
         default=32,
@@ -2120,6 +2129,7 @@ def main() -> None:
         obs_mode=args.obs_mode,
         compact_obs=not args.no_compact_obs,
         micro_batch_rows=int(args.micro_batch_rows),
+        batch_on_host=bool(args.batch_on_host),
         batched_opponents=not args.no_batched_opponents,
         num_envs=args.num_envs,
         rollout_length=args.rollout_length,

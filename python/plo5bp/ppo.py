@@ -34,6 +34,8 @@ from plo5bp.config import TrainingConfig
 from plo5bp.network import ActorCritic, CentralCritic, opp_holes_multihot
 from plo5bp.rollout import (  # noqa: F401 (iter_minibatches: re-export)
     Batch,
+    HostBatchLoader,
+    _minibatch_bounds,
     gather_minibatch,
     iter_minibatch_indices,
     iter_minibatches,
@@ -829,6 +831,23 @@ class PPOTrainer:
         display_coef = float(getattr(cfg, "display_value_coef", 0.125))
         value_coef = float(getattr(cfg, "value_loss_coef", 0.5))
         device = batch.obs.device
+        micro = int(getattr(cfg, "micro_batch_rows", 0) or 0)
+        # TrainingConfig.batch_on_host: the batch stays in host memory and
+        # each minibatch / chunk is shipped to the learner's device as it is
+        # needed (HostBatchLoader) -- the same device tensors, so the same
+        # update, as a device-resident batch.
+        host_loader = None
+        learner_device = next(self.model.parameters()).device
+        if device.type == "cpu" and learner_device.type != "cpu":
+            n_rows = int(batch.obs.shape[0])
+            mb_max = max(
+                (b - a for a, b in _minibatch_bounds(n_rows, cfg.batch_size)),
+                default=1,
+            )
+            host_loader = HostBatchLoader(
+                batch, learner_device, min(micro, mb_max) if micro > 0 else mb_max
+            )
+            device = learner_device
         # Accumulate as device tensors; one .item() at the end avoids
         # per-minibatch CUDA syncs that serialize against compute.
         total_policy = torch.zeros((), device=device)
@@ -866,7 +885,6 @@ class PPOTrainer:
                     st["exp_avg"].clone() if "exp_avg" in st else None,
                     st["exp_avg_sq"].clone() if "exp_avg_sq" in st else None,
                 ))
-        micro = int(getattr(cfg, "micro_batch_rows", 0) or 0)
         with record_function("step12/inner_loop"):
             for _ in range(cfg.ppo_epochs):
                 if kl_stopped_at >= 0:
@@ -875,7 +893,11 @@ class PPOTrainer:
                     n_mb = int(sel.shape[0])
                     chunked = micro > 0 and n_mb > micro
                     if not chunked:
-                        mb = gather_minibatch(batch, sel)
+                        mb = (
+                            host_loader.gather(sel)
+                            if host_loader is not None
+                            else gather_minibatch(batch, sel)
+                        )
                         t = self._minibatch_terms(
                             mb, eff_entropy_coef, display_coef, value_coef, device
                         )
@@ -888,14 +910,19 @@ class PPOTrainer:
                         fold_denom = None
                         if self._q_fold_sup > 0.0:
                             fold_denom = (
-                                batch.gate_masks[sel][..., GATE_FOLD]
+                                batch.gate_masks[sel]
+                                .to(device)[..., GATE_FOLD]
                                 .float()
                                 .sum()
                                 .clamp_min(1.0)
                             )
                         t = None
                         for lo in range(0, n_mb, micro):
-                            sub_mb = gather_minibatch(batch, sel[lo : lo + micro])
+                            sub_mb = (
+                                host_loader.gather(sel[lo : lo + micro])
+                                if host_loader is not None
+                                else gather_minibatch(batch, sel[lo : lo + micro])
+                            )
                             w = float(min(micro, n_mb - lo)) / float(n_mb)
                             tc = self._minibatch_terms(
                                 sub_mb, eff_entropy_coef, display_coef, value_coef,
