@@ -2739,11 +2739,14 @@ def collect_rollout_batched(
                 f"({wcursor}/{rollout_target} rows) — config {game_config!r}"
             )
         # Pre-step total_commit / bet_to_call / street_commit / street
-        # snapshots for the aggression-bonus and forward-EV reward.
-        pre_total_commit = env._total_commit.copy()
-        pre_bet_to_call = env._bet_to_call.copy()
-        pre_street_commit = env._street_commit.copy()
-        pre_street = env._street.copy()
+        # snapshots for the aggression-bonus and forward-EV reward. References,
+        # not copies: the post-apply refresh REPLACES these cached arrays with
+        # fresh ones from the engine and nothing writes the old ones before
+        # step8 reads them (asserted right after that refresh).
+        pre_total_commit = env._total_commit
+        pre_bet_to_call = env._bet_to_call
+        pre_street_commit = env._street_commit
+        pre_street = env._street
 
         # Vectorized classification: active learner envs vs active
         # opponent envs. `safe_actors` clamps -1 to 0 so the indexing
@@ -3049,6 +3052,12 @@ def collect_rollout_batched(
             else:
                 env._refresh(encode_mask=_enc)
         post_total_commit = env._total_commit
+        assert (
+            post_total_commit is not pre_total_commit
+            and env._bet_to_call is not pre_bet_to_call
+            and env._street_commit is not pre_street_commit
+            and env._street is not pre_street
+        ), "the refresh updated the pre-step snapshot arrays in place"
 
         # Rust-parallel aggression bonus + per-step cost/pot/street
         # bookkeeping. Replaces the per-env Python arithmetic loop.
