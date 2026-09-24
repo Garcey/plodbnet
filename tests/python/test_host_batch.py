@@ -78,6 +78,9 @@ def test_loader_equals_gather_minibatch(rollout, monkeypatch, min_rows) -> None:
     for k in (n, n // 3, 1, 0):
         sel = torch.from_numpy(rng.permutation(n)[:k].astype(np.int64))
         _same(loader.gather(sel), gather_minibatch(batch, sel))
+    # The fold-denominator input: gate-mask rows for a whole minibatch (any size).
+    big = torch.from_numpy(rng.integers(0, n, size=3 * n).astype(np.int64))
+    assert torch.equal(loader.gate_mask_rows(big), batch.gate_masks[big])
     with pytest.raises(ValueError, match="capacity"):
         HostBatchLoader(batch, torch.device("cpu"), capacity=3).gather(
             torch.arange(4)

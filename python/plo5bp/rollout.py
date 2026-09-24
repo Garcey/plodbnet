@@ -4042,7 +4042,17 @@ class HostBatchLoader:
             add("is_terminal", batch.is_terminal)
         if batch.ent_coef_rows is not None:
             add("ent_coef_rows", batch.ent_coef_rows)
+        self._gm_host = batch.gate_masks.detach().contiguous().numpy()
         self._copied = None  # event: the last copies out of the staging are done
+
+    def gate_mask_rows(self, sel: torch.Tensor) -> torch.Tensor:
+        """`batch.gate_masks[sel]` on the learner device (any number of rows)
+        -- the micro-batching fold denominator's input, gathered in parallel
+        instead of by a single-threaded CPU tensor index."""
+        rows = np.ascontiguousarray(sel.detach().cpu().numpy(), dtype=np.int64)
+        out = np.empty((rows.shape[0],) + self._gm_host.shape[1:], dtype=self._gm_host.dtype)
+        _gather_rows(self._gm_host, rows, out)
+        return torch.from_numpy(out).to(self.device)
 
     def gather(self, sel: torch.Tensor) -> Batch:
         rows = np.ascontiguousarray(sel.detach().cpu().numpy(), dtype=np.int64)
@@ -4051,9 +4061,16 @@ class HostBatchLoader:
             raise ValueError(f"HostBatchLoader: {k} rows > capacity {self.cap}")
         if self._copied is not None:
             self._copied.synchronize()
+        # Every field's rows in ONE parallel pass (field by field, the small
+        # fields stayed below the parallel threshold: a 1M-row chunk of a
+        # ~360M-row batch is ~17M random reads, and single-threaded they made
+        # host-batch PPO ~3x slower than device-resident PPO).
+        _gather_rows_multi(
+            [(src, stage.numpy().reshape(self.cap, -1)) for _, src, stage in self._fields],
+            rows,
+        )
         out: dict[str, torch.Tensor] = {}
-        for name, src, stage in self._fields:
-            _gather_rows(src, rows, stage.numpy().reshape(self.cap, -1))
+        for name, _, stage in self._fields:
             out[name] = stage[:k].to(self.device, non_blocking=True)
         if self.device.type == "cuda":
             ev = torch.cuda.Event()

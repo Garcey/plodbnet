@@ -909,9 +909,13 @@ class PPOTrainer:
                         self.optimizer.zero_grad()
                         fold_denom = None
                         if self._q_fold_sup > 0.0:
+                            gm_sel = (
+                                host_loader.gate_mask_rows(sel)
+                                if host_loader is not None
+                                else batch.gate_masks[sel]
+                            )
                             fold_denom = (
-                                batch.gate_masks[sel]
-                                .to(device)[..., GATE_FOLD]
+                                gm_sel[..., GATE_FOLD]
                                 .float()
                                 .sum()
                                 .clamp_min(1.0)
