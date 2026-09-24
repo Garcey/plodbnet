@@ -360,9 +360,63 @@ anchor` = v2 (head_version 2), `logistic` = v4 (3), `mixture` = v5 (4).
     Host-batch PPO: 161 s for 340M rows after the fused gather (433 s before).
   - `scripts/vMin3_guardian.sh` = the full run on these settings (32x3 /
     128x2, 1.76M envs pinned to the GPU's node, 330M-row default via
-    `ROLLOUT_LENGTH`, host batch, micro-batching); it refuses to start while
+    `ROLLOUT_LENGTH`, host batch, micro-batching, entropy 0.10 from the tuning
+    below; warm start `WARM=checkpoints/t3ent10.pt`); it refuses to start while
     any other trainer runs (their RAM would push the container over its
-    limit).
+    limit) — also stop leftover evaluators first (each holds a few GiB).
+- **Hyperparameter tuning (2026-09-24, RunPod) — the vMin3 settings** (`t1*`-
+  `t4*` stems; the KL-anchor magnet was deliberately NOT tuned — it stays off
+  until late-stage training):
+  - Method: `scripts/tune_run.sh STEM NODE UPDATES [flags]` = the vMin3 recipe
+    at a tuning scale (1.76M envs, 44M-row target ~ 58M rows/update, host
+    batch) warm-started from `swA32_40` WITH its Adam state, opponent pool and
+    resume seed, ONE knob overridden, 20 updates, one NUMA node each, four at a
+    time. Runs are compared at EQUAL update counts.
+  - Measures: stochastic h2h (how the policy plays); **argmax vs argmax**
+    (`h2h_eval.py --greedy-a --greedy-b`, `sweep_eval.py` passes both): what a
+    run has LEARNED to prefer, apart from how much it still randomizes — half
+    the noise of a stochastic h2h, and it keeps separating runs where a
+    candidate's argmax vs a SAMPLING reference saturates (+2.27 from u49 on);
+    `scripts/policy_sharpness.py` (one fixed set of self-play states): gate
+    entropy and the share of decisions whose least-likely legal action is
+    below 1% / 0.1% (the collapse indicator). A single checkpoint's h2h swings
+    +-0.1-0.3, so read runs of 3+ checkpoints, never one.
+  - **lr stays 1.5e-4**: 5e-4 and 1.5e-3 swing up to +-0.3 bb/seat-hand
+    between 5-update checkpoints (self-play cycling) and are worse on average
+    (argmax vs argmax means -0.01 / -0.24); 5e-3 blew up the critic (v 3.2 ->
+    18). `--critic-lr` (the critic in its own AdamW group) gained nothing, so
+    one group.
+  - **Entropy 0.25 -> 0.10.** At 0.25 the policy is very random (raises 44% of
+    the time where legal, near-uniform raise sizes; against the same sampling
+    opponent, playing its most likely action instead of sampling is worth ~2
+    bb/seat-hand). Argmax vs the 0.25 run at u49/u54/u59: 0.40 -0.25/-0.21/
+    -0.16, 0.15 +0.15/+0.34/+0.22, 0.10 +0.18/+0.43/+0.33, 0.07 +0.29/+0.45/
+    +0.44 — every tier, the deep tier most; the same order against vMin2 u150's
+    argmax (a different, longer-trained 128x3 lineage: 0.40 -0.15, 0.25 +0.05,
+    0.15 +0.27, 0.10 +0.42, 0.07 +0.50). Continued to u79 (40 updates), the
+    order held with steady leads (means u64-u79 vs 0.25: 0.15 +0.24, 0.10
+    +0.29, 0.07 +0.38; 0.10 vs 0.15 +0.09, 0.07 vs 0.10 +0.10). Sampled play vs
+    0.25: 0.15 +0.6-0.7, 0.10 +1.0-1.1 bb/seat-hand. Collapse indicator
+    (least-likely legal gate action < 0.1%): 0.25 ~3% of decisions, 0.15 9%,
+    0.10 13%, 0.07 17% — each level settles within ~15-20 updates of the switch
+    and then holds flat through u79 (no collapse, 0.07 included). The 2026-05
+    reason for a high exploration entropy was a 16k-row rollout; at 58M-345M
+    rows per update even a 0.1% action is sampled many times per update. vMin3
+    starts at 0.10 = the owner's floor; 0.07 was better still and stable, but
+    going below 0.1 is the owner's call. Watch a long run with
+    `policy_sharpness.py` on its checkpoints (same cached states).
+  - No gain (stay as they were): `--sizing-entropy-scale 0.5`, `--ppo-epochs 4`
+    (vs 2 at entropy 0.15), `--gae-lambda` 0.9 and 1.0 (flag added; 1.0's sampled
+    play was worse). Raise-size entropy did not move in ANY run (~1.98 of a
+    2.40 max): the pooled raise Q column gives sizes signal only through the
+    lambda-TD terms, so sizing sharpens slowly whatever the entropy.
+  - Not tested, kept (reasoned): gamma 1.0 (chips, no discount), v6 clip room
+    (at KL ~0.0005/update the ratio band rarely binds; `clip` 0.2 is unused
+    under v6), target_kl 0.5 / kl_hard 10 (guards that never trip at this lr),
+    adv_clip 8, q_aux 0.5 / fold-sup 15 / value 0.5 (critic-internal balance;
+    critic stable at v ~3.2), HL-Gauss 51 bins / 1500 / 0.75, AGC 0.1, l2-init
+    1e-4, AdamW b2 0.999 / wd 0.01, pool 8 x every 5 updates at mix 0.5,
+    ev_runout_samples 64, bonuses 0, 16 minibatches.
 
 ### v5 (2026-07-06, IMPLEMENTED, not yet trained — V5_DESIGN.md canonical)
 
