@@ -328,7 +328,36 @@ anchor` = v2 (head_version 2), `logistic` = v4 (3), `mixture` = v5 (4).
     (`rollout.HostBatchLoader`), compact obs unpacked on the GPU. The CUDA
     digest equals the device-resident batch's (also with
     `--micro-batch-rows`), so the rollout is bounded by host RAM (~573 B/row
-    stored) instead of GPU memory. `test_host_batch.py`.
+    stored) instead of GPU memory. `test_host_batch.py`. Each chunk's ~17
+    fields are gathered in ONE parallel pass, and the fold denominator's
+    gate-mask rows through `HostBatchLoader.gate_mask_rows` (field-by-field
+    single-threaded gathers made host PPO ~3x slower).
+- **Size sweep + rollout/num_envs results (2026-09-24, RunPod)** — the
+  `sw*` stems, `scripts/sweep_report.py`:
+  - Every actor from 32 to 128 wide (x3) and every critic from 32 to 128
+    (x2) matched a 128x3/128x2 control over updates 30-39 (h2h means within
+    +-0.06 bb/seat-hand; two 128 runs differ by 0.03-0.07 — run-to-run
+    noise). Smaller nets LAG for ~20-30 updates, then catch up; 16x3/16x2
+    was -0.86 at update 9. The critic's own loss rises monotonically as it
+    shrinks (HL-Gauss CE over u30-39: 128 3.27-3.30, 64 3.36-3.40, 32
+    3.42-3.45, 16 far worse), the actor shows no such penalty. Chosen:
+    **actor 32x3, critic 128x2**. A 40-update sweep cannot see capacity
+    limits that only bind late in training (entropy still 0.25 here).
+  - Network size barely moves speed or memory: the rollout is CPU-bound and
+    GPU memory is the stored batch — shrinking the net does NOT buy a longer
+    rollout any more.
+  - **num_envs**: 2.64M = most rows/s at a 44M-row target (457k rows/s, 142 s
+    per update for 65M rows; 1.3M-3.5M all within ~5%; 220k = 201k rows/s).
+    The drain adds ~8 rows per env to every update.
+  - **Maximum rollout** (host RAM, 233.8 GiB container): RSS ~= 6.7 GiB +
+    570 B/row with `--batch-on-host --micro-batch-rows 1000000` (GPU flat at
+    12.8 GiB). Confirmed: a 349M-row target collected 362M rows in one update
+    at 212 GiB peak (rollout 621k rows/s). Long rollouts collect faster
+    (fixed per-step costs amortize).
+  - `scripts/vMin3_guardian.sh` = the full run on these settings (32x3 /
+    128x2, 2.64M envs, 320M-row default via `ROLLOUT_LENGTH`, host batch,
+    micro-batching); it refuses to start while any other trainer runs (their
+    RAM would push the container over its limit).
 
 ### v5 (2026-07-06, IMPLEMENTED, not yet trained — V5_DESIGN.md canonical)
 
