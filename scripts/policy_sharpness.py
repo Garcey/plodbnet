@@ -42,6 +42,7 @@ from plo5bp.sizing import anchor_grid_torch
 REPO = Path(__file__).resolve().parents[1]
 BB = 10_000
 TIERS = ("clubgg", "clubgg_deep", "deep")
+_ANCHOR_NAMES = ("min", "10%", "20%", "30%", "40%", "50%", "60%", "70%", "80%", "90%", "pot")
 
 
 def _load_actor(path: str):
@@ -118,7 +119,7 @@ def _entropy(p: torch.Tensor) -> torch.Tensor:
 
 def measure(actor, obs, masks, sizing, tiers, batch: int = 8192) -> dict:
     gate_h, rare2, rare3, p_raise, raise_ok = [], [], [], [], []
-    anch_h, anch_rare, anch_legal = [], [], []
+    anch_h, anch_rare, anch_legal, anch_p, anch_ok = [], [], [], [], []
     with torch.no_grad():
         for s in range(0, obs.shape[0], batch):
             o = torch.from_numpy(obs[s:s + batch])
@@ -140,6 +141,8 @@ def measure(actor, obs, masks, sizing, tiers, batch: int = 8192) -> dict:
             anch_h.append(_entropy(ap))
             anch_rare.append(((ap < 1e-3) & grid.legal).sum(-1).float())
             anch_legal.append(grid.legal.sum(-1).float())
+            anch_p.append(ap)
+            anch_ok.append(grid.legal)
     gate_h = torch.cat(gate_h).numpy()
     rare2 = torch.cat(rare2).numpy()
     rare3 = torch.cat(rare3).numpy()
@@ -148,6 +151,8 @@ def measure(actor, obs, masks, sizing, tiers, batch: int = 8192) -> dict:
     anch_h = torch.cat(anch_h).numpy()
     anch_rare = torch.cat(anch_rare).numpy()
     anch_legal = torch.cat(anch_legal).numpy()
+    anch_p = torch.cat(anch_p).numpy()
+    anch_ok = torch.cat(anch_ok).numpy()
     multi = (masks.sum(-1) > 1)
 
     def block(sel):
@@ -162,6 +167,11 @@ def measure(actor, obs, masks, sizing, tiers, batch: int = 8192) -> dict:
             "p_raise": float(p_raise[sel & raise_ok].mean()) if (sel & raise_ok).any() else None,
             "anchor_h": float(anch_h[r].mean()) if r.any() else None,
             "rare_anchor_1e3": float((anch_rare[r] / anch_legal[r]).mean()) if r.any() else None,
+            # mean probability of each anchor (min, 10%, ..., pot) where raising
+            # with 2+ legal sizes, and how often each anchor is legal there
+            "anchor_mean": [float(x) for x in anch_p[r].mean(0)] if r.any() else None,
+            "anchor_legal": [float(x) for x in anch_ok[r].mean(0)] if r.any() else None,
+            "anchor_top": float(anch_p[r].max(-1).mean()) if r.any() else None,
         }
 
     out = {"ALL": block(np.ones_like(multi))}
@@ -212,6 +222,10 @@ def main(argv=None) -> int:
                 print(f"{Path(path).name:28s} {k:12s} {f(b['gate_h']):>6s} {qs:>17s} "
                       f"{f(b['rare_gate_1e2']):>8s} {f(b['rare_gate_1e3']):>8s} "
                       f"{f(b['p_raise']):>7s} {f(b['anchor_h']):>6s} {f(b['rare_anchor_1e3']):>7s}")
+            am = res["ALL"]["anchor_mean"]
+            if am is not None:
+                print(f"{'':28s} {'sizes':12s} top-size prob {res['ALL']['anchor_top']:.3f} | mean prob "
+                      + " ".join("%s %.3f" % (n, x) for n, x in zip(_ANCHOR_NAMES, am)))
             fh.write(json.dumps({"ckpt": str(path), "update": upd, "states": str(cache),
                                  "result": res}) + "\n")
     return 0

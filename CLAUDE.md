@@ -360,8 +360,8 @@ anchor` = v2 (head_version 2), `logistic` = v4 (3), `mixture` = v5 (4).
     Host-batch PPO: 161 s for 340M rows after the fused gather (433 s before).
   - `scripts/vMin3_guardian.sh` = the full run on these settings (32x3 /
     128x2, 1.76M envs pinned to the GPU's node, 330M-row default via
-    `ROLLOUT_LENGTH`, host batch, micro-batching, entropy 0.10 from the tuning
-    below; warm start `WARM=checkpoints/t3ent10.pt`); it refuses to start while
+    `ROLLOUT_LENGTH`, host batch, micro-batching, entropy 0.07 from the tuning
+    below; warm start `WARM=checkpoints/t3ent07.pt`); it refuses to start while
     any other trainer runs (their RAM would push the container over its
     limit) — also stop leftover evaluators first (each holds a few GiB).
 - **Hyperparameter tuning (2026-09-24, RunPod) — the vMin3 settings** (`t1*`-
@@ -386,7 +386,7 @@ anchor` = v2 (head_version 2), `logistic` = v4 (3), `mixture` = v5 (4).
     (argmax vs argmax means -0.01 / -0.24); 5e-3 blew up the critic (v 3.2 ->
     18). `--critic-lr` (the critic in its own AdamW group) gained nothing, so
     one group.
-  - **Entropy 0.25 -> 0.10.** At 0.25 the policy is very random (raises 44% of
+  - **Entropy 0.25 -> 0.07.** At 0.25 the policy is very random (raises 44% of
     the time where legal, near-uniform raise sizes; against the same sampling
     opponent, playing its most likely action instead of sampling is worth ~2
     bb/seat-hand). Argmax vs the 0.25 run at u49/u54/u59: 0.40 -0.25/-0.21/
@@ -401,9 +401,9 @@ anchor` = v2 (head_version 2), `logistic` = v4 (3), `mixture` = v5 (4).
     0.10 13%, 0.07 17% — each level settles within ~15-20 updates of the switch
     and then holds flat through u79 (no collapse, 0.07 included). The 2026-05
     reason for a high exploration entropy was a 16k-row rollout; at 58M-345M
-    rows per update even a 0.1% action is sampled many times per update. vMin3
-    starts at 0.10 = the owner's floor; 0.07 was better still and stable, but
-    going below 0.1 is the owner's call. Watch a long run with
+    rows per update even a 0.1% action is sampled many times per update. **The
+    owner chose 0.07 for vMin3 (2026-09-24)** — an explicit exception to the
+    usual 0.1 floor, backed by these runs. Watch a long run with
     `policy_sharpness.py` on its checkpoints (same cached states).
   - No gain (stay as they were): `--sizing-entropy-scale 0.5`, `--ppo-epochs 4`
     (vs 2 at entropy 0.15), `--gae-lambda` 0.9 and 1.0 (flag added; 1.0's sampled

@@ -19,19 +19,20 @@
 #   - CPUs pinned to the GPU's NUMA node (taskset): unpinned, the host's automatic
 #     NUMA balancing tripled the rollout's kernel time (flush 525 s vs 209 s of
 #     sys time per update); memory still spills to the other nodes.
-#   - entropy 0.10 (was 0.25): the 2026-09-24 hyperparameter tuning (CLAUDE.md,
+#   - entropy 0.07 (was 0.25): the 2026-09-24 hyperparameter tuning (CLAUDE.md,
 #     "Hyperparameter tuning"): lower entropy learned better moves in every tier
-#     (argmax vs argmax, +0.29 bb/seat-hand over 0.25 through u79), plays ~1
-#     bb/seat-hand stronger, and its sharpness settles (no collapse); 0.10 is the
-#     owner's floor (0.07 was better still -- go lower only on the owner's word).
+#     (argmax vs argmax over u64-u79: 0.07 +0.38, 0.10 +0.29 bb/seat-hand over
+#     0.25), plays far stronger, and its sharpness settles (no collapse through
+#     u79). 0.07 is below the owner's usual 0.1 floor BY THE OWNER'S DECISION
+#     (2026-09-24).
 #     lr 1.5e-4, 2 PPO epochs, GAE lambda 0.95, sizing-entropy scale 1.0 and the
 #     rest of the v6 preset were tested or checked and stay.
 #   - everything else = the vMin2 recipe (v6 preset, minimal obs rev 2, 30 mixed
 #     configs, drain on, checkpoint every update).
-#   - warm start: WARM=checkpoints/t3ent10.pt = the tuning run at entropy 0.10
+#   - warm start: WARM=checkpoints/t3ent07.pt = the tuning run at entropy 0.07
 #     (same network / obs / recipe, 80 updates of 44M-row rollouts).
 #
-#   WARM=checkpoints/t3ent10.pt bash scripts/vMin3_guardian.sh    # warm start (recommended)
+#   WARM=checkpoints/t3ent07.pt bash scripts/vMin3_guardian.sh    # warm start (recommended)
 #   bash scripts/vMin3_guardian.sh                      # cold start
 #   ROLLOUT_LENGTH=200000000 bash scripts/vMin3_guardian.sh       # shorter rollout
 #
@@ -88,7 +89,7 @@ launch(){
     --batch-on-host --micro-batch-rows 1000000 \
     --num-minibatches 16 --ppo-epochs 2 \
     --mix-configs --configs-per-tier 10 --mix-tiers clubgg,clubgg_deep,deep \
-    --entropy-coef 0.10 --sizing-entropy-scale 1.0 \
+    --entropy-coef 0.07 --sizing-entropy-scale 1.0 \
     --lr 1.5e-4 --lr-warmup-updates 0 --clip-room-mid 0.07 \
     --target-kl 0.5 --kl-hard 10.0 --adv-clip 8 --cpu-threads 24 \
     --snapshot-every 5 --checkpoint-every 1 \
