@@ -1961,7 +1961,7 @@ def collect_rollout_batched(
                 "provided env cannot reconfigure to game_config "
                 f"(seats/variant mismatch)"
             )
-        env.reconfigure(game_config)
+        env.reconfigure(game_config, clear_obs=False)  # reset_batch below
         # Keep EV / MC knobs aligned with this train_config.
         env._ev_runout_samples = int(train_config.ev_runout_samples)
     else:
@@ -1971,7 +1971,7 @@ def collect_rollout_batched(
         )
         if env_cache is not None and cache_key in env_cache:
             env = env_cache[cache_key]
-            env.reconfigure(game_config)
+            env.reconfigure(game_config, clear_obs=False)  # reset_batch below
             env._ev_runout_samples = int(train_config.ev_runout_samples)
         else:
             _obs_mode = str(getattr(train_config, "obs_mode", "full"))
@@ -2052,7 +2052,10 @@ def collect_rollout_batched(
     init_buttons = rng.integers(0, n_seats, size=n_envs, dtype=np.int64).astype(
         np.uint8
     )
-    env.reset_batch(init_seeds, init_buttons)
+    # snapshot=False: the collector reads the env's arrays in place (the
+    # snapshot copied the whole observation buffer -- 186 MB per sub-rollout
+    # at 58k envs -- only to be dropped).
+    env.reset_batch(init_seeds, init_buttons, snapshot=False)
 
     def _redeal_done_at_deal(env_ids: np.ndarray) -> np.ndarray:
         """Re-deal (fresh seed + button) every env in `env_ids` that is
@@ -2098,9 +2101,13 @@ def collect_rollout_batched(
     # Attack #4 S2: hero-rotated opp-hole blocks per (env, seat), filled on
     # deal/reset. Flush indexes this instead of rebuilding every terminal wave.
     _hole_w = int(game_config.hole_count)
-    holes_rot_cache = np.full(
-        (n_envs, n_seats, 5, _hole_w), 255, dtype=np.uint8
-    )
+    # Reused across sub-rollouts / updates of the same shape: the full-batch
+    # _fill_holes_rot below rewrites every element before anything reads it.
+    _hr_key = (int(n_envs), int(n_seats), _hole_w)
+    holes_rot_cache = _HOLES_ROT_BUFFERS.get(_hr_key)
+    if holes_rot_cache is None:
+        holes_rot_cache = np.full((n_envs, n_seats, 5, _hole_w), 255, dtype=np.uint8)
+        _HOLES_ROT_BUFFERS[_hr_key] = holes_rot_cache
 
     def _fill_holes_rot(env_ids: np.ndarray) -> None:
         if env_ids.size == 0:
@@ -3543,6 +3550,10 @@ def collect_rollout_batched(
 # collector: split → host-concat → a final pooled advantage re-normalization
 # which is numerically a NO-OP — advantages are effectively normalized PER
 # CONFIG (see the `_concat_batches` docstring; review 2026-09-20 A5).
+
+# Per-(env, seat) hero-rotated opponent-hole blocks, by (n_envs, n_seats,
+# hole width) -- reused like the trajectory buffers (collect_rollout_batched).
+_HOLES_ROT_BUFFERS: dict = {}
 
 _BATCH_TENSOR_FIELDS = (
     "obs", "gate_masks", "gate_actions", "raise_chips", "sizing",

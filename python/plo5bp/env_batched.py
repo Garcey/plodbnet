@@ -223,14 +223,16 @@ class BatchedBombPotEnv:
             and config.hole_count == self.config.hole_count
         )
 
-    def reconfigure(self, config: GameConfig) -> None:
+    def reconfigure(self, config: GameConfig, clear_obs: bool = True) -> None:
         """Point this env at a new GameConfig without reallocating the
         BatchedEngine state vector or the Python cache arrays.
 
         Requires `can_reconfigure(config)`. Updates stacks/ante/bb/sb via
         the engine's `reconfigure` (clears live hands + outcome MC cache);
         caller must `reset_batch` before the next step. No-op-cheap when the
-        resolved chip config is already identical.
+        resolved chip config is already identical. `clear_obs=False` skips
+        zeroing the observation rows -- for a caller that resets every env
+        right away (the reset re-encodes every row from scratch).
         """
         if not self.can_reconfigure(config):
             raise ValueError(
@@ -259,16 +261,19 @@ class BatchedBombPotEnv:
         # Caches are stale until reset_batch; mark done so a stray step is safe.
         self._dones.fill(True)
         self._actors.fill(-1)
-        self._obs.fill(0.0)
-        self._zero_packed_obs()
+        if clear_obs:
+            self._obs.fill(0.0)
+            self._zero_packed_obs()
         self._reset_seeds.fill(0)
         self._pot.fill(0)
 
     def reset_batch(
-        self, seeds: np.ndarray, buttons: np.ndarray
-    ) -> BatchedStep:
+        self, seeds: np.ndarray, buttons: np.ndarray, snapshot: bool = True
+    ) -> "BatchedStep | None":
         """Reset all envs. Returns the initial observation batch with
-        `rewards=0` and `newly_terminal=False` for every env."""
+        `rewards=0` and `newly_terminal=False` for every env (copies of every
+        cache array) -- or None with `snapshot=False`, for callers that read
+        the env's own arrays (the rollout collector)."""
         seeds_u64 = np.ascontiguousarray(seeds, dtype=np.uint64)
         buttons_u8 = np.ascontiguousarray(buttons, dtype=np.uint8)
         if seeds_u64.shape != (self.n,) or buttons_u8.shape != (self.n,):
@@ -279,6 +284,8 @@ class BatchedBombPotEnv:
         self._be.reset_batch(seeds_u64, buttons_u8)
         self._reset_seeds = seeds_u64.copy()
         self._refresh()
+        if not snapshot:
+            return None
         return self._snapshot(
             rewards=np.zeros((self.n, self.num_seats), dtype=np.float32),
             newly_terminal=np.zeros(self.n, dtype=bool),
