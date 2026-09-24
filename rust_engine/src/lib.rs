@@ -34,6 +34,10 @@ fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
         crate::bindings::compute_aggression_bonus_batch,
         m
     )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        crate::bindings::aggression_record_batch,
+        m
+    )?)?;
     // Compact rollout-observation storage (python/plo5bp/compact_obs.py).
     m.add_function(pyo3::wrap_pyfunction!(crate::bindings::pack_obs_rows, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(crate::bindings::unpack_obs_rows, m)?)?;

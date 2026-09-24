@@ -40,6 +40,10 @@ try:  # ... and record each step's learner rows in one Rust call
     from plo5bp._engine import record_learner_steps as _rust_record_learner_steps  # type: ignore[attr-defined]
 except ImportError:
     _rust_record_learner_steps = None
+try:  # ... and fold the aggression bonus + its trajectory record into one call
+    from plo5bp._engine import aggression_record_batch as _rust_aggression_record  # type: ignore[attr-defined]
+except ImportError:
+    _rust_aggression_record = None
 try:  # engines built since 2026-09-24 copy per-step host rows in one call
     from plo5bp._engine import gather_rows_multi as _rust_gather_rows_multi  # type: ignore[attr-defined]
 except ImportError:
@@ -3049,41 +3053,70 @@ def collect_rollout_batched(
         # Rust-parallel aggression bonus + per-step cost/pot/street
         # bookkeeping. Replaces the per-env Python arithmetic loop.
         with _TimedRF("step8/aggression_bonus"):
-            agg = compute_aggression_bonus_batch(
-                actors,
-                dones,
-                learner_seats_mask,
-                gates_per_env,
-                pre_total_commit,
-                post_total_commit.astype(np.int64) if post_total_commit.dtype != np.int64 else post_total_commit,
-                pre_bet_to_call,
-                pre_street_commit,
-                pre_street,
-                float(aggression_bonus_c),
-                float(reward_norm),
-            )
-            valid_arr = np.asarray(agg["valid"], dtype=bool)
-            valid_idx = np.nonzero(valid_arr)[0]
-            if valid_idx.size:
-                cost_inc_arr = np.asarray(agg["cost_increment"], dtype=np.float32)
-                pot_pre_bb_arr = np.asarray(agg["pot_pre_bb"], dtype=np.float32)
-                street_pre_arr = np.asarray(agg["street_pre"], dtype=np.int8)
-                valid_actors = safe_actors[valid_idx]
-                valid_slots = traj_lengths[valid_idx, valid_actors]
-                vw = (valid_idx * n_seats + valid_actors) * traj_cap + valid_slots
-                traj_flat["costs"][vw] = cost_inc_arr[valid_idx]
-                traj_flat["pots"][vw] = pot_pre_bb_arr[valid_idx]
-                traj_flat["streets"][vw] = street_pre_arr[valid_idx]
-                traj_lengths[valid_idx, valid_actors] += 1
+            if _rust_aggression_record is not None and not _numpy_flush:
+                # The bonus AND its trajectory record (cost / pot / street at the
+                # acting seat's slot, slot count + 1) in one engine call -- the
+                # numpy block below is the reference it reproduces.
+                tb, ts, bs, sbs, bbs = _rust_aggression_record(
+                    actors,
+                    dones,
+                    learner_seats_mask,
+                    gates_per_env,
+                    pre_total_commit,
+                    post_total_commit.astype(np.int64) if post_total_commit.dtype != np.int64 else post_total_commit,
+                    pre_bet_to_call,
+                    pre_street_commit,
+                    pre_street,
+                    float(aggression_bonus_c),
+                    float(reward_norm),
+                    traj_flat["costs"],
+                    traj_flat["pots"],
+                    traj_flat["streets"],
+                    traj_lengths,
+                    int(traj_cap),
+                )
+                aggr_bonus_total_bb += float(tb)
+                aggr_steps_total += int(ts)
+                aggr_bonus_steps += int(bs)
+                for s in range(3):
+                    aggr_steps_total_by_street[s] += int(sbs[s])
+                    aggr_bonus_steps_by_street[s] += int(bbs[s])
+            else:
+                agg = compute_aggression_bonus_batch(
+                    actors,
+                    dones,
+                    learner_seats_mask,
+                    gates_per_env,
+                    pre_total_commit,
+                    post_total_commit.astype(np.int64) if post_total_commit.dtype != np.int64 else post_total_commit,
+                    pre_bet_to_call,
+                    pre_street_commit,
+                    pre_street,
+                    float(aggression_bonus_c),
+                    float(reward_norm),
+                )
+                valid_arr = np.asarray(agg["valid"], dtype=bool)
+                valid_idx = np.nonzero(valid_arr)[0]
+                if valid_idx.size:
+                    cost_inc_arr = np.asarray(agg["cost_increment"], dtype=np.float32)
+                    pot_pre_bb_arr = np.asarray(agg["pot_pre_bb"], dtype=np.float32)
+                    street_pre_arr = np.asarray(agg["street_pre"], dtype=np.int8)
+                    valid_actors = safe_actors[valid_idx]
+                    valid_slots = traj_lengths[valid_idx, valid_actors]
+                    vw = (valid_idx * n_seats + valid_actors) * traj_cap + valid_slots
+                    traj_flat["costs"][vw] = cost_inc_arr[valid_idx]
+                    traj_flat["pots"][vw] = pot_pre_bb_arr[valid_idx]
+                    traj_flat["streets"][vw] = street_pre_arr[valid_idx]
+                    traj_lengths[valid_idx, valid_actors] += 1
 
-            aggr_bonus_total_bb += float(agg["total_bonus_bb"])
-            aggr_steps_total += int(agg["total_steps"])
-            aggr_bonus_steps += int(agg["bonus_steps"])
-            sbs = np.asarray(agg["steps_by_street"])
-            bbs = np.asarray(agg["bonus_steps_by_street"])
-            for s in range(3):
-                aggr_steps_total_by_street[s] += int(sbs[s])
-                aggr_bonus_steps_by_street[s] += int(bbs[s])
+                aggr_bonus_total_bb += float(agg["total_bonus_bb"])
+                aggr_steps_total += int(agg["total_steps"])
+                aggr_bonus_steps += int(agg["bonus_steps"])
+                sbs = np.asarray(agg["steps_by_street"])
+                bbs = np.asarray(agg["bonus_steps_by_street"])
+                for s in range(3):
+                    aggr_steps_total_by_street[s] += int(sbs[s])
+                    aggr_bonus_steps_by_street[s] += int(bbs[s])
 
         # Attack #2 Phase 2: while terminal host runs, queue next-step acts
         # for envs that are still live (not newly terminal). After reset,

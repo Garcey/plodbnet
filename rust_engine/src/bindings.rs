@@ -4,7 +4,7 @@
 use numpy::ndarray::{Array1, Array2};
 use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2,
-    PyReadonlyArray3, PyReadwriteArray2, PyUntypedArrayMethods,
+    PyReadonlyArray3, PyReadwriteArray1, PyReadwriteArray2, PyUntypedArrayMethods,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -1000,6 +1000,171 @@ fn aggression_bonus_bb_inner(
         ratio = 1.0;
     }
     c * ratio
+}
+
+/// Raw trajectory outputs of `aggression_record_batch`; every env writes only
+/// its own actor's slot and its own `traj_lengths` entry.
+struct AggrOut {
+    costs: *mut f32,
+    pots: *mut f32,
+    streets: *mut i8,
+    lengths: *mut i32,
+}
+unsafe impl Send for AggrOut {}
+unsafe impl Sync for AggrOut {}
+
+/// `compute_aggression_bonus_batch` + the rollout's per-step record of its
+/// results (python/plo5bp/rollout.py step8) in ONE call: for every valid env
+/// (live, learner seat acting) the step's cost increment, pre-step pot (bb)
+/// and street go into the flat trajectory arrays at that seat's current slot
+/// (`(env * S + actor) * traj_cap + traj_lengths[env, actor]`), and the slot
+/// count advances -- exactly the numpy assignments it replaces, including the
+/// f64 -> f32 roundings (`as f32` rounds to nearest-even like numpy's cast).
+/// Returns (total bonus bb, steps, bonus steps, steps by street (flop, turn,
+/// river), bonus steps by street); the bonus total is summed in env order, as
+/// the numpy path did.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub fn aggression_record_batch<'py>(
+    py: Python<'py>,
+    actors: PyReadonlyArray1<'_, i8>,
+    dones: PyReadonlyArray1<'_, bool>,
+    learner_mask: PyReadonlyArray2<'_, bool>,
+    gates: PyReadonlyArray1<'_, u8>,
+    pre_total_commit: PyReadonlyArray2<'_, i64>,
+    post_total_commit: PyReadonlyArray2<'_, i64>,
+    pre_bet_to_call: PyReadonlyArray1<'_, u64>,
+    pre_street_commit: PyReadonlyArray2<'_, u64>,
+    pre_street: PyReadonlyArray1<'_, u8>,
+    c: f64,
+    reward_norm: f64,
+    mut costs: PyReadwriteArray1<'_, f32>,
+    mut pots: PyReadwriteArray1<'_, f32>,
+    mut streets: PyReadwriteArray1<'_, i8>,
+    mut traj_lengths: PyReadwriteArray2<'_, i32>,
+    traj_cap: usize,
+) -> PyResult<(f64, u64, u64, (u64, u64, u64), (u64, u64, u64))> {
+    let err = |m: String| PyValueError::new_err(format!("aggression_record_batch: {m}"));
+    let n = actors.len();
+    let s_n = pre_total_commit.shape()[1];
+    for (name, shape, contig) in [
+        ("learner_mask", learner_mask.shape(), learner_mask.is_c_contiguous()),
+        ("pre_total_commit", pre_total_commit.shape(), pre_total_commit.is_c_contiguous()),
+        ("post_total_commit", post_total_commit.shape(), post_total_commit.is_c_contiguous()),
+        ("pre_street_commit", pre_street_commit.shape(), pre_street_commit.is_c_contiguous()),
+        ("traj_lengths", traj_lengths.shape(), traj_lengths.is_c_contiguous()),
+    ] {
+        if shape != [n, s_n] || !contig {
+            return Err(err(format!("{name} must be a C-contiguous ({n}, {s_n}) array")));
+        }
+    }
+    let actors_s = actors.as_slice()?;
+    let dones_s = dones.as_slice()?;
+    let gates_s = gates.as_slice()?;
+    let btc_s = pre_bet_to_call.as_slice()?;
+    let street_s = pre_street.as_slice()?;
+    if dones_s.len() != n || gates_s.len() != n || btc_s.len() != n || street_s.len() != n {
+        return Err(err("1-D inputs must all have num_envs entries".into()));
+    }
+    let lm = learner_mask.as_slice()?;
+    let pre_tc = pre_total_commit.as_slice()?;
+    let post_tc = post_total_commit.as_slice()?;
+    let pre_sc = pre_street_commit.as_slice()?;
+    let m = costs.len();
+    if pots.len() != m || streets.len() != m || n * s_n * traj_cap > m {
+        return Err(err(format!(
+            "trajectory arrays hold {m} / {} / {} slots, need {} ({n} envs x {s_n} seats x {traj_cap})",
+            pots.len(),
+            streets.len(),
+            n * s_n * traj_cap
+        )));
+    }
+    let o = AggrOut {
+        costs: costs.as_slice_mut()?.as_mut_ptr(),
+        pots: pots.as_slice_mut()?.as_mut_ptr(),
+        streets: streets.as_slice_mut()?.as_mut_ptr(),
+        lengths: traj_lengths.as_slice_mut()?.as_mut_ptr(),
+    };
+    let bad_slot = std::sync::atomic::AtomicBool::new(false);
+    // Per env: (valid, bonus bb, street) -- reduced serially below, in order.
+    let per_env: Vec<(bool, f64, i8)> = py.allow_threads(|| {
+        (0..n)
+            .into_par_iter()
+            .with_min_len(APPLY_MIN_LEN)
+            .map(|i| {
+                let o = &o;
+                let a = actors_s[i];
+                if dones_s[i] || a < 0 || a as usize >= s_n || !lm[i * s_n + a as usize] {
+                    return (false, 0.0, -1i8);
+                }
+                let actor = a as usize;
+                let row = i * s_n;
+                let delta = (post_tc[row + actor] - pre_tc[row + actor]).max(0);
+                let mut pot_pre: i64 = 0;
+                for s in 0..s_n {
+                    pot_pre += pre_tc[row + s];
+                }
+                let pot_pre = pot_pre.max(0);
+                let bonus_bb = aggression_bonus_bb_inner(
+                    gates_s[i],
+                    delta,
+                    btc_s[i] as i64,
+                    pre_sc[row + actor] as i64,
+                    pot_pre,
+                    c,
+                );
+                let cost_inc = -(delta as f64) * reward_norm + bonus_bb;
+                let pot_pre_bb = pot_pre as f64 * reward_norm;
+                let street = street_s[i] as i8;
+                // SAFETY: env i owns traj_lengths[i, actor] and the slots
+                // [(i * S + actor) * cap, +cap) -- checked in range above.
+                unsafe {
+                    let len_p = o.lengths.add(row + actor);
+                    let slot = *len_p;
+                    if slot < 0 || slot as usize >= traj_cap {
+                        bad_slot.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return (true, bonus_bb, street);
+                    }
+                    let vw = (row + actor) * traj_cap + slot as usize;
+                    *o.costs.add(vw) = cost_inc as f32;
+                    *o.pots.add(vw) = pot_pre_bb as f32;
+                    *o.streets.add(vw) = street;
+                    *len_p = slot + 1;
+                }
+                (true, bonus_bb, street)
+            })
+            .collect()
+    });
+    if bad_slot.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(err(format!("a trajectory slot is outside [0, {traj_cap})")));
+    }
+    let mut total_bonus_bb = 0f64;
+    let (mut steps, mut bonus_steps) = (0u64, 0u64);
+    let (mut by_street, mut bonus_by_street) = ([0u64; 3], [0u64; 3]);
+    for (v, bb, sp) in per_env {
+        if !v {
+            continue;
+        }
+        steps += 1;
+        total_bonus_bb += bb;
+        if bb > 0.0 {
+            bonus_steps += 1;
+        }
+        let bucket = sp as i64 - 1;
+        if (0..3).contains(&bucket) {
+            by_street[bucket as usize] += 1;
+            if bb > 0.0 {
+                bonus_by_street[bucket as usize] += 1;
+            }
+        }
+    }
+    Ok((
+        total_bonus_bb,
+        steps,
+        bonus_steps,
+        (by_street[0], by_street[1], by_street[2]),
+        (bonus_by_street[0], bonus_by_street[1], bonus_by_street[2]),
+    ))
 }
 
 /// Per-env aggression-bonus computation for the batched rollout driver,
