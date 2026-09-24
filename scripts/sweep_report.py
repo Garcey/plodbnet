@@ -31,7 +31,10 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--h2h", default="runs/h2h_history.jsonl")
     ap.add_argument("--util", default="runs/utilization_selfplay.jsonl")
+    ap.add_argument("--window", default="30:39",
+                    help="FROM:TO update range averaged per pair (every checkpoint in it)")
     args = ap.parse_args()
+    w_lo, w_hi = (int(x) for x in args.window.split(":"))
 
     h2h_path = REPO / args.h2h
     rows = [json.loads(line) for line in h2h_path.read_text().splitlines() if line.strip()] \
@@ -49,11 +52,28 @@ def main() -> None:
     for (cand, ref), by_k in sorted(table.items()):
         cells = []
         for k in sorted(by_k):
+            if w_lo <= k <= w_hi and k % 10 != 9:
+                continue  # the dense window is summarised below
             r = by_k[k]
             z = r["edge_bb"] / r["se"] if r["se"] > 0 else 0.0
             label = f"u{k}" if k >= 0 else "  "
             cells.append(f"{label} {r['edge_bb']:+.3f}+-{r['se']:.3f} (z{z:+.1f})")
         print(f"  {cand:>10} vs {ref:<10} " + "   ".join(cells))
+
+    print(f"\n== mean over every checkpoint u{w_lo}..u{w_hi} (se_eval from the deals; "
+          "se_spread = std across checkpoints / sqrt(n), includes checkpoint noise)")
+    for (cand, ref), by_k in sorted(table.items()):
+        ks = [k for k in sorted(by_k) if w_lo <= k <= w_hi]
+        if len(ks) < 3:
+            continue
+        edges = [by_k[k]["edge_bb"] for k in ks]
+        n = len(edges)
+        mean = sum(edges) / n
+        se_eval = (sum(by_k[k]["se"] ** 2 for k in ks) ** 0.5) / n
+        var = sum((e - mean) ** 2 for e in edges) / (n - 1)
+        se_spread = (var / n) ** 0.5
+        print(f"  {cand:>10} vs {ref:<10} n={n:2d}  mean {mean:+.3f}  se_eval {se_eval:.3f}"
+              f"  se_spread {se_spread:.3f}  (z {mean / max(se_spread, se_eval, 1e-9):+.1f})")
 
     util_path = REPO / args.util
     if not util_path.exists():

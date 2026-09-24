@@ -44,6 +44,13 @@ def main() -> None:
     ap.add_argument("--loop", type=float, default=0.0, help="re-check every N s (0 = once)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--done", default="runs/sweep_eval_done.json")
+    ap.add_argument(
+        "--from-update", type=int, default=0,
+        help="only checkpoint indices >= this (e.g. --every 1 --from-update 30 "
+        "--max-updates 40 compares u30..u39: averaging several checkpoints "
+        "takes out checkpoint-to-checkpoint noise)",
+    )
+    ap.add_argument("--no-probe", action="store_true", help="head-to-heads only")
     args = ap.parse_args()
     stems = [s for s in args.stems.split(",") if s]
 
@@ -60,6 +67,8 @@ def main() -> None:
     while True:
         worked = False
         for n in range(args.every - 1, args.max_updates, args.every):
+            if n < args.from_update:
+                continue
             ref = REPO / "checkpoints" / f"{args.ref}_{n}.pt"
             if not ref.exists():
                 continue
@@ -71,11 +80,12 @@ def main() -> None:
                 rc = run([py, "scripts/h2h_eval.py", str(cand), str(ref),
                           "--deals", str(args.deals), "--device", args.device,
                           "--seed", str(n)])
-                rc |= probe(cand)
-                ref_key = f"{args.ref}@{n}"
-                if ref_key not in done:
-                    if probe(ref) == 0:
-                        done.add(ref_key)
+                if not args.no_probe:
+                    rc |= probe(cand)
+                    ref_key = f"{args.ref}@{n}"
+                    if ref_key not in done:
+                        if probe(ref) == 0:
+                            done.add(ref_key)
                 if rc == 0:
                     done.add(key)
                     done_path.write_text(json.dumps(sorted(done)))
