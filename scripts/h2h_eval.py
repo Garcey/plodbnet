@@ -145,6 +145,12 @@ def main() -> None:
         "sampling: what A has LEARNED to prefer, apart from how much it still mixes "
         "(compare runs trained at different entropy coefficients this way)",
     )
+    ap.add_argument(
+        "--greedy-b", action="store_true",
+        help="B plays its most likely action too. With --greedy-a: argmax vs argmax, "
+        "which keeps separating two runs after A's argmax has saturated against a "
+        "sampling B (a sampling opponent is much weaker than its own argmax)",
+    )
     args = ap.parse_args()
 
     device = torch.device(args.device)
@@ -175,12 +181,13 @@ def main() -> None:
             )
             pair_net, n_seats, _steps = play_config(
                 cfg, (model_a, model_b), args.deals, obs_mode, device, rng, args.ev_samples,
-                greedy=(bool(args.greedy_a), False),
+                greedy=(bool(args.greedy_a), bool(args.greedy_b)),
             )
             per_tier[tier].append(pair_net / bb / n_seats)   # bb per A seat-hand
     report = {"a": meta_a, "b": meta_b, "deals_per_config": args.deals,
               "configs_per_tier": args.configs_per_tier, "seed": args.seed,
-              "ema": bool(args.ema), "greedy_a": bool(args.greedy_a), "tiers": {}}
+              "ema": bool(args.ema), "greedy_a": bool(args.greedy_a),
+              "greedy_b": bool(args.greedy_b), "tiers": {}}
     everything = []
     for tier in TIERS:
         x = np.concatenate(per_tier[tier]) if per_tier[tier] else np.zeros(0)

@@ -49,8 +49,12 @@ def main() -> None:
         ref = _stem(b["path"])
         if b.get("update") != a.get("update"):
             ref = f"{ref}@u{b.get('update')}"
-        if r.get("greedy_a"):
+        if r.get("greedy_a") and r.get("greedy_b"):
+            ref += " (both greedy)"
+        elif r.get("greedy_a"):
             ref += " (A greedy)"
+        elif r.get("greedy_b"):
+            ref += " (B greedy)"
         table[(_stem(a["path"]), ref)][int(a["update"])] = r
 
     print("== strength: candidate vs reference at equal updates (bb/seat-hand, + = candidate stronger)")
