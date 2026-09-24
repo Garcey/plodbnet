@@ -11,8 +11,10 @@ compilation and first-touch costs), rows per second, and peak GPU memory.
 
 `--grid` is "name=v1,v2,..." over num_envs, rollout_length or
 micro_batch_rows (one axis per probe); the other two come from the flags.
-A point that fails (e.g. CUDA out of memory) is reported, not fatal. Results
-append to runs/throughput_probe.jsonl.
+`--extra` passes more train.py flags (e.g. "--batch-on-host"). Peak host RSS
+of the trainer is sampled from /proc (Linux). A point that fails (e.g. CUDA
+out of memory) is reported, not fatal. Results append to
+runs/throughput_probe.jsonl.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import statistics
 import subprocess
 import sys
@@ -59,6 +62,8 @@ def run_point(args, num_envs: int, rollout: int, micro: int, tag: str) -> dict:
         cmd += ["--load-checkpoint", args.warm]
     if args.gpu_lock:
         cmd += ["--gpu-lock", args.gpu_lock]
+    if args.extra:
+        cmd += shlex.split(args.extra)
     env = dict(
         os.environ,
         PLO5_RUST_ENCODER="1",
@@ -71,8 +76,19 @@ def run_point(args, num_envs: int, rollout: int, micro: int, tag: str) -> dict:
     )
     log_path = scratch / f"probe_{tag}.log"
     t0 = time.time()
+    peak_rss_kb = 0
     with open(log_path, "w", encoding="utf-8") as fh:
-        rc = subprocess.call(cmd, cwd=REPO, env=env, stdout=fh, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(cmd, cwd=REPO, env=env, stdout=fh, stderr=subprocess.STDOUT)
+        while proc.poll() is None:
+            try:
+                with open(f"/proc/{proc.pid}/status", encoding="utf-8") as st:
+                    for line in st:
+                        if line.startswith("VmHWM:"):
+                            peak_rss_kb = max(peak_rss_kb, int(line.split()[1]))
+            except OSError:
+                pass
+            time.sleep(2.0)
+        rc = proc.returncode
     log = log_path.read_text(encoding="utf-8", errors="replace")
     phases = [tuple(float(x) for x in m.groups()) for m in _PHASE.finditer(log)]
     vrams = [(float(a), float(b), int(c.replace(",", ""))) for a, b, c in _VRAM.findall(log)]
@@ -81,7 +97,10 @@ def run_point(args, num_envs: int, rollout: int, micro: int, tag: str) -> dict:
         "micro_batch_rows": micro, "rc": rc, "wall_s": round(time.time() - t0, 1),
         "hidden_dim": args.hidden_dim, "critic_hidden_dim": args.critic_hidden_dim,
         "log": str(log_path),
+        "extra": args.extra,
     }
+    if peak_rss_kb:
+        res["peak_rss_gib"] = round(peak_rss_kb / 2**20, 2)
     if "out of memory" in log.lower():
         res["oom"] = True
     steady = [p for p in phases if p[0] >= 1]
@@ -114,6 +133,7 @@ def main() -> None:
     ap.add_argument("--scratch", default="/root/probe_scratch")
     ap.add_argument("--gpu-lock", default="")
     ap.add_argument("--out", default="runs/throughput_probe.jsonl")
+    ap.add_argument("--extra", default="", help="more train.py flags, one string")
     args = ap.parse_args()
 
     axis, values = args.grid.split("=", 1)
@@ -136,13 +156,15 @@ def main() -> None:
         print(f"[probe] {json.dumps(res)}", flush=True)
         with open(REPO / args.out, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(res) + "\n")
-    print("\n  {:>22} {:>9} {:>10} {:>11} {:>10} {:>10}".format(
-        axis, "total_s", "rollout_s", "rows/s", "peak_GiB", "status"))
+    fmt = "  {:>16} {:>9} {:>10} {:>11} {:>12} {:>9} {:>9} {:>8}"
+    print("\n" + fmt.format(
+        axis, "total_s", "rollout_s", "rows/s", "rows", "gpu_GiB", "rss_GiB", "status"))
     for r in rows:
         status = "OOM" if r.get("oom") else ("ok" if r["rc"] == 0 else f"rc={r['rc']}")
-        print("  {:>22} {:>9} {:>10} {:>11} {:>10} {:>10}".format(
+        print(fmt.format(
             r[axis], r.get("total_s", "-"), r.get("rollout_s", "-"),
-            r.get("rows_per_s", "-"), r.get("peak_alloc_gib", "-"), status))
+            r.get("rows_per_s", "-"), r.get("rows", "-"), r.get("peak_alloc_gib", "-"),
+            r.get("peak_rss_gib", "-"), status))
 
 
 if __name__ == "__main__":
