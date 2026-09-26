@@ -356,6 +356,7 @@ input[type="range"]::-moz-range-thumb { width: 14px; height: 14px; border-radius
 .seat-badge.k-eq span::before { content: attr(data-b) " "; color: var(--tx-3); font-weight: 600; }
 .seat-bubble { position: absolute; left: 50%; bottom: 100%; transform: translateX(-50%); margin-bottom: calc(var(--u) * 0.6); max-width: calc(var(--u) * 22); padding: 6px 11px; border-radius: 13px 13px 13px 4px; background: #fff; color: #0c1220; font-size: 12.5px; font-weight: 500; line-height: 1.3; box-shadow: 0 8px 22px rgba(0, 0, 0, 0.5); z-index: 12; pointer-events: none; animation: bubble 4s var(--ease) forwards; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; width: max-content; }
 .seat-bubble.emote { background: transparent; box-shadow: none; font-size: calc(var(--u) * 4.2); padding: 0; animation: emote 2.6s var(--ease) forwards; filter: drop-shadow(0 6px 10px rgba(0, 0, 0, 0.55)); -webkit-line-clamp: unset; display: block; }
+.fx-bubble { position: absolute; width: 0; height: 0; pointer-events: none; } /* a bubble's anchor on the fx layer (games.table.js bubble) */
 @keyframes bubble { 0% { opacity: 0; transform: translate(-50%, 8px) scale(0.9); } 6%, 88% { opacity: 1; transform: translate(-50%, 0) scale(1); } 100% { opacity: 0; transform: translate(-50%, -6px) scale(0.98); } }
 @keyframes emote { 0% { opacity: 0; transform: translate(-50%, 20px) scale(0.3); } 15% { opacity: 1; transform: translate(-50%, 0) scale(1.15); } 25% { transform: translate(-50%, 0) scale(1); } 80% { opacity: 1; } 100% { opacity: 0; transform: translate(-50%, -30px) scale(1); } }
 .seat-delta { position: absolute; left: 50%; top: 0; transform: translate(-50%, -50%); font-family: var(--mono); font-weight: 800; font-size: max(13px, calc(var(--u) * 1.9)); pointer-events: none; z-index: 13; text-shadow: 0 2px 8px rgba(0, 0, 0, 0.85); animation: floatup 2.4s var(--ease) forwards; white-space: nowrap; }
@@ -1091,3 +1092,20 @@ body.in-lobby.has-joinreq #toast-root { top: 64px; }
 }
 @media (max-width: 760px) { .lb-hero > .spacer { display: none; } .lb-hero { gap: 16px; } }
 @media (max-width: 420px) { .wel-form .input { flex: none; } }
+
+/* ---- profile pictures (2026-09-26) --------------------------------------------
+   The picture covers the initials (kept underneath as the fallback); on a seat it
+   sits inside the circle, under the countdown overlay, the crown and the tag, and
+   inside the turn ring (which is drawn outside the circle). */
+.av { position: relative; overflow: hidden; }
+.av > img { position: absolute; inset: 0; width: 100%; height: 100%; border-radius: 50%; object-fit: cover; display: block; }
+.av.xl { width: 112px; height: 112px; font-size: 36px; }
+.seat-av .av-img { position: absolute; inset: 0; width: 100%; height: 100%; border-radius: 50%; object-fit: cover; display: block; }
+.seat-av .av-img[hidden] { display: none; }
+button.userchip { font: inherit; cursor: pointer; transition: background 0.15s, border-color 0.15s; }
+button.userchip:hover { background: rgba(255, 255, 255, 0.09); border-color: rgba(255, 255, 255, 0.22); }
+.avup { display: flex; align-items: center; gap: 20px; }
+.avup-pic { flex: none; }
+.avup-side { display: flex; flex-direction: column; gap: 10px; align-items: flex-start; min-width: 0; }
+.avup-side .btn { cursor: pointer; }
+@media (max-width: 420px) { .avup { flex-direction: column; text-align: center; } .avup-side { align-items: center; } }

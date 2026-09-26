@@ -24,9 +24,12 @@
     if (html != null) e.innerHTML = html;
     return e;
   }
-  function avatar(name, key, cls) {
+  // `url` = the person's profile picture (2026-09-26); the initials stay under it
+  // and show again if the picture can't load (the error listener in init drops it).
+  function avatar(name, key, cls, url) {
     const A = HG.avatar;
-    return `<span class="av ${cls || ""}" style="--h:${A.hueOf(key != null ? key : name)}">${esc(A.initials(name))}</span>`;
+    const img = url ? `<img src="${esc(url)}" alt="" loading="lazy" decoding="async"/>` : "";
+    return `<span class="av ${cls || ""}" style="--h:${A.hueOf(key != null ? key : name)}">${esc(A.initials(name))}${img}</span>`;
   }
   function moneyInput(id, cents, attrs) {
     return `<div class="money"><input class="input" id="${id}" inputmode="decimal" autocomplete="off" value="${(cents / 100).toFixed(2)}" ${attrs || ""}/></div>`;
@@ -228,6 +231,7 @@
     const tables = data.tables || [];
     const clubs = data.clubs || [];
     U.lobbyData = data;
+    setMyAvatar(data.my_avatar);
     renderJoinReqs(data.join_requests);
     // a request to join was answered while this page was open: straight into the club
     // (and back to the table the request came from)
@@ -479,10 +483,10 @@
           `<small class="muted">Anyone with this link can ${v.approve_joins ? "ask to join" : "join the club"}. <button class="linkish" id="cs-reset" type="button">Make a new link</button> — the old one stops working.</small>` +
           (owner ? `<div class="setrow"><div><b>Ask me first</b><small>New people ask to join; you or an admin let them in</small></div><label class="switch"><input type="checkbox" id="cs-approve" ${v.approve_joins ? "checked" : ""}/><i></i></label></div>` : "") + `</div>` : "") +
         ((v.requests || []).length ? `<div class="grp"><h4>Waiting to join · ${v.requests.length}</h4>${v.requests.map((q) =>
-          `<div class="mem"><span class="mem-who">${avatar(q.name, q.name, "sm")}<span><b>${esc(q.name)}</b><small>${esc(q.email)}</small></span></span>` +
+          `<div class="mem"><span class="mem-who">${avatar(q.name, q.name, "sm", q.avatar)}<span><b>${esc(q.name)}</b><small>${esc(q.email)}</small></span></span>` +
           `<span class="mem-act"><button class="btn sm ghost" type="button" data-deny="${q.user_id}">Not now</button><button class="btn sm gold" type="button" data-allow="${q.user_id}">Let in</button></span></div>`).join("")}</div>` : "") +
         `<div class="grp"><h4>Members · ${v.members.length}</h4>${v.members.map((m) =>
-          `<div class="mem"><span class="mem-who">${avatar(m.name, m.name, "sm")}<span><b>${esc(m.name)}${m.is_me ? " <i>you</i>" : ""}</b><small>${m.role === "owner" ? "Runs the club" : m.role === "admin" ? "Admin: lets people in" : "Member"}</small></span></span>` +
+          `<div class="mem"><span class="mem-who">${avatar(m.name, m.name, "sm", m.avatar)}<span><b>${esc(m.name)}${m.is_me ? " <i>you</i>" : ""}</b><small>${m.role === "owner" ? "Runs the club" : m.role === "admin" ? "Admin: lets people in" : "Member"}</small></span></span>` +
           `<span class="mem-act"><span class="pill role-${m.role}">${m.role}</span>${canAct(m) ? `<button class="icon-btn" type="button" data-mem="${m.user_id}" aria-label="Manage ${esc(m.name)}">${icon("i-menu")}</button>` : ""}</span></div>`).join("")}</div>` +
         (owner ? `<p class="muted" style="font-size:12px;margin:0">You run this club. To step down, hand it to another member (the ☰ next to their name).</p>`
           : `<button class="btn sm danger" id="cs-leave" type="button">${icon("i-door", "sm")}Leave club</button>`);
@@ -543,38 +547,56 @@
     U.clubPanel = { api, cid, sig: summary ? `${summary.members}:${summary.requests}` : "", refresh };
   }
 
-  function openCreate() {
+  async function openCreate(fresh) {
     const me = C().G.me || {};
     const clubs = (U.lobbyData && U.lobbyData.clubs) || [];
     const cur = clubs.find((c) => c.id === C().G.clubId) || clubs[0];
     if (!cur) return openCreateClub();  // (a table lives in a club)
+    // The settings of the last table you hosted (2026-09-26); amounts come in big blinds.
+    let prefs = null;
+    if (!fresh) { try { prefs = (await C().j("/games/api/host_prefs")).prefs || null; } catch (_) { prefs = null; } }
+    const P = prefs || {};
+    const num = (v, dflt) => (Number.isFinite(Number(v)) && v !== null && v !== undefined ? Number(v) : dflt);
+    const bb0 = num(P.bb_cents, 0) > 0 ? num(P.bb_cents, 100) : 100;
+    const anteBB0 = num(P.ante_bb, 0) > 0 ? num(P.ante_bb, 3) : 3;
+    const buyinBB0 = num(P.buyin_bb, 0) > 0 ? num(P.buyin_bb, 40) : 40;
+    const segHtml = (id, opts, cur2, fmt) => {
+      const list = opts.slice();
+      if (!list.some(([v]) => v === cur2)) list.push([cur2, fmt(cur2)]);  // a value set in Manage
+      list.sort((a, b) => a[0] - b[0]);
+      return `<div class="seg" id="${id}">${list.map(([v, l]) => `<button type="button" data-v="${v}" class="${v === cur2 ? "on" : ""}">${l}</button>`).join("")}</div>`;
+    };
+    const secs = (v) => (v ? `${v}s` : "Off");
     const body = h("div", { style: "display:flex;flex-direction:column;gap:16px" });
     body.innerHTML =
+      (prefs ? `<div class="setrow"><div><b>Your settings from last time</b><small>Stakes, seats, clock and buy-ins — and Manage's too: automatic chips, grades, rabbit</small></div><button type="button" class="btn sm" id="c-reset">Use defaults</button></div>` : "") +
       (clubs.length > 1 ? `<label class="field"><span>Club</span><select class="input" id="c-club">${clubs.map((c) => `<option value="${esc(c.id)}" ${c.id === cur.id ? "selected" : ""}>${esc(c.name)}</option>`).join("")}</select><small>Only this club's members can see and join the table</small></label>` : "") +
       `<label class="field"><span>Table name</span><input type="text" id="c-name" maxlength="60" value="${esc((me.name || "My").split(" ")[0])}'s game"/></label>` +
       `<div class="row3" style="grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto;align-items:start">` +
-      `<label class="field"><span>Big blind</span>${moneyInput("c-bb", 100)}<small>The chip unit and the minimum bet</small></label>` +
-      `<label class="field"><span>Ante, in big blinds</span><div class="money unit-bb"><input class="input" id="c-ante-bb" inputmode="decimal" autocomplete="off" value="3"/></div><small id="c-ante-eq">= $3.00 per player, every hand</small></label>` +
-      `<div class="field"><span>Seats</span><div class="seg" id="c-seats">${[2, 4, 6, 8].map((n) => `<button type="button" data-v="${n}" class="${n === 8 ? "on" : ""}">${n}</button>`).join("")}</div></div></div>` +
-      `<label class="field"><span>Your buy-in</span>${moneyInput("c-buyin", 4000)}<small>Nobody posts blinds — every hand is a bomb pot: everyone antes and the action starts on the flop.</small></label>` +
+      `<label class="field"><span>Big blind</span>${moneyInput("c-bb", bb0)}<small>The chip unit and the minimum bet</small></label>` +
+      `<label class="field"><span>Ante, in big blinds</span><div class="money unit-bb"><input class="input" id="c-ante-bb" inputmode="decimal" autocomplete="off" value="${anteBB0}"/></div><small id="c-ante-eq">= $3.00 per player, every hand</small></label>` +
+      `<div class="field"><span>Seats</span>${segHtml("c-seats", [2, 4, 6, 8].map((n) => [n, String(n)]), num(P.num_seats, 8), String)}</div></div>` +
+      `<label class="field"><span>Your buy-in</span>${moneyInput("c-buyin", Math.round(bb0 * buyinBB0))}<small>Nobody posts blinds — every hand is a bomb pot: everyone antes and the action starts on the flop.</small></label>` +
       `<details class="adv"><summary>More options</summary><div>` +
-      `<div class="row2"><label class="field"><span>Min buy-in</span>${moneyInput("c-min", 0)}<small>0 = no minimum</small></label><label class="field"><span>Max buy-in</span>${moneyInput("c-max", 0)}<small>0 = no maximum</small></label></div>` +
-      `<div class="field"><span>Decision time</span><div class="seg" id="c-clock">${[[0, "Off"], [15, "15s"], [20, "20s"], [30, "30s"], [45, "45s"], [60, "60s"]].map(([v, l]) => `<button type="button" data-v="${v}" class="${v === 30 ? "on" : ""}">${l}</button>`).join("")}</div></div>` +
-      `<div class="field"><span>Time bank</span><div class="seg" id="c-bank">${[[0, "Off"], [30, "30s"], [60, "60s"], [120, "2 min"]].map(([v, l]) => `<button type="button" data-v="${v}" class="${v === 30 ? "on" : ""}">${l}</button>`).join("")}</div></div>` +
-      `<div class="field"><span>Next hand</span><div class="seg" id="c-deal">${[[0, "Manual"], [3, "3s"], [5, "5s"], [8, "8s"], [12, "12s"]].map(([v, l]) => `<button type="button" data-v="${v}" class="${v === 5 ? "on" : ""}">${l}</button>`).join("")}</div></div>` +
-      `<div class="setrow"><div><b>I approve every buy-in</b><small>Sit-downs and top-ups wait for your OK — you can trust regulars so they never wait</small></div><label class="switch"><input type="checkbox" id="c-approve"/><i></i></label></div>` +
-      `<div class="setrow"><div><b>Players may take chips off the table</b><small>Ratholing allowed: anyone can pocket part of their stack between hands</small></div><label class="switch"><input type="checkbox" id="c-rathole"/><i></i></label></div>` +
-      `<div class="setrow"><div><b>Show it in the club lobby</b><small>Off = only club members with the link can find it</small></div><label class="switch"><input type="checkbox" id="c-listed" checked/><i></i></label></div>` +
+      `<div class="row2"><label class="field"><span>Min buy-in</span>${moneyInput("c-min", Math.round(bb0 * num(P.min_buyin_bb, 0)))}<small>0 = no minimum</small></label><label class="field"><span>Max buy-in</span>${moneyInput("c-max", Math.round(bb0 * num(P.max_buyin_bb, 0)))}<small>0 = no maximum</small></label></div>` +
+      `<div class="field"><span>Decision time</span>${segHtml("c-clock", [[0, "Off"], [15, "15s"], [20, "20s"], [30, "30s"], [45, "45s"], [60, "60s"]], num(P.decision_secs, 30), secs)}</div>` +
+      `<div class="field"><span>Time bank</span>${segHtml("c-bank", [[0, "Off"], [30, "30s"], [60, "60s"], [120, "2 min"]], num(P.time_bank_secs, 30), secs)}</div>` +
+      `<div class="field"><span>Next hand</span>${segHtml("c-deal", [[0, "Manual"], [3, "3s"], [5, "5s"], [8, "8s"], [12, "12s"]], num(P.deal_delay_secs, 5), (v) => (v ? `${v}s` : "Manual"))}</div>` +
+      `<div class="setrow"><div><b>I approve every buy-in</b><small>Sit-downs and top-ups wait for your OK — you can trust regulars so they never wait</small></div><label class="switch"><input type="checkbox" id="c-approve" ${P.approve_buyins ? "checked" : ""}/><i></i></label></div>` +
+      `<div class="setrow"><div><b>Players may take chips off the table</b><small>Ratholing allowed: anyone can pocket part of their stack between hands</small></div><label class="switch"><input type="checkbox" id="c-rathole" ${P.allow_rathole ? "checked" : ""}/><i></i></label></div>` +
+      `<div class="setrow"><div><b>Show it in the club lobby</b><small>Off = only club members with the link can find it</small></div><label class="switch"><input type="checkbox" id="c-listed" ${P.listed === false ? "" : "checked"}/><i></i></label></div>` +
       `</div></details>`;
     segWire(body);
     const q = (id) => body.querySelector("#" + id);
+    const reset = q("c-reset");
+    if (reset) reset.addEventListener("click", () => { closeTop(); setTimeout(() => openCreate(true), 260); });
     const bbCents = () => Math.max(1, C().toCents(q("c-bb").value) || 0);
     const anteBB = () => Math.max(0, Number(String(q("c-ante-bb").value).replace(",", ".")) || 0);
     const anteCents = () => Math.round(bbCents() * anteBB());
     let buyinTouched = false;
     const sync = () => {
       q("c-ante-eq").textContent = `= ${d2(anteCents())} per player, every hand`;
-      if (!buyinTouched) q("c-buyin").value = ((bbCents() * 40) / 100).toFixed(2);  // 40 bb until you say otherwise
+      if (!buyinTouched) q("c-buyin").value = ((bbCents() * buyinBB0) / 100).toFixed(2);  // your usual buy-in in bb (40 bb by default)
     };
     q("c-bb").addEventListener("input", sync);
     q("c-ante-bb").addEventListener("input", sync);
@@ -598,6 +620,7 @@
               time_bank_secs: segVal(body, "c-bank"), deal_delay_secs: segVal(body, "c-deal"), listed: q("c-listed").checked,
               approve_buyins: q("c-approve").checked, allow_rathole: q("c-rathole").checked,
               club_id: clubs.length > 1 ? q("c-club").value : cur.id,
+              remembered: !!prefs,  // also bring Manage's settings from last time
             };
             try {
               const s = await C().j("/games/api/tables", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
@@ -640,6 +663,7 @@
       `<input type="range" id="md-range" min="${lo}" max="${hi}" step="${Math.max(1, Math.round(o.step || 100))}" value="${cents}"/>` +
       `<div class="sz-row"><div class="sz-presets" id="md-presets"></div><div class="sz-amt">${moneyInput("md-input", cents)}</div></div>` +
       `<small class="muted">${esc(o.hint || "")}</small>`;
+    if (o.footer) body.appendChild(o.footer);
     const big = body.querySelector("#md-big"), antes = body.querySelector("#md-antes"), range = body.querySelector("#md-range"), input = body.querySelector("#md-input");
     const presets = body.querySelector("#md-presets");
     const sync = (from) => {
@@ -694,10 +718,14 @@
       // the host allows ratholing: ask which way the chips go
       const floor = s.stakes.ante_cents + s.stakes.bb_cents;
       const canTake = me.stack_cents - floor >= s.stakes.bb_cents;
-      const body = h("div", { class: "seg", style: "width:100%" });
-      body.innerHTML = `<button type="button" data-v="add" class="on">Add chips</button><button type="button" data-v="remove" ${canTake ? "" : "disabled"}>Take chips off</button>`;
+      const seg = h("div", { class: "seg", style: "width:100%" });
+      seg.innerHTML = `<button type="button" data-v="add" class="on">Add chips</button><button type="button" data-v="remove" ${canTake ? "" : "disabled"}>Take chips off</button>`;
       let pick = "add";
-      body.addEventListener("click", (e) => { const b = e.target.closest("button[data-v]"); if (!b || b.disabled) return; pick = b.dataset.v; body.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b)); });
+      seg.addEventListener("click", (e) => { const b = e.target.closest("button[data-v]"); if (!b || b.disabled) return; pick = b.dataset.v; seg.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b)); });
+      const body = h("div", { style: "display:flex;flex-direction:column;gap:14px" });
+      body.appendChild(seg);
+      const auto = autoChipsRow(s, me);
+      if (auto) body.appendChild(auto);
       return openModal({ title: "Chips", sub: `Your stack is ${d2(me.stack_cents)}. This table lets players take chips off between hands.`, body, autofocus: false,
         buttons: [{ label: "Cancel", cls: "ghost" }, { label: "Continue", cls: "primary", onClick: () => { setTimeout(() => openTopUp(pick === "remove" ? "remove" : "add"), 260); } }] });
     }
@@ -708,6 +736,7 @@
       title: "Add chips", sub: `Your stack is ${d2(me.stack_cents)}.` + (holding ? " They are added when this hand ends." : ""), lo: lim.lo, hi: lim.hi, start: dflt,
       ante: s.stakes.ante_cents, step: s.stakes.bb_cents, okLabel: s.needs_approval ? "Request chips" : "Add chips",
       hint: (s.needs_approval ? "The host approves buy-ins here. " : "") + (lim.capped ? `You can top up to ${d2(s.settings.max_buyin_cents)} in total.` : ""),
+      footer: autoChipsRow(s, me),
       // "To $100" tops the stack up to a buy-in; "+$100" adds one on top
       presets: [
         ...(me.stack_cents > 0 && s.stakes.default_buyin_cents > me.stack_cents
@@ -744,6 +773,32 @@
         HG.sound && HG.sound.play("chips");
       },
     });
+  }
+  // What automatic chips do for this player here, for the places people look
+  // (2026-09-26): the choice used to live only behind the top bar's person icon,
+  // so a table set to "Players choose" looked like it had no such option.
+  function autoChipsNow(s, me) {
+    const top = s.auto_topup.mode, set = s.auto_stack.mode;
+    const setOn = set !== "off" && me.auto_stack_cents > 0;
+    const topOn = !setOn && top !== "off" && me.topup_target_cents > 0;
+    let text = setOn ? `Your stack resets to ${d2(me.auto_stack_cents)} before every hand.`
+      : topOn ? `Topped back up to ${d2(me.topup_target_cents)} when you drop below ${d2(me.topup_below_cents || me.topup_target_cents)}.`
+      : top === "player" || set === "player" ? "Off. This table lets you choose." : "Off for you.";
+    if ((setOn && set === "host") || (topOn && top === "host")) text += " Set by the host.";
+    if ((setOn || topOn) && s.needs_approval) text += " Runs once the host trusts you.";
+    return { any: top !== "off" || set !== "off", choose: top === "player" || set === "player", text };
+  }
+  function autoChipsRow(s, me) {
+    const a = autoChipsNow(s, me);
+    if (!a.any) return null;
+    const row = h("div", { class: "setrow" }, `<div><b>Automatic chips</b><small>${esc(a.text)}</small></div>`);
+    row.appendChild(h("button", {
+      type: "button", class: "btn sm",
+      onclick: () => { closeTop(); setTimeout(openAutoChips, 260); },
+    }, a.choose ? "Change" : "Details"));
+    const box = h("div", { class: "grp" });
+    box.appendChild(row);
+    return box;
   }
   function openAutoChips() {
     const s = C().G.state;
@@ -789,6 +844,81 @@
       }] : [{ label: "Done", cls: "primary" }],
     });
   }
+  // --------------------------------------------------------- profile picture
+  // (2026-09-26) The browser crops the middle square of the photo and re-encodes
+  // it at 256 px (small, and free of the photo's metadata) before it is sent.
+  function squareDataUrl(file) {
+    return new Promise((resolve, reject) => {
+      if (!/^image\//.test(file.type || "")) return reject(new Error("That file isn't a picture"));
+      if (file.size > 30e6) return reject(new Error("That picture is too large"));
+      const fr = new FileReader();
+      fr.onerror = () => reject(new Error("Couldn't read that file"));
+      fr.onload = () => {
+        const img = new Image();
+        img.onerror = () => reject(new Error("Couldn't open that picture"));
+        img.onload = () => {
+          const side = Math.min(img.naturalWidth, img.naturalHeight);
+          if (!side) return reject(new Error("Couldn't open that picture"));
+          const c = document.createElement("canvas");
+          c.width = c.height = 256;
+          const g = c.getContext("2d");
+          g.imageSmoothingQuality = "high";
+          g.drawImage(img, (img.naturalWidth - side) / 2, (img.naturalHeight - side) / 2, side, side, 0, 0, 256, 256);
+          let out = c.toDataURL("image/webp", 0.86);
+          if (!out.startsWith("data:image/webp")) out = c.toDataURL("image/jpeg", 0.88);  // (no WebP encoder)
+          resolve(out);
+        };
+        img.src = fr.result;
+      };
+      fr.readAsDataURL(file);
+    });
+  }
+  function renderMe() {
+    const me = C().G.me || {};
+    const nm = me.name || me.email || "";
+    $("userchip").innerHTML = `${avatar(nm, nm, "sm", me.avatar)}<span>${esc(nm)}</span>`;
+  }
+  function setMyAvatar(url) {  // the lobby and the table views carry it (my_avatar)
+    const me = C().G.me || {};
+    if (url === undefined || (me.avatar || null) === (url || null)) return;
+    me.avatar = url || null;
+    renderMe();
+  }
+  async function saveAvatar(dataUrl) {
+    try {
+      const out = await C().j("/games/api/me/avatar", dataUrl
+        ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ data_url: dataUrl }) }
+        : { method: "DELETE" });
+      setMyAvatar(out.avatar || null);
+      toast(out.avatar ? "Picture saved" : "Picture removed", "ok");
+    } catch (e) { toast(e.message, "err"); return false; }
+  }
+  function openAvatar() {
+    const me = C().G.me || {};
+    const nm = me.name || me.email || "?";
+    let picked = null;
+    const body = h("div", { class: "avup" });
+    const paint = () => {
+      body.innerHTML = `<div class="avup-pic">${avatar(nm, nm, "xl", picked || me.avatar)}</div>` +
+        `<div class="avup-side"><label class="btn" for="avup-file">${icon("i-user", "sm")}Choose a photo</label>` +
+        `<input type="file" id="avup-file" accept="image/*" hidden/>` +
+        `<small class="muted">We use a square from the middle of it. Everyone in your clubs sees it at the table and on the club page.</small></div>`;
+      body.querySelector("#avup-file").addEventListener("change", async (e) => {
+        const f = e.target.files && e.target.files[0];
+        if (!f) return;
+        try { picked = await squareDataUrl(f); paint(); } catch (err) { toast(err.message, "err"); }
+      });
+    };
+    paint();
+    const buttons = [];
+    if (me.avatar) buttons.push({ label: "Remove", cls: "ghost", onClick: () => saveAvatar(null) });
+    buttons.push({ label: "Cancel", cls: "ghost" }, {
+      label: "Save", cls: "gold",
+      onClick: () => { if (!picked) { toast("Choose a photo first", "err"); return false; } return saveAvatar(picked); },
+    });
+    openModal({ title: "Your picture", body, buttons, autofocus: false });
+  }
+
   // ------------------------------------------------------------ preferences
   function openPrefs() {
     const p = C().G.prefs;
@@ -875,7 +1005,7 @@
       const log = $("chat-log"), sc = log.parentNode;
       const stick = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 40;
       log.innerHTML = items.length ? items.map((it) => it.chat
-        ? `<div class="msg ${it.chat.name === myName ? "me" : ""}">${avatar(it.chat.name, it.chat.name, "sm")}<div class="body"><div class="who">${esc(it.chat.name)}<time>${it.t ? hhmm(it.t) : ""}</time></div><div class="txt">${esc(it.chat.text)}</div></div></div>`
+        ? `<div class="msg ${it.chat.name === myName ? "me" : ""}">${avatar(it.chat.name, it.chat.name, "sm", it.chat.avatar)}<div class="body"><div class="who">${esc(it.chat.name)}<time>${it.t ? hhmm(it.t) : ""}</time></div><div class="txt">${esc(it.chat.text)}</div></div></div>`
         : `<div class="msg sys ${it.ev.kind === "win" ? "win" : ""}">${esc(it.ev.text)}</div>`).join("")
         : `<div class="muted" style="text-align:center;padding:28px 10px">Say hi — the dealer posts joins, rebuys and results here too.</div>`;
       if (stick || firstPaint) sc.scrollTop = sc.scrollHeight;
@@ -896,14 +1026,14 @@
     const sig = `${s.hand_no}:${hist.length}:${C().G.prefs.unit}`;
     if (sig === U.logSig) return;
     U.logSig = sig;
-    const names = {};
-    s.seats.forEach((x) => { if (!x.empty) names[x.seat] = x.name; });
+    const names = {}, pics = {};
+    s.seats.forEach((x) => { if (!x.empty) { names[x.seat] = x.name; pics[x.seat] = x.avatar; } });
     let html = "", street = null;
     hist.forEach((x) => {
       if (x.street !== street) { street = x.street; html += `<div class="log-street">${esc(street)}</div>`; }
       const k = x.action === 0 ? "fold" : x.action === 1 ? (x.chips > 0 ? "call" : "check") : x.action === 7 ? "allin" : "raise";
       const lb = k === "fold" ? "Fold" : k === "check" ? "Check" : k === "call" ? "Call " + C().fmtAmt(x.cents, s) : (k === "allin" ? "All-in " : "Raise to ") + C().fmtAmt(x.to_cents, s);
-      html += `<div class="log-row k-${k}">${avatar(names[x.seat] || "?", names[x.seat], "sm")}<span class="nm">${esc(names[x.seat] || "Seat " + (x.seat + 1))}</span><span class="lb">${lb}</span></div>`;
+      html += `<div class="log-row k-${k}">${avatar(names[x.seat] || "?", names[x.seat], "sm", pics[x.seat])}<span class="nm">${esc(names[x.seat] || "Seat " + (x.seat + 1))}</span><span class="lb">${lb}</span></div>`;
     });
     $("log-body").innerHTML = (s.hand_no ? `<div class="muted num" style="margin-bottom:10px">Hand #${s.hand_no} · ante ${d2(s.stakes.ante_cents)}</div>` : "") +
       (html || `<div class="muted" style="text-align:center;padding:28px 10px">${s.phase === "in_hand" ? "No action yet — everyone anted." : "The action of the current hand shows up here."}</div>`);
@@ -1069,7 +1199,7 @@
         const cards = p.folded && !known ? "" : `<span class="mini-cards" data-cards="${known ? x.hole.join(",") : "x,x,x,x,x"}"></span>`;
         const res = st.over ? `<b class="num ${x.delta_cents > 0 ? "pos" : x.delta_cents < 0 ? "neg" : "muted"}">${x.delta_cents > 0 ? "+" : ""}${d2(x.delta_cents)}</b>` : "";
         html += `<div class="rp-seat ${p.folded ? "folded" : ""} ${acting ? "acting" : ""}" style="left:${px}%;top:${py}%">${cards}` +
-          `<div class="rp-plate">${avatar(x.name, x.name, "sm")}<div><b>${esc(names[x.seat])}${x.seat === rec.button ? ' <i class="rp-d">D</i>' : ""}</b><span class="num">${d2(Math.max(0, p.stack))}</span></div></div>` +
+          `<div class="rp-plate">${avatar(x.name, x.name, "sm", x.avatar)}<div><b>${esc(names[x.seat])}${x.seat === rec.button ? ' <i class="rp-d">D</i>' : ""}</b><span class="num">${d2(Math.max(0, p.stack))}</span></div></div>` +
           (p.bet > 0 ? `<span class="rp-bet num">${d2(p.bet)}</span>` : "") + res + `</div>`;
       });
       html += `<div class="rp-center"><span class="rp-pot num">Pot ${d2(st.pot)}</span>` +
@@ -1309,7 +1439,7 @@
     pod.hidden = !top.length;
     const step = (p, place) => !p ? `<div class="pod-col p${place} empty"><div class="pod-step"><b>${place}</b></div></div>` :
       `<button type="button" class="pod-col p${place}" data-uid="${p.user_id}" title="Open ${esc(p.name)}'s hands">` +
-      `${place === 1 ? `<span class="pod-crown">${icon("i-crown")}</span>` : ""}${avatar(p.name, p.name, "lg")}` +
+      `${place === 1 ? `<span class="pod-crown">${icon("i-crown")}</span>` : ""}${avatar(p.name, p.name, "lg", p.avatar)}` +
       `<span class="pod-name">${esc(p.name)}${p.is_me ? " <i>you</i>" : ""}</span>` +
       `<span class="pod-acc num">${accTxt(p.accuracy)}</span>` +
       `<span class="pod-sub">${p.graded} decision${p.graded === 1 ? "" : "s"}${p.graded < MIN_RANKED ? " · provisional" : ""}</span>` +
@@ -1319,7 +1449,7 @@
     $("lb-players").innerHTML = players.map((p) => {
       const pct = p.accuracy == null ? 0 : Math.max(0, Math.min(100, p.accuracy));
       return `<button type="button" class="plcard ${p.is_me ? "me" : ""}" data-uid="${p.user_id}">` +
-        `<span class="plcard-top">${avatar(p.name, p.name)}<span class="plcard-name"><b>${esc(p.name)}</b><small>${p.hands} hand${p.hands === 1 ? "" : "s"} · ${p.sessions} session${p.sessions === 1 ? "" : "s"}</small></span>` +
+        `<span class="plcard-top">${avatar(p.name, p.name, "", p.avatar)}<span class="plcard-name"><b>${esc(p.name)}</b><small>${p.hands} hand${p.hands === 1 ? "" : "s"} · ${p.sessions} session${p.sessions === 1 ? "" : "s"}</small></span>` +
         `<b class="num plcard-net ${tone(p.net_cents)}">${signed(p.net_cents)}</b></span>` +
         `<span class="plcard-acc"><span class="plcard-meter"><i style="width:${pct}%"></i></span><b class="num">${accTxt(p.accuracy)}</b></span>` +
         `<span class="plcard-foot"><span>Accuracy${p.graded ? ` · ${p.graded} decisions` : " · not rated yet"}</span><span>Won ${p.hands ? Math.round((100 * p.wins) / p.hands) : 0}% · best ${d2(p.best_cents)}</span></span></button>`;
@@ -1347,10 +1477,10 @@
       return `<td class="num ${tone(v)}" style="background:rgba(${v > 0 ? "53,200,120" : "242,86,106"},${a.toFixed(2)})">${signed(v)}</td>`;
     };
     const body = h("div", { class: "mx-wrap" });
-    body.innerHTML = `<table class="mx"><thead><tr><th class="mx-corner">won from →</th>${ps.map((p) => `<th title="${esc(p.name)}">${avatar(p.name, p.name, "sm")}<span>${esc(p.name)}</span></th>`).join("")}<th class="mx-total">Total</th></tr></thead><tbody>` +
+    body.innerHTML = `<table class="mx"><thead><tr><th class="mx-corner">won from →</th>${ps.map((p) => `<th title="${esc(p.name)}">${avatar(p.name, p.name, "sm", p.avatar)}<span>${esc(p.name)}</span></th>`).join("")}<th class="mx-total">Total</th></tr></thead><tbody>` +
       ps.map((r) => {
         const total = ps.reduce((acc, c) => acc + (net[r.user_id + ":" + c.user_id] || 0), 0);
-        return `<tr><th data-uid="${r.user_id}" title="Open ${esc(r.name)}'s hands">${avatar(r.name, r.name, "sm")}<span>${esc(r.name)}${r.is_me ? " (you)" : ""}</span></th>` +
+        return `<tr><th data-uid="${r.user_id}" title="Open ${esc(r.name)}'s hands">${avatar(r.name, r.name, "sm", r.avatar)}<span>${esc(r.name)}${r.is_me ? " (you)" : ""}</span></th>` +
           ps.map((c) => (c.user_id === r.user_id ? `<td class="mx-self"></td>` : cell(net[r.user_id + ":" + c.user_id] || 0))).join("") +
           `<td class="num mx-total ${tone(total)}">${signed(total)}</td></tr>`;
       }).join("") + `</tbody></table>` +
@@ -1446,19 +1576,21 @@
         `<div class="field"><span>Seats</span>${segHtml("m-seats", [2, 3, 4, 5, 6, 7, 8].map((n) => [n, String(n)]), s.num_seats)}<small>Between hands only — the higher seats must be empty to shrink</small></div></div>` +
         `<div class="grp"><h4>Buy-ins</h4><div class="row3"><label class="field"><span>Minimum</span>${moneyInput("m-min", set.min_buyin_cents)}</label><label class="field"><span>Default</span>${moneyInput("m-dflt", st.default_buyin_cents)}</label><label class="field"><span>Maximum</span>${moneyInput("m-max", set.max_buyin_cents)}</label></div><p>0 = no limit. The maximum also caps top-ups.</p></div>` +
         `<div class="grp"><h4>Privacy &amp; extras</h4><div class="setrow"><div><b>List in the lobby</b><small>Off = link only</small></div><label class="switch"><input type="checkbox" id="m-listed" ${set.listed ? "checked" : ""}/><i></i></label></div>` +
-        `<div class="setrow"><div><b>Accuracy marks on everyone's actions</b><small>The replayer rates every decision against the network. Off = players only see marks on their own</small></div><label class="switch"><input type="checkbox" id="m-grades" ${set.show_grades ? "checked" : ""}/><i></i></label></div>` +
+        `<div class="setrow"><div><b>Accuracy marks on shown hands</b><small>Everyone sees the network's marks on their own decisions, and on hands tabled at showdown — never on a mucked hand. Off = only their own</small></div><label class="switch"><input type="checkbox" id="m-grades" ${set.show_grades ? "checked" : ""}/><i></i></label></div>` +
         `<div class="setrow"><div><b>Rabbit hunting</b><small>Let players peek at the undealt streets after a fold-out</small></div><label class="switch"><input type="checkbox" id="m-rabbit" ${set.allow_rabbit ? "checked" : ""}/><i></i></label></div>` +
         `<div class="setrow"><div><b>Players may take chips off the table</b><small>Ratholing allowed: anyone can pocket part of their stack between hands (a player always keeps an ante + 1 bb)</small></div><label class="switch"><input type="checkbox" id="m-rathole" ${set.allow_rathole ? "checked" : ""}/><i></i></label></div></div>`;
     } else if (U.drawerTab === "chips") {
       const modeSeg = (id, cur) => `<div class="seg as-modes" id="${id}">${[["off", "Off"], ["host", "Host sets"], ["player", "Players choose"]].map(([v, l]) => `<button type="button" data-v="${v}" class="${cur === v ? "on" : ""}">${l}</button>`).join("")}</div>`;
       html += `<div class="grp"><h4>Buy-in approval</h4><div class="setrow"><div><b>I approve every buy-in</b><small>Sit-downs and top-ups wait for your OK. Players you trust never wait.</small></div><label class="switch"><input type="checkbox" id="m-approve" ${set.approve_buyins ? "checked" : ""}/><i></i></label></div>` +
         (nReq ? (s.requests || []).map((r) =>
-          `<div class="prow req" data-req="${r.id}">${avatar(r.name, r.name)}<div class="who"><b>${esc(r.name)}</b><small>${r.kind === "sit" ? `wants seat ${r.seat + 1} with ${d2(r.amount_cents)}` : `wants to add ${d2(r.amount_cents)}`}</small></div>` +
+          `<div class="prow req" data-req="${r.id}">${avatar(r.name, r.name, "", r.avatar)}<div class="who"><b>${esc(r.name)}</b><small>${r.kind === "sit" ? `wants seat ${r.seat + 1} with ${d2(r.amount_cents)}` : `wants to add ${d2(r.amount_cents)}`}</small></div>` +
           `<div class="acts"><button class="btn sm primary" data-ok="${r.id}">Approve</button><button class="btn sm gold" data-okt="${r.id}" title="Approve, and never ask again for this player">+ Trust</button><button class="btn sm" data-edit="${r.id}" title="Change the amount, then approve">Edit</button><button class="icon-btn" data-no="${r.id}" title="Decline" style="color:#ff9aa6">${icon("i-x")}</button></div></div>`).join("")
           : (set.approve_buyins ? `<p>No one is waiting. Trust regulars from the Players tab so the game never stops for them.</p>` : "")) + `</div>` +
         `<div class="grp"><h4>Auto top-up</h4><p>When a stack drops below a threshold it is topped back up before the next hand. Winnings stay on the table — no ratholing.</p>${modeSeg("m-top", s.auto_topup.mode)}` +
+        (s.auto_topup.mode === "player" ? `<small class="muted">Each player picks their own: they tap their seat (or Add chips) › Automatic chips.</small>` : "") +
         (s.auto_topup.mode === "host" ? `<div class="row2"><label class="field"><span>Top up to</span>${moneyInput("m-top-target", s.auto_topup.all_target_cents || st.default_buyin_cents)}</label><label class="field"><span>When below</span>${moneyInput("m-top-below", s.auto_topup.all_below_cents || s.auto_topup.all_target_cents || st.default_buyin_cents)}</label></div><button class="btn sm" id="m-top-apply">Apply to everyone</button><small class="muted">Per-player amounts: tap a player's seat.</small>` : "") + `</div>` +
         `<div class="grp"><h4>Set stack every hand</h4><p>Every stack is reset to one amount before EVERY deal — short stacks top up, big stacks bank the difference. For high-action games where ratholing is fine.</p>${modeSeg("m-auto", s.auto_stack.mode)}` +
+        (s.auto_stack.mode === "player" ? `<small class="muted">Each player picks their own: they tap their seat (or Add chips) › Automatic chips.</small>` : "") +
         (s.auto_stack.mode === "host" ? `<div class="sz-row"><label class="field" style="flex:1"><span>Stack for everyone</span>${moneyInput("m-auto-all", s.auto_stack.all_cents || st.default_buyin_cents)}</label><button class="btn sm" id="m-auto-apply" style="align-self:flex-end;height:40px">Apply</button></div><small class="muted">Per-player amounts: tap a player's seat. Set-stack wins when a player has both.</small>` : "") + `</div>` +
         (set.approve_buyins ? `<small class="muted">While you approve buy-ins, automatic chips only run for you and the players you trust.</small>` : "");
     } else if (U.drawerTab === "pace") {
@@ -1470,7 +1602,7 @@
     } else if (U.drawerTab === "players") {
       const seated = s.seats.filter((x) => !x.empty);
       html += `<div class="grp"><h4>${seated.length} seated</h4>` + seated.map((x) =>
-        `<div class="prow" data-uid="${x.user_id}">${avatar(x.name, x.name)}<div class="who"><b>${esc(x.name)}${x.is_host ? ' <span class="pill host" style="height:18px;font-size:10px">Host</span>' : ""}</b><small>${d2(x.stack_cents)}${x.sitting_out ? " · sitting out" : ""}${x.pending_remove ? " · leaving" : ""}</small></div>` +
+        `<div class="prow" data-uid="${x.user_id}">${avatar(x.name, x.name, "", x.avatar)}<div class="who"><b>${esc(x.name)}${x.is_host ? ' <span class="pill host" style="height:18px;font-size:10px">Host</span>' : ""}</b><small>${d2(x.stack_cents)}${x.sitting_out ? " · sitting out" : ""}${x.pending_remove ? " · leaving" : ""}</small></div>` +
         `<div class="acts">` +
         (x.user_id !== s.my_user_id ? `<button class="btn sm ${x.trusted ? "gold" : ""}" data-trust="${x.user_id}" data-on="${x.trusted ? 0 : 1}" title="${x.trusted ? "Trusted: buys in without asking. Click to stop trusting." : "Trust: let them buy in and top up without your approval"}">${icon("i-check", "sm")}${x.trusted ? "Trusted" : "Trust"}</button>` : "") +
         (x.pending_remove ? "" : `<button class="btn sm" data-away="${x.user_id}" data-on="${x.sitting_out ? 0 : 1}">${x.sitting_out ? (x.user_id === s.my_user_id ? "I'm back" : "Sit in") : "Sit out"}</button>`) +
@@ -1615,7 +1747,7 @@
     let cents = Math.max(lo, Math.min(hi, r.amount_cents));
     const body = h("div", { style: "display:flex;flex-direction:column;gap:14px" });
     body.innerHTML =
-      `<div class="req-head">${avatar(r.name, r.name)}<div><b>${esc(r.name)}</b><small>${r.kind === "sit" ? `wants seat ${r.seat + 1} with ${d2(r.amount_cents)}` : `wants to add ${d2(r.amount_cents)} (stack ${d2(stackNow)})`}</small></div></div>` +
+      `<div class="req-head">${avatar(r.name, r.name, "", r.avatar)}<div><b>${esc(r.name)}</b><small>${r.kind === "sit" ? `wants seat ${r.seat + 1} with ${d2(r.amount_cents)}` : `wants to add ${d2(r.amount_cents)} (stack ${d2(stackNow)})`}</small></div></div>` +
       `<div class="bigmoney"><span id="rq-big">${d2(cents)}</span><small id="rq-note"></small></div>` +
       `<input type="range" id="rq-range" min="${lo}" max="${hi}" step="${Math.max(1, st.bb_cents)}" value="${cents}"/>` +
       `<div class="sz-row"><div class="sz-presets" id="rq-presets"></div><div class="sz-amt">${moneyInput("rq-input", cents)}</div></div>` +
@@ -1657,18 +1789,23 @@
     const s = C().G.state;
     const x = s && s.seats[seatIdx];
     if (!x || x.empty) return;
-    if (s.is_host && x.request) return openRequestDialog(Object.assign({ user_id: x.user_id, name: x.name, seat: seatIdx }, x.request));
+    if (s.is_host && x.request) return openRequestDialog(Object.assign({ user_id: x.user_id, name: x.name, avatar: x.avatar, seat: seatIdx }, x.request));
     const mine = x.user_id === s.my_user_id;
     const row = (s.ledger || []).find((r) => r.user_id === x.user_id) || {};
     const st = ((U.hands && U.hands.stats) || []).find((r) => r.name === x.name) || {};
     const note = noteFor(x.user_id);
     const body = h("div", { style: "display:flex;flex-direction:column;gap:16px" });
     body.innerHTML =
-      `<div class="pcard-head">${avatar(x.name, x.name)}<div><b>${esc(x.name)}${mine ? " (you)" : ""}</b><span class="muted">Seat ${seatIdx + 1}${x.is_host ? " · host" : ""}${x.sitting_out ? " · sitting out" : ""}</span></div></div>` +
+      `<div class="pcard-head">${avatar(x.name, x.name, "", x.avatar)}<div><b>${esc(x.name)}${mine ? " (you)" : ""}</b><span class="muted">Seat ${seatIdx + 1}${x.is_host ? " · host" : ""}${x.sitting_out ? " · sitting out" : ""}</span></div></div>` +
       `<div class="pcard-stats"><div><b>${d2(x.stack_cents)}</b><small>Stack</small></div><div><b class="${row.net_cents > 0 ? "pos" : row.net_cents < 0 ? "neg" : ""}">${row.net_cents > 0 ? "+" : ""}${d2(row.net_cents || 0)}</b><small>Net</small></div>` +
       `<div><b>${st.hands != null ? st.hands : "–"}</b><small>Hands</small></div><div><b>${st.wins != null ? st.wins : "–"}</b><small>Won</small></div></div>` +
       (mine ? "" : `<div class="field"><span>Colour tag</span><div class="tagrow">${Object.entries(TAGS).map(([k, col]) => `<button type="button" data-tag="${k}" class="${note.tag === k ? "on" : ""}" style="--tc:${k === "none" ? "rgba(255,255,255,.12)" : col}" title="${k}"></button>`).join("")}</div></div>` +
         `<label class="field"><span>Private note</span><textarea class="input" id="pc-note" maxlength="500" placeholder="Only you can see this — it stays in this browser.">${esc(note.text)}</textarea></label>`);
+    // your own automatic chips (the host's own fields sit in the Host box below)
+    if (mine && s.status === "open" && seatIdx === s.my_seat && !(s.is_host && !autoChipsNow(s, x).choose)) {
+      const auto = autoChipsRow(s, x);
+      if (auto) body.appendChild(auto);
+    }
     if (s.is_host && s.status === "open") {
       const hostBox = h("div", { class: "grp" });
       hostBox.innerHTML = `<h4>Host</h4>` +
@@ -1761,9 +1898,14 @@
 
   // -------------------------------------------------------------------- init
   function init() {
-    const me = C().G.me || {};
-    $("userchip").innerHTML = `${avatar(me.name || me.email, me.name || me.email, "sm")}<span>${esc(me.name || me.email || "")}</span>`;
-    $("c-open").addEventListener("click", openCreate);
+    renderMe();
+    $("userchip").addEventListener("click", openAvatar);
+    // a profile picture that can't load leaves the initials under it
+    document.addEventListener("error", (e) => {
+      const t = e.target;
+      if (t && t.tagName === "IMG" && t.parentElement && t.parentElement.classList.contains("av")) t.remove();
+    }, true);
+    $("c-open").addEventListener("click", () => openCreate());
     $("lb-myhands").addEventListener("click", () => openMyHands(""));
     $("lb-h2h").addEventListener("click", openMatrix);
     $("lb-allsess").addEventListener("click", openSessions);
@@ -1813,6 +1955,7 @@
         "-",
         { icon: on ? "i-vol" : "i-mute", label: on ? "Sound on" : "Sound off", onClick: () => { C().savePrefs({ sound: !on }); renderSound(); } },
         { icon: "i-sliders", label: "Preferences", onClick: openPrefs },
+        { icon: "i-user", label: "Your picture…", onClick: openAvatar },
       ]);
     });
     $("tb-sound").addEventListener("click", () => { C().savePrefs({ sound: !C().G.prefs.sound }); renderSound(); if (C().G.prefs.sound) { HG.sound.unlock(); HG.sound.play("chip"); } });
@@ -1915,6 +2058,7 @@
   }
 
   function render(s, prev, opts) {
+    setMyAvatar(s.my_avatar);
     renderJoinReqs(s.join_requests);
     renderTop(s);
     HG.table.render(s, prev, opts);
@@ -1927,7 +2071,7 @@
   HG.ui = {
     init, render, renderLobby, showLobby, showTable, renderConn, toast, openModal, confirmDialog, openMenu, closeTop,
     openSit, openTopUp, openAutoChips, openPlayer, openRequest, openLeave, openMyHands, noteFor, TAGS, openDrawer, openInfo, openPrefs, openHand, copyInvite, setRail, onMyTurn, renderDock: (s) => HG.play && HG.play.render(s, s),
-    openInvite, openClubGate, openClubSettings,
+    openInvite, openClubGate, openClubSettings, openAvatar, setMyAvatar,
     onClock: (left, tm) => HG.play && HG.play.onClock(left, tm),
   };
 })();

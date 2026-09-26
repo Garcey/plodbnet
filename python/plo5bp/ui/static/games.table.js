@@ -491,7 +491,7 @@
         '<div class="seat-cards"></div>' +
         '<div class="seat-main">' +
         '<div class="seat-av"><svg class="actor-timer" viewBox="0 0 100 100"><circle class="trk" cx="50" cy="50" r="46"/><circle class="arc" cx="50" cy="50" r="46"/></svg>' +
-        `<span class="av-txt"></span><span class="av-count"></span><span class="av-crown">${icon("i-crown")}</span></div>` +
+        `<span class="av-txt"></span><img class="av-img" alt="" hidden/><span class="av-count"></span><span class="av-crown">${icon("i-crown")}</span></div>` +
         '<div class="seat-plate"><span class="seat-pos"></span><div class="seat-name"></div><div class="seat-stack num"></div></div>' +
         "</div>" +
         '<div class="seat-badge"></div><div class="seat-hand"></div>';
@@ -507,11 +507,14 @@
       e.querySelector(".seat-main").addEventListener("click", () => HG.ui && HG.ui.openPlayer(i));
       e.appendChild(sit);
       seatsEl.appendChild(e);
+      const avImg = e.querySelector(".av-img");
+      avImg.addEventListener("error", () => { avImg.hidden = true; });  // (the initials show again)
       const arc = e.querySelector(".arc");
       arc.style.strokeDasharray = String(RING);
       T.seats.push({
         el: e, cards: e.querySelector(".seat-cards"), main: e.querySelector(".seat-main"), av: e.querySelector(".seat-av"),
-        avTxt: e.querySelector(".av-txt"), count: e.querySelector(".av-count"), arc,
+        avTxt: e.querySelector(".av-txt"), avImg: e.querySelector(".av-img"), avUrl: null,
+        count: e.querySelector(".av-count"), arc,
         name: e.querySelector(".seat-name"), stack: e.querySelector(".seat-stack"), pos: e.querySelector(".seat-pos"),
         badge: e.querySelector(".seat-badge"), hand: e.querySelector(".seat-hand"), sit,
         stackCents: null, cardEls: [], nameKey: null, folded: false,
@@ -609,11 +612,24 @@
   function bubble(i, text, emote) {
     const sv = T.seats[i];
     if (!sv) return;
-    sv.el.querySelectorAll(".seat-bubble" + (emote ? ".emote" : ":not(.emote)")).forEach((x) => x.remove());
+    // On the fx layer, not inside the seat (2026-09-26): the viewer's own hole
+    // cards sit in a layer above every seat and hid their own emotes and chat.
+    // Your bubble rises from the top of your cards, everyone else's from their seat.
+    const fx = $("fx"), kind = emote ? "emote" : "chat";
+    fx.querySelectorAll(`.fx-bubble[data-seat="${i}"][data-kind="${kind}"]`).forEach((x) => x.remove());
+    const hole = $("hero-hole");
+    const mine = sv.el.classList.contains("is-hero") && !$("hero-zone").hidden && hole.childElementCount > 0;
+    const st = $("stage").getBoundingClientRect(), r = (mine ? hole : sv.el).getBoundingClientRect();
+    const at = el("div", "fx-bubble");
+    at.dataset.seat = String(i);
+    at.dataset.kind = kind;
+    at.style.left = r.left + r.width / 2 - st.left + "px";
+    at.style.top = r.top - st.top + "px";
     const b = el("div", "seat-bubble" + (emote ? " emote" : ""));
     b.textContent = text;
-    sv.el.appendChild(b);
-    setTimeout(() => b.remove(), emote ? 2700 : 4100);
+    at.appendChild(b);
+    fx.appendChild(at);
+    setTimeout(() => at.remove(), emote ? 2700 : 4100);
   }
 
   // -------------------------------------------------------------- seat update
@@ -655,6 +671,7 @@
       sv.hand.innerHTML = ""; sv.hand.dataset.h = "";
       e.classList.remove("is-hero", "is-actor", "is-folded", "is-away", "is-winner", "is-out", "is-host", "t-warn", "t-crit", "t-bank");
       sv.stackCents = null; sv.nameKey = null; sv.folded = false;
+      if (sv.avUrl) { sv.avUrl = null; sv.avImg.hidden = true; sv.avImg.removeAttribute("src"); }
       return;
     }
     const key = seat.user_id + "|" + seat.name;
@@ -664,6 +681,12 @@
       sv.name.title = seat.name || "";
       sv.avTxt.textContent = initials(seat.name);
       sv.av.style.setProperty("--h", String(hueOf(seat.name)));  // by NAME: history / lobby rows carry no ids
+    }
+    // the profile picture over the initials (2026-09-26)
+    const pic = seat.avatar || null;
+    if (sv.avUrl !== pic) {
+      sv.avUrl = pic;
+      if (pic) { sv.avImg.src = pic; sv.avImg.hidden = false; } else { sv.avImg.hidden = true; sv.avImg.removeAttribute("src"); }
     }
     // my private colour tag for this player (games.ui.js, localStorage)
     const tag = HG.ui && seat.user_id !== s.my_user_id ? HG.ui.noteFor(seat.user_id).tag : "none";

@@ -9,6 +9,7 @@ exactly what the engine paid them.
 
 from __future__ import annotations
 
+import json
 import random
 import sys
 
@@ -226,13 +227,17 @@ def test_every_player_decision_is_graded_in_the_background(cast, hg):
     _post(p[0], gid, "run", {"running": True})
     _bet_and_fold_out(cast, gid)
     assert hg.wait_for_grading(30.0), "the grader never finished"
-    det = p[0].get(f"/games/api/tables/{gid}/hands/1").json()
-    assert det["grades"] and det["grades_public"] is True
-    assert {g["i"] for g in det["grades"]} == set(range(len(det["actions"]))), "one grade per player action"
-    for g in det["grades"]:
+    raw = _stored(hg, gid, 1)
+    assert {g["i"] for g in raw["grades"]} == set(range(len(raw["actions"]))), "one grade per player action"
+    for g in raw["grades"]:
         assert 0.0 <= g["score"] <= 100.0
         assert g["cat"] in ("best", "correct", "inaccuracy", "wrong", "blunder")
-        assert g["seat"] == det["actions"][g["i"]]["seat"]
+        assert g["seat"] == raw["actions"][g["i"]]["seat"]
+    # nobody reached showdown: everyone sees the marks on their own decisions only
+    for i in range(3):
+        det = p[i].get(f"/games/api/tables/{gid}/hands/1").json()
+        assert det["grades_public"] is True
+        assert det["grades"] and {g["seat"] for g in det["grades"]} == {i}
     lst = p[0].get(f"/games/api/tables/{gid}/hands").json()
     assert lst["hands"][0]["my_accuracy"] is not None
     assert all(r["accuracy"] is not None and r["graded"] >= 1 for r in lst["stats"])
@@ -251,6 +256,64 @@ def test_grades_can_be_limited_to_your_own_actions(cast, hg):
         det = p[i].get(f"/games/api/tables/{gid}/hands/1").json()
         assert det["grades_public"] is False
         assert det["grades"] and all(g["seat"] == i for g in det["grades"])
+
+
+def _stored(hg, gid, hand_no):
+    row = hg.pub.DB.one("SELECT summary FROM homegame_hands WHERE game_id=? AND hand_no=?", (gid, hand_no))
+    return json.loads(row["summary"])
+
+
+def _showdown_with_a_fold(cast, gid, folder):
+    """The first other player to act bets the minimum, `folder` folds to it, the
+    rest call and check it down: a showdown with one mucked hand."""
+    bet = False
+    for _ in range(60):
+        cl, s = _actor(cast, gid)
+        if cl is None:
+            return
+        if s["actor"] == folder:
+            _post(cl, gid, "act", {"gate": "fold" if bet and s["legal"]["fold"] else "check_call"})
+        elif not bet:
+            assert _post(cl, gid, "act", {"gate": "raise", "raise_to_chips":
+                                          s["raise_bounds"]["min_chips"] + s["street_commit_chips"]}).status_code == 200
+            bet = True
+        else:
+            _post(cl, gid, "act", {"gate": "check_call"})
+
+
+def test_grades_follow_the_cards_a_tabled_hand_yes_a_mucked_hand_no(cast, hg):
+    """(owner, 2026-09-26) You see the network's marks on your own decisions and
+    on hands that reached showdown — never on a hand that was mucked, in the
+    replayer or in anyone's history — and the hidden marks still count."""
+    p = cast["p"]
+    gid = _table(cast, 3)
+    _post(p[0], gid, "run", {"running": True})
+    _showdown_with_a_fold(cast, gid, folder=2)
+    t = hg.HUB.get(gid)
+    with t.lock:  # skip the runout's reveal pauses
+        if t.runout_active and t.runout_started_mono is not None:
+            t.runout_started_mono -= 600.0
+    assert hg.wait_for_grading(30.0)
+    raw = _stored(hg, gid, 1)
+    assert raw["showdown"] and {s["seat"] for s in raw["seats"] if s["shown"]} == {0, 1}
+    assert {g["seat"] for g in raw["grades"]} == {0, 1, 2}
+
+    def marks(i):
+        return {g["seat"] for g in p[i].get(f"/games/api/tables/{gid}/hands/1").json()["grades"]}
+
+    assert marks(0) == {0, 1} and marks(1) == {0, 1}, "bob mucked: his marks stay hidden"
+    assert marks(2) == {0, 1, 2}, "your own marks, plus the hands that were tabled"
+    ids = {x["name"]: x["user_id"] for x in p[0].get("/games/api/community").json()["players"]}
+    theirs = p[0].get(f"/games/api/players/{ids['bob']}/hands", params={"game": gid}).json()["hands"][0]
+    assert theirs["my_hole"] is None and theirs["accuracy"] is None, "no cards, no marks"
+    for key in ("accuracy", "time"):  # a sort can't dig the hidden marks up either
+        assert p[0].get(f"/games/api/players/{ids['bob']}/hands", params={"sort": key}).json()["hands"][0]["accuracy"] is None
+    own = p[2].get(f"/games/api/players/{ids['bob']}/hands", params={"game": gid}).json()["hands"][0]
+    assert own["my_hole"] and own["accuracy"] is not None
+    tabled = p[2].get(f"/games/api/players/{ids['me']}/hands", params={"game": gid}).json()["hands"][0]
+    assert tabled["my_hole"] and tabled["accuracy"] is not None, "a tabled hand keeps both"
+    st = p[0].get(f"/games/api/players/{ids['bob']}/stats").json()
+    assert st["graded"] >= 1 and st["accuracy"] is not None, "the hidden marks still count"
 
 
 def test_clock_actions_are_recorded_but_not_graded(cast, hg):

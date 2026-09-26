@@ -70,6 +70,8 @@ Chips in (2026-09-22):
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import html as html_mod
 import json
 import queue
@@ -317,6 +319,18 @@ CREATE TABLE IF NOT EXISTS homegame_club_requests (
   decided_at TEXT,
   PRIMARY KEY (club_id, user_id)
 );
+CREATE TABLE IF NOT EXISTS homegame_host_prefs (
+  user_id INTEGER PRIMARY KEY,
+  prefs TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS homegame_avatars (
+  user_id INTEGER PRIMARY KEY,
+  mime TEXT NOT NULL,
+  data BLOB NOT NULL,
+  version TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 """
 
 
@@ -504,6 +518,105 @@ def _display_name(user: Any) -> str:
         return name
     email = (user["email"] or "").strip()
     return email.split("@")[0] if email else f"player-{user['id']}"
+
+
+# --- profile pictures (owner, 2026-09-26) ----------------------------------------
+# The browser crops and re-encodes the photo to a small square (which also drops
+# its EXIF metadata) and uploads it; the server has no image library, so it only
+# accepts a PNG / JPEG / WebP whose header it can read, within size and pixel
+# limits, and serves it back with nosniff + a sandboxing CSP. Stored in SQLite
+# (small, and the nightly DB backup covers it). URLs carry a content version, so
+# a new picture is a new URL and a browser may cache any one of them for good.
+AVATAR_MAX_BYTES = 200_000
+AVATAR_MAX_PX = 1024
+AVATAR_HEADERS = {
+    "Cache-Control": "private, max-age=31536000, immutable",
+    "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": "default-src 'none'; sandbox",
+    "Content-Disposition": "inline",
+}
+_AVATAR_MIMES = ("image/png", "image/jpeg", "image/webp")
+_AVATAR_URLS: dict[int, str | None] = {}
+_AVATAR_LOCK = threading.Lock()
+
+
+def _image_info(b: bytes) -> tuple[str, int, int] | None:
+    """(mime, width, height) of a PNG / JPEG / WebP read from its header, or None."""
+    if b.startswith(b"\x89PNG\r\n\x1a\n") and len(b) >= 24 and b[12:16] == b"IHDR":
+        return "image/png", int.from_bytes(b[16:20], "big"), int.from_bytes(b[20:24], "big")
+    if b[:3] == b"\xff\xd8\xff":
+        i = 2
+        while i + 9 < len(b):
+            if b[i] != 0xFF:
+                return None
+            marker = b[i + 1]
+            if marker == 0xFF:  # fill byte
+                i += 1
+                continue
+            if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+                i += 2
+                continue
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                return "image/jpeg", int.from_bytes(b[i + 7:i + 9], "big"), int.from_bytes(b[i + 5:i + 7], "big")
+            i += 2 + int.from_bytes(b[i + 2:i + 4], "big")
+        return None
+    if b[:4] == b"RIFF" and b[8:12] == b"WEBP" and len(b) >= 30:
+        chunk = b[12:16]
+        if chunk == b"VP8 " and b[23:26] == b"\x9d\x01\x2a":
+            return ("image/webp", int.from_bytes(b[26:28], "little") & 0x3FFF,
+                    int.from_bytes(b[28:30], "little") & 0x3FFF)
+        if chunk == b"VP8L" and b[20] == 0x2F:
+            bits = int.from_bytes(b[21:25], "little")
+            return "image/webp", (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+        if chunk == b"VP8X":
+            return ("image/webp", int.from_bytes(b[24:27], "little") + 1,
+                    int.from_bytes(b[27:30], "little") + 1)
+    return None
+
+
+def _avatar_url(uid: Any) -> str | None:
+    """The user's picture URL (with its content version), or None — cached."""
+    if uid is None:
+        return None
+    uid = int(uid)
+    with _AVATAR_LOCK:
+        if uid in _AVATAR_URLS:
+            return _AVATAR_URLS[uid]
+    row = pub.DB.one("SELECT version FROM homegame_avatars WHERE user_id=?", (uid,))
+    url = f"/games/api/avatars/{uid}?v={row['version']}" if row is not None else None
+    with _AVATAR_LOCK:
+        _AVATAR_URLS[uid] = url
+    return url
+
+
+def _set_avatar(uid: int, data_url: Any) -> str | None:
+    """Store (or with None, remove) the user's picture; returns its new URL."""
+    uid = int(uid)
+    if data_url is None:
+        pub.DB.q("DELETE FROM homegame_avatars WHERE user_id=?", (uid,))
+    else:
+        m = re.fullmatch(r"data:(image/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=\s]+)", str(data_url))
+        if m is None or len(m.group(2)) > AVATAR_MAX_BYTES * 4 // 3 + 16:
+            raise HTTPException(status_code=400, detail="send a PNG, JPEG or WebP picture under 200 KB")
+        try:
+            data = base64.b64decode("".join(m.group(2).split()), validate=True)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail="that picture could not be read") from e
+        info = _image_info(data)
+        if info is None or info[0] != m.group(1) or len(data) > AVATAR_MAX_BYTES:
+            raise HTTPException(status_code=400, detail="that picture could not be read")
+        if not (16 <= info[1] <= AVATAR_MAX_PX and 16 <= info[2] <= AVATAR_MAX_PX):
+            raise HTTPException(status_code=400, detail="pictures must be 16 to 1024 pixels on a side")
+        version = hashlib.sha256(data).hexdigest()[:12]
+        pub.DB.q(
+            "INSERT INTO homegame_avatars(user_id,mime,data,version,updated_at) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET mime=excluded.mime, data=excluded.data, "
+            "version=excluded.version, updated_at=excluded.updated_at",
+            (uid, info[0], data, version, pub._now()),
+        )
+    with _AVATAR_LOCK:
+        _AVATAR_URLS.pop(uid, None)
+    return _avatar_url(uid)
 
 
 def _gate_key(gate: int | str) -> int:
@@ -1221,6 +1334,22 @@ def _apply_auto_stacks_locked(t: LiveTable) -> None:
         _persist_seats(t)
 
 
+# Said to the table when the host switches a mode: "players choose" is only
+# useful if the players hear about it (they set theirs from their own seat).
+_AUTO_MODE_LINES = {
+    "topup": {
+        "player": "players now set their own auto top-up (tap your seat)",
+        "host": "the host now sets auto top-up",
+        "off": "auto top-up is off",
+    },
+    "set": {
+        "player": "players now choose their own stack for every hand (tap your seat)",
+        "host": "the host now sets the stack for every hand",
+        "off": "set stack is off",
+    },
+}
+
+
 def _auto_stack_host_locked(t: LiveTable, uid: int, body: dict) -> None:
     _require_open(t)
     if uid != t.host_user_id:
@@ -1228,6 +1357,7 @@ def _auto_stack_host_locked(t: LiveTable, uid: int, body: dict) -> None:
             status_code=400, detail="only the host can change auto-stack settings"
         )
     body = body or {}
+    old_mode = t.auto_stack_mode
     with _mutation(t):
         if "mode" in body and body["mode"] is not None:
             mode = str(body["mode"]).strip().lower()
@@ -1262,6 +1392,9 @@ def _auto_stack_host_locked(t: LiveTable, uid: int, body: dict) -> None:
                     raise HTTPException(status_code=400, detail="player not seated")
                 p.auto_stack_cents = pcents
         _persist_seats(t)
+    if t.auto_stack_mode != old_mode:
+        _emit(t, "settings", f"Host: {_AUTO_MODE_LINES['set'][_norm_auto_mode(t.auto_stack_mode)]}")
+    _remember_host_prefs(t)
 
 
 def _auto_topup_host_locked(t: LiveTable, uid: int, body: dict) -> None:
@@ -1273,6 +1406,7 @@ def _auto_topup_host_locked(t: LiveTable, uid: int, body: dict) -> None:
             status_code=400, detail="only the host can change auto top-up settings"
         )
     body = body or {}
+    old_mode = t.topup_mode
     with _mutation(t):
         if body.get("mode") is not None:
             mode = str(body["mode"]).strip().lower()
@@ -1311,6 +1445,9 @@ def _auto_topup_host_locked(t: LiveTable, uid: int, body: dict) -> None:
                     _parse_cents(item, "below_cents", 0),
                 )
         _persist_seats(t)
+    if t.topup_mode != old_mode:
+        _emit(t, "settings", f"Host: {_AUTO_MODE_LINES['topup'][_norm_auto_mode(t.topup_mode)]}")
+    _remember_host_prefs(t)
 
 
 def _auto_chips_self_locked(t: LiveTable, uid: int, body: dict) -> None:
@@ -2179,6 +2316,7 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
             "empty": p is None,
             "user_id": p.user_id if p else None,
             "name": p.name if p else None,
+            "avatar": _avatar_url(p.user_id) if p else None,
             "sitting_out": bool(p.sitting_out) if p else False,
             "stack_chips": stack_chips,
             "stack_cents": stack_cents,
@@ -2433,10 +2571,12 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
         # buy-in approval: the host sees the queue, a player their own request
         "needs_approval": bool(t.approve_buyins) and not _is_trusted_cached(t, viewer_id),
         "requests": (
-            [{k: r[k] for k in ("id", "user_id", "name", "kind", "seat", "amount_cents")}
+            [{**{k: r[k] for k in ("id", "user_id", "name", "kind", "seat", "amount_cents")},
+              "avatar": _avatar_url(r["user_id"])}
              for r in t.requests]
             if viewer_id == t.host_user_id else []
         ),
+        "my_avatar": _avatar_url(viewer_id),
         "my_request": next(
             ({k: r[k] for k in ("id", "kind", "seat", "amount_cents")}
              for r in t.requests if r["user_id"] == viewer_id), None,
@@ -4071,6 +4211,7 @@ def _settings_locked(t: LiveTable, uid: int, body: dict) -> None:
                 pass
     for line in changed:
         _emit(t, "settings", f"Host: {line}")
+    _remember_host_prefs(t)
 
 
 def _validate_buyin_window(bb_cents: int, lo: int, hi: int, dflt: int) -> None:
@@ -4154,7 +4295,13 @@ def _hand_for_viewer(
 ) -> dict[str, Any]:
     """A stored hand as THIS viewer may see it: own cards, plus hands tabled
     at showdown or shown voluntarily. Everything else is face-down — same
-    rule as the live table (review 2026-09-20 G1/G2)."""
+    rule as the live table (review 2026-09-20 G1/G2).
+
+    Grades follow the cards (owner, 2026-09-26): you see the network's marks
+    on your own actions and on the actions of a hand you can see (tabled at
+    showdown or shown) — a mucked hand's marks would say what it was. The
+    table's ``show_grades`` off = your own marks only. Every grade still counts
+    in everyone's accuracy (`homegame_hand_results`); only the display hides."""
     out = dict(rec)
     seats = []
     for s in rec.get("seats") or []:
@@ -4163,13 +4310,16 @@ def _hand_for_viewer(
         if not (mine or s.get("shown")):
             s2["hole"] = None
         s2["is_me"] = mine
+        s2["avatar"] = _avatar_url(s.get("user_id"))
         s2.pop("user_id", None)
         seats.append(s2)
     out["seats"] = seats
     my_seats = {int(s["seat"]) for s in seats if s.get("is_me")}
+    seen = my_seats | {int(s["seat"]) for s in seats if s.get("shown")}
     grades = rec.get("grades")
-    if grades is not None and not show_all_grades:
-        grades = [g for g in grades if int(g.get("seat", -1)) in my_seats]
+    if grades is not None:
+        keep = seen if show_all_grades else my_seats
+        grades = [g for g in grades if int(g.get("seat", -1)) in keep]
     out["grades"] = grades
     out["grades_public"] = bool(show_all_grades)
     return out
@@ -4324,6 +4474,7 @@ def _community(viewer_id: int, club_id: str, can_manage: bool) -> dict[str, Any]
     players = [
         {
             "user_id": int(r["user_id"]), "name": _display_name(r),
+            "avatar": _avatar_url(r["user_id"]),
             "is_me": int(r["user_id"]) == int(viewer_id),
             "hands": int(r["hands"] or 0), "wins": int(r["wins"] or 0),
             "sessions": int(r["sessions"] or 0), "net_cents": int(r["net"] or 0),
@@ -4410,9 +4561,14 @@ def _my_hands(viewer_id: int, sort: str, direction: str, game_id: str | None,
     """``player_id``'s hands (default: the viewer's own). The club is private and
     everyone may browse everyone's history — but the CARDS in it follow the live
     table's rule for the VIEWER: their own, plus hands that were tabled or shown.
-    Browsing Riley's history never turns over a hand Riley mucked."""
+    Browsing Riley's history never turns over a hand Riley mucked, and neither
+    do its accuracy marks (they still count in Riley's totals)."""
     player = int(player_id) if player_id is not None else int(viewer_id)
     col = _MY_SORTS.get(sort, _MY_SORTS["time"])
+    if player != int(viewer_id) and sort == "accuracy":
+        # someone else's per-hand marks show only where their hand was tabled —
+        # sorting on the hidden ones would leak them (2026-09-26)
+        col = f"(CASE WHEN r.showdown=1 THEN {col} ELSE NULL END)"
     desc = str(direction).lower() != "asc"
     limit = max(1, min(HANDS_PAGE_MAX, int(limit)))
     offset = max(0, int(offset))
@@ -4456,11 +4612,13 @@ def _my_hands(viewer_id: int, sort: str, direction: str, game_id: str | None,
         except Exception:  # noqa: BLE001
             continue
         me = next((x for x in rec["seats"] if int(x["seat"]) == seat_no), None)
+        seen = player == int(viewer_id) or bool(me and me.get("shown"))
         hands.append({
             "game_id": r["game_id"], "table_name": r["table_name"],
             "hand_no": int(r["hand_no"]), "ended_at": r["ended_at"],
             "pot_cents": int(r["pot_cents"]), "net_cents": int(r["delta_cents"]),
-            "accuracy": round(float(r["acc_sum"]) / int(r["acc_n"]), 1) if int(r["acc_n"] or 0) else None,
+            "accuracy": (round(float(r["acc_sum"]) / int(r["acc_n"]), 1)
+                         if seen and int(r["acc_n"] or 0) else None),
             "showdown": bool(rec.get("showdown")),
             "my_hole": me.get("hole") if me else None,
             "board_a": rec.get("board_a") or [], "board_b": rec.get("board_b") or [],
@@ -4589,6 +4747,82 @@ def _parse_bool(body: dict, key: str, default: bool) -> bool:
     if isinstance(v, (int, float)) and v in (0, 1):
         return bool(v)
     raise HTTPException(status_code=400, detail=f"{key} must be true or false")
+
+
+# --- the host's settings from last time (owner, 2026-09-26) ---------------------
+# Every setting a host gives a table is saved per HOST — amounts as multiples of
+# the big blind, so a new big blind scales them. The create dialog starts from
+# them (GET /games/api/host_prefs); a create with ``remembered: true`` also takes
+# the ones only Manage has (grades, rabbit, runout pause, automatic chips).
+def _host_prefs_of(t: LiveTable) -> dict[str, Any]:
+    bb = max(1, int(t.bb_cents))
+
+    def per_bb(cents: Any) -> float:
+        return round(int(cents or 0) / bb, 4)
+
+    return {
+        "bb_cents": bb, "ante_bb": per_bb(t.ante_cents), "num_seats": int(t.num_seats),
+        "buyin_bb": per_bb(t.default_buyin_cents), "min_buyin_bb": per_bb(t.min_buyin_cents),
+        "max_buyin_bb": per_bb(t.max_buyin_cents),
+        "decision_secs": int(t.decision_secs or 0), "time_bank_secs": int(t.time_bank_secs or 0),
+        "deal_delay_secs": float(t.deal_delay_secs or 0.0),
+        "street_pause_secs": float(t.street_pause_secs),
+        "listed": bool(t.listed), "approve_buyins": bool(t.approve_buyins),
+        "allow_rathole": bool(t.allow_rathole), "allow_rabbit": bool(t.allow_rabbit),
+        "show_grades": bool(t.show_grades),
+        "topup_mode": _norm_auto_mode(t.topup_mode),
+        "topup_target_bb": per_bb(t.topup_all_target_cents),
+        "topup_below_bb": per_bb(t.topup_all_below_cents),
+        "auto_stack_mode": _norm_auto_mode(t.auto_stack_mode),
+        "auto_stack_bb": per_bb(t.auto_stack_all_cents),
+    }
+
+
+def _remember_host_prefs(t: LiveTable) -> None:
+    """Cosmetic: a failure here never touches the table."""
+    try:
+        pub.DB.q(
+            "INSERT INTO homegame_host_prefs(user_id,prefs,updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET prefs=excluded.prefs, updated_at=excluded.updated_at",
+            (int(t.host_user_id), json.dumps(_host_prefs_of(t), separators=(",", ":")), pub._now()),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("homegame host prefs (%s)", t.game_id)
+
+
+def _host_prefs(uid: int) -> dict[str, Any] | None:
+    row = pub.DB.one("SELECT prefs FROM homegame_host_prefs WHERE user_id=?", (int(uid),))
+    try:
+        out = json.loads(row["prefs"]) if row is not None else None
+    except ValueError:
+        return None
+    return out if isinstance(out, dict) else None
+
+
+def _apply_remembered_locked(t: LiveTable, uid: int, prefs: dict[str, Any]) -> None:
+    """The settings the create dialog doesn't carry, from the host's last table,
+    each through the host's own endpoint logic; one that no longer fits (say a
+    top-up target above this table's maximum) is skipped."""
+    def cents(key: str) -> int:
+        try:
+            return int(round(float(prefs.get(key) or 0) * int(t.bb_cents)))
+        except (TypeError, ValueError):
+            return 0
+
+    steps: list[tuple[Any, dict[str, Any]]] = [
+        (_settings_locked, {k: prefs[k] for k in ("street_pause_secs", "allow_rabbit", "show_grades")
+                            if prefs.get(k) is not None}),
+        (_auto_topup_host_locked, {"mode": prefs.get("topup_mode") or "off", **(
+            {"all_target_cents": cents("topup_target_bb"), "all_below_cents": cents("topup_below_bb")}
+            if cents("topup_target_bb") > 0 else {})}),
+        (_auto_stack_host_locked, {"mode": prefs.get("auto_stack_mode") or "off", **(
+            {"all_cents": cents("auto_stack_bb")} if cents("auto_stack_bb") > 0 else {})}),
+    ]
+    for fn, body in steps:
+        try:
+            fn(t, uid, body)
+        except HTTPException:
+            pass
 
 
 def _create_table(user: Any, body: dict) -> LiveTable:
@@ -4772,7 +5006,7 @@ def _my_sessions(viewer_id: int, club_id: str | None = None, limit: int = 12) ->
 
 def _chat_messages(game_id: str) -> list[dict[str, Any]]:
     rows = pub.DB.q(
-        "SELECT c.id, c.body, c.created_at, u.name, u.email "
+        "SELECT c.id, c.body, c.created_at, c.user_id, u.name, u.email "
         "FROM homegame_chat c JOIN users u ON u.id=c.user_id "
         "WHERE c.game_id=? ORDER BY c.id DESC LIMIT 80",
         (game_id,),
@@ -4782,6 +5016,7 @@ def _chat_messages(game_id: str) -> list[dict[str, Any]]:
         out.append({
             "id": int(r["id"]),
             "name": _display_name(r),
+            "avatar": _avatar_url(r["user_id"]),
             "text": r["body"],
             "created_at": r["created_at"],
         })
@@ -5060,7 +5295,8 @@ def _club_requests(club_id: str) -> list[dict[str, Any]]:
     members = _club_member_ids(club_id)
     return [
         {"club_id": club_id, "club_name": str(club["name"]) if club else "", "user_id": int(r["user_id"]),
-         "name": _display_name(r), "email": _mask_email(r["email"]), "since": str(r["created_at"])}
+         "name": _display_name(r), "avatar": _avatar_url(r["user_id"]),
+         "email": _mask_email(r["email"]), "since": str(r["created_at"])}
         for r in rows if int(r["user_id"]) not in members
     ]
 
@@ -5184,6 +5420,7 @@ def _club_view(club_id: Any, uid: int) -> dict[str, Any]:
     )
     members = sorted(
         ({"user_id": int(r["user_id"]), "name": _display_name(r), "role": str(r["role"]),
+          "avatar": _avatar_url(r["user_id"]),
           "is_me": int(r["user_id"]) == int(uid), "joined_at": str(r["joined_at"])} for r in rows),
         key=lambda m: (_ROLE_RANK.get(m["role"], 9), m["name"].lower()),
     )
@@ -5569,6 +5806,7 @@ def install(app: FastAPI, *, static_dir: Path) -> None:
             "tables": tables,
             "sessions": _my_sessions(viewer, club),
             "join_requests": _club_requests(club) if manage else [],
+            "my_avatar": _avatar_url(viewer),
         }
 
     # --- clubs --------------------------------------------------------------------
@@ -5641,8 +5879,17 @@ def install(app: FastAPI, *, static_dir: Path) -> None:
         if user is None:
             raise HTTPException(status_code=404, detail="Not Found")
         t = _create_table(user, body or {})
+        prefs = _host_prefs(int(user["id"])) if (body or {}).get("remembered") else None
         with t.lock:
+            if prefs:
+                _apply_remembered_locked(t, int(user["id"]), prefs)
+            _remember_host_prefs(t)
             return _view(t, int(user["id"]))
+
+    @app.get("/games/api/host_prefs")
+    def api_host_prefs():
+        """The settings of the last table this user hosted (None = never)."""
+        return {"prefs": _host_prefs(_uid())}
 
     @app.get("/games/api/tables/{game_id}")
     def api_get(game_id: str):
@@ -5731,6 +5978,45 @@ def install(app: FastAPI, *, static_dir: Path) -> None:
     def api_my_stats(club: str | None = None):
         uid = _uid()
         return _my_stats(uid, clubs=_scope_clubs(uid, club, own=True))
+
+    def _avatar_changed(uid: int) -> None:
+        """The tables this player sits at redraw with the new picture now."""
+        with HUB._lock:
+            tables = list(HUB._tables.values())
+        for tb in tables:
+            with tb.lock:
+                if tb.player(uid) is not None:
+                    tb.rev += 1
+
+    @app.post("/games/api/me/avatar")
+    def api_set_avatar(body: dict = Body({})):
+        """{data_url}: a PNG / JPEG / WebP picture (the page sends a 256 px square)."""
+        uid = _uid()
+        url = _set_avatar(uid, (body or {}).get("data_url") or "")
+        _avatar_changed(uid)
+        return {"avatar": url}
+
+    @app.delete("/games/api/me/avatar")
+    def api_clear_avatar():
+        uid = _uid()
+        url = _set_avatar(uid, None)
+        _avatar_changed(uid)
+        return {"avatar": url}
+
+    @app.get("/games/api/avatars/{user_id}")
+    def api_avatar(user_id: int):
+        """Someone's picture — for them, or anyone sharing a club with them."""
+        viewer = _uid()
+        if int(user_id) != viewer and pub.DB.one(
+            "SELECT 1 FROM homegame_club_members a JOIN homegame_club_members b "
+            "ON a.club_id=b.club_id WHERE a.user_id=? AND b.user_id=? LIMIT 1",
+            (viewer, int(user_id)),
+        ) is None:
+            raise HTTPException(status_code=404, detail="Not Found")
+        row = pub.DB.one("SELECT mime, data FROM homegame_avatars WHERE user_id=?", (int(user_id),))
+        if row is None or row["mime"] not in _AVATAR_MIMES:
+            raise HTTPException(status_code=404, detail="Not Found")
+        return Response(bytes(row["data"]), media_type=row["mime"], headers=AVATAR_HEADERS)
 
     @app.get("/games/api/community")
     def api_community(club: str | None = None):

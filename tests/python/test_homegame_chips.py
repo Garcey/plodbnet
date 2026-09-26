@@ -337,6 +337,52 @@ def test_auto_chips_need_trust_while_the_host_approves_buy_ins(cast, hg):
     assert _nets(s) == 0
 
 
+# (2026-09-26) "Players choose" looked like no option at all: the choice sat only
+# behind the top bar's person icon and nobody was told the host had allowed it.
+
+
+def test_switching_who_chooses_is_said_to_the_table_once(cast):
+    p = cast["p"]
+    gid = _create(p[0])["id"]
+    _ok(_post(p[1], gid, "sit", {"seat": 1, "buyin_cents": 4000}))
+    _ok(_post(p[0], gid, "auto_topup", {"mode": "player"}))
+    _ok(_post(p[0], gid, "auto_topup", {"mode": "player"}))  # no change: nothing new is said
+    _ok(_post(p[0], gid, "auto_stack", {"mode": "player"}))
+    _ok(_post(p[0], gid, "auto_stack", {"mode": "host", "all_cents": 5000}))
+    _ok(_post(p[0], gid, "auto_stack", {"all_cents": 6000}))  # amounts only: nothing said
+    # a refused request changes nothing, so it says nothing (the mode rolls back)
+    r = _post(p[0], gid, "auto_stack", {"mode": "player", "players": [{"user_id": cast["uid"]["ivy"], "cents": 5000}]})
+    assert r.status_code == 400
+    _ok(_post(p[0], gid, "auto_topup", {"mode": "off"}))
+    s = _state(p[1], gid)  # what the PLAYER sees
+    assert s["auto_stack"]["mode"] == "host"
+    assert [e["text"] for e in s["events"] if e["kind"] == "settings"] == [
+        "Host: players now set their own auto top-up (tap your seat)",
+        "Host: players now choose their own stack for every hand (tap your seat)",
+        "Host: the host now sets the stack for every hand",
+        "Host: auto top-up is off",
+    ]
+
+
+def test_players_find_automatic_chips_where_they_look():
+    """Add chips (and the Chips chooser when ratholing is on) and your own seat card
+    show what automatic chips do for you and open the choice; the host's Chips tab
+    says where players set it."""
+    from pathlib import Path
+
+    js = (Path(__file__).resolve().parents[2] / "python" / "plo5bp" / "ui" / "static" / "games.ui.js").read_text(encoding="utf-8")
+
+    def fn(name):
+        start = js.index(f"  function {name}(")
+        return js[start:js.index("\n  }\n", start)]
+
+    assert fn("openTopUp").count("autoChipsRow(s, me)") == 2  # the chooser and the Add chips dialog
+    assert "footer" in fn("moneyDialog")
+    assert "autoChipsRow(s, x)" in fn("openPlayer")
+    assert "openAutoChips" in fn("autoChipsRow")
+    assert js.count("they tap their seat (or Add chips) › Automatic chips") == 2  # top-up + set stack
+
+
 # --- spectators / presence -------------------------------------------------------------
 
 

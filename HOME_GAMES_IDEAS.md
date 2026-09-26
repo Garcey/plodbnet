@@ -26,7 +26,8 @@ real night with friends. ★ = my top picks.
 - ★ **Cross-session settle-up**: one running balance per pair of players across
   every night in the club ("Dana owes you $42 overall"), with a "settled" button.
 - **Club table defaults**: stakes, clock, rabbit, approval… set once for the
-  club, used by every new table.
+  club, used by every new table. (Per HOST this exists since 2026-09-26: a new
+  table starts from the settings of the last one you hosted.)
 - **Scheduled games**: "Friday 8 pm" with RSVPs and a reminder.
 - **A club wall**: announcements and chat outside the tables.
 - **Invite options**: single-use or expiring links; let members (not only
