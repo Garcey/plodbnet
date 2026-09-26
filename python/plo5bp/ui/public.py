@@ -344,19 +344,20 @@ def _is_admin(user: sqlite3.Row | None) -> bool:
 
 
 def _homegame_access(user: sqlite3.Row | None) -> bool:
-    """Private home-games page. Independent of subscription.
+    """The home-games pages. Independent of subscription.
 
-    Admins always have it. Everyone else needs the admin-granted
-    ``homegame_access`` flag. Absence of the user (signed out) is denial.
+    Since clubs (2026-09-25) every signed-in user has them: what a user may SEE
+    there — a club's tables, members and numbers — is the club's business
+    (homegame.py). Signed out is denial (a sign-in page / the hidden 404).
     """
-    if user is None:
-        return False
-    if _is_admin(user):
-        return True
-    try:
-        return int(user["homegame_access"] or 0) != 0
-    except (KeyError, IndexError, TypeError):
-        return False
+    return user is not None
+
+
+# homegame.install: /admin's home-games switch now means "a member of the MAIN
+# club" (the site's original circle). (admin_uid, uid, grant) -> member after;
+# (uid) -> member?
+_GAMES_ACCESS_HOOK: Any = None
+_GAMES_MEMBER_HOOK: Any = None
 
 
 def _games_path(path: str) -> bool:
@@ -379,6 +380,22 @@ def _games_asset(path: str) -> bool:
     Case-folded: a case-insensitive filesystem (Windows/macOS dev boxes)
     serves ``/static/GAMES.JS`` as the same file."""
     return path.lower() in _GAMES_ASSETS
+
+
+# A table link is itself the secret. For someone WITHOUT home-games access,
+# homegame.install sets this to a function (request, path, user) -> Response | None
+# that answers a VALID table link with an invite page (sign in / ask to join /
+# waiting) instead of the hidden 404 — every other /games path stays a 404.
+_GAMES_INVITE_HOOK: Any = None
+
+# Where a sign-in may send the browser afterwards: the home-games lobby, a table
+# link or a club invite link only (an open redirect would let a phishing page
+# borrow this site's name).
+_NEXT_RE = re.compile(r"^/games(?:/t/[A-Za-z0-9_-]{1,40}|/join/[A-Za-z0-9_-]{6,40})?$")
+
+
+def _safe_next(raw: Any) -> str | None:
+    return raw if isinstance(raw, str) and _NEXT_RE.match(raw) else None
 
 
 def _hidden_not_found(request: Request) -> HTMLResponse | JSONResponse:
@@ -836,7 +853,9 @@ class AccessMiddleware(BaseHTTPMiddleware):
         # of /games or /static/games.js looks like a missing page.
         if _games_path(path) or _games_asset(path):
             if not _homegame_access(user):
-                return _hidden_not_found(request)
+                hook = _GAMES_INVITE_HOOK
+                invite = hook(request, path, user) if hook is not None else None
+                return invite if invite is not None else _hidden_not_found(request)
 
         if _open_route(path) and not _games_path(path):
             return await call_next(request)
@@ -1004,6 +1023,11 @@ def install(
                 status_code=503,
             )
         redirect_uri = f"{BASE_URL}/auth/callback"
+        nxt = _safe_next(request.query_params.get("next"))
+        if nxt:
+            request.session["next"] = nxt  # back to the table link after sign-in
+        else:
+            request.session.pop("next", None)
         return await oauth.google.authorize_redirect(request, redirect_uri)
 
     @app.get("/auth/callback")
@@ -1023,7 +1047,7 @@ def install(
             info.get("sub"), email, info.get("name") or "", info.get("picture") or ""
         )
         request.session["uid"] = int(user["id"])
-        return RedirectResponse(url="/")
+        return RedirectResponse(url=_safe_next(request.session.pop("next", None)) or "/")
 
     if DEV_LOGIN_REQUESTED and not DEV_LOGIN:
         logger.warning(
@@ -1034,7 +1058,7 @@ def install(
     if DEV_LOGIN:
 
         @app.get("/auth/dev")
-        def auth_dev(request: Request, email: str, name: str = ""):
+        def auth_dev(request: Request, email: str, name: str = "", next: str = ""):  # noqa: A002
             """Loopback-only fake sign-in for local testing without OAuth.
 
             NEVER expose a tunnel with PLO5BP_DEV_LOGIN=1 — anyone could sign
@@ -1045,7 +1069,7 @@ def install(
                 raise HTTPException(status_code=403, detail="dev login is loopback-only")
             user = _upsert_user(None, email, name or email.split("@")[0], "")
             request.session["uid"] = int(user["id"])
-            return RedirectResponse(url="/")
+            return RedirectResponse(url=_safe_next(next) or "/")
 
     # (review 2026-09-20 F7) Logout is state-changing, so POST is the real
     # verb. GET stays because app.js still navigates to it
@@ -1363,7 +1387,8 @@ def install(
                     "hands_today": r["hands_today"],
                     "hands_total": r["hands_total"],
                     "period_end": r["current_period_end"],
-                    "homegame_access": _homegame_access(r),
+                    # (in the main club — see _GAMES_MEMBER_HOOK)
+                    "homegame_access": bool(_GAMES_MEMBER_HOOK(int(r["id"]))) if _GAMES_MEMBER_HOOK else False,
                 }
                 for r in rows
             ]
@@ -1396,26 +1421,23 @@ def install(
 
     @app.post("/admin/api/games_access")
     def admin_games_access(body: dict):
-        """Grant/revoke the private home-games flag. Independent of
-        subscription/comp. Admins already have access; the flag still
-        stores so a later admin-email change does not strand them."""
+        """Add someone to / remove them from the MAIN home-games club (the site's
+        original private circle; made on the first grant, owned by the granting
+        admin). Everyone signed in can use home games; this is only the club.
+        The old flag is still written so the history of who was in stays."""
         uid = body_int(body, "user_id")
         action = body.get("action", "")
         user = _user_by_id(uid)
         if user is None:
             raise HTTPException(status_code=404, detail="no such user")
-        if action == "grant":
-            DB.q("UPDATE users SET homegame_access=1 WHERE id=?", (uid,))
-        elif action == "revoke":
-            DB.q("UPDATE users SET homegame_access=0 WHERE id=?", (uid,))
-        else:
+        if action not in ("grant", "revoke"):
             raise HTTPException(status_code=400, detail="action must be grant|revoke")
-        return {
-            "ok": True,
-            "user_id": uid,
-            "action": action,
-            "homegame_access": action == "grant" or _is_admin(user),
-        }
+        admin_uid = _CURRENT_USER_ID.get()
+        member = False
+        if _GAMES_ACCESS_HOOK is not None:
+            member = bool(_GAMES_ACCESS_HOOK(int(admin_uid) if admin_uid is not None else uid, uid, action == "grant"))
+        DB.q("UPDATE users SET homegame_access=? WHERE id=?", (1 if action == "grant" else 0, uid))
+        return {"ok": True, "user_id": uid, "action": action, "homegame_access": member}
 
     @app.get("/admin/api/metrics")
     def admin_metrics():

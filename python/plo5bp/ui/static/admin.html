@@ -68,7 +68,7 @@
       <thead>
         <tr>
           <th>Email</th><th>Name</th><th>Joined</th><th>Last login</th>
-          <th>Subscription</th><th>Home games</th><th>Hands today</th><th>Hands total</th><th></th>
+          <th>Subscription</th><th title="Membership of your home-games club (everyone can play home games; this is your own circle)">Your club</th><th>Hands today</th><th>Hands total</th><th></th>
         </tr>
       </thead>
       <tbody id="user-rows"></tbody>
@@ -134,8 +134,8 @@
             const games = x.is_admin
               ? '<span class="pill admin">ADMIN</span>'
               : x.homegame_access
-                ? `<span class="pill active-comp">ON</span> <button class="revoke" data-uid="${x.id}" data-gaction="revoke">Revoke</button>`
-                : `<span class="pill none">OFF</span> <button class="grant" data-uid="${x.id}" data-gaction="grant">Grant</button>`;
+                ? `<span class="pill active-comp">MEMBER</span> <button class="revoke" data-uid="${x.id}" data-gaction="revoke">Remove</button>`
+                : `<span class="pill none">—</span> <button class="grant" data-uid="${x.id}" data-gaction="grant">Add to club</button>`;
             return `<tr>
               <td>${esc(x.email)}</td><td>${esc(x.name) || "—"}</td>
               <td class="num">${fmtDay(x.created_at)}</td>

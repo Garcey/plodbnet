@@ -1325,11 +1325,13 @@ Service-layer rules (review 2026-09-20 — keep them):
   Forwarded, …) and needs a loopback client + Host. The test client is
   accepted only with `PLO5BP_DEV_LOGIN_TESTCLIENT=1` (fixtures set it).
   `email_verified` defaults to False when the claim is absent.
-- `/me.homegame` is `{"href", "label"}` for granted users (absent
-  otherwise) so `app.js` ships no home-games strings to everyone else.
+- `/me.homegame` is `{"href", "label"}` for every SIGNED-IN user (clubs,
+  2026-09-25; absent signed out) so `app.js` ships no home-games strings to a
+  signed-out visitor.
 
-**Home games** (`ui/homegame.py`, `static/games.*`, admin-granted
-`homegame_access`, 404 for everyone else): PokerNow-style private PLO5
+**Home games** (`ui/homegame.py`, `static/games.*`, every signed-in user since
+clubs — a club's tables, members and numbers are its members' only; signed out
+= a sign-in page for a browser, the hidden 404 otherwise): PokerNow-style private PLO5
 double-board tables over `BombPotEnv` (minimal obs, actual payouts, HTTP
 polling, per-table RLock + clock watchdog). Invariants: hole cards are
 revealed only when ≥ 2 hands are live at terminal (an uncontested winner
@@ -1389,6 +1391,17 @@ Premium tables pass (2026-09-21 — `tests/python/test_homegame_premium.py`):
   multiples of `--u` (set by `layout()`); the felt insets in `computeGeom`
   and the seat geometry must stay in step. Player notes/tags and preferences
   are localStorage-only.
+- **Page security headers (2026-09-25 — `test_homegame_page_headers.py`)**:
+  `/games` and `/games/t/{id}` send `homegame.PAGE_HEADERS` — a CSP with
+  `script-src 'self'` (NO inline `<script>`, NO inline event-handler attribute:
+  attach listeners, e.g. `h(tag, {onclick: fn})`; no `javascript:` URL, no
+  eval), styles/fonts from self + Google Fonts, `img-src 'self' data:`,
+  `connect-src 'self'`, `frame-ancestors 'none'` + `X-Frame-Options: DENY`,
+  `nosniff` (also on the `/games/static` assets), `Referrer-Policy: same-origin`
+  and COOP `same-origin-allow-popups` (`openInStudy` fills the tab it opens). A
+  blocked script fails SILENTLY in production (a dead button), so the test scans
+  the client for inline handlers; a new outside origin (CDN, image host) must be
+  added to `PAGE_CSP` and to the test's allow-list.
 - **Chips in (2026-09-22 — `tests/python/test_homegame_chips.py`)**:
   `approve_buyins` turns a sit / top-up by anyone but the host or a TRUSTED
   player (`homegame_players.trusted`, `/trust`) into a pending request
@@ -1448,22 +1461,25 @@ Premium tables pass (2026-09-21 — `tests/python/test_homegame_premium.py`):
   inside the click (after the awaits a browser blocks it as a pop-up) and
   pointed at `/?mode=study` once the spot is loaded; blocked pop-ups fall back
   to a modal with a plain `target=_blank` link — the replayer never navigates.
-- **The club (2026-09-24)**: home games are a private circle, so stats are OPEN
-  inside it — `GET /games/api/community` (every player's hands / net / accuracy,
-  the pairwise `pairs` = "`to` is up `cents` on `from`", all sessions),
-  `/games/api/players/{id}/stats|hands` (= the `my/*` pair for any player;
-  `_my_hands(viewer, …, player_id=)`). What stays PRIVATE is unchanged: hole
+- **The club (2026-09-24; one per CLUB since 2026-09-25)**: a club is a private
+  circle, so stats are OPEN inside it — `GET /games/api/community?club=` (every
+  player's hands / net / accuracy, the pairwise `pairs` = "`to` is up `cents` on
+  `from`", all sessions — of that club's tables only), `/games/api/players/{id}/
+  stats|hands?club=` (= the `my/*` pair for any player; `_my_hands(viewer, …,
+  player_id=, clubs=)`; without a club: your OWN numbers = everything, someone
+  else's = only the clubs you share). What stays PRIVATE is unchanged: hole
   cards follow the table's reveal rule for the VIEWER (own + tabled/shown) even
   when browsing someone else's history, and no email is ever served. The lobby's
   Players section (`renderClub` in `games.ui.js`) = podium of the top three by
   accuracy (needs `MIN_RANKED` = 20 graded decisions, else "provisional"), a
   card per player, the head-to-head matrix (`openMatrix`) and All sessions.
   **Excluded sessions**: `homegames.excluded` is a SOFT, reversible flag set by
-  the SITE ADMIN only (`POST …/exclude {on}`, not the host — a host must not be
+  the CLUB'S OWNER only (`POST …/exclude {on}`, not the host — a host must not be
   able to erase a losing night); an open table is closed first (cash-out), a
   busy hand is a 400. Every stats query joins `homegames` and filters
   `excluded=0` (`_my_hands`, `_my_stats`, `_community`, lobby sessions) — a new
-  aggregate MUST do the same. Nothing is deleted; the table still opens by link.
+  aggregate MUST do the same — and filter `g.club_id` (`_club_clause`). Nothing
+  is deleted; the table still opens by link.
 - **Bet spots (`placeBetSpots` in `games.table.js`)**: a bet sits on the rail's
   inward NORMAL at its seat (`railNormal`: flat edges straight across, round
   ends toward their own circle's centre), just clear of the seat's own box —
@@ -1535,15 +1551,108 @@ Premium tables pass (2026-09-21 — `tests/python/test_homegame_premium.py`):
   whose browser is gone counts as away so the clock never waits on them. The
   rabbit button lives ON THE FELT in the 2x2 gap of the undealt cards
   (`placeRabbit`, "Click to reveal"), the host has Start/Pause in the top bar
-  (`#tb-run`). Award animation (ClubGG-style): `_capture_rabbit` names the pot
-  layers deepest-first ("Side pot N" … "Main pot", `t.pots`, served as `pots`
-  while the runout blocks) and tags each award step with its `pot`
-  (`_assign_award_pots`); the client shows the pots as inline pills that REPLACE
+  (`#tb-run`). Award animation (ClubGG-style): `_capture_rabbit` names the POTS
+  deepest-first ("Side pot N" … "Main pot", `t.pots`, served as `pots` while the
+  runout blocks) — `runout.display_pots` / `pot_groups`: pot LAYERS with the same
+  eligible players are ONE pot (a folded player's chips are dead money in it,
+  never a side pot of their own; 2026-09-25) — and `runout.build_awards` tags
+  each award step with its `pot` (the chips are still split layer by layer,
+  exactly like the engine; `test_merged_pots_pay_every_seat_exactly_what_the_layers_do`).
+  The client shows the pots as inline pills that REPLACE
   the pot pill (same height — the boards must not move at showdown), highlights
   the active pot, counts each one down as its halves are paid, flies the chips
   from THAT pot, prefixes the caption with the pot name, and the layout reserves
   room under the boards for the caption (`captionHeight`) so it never lands on
   the hero's cards (it wraps on portrait phones).
+- **Clubs (2026-09-25 — `test_homegame_clubs.py`; owner request)**: home games
+  used to be admin-granted per account (`homegame_access`); now every signed-in
+  user has them and a CLUB is the private circle. Tables: `homegame_clubs` (id,
+  name, owner, `invite_code`, `approve_joins`, `is_main`), `homegame_club_members`
+  (role owner | admin | member), `homegame_club_requests` (pending | approved |
+  declined), `homegames.club_id`. EVERY table belongs to one club and every table
+  endpoint goes through `_table_for` → `_table_access`: a non-member gets 403
+  `{"error": "club", "club": {id, name}, "request", "retry_in"}` (the client offers
+  "ask to join"); the stream re-checks on every push. Anyone may start a club
+  (`MAX_CLUBS_OWNED` = 5) and any member may host in it (`club_id` on create; none
+  given = the main club if you are in it, else your oldest). Joining: the invite
+  link `/games/join/{code}` (`/games/api/invites/{code}[/join]` — straight in, or a
+  request when the club asks first), or "ask to join" from a table link
+  (`/games/api/clubs/{id}/request`). The owner and admins see requests (masked
+  email) in the lobby and at the club's tables and decide
+  (`/games/api/clubs/{id}/requests/decide`); a declined request may ask again
+  after `JOIN_RETRY_S`. Roles (`/games/api/clubs/{id}/members`): the owner makes
+  admins, hands the club over (they become an admin) and removes anyone; an admin
+  removes members; nobody is removed (and nobody leaves) while they have a seat at
+  one of the club's open tables or host one (`_busy_in_club`); the owner can't
+  leave. The owner renames, switches "ask me first" and makes a new invite link
+  (admins too). The MAIN club (`is_main`) = the site's original circle:
+  `_migrate_clubs` (every start, idempotent) moves every table with no club into
+  it with everyone who hosted, sat or had the old flag, named "<owner>'s club";
+  the /admin switch (`public._GAMES_ACCESS_HOOK` / `_GAMES_MEMBER_HOOK`) now adds
+  to / removes from it. Lobby: `GET /games/api/tables?club=` = the viewer's clubs,
+  that club's tables (+ your seats elsewhere, tagged), its sessions and — managers
+  — its requests; the client remembers the club per browser (`hg.club.v1`,
+  `setClub`), shows a club bar (switcher, Invite, Members) and, in no club yet, a
+  welcome (start one / join with a link). Signed out, `/games`, a table link or an
+  invite link is a script-free sign-in page (`_invite_response`, `INVITE_HEADERS`)
+  whose Google sign-in comes back to it (`_safe_next`: those three shapes only).
+- **Readiness pass (2026-09-25 — `test_homegame_clubs.py`,
+  `test_homegame_client_reconnect.py`, `test_homegame_short_hands.py`, new
+  cases in `test_homegame_table_ux.py`)**, after hours of bot play in the preview:
+  - A server restart mid-hand voids that hand chip-neutrally (stacks persist at
+    hand end only); `_load_table` now says so in the table's feed ("Hand #N was
+    cut short …"). Identical pending chip requests are deduplicated
+    (`_request_locked`); closing a table keeps its host
+    (`_cash_out_seat(..., closing=True)` skips the host hand-over).
+  - Client: `#connbar` "Connection lost — reconnecting…" + a "Back online"
+    toast; after the live stream gives up (a restart) a successful poll re-opens
+    it past `G.streamRetryAt` (30 s, doubling to 5 min); `HG.ui.onMyTurn` closes
+    an overlay rail / toasts "It's your turn" when a drawer or modal hides the
+    action buttons; toasts are deduplicated. On the COMPACT layout (≤ 760 px
+    wide or ≤ 700 px tall — a 1366x768 laptop's browser is compact too) the R/B
+    hotkey works like the Raise button: the first press opens the sizing panel,
+    the second bets (it used to bet the minimum unseen); arrows / 1-6 open it
+    too. The ≡ menu has "React" (a phone has no React button).
+  - **Showdown layout (phones)** — `fitSeats()` runs after every layout and
+    render, all reads first: a tabled row that would touch the boards / pots /
+    caption block fans tighter (`--ov` 0.3 → 0.56 of a card; the first card has
+    no negative margin, so a row is centred on its seat) and moves to the stage
+    edge; a showdown label slides outward off that block, and a label that still
+    lands on another seat, a tabled row, the hero's cards or more than a corner
+    of a board is hidden (`.seat-hand.crowded` — the cards and the caption still
+    tell). The dealer disc sits UNDER the seats (z 3) and fades (`.covered`)
+    while a label or row covers it. All-in EQUITIES are on the badge line
+    (`.seat-badge.k-eq`, in place of "All-in"): the old `.seat-eq` above the seat
+    was always under the tabled cards. Felt labels are short (`shortHand`: "Js
+    full of 4s", "Two pair 10s & 2s", "K-high flush"…; pinned against every
+    `hand_describe._fmt` phrase); the caption, dock and history keep the full
+    wording. `fitPots()`: pots wider than the gap between the seats (and labels)
+    beside them drop their chip icons (`#pots.tight`), then scale down (≥ 0.7).
+    A phone-sized box (< 520 px wide, ratio < 1.3) keeps the upright table (the
+    flat one drew every card ~1/3 smaller on an SE with Safari's bars); the
+    upright table stays ≤ 0.74 wide per unit of height (squarer lifts the side
+    seats onto the boards — tried 0.9, worse). Short upright phones (≤ 700 px)
+    get a tighter dock; ≤ 620 px hide the dock's Sit out / Add chips / Leave row
+    (all three are in the seat menu, and the status strip offers I'm back / Add
+    chips / Stay whenever they matter). The check behind all this:
+    `.claude/tools/games_preview/measure_showdown.js` (overlap pairs per runout
+    street / award step at every screen size; 0 at 360-430 px phones, tablet,
+    desktop; an SE-sized 375x560 keeps a few corner touches).
+  - **Side pots while the hand is played + pot hover (owner request)**: the
+    view carries `live_pots` during `in_hand` (`homegame._live_pots` =
+    `display_pots` of total − street commit: the antes and finished streets;
+    this street's bets stay in front of the players until the round closes, as
+    on any site). Same names and order as `t.pots` (`_named_pots`), so the
+    runout takes over in place; an uncalled excess only exists once betting is
+    over, so it never shows mid-hand. Two or more pots take the pot pill's place
+    in `#pot-row` (`#live-pots`, `renderLivePots`; `#pot.split` hides the pill;
+    bets fly into `potAnchor()`; the bet spots are re-placed when the row changes
+    shape; `fitPots` leaves room for the street total on both sides). Hovering
+    any pot pill (a tap on a phone = a 3.5 s toggle) lights up its `eligible`
+    seats and dims the rest (`#stage.pot-focus` / `.seat.pot-in`, `focusPot` /
+    `applyPotFocus`, re-applied after every render by pill index); the single
+    pot and the main pot = everyone still in the hand; a pill's title names its
+    players; phones show short names ("Side 1", "Main").
 - Preview harness (gitignored): `.claude/tools/games_preview/` — launch
   entry `games_preview` (public build + dev login + temp DB on :8772) and
   `bot.py` (scripted guests).

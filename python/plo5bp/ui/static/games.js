@@ -87,8 +87,10 @@ async function j(url, opts) {
   const body = ct.includes("json") ? await res.json() : { detail: await res.text() };
   if (!res.ok) {
     const d = body.detail || body.error || res.statusText;
-    const err = new Error(typeof d === "string" ? d : JSON.stringify(d));
+    // (a structured answer — e.g. a table of a club you are not in — keeps its fields)
+    const err = new Error(typeof d === "string" ? d : (d && d.message) || JSON.stringify(d));
     err.status = res.status;
+    err.detail = d;
     throw err;
   }
   return body;
@@ -222,6 +224,7 @@ function turnCue(s) {
   }
   if (key && key !== G.turnKey) {
     if (HG.sound) HG.sound.play("turn");
+    if (HG.ui && HG.ui.onMyTurn) HG.ui.onMyTurn(s);
     if (G.prefs.notify && document.hidden && globalThis.Notification && Notification.permission === "granted") {
       try { new Notification("Your turn", { body: s.name, tag: "hg-turn" }); } catch (_) { /* optional */ }
     }
@@ -307,11 +310,26 @@ function startPoll() {
       G.lastLatency = performance.now() - t0;
       setConn(G.lastLatency > 1200 ? "slow" : "ok");
       if (acceptState(s, seq)) render(s);
+      // Polling is the fallback, not the way of life: once the server answers again
+      // (after a restart the stream had given up), try the push again now and then.
+      if (globalThis.EventSource && G.streamRetryAt && performance.now() >= G.streamRetryAt) {
+        G.streamRetryMs = Math.min((G.streamRetryMs || 15000) * 2, 300000);
+        G.streamRetryAt = performance.now() + G.streamRetryMs;
+        startLive();
+      }
     } catch (e) {
       if (e.status === 404) {
         stopPoll();
         showErr("That table no longer exists.");
         showLobby(true);
+      } else if (e.status === 403 && e.detail && e.detail.error === "club") {
+        // (no longer in the table's club — removed, or left in another tab): back to
+        // the lobby, saying so — never a "connection lost" bar that cannot come back
+        stopPoll();
+        const gid = G.gameId;
+        showErr(`You're no longer a member of ${e.detail.club.name}.`);
+        showLobby(true);
+        if (HG.ui && HG.ui.openClubGate) HG.ui.openClubGate(e.detail, gid);
       } else if (++G.fails >= 3) setConn("off");
     } finally {
       G.pollBusy = false;
@@ -337,7 +355,7 @@ function startLive() {
   let errors = 0;
   const es = new EventSource(`/games/api/tables/${id}/stream`);
   G.live = es;
-  es.onopen = () => { errors = 0; setConn("ok"); };
+  es.onopen = () => { errors = 0; setConn("ok"); G.streamRetryAt = null; G.streamRetryMs = null; };
   es.onmessage = (ev) => {
     if (G.live !== es || G.gameId !== id) return;
     let s = null;
@@ -359,7 +377,11 @@ function startLive() {
     }
     if (errors >= 4 || es.readyState === 2) {
       es.close();
-      if (G.live === es) { G.live = null; startPoll(); }
+      if (G.live === es) {
+        G.live = null;
+        if (!G.streamRetryAt) { G.streamRetryMs = 30000; G.streamRetryAt = performance.now() + 30000; }
+        startPoll();
+      }
     }
   };
 }
@@ -385,8 +407,33 @@ async function openTable(id, push) {
   return s;
 }
 
+// ------------------------------------------------------------------- clubs
+// The lobby shows ONE club at a time: its tables, its players, its numbers.
+// Which one is remembered per browser (a convenience — the server decides who
+// may see what).
+const CLUB_KEY = "hg.club.v1";
+function savedClub() {
+  try { return (globalThis.localStorage && localStorage.getItem(CLUB_KEY)) || null; } catch (_) { return null; }
+}
+function setClub(id) {
+  G.clubId = id || null;
+  try { if (globalThis.localStorage) { if (id) localStorage.setItem(CLUB_KEY, id); else localStorage.removeItem(CLUB_KEY); } } catch (_) { /* private mode */ }
+}
+
 async function loadLobby() {
-  const data = await j("/games/api/tables");
+  if (G.clubId === undefined) G.clubId = savedClub();
+  let data = await j("/games/api/tables" + (G.clubId ? `?club=${encodeURIComponent(G.clubId)}` : "")).catch((e) => {
+    if (e.status === 404 && G.clubId) return null;  // (left or removed from that club)
+    throw e;
+  });
+  const clubs = (data && data.clubs) || [];
+  if (!data || !G.clubId || !clubs.some((c) => c.id === G.clubId)) {
+    const pick = clubs.length ? clubs[0].id : null;
+    if (!data || pick !== G.clubId) {
+      setClub(pick);
+      data = await j("/games/api/tables" + (pick ? `?club=${encodeURIComponent(pick)}` : ""));
+    }
+  }
   if (HG.ui) HG.ui.renderLobby(data);
   return data;
 }
@@ -396,6 +443,8 @@ function showLobby(replace) {
   G.gameId = null;
   G.state = null;
   G.turnKey = null;
+  G.fails = 0;
+  setConn("ok");  // (the "connection lost" bar is about a table: the lobby has its own poll)
   if (typeof document !== "undefined") document.title = G.baseTitle;
   if (location.pathname !== "/games") {
     if (replace) history.replaceState(null, "", "/games");
@@ -413,7 +462,21 @@ async function route() {
   const m = location.pathname.match(/^\/games\/t\/([^/]+)$/);
   if (m) {
     try { await openTable(m[1], false); return; }
-    catch (e) { showErr(e.status === 404 ? "That table no longer exists." : e.message); showLobby(true); return; }
+    catch (e) {
+      // a table of a club I am not in: the lobby, with "ask to join the club" on top
+      if (e.status === 403 && e.detail && e.detail.error === "club") {
+        showLobby(true);
+        if (HG.ui && HG.ui.openClubGate) HG.ui.openClubGate(e.detail, m[1]);
+        return;
+      }
+      showErr(e.status === 404 ? "That table no longer exists." : e.message); showLobby(true); return;
+    }
+  }
+  const inv = location.pathname.match(/^\/games\/join\/([A-Za-z0-9_-]+)$/);
+  if (inv) {
+    showLobby(true);
+    if (HG.ui && HG.ui.openInvite) HG.ui.openInvite(inv[1]);
+    return;
   }
   showLobby(true);
 }
@@ -445,7 +508,7 @@ function applyPrefs() {
 HG.core = {
   G, $, j, post, act, deal, tablePost, refreshNow, fmtAmt, dollars, toCents, esc, chipsToCents, centsToChips,
   potBetTo, clampRaiseTo, raiseBoundsTo, myTurn, inHandAlive, heroToCallCents, setPreAction, savePrefs,
-  applyPrefs, openTable, showLobby, loadLobby, showErr, startLive, stopLive,
+  applyPrefs, openTable, showLobby, loadLobby, showErr, startLive, stopLive, setClub,
 };
 
 async function init() {

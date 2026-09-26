@@ -92,11 +92,12 @@ def test_me_shape(clients):
     assert me["free"]["limit"] == FREE_HANDS
     admin_me = adm.get("/me").json()
     assert admin_me["is_admin"] is True and admin_me["sub"]["active"] is True
-    # Home games: admin always has it; a normal user does not even see the key.
-    # Contract (review 2026-09-20 F1): the payload carries href + label so the
-    # frontend never ships those literals to users without access.
+    # Home games (clubs, 2026-09-25): every signed-in user has them. Contract
+    # (review 2026-09-20 F1): the payload carries href + label, so the frontend
+    # ships no home-games literals to a signed-out visitor.
     assert admin_me.get("homegame") == HOMEGAME_ME
-    assert "homegame" not in me
+    assert me.get("homegame") == HOMEGAME_ME
+    assert "homegame" not in TestClient(a.app).get("/me").json()
 
 
 def test_free_limit_and_headers(clients):
@@ -313,43 +314,35 @@ def test_webhook_requires_settled_payment(server, clients, monkeypatch):
     assert me["sub"]["source"] == "stripe"
 
 
-def test_homegame_hidden_without_grant(clients):
-    """The games page 404s for signed-out, free, and subscribed users.
-    Comp does not grant it. Admin grant is a separate column."""
+def test_homegames_are_open_to_signed_in_users_and_the_admin_switch_is_the_main_club(clients):
+    """Clubs (2026-09-25): signed out = the hidden 404 (a sign-in page for a
+    browser); signed in = the home games, whatever the subscription. The /admin
+    switch now adds to / removes from the MAIN club, the site's own circle."""
     a, _, adm = clients
     unsigned = TestClient(adm.app)
     assert unsigned.get("/games").status_code == 404
     assert unsigned.get("/games/api/tables").status_code == 404
     assert unsigned.get("/static/games.js").status_code == 404
-    # Alice is signed in (and may or may not be entitled after earlier tests).
-    assert a.get("/games").status_code == 404
-    assert a.get("/games/api/tables").status_code == 404
-    assert a.get("/static/games.js").status_code == 404
-    assert "homegame" not in a.get("/me").json()
-    # Comp subscription does not unlock games.
-    users = adm.get("/admin/api/users").json()["users"]
-    alice = next(u for u in users if u["email"] == "alice@example.com")
-    adm.post("/admin/api/grant", json={"user_id": alice["id"], "action": "grant"})
-    assert a.get("/state").status_code == 200
-    assert a.get("/games").status_code == 404
-    assert alice["id"]
-    # Admin sees the flag off, then grant unlocks, revoke re-hides.
-    assert alice["homegame_access"] is False
-    r = adm.post(
-        "/admin/api/games_access",
-        json={"user_id": alice["id"], "action": "grant"},
-    )
-    assert r.status_code == 200
-    assert a.get("/me").json().get("homegame") == HOMEGAME_ME
+    page = unsigned.get("/games", headers={"accept": "text/html"})
+    assert page.status_code == 200 and "Sign in with Google" in page.text and "next=/games" in page.text
     assert a.get("/games").status_code == 200
     assert "Home games" in a.get("/games").text
-    assert a.get("/games/api/tables").status_code == 200
-    adm.post(
-        "/admin/api/games_access",
-        json={"user_id": alice["id"], "action": "revoke"},
-    )
-    assert a.get("/games").status_code == 404
-    assert "homegame" not in a.get("/me").json()
-    # Admin themselves can always open it.
+    assert a.get("/games/api/tables").json()["clubs"] == []
+    assert a.get("/static/games.js").status_code == 404
+    assert a.get("/me").json().get("homegame") == HOMEGAME_ME
+    users = adm.get("/admin/api/users").json()["users"]
+    alice = next(u for u in users if u["email"] == "alice@example.com")
+    assert alice["homegame_access"] is False  # (not in the main club yet)
+    r = adm.post("/admin/api/games_access", json={"user_id": alice["id"], "action": "grant"})
+    assert r.status_code == 200 and r.json()["homegame_access"] is True
+    clubs = a.get("/games/api/tables").json()["clubs"]
+    assert len(clubs) == 1 and clubs[0]["is_main"] and clubs[0]["role"] == "member"
+    admin_club = adm.get("/games/api/clubs").json()["clubs"]
+    assert admin_club[0]["id"] == clubs[0]["id"] and admin_club[0]["role"] == "owner"
+    users = adm.get("/admin/api/users").json()["users"]
+    assert next(u for u in users if u["email"] == "alice@example.com")["homegame_access"] is True
+    adm.post("/admin/api/games_access", json={"user_id": alice["id"], "action": "revoke"})
+    assert a.get("/games/api/tables").json()["clubs"] == []
+    assert a.get("/games").status_code == 200  # (still has the home games — just not that club)
     assert adm.get("/games").status_code == 200
     assert adm.get("/me").json().get("homegame") == HOMEGAME_ME

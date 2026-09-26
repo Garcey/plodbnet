@@ -70,11 +70,13 @@ Chips in (2026-09-22):
 from __future__ import annotations
 
 import asyncio
+import html as html_mod
 import json
 import queue
 import logging
 import math
 import os
+import re
 import secrets
 import threading
 import time
@@ -82,11 +84,12 @@ import zlib
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
 from fastapi import Body, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from plo5bp.actions import FOLD, GATE_CHECK_CALL, GATE_FOLD, GATE_RAISE
@@ -94,7 +97,7 @@ from plo5bp.config import VARIANT_PLO5, GameConfig
 from plo5bp.env import BombPotEnv, StepInfo
 from plo5bp.ui.common import STREET_NAMES, position_name
 from plo5bp.ui.hand_describe import describe_made_hand
-from plo5bp.ui.runout import AWARD_SECS, board_equities, build_awards, money_flows, pot_layers
+from plo5bp.ui.runout import AWARD_SECS, board_equities, build_awards, display_pots, money_flows
 from plo5bp.ui import fairdeal
 from plo5bp.ui import public as pub
 
@@ -289,6 +292,31 @@ CREATE TABLE IF NOT EXISTS homegame_chat (
   body TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS homegame_clubs (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  owner_user_id INTEGER NOT NULL,
+  invite_code TEXT NOT NULL UNIQUE,
+  approve_joins INTEGER NOT NULL DEFAULT 0,
+  is_main INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS homegame_club_members (
+  club_id TEXT NOT NULL,
+  user_id INTEGER NOT NULL,
+  role TEXT NOT NULL DEFAULT 'member',
+  joined_at TEXT NOT NULL,
+  PRIMARY KEY (club_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS homegame_club_members_user ON homegame_club_members(user_id);
+CREATE TABLE IF NOT EXISTS homegame_club_requests (
+  club_id TEXT NOT NULL,
+  user_id INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at TEXT NOT NULL,
+  decided_at TEXT,
+  PRIMARY KEY (club_id, user_id)
+);
 """
 
 
@@ -371,7 +399,11 @@ def _ensure_schema() -> None:
                     f"ALTER TABLE homegame_players ADD COLUMN {col} "
                     "INTEGER NOT NULL DEFAULT 0"
                 )
+        if "club_id" not in cols:  # 2026-09-25: every table belongs to a club
+            pub.DB._conn.execute("ALTER TABLE homegames ADD COLUMN club_id TEXT")
+        pub.DB._conn.execute("CREATE INDEX IF NOT EXISTS homegames_club ON homegames(club_id)")
         pub.DB._conn.commit()
+    _migrate_clubs()
 
 
 def _make_env(cfg: GameConfig) -> BombPotEnv:
@@ -524,6 +556,7 @@ class LiveTable:
     hand_no: int
     seats: list[Seat | None]
     running: bool = False
+    club_id: str | None = None  # the club it belongs to: only members see / sit / watch it
     auto_stack_mode: str = "off"  # off | host | player
     auto_stack_all_cents: int = 0
     decision_secs: int = 0  # 0 = unlimited
@@ -631,6 +664,13 @@ class LiveTable:
     fair_strikes: dict = field(default_factory=dict)     # user id -> missed reveals in a row
     fair_penalty_until: dict = field(default_factory=dict)  # user id -> hand_no
     fair_void_counts: dict = field(default_factory=dict)  # name -> voided shuffles this session
+    # People without home-games access who asked to join from this table's link
+    # (``homegame_join_requests``; admins see them). Re-read at most every
+    # JOIN_REFRESH_S so an /admin grant clears them too.
+    join_reqs: list = field(default_factory=list)
+    join_checked_mono: float = 0.0
+    club_info: dict[str, Any] | None = None
+    club_checked_mono: float = 0.0
     lock: threading.RLock = field(default_factory=threading.RLock)
 
     @property
@@ -681,6 +721,11 @@ class Hub:
                 self._tables[game_id] = t
             t.last_access_mono = time.monotonic()
             return t
+
+    def peek(self, game_id: str) -> LiveTable | None:
+        """The table if it is loaded — never loads it."""
+        with self._lock:
+            return self._tables.get(game_id)
 
     def put(self, table: LiveTable) -> None:
         with self._lock:
@@ -812,7 +857,7 @@ def _load_table(game_id: str) -> LiveTable:
     was_running = bool(int(row["running"] if "running" in row.keys() else 0))
     if was_running:
         pub.DB.q("UPDATE homegames SET running=0 WHERE id=?", (game_id,))
-    return LiveTable(
+    t = LiveTable(
         game_id=row["id"],
         host_user_id=int(row["host_user_id"]),
         name=row["name"],
@@ -826,6 +871,7 @@ def _load_table(game_id: str) -> LiveTable:
         hand_no=int(row["hand_no"]),
         seats=seats,
         running=False,
+        club_id=(row["club_id"] if "club_id" in row.keys() else None) or _main_club(),
         auto_stack_mode=_norm_auto_mode(
             row["auto_stack_mode"] if "auto_stack_mode" in row.keys() else "off"
         ),
@@ -858,6 +904,15 @@ def _load_table(game_id: str) -> LiveTable:
         show_grades=bool(_row_int(row, "show_grades", 1)),
         allow_rathole=bool(_row_int(row, "allow_rathole", 0)),
     )
+    # A hand dealt (hand_no is saved at the deal) but never recorded was cut short
+    # by a restart. It is void — stacks are saved only when a hand ends, so everyone
+    # has what they had before it — but say so: to the players it just vanished.
+    if t.status == "open" and t.hand_no > 0:
+        last = pub.DB.one("SELECT MAX(hand_no) AS n FROM homegame_hands WHERE game_id=?", (game_id,))
+        if last is not None and int(last["n"] or 0) < t.hand_no:
+            _emit(t, "run", f"Hand #{t.hand_no} was cut short (the server restarted) and doesn't count — "
+                            "everyone has the chips they had before it. The host restarts the game.")
+    return t
 
 
 def _row_int(row: Any, key: str, default: int) -> int:
@@ -2353,6 +2408,10 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
         },
         "pot_awards": shown_awards,
         "pots": list(t.pots or []) if t.runout_active else [],
+        "live_pots": (
+            _live_pots(raw, in_hand, t.num_seats)
+            if raw and t.phase == "in_hand" and not t.runout_active else []
+        ),
         # --- 2026-09-21 ----------------------------------------------------
         "host_user_id": t.host_user_id,
         "settings": {
@@ -2382,6 +2441,9 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
             ({k: r[k] for k in ("id", "kind", "seat", "amount_cents")}
              for r in t.requests if r["user_id"] == viewer_id), None,
         ),
+        # people asking to join the home games from this table's link (admins only)
+        "join_requests": _table_join_requests(t, viewer_id),
+        "club": _table_club(t, viewer_id),
         "spectators": sorted(
             t.names.get(uid, "?") for uid, last in t.seen.items()
             if now_mono - last <= PRESENCE_WINDOW_S and t.seat_of(uid) is None
@@ -2438,8 +2500,13 @@ def _require_member(t: LiveTable, uid: int) -> None:
         raise HTTPException(status_code=403, detail="take a seat first")
 
 
-def _cash_out_seat(t: LiveTable, i: int) -> None:
+def _cash_out_seat(t: LiveTable, i: int, *, closing: bool = False) -> None:
     """Seat ``i`` leaves with its share of the money on the table.
+
+    A host who leaves hands the table to the next player — but NOT when the
+    table is closing (``closing``): closing cashed the host out first, so the
+    role walked round the table and the finished session ended up "hosted by"
+    whoever was cashed out second to last (with an "X is now the host" toast).
 
     The amount is the seat's entry in the largest-remainder apportionment of
     the table's money over ALL seated stacks (module docstring, review
@@ -2457,7 +2524,7 @@ def _cash_out_seat(t: LiveTable, i: int) -> None:
         _persist_player(t, None, p, False)
         t.seats[i] = None
         new_host = None
-        if t.host_user_id == p.user_id:
+        if t.host_user_id == p.user_id and not closing:
             occ = t.occupied()
             t.host_user_id = t.seats[occ[0]].user_id if occ else t.host_user_id
             new_host = t.seats[occ[0]].name if occ else None
@@ -3025,33 +3092,45 @@ def _capture_rabbit(t: LiveTable, played_len: int) -> None:
         full_b if len(full_b) >= 3 else full_b,
         t.button,
     )
-    # Name the pots the way the table talks about them (ClubGG-style award
-    # animation, 2026-09-22): the layers are already deepest-first; the LAST is
-    # the main pot, the ones before it side pots numbered from the main pot up.
-    layers = [ly for ly in pot_layers(commit[: t.num_seats], folded_full) if ly["chips"] > 0 and ly["eligible"]]
-    t.pots = [
-        {"index": k, "label": "Main pot" if k == len(layers) - 1 else f"Side pot {len(layers) - 1 - k}",
-         "chips": int(ly["chips"]), "eligible": list(ly["eligible"]), "level": int(ly["level"])}
-        for k, ly in enumerate(layers)
-    ]
-    _assign_award_pots(t.pot_awards, layers)
+    # The award steps carry the index of the pot they pay from (``build_awards``).
+    t.pots = _named_pots(display_pots(commit[: t.num_seats], folded_full))
     _compute_runout_equities(t, {i: holes[i] for i in alive if holes[i]}, full_a, full_b)
 
 
-def _assign_award_pots(awards: list[dict[str, Any]], layers: list[dict[str, Any]]) -> None:
-    """Tag each award step with the pot (layer index, deepest first) it pays
-    from. ``build_awards`` walks the layers in order and emits up to two steps
-    (board a, board b) per layer, so steps pair up with layers by counting the
-    board-a steps: a layer without a board-a step (half_a == 0) can only be a
-    one-chip layer, which has no board-b step either."""
-    k = -1
-    for a in awards:
-        if a.get("uncontested") and len(layers) <= 1:
-            a["pot"] = max(0, len(layers) - 1)
-            continue
-        if a["board"] == "a" or k < 0:
-            k += 1
-        a["pot"] = min(k, max(0, len(layers) - 1))
+def _named_pots(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """``runout.display_pots`` named the way the table talks about them
+    (ClubGG-style, 2026-09-22): deepest first; the LAST is the main pot, the ones
+    before it side pots numbered from the main pot up. Layers the same players
+    can win are ONE pot (a fold is dead money, not a side pot)."""
+    n = len(groups)
+    return [
+        {"index": k, "label": "Main pot" if k == n - 1 else f"Side pot {n - 1 - k}",
+         "chips": int(g["chips"]), "eligible": list(g["eligible"]), "level": int(g["level"])}
+        for k, g in enumerate(groups)
+    ]
+
+
+def _live_pots(raw: dict[str, Any], in_hand: list[bool], n: int) -> list[dict[str, Any]]:
+    """The pots WHILE a hand is played (2026-09-25; they used to appear only at
+    the showdown): what is already in the middle — the antes and the finished
+    streets — split exactly the way the showdown will pay it, so a side pot
+    shows the moment someone all-in for less has been called past, and a
+    fold's chips stay dead money in the pot they went into. This street's bets
+    are still in front of the players and join the pots when the betting round
+    closes, as on any poker site. Same names and order as ``t.pots``, so the
+    runout takes over without a pot changing place."""
+    total = [int(x) for x in (raw.get("total_commit") or [])]
+    street = [int(x) for x in (raw.get("street_commit") or [])]
+    folded = [bool(x) for x in (raw.get("folded") or [])]
+    middle = [
+        max(0, (total[i] if i < len(total) else 0) - (street[i] if i < len(street) else 0))
+        for i in range(n)
+    ]
+    gone = [
+        (folded[i] if i < len(folded) else True) or not (in_hand[i] if i < len(in_hand) else False)
+        for i in range(n)
+    ]
+    return _named_pots(display_pots(middle, gone))
 
 
 def _compute_runout_equities(
@@ -3338,6 +3417,11 @@ def _request_locked(t: LiveTable, user: Any, kind: str, seat: int | None, cents:
         seat = t.seat_of(uid)
         have = chips_to_cents(p.stack_chips, t.bb_cents) + int(p.queued_topup_cents or 0)
         _check_buyin_limits(t, cents, have, fresh=False)
+    # The same request again (a double tap, an impatient second tap) is not news:
+    # the host used to get one "asks to" toast per tap, stacked over the table.
+    if any(r["user_id"] == uid and r["kind"] == kind and r["seat"] == seat and int(r["amount_cents"]) == int(cents)
+           for r in t.requests):
+        return
     t.requests = [r for r in t.requests if r["user_id"] != uid]
     if len(t.requests) >= MAX_REQUESTS:
         raise HTTPException(status_code=429, detail="too many pending requests")
@@ -3778,7 +3862,7 @@ def _close_locked(t: LiveTable, uid: int) -> None:
         raise HTTPException(status_code=400, detail="wait for the hand to finish")
     with _mutation(t):
         for i in list(t.occupied()):
-            _cash_out_seat(t, i)
+            _cash_out_seat(t, i, closing=True)
         t.pending_kicks.clear()
         t.status = "closed"
         t.running = False
@@ -4214,7 +4298,18 @@ def _revealing_now() -> list[tuple[str, int]]:
     return out
 
 
-def _community(viewer_id: int, is_admin: bool) -> dict[str, Any]:
+def _club_clause(clubs: list[str] | None, col: str = "g.club_id") -> tuple[str, list[Any]]:
+    """`` AND g.club_id IN (...)`` for a stats scope (None = no restriction)."""
+    if clubs is None:
+        return "", []
+    if not clubs:
+        return " AND 0", []
+    return f" AND {col} IN ({','.join('?' * len(clubs))})", list(clubs)
+
+
+def _community(viewer_id: int, club_id: str, can_manage: bool) -> dict[str, Any]:
+    """ONE club's numbers (rankings never mix clubs). ``can_manage`` = the club's
+    owner: sees excluded sessions and may exclude / restore them."""
     skip = _revealing_now()
     guard = "".join(" AND NOT (r.game_id=? AND r.hand_no=?)" for _ in skip)
     gargs = [x for pair in skip for x in pair]
@@ -4223,8 +4318,8 @@ def _community(viewer_id: int, is_admin: bool) -> dict[str, Any]:
         "SUM(r.acc_sum) a, SUM(r.acc_n) n, SUM(CASE WHEN r.delta_cents>0 THEN 1 ELSE 0 END) wins, "
         "COUNT(DISTINCT r.game_id) sessions, MAX(r.delta_cents) best "
         "FROM homegame_hand_results r JOIN homegames g ON g.id=r.game_id "
-        f"JOIN users u ON u.id=r.user_id WHERE g.excluded=0{guard} GROUP BY r.user_id",
-        tuple(gargs),
+        f"JOIN users u ON u.id=r.user_id WHERE g.excluded=0 AND g.club_id=?{guard} GROUP BY r.user_id",
+        tuple([club_id] + gargs),
     )
     players = [
         {
@@ -4243,8 +4338,8 @@ def _community(viewer_id: int, is_admin: bool) -> dict[str, Any]:
     gross: dict[tuple[int, int], float] = {}
     for r in pub.DB.q(
         "SELECT f.payer, f.payee, SUM(f.chips * g.bb_cents) v FROM homegame_flows f "
-        f"JOIN homegames g ON g.id=f.game_id WHERE g.excluded=0{fguard} "
-        "GROUP BY f.payer, f.payee", tuple(gargs),
+        f"JOIN homegames g ON g.id=f.game_id WHERE g.excluded=0 AND g.club_id=?{fguard} "
+        "GROUP BY f.payer, f.payee", tuple([club_id] + gargs),
     ):
         gross[(int(r["payer"]), int(r["payee"]))] = float(r["v"] or 0) / BB_CHIPS
     pairs = []
@@ -4256,11 +4351,12 @@ def _community(viewer_id: int, is_admin: bool) -> dict[str, Any]:
         "SELECT g.id, g.name, g.status, g.excluded, g.created_at, g.closed_at, g.hand_no, "
         "g.sb_cents, g.bb_cents, g.ante_cents, "
         "(SELECT COUNT(*) FROM homegame_players p WHERE p.game_id=g.id AND p.buyin_cents>0) players "
-        "FROM homegames g " + ("" if is_admin else "WHERE g.excluded=0 ") +
-        "ORDER BY g.created_at DESC LIMIT 300"
+        "FROM homegames g WHERE g.club_id=? " + ("" if can_manage else "AND g.excluded=0 ") +
+        "ORDER BY g.created_at DESC LIMIT 300", (club_id,),
     )
     return {
-        "players": players, "pairs": pairs, "is_admin": bool(is_admin),
+        "club": club_id, "players": players, "pairs": pairs,
+        "can_manage": bool(can_manage), "is_admin": bool(can_manage),
         "sessions": [
             {"id": r["id"], "name": r["name"], "open": r["status"] == "open",
              "excluded": bool(int(r["excluded"] or 0)), "created_at": r["created_at"],
@@ -4273,18 +4369,19 @@ def _community(viewer_id: int, is_admin: bool) -> dict[str, Any]:
 
 
 def _exclude_locked(t: LiveTable, user: Any, on: bool) -> None:
-    """Admin: take a session out of the record (test tables) or put it back.
+    """The CLUB'S OWNER: take a session out of the club's record (test tables) or
+    put it back — not the host (a host must not be able to erase a losing night).
     Nothing is deleted — hands, ledger and flows stay in the database and the
     table still opens by its link; it just counts nowhere. An open table is
     closed first (everyone is cashed out), so it also leaves the lobby."""
-    if not pub._is_admin(user):
-        raise HTTPException(status_code=403, detail="only the site admin can do that")
+    if user is None or _club_role(t.club_id, int(user["id"])) != "owner":
+        raise HTTPException(status_code=403, detail="only the club's owner can do that")
     if on and t.status == "open":
         if _hand_busy(t):
             raise HTTPException(status_code=400, detail="wait for the hand to finish")
         with _mutation(t):
             for i in list(t.occupied()):
-                _cash_out_seat(t, i)
+                _cash_out_seat(t, i, closing=True)
             t.pending_kicks.clear()
             t.status = "closed"
             t.running = False
@@ -4308,7 +4405,8 @@ _MY_SORTS = {
 
 
 def _my_hands(viewer_id: int, sort: str, direction: str, game_id: str | None,
-              offset: int, limit: int, player_id: int | None = None) -> dict[str, Any]:
+              offset: int, limit: int, player_id: int | None = None,
+              clubs: list[str] | None = None) -> dict[str, Any]:
     """``player_id``'s hands (default: the viewer's own). The club is private and
     everyone may browse everyone's history — but the CARDS in it follow the live
     table's rule for the VIEWER: their own, plus hands that were tabled or shown.
@@ -4318,8 +4416,9 @@ def _my_hands(viewer_id: int, sort: str, direction: str, game_id: str | None,
     desc = str(direction).lower() != "asc"
     limit = max(1, min(HANDS_PAGE_MAX, int(limit)))
     offset = max(0, int(offset))
-    where = "r.user_id=? AND g.excluded=0"
-    args: list[Any] = [player]
+    scope, sargs = _club_clause(clubs)
+    where = "r.user_id=? AND g.excluded=0" + scope
+    args: list[Any] = [player] + sargs
     if game_id:
         where += " AND r.game_id=?"
         args.append(str(game_id))
@@ -4369,28 +4468,31 @@ def _my_hands(viewer_id: int, sort: str, direction: str, game_id: str | None,
     return {"hands": hands, "total": int(total), "offset": offset, "limit": limit}
 
 
-def _my_stats(viewer_id: int) -> dict[str, Any]:
+def _my_stats(viewer_id: int, clubs: list[str] | None = None) -> dict[str, Any]:
+    """A player's numbers, within ``clubs`` (None = everything they played)."""
     uid = int(viewer_id)
     who = pub._user_by_id(uid)
+    scope, sargs = _club_clause(clubs)
     tot = pub.DB.one(
         "SELECT COUNT(*) hands, COALESCE(SUM(r.delta_cents),0) net, COALESCE(SUM(r.acc_sum),0) a, "
         "COALESCE(SUM(r.acc_n),0) n, SUM(CASE WHEN r.delta_cents>0 THEN 1 ELSE 0 END) wins "
         "FROM homegame_hand_results r JOIN homegames g ON g.id=r.game_id "
-        "WHERE r.user_id=? AND g.excluded=0", (uid,),
+        f"WHERE r.user_id=? AND g.excluded=0{scope}", tuple([uid] + sargs),
     )
     sessions = pub.DB.q(
         "SELECT g.id, g.name, g.status, g.sb_cents, g.bb_cents, g.ante_cents, COUNT(*) hands, "
         "SUM(r.delta_cents) net, SUM(r.acc_sum) a, SUM(r.acc_n) n, MAX(h.ended_at) last "
         "FROM homegame_hand_results r JOIN homegames g ON g.id=r.game_id "
         "JOIN homegame_hands h ON h.game_id=r.game_id AND h.hand_no=r.hand_no "
-        "WHERE r.user_id=? AND g.excluded=0 GROUP BY g.id ORDER BY last DESC LIMIT 200", (uid,),
+        f"WHERE r.user_id=? AND g.excluded=0{scope} GROUP BY g.id ORDER BY last DESC LIMIT 200",
+        tuple([uid] + sargs),
     )
     # head to head, in CENTS (chips are relative to each table's big blind)
     vs: dict[int, float] = {}
     for r in pub.DB.q(
         "SELECT f.payer, f.payee, SUM(f.chips * g.bb_cents) v FROM homegame_flows f "
-        "JOIN homegames g ON g.id=f.game_id WHERE (f.payer=? OR f.payee=?) AND g.excluded=0 "
-        "GROUP BY f.payer, f.payee", (uid, uid),
+        f"JOIN homegames g ON g.id=f.game_id WHERE (f.payer=? OR f.payee=?) AND g.excluded=0{scope} "
+        "GROUP BY f.payer, f.payee", tuple([uid, uid] + sargs),
     ):
         other = int(r["payee"]) if int(r["payer"]) == uid else int(r["payer"])
         sign = -1 if int(r["payer"]) == uid else 1
@@ -4522,6 +4624,7 @@ def _create_table(user: Any, body: dict) -> LiveTable:
     listed = _parse_bool(body, "listed", True)
     approve = _parse_bool(body, "approve_buyins", False)
     rathole = _parse_bool(body, "allow_rathole", False)
+    club_id = _club_for_new_table(int(user["id"]), body.get("club_id"))
     # (review 2026-09-20 G13) 50 tables in 0.32 s, none ever evicted.
     open_n = pub.DB.one(
         "SELECT COUNT(*) c FROM homegames WHERE host_user_id=? AND status='open'",
@@ -4550,6 +4653,7 @@ def _create_table(user: Any, body: dict) -> LiveTable:
         hand_no=0,
         seats=[None] * n,
         running=False,
+        club_id=club_id,
         decision_secs=secs,
         deal_delay_secs=delay,
         time_bank_secs=bank,
@@ -4565,11 +4669,11 @@ def _create_table(user: Any, body: dict) -> LiveTable:
             "INSERT INTO homegames(id,host_user_id,name,num_seats,sb_cents,bb_cents,"
             "ante_cents,default_buyin_cents,status,running,decision_secs,button,"
             "hand_no,created_at,deal_delay_ms,time_bank_secs,min_buyin_cents,"
-            "max_buyin_cents,listed,approve_buyins,allow_rathole) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "max_buyin_cents,listed,approve_buyins,allow_rathole,club_id) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (gid, int(user["id"]), name, n, sb, bb, ante, buyin, "open", 0, secs,
              0, 0, pub._now(), int(round(delay * 1000)), bank, lo, hi,
-             1 if listed else 0, 1 if approve else 0, 1 if rathole else 0),
+             1 if listed else 0, 1 if approve else 0, 1 if rathole else 0, club_id),
         )
         # Host sits seat 0 with the default buy-in so they can deal once a
         # second player sits.
@@ -4635,15 +4739,16 @@ def _lobby_visible(row: Any, viewer_id: int | None) -> bool:
     ) is not None
 
 
-def _my_sessions(viewer_id: int, limit: int = 12) -> list[dict[str, Any]]:
-    """The viewer's finished sessions (closed tables they played at)."""
+def _my_sessions(viewer_id: int, club_id: str | None = None, limit: int = 12) -> list[dict[str, Any]]:
+    """The viewer's finished sessions (closed tables they played at), in one club."""
+    scope, sargs = _club_clause([club_id] if club_id else None)
     rows = pub.DB.q(
         "SELECT g.id, g.name, g.sb_cents, g.bb_cents, g.ante_cents, g.hand_no, "
         "g.closed_at, p.buyin_cents, p.leftover_cents FROM homegame_players p "
         "JOIN homegames g ON g.id=p.game_id "
-        "WHERE p.user_id=? AND g.status='closed' AND p.buyin_cents>0 AND g.excluded=0 "
+        f"WHERE p.user_id=? AND g.status='closed' AND p.buyin_cents>0 AND g.excluded=0{scope} "
         "ORDER BY g.closed_at DESC LIMIT ?",
-        (int(viewer_id), int(limit)),
+        tuple([int(viewer_id)] + sargs + [int(limit)]),
     )
     out = []
     for r in rows:
@@ -4712,6 +4817,628 @@ def _page_html(static_dir: Path) -> str:
     return (static_dir / "games.html").read_text(encoding="utf-8")
 
 
+# Security headers for the home-games page (the lobby and every table). Scripts
+# run ONLY from this site: no inline <script>, no inline event-handler attribute
+# (onclick=...), no javascript: URL — a script injected through a name or a chat
+# line cannot run. Styles/fonts come from this site and Google Fonts; images from
+# this site or data: URIs (so injected CSS cannot send anything elsewhere either);
+# no other site may frame the page. A new outside resource (a CDN, an image host)
+# needs its origin added here; test_homegame_page_headers.py scans the client for
+# inline handlers the policy would silently block.
+PAGE_CSP = "; ".join((
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    "font-src 'self' https://fonts.gstatic.com",
+    "img-src 'self' data:",
+    "connect-src 'self'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+))
+PAGE_HEADERS: dict[str, str] = {
+    "Cache-Control": "no-store, must-revalidate",
+    "Content-Security-Policy": PAGE_CSP,
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "same-origin",
+    # allow-popups: "Open in Study" fills the new tab it opens before sending it on
+    "Cross-Origin-Opener-Policy": "same-origin-allow-popups",
+}
+
+
+# --- clubs (2026-09-25) -----------------------------------------------------------
+#
+# Home games are open to every signed-in user; a CLUB is the private circle: its
+# tables, its members and its numbers. A table belongs to exactly one club. Only
+# members see it in the lobby, sit, watch or open its history, and every ranking,
+# accuracy score, profit table and head-to-head is computed from ONE club's tables:
+# nothing ranks the whole user base. Anyone can start a club and host in it.
+# People join with the club's invite link (the owner can make it "ask first"), or
+# ask from a table link and wait for the owner or an admin to let them in.
+# The site's original private circle is the MAIN club: the migration gives it every
+# table and player that predate clubs, and the /admin home-games switch adds and
+# removes people there.
+
+CLUB_ROLES = ("owner", "admin", "member")
+MAX_CLUBS_OWNED = 5
+MAX_CLUB_NAME = 40
+JOIN_RETRY_S = 60.0     # a declined request can be sent again after this
+JOIN_REFRESH_S = 5.0    # how stale a club manager's view of the requests may be
+_CODE_RE = re.compile(r"^[A-Za-z0-9_-]{6,40}$")
+
+
+def _club(club_id: Any) -> Any:
+    if not club_id or not _CODE_RE.match(str(club_id)):
+        return None
+    return pub.DB.one("SELECT * FROM homegame_clubs WHERE id=?", (str(club_id),))
+
+
+def _club_role(club_id: Any, uid: Any) -> str | None:
+    if not club_id or uid is None:
+        return None
+    r = pub.DB.one(
+        "SELECT role FROM homegame_club_members WHERE club_id=? AND user_id=?", (str(club_id), int(uid))
+    )
+    return str(r["role"]) if r is not None else None
+
+
+def _require_club(club_id: Any, uid: int, *roles: str) -> tuple[Any, str]:
+    """The club and the viewer's role in it. Not a member = 404 (a club's
+    existence is nobody else's business); a member without one of ``roles`` = 403."""
+    club = _club(club_id)
+    role = _club_role(club["id"], uid) if club is not None else None
+    if club is None or role is None:
+        raise HTTPException(status_code=404, detail="Not Found")
+    if roles and role not in roles:
+        who = "the club's owner" if roles == ("owner",) else "the club's owner or an admin"
+        raise HTTPException(status_code=403, detail=f"only {who} can do that")
+    return club, role
+
+
+def _club_member_ids(club_id: str) -> set[int]:
+    return {int(r["user_id"]) for r in pub.DB.q(
+        "SELECT user_id FROM homegame_club_members WHERE club_id=?", (club_id,))}
+
+
+def _add_member(club_id: str, uid: int, role: str = "member") -> None:
+    now = pub._now()
+    pub.DB.q(
+        "INSERT OR IGNORE INTO homegame_club_members(club_id,user_id,role,joined_at) VALUES(?,?,?,?)",
+        (club_id, int(uid), role, now),
+    )
+    pub.DB.q(
+        "UPDATE homegame_club_requests SET status='approved', decided_at=? "
+        "WHERE club_id=? AND user_id=? AND status='pending'", (now, club_id, int(uid)),
+    )
+
+
+def _create_club(user: Any, name: Any, *, main: bool = False) -> str:
+    name = " ".join(str(name or "").split())
+    if not name:
+        raise HTTPException(status_code=400, detail="give the club a name")
+    if len(name) > MAX_CLUB_NAME:
+        raise HTTPException(status_code=400, detail=f"a club name is limited to {MAX_CLUB_NAME} characters")
+    uid = int(user["id"])
+    owned = pub.DB.one("SELECT COUNT(*) c FROM homegame_clubs WHERE owner_user_id=?", (uid,))["c"]
+    if not main and int(owned) >= MAX_CLUBS_OWNED:
+        raise HTTPException(status_code=429, detail=f"you already run {MAX_CLUBS_OWNED} clubs")
+    cid = secrets.token_urlsafe(6)
+    now = pub._now()
+    with pub.DB.transaction():
+        pub.DB.q(
+            "INSERT INTO homegame_clubs(id,name,owner_user_id,invite_code,approve_joins,is_main,created_at) "
+            "VALUES(?,?,?,?,0,?,?)",
+            (cid, name, uid, secrets.token_urlsafe(9), 1 if main else 0, now),
+        )
+        pub.DB.q(
+            "INSERT OR IGNORE INTO homegame_club_members(club_id,user_id,role,joined_at) VALUES(?,?,'owner',?)",
+            (cid, uid, now),
+        )
+    return cid
+
+
+def _main_club(create_for: int | None = None) -> str | None:
+    """The site's original circle (see above). Made on first need: by the
+    migration, or by the first /admin home-games grant (``create_for`` = the
+    granting admin, who then owns it)."""
+    r = pub.DB.one("SELECT id FROM homegame_clubs WHERE is_main=1 ORDER BY created_at LIMIT 1")
+    if r is not None:
+        return str(r["id"])
+    owner = pub._user_by_id(int(create_for)) if create_for is not None else None
+    if owner is None:
+        return None
+    first = (_display_name(owner) or "Home").split(" ")[0]
+    return _create_club(owner, f"{first}'s club"[:MAX_CLUB_NAME], main=True)
+
+
+def _migrate_clubs() -> None:
+    """Tables that predate clubs (``club_id`` NULL) join the MAIN club, and so
+    does everyone who ever hosted or sat at one, plus everyone who had the old
+    admin-granted home-games flag: the circle and its numbers carry on exactly as
+    they were. Idempotent (nothing left to move = nothing happens)."""
+    legacy = pub.DB.q("SELECT id, host_user_id FROM homegames WHERE club_id IS NULL ORDER BY created_at")
+    if not legacy:
+        return
+    granted = [int(r["id"]) for r in pub.DB.q("SELECT id FROM users WHERE homegame_access=1 ORDER BY created_at")]
+    admins = [int(r["id"]) for r in pub.DB.q("SELECT id, email FROM users ORDER BY created_at") if pub._is_admin(r)]
+    owner = admins[0] if admins else int(legacy[0]["host_user_id"])
+    cid = _main_club(create_for=owner)
+    if cid is None:
+        return
+    members = set(granted) | {int(r["host_user_id"]) for r in legacy}
+    for r in pub.DB.q("SELECT DISTINCT p.user_id FROM homegame_players p JOIN homegames g ON g.id=p.game_id "
+                      "WHERE g.club_id IS NULL"):
+        members.add(int(r["user_id"]))
+    with pub.DB.transaction():
+        for uid in sorted(members):
+            if pub._user_by_id(uid) is not None:
+                pub.DB.q(
+                    "INSERT OR IGNORE INTO homegame_club_members(club_id,user_id,role,joined_at) "
+                    "VALUES(?,?,'member',?)", (cid, uid, pub._now()),
+                )
+        pub.DB.q("UPDATE homegames SET club_id=? WHERE club_id IS NULL", (cid,))
+    logger.info("clubs: %d table(s) and %d player(s) moved into the main club %s", len(legacy), len(members), cid)
+
+
+def _club_for_new_table(uid: int, requested: Any) -> str:
+    """Any member may host in a club. Without a choice (scripts, older clients):
+    the main club when the host is in it, else their oldest club."""
+    if requested:
+        club, _ = _require_club(requested, uid)
+        return str(club["id"])
+    r = pub.DB.one(
+        "SELECT m.club_id FROM homegame_club_members m JOIN homegame_clubs c ON c.id=m.club_id "
+        "WHERE m.user_id=? ORDER BY c.is_main DESC, m.joined_at LIMIT 1", (int(uid),),
+    )
+    if r is None:
+        raise HTTPException(status_code=400, detail="start a club (or join one) before you host a table")
+    return str(r["club_id"])
+
+
+def _mask_email(email: Any) -> str:
+    """Enough to tell two Alexes apart, not a mailing list: ``a•••@gmail.com``."""
+    s = str(email or "")
+    if "@" not in s:
+        return ""
+    user, dom = s.split("@", 1)
+    return f"{user[:1]}•••@{dom}"
+
+
+def _join_retry_in(decided_at: str | None) -> float:
+    try:
+        dt = datetime.fromisoformat(str(decided_at))
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, JOIN_RETRY_S - (datetime.now(timezone.utc) - dt).total_seconds())
+
+
+def _request_state(club_id: str, uid: int) -> tuple[str | None, float]:
+    r = pub.DB.one(
+        "SELECT status, decided_at FROM homegame_club_requests WHERE club_id=? AND user_id=?", (club_id, int(uid))
+    )
+    if r is None:
+        return None, 0.0
+    status = str(r["status"])
+    return status, (_join_retry_in(r["decided_at"]) if status == "declined" else 0.0)
+
+
+def _request_club(club_id: str, uid: int) -> None:
+    """Ask to join (from a table link, or an invite link of an ask-first club).
+    Once pending, or declined less than a minute ago, asking again is a no-op."""
+    if _club_role(club_id, uid) is not None:
+        return
+    status, retry = _request_state(club_id, uid)
+    if status == "pending" or (status == "declined" and retry > 0):
+        return
+    pub.DB.q(
+        "INSERT OR REPLACE INTO homegame_club_requests(club_id,user_id,status,created_at,decided_at) "
+        "VALUES(?,?,'pending',?,NULL)", (club_id, int(uid), pub._now()),
+    )
+    user = pub._user_by_id(uid)
+    for t in _open_club_tables_in_memory(club_id):
+        with t.lock:
+            t.join_checked_mono = 0.0
+            _emit(t, "joinreq", f"{_display_name(user) if user else 'Someone'} asks to join the club")
+            t.rev += 1
+
+
+def _open_club_tables_in_memory(club_id: str) -> list[LiveTable]:
+    with HUB._lock:
+        return [t for t in HUB._tables.values() if t.club_id == club_id and t.status == "open"]
+
+
+def _club_requests(club_id: str) -> list[dict[str, Any]]:
+    """Pending requests, oldest first (people who got in meanwhile drop out)."""
+    club = _club(club_id)
+    rows = pub.DB.q(
+        "SELECT r.user_id, r.created_at, u.name, u.email FROM homegame_club_requests r "
+        "JOIN users u ON u.id=r.user_id WHERE r.club_id=? AND r.status='pending' ORDER BY r.created_at",
+        (club_id,),
+    )
+    members = _club_member_ids(club_id)
+    return [
+        {"club_id": club_id, "club_name": str(club["name"]) if club else "", "user_id": int(r["user_id"]),
+         "name": _display_name(r), "email": _mask_email(r["email"]), "since": str(r["created_at"])}
+        for r in rows if int(r["user_id"]) not in members
+    ]
+
+
+def _decide_club_request(club_id: str, by_uid: int, target: int, allow: bool) -> dict[str, Any]:
+    _require_club(club_id, by_uid, "owner", "admin")
+    status, _ = _request_state(club_id, target)
+    if status != "pending" or _club_role(club_id, target) is not None:
+        raise HTTPException(status_code=409, detail="that request is gone")
+    user = pub._user_by_id(target)
+    if allow:
+        _add_member(club_id, target)
+    else:
+        pub.DB.q("UPDATE homegame_club_requests SET status='declined', decided_at=? WHERE club_id=? AND user_id=?",
+                 (pub._now(), club_id, int(target)))
+    for t in _open_club_tables_in_memory(club_id):
+        with t.lock:
+            t.join_checked_mono = 0.0
+            if allow:
+                _emit(t, "join", f"{_display_name(user) if user else 'A new player'} joined the club")
+            t.rev += 1
+    return {"ok": True, "allowed": bool(allow)}
+
+
+def _table_join_requests(t: LiveTable, viewer_id: int | None) -> list[dict[str, Any]]:
+    """What the club's owner / an admin at this table is asked to decide."""
+    if viewer_id is None or _club_role(t.club_id, viewer_id) not in ("owner", "admin"):
+        return []
+    now = time.monotonic()
+    if now - t.join_checked_mono > JOIN_REFRESH_S:
+        t.join_checked_mono = now
+        try:
+            t.join_reqs = _club_requests(t.club_id) if t.club_id else []
+        except Exception:  # noqa: BLE001 — cosmetic: never take the view down
+            logger.exception("club requests (table %s)", t.game_id)
+    return list(t.join_reqs)
+
+
+def _table_club(t: LiveTable, viewer_id: int | None) -> dict[str, Any] | None:
+    """The table's club as its view shows it (cached per table: names rarely change)."""
+    now = time.monotonic()
+    if t.club_info is None or now - t.club_checked_mono > 30.0:
+        t.club_checked_mono = now
+        club = _club(t.club_id)
+        t.club_info = {"id": str(club["id"]), "name": str(club["name"])} if club is not None else None
+    if t.club_info is None:
+        return None
+    return dict(t.club_info, role=_club_role(t.club_id, viewer_id))
+
+
+def _table_access(t: LiveTable, uid: int) -> None:
+    """Only the table's club may see it, sit, watch or act. Anyone else gets 403
+    naming the club (and where their request stands), so a table link can offer
+    "ask to join the club" instead of a dead end."""
+    if t.club_id and _club_role(t.club_id, uid) is not None:
+        return
+    club = _club(t.club_id)
+    if club is None:  # (no club at all cannot happen after the migration: its host only)
+        if int(uid) == int(t.host_user_id):
+            return
+        raise HTTPException(status_code=404, detail="Not Found")
+    status, retry = _request_state(str(club["id"]), uid)
+    raise HTTPException(status_code=403, detail={
+        "error": "club", "club": {"id": str(club["id"]), "name": str(club["name"])},
+        "request": status, "retry_in": round(retry, 1),
+        "message": f"This table belongs to the club “{club['name']}”.",
+    })
+
+
+def _busy_in_club(club_id: str, uid: int, who: str) -> str | None:
+    """Why this person can't leave the club right now (``who`` = "you" or their
+    name), or None: a seat at one of its open tables, or hosting one (a table
+    whose host is outside its club would have nobody left to run it)."""
+    r = pub.DB.one(
+        "SELECT g.name FROM homegame_players p JOIN homegames g ON g.id=p.game_id "
+        "WHERE g.club_id=? AND g.status='open' AND p.user_id=? AND p.seat IS NOT NULL LIMIT 1",
+        (club_id, int(uid)),
+    )
+    if r is not None:
+        return f"{who} {'have' if who == 'you' else 'has'} a seat at “{r['name']}” — leave the table first"
+    r = pub.DB.one(
+        "SELECT name FROM homegames WHERE club_id=? AND status='open' AND host_user_id=? LIMIT 1",
+        (club_id, int(uid)),
+    )
+    if r is not None:
+        return f"{who} {'host' if who == 'you' else 'hosts'} “{r['name']}” — hand the table over or close it first"
+    return None
+
+
+def _club_summary(r: Any, uid: int) -> dict[str, Any]:
+    cid, role = str(r["id"]), str(r["role"])
+    manage = role in ("owner", "admin")
+    return {
+        "id": cid, "name": str(r["name"]), "role": role, "is_main": bool(int(r["is_main"] or 0)),
+        "members": int(pub.DB.one("SELECT COUNT(*) c FROM homegame_club_members WHERE club_id=?", (cid,))["c"]),
+        "open_tables": int(pub.DB.one(
+            "SELECT COUNT(*) c FROM homegames WHERE club_id=? AND status='open'", (cid,))["c"]),
+        "requests": len(_club_requests(cid)) if manage else 0,
+    }
+
+
+def _my_clubs(uid: int) -> list[dict[str, Any]]:
+    rows = pub.DB.q(
+        "SELECT c.*, m.role FROM homegame_club_members m JOIN homegame_clubs c ON c.id=m.club_id "
+        "WHERE m.user_id=? ORDER BY c.is_main DESC, c.created_at", (int(uid),),
+    )
+    return [_club_summary(r, uid) for r in rows]
+
+
+_ROLE_RANK = {"owner": 0, "admin": 1, "member": 2}
+
+
+def _club_view(club_id: Any, uid: int) -> dict[str, Any]:
+    club, role = _require_club(club_id, uid)
+    cid = str(club["id"])
+    manage = role in ("owner", "admin")
+    owner = pub._user_by_id(int(club["owner_user_id"]))
+    rows = pub.DB.q(
+        "SELECT m.user_id, m.role, m.joined_at, u.name, u.email FROM homegame_club_members m "
+        "JOIN users u ON u.id=m.user_id WHERE m.club_id=?", (cid,),
+    )
+    members = sorted(
+        ({"user_id": int(r["user_id"]), "name": _display_name(r), "role": str(r["role"]),
+          "is_me": int(r["user_id"]) == int(uid), "joined_at": str(r["joined_at"])} for r in rows),
+        key=lambda m: (_ROLE_RANK.get(m["role"], 9), m["name"].lower()),
+    )
+    return {
+        "id": cid, "name": str(club["name"]), "role": role, "is_main": bool(int(club["is_main"] or 0)),
+        "approve_joins": bool(int(club["approve_joins"] or 0)),
+        "owner": {"user_id": int(club["owner_user_id"]), "name": _display_name(owner) if owner else "?"},
+        "members": members,
+        "invite_code": str(club["invite_code"]) if manage else None,
+        "requests": _club_requests(cid) if manage else [],
+        "created_at": str(club["created_at"]),
+    }
+
+
+def _club_settings(club_id: Any, uid: int, body: dict) -> dict[str, Any]:
+    club, _ = _require_club(club_id, uid, "owner")
+    cid = str(club["id"])
+    name = str(club["name"])
+    if body.get("name") is not None:
+        name = " ".join(str(body.get("name") or "").split())
+        if not name:
+            raise HTTPException(status_code=400, detail="give the club a name")
+        if len(name) > MAX_CLUB_NAME:
+            raise HTTPException(status_code=400, detail=f"a club name is limited to {MAX_CLUB_NAME} characters")
+    approve = _parse_bool(body, "approve_joins", bool(int(club["approve_joins"] or 0)))
+    pub.DB.q("UPDATE homegame_clubs SET name=?, approve_joins=? WHERE id=?", (name, 1 if approve else 0, cid))
+    return _club_view(cid, uid)
+
+
+def _reset_invite(club_id: Any, uid: int) -> dict[str, Any]:
+    club, _ = _require_club(club_id, uid, "owner", "admin")
+    pub.DB.q("UPDATE homegame_clubs SET invite_code=? WHERE id=?", (secrets.token_urlsafe(9), str(club["id"])))
+    return _club_view(str(club["id"]), uid)
+
+
+def _set_member(club_id: Any, by_uid: int, target: int, *, role: Any = None, remove: bool = False) -> dict[str, Any]:
+    club, my_role = _require_club(club_id, by_uid, "owner", "admin")
+    cid = str(club["id"])
+    their = _club_role(cid, target)
+    if their is None:
+        raise HTTPException(status_code=404, detail="they are not in the club")
+    who = pub._user_by_id(target)
+    name = _display_name(who) if who is not None else "They"
+    if remove:
+        if int(target) == int(by_uid):
+            raise HTTPException(status_code=400, detail="to go, use Leave club")
+        if their == "owner":
+            raise HTTPException(status_code=403, detail="the owner can't be removed")
+        if my_role == "admin" and their != "member":
+            raise HTTPException(status_code=403, detail="only the owner can remove an admin")
+        busy = _busy_in_club(cid, target, name)
+        if busy:
+            raise HTTPException(status_code=409, detail=busy)
+        pub.DB.q("DELETE FROM homegame_club_members WHERE club_id=? AND user_id=?", (cid, int(target)))
+        return _club_view(cid, by_uid)
+    if my_role != "owner":
+        raise HTTPException(status_code=403, detail="only the club's owner can change roles")
+    role = str(role or "")
+    if role not in CLUB_ROLES:
+        raise HTTPException(status_code=400, detail="role must be owner, admin or member")
+    if role == "owner":
+        # handing the club over: the old owner stays on as an admin
+        if int(target) == int(by_uid):
+            return _club_view(cid, by_uid)
+        with pub.DB.transaction():
+            pub.DB.q("UPDATE homegame_clubs SET owner_user_id=? WHERE id=?", (int(target), cid))
+            pub.DB.q("UPDATE homegame_club_members SET role='owner' WHERE club_id=? AND user_id=?", (cid, int(target)))
+            pub.DB.q("UPDATE homegame_club_members SET role='admin' WHERE club_id=? AND user_id=?", (cid, int(by_uid)))
+        return _club_view(cid, by_uid)
+    if their == "owner":
+        raise HTTPException(status_code=400, detail="the owner's role only changes by handing the club over")
+    pub.DB.q("UPDATE homegame_club_members SET role=? WHERE club_id=? AND user_id=?", (role, cid, int(target)))
+    return _club_view(cid, by_uid)
+
+
+def _leave_club(club_id: Any, uid: int) -> None:
+    club, role = _require_club(club_id, uid)
+    cid = str(club["id"])
+    if role == "owner":
+        raise HTTPException(status_code=400, detail="hand the club to another member first (Club settings → Members)")
+    busy = _busy_in_club(cid, uid, "you")
+    if busy:
+        raise HTTPException(status_code=409, detail=busy[0].upper() + busy[1:])
+    pub.DB.q("DELETE FROM homegame_club_members WHERE club_id=? AND user_id=?", (cid, int(uid)))
+
+
+def _club_by_code(code: Any) -> Any:
+    if not code or not _CODE_RE.match(str(code)):
+        return None
+    return pub.DB.one("SELECT * FROM homegame_clubs WHERE invite_code=?", (str(code),))
+
+
+def _invite_info(code: Any, uid: int | None) -> dict[str, Any]:
+    club = _club_by_code(code)
+    if club is None:
+        raise HTTPException(status_code=404, detail="This invite link is no longer valid — ask for a new one.")
+    cid = str(club["id"])
+    owner = pub._user_by_id(int(club["owner_user_id"]))
+    status, retry = _request_state(cid, uid) if uid is not None else (None, 0.0)
+    return {
+        "club": {"id": cid, "name": str(club["name"]), "owner_name": _display_name(owner) if owner else "?",
+                 "members": len(_club_member_ids(cid))},
+        "member": uid is not None and _club_role(cid, uid) is not None,
+        "approve": bool(int(club["approve_joins"] or 0)),
+        "request": status, "retry_in": round(retry, 1),
+    }
+
+
+def _join_by_invite(code: Any, uid: int) -> dict[str, Any]:
+    club = _club_by_code(code)
+    if club is None:
+        raise HTTPException(status_code=404, detail="This invite link is no longer valid — ask for a new one.")
+    cid = str(club["id"])
+    if _club_role(cid, uid) is None:
+        if bool(int(club["approve_joins"] or 0)):
+            _request_club(cid, uid)
+        else:
+            _add_member(cid, uid)
+    return _invite_info(code, uid)
+
+
+# --- pages for someone who is not signed in ----------------------------------------
+#
+# Home games need an account: the lobby, a table link or a club invite link opened
+# signed out answers with a small page (no scripts) naming what it is and a
+# "Sign in with Google" button that comes straight back to the same link.
+
+_SIGNIN_PATH = re.compile(r"^/games(?:/t/([A-Za-z0-9_-]{1,40})|/join/([A-Za-z0-9_-]{6,40}))?$")
+INVITE_HEADERS: dict[str, str] = {
+    "Cache-Control": "no-store, must-revalidate",
+    "Content-Security-Policy": "; ".join((
+        "default-src 'none'",
+        "style-src 'unsafe-inline' https://fonts.googleapis.com",
+        "font-src https://fonts.gstatic.com",
+        "img-src 'self' data:",
+        "form-action 'self'",
+        "base-uri 'none'",
+        "frame-ancestors 'none'",
+    )),
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "same-origin",
+}
+_INVITE_CSS = """
+:root{color-scheme:dark}*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px 16px;
+background:radial-gradient(1200px 600px at 50% -10%,#123127 0,#070b11 60%) #070b11;color:#e8edf3;
+font:15px/1.5 Geist,system-ui,-apple-system,"Segoe UI",sans-serif}
+.card{width:100%;max-width:420px;background:#0f1620;border:1px solid #223041;border-radius:18px;
+padding:28px 24px;box-shadow:0 20px 60px rgba(0,0,0,.45);text-align:center}
+.brand{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:#8794a6;margin-bottom:14px}
+h1{font-size:22px;line-height:1.25;margin:0 0 10px}p{margin:0 0 18px;color:#b7c2d0}
+.btn{display:inline-block;width:100%;border:0;border-radius:12px;padding:13px 16px;font:inherit;
+font-weight:700;cursor:pointer;text-decoration:none;background:linear-gradient(#f3d27a,#d9a93c);color:#1a1405}
+"""
+
+
+def _signin_html(head: str, text: str, next_path: str) -> str:
+    """``text`` is HTML (its names already escaped); ``head`` is plain text."""
+    def esc(s: str) -> str:  # (text nodes: & < > only — "You're" stays readable)
+        return html_mod.escape(str(s), quote=False)
+    return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+            '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            f"<title>{esc(head)} · Home games</title>"
+            '<link rel="icon" type="image/svg+xml" href="/static/brand/wrap-app-icon-dark.svg">'
+            '<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400..800&display=swap" rel="stylesheet">'
+            f"<style>{_INVITE_CSS}</style></head><body><main class=\"card\">"
+            f'<div class="brand">WrapGTO · Home games</div><h1>{esc(head)}</h1><p>{text}</p>'
+            f'<a class="btn" href="/auth/login?next={html_mod.escape(next_path, quote=True)}">Sign in with Google</a></main></body></html>')
+
+
+def _invite_response(request: Request, path: str, user: Any) -> Response | None:
+    """``pub._GAMES_INVITE_HOOK``: a /games page opened SIGNED OUT (or None for
+    the hidden 404 — the API, the assets and unknown links)."""
+    if user is not None or request.method.upper() not in ("GET", "HEAD"):
+        return None
+    if "text/html" not in request.headers.get("accept", "text/html"):
+        return None
+    m = _SIGNIN_PATH.match(path)
+    if m is None:
+        return None
+    esc = html_mod.escape
+    game_id, code = m.group(1), m.group(2)
+    if game_id:
+        table = pub.DB.one(
+            "SELECT g.name, g.status, u.name AS host_name, c.name AS club_name FROM homegames g "
+            "JOIN users u ON u.id=g.host_user_id LEFT JOIN homegame_clubs c ON c.id=g.club_id WHERE g.id=?",
+            (game_id,),
+        )
+        if table is None or table["status"] != "open":
+            return None
+        club = f" in <b>{esc(str(table['club_name']))}</b>" if table["club_name"] else ""
+        html = _signin_html(
+            f"You're invited to {table['name']}",
+            f"<b>{esc(str(table['host_name'] or 'A friend'))}</b> is hosting a PLO5 double-board bomb-pot "
+            f"game{club}. Sign in with Google to join — you'll come straight back to the table.",
+            path,
+        )
+    elif code:
+        club = _club_by_code(code)
+        if club is None:
+            return None
+        owner = pub._user_by_id(int(club["owner_user_id"]))
+        html = _signin_html(
+            f"Join {club['name']}",
+            f"<b>{esc(_display_name(owner) if owner else 'A friend')}</b> invited you to their home-games club: "
+            "PLO5 double-board bomb pots with friends, with the stats kept inside the club. "
+            "Sign in with Google to join.",
+            path,
+        )
+    else:
+        html = _signin_html(
+            "Home games",
+            "PLO5 double-board bomb pots with your friends, in private clubs. Sign in with Google to start a "
+            "club or join one.",
+            "/games",
+        )
+    return HTMLResponse(html, headers=dict(INVITE_HEADERS))
+
+
+def _main_club_member(uid: int) -> bool:
+    """/admin's home-games column: is this person in the main club?"""
+    cid = _main_club()
+    return cid is not None and _club_role(cid, uid) is not None
+
+
+def _admin_games_access(admin_uid: int, uid: int, grant: bool) -> bool:
+    """/admin's home-games switch: add to / remove from the MAIN club (made on the
+    first grant, owned by the granting admin). Returns membership afterwards."""
+    cid = _main_club(create_for=admin_uid if grant else None)
+    if cid is None:
+        return False
+    if grant:
+        _add_member(cid, uid)
+    elif _club_role(cid, uid) not in (None, "owner"):
+        who = pub._user_by_id(uid)
+        busy = _busy_in_club(cid, uid, _display_name(who) if who is not None else "They")
+        if busy:
+            raise HTTPException(status_code=409, detail=busy)
+        pub.DB.q("DELETE FROM homegame_club_members WHERE club_id=? AND user_id=?", (cid, int(uid)))
+    return _club_role(cid, uid) is not None
+
+
+_ADMIN_IDS: dict[int, bool] = {}
+
+
+def _viewer_is_admin(uid: int | None) -> bool:
+    if uid is None:
+        return False
+    hit = _ADMIN_IDS.get(int(uid))
+    if hit is None:
+        hit = _ADMIN_IDS[int(uid)] = bool(pub._is_admin(pub._user_by_id(int(uid))))
+    return hit
+
+
 def _require_sync(t: LiveTable, body: dict, *, with_seq: bool) -> None:
     """Reject a request composed against a state the table has left.
 
@@ -4744,12 +5471,12 @@ def _stream_sig(t: LiveTable) -> tuple:
 
 def install(app: FastAPI, *, static_dir: Path) -> None:
     _ensure_schema()
+    pub._GAMES_INVITE_HOOK = _invite_response
+    pub._GAMES_ACCESS_HOOK = _admin_games_access
+    pub._GAMES_MEMBER_HOOK = _main_club_member
 
     def _html() -> HTMLResponse:
-        return HTMLResponse(
-            _page_html(static_dir),
-            headers={"Cache-Control": "no-store, must-revalidate"},
-        )
+        return HTMLResponse(_page_html(static_dir), headers=dict(PAGE_HEADERS))
 
     @app.get("/games")
     def games_index():
@@ -4760,6 +5487,11 @@ def install(app: FastAPI, *, static_dir: Path) -> None:
         row = pub.DB.one("SELECT id FROM homegames WHERE id=?", (game_id,))
         if row is None:
             raise HTTPException(status_code=404, detail="Not Found")
+        return _html()
+
+    @app.get("/games/join/{code}")
+    def games_join_page(code: str):
+        """A club invite link (the page shows the invitation — or that it expired)."""
         return _html()
 
     @app.get("/games/static/{name}")
@@ -4779,22 +5511,127 @@ def install(app: FastAPI, *, static_dir: Path) -> None:
         return Response(
             path.read_text(encoding="utf-8"),
             media_type=media,
-            headers={"Cache-Control": "no-store, must-revalidate"},
+            headers={"Cache-Control": "no-store, must-revalidate", "X-Content-Type-Options": "nosniff"},
         )
 
-    @app.get("/games/api/tables")
-    def api_list():
+    def _uid() -> int:
         uid = pub._CURRENT_USER_ID.get()
-        viewer = int(uid) if uid is not None else None
+        if uid is None:
+            raise HTTPException(status_code=404, detail="Not Found")
+        return int(uid)
+
+    def _table_for(game_id: str) -> LiveTable:
+        """Every table endpoint comes through here: members of the table's club only."""
+        t = HUB.get(game_id)
+        _table_access(t, _uid())
+        return t
+
+    def _scope_clubs(uid: int, club: str | None, *, own: bool) -> list[str] | None:
+        """Whose tables a stats query may read: one club the viewer is in; else, for
+        the viewer's OWN numbers, everything they played (None); for somebody
+        else's, only the clubs the viewer shares with them."""
+        if club:
+            row, _ = _require_club(club, uid)
+            return [str(row["id"])]
+        if own:
+            return None
+        return [c["id"] for c in _my_clubs(uid)]
+
+    @app.get("/games/api/tables")
+    def api_list(club: str | None = None):
+        """The lobby: the viewer's clubs, one club's tables (plus the viewer's own
+        seats elsewhere), their finished sessions there, and — for the club's
+        owner and admins — who is asking to join."""
+        viewer = _uid()
+        clubs = _my_clubs(viewer)
+        by_id = {c["id"]: c for c in clubs}
+        if club and club not in by_id:
+            raise HTTPException(status_code=404, detail="Not Found")
         rows = pub.DB.q(
-            "SELECT * FROM homegames WHERE status='open' ORDER BY created_at DESC"
-        )
+            "SELECT * FROM homegames WHERE status='open' AND club_id IN (%s) ORDER BY created_at DESC"
+            % ",".join("?" * len(by_id)), tuple(by_id),
+        ) if by_id else []
+        tables = []
+        for r in rows:
+            if not _lobby_visible(r, viewer):
+                continue
+            row = _lobby_row(r, viewer)
+            if club and r["club_id"] != club and not (row["is_host"] or row["is_seated"]):
+                continue
+            row["club_id"] = str(r["club_id"])
+            row["club_name"] = by_id[str(r["club_id"])]["name"]
+            tables.append(row)
+        manage = bool(club) and by_id[club]["role"] in ("owner", "admin")
         return {
-            "tables": [
-                _lobby_row(r, viewer) for r in rows if _lobby_visible(r, viewer)
-            ],
-            "sessions": _my_sessions(viewer) if viewer is not None else [],
+            "clubs": clubs,
+            "club": club,
+            "tables": tables,
+            "sessions": _my_sessions(viewer, club),
+            "join_requests": _club_requests(club) if manage else [],
         }
+
+    # --- clubs --------------------------------------------------------------------
+    @app.get("/games/api/clubs")
+    def api_clubs():
+        return {"clubs": _my_clubs(_uid())}
+
+    @app.post("/games/api/clubs")
+    def api_club_create(body: dict = Body({})):
+        uid = _uid()
+        user = pub._user_by_id(uid)
+        if user is None:
+            raise HTTPException(status_code=404, detail="Not Found")
+        return _club_view(_create_club(user, (body or {}).get("name")), uid)
+
+    @app.get("/games/api/clubs/{club_id}")
+    def api_club(club_id: str):
+        return _club_view(club_id, _uid())
+
+    @app.post("/games/api/clubs/{club_id}/settings")
+    def api_club_settings(club_id: str, body: dict = Body({})):
+        return _club_settings(club_id, _uid(), body or {})
+
+    @app.post("/games/api/clubs/{club_id}/invite")
+    def api_club_invite_reset(club_id: str):
+        """A new invite link (the old one stops working)."""
+        return _reset_invite(club_id, _uid())
+
+    @app.post("/games/api/clubs/{club_id}/members")
+    def api_club_member(club_id: str, body: dict = Body({})):
+        body = body or {}
+        return _set_member(club_id, _uid(), pub.body_int(body, "user_id"), role=body.get("role"),
+                           remove=_parse_bool(body, "remove", False))
+
+    @app.post("/games/api/clubs/{club_id}/leave")
+    def api_club_leave(club_id: str):
+        _leave_club(club_id, _uid())
+        return {"ok": True}
+
+    @app.post("/games/api/clubs/{club_id}/request")
+    def api_club_request(club_id: str):
+        """Ask to join (from a table link: the club's id only travels in the answer
+        a table link gives a non-member). The owner or an admin decides."""
+        uid = _uid()
+        club = _club(club_id)
+        if club is None:
+            raise HTTPException(status_code=404, detail="Not Found")
+        cid = str(club["id"])
+        _request_club(cid, uid)
+        status, retry = _request_state(cid, uid)
+        return {"ok": True, "member": _club_role(cid, uid) is not None, "request": status,
+                "retry_in": round(retry, 1)}
+
+    @app.post("/games/api/clubs/{club_id}/requests/decide")
+    def api_club_decide(club_id: str, body: dict = Body({})):
+        return _decide_club_request(club_id, _uid(), pub.body_int(body, "user_id"), bool((body or {}).get("allow")))
+
+    @app.get("/games/api/invites/{code}")
+    def api_invite(code: str):
+        return _invite_info(code, _uid())
+
+    @app.post("/games/api/invites/{code}/join")
+    def api_invite_join(code: str):
+        return _join_by_invite(code, _uid())
 
     @app.post("/games/api/tables")
     def api_create(body: dict = Body({})):
@@ -4805,15 +5642,6 @@ def install(app: FastAPI, *, static_dir: Path) -> None:
         t = _create_table(user, body or {})
         with t.lock:
             return _view(t, int(user["id"]))
-
-    def _table_for(game_id: str) -> LiveTable:
-        return HUB.get(game_id)
-
-    def _uid() -> int:
-        uid = pub._CURRENT_USER_ID.get()
-        if uid is None:
-            raise HTTPException(status_code=404, detail="Not Found")
-        return int(uid)
 
     @app.get("/games/api/tables/{game_id}")
     def api_get(game_id: str):
@@ -4893,32 +5721,42 @@ def install(app: FastAPI, *, static_dir: Path) -> None:
 
     @app.get("/games/api/my/hands")
     def api_my_hands(sort: str = "time", dir: str = "desc", game: str | None = None,
-                     offset: int = 0, limit: int = 40):
-        """The signed-in player's lifetime hand database."""
-        return _my_hands(_uid(), sort, dir, game, offset, limit)
+                     offset: int = 0, limit: int = 40, club: str | None = None):
+        """The signed-in player's hand database (one club's, or all of it)."""
+        uid = _uid()
+        return _my_hands(uid, sort, dir, game, offset, limit, clubs=_scope_clubs(uid, club, own=True))
 
     @app.get("/games/api/my/stats")
-    def api_my_stats():
-        return _my_stats(_uid())
+    def api_my_stats(club: str | None = None):
+        uid = _uid()
+        return _my_stats(uid, clubs=_scope_clubs(uid, club, own=True))
 
     @app.get("/games/api/community")
-    def api_community():
-        """Everyone's numbers: player cards, the pairwise money, all sessions."""
+    def api_community(club: str | None = None):
+        """One club's numbers: player cards, the pairwise money, all sessions. The
+        rankings never mix clubs. (No club named: the main club, else the first.)"""
         uid = _uid()
-        user = pub._user_by_id(uid)
-        return _community(uid, bool(user is not None and pub._is_admin(user)))
+        if not club:
+            mine = _my_clubs(uid)
+            if not mine:
+                return {"club": None, "players": [], "pairs": [], "sessions": [], "can_manage": False, "is_admin": False}
+            club = mine[0]["id"]
+        row, role = _require_club(club, uid)
+        return _community(uid, str(row["id"]), role == "owner")
 
     @app.get("/games/api/players/{player_id}/stats")
-    def api_player_stats(player_id: int):
-        _uid()
+    def api_player_stats(player_id: int, club: str | None = None):
+        uid = _uid()
         if pub._user_by_id(int(player_id)) is None:
             raise HTTPException(status_code=404, detail="Not Found")
-        return _my_stats(int(player_id))
+        return _my_stats(int(player_id), clubs=_scope_clubs(uid, club, own=int(player_id) == uid))
 
     @app.get("/games/api/players/{player_id}/hands")
     def api_player_hands(player_id: int, sort: str = "time", dir: str = "desc",
-                         game: str | None = None, offset: int = 0, limit: int = 40):
-        return _my_hands(_uid(), sort, dir, game, offset, limit, player_id=int(player_id))
+                         game: str | None = None, offset: int = 0, limit: int = 40, club: str | None = None):
+        uid = _uid()
+        return _my_hands(uid, sort, dir, game, offset, limit, player_id=int(player_id),
+                         clubs=_scope_clubs(uid, club, own=int(player_id) == uid))
 
     @app.post("/games/api/tables/{game_id}/remove_chips")
     def api_remove_chips(game_id: str, body: dict = Body({})):
@@ -5090,7 +5928,13 @@ def install(app: FastAPI, *, static_dir: Path) -> None:
         t = _table_for(game_id)
         uid = _uid()
 
-        def snapshot() -> tuple[tuple, str]:
+        def snapshot() -> tuple[tuple, str | None]:
+            # (removed from the club mid-stream: the push ends, and the client's
+            # next poll gets the "ask to join" answer)
+            try:
+                _table_access(t, uid)
+            except HTTPException:
+                return (), None
             with t.lock:
                 view = _view(t, uid)
                 return _stream_sig(t), json.dumps(view, separators=(",", ":"))
@@ -5104,6 +5948,8 @@ def install(app: FastAPI, *, static_dir: Path) -> None:
                 now = time.monotonic()
                 if _stream_sig(t) != last_sig or now - last_push >= STREAM_HEARTBEAT_S:
                     last_sig, payload = await run_in_threadpool(snapshot)
+                    if payload is None:
+                        return
                     last_push = now
                     yield f"data: {payload}\n\n"
                     sent += 1

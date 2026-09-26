@@ -167,7 +167,9 @@
     const bottom = seatBottom(u);
     // what a bet must never cover
     const fixed = [];
-    const pot = rectOf($("pot")), boards = rectOf($("boards"));
+    // the pot pill — or the pots in its place mid-hand (a hidden element's box is empty)
+    const potNode = ["live-pots", "pot", "pots"].map($).find((e) => e && !e.hidden && e.offsetWidth) || $("pot");
+    const pot = rectOf(potNode), boards = rectOf($("boards"));
     const potHalf = Math.max((pot[2] - pot[0]) / 2, u * 8);
     fixed.push([g.cx - potHalf, pot[1], g.cx + potHalf, pot[3]]);
     fixed.push([g.cx - potHalf - u * 8.4, pot[1], g.cx - potHalf, pot[3]]); // the street total, left of the pot
@@ -231,12 +233,18 @@
     for (let i = 0; i < n; i++) {
       const sv = T.seats[i];
       const others = fixed.concat(boxes.filter((_, k) => k !== i), placed);
+      // The button clears the plate's REAL width: on a small phone the name / stack
+      // stop shrinking at their font floors, and the plate grows up to its max-width
+      // (7.5u a side) — the 5.9u model put the disc over the stack's last digits.
+      const plate = sv.el.querySelector(".seat-plate");
+      const halfW = Math.max(u * 7.6, plate && plate.offsetWidth ? plate.offsetWidth / 2 + u * 0.3 : 0);
+      const own = [sv.x - halfW, boxes[i][1], sv.x + halfW, boxes[i][3]];
       // (the hero's bet leaves from the hero's CARDS — the button stays by the hero's plate)
       const ang = sv === heroV ? Math.atan2(sv.normal[1], sv.normal[0]) : Math.atan2(sv.by - sv.y, sv.bx - sv.x);
       let pick = [sv.x, sv.y], pickOver = Infinity;
       for (const off of sv === heroV || (n % 2 === 0 && sv.rel === n / 2) ? [-90, 90, -66, 66, -112, 112] : [48, -48, 66, -66, 90, -90, 112, -112]) {
         const th = ang + (off * Math.PI) / 180, dx = Math.cos(th), dy = Math.sin(th);
-        const r = reach(sv.x, sv.y, boxes[i], dx, dy, disc, u * 0.2), x = sv.x + dx * r, y = sv.y + dy * r;
+        const r = reach(sv.x, sv.y, own, dx, dy, disc, u * 0.2), x = sv.x + dx * r, y = sv.y + dy * r;
         const rc = [x - disc.hw, y - disc.hh, x + disc.hw, y + disc.hh];
         let over = inStage(rc) ? 0 : 1e6;
         for (const o of others) over += rOver(rc, o, u * 0.2);
@@ -250,7 +258,10 @@
   function computeGeom() {
     const box = $("stage-box").getBoundingClientRect();
     const bw = Math.max(240, box.width), bh = Math.max(200, box.height);
-    const portrait = bw / bh < 0.92;
+    // (a phone keeps the upright table up to a squarish box — a short screen,
+    // e.g. an iPhone SE with Safari's bars: the flat one there drew every card
+    // about a third smaller)
+    const portrait = bw / bh < 0.92 || (bw < 520 && bw / bh < 1.3);
     // WIDE = a phone on its side. Height is the scarce thing, so the table
     // goes flat and wide, the two boards sit SIDE BY SIDE, the hero's plate
     // moves beside the hero's cards, and nobody is seated along the bottom
@@ -258,6 +269,8 @@
     const wide = !portrait && !!(globalThis.matchMedia && matchMedia("(max-height: 480px) and (orientation: landscape)").matches);
     // The table takes the shape of the space it is given (within reason): a
     // squarer window gets a rounder table instead of letterbox bars.
+    // (upright: never wider than 0.74 per unit of height — a squarer table lifts
+    // the seats on its long sides onto the boards)
     const aspect = portrait ? Math.max(0.52, Math.min(0.74, bw / bh))
       : wide ? Math.max(1.9, Math.min(2.5, bw / bh))
       : Math.max(1.25, Math.min(1.5, bw / bh));
@@ -320,19 +333,16 @@
         if (rel === 0) { px = -g.u * 25.2; py = g.h - g.u * 8.6 - g.cy; }
         else [px, py] = stadiumPoint(n > 2 ? d0 + ((rel - 1) / (n - 2)) * (P - 2 * d0) : P / 2, W, H);
       }
-      const x = g.cx + px, y = g.cy + py;
       const sv = T.seats[i];
+      // the side seats sit ON the rail's ends: on a narrow phone half their plate
+      // used to hang off the screen — keep the (measured) plate on the stage
+      const plate = sv.el.querySelector(".seat-plate");
+      const ph = Math.max(g.u * 3, plate && plate.offsetWidth ? plate.offsetWidth / 2 : 0);
+      const x = Math.max(ph + 2, Math.min(g.w - ph - 2, g.cx + px)), y = g.cy + py;
       sv.x = x; sv.y = y; sv.rel = rel;
       sv.el.style.left = (x / g.w) * 100 + "%";
       sv.el.style.top = (y / g.h) * 100 + "%";
       sv.normal = g.wide && rel === 0 ? [0, -1] : railNormal(px, py, W, H);
-      // opened (face-up) cards sit above the avatar; keep the row on the stage
-      const half = g.u * 7.2;
-      let shift = 0;
-      if (x - half < g.u) shift = g.u - (x - half);
-      if (x + half > g.w - g.u) shift = (g.w - g.u) - (x + half);
-      sv.openShift = shift;
-      placeCards(sv);
     }
     placeBetSpots(g, pill);
     for (let i = 0; i < n; i++) {
@@ -346,12 +356,109 @@
     // wide: the hero's cards sit left of centre so the action buttons fit beside them
     hz.style.left = g.wide ? ((g.cx - g.u * 5.5) / g.w) * 100 + "%" : "50%";
     placeDealer(T.lastButton);
+    fitPots($("pots"));
+    fitPots($("live-pots"));
+    fitSeats();
+  }
+
+  // Tabled (face-up) cards sit over the avatar and a seat's showdown labels hang
+  // under it. On a phone the seats on the table's long sides are level with the
+  // boards: a five-card row reached over the end card of a board, and a label
+  // over a board's corner. So a row that would touch the boards / pot block fans
+  // its cards tighter (down to a little under half a card each: the rank and
+  // suit in the corner still show) and moves to the stage edge, and a label
+  // slides outward — neither ever leaves the stage. Runs after every layout and
+  // render (the pot row changes width at a showdown); every read comes first.
+  function fitSeats() {
+    const g = T.geom;
+    if (!g || !T.seats.length) return;
+    const st = $("stage").getBoundingClientRect();
+    const blocks = [];
+    for (const id of ["boards", "pots", "pot-row", "street-tag", "award-caption"]) {
+      const e = $(id);
+      if (!e || e.hidden || !e.offsetWidth) continue;
+      const r = e.getBoundingClientRect();
+      blocks.push([r.left - st.left, r.top - st.top, r.right - st.left, r.bottom - st.top]);
+    }
+    const box = (e) => { const r = e.getBoundingClientRect(); return [r.left - st.left, r.top - st.top, r.right - st.left, r.bottom - st.top]; };
+    const labels = T.seats.map((sv) => {
+      const w = sv.x == null ? 0 : sv.hand.offsetWidth;
+      if (!w) return null;
+      const r = sv.hand.getBoundingClientRect();
+      return { w, top: r.top - st.top, bot: r.bottom - st.top };
+    });
+    const mains = T.seats.map((sv) => (sv.x == null || !sv.main.offsetWidth ? null : box(sv.main)));
+    const hz = $("hero-zone");
+    const heroBox = hz && !hz.hidden && hz.offsetWidth ? box(hz) : null;
+    const cw = g.u * (g.wide ? 3 : 3.5), gap = g.u * 0.4, edge = g.u * 0.6;
+    const labelBox = [], rowBox = [];
+    T.seats.forEach((sv, i) => {
+      if (sv.x == null) return;
+      const left = sv.x < g.w / 2;
+      // the label: on the stage, then off the block
+      const lb = labels[i];
+      let hx = 0;
+      if (lb) {
+        const m = 4, l = sv.x - lb.w / 2, r = sv.x + lb.w / 2;
+        hx = l < m ? m - l : r > g.w - m ? g.w - m - r : 0;
+        const hit = blocks.filter((b) => b[1] < lb.bot && b[3] > lb.top && b[0] < r + hx + gap && b[2] > l + hx - gap);
+        if (hit.length && left) {
+          const bl = Math.min(...hit.map((b) => b[0])) - gap;
+          if (sv.x < bl) hx = Math.max(m - l, Math.min(hx, bl - r));
+        } else if (hit.length) {
+          const br = Math.max(...hit.map((b) => b[2])) + gap;
+          if (sv.x > br) hx = Math.min(g.w - m - r, Math.max(hx, br - l));
+        }
+        labelBox[i] = [l + hx, lb.top, r + hx, lb.bot];
+      }
+      hx = Math.round(hx);
+      if (sv.labelShift !== hx) { sv.labelShift = hx; sv.hand.style.setProperty("--hx", hx + "px"); }
+      // the tabled cards
+      const n = sv.cardEls.length || 5;
+      const width = (ov) => (n - (n - 1) * ov) * cw;  // (keep in step with .seat-cards.open in games.css)
+      const cy = sv.y + g.u * (g.wide ? -0.4 : -5.5);
+      const top = cy - cw * 0.87, bot = cy + cw * 0.69;  // (a winning card lifts 0.18 of a card)
+      let ov = 0.3, hw = width(ov) / 2;
+      let c = Math.max(g.u + hw, Math.min(g.w - g.u - hw, sv.x));
+      const hits = blocks.filter((b) => b[1] < bot && b[3] > top && b[0] < c + hw + gap && b[2] > c - hw - gap);
+      const inner = !hits.length ? null : left ? Math.min(...hits.map((b) => b[0])) - gap : Math.max(...hits.map((b) => b[2])) + gap;
+      if (inner != null && n > 1 && (left ? sv.x < inner : sv.x > inner)) {  // (beside the block, not over it)
+        const room = left ? inner - edge : g.w - edge - inner;
+        ov = Math.min(0.56, Math.max(0.3, (n - room / cw) / (n - 1)));
+        hw = width(ov) / 2;
+        c = left ? Math.max(edge + hw, Math.min(inner - hw, sv.x)) : Math.min(g.w - edge - hw, Math.max(inner + hw, sv.x));
+      }
+      const shift = Math.round((c - sv.x) * 10) / 10, ovr = Math.round(ov * 1000) / 1000;
+      if (sv.openShift !== shift || sv.openOv !== ovr) { sv.openShift = shift; sv.openOv = ovr; placeCards(sv); }
+      if (sv.cards.classList.contains("open") && sv.cardEls.length) rowBox[i] = [c - hw, top, c + hw, bot];
+    });
+    // On a short phone a label can still land on the next seat down (its
+    // avatar or tabled cards), the hero's cards or a board: then it steps back
+    // (hidden) — the cards and the award caption still say what everyone had.
+    // (a board or the pots only when it is more than a corner: the label was already slid clear of them as far as the stage allows)
+    const meets = (a, b, mx) => !!b && Math.min(a[2], b[2]) - Math.max(a[0], b[0]) > mx && Math.min(a[3], b[3]) - Math.max(a[1], b[1]) > 3;
+    T.seats.forEach((sv, i) => {
+      const lb = labelBox[i];
+      const crowded = !!lb && (T.seats.some((_, j) => j !== i && (meets(lb, mains[j], 3) || meets(lb, rowBox[j], 3))) || meets(lb, heroBox, 3) || blocks.some((b) => meets(lb, b, 8)));
+      if (sv.crowded !== crowded) { sv.crowded = crowded; sv.hand.classList.toggle("crowded", crowded); }
+    });
+    // The dealer disc sits beside its seat, which is where a showdown's labels
+    // and tabled cards can land: it steps aside (fades) while they cover it.
+    const taken = [...labelBox.filter((b, i) => b && !T.seats[i].crowded), ...rowBox.filter(Boolean)];
+    const d = $("dealer-btn"), bs = T.lastButton != null ? T.seats[T.lastButton] : null;
+    let covered = false;
+    if (bs && bs.dx != null && !d.hidden) {
+      const rad = Math.max(g.u * 1.25, 8.5);
+      covered = taken.some((t) => t[0] < bs.dx + rad && t[2] > bs.dx - rad && t[1] < bs.dy + rad && t[3] > bs.dy - rad);
+    }
+    d.classList.toggle("covered", covered);
   }
 
   function placeCards(sv) {
     const c = sv.cards;
     if (c.classList.contains("open")) {
       c.style.setProperty("--cx", (sv.openShift || 0) + "px");
+      c.style.setProperty("--ov", String(sv.openOv || 0.3));
       // (wide: no air above the top seats — tabled cards sit ON the avatar)
       c.style.setProperty("--cy", T.geom && T.geom.wide ? "calc(var(--u) * -0.4)" : "calc(var(--u) * -5.5)");
     } else {
@@ -387,9 +494,10 @@
         `<span class="av-txt"></span><span class="av-count"></span><span class="av-crown">${icon("i-crown")}</span></div>` +
         '<div class="seat-plate"><span class="seat-pos"></span><div class="seat-name"></div><div class="seat-stack num"></div></div>' +
         "</div>" +
-        '<div class="seat-badge"></div><div class="seat-hand"></div><div class="seat-eq"></div>';
+        '<div class="seat-badge"></div><div class="seat-hand"></div>';
       const sit = el("button", "seat-sit", `${icon("i-plus")}<span>Sit</span>`);
       sit.type = "button";
+      sit.hidden = true;  // the render shows it on empty seats (else a bare button flashes on load)
       sit.addEventListener("click", () => {
         const st = HG.core.G.state;
         const held = st && st.seats[i] && st.seats[i].reserved_by;
@@ -405,7 +513,7 @@
         el: e, cards: e.querySelector(".seat-cards"), main: e.querySelector(".seat-main"), av: e.querySelector(".seat-av"),
         avTxt: e.querySelector(".av-txt"), count: e.querySelector(".av-count"), arc,
         name: e.querySelector(".seat-name"), stack: e.querySelector(".seat-stack"), pos: e.querySelector(".seat-pos"),
-        badge: e.querySelector(".seat-badge"), hand: e.querySelector(".seat-hand"), eq: e.querySelector(".seat-eq"), sit,
+        badge: e.querySelector(".seat-badge"), hand: e.querySelector(".seat-hand"), sit,
         stackCents: null, cardEls: [], nameKey: null, folded: false,
       });
       const b = el("div", "bet", '<span class="chips"></span><span class="amt"></span>');
@@ -543,8 +651,8 @@
     }
     if (empty) {
       setSeatCards(sv, null, false, ctx);
-      sv.badge.className = "seat-badge"; sv.badge.textContent = "";
-      sv.hand.innerHTML = ""; sv.eq.innerHTML = "";
+      sv.badge.className = "seat-badge"; sv.badge.textContent = ""; sv.badge.dataset.k = "";
+      sv.hand.innerHTML = ""; sv.hand.dataset.h = "";
       e.classList.remove("is-hero", "is-actor", "is-folded", "is-away", "is-winner", "is-out", "is-host", "t-warn", "t-crit", "t-bank");
       sv.stackCents = null; sv.nameKey = null; sv.folded = false;
       return;
@@ -592,9 +700,19 @@
     }
     else if (seat.sitting_out) { label = "Sitting out"; cls = "k-away"; }
     else if (seat.sit_out_next) { label = "Out next hand"; cls = "k-away"; }
-    if (sv.badge.textContent !== label || !sv.badge.classList.contains("show") !== !label) {
-      sv.badge.textContent = label;
-      sv.badge.className = "seat-badge" + (label ? " show " + cls : "");
+    // All-in runout: each player's chance to win each board takes the badge
+    // line while cards are still to come (over the seat, where it used to hang,
+    // the tabled cards covered it).
+    let eqHtml = "";
+    if (dealtIn && !folded && (seat.equity_a != null || seat.equity_b != null) && s.runout.active && (s.runout.shown_len || 0) < 5) {
+      const p = (x) => (x == null ? "–" : Math.round(x * 100) + "%");
+      eqHtml = `<span data-b="1">${p(seat.equity_a)}</span><span data-b="2">${p(seat.equity_b)}</span>`;
+    }
+    const bkey = eqHtml ? "eq|" + eqHtml : label ? cls + "|" + label : "";
+    if (sv.badge.dataset.k !== bkey) {
+      sv.badge.dataset.k = bkey;
+      if (eqHtml) sv.badge.innerHTML = eqHtml; else sv.badge.textContent = label;
+      sv.badge.className = "seat-badge" + (eqHtml ? " show k-eq" : label ? " show " + cls : "");
     }
 
     // cards
@@ -608,19 +726,32 @@
     }
     sv.folded = folded;
 
-    // showdown labels + equities
+    // showdown labels (the short form: "Js full of 4s" — the caption, the dock
+    // and the hand history keep the full wording)
     let handHtml = "";
     if (!isHeroCards && seat.hand_desc && (showdown || s.runout.active)) {
-      handHtml = seat.hand_desc.map((d, k) => (d ? `<span><b>${k + 1}</b>${HG.core.esc(d.charAt(0).toUpperCase() + d.slice(1))}</span>` : "")).join("");
+      handHtml = seat.hand_desc.map((d, k) => (d ? `<span><b>${k + 1}</b>${HG.core.esc(shortHand(d))}</span>` : "")).join("");
     }
-    if (sv.hand.dataset.h !== handHtml) { sv.hand.dataset.h = handHtml; sv.hand.innerHTML = handHtml; }
-    let eqHtml = "";
-    // equities matter while cards are still to come — not once the board is out
-    if ((seat.equity_a != null || seat.equity_b != null) && s.runout.active && (s.runout.shown_len || 0) < 5) {
-      const p = (x) => (x == null ? "–" : Math.round(x * 100) + "%");
-      eqHtml = `<span data-b="1">${p(seat.equity_a)}</span><span data-b="2">${p(seat.equity_b)}</span>`;
-    }
-    if (sv.eq.dataset.h !== eqHtml) { sv.eq.dataset.h = eqHtml; sv.eq.innerHTML = eqHtml; }
+    if (sv.hand.dataset.h !== handHtml) { sv.hand.dataset.h = handHtml; sv.hand.innerHTML = handHtml; }  // (placed by fitSeats)
+  }
+
+  // A made hand as the felt labels it: short enough to sit beside the boards on
+  // a phone ("a full house, Js full of 4s" -> "Js full of 4s"). Anything this
+  // does not recognise is shown as it came.
+  const SHORT_HANDS = [
+    [/^a pair of (\S+)$/i, "Pair of $1"],
+    [/^two pair, (\S+) and (\S+)$/i, "Two pair $1 & $2"],
+    [/^three of a kind, (\S+)$/i, "Three $1"],
+    [/^a straight flush, (\S+)$/i, "Straight flush $1"],
+    [/^a straight (\S+)$/i, "Straight $1"],
+    [/^a flush (\S+) high$/i, "$1-high flush"],
+    [/^a full house, (.+)$/i, "$1"],
+    [/^four of a kind, (\S+)$/i, "Four $1"],
+  ];
+  function shortHand(d) {
+    const t = String(d || "");
+    for (const [re, out] of SHORT_HANDS) if (re.test(t)) return t.replace(re, out);
+    return t.charAt(0).toUpperCase() + t.slice(1);
   }
 
   function setSeatCards(sv, hole, open, ctx, mucking) {
@@ -743,7 +874,8 @@
   function updateMoney(s, prev, ctx) {
     const inHand = s.phase === "in_hand";
     const potEl = $("pot"), amt = $("pot-amt"), total = $("pot-total");
-    const potCenter = () => centerOf(potEl);
+    const reshaped = renderLivePots(s);
+    const potCenter = () => centerOf(potAnchor());
     let streetSum = 0;
     const newBets = [];
     for (let i = 0; i < T.n; i++) {
@@ -801,6 +933,9 @@
     total.hidden = !totalTxt;
     const totalAmt = $("pot-total-amt");
     if (totalAmt.textContent !== totalTxt) totalAmt.textContent = totalTxt;
+    fitPots($("live-pots"));
+    // (a wider or narrower pot row: the bet spots are placed around it again)
+    if (reshaped) layout();
     if (collected && ctx.animate) play("pot");
     return collected;
   }
@@ -863,7 +998,7 @@
     // chips: pot -> winners, once per award step / fold-out
     if (!ctx.animate) { T.awardKey = step ? `${s.hand_no}:${s.runout.award_index}` : T.awardKey; if (foldout) T.foldoutKey = s.hand_no; return; }
     // the chips leave the pot they belong to (side pots first, main pot last)
-    const potNode = step && pots.length > 1 && pots[step.pot] ? pots[step.pot] : $("pot");
+    const potNode = step && pots.length > 1 && pots[step.pot] ? pots[step.pot] : potAnchor();
     const pc = centerOf(potNode);
     if (step) {
       const key = `${s.hand_no}:${s.runout.award_index}`;
@@ -909,15 +1044,154 @@
       host.innerHTML = "";
       pots.forEach((p, k) => {
         const left = Math.max(0, p.chips - (paid[k] || 0));
-        const d = el("div", "potc" + (k === cur ? " on" : "") + (left <= 0 ? " paid" : ""));
-        d.innerHTML = `<small>${p.label}</small><span class="chips"></span><b class="num">${fmt(chipsToCents(left, s), s)}</b>`;
-        chipStack(d.querySelector(".chips"), chipsToCents(Math.max(left, 1), s), s);
+        const d = potPill(p, chipsToCents(left, s), s, "final:" + k);
+        if (k === cur) d.classList.add("on");
+        if (left <= 0) d.classList.add("paid");
         host.appendChild(d);
       });
     }
     host.hidden = false;
     $("pot-row").classList.add("replaced");  // the split pots ARE the pot
+    fitPots(host);  // (before the chips fly from them)
     return Array.from(host.children);
+  }
+
+  // One pot as a pill: its name ("Side pot 1", on a phone "Side 1"), a chip
+  // stack and what is in it. The title names the players who can win it;
+  // hovering it lights them up.
+  function potPill(p, cents, s, id) {
+    const d = el("div", "potc");
+    d.dataset.pot = id;
+    const short = p.label === "Main pot" ? "Main" : String(p.label).replace(/^Side pot /, "Side ");
+    d.innerHTML = `<small class="lab-l">${HG.core.esc(p.label)}</small><small class="lab-s">${HG.core.esc(short)}</small>` +
+      `<span class="chips"></span><b class="num">${fmt(cents, s)}</b>`;
+    chipStack(d.querySelector(".chips"), Math.max(cents, 1), s);
+    const names = (p.eligible || []).map((i) => s.seats[i] && (s.seats[i].is_hero && s.my_seat === i ? "You" : s.seats[i].name)).filter(Boolean);
+    d.title = `${p.label}: ${names.join(", ")}`;
+    return d;
+  }
+
+  // The pots WHILE the hand is played (server `live_pots`, 2026-09-25 — side
+  // pots used to show only at the showdown): two or more take the pot pill's
+  // place in its row, with the same names and order as the showdown's, so the
+  // runout takes over without a pot moving. A pot that grew bumps like the pot.
+  function renderLivePots(s) {
+    const host = $("live-pots"), pot = $("pot");
+    const pots = (s.phase === "in_hand" && s.live_pots) || [];
+    if (pots.length < 2) {
+      if (!host.hidden || pot.classList.contains("split")) {
+        host.hidden = true; host.innerHTML = ""; host.dataset.k = ""; pot.classList.remove("split");
+        T.livePots = null;
+        return true;  // (the pot row changed shape)
+      }
+      return false;
+    }
+    const key = pots.map((p) => `${p.label}:${p.chips}:${p.eligible.join(",")}`).join("|") + "|" + (s.hand_no || 0);
+    if (host.dataset.k === key) return false;
+    const was = T.livePots || {};
+    host.dataset.k = key;
+    host.innerHTML = "";
+    T.livePots = {};
+    pots.forEach((p, k) => {
+      const d = potPill(p, chipsToCents(p.chips, s), s, "live:" + k);
+      if (was[p.label] != null && p.chips > was[p.label] && anim()) d.classList.add("bump");
+      T.livePots[p.label] = p.chips;
+      host.appendChild(d);
+    });
+    host.hidden = false;
+    pot.classList.add("split");
+    return true;
+  }
+  // (bets fly into — and a fold-out's chips out of — whichever holds the pot)
+  const potAnchor = () => ["live-pots", "pot"].map($).find((e) => e && !e.hidden && e.offsetWidth) || $("pot");
+
+  // Hover a pot — tap it on a phone — and its players light up while everyone
+  // else dims: a side pot shows who can still win it, the main pot everyone
+  // still in the hand. The focus survives the pills being rebuilt (by index).
+  function potEligible(node) {
+    const s = HG.core.G.state;
+    if (!s || !node || !node.offsetWidth) return null;
+    if (node.id === "pot") return s.seats.filter((x) => !x.empty && x.in_hand && !x.folded).map((x) => x.seat);
+    const [kind, k] = String(node.dataset.pot || "").split(":");
+    const list = kind === "live" ? s.live_pots : kind === "final" ? s.pots : null;
+    const p = list && list[Number(k)];
+    return p ? p.eligible : null;
+  }
+  function focusPot(node) {
+    T.potFocus = node ? (node.id === "pot" ? "pot" : node.dataset.pot) : null;
+    applyPotFocus();
+  }
+  function applyPotFocus() {
+    const f = T.potFocus;
+    const node = !f ? null : f === "pot" ? $("pot") : document.querySelector(`.potc[data-pot="${f}"]`);
+    const elig = potEligible(node);
+    if (!elig) T.potFocus = null;
+    const set = new Set(elig || []);
+    $("stage").classList.toggle("pot-focus", !!elig);
+    T.seats.forEach((sv, i) => sv.el.classList.toggle("pot-in", !!elig && set.has(i)));
+    document.querySelectorAll("#pot.hi, .potc.hi").forEach((x) => { if (x !== node || !elig) x.classList.remove("hi"); });
+    if (node && elig) node.classList.add("hi");
+  }
+  function wirePotFocus() {
+    const center = $("center");
+    const potOf = (e) => (e.target && e.target.closest ? e.target.closest("#pot, .potc") : null);
+    center.addEventListener("pointerover", (e) => { if (e.pointerType === "touch") return; const n = potOf(e); if (n) focusPot(n); });
+    center.addEventListener("pointerout", (e) => {
+      if (e.pointerType === "touch") return;
+      const n = potOf(e);
+      if (n && !(e.relatedTarget && n.contains(e.relatedTarget))) focusPot(null);
+    });
+    // a phone has no hover: a tap shows the pot's players for a few seconds (tap again to hide)
+    center.addEventListener("pointerup", (e) => {
+      if (e.pointerType !== "touch") return;
+      const n = potOf(e);
+      if (!n) return;
+      clearTimeout(T.potFocusTimer);
+      const id = n.id === "pot" ? "pot" : n.dataset.pot;
+      if (T.potFocus === id) { focusPot(null); return; }
+      focusPot(n);
+      T.potFocusTimer = setTimeout(() => focusPot(null), 3500);
+    });
+  }
+
+  // Four or more pots are wider than the gap between the seats beside them on
+  // a phone (the outer pills went under those seats' plates): drop the chip
+  // icons, then shrink the row until it fits. (The pots of a live hand share
+  // the pot's row with the street total: they need its room on BOTH sides.)
+  function fitPots(host) {
+    if (!host || host.hidden || !T.geom) return;
+    const total = $("pot-total");
+    const flank = host.id === "live-pots" && !total.hidden ? total.offsetWidth + T.geom.u * 1.1 : 0;
+    const key = `${host.dataset.k}|${T.geom.w}x${T.geom.h}|${Math.round(flank)}`;
+    if (host.dataset.fit === key) return;
+    host.dataset.fit = key;
+    host.classList.remove("tight");
+    host.style.transform = "";
+    const st = $("stage").getBoundingClientRect(), pr = host.getBoundingClientRect();
+    const mid = (pr.left + pr.right) / 2, gap = T.geom.u * 0.5;
+    let room = 2 * Math.min(mid - st.left, st.right - mid) - 2 * gap;
+    for (const sv of T.seats) {
+      for (const node of [sv.el.querySelector(".seat-plate"), sv.badge]) {
+        if (!node || !node.offsetWidth) continue;
+        const r = node.getBoundingClientRect();
+        if (r.bottom <= pr.top || r.top >= pr.bottom) continue;
+        if (r.right <= mid) room = Math.min(room, 2 * (mid - r.right - gap));
+        else if (r.left >= mid) room = Math.min(room, 2 * (r.left - mid - gap));
+      }
+      // a showdown label slides out as far as the stage edge (fitSeats), no further
+      const lw = sv.x == null ? 0 : sv.hand.offsetWidth;
+      if (lw) {
+        const r = sv.hand.getBoundingClientRect();
+        if (r.bottom <= pr.top || r.top >= pr.bottom) continue;
+        if (st.left + sv.x < mid) room = Math.min(room, 2 * (mid - (st.left + 4 + lw) - gap));
+        else room = Math.min(room, 2 * (st.right - 4 - lw - mid - gap));
+      }
+    }
+    room -= 2 * flank;
+    if (host.offsetWidth <= room) return;
+    host.classList.add("tight");
+    const w = host.offsetWidth;
+    if (w > room) host.style.transform = `scale(${Math.max(0.7, room / w).toFixed(3)})`;
   }
 
   // The rabbit hunt: a small button in the gap the turn and river would fill.
@@ -987,6 +1261,7 @@
     const o = opts || {};
     if (!T.ready) {
       T.ready = true;
+      wirePotFocus();
       if (globalThis.ResizeObserver) { T.ro = new ResizeObserver(() => { layout(); if (HG.core.G.state) placeRabbit(HG.core.G.state); }); T.ro.observe($("stage-box")); }
       else globalThis.addEventListener("resize", layout);
     }
@@ -1027,6 +1302,8 @@
     placeDealer(s.phase === "waiting" && !s.hand_no ? null : s.button_seat);
     updateAwards(s, prev, ctx);
     placeRabbit(s);
+    fitSeats();
+    applyPotFocus();  // (fresh players for the pot under the pointer; rebuilt pills keep the focus)
     syncTimer(s);
 
     // chat bubbles + reactions over the seats
@@ -1044,5 +1321,5 @@
     });
   }
 
-  HG.table = { render, layout, EMOTES, seatCenter: (i) => (T.seats[i] ? [T.seats[i].x, T.seats[i].y] : null) };
+  HG.table = { render, layout, EMOTES, shortHand, seatCenter: (i) => (T.seats[i] ? [T.seats[i].x, T.seats[i].y] : null) };
 })();

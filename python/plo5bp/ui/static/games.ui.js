@@ -32,15 +32,60 @@
     return `<div class="money"><input class="input" id="${id}" inputmode="decimal" autocomplete="off" value="${(cents / 100).toFixed(2)}" ${attrs || ""}/></div>`;
   }
   const d2 = (c) => C().dollars(c);
+  const d0 = (c) => (c % 100 ? d2(c) : d2(c).replace(/\.00$/, ""));  // "$100", "$12.50": preset buttons are narrow
 
   // ------------------------------------------------------------------ toasts
   function toast(msg, kind, ms) {
     const root = $("toast-root");
     if (!root) return;
+    // the same line again while it is still up is noise (stacked copies hid the table)
+    if ([...root.children].some((x) => x.textContent === String(msg) && !x.classList.contains("out"))) return;
     const t = h("div", { class: "toast " + (kind || "") }, esc(msg));
     root.appendChild(t);
     while (root.children.length > 4) root.firstChild.remove();
     setTimeout(() => { t.classList.add("out"); setTimeout(() => t.remove(), 260); }, ms || 3400);
+  }
+
+  // --------------------------------------- join requests (club owner / admins)
+  // Someone asked to join the club (from a table link, or the invite link of an
+  // ask-first club). A small card, never a modal — it must not get in the way of
+  // a hand.
+  function renderJoinReqs(list) {
+    let el = $("joinreq");
+    if (!list || !list.length) {
+      if (el && !el.hidden) { el.hidden = true; el.dataset.sig = ""; }
+      document.body.classList.remove("has-joinreq");
+      return;
+    }
+    if (!el) {
+      el = h("div", { id: "joinreq", class: "joinreq", role: "status" });
+      document.body.appendChild(el);
+      el.addEventListener("click", async (e) => {
+        const b = e.target.closest("button[data-j]");
+        const r = U.joinReq;
+        if (!b || b.disabled || !r) return;
+        el.querySelectorAll("button").forEach((x) => { x.disabled = true; });
+        const allow = b.dataset.j === "yes";
+        try {
+          await C().j(`/games/api/clubs/${encodeURIComponent(r.club_id)}/requests/decide`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ user_id: r.user_id, allow }) });
+          toast(allow ? `${r.name || "They"} joined ${r.club_name || "the club"}` : "Request declined", allow ? "ok" : "");
+        } catch (err) { toast(err.message, "err"); }
+        el.dataset.sig = "";  // the next state (or lobby poll) brings the rest
+        el.hidden = true;
+        document.body.classList.remove("has-joinreq");
+        if (C().G.gameId) C().refreshNow().catch(() => {}); else C().loadLobby().catch(() => {});
+      });
+    }
+    const r = list[0];
+    U.joinReq = r;
+    const sig = list.map((x) => `${x.club_id}:${x.user_id}`).join(",");
+    if (el.dataset.sig !== sig) {
+      el.dataset.sig = sig;
+      el.innerHTML = `<div class="jr-txt"><b>${esc(r.name || "Someone")}</b> wants to join ${esc(r.club_name || "the club")}<small>${esc(r.email)}${list.length > 1 ? ` · +${list.length - 1} more` : ""}</small></div>` +
+        `<div class="jr-btns"><button class="btn sm ghost" type="button" data-j="no">Not now</button><button class="btn sm gold" type="button" data-j="yes">Let in</button></div>`;
+    }
+    el.hidden = false;
+    document.body.classList.add("has-joinreq");
   }
 
   // ------------------------------------------------------------------ modals
@@ -159,9 +204,11 @@
     const full = t.seated >= t.num_seats;
     const cta = t.is_seated ? "Return to table" : full ? "Watch" : "Join table";
     const card = h("div", { class: "tcard" });
+    // (your seat at a table of ANOTHER club: say which club it is in)
+    const other = t.club_id && t.club_id !== C().G.clubId ? ` · ${esc(t.club_name || "another club")}` : "";
     card.innerHTML =
       `<div class="tcard-top"><div style="min-width:0;flex:1"><div class="tcard-name">${esc(t.name)}</div>` +
-      `<div class="tcard-host">Hosted by ${esc(t.host_name)}${t.is_host ? " (you)" : ""}</div></div>` +
+      `<div class="tcard-host">Hosted by ${esc(t.host_name)}${t.is_host ? " (you)" : ""}${other}</div></div>` +
       `<span class="pill ${t.running ? "live" : "paused"}">${t.running ? "Live" : "Paused"}</span></div>` +
       miniFelt(t) +
       `<div class="tcard-meta"><span class="pill gold num">${d2(t.bb_cents)} bb</span>` +
@@ -179,9 +226,33 @@
   }
   function renderLobby(data) {
     const tables = data.tables || [];
+    const clubs = data.clubs || [];
+    U.lobbyData = data;
+    renderJoinReqs(data.join_requests);
+    // a request to join was answered while this page was open: straight into the club
+    // (and back to the table the request came from)
+    const pend = U.pendingClub;
+    if (pend && clubs.some((c) => c.id === pend.id)) {
+      U.pendingClub = null;
+      toast(`You're in ${pend.name}!`, "ok", 5000);
+      HG.sound && HG.sound.play("sit");
+      if (pend.table) { C().openTable(pend.table, true).catch(() => {}); return; }
+      if (C().G.clubId !== pend.id) { switchClub(pend.id); return; }
+    }
     const sig = JSON.stringify(data);
     if (sig === U.lobbySig) return;
     U.lobbySig = sig;
+    $("lobby").classList.remove("loading");  // (until the first answer the page does not guess: no half-empty lobby)
+    renderClubBar(data);
+    const panel = U.clubPanel, shown = clubs.find((c) => c.id === data.club);
+    if (panel && shown && panel.cid === shown.id) {
+      const psig = `${shown.members}:${shown.requests}`;
+      if (psig !== panel.sig) { panel.sig = psig; panel.refresh(); }
+    }
+    const none = !clubs.length;
+    $("lb-welcome").hidden = !none;
+    $("lb-hero").querySelector(".lb-actions").hidden = none;  // (hosting needs a club: the welcome offers one)
+    $("lb-open").closest(".lb-sec").hidden = none;
     const mine = tables.filter((t) => t.is_host || t.is_seated);
     const open = tables.filter((t) => !(t.is_host || t.is_seated));
     $("lb-mine-sec").hidden = !mine.length;
@@ -192,7 +263,7 @@
     $("lb-open-count").textContent = open.length ? `${open.length} running` : "";
     if (!open.length) {
       const empty = h("div", { class: "lb-empty", style: "grid-column:1/-1" },
-        mine.length ? "<b>No other tables right now</b>When a friend hosts one it shows up here." : "<b>No tables yet</b>Host one and send your friends the invite link — it takes ten seconds.");
+        mine.length ? "<b>No other tables right now</b>When someone in the club hosts one, it shows up here." : "<b>No tables yet</b>Host one — everyone in the club sees it here, or send them its link.");
       openEl.appendChild(empty);
     }
     const sess = data.sessions || [];
@@ -210,13 +281,276 @@
   async function copyInvite(id) {
     const url = `${location.origin}/games/t/${id}`;
     try { await navigator.clipboard.writeText(url); toast("Invite link copied", "ok"); }
-    catch (_) { openModal({ title: "Invite link", sub: "Copy this link and send it to your friends.", body: `<input class="input" readonly value="${esc(url)}" onfocus="this.select()"/>`, buttons: [{ label: "Done", cls: "primary" }] }); }
+    catch (_) {
+      // (listeners, not an onfocus="" attribute: the page's security policy blocks inline
+      // handlers. Click too: the mouse-up after a click-to-focus clears a focus-time selection.)
+      const pick = (e) => e.target.select();
+      const box = h("input", { class: "input", readonly: true, value: url, onfocus: pick, onclick: pick });
+      openModal({ title: "Invite link", sub: "Copy this link and send it to your friends.", body: box, buttons: [{ label: "Done", cls: "primary" }] });
+    }
+  }
+
+  // ------------------------------------------------------------------- clubs
+  // The lobby shows ONE club: its tables, its players, its numbers. A club's
+  // owner (and admins) invite people with its link and let in whoever asks.
+  const ROLE_WORD = { owner: "you run it", admin: "you're an admin", member: "member" };
+  function clubBadge(name, cls) {
+    const A = HG.avatar;
+    return `<span class="club-badge ${cls || ""}" style="--h:${A.hueOf("club:" + name)}">${esc(A.initials(name))}</span>`;
+  }
+  function inviteUrl(code) { return `${location.origin}/games/join/${code}`; }
+  async function copyText(text, okMsg, title) {
+    try { await navigator.clipboard.writeText(text); toast(okMsg, "ok"); }
+    catch (_) {
+      const pick = (e) => e.target.select();
+      const box = h("input", { class: "input", readonly: true, value: text, onfocus: pick, onclick: pick });
+      openModal({ title, sub: "Copy this link and send it to your friends.", body: box, buttons: [{ label: "Done", cls: "primary" }] });
+    }
+  }
+  function currentClub() {
+    const d = U.lobbyData || {};
+    return (d.clubs || []).find((c) => c.id === C().G.clubId) || null;
+  }
+  function renderClubBar(data) {
+    const club = (data.clubs || []).find((c) => c.id === data.club) || null;
+    const bar = $("lb-clubbar");
+    bar.hidden = !club;
+    if (!club) return;
+    const A = HG.avatar, badge = $("club-badge");
+    badge.textContent = A.initials(club.name);
+    badge.style.setProperty("--h", A.hueOf("club:" + club.name));
+    $("club-name").textContent = club.name;
+    $("club-kicker").textContent = data.clubs.length > 1 ? `Club · 1 of ${data.clubs.length}` : "Club";
+    $("club-meta").textContent = `${club.members} member${club.members === 1 ? "" : "s"} · ${ROLE_WORD[club.role] || club.role}`;
+    const manage = club.role === "owner" || club.role === "admin";
+    $("club-invite").hidden = !manage;
+    const req = $("club-req");
+    req.hidden = !club.requests; req.textContent = String(club.requests || 0);
+  }
+  function switchClub(id) {
+    C().setClub(id);
+    U.lobbySig = ""; U.clubAt = 0; U.club = null;
+    C().loadLobby().catch((e) => toast(e.message, "err"));
+    loadClub(true);
+  }
+  function openClubMenu(anchor) {
+    const clubs = (U.lobbyData && U.lobbyData.clubs) || [];
+    const cur = C().G.clubId;
+    openMenu(anchor, [{ header: "Your clubs" }]
+      .concat(clubs.map((c) => ({
+        icon: c.id === cur ? "i-check" : "i-users",
+        label: c.name + (c.requests ? ` · ${c.requests} waiting` : ""),
+        hint: `${c.members} member${c.members === 1 ? "" : "s"} · ${ROLE_WORD[c.role] || c.role}`,
+        onClick: () => { if (c.id !== cur) switchClub(c.id); },
+      })))
+      .concat(["-", { icon: "i-plus", label: "Start a new club", onClick: openCreateClub },
+        { icon: "i-link", label: "Join a club with a link", onClick: openJoinClub }]));
+  }
+  async function createClub(name) {
+    try {
+      const club = await C().j("/games/api/clubs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
+      switchClub(club.id);
+      toast(`${club.name} is ready — send your friends its invite link`, "ok", 5000);
+      return true;
+    } catch (e) { toast(e.message, "err"); return false; }
+  }
+  function openCreateClub() {
+    const body = h("div", { style: "display:flex;flex-direction:column;gap:14px" },
+      `<label class="field"><span>Club name</span><input type="text" class="input" id="cc-name" maxlength="40" placeholder="Friday night"/></label>` +
+      `<p class="muted" style="margin:0;font-size:12.5px">You run it: invite people with the club's link and decide who's in. Its tables, leaderboard and everyone's numbers stay inside the club.</p>`);
+    openModal({
+      title: "Start a club", body,
+      buttons: [{ label: "Cancel", cls: "ghost" }, {
+        label: "Create club", cls: "gold",
+        onClick: async () => {
+          const name = body.querySelector("#cc-name").value.trim();
+          if (!name) { toast("Give the club a name", "err"); return false; }
+          return createClub(name);
+        },
+      }],
+    });
+  }
+  function openJoinClub() {
+    const body = h("div", { style: "display:flex;flex-direction:column;gap:12px" },
+      `<label class="field"><span>Invite link</span><input type="text" class="input" id="jc-link" placeholder="Paste the invite link" autocomplete="off"/><small>A table link works too: you can ask its club to let you in.</small></label>`);
+    openModal({
+      title: "Join a club", body,
+      buttons: [{ label: "Cancel", cls: "ghost" }, { label: "Continue", cls: "gold", onClick: () => { joinByLink(body.querySelector("#jc-link").value); } }],
+    });
+  }
+  // a pasted link: a club invite, a table link (joins or asks its club) or a bare code
+  async function joinByLink(raw) {
+    const s = String(raw || "").trim();
+    let m = s.match(/\/games\/join\/([A-Za-z0-9_-]+)/);
+    if (m) return openInvite(m[1]);
+    m = s.match(/\/games\/t\/([A-Za-z0-9_-]+)/) || s.match(/^([A-Za-z0-9_-]{4,})$/);
+    if (!m) return toast("Paste a table link or a club's invite link", "err");
+    try { await C().openTable(m[1], true); }
+    catch (err) {
+      if (err.status === 403 && err.detail && err.detail.error === "club") return openClubGate(err.detail, m[1]);
+      if (err.status === 404 && !/\/games\/t\//.test(s)) return openInvite(m[1], true);  // (a bare code: a club's?)
+      toast(err.status === 404 ? "No table or club with that link" : err.message, "err");
+    }
+  }
+  // someone else's club: its invite link (join now, or ask when the club asks first)
+  async function openInvite(code, quiet404) {
+    let info;
+    try { info = await C().j(`/games/api/invites/${encodeURIComponent(code)}`); }
+    catch (e) { return toast(e.status === 404 ? (quiet404 ? "No table or club with that link" : "That invite link is no longer valid — ask for a new one") : e.message, "err", 5000); }
+    if (info.member) { if (C().G.clubId !== info.club.id) switchClub(info.club.id); return toast(`You're in ${info.club.name}`, "ok"); }
+    const c = info.club, body = h("div", { class: "invite-box" });
+    const paint = () => {
+      body.innerHTML = `<div class="inv-head">${clubBadge(c.name, "lg")}<div><b>${esc(c.name)}</b><small>${c.members} member${c.members === 1 ? "" : "s"} · run by ${esc(c.owner_name)}</small></div></div>` +
+        (info.request === "pending" ? `<p class="inv-note">Your request is in. ${esc(c.owner_name)} or a club admin lets you in — you'll be taken into the club as soon as they do.</p>`
+          : info.request === "declined" && info.retry_in > 0 ? `<p class="inv-note">The club didn't let you in this time. You can ask again in a minute.</p>`
+            : `<p>Join to see the club's tables, sit down with its members and show up on its leaderboard. The club's numbers stay inside the club.</p>`);
+    };
+    paint();
+    const waiting = info.request === "pending" || (info.request === "declined" && info.retry_in > 0);
+    const buttons = [{ label: waiting ? "Close" : "Not now", cls: "ghost" }];
+    if (!waiting) buttons.push({
+      label: info.approve ? "Ask to join" : "Join club", cls: "gold",
+      onClick: async () => {
+        try {
+          const out = await C().j(`/games/api/invites/${encodeURIComponent(code)}/join`, { method: "POST" });
+          if (out.member) { switchClub(out.club.id); toast(`Welcome to ${out.club.name}!`, "ok", 5000); HG.sound && HG.sound.play("sit"); return true; }
+          info = out; paint();
+          U.pendingClub = { id: c.id, name: c.name, table: null };
+          toast("Request sent", "ok");
+          return true;
+        } catch (e) { toast(e.message, "err"); return false; }
+      },
+    });
+    openModal({ title: "Club invite", body, buttons, autofocus: false });
+    if (info.request === "pending") U.pendingClub = { id: c.id, name: c.name, table: null };
+  }
+  // a table of a club I am not in (a table link): ask to join the club
+  function openClubGate(d, tableId) {
+    const c = d.club, body = h("div", { class: "invite-box" });
+    let st = d.request;
+    const retry = d.retry_in || 0;
+    const paint = () => {
+      body.innerHTML = `<div class="inv-head">${clubBadge(c.name, "lg")}<div><b>${esc(c.name)}</b><small>This table belongs to the club</small></div></div>` +
+        (st === "pending" ? `<p class="inv-note">Your request is in — the club's owner or an admin lets you in. The table opens by itself as soon as they do (keep this page open).</p>`
+          : st === "declined" && retry > 0 ? `<p class="inv-note">The club didn't let you in this time. You can ask again in a minute.</p>`
+            : `<p>Only the club's members can sit at its tables or watch them. Ask to join, and the club's owner or an admin lets you in.</p>`);
+    };
+    paint();
+    if (st === "pending") U.pendingClub = { id: c.id, name: c.name, table: tableId || null };
+    const waiting = st === "pending" || (st === "declined" && retry > 0);
+    const buttons = [{ label: waiting ? "Close" : "Not now", cls: "ghost" }];
+    if (!waiting) buttons.push({
+      label: "Ask to join", cls: "gold",
+      onClick: async () => {
+        try {
+          const out = await C().j(`/games/api/clubs/${encodeURIComponent(c.id)}/request`, { method: "POST" });
+          if (out.member) { if (tableId) await C().openTable(tableId, true); return true; }
+          st = out.request; paint();
+          U.pendingClub = { id: c.id, name: c.name, table: tableId || null };
+          toast("Request sent — you'll be let in by the club", "ok", 5000);
+          return true;
+        } catch (e) { toast(e.message, "err"); return false; }
+      },
+    });
+    openModal({ title: "Members only", body, buttons, autofocus: false });
+  }
+  // the club's members, invite link and settings (owner / admins manage, members look)
+  async function openClubSettings() {
+    const cid = C().G.clubId;
+    if (!cid) return;
+    let v;
+    try { v = await C().j(`/games/api/clubs/${encodeURIComponent(cid)}`); } catch (e) { return toast(e.message, "err"); }
+    const body = h("div", { class: "club-set" });
+    const post = async (path, payload) => {
+      try {
+        const out = await C().j(`/games/api/clubs/${encodeURIComponent(cid)}/${path}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload || {}) });
+        if (out && out.members) v = out;
+        U.lobbySig = ""; C().loadLobby().catch(() => {});
+        return true;
+      } catch (e) { toast(e.message, "err", 5000); return false; }
+    };
+    const refresh = async () => { try { v = await C().j(`/games/api/clubs/${encodeURIComponent(cid)}`); } catch (_) { /* keep */ } paint(); };
+    const canAct = (m) => !m.is_me && (v.role === "owner" || (v.role === "admin" && m.role === "member"));
+    const paint = () => {
+      const owner = v.role === "owner", manage = owner || v.role === "admin";
+      body.innerHTML =
+        (owner ? `<div class="grp"><label class="field"><span>Club name</span><span class="row-inline"><input class="input" id="cs-name" maxlength="40" value="${esc(v.name)}"/><button class="btn sm" id="cs-save" type="button">Save</button></span></label></div>` : "") +
+        (manage ? `<div class="grp"><h4>Invite link</h4><span class="row-inline"><input class="input" id="cs-link" readonly value="${esc(inviteUrl(v.invite_code))}"/><button class="btn sm gold" id="cs-copy" type="button">${icon("i-copy", "sm")}Copy</button></span>` +
+          `<small class="muted">Anyone with this link can ${v.approve_joins ? "ask to join" : "join the club"}. <button class="linkish" id="cs-reset" type="button">Make a new link</button> — the old one stops working.</small>` +
+          (owner ? `<div class="setrow"><div><b>Ask me first</b><small>New people ask to join; you or an admin let them in</small></div><label class="switch"><input type="checkbox" id="cs-approve" ${v.approve_joins ? "checked" : ""}/><i></i></label></div>` : "") + `</div>` : "") +
+        ((v.requests || []).length ? `<div class="grp"><h4>Waiting to join · ${v.requests.length}</h4>${v.requests.map((q) =>
+          `<div class="mem"><span class="mem-who">${avatar(q.name, q.name, "sm")}<span><b>${esc(q.name)}</b><small>${esc(q.email)}</small></span></span>` +
+          `<span class="mem-act"><button class="btn sm ghost" type="button" data-deny="${q.user_id}">Not now</button><button class="btn sm gold" type="button" data-allow="${q.user_id}">Let in</button></span></div>`).join("")}</div>` : "") +
+        `<div class="grp"><h4>Members · ${v.members.length}</h4>${v.members.map((m) =>
+          `<div class="mem"><span class="mem-who">${avatar(m.name, m.name, "sm")}<span><b>${esc(m.name)}${m.is_me ? " <i>you</i>" : ""}</b><small>${m.role === "owner" ? "Runs the club" : m.role === "admin" ? "Admin: lets people in" : "Member"}</small></span></span>` +
+          `<span class="mem-act"><span class="pill role-${m.role}">${m.role}</span>${canAct(m) ? `<button class="icon-btn" type="button" data-mem="${m.user_id}" aria-label="Manage ${esc(m.name)}">${icon("i-menu")}</button>` : ""}</span></div>`).join("")}</div>` +
+        (owner ? `<p class="muted" style="font-size:12px;margin:0">You run this club. To step down, hand it to another member (the ☰ next to their name).</p>`
+          : `<button class="btn sm danger" id="cs-leave" type="button">${icon("i-door", "sm")}Leave club</button>`);
+      const q = (id) => body.querySelector("#" + id);
+      if (q("cs-save")) q("cs-save").addEventListener("click", async () => { const name = q("cs-name").value.trim(); if (!name) return toast("Give the club a name", "err"); if (await post("settings", { name })) { toast("Renamed", "ok"); paint(); } });
+      if (q("cs-copy")) q("cs-copy").addEventListener("click", () => copyText(inviteUrl(v.invite_code), "Invite link copied", "Invite link"));
+      if (q("cs-link")) { const pick = (e) => e.target.select(); q("cs-link").addEventListener("focus", pick); q("cs-link").addEventListener("click", pick); }
+      if (q("cs-reset")) q("cs-reset").addEventListener("click", async () => {
+        const ok = await confirmDialog({ title: "Make a new invite link?", text: "The current link stops working — anyone who has it but hasn't joined yet will need the new one.", okLabel: "New link" });
+        if (ok && await post("invite")) { toast("New invite link ready", "ok"); paint(); }
+      });
+      if (q("cs-approve")) q("cs-approve").addEventListener("change", async (e) => { if (await post("settings", { approve_joins: e.target.checked })) { toast(e.target.checked ? "New people ask first now" : "The link lets people straight in", "ok"); paint(); } else e.target.checked = !e.target.checked; });
+      body.querySelectorAll("[data-allow],[data-deny]").forEach((b) => b.addEventListener("click", async () => {
+        const allow = !!b.dataset.allow, uid = Number(b.dataset.allow || b.dataset.deny);
+        b.disabled = true;
+        if (await post("requests/decide", { user_id: uid, allow })) { toast(allow ? "Welcome aboard — they're in" : "Request declined", allow ? "ok" : ""); await refresh(); }
+        else b.disabled = false;
+      }));
+      body.querySelectorAll("[data-mem]").forEach((b) => b.addEventListener("click", () => {
+        const m = v.members.find((x) => String(x.user_id) === b.dataset.mem);
+        if (!m) return;
+        const items = [{ header: m.name }];
+        if (v.role === "owner") {
+          items.push(m.role === "admin"
+            ? { icon: "i-user", label: "Make a member", onClick: async () => { if (await post("members", { user_id: m.user_id, role: "member" })) paint(); } }
+            : { icon: "i-shield", label: "Make an admin", hint: "Admins let people in and remove members", onClick: async () => { if (await post("members", { user_id: m.user_id, role: "admin" })) paint(); } });
+          items.push({ icon: "i-crown", label: "Hand the club over", onClick: async () => {
+            const ok = await confirmDialog({ title: `Hand ${v.name} to ${m.name}?`, text: `${m.name} runs the club from now on; you stay on as an admin.`, okLabel: "Hand over" });
+            if (ok && await post("members", { user_id: m.user_id, role: "owner" })) { toast(`${m.name} runs ${v.name} now`, "ok"); paint(); }
+          } });
+          items.push("-");
+        }
+        items.push({ icon: "i-door", label: "Remove from the club", danger: true, onClick: async () => {
+          const ok = await confirmDialog({ title: `Remove ${m.name}?`, text: "They lose the club's tables and numbers. Their hands stay in the club's history.", okLabel: "Remove", danger: true });
+          if (ok && await post("members", { user_id: m.user_id, remove: true })) { toast(`${m.name} is out of the club`, ""); paint(); }
+        } });
+        openMenu(b, items);
+      }));
+      if (q("cs-leave")) q("cs-leave").addEventListener("click", async () => {
+        const ok = await confirmDialog({ title: `Leave ${v.name}?`, text: "Its tables and numbers disappear from your lobby. You can come back with an invite link.", okLabel: "Leave club", danger: true });
+        if (!ok) return;
+        try {
+          await C().j(`/games/api/clubs/${encodeURIComponent(cid)}/leave`, { method: "POST" });
+          api.close(null);
+          toast(`You left ${v.name}`, "");
+          C().setClub(null); U.lobbySig = ""; C().loadLobby().catch(() => {});
+        } catch (e) { toast(e.message, "err", 5000); }
+      });
+    };
+    const api = openModal({
+      title: v.name, sub: `${v.members.length} member${v.members.length === 1 ? "" : "s"} · ${ROLE_WORD[v.role] || v.role}`, body, wide: true, autofocus: false,
+      buttons: [{ label: "Done", cls: "primary" }],
+      onClose: () => { if (U.clubPanel && U.clubPanel.api === api) U.clubPanel = null; },
+    });
+    paint();
+    // (someone joins or asks while it is open: the lobby poll notices and it repaints)
+    const summary = currentClub();
+    U.clubPanel = { api, cid, sig: summary ? `${summary.members}:${summary.requests}` : "", refresh };
   }
 
   function openCreate() {
     const me = C().G.me || {};
+    const clubs = (U.lobbyData && U.lobbyData.clubs) || [];
+    const cur = clubs.find((c) => c.id === C().G.clubId) || clubs[0];
+    if (!cur) return openCreateClub();  // (a table lives in a club)
     const body = h("div", { style: "display:flex;flex-direction:column;gap:16px" });
     body.innerHTML =
+      (clubs.length > 1 ? `<label class="field"><span>Club</span><select class="input" id="c-club">${clubs.map((c) => `<option value="${esc(c.id)}" ${c.id === cur.id ? "selected" : ""}>${esc(c.name)}</option>`).join("")}</select><small>Only this club's members can see and join the table</small></label>` : "") +
       `<label class="field"><span>Table name</span><input type="text" id="c-name" maxlength="60" value="${esc((me.name || "My").split(" ")[0])}'s game"/></label>` +
       `<div class="row3" style="grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto;align-items:start">` +
       `<label class="field"><span>Big blind</span>${moneyInput("c-bb", 100)}<small>The chip unit and the minimum bet</small></label>` +
@@ -230,7 +564,7 @@
       `<div class="field"><span>Next hand</span><div class="seg" id="c-deal">${[[0, "Manual"], [3, "3s"], [5, "5s"], [8, "8s"], [12, "12s"]].map(([v, l]) => `<button type="button" data-v="${v}" class="${v === 5 ? "on" : ""}">${l}</button>`).join("")}</div></div>` +
       `<div class="setrow"><div><b>I approve every buy-in</b><small>Sit-downs and top-ups wait for your OK — you can trust regulars so they never wait</small></div><label class="switch"><input type="checkbox" id="c-approve"/><i></i></label></div>` +
       `<div class="setrow"><div><b>Players may take chips off the table</b><small>Ratholing allowed: anyone can pocket part of their stack between hands</small></div><label class="switch"><input type="checkbox" id="c-rathole"/><i></i></label></div>` +
-      `<div class="setrow"><div><b>List in the lobby</b><small>Off = only people with the link can find it</small></div><label class="switch"><input type="checkbox" id="c-listed" checked/><i></i></label></div>` +
+      `<div class="setrow"><div><b>Show it in the club lobby</b><small>Off = only club members with the link can find it</small></div><label class="switch"><input type="checkbox" id="c-listed" checked/><i></i></label></div>` +
       `</div></details>`;
     segWire(body);
     const q = (id) => body.querySelector("#" + id);
@@ -247,7 +581,7 @@
     q("c-buyin").addEventListener("input", () => { buyinTouched = true; });
     sync();
     openModal({
-      title: "Host a table", sub: "You can change almost everything later from Manage table.", body,
+      title: "Host a table", sub: `In ${cur.name}: its members see the table in the lobby. You can change almost everything later from Manage table.`, body,
       buttons: [
         { label: "Cancel", cls: "ghost" },
         {
@@ -263,6 +597,7 @@
               num_seats: segVal(body, "c-seats"), decision_secs: segVal(body, "c-clock"),
               time_bank_secs: segVal(body, "c-bank"), deal_delay_secs: segVal(body, "c-deal"), listed: q("c-listed").checked,
               approve_buyins: q("c-approve").checked, allow_rathole: q("c-rathole").checked,
+              club_id: clubs.length > 1 ? q("c-club").value : cur.id,
             };
             try {
               const s = await C().j("/games/api/tables", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
@@ -315,7 +650,8 @@
       if (from !== "input") input.value = (cents / 100).toFixed(2);
       range.style.setProperty("--fill", (hi > lo ? ((cents - lo) / (hi - lo)) * 100 : 100) + "%");
     };
-    (o.presets || []).filter((p) => p.cents >= lo && p.cents <= hi).slice(0, 4).forEach((p) => {
+    const seen = new Set();  // two presets on the same amount read as a bug: keep the first
+    (o.presets || []).filter((p) => p.cents >= lo && p.cents <= hi && !seen.has(p.cents) && seen.add(p.cents)).slice(0, 4).forEach((p) => {
       const b = h("button", { type: "button" }, esc(p.label));
       b.addEventListener("click", () => { cents = p.cents; sync(); });
       presets.appendChild(b);
@@ -338,7 +674,7 @@
       title: `Take seat ${seat + 1}`, sub: `${s.name} · ${d2(s.stakes.bb_cents)} bb · ante ${d2(s.stakes.ante_cents)}`,
       lo: lim.lo, hi: lim.hi, start: dflt, ante: s.stakes.ante_cents, step: s.stakes.bb_cents, okLabel: s.needs_approval ? "Request seat" : "Sit down",
       hint: (s.needs_approval ? "The host approves buy-ins here — your seat is held while they decide. " : "") + (lim.capped ? `Buy-in ${d2(lim.lo)} – ${d2(lim.hi)}. ` : "") + "Real money is settled between you — the ledger just keeps score.",
-      presets: [{ label: "Min", cents: lim.lo }, { label: d2(dflt), cents: dflt }, { label: d2(dflt * 2), cents: dflt * 2 }, { label: "Max", cents: lim.hi }],
+      presets: [{ label: "Min", cents: lim.lo }, { label: d0(dflt), cents: dflt }, { label: d0(dflt * 2), cents: dflt * 2 }, { label: "Max", cents: lim.hi }],
       onOk: async (cents) => {
         const out = await C().tablePost("sit", { seat, buyin_cents: cents });
         if (out && out.my_request) toast("Request sent — waiting for the host", "ok");
@@ -372,7 +708,14 @@
       title: "Add chips", sub: `Your stack is ${d2(me.stack_cents)}.` + (holding ? " They are added when this hand ends." : ""), lo: lim.lo, hi: lim.hi, start: dflt,
       ante: s.stakes.ante_cents, step: s.stakes.bb_cents, okLabel: s.needs_approval ? "Request chips" : "Add chips",
       hint: (s.needs_approval ? "The host approves buy-ins here. " : "") + (lim.capped ? `You can top up to ${d2(s.settings.max_buyin_cents)} in total.` : ""),
-      presets: [{ label: d2(dflt), cents: dflt }, { label: d2(s.stakes.default_buyin_cents), cents: s.stakes.default_buyin_cents }, { label: "Max", cents: lim.hi }],
+      // "To $100" tops the stack up to a buy-in; "+$100" adds one on top
+      presets: [
+        ...(me.stack_cents > 0 && s.stakes.default_buyin_cents > me.stack_cents
+          ? [{ label: `To ${d0(s.stakes.default_buyin_cents)}`, cents: s.stakes.default_buyin_cents - me.stack_cents }] : []),
+        { label: `+${d0(s.stakes.default_buyin_cents)}`, cents: s.stakes.default_buyin_cents },
+        { label: `+${d0(s.stakes.default_buyin_cents * 2)}`, cents: s.stakes.default_buyin_cents * 2 },
+        { label: "Max", cents: lim.hi },
+      ],
       onOk: async (cents) => {
         const out = await C().tablePost("rebuy", { amount_cents: cents, queue: true });
         if (out && out.my_request) toast("Request sent — waiting for the host", "ok");
@@ -389,7 +732,12 @@
       title: "Take chips off the table", sub: `Your stack is ${d2(me.stack_cents)}.` + (holding ? " They come off when this hand ends." : ""), lo, hi, start: Math.min(hi, Math.max(lo, Math.round(hi / 2 / s.stakes.bb_cents) * s.stakes.bb_cents)),
       ante: s.stakes.ante_cents, step: s.stakes.bb_cents, okLabel: "Take off",
       hint: `They go back to your ledger as if you had cashed them out. You keep at least ${d2(floor)} on the table.`,
-      presets: [{ label: "Half", cents: Math.round(hi / 2) }, { label: d2(s.stakes.default_buyin_cents), cents: Math.max(lo, me.stack_cents - s.stakes.default_buyin_cents) }, { label: "Max", cents: hi }],
+      presets: [
+        { label: "Half", cents: Math.round(hi / 2) },
+        ...(me.stack_cents - s.stakes.default_buyin_cents >= lo
+          ? [{ label: `Keep ${d0(s.stakes.default_buyin_cents)}`, cents: me.stack_cents - s.stakes.default_buyin_cents }] : []),
+        { label: "Max", cents: hi },
+      ],
       onOk: async (cents) => {
         await C().tablePost("remove_chips", { amount_cents: cents, queue: holding });
         toast(holding ? `${d2(cents)} comes off when this hand ends` : `${d2(cents)} taken off the table`, "ok");
@@ -494,6 +842,14 @@
     if (p.rail !== open) setTimeout(() => HG.table.layout(), 300);
     const s = C().G.state;
     if (s && open) renderRail(s, true);
+  }
+  // It just became my turn. On a phone the side panel covers the whole table —
+  // someone reading the chat never saw the buttons and the clock folded them: close
+  // it (a half-typed message stays in its box). A dialog or the Manage drawer may hold
+  // unsaved edits, so those stay open and a toast says it instead.
+  function onMyTurn() {
+    if (C().G.prefs.rail && getComputedStyle($("rail")).position === "absolute") setRail(false);
+    if (U.drawer || document.querySelector("#modal-root .modal")) toast("It's your turn", "gold", 4000);
   }
   function renderUnread() {
     const n = U.unread;
@@ -630,7 +986,8 @@
     list.forEach((x) => {
       const net = x.my_delta_cents;
       const row = h("button", { class: "hand-row", type: "button" },
-        `<span class="no">#${x.hand_no}</span><span style="display:flex;align-items:center;min-width:0">${x.my_hole ? miniCards(x.my_hole) : ""}${miniCards(x.board_a, "gap")}</span>` +
+        // (your hand framed in gold, then board 1 — they used to read as one row of cards)
+        `<span class="no">#${x.hand_no}</span><span style="display:flex;align-items:center;min-width:0">${x.my_hole ? miniCards(x.my_hole, "mine") : ""}${miniCards(x.board_a, x.my_hole ? "gap board" : "board")}</span>` +
         `<span class="net ${net > 0 ? "pos" : net < 0 ? "neg" : "muted"}">${net == null ? "—" : (net > 0 ? "+" : "") + d2(net)}</span>` +
         `<span></span><span class="who">${esc((x.winners || []).map((w) => w.name).join(", ") || "Split pot")} · pot ${d2(x.pot_cents)}</span><span class="muted num" style="font-size:11px">${x.my_accuracy == null ? (x.showdown ? "Showdown" : "") : Math.round(x.my_accuracy) + "%"}</span>`);
       row.addEventListener("click", () => openHand(s.id, x.hand_no));
@@ -862,18 +1219,22 @@
   // --------------------------------------------------- lifetime hand database
   // `player` = {user_id, name} opens somebody else's database (the club is private:
   // everyone may browse everyone — cards still follow the table's reveal rule).
-  async function openMyHands(gameId, player) {
+  async function openMyHands(gameId, player, clubId) {
     const other = player && !player.is_me ? player : null;
     const base = other ? `/games/api/players/${other.user_id}` : "/games/api/my";
+    // (one club's numbers — the club's lobby, or the club of the table it was opened from)
+    const club = clubId || C().G.clubId;
+    const clubQ = club ? `club=${encodeURIComponent(club)}` : "";
+    const clubName = (currentClub() && currentClub().id === club && currentClub().name) || "";
     let stats;
-    try { stats = await C().j(base + "/stats"); } catch (e) { return toast(e.message, "err"); }
+    try { stats = await C().j(base + "/stats" + (clubQ ? "?" + clubQ : "")); } catch (e) { return toast(e.message, "err"); }
     const F = { sort: "time", dir: "desc", game: gameId || "", offset: 0, rows: [], total: 0 };
     const acc = (v) => (v == null ? "–" : Math.round(v) + "%");
     const body = h("div", { class: "db" });
     body.innerHTML =
       `<div class="pcard-stats"><div><b>${stats.hands}</b><small>Hands</small></div><div><b class="${stats.net_cents > 0 ? "pos" : stats.net_cents < 0 ? "neg" : ""}">${stats.net_cents > 0 ? "+" : ""}${d2(stats.net_cents)}</b><small>Lifetime net</small></div>` +
       `<div><b>${acc(stats.accuracy)}</b><small>Accuracy (${stats.graded} decisions)</small></div><div><b>${stats.hands ? Math.round((100 * stats.wins) / stats.hands) + "%" : "–"}</b><small>Hands won</small></div></div>` +
-      ((stats.versus || []).length ? `<div class="rsec"><h4>Head to head — lifetime</h4><div class="vs">${stats.versus.map((v) => `<span class="vs-chip"><span>${esc(v.name)}</span><b class="num ${v.net_cents > 0 ? "pos" : v.net_cents < 0 ? "neg" : ""}">${v.net_cents > 0 ? "+" : ""}${d2(v.net_cents)}</b></span>`).join("")}</div></div>` : "") +
+      ((stats.versus || []).length ? `<div class="rsec"><h4>Head to head${clubName ? " — " + esc(clubName) : ""}</h4><div class="vs">${stats.versus.map((v) => `<span class="vs-chip"><span>${esc(v.name)}</span><b class="num ${v.net_cents > 0 ? "pos" : v.net_cents < 0 ? "neg" : ""}">${v.net_cents > 0 ? "+" : ""}${d2(v.net_cents)}</b></span>`).join("")}</div></div>` : "") +
       `<div class="db-bar"><select class="input" id="db-game"><option value="">All sessions (${(stats.sessions || []).length})</option>${(stats.sessions || []).map((x) => `<option value="${esc(x.id)}" ${x.id === F.game ? "selected" : ""}>${esc(x.name)} · ${x.hands} hands · ${x.net_cents >= 0 ? "+" : ""}${d2(x.net_cents)}${x.accuracy == null ? "" : " · " + acc(x.accuracy)}</option>`).join("")}</select>` +
       `<div class="seg" id="db-sort">${[["time", "Date"], ["pot", "Pot size"], ["net", "Profit / loss"], ["accuracy", "Accuracy"]].map(([v, l]) => `<button type="button" data-v="${v}" class="${v === "time" ? "on" : ""}">${l}</button>`).join("")}</div>` +
       `<button class="btn sm" id="db-dir" title="Reverse the order">↓ High to low</button></div>` +
@@ -881,7 +1242,7 @@
     const q = (id) => body.querySelector("#" + id);
     const draw = () => {
       const host = q("db-list");
-      host.innerHTML = F.rows.length ? "" : `<div class="muted" style="text-align:center;padding:26px">${other ? "No hands here yet." : "No hands yet. Every hand you play at any table lands here."}</div>`;
+      host.innerHTML = F.rows.length ? "" : `<div class="muted" style="text-align:center;padding:26px">${other ? "No hands here yet." : "No hands yet. Every hand you play at this club's tables lands here."}</div>`;
       F.rows.forEach((x) => {
         const net = x.net_cents;
         const row = h("button", { class: "hand-row db-row", type: "button" },
@@ -898,7 +1259,7 @@
     const load = async (reset) => {
       if (reset) { F.offset = 0; F.rows = []; }
       try {
-        const d = await C().j(`${base}/hands?sort=${F.sort}&dir=${F.dir}&limit=40&offset=${F.offset}` + (F.game ? `&game=${encodeURIComponent(F.game)}` : ""));
+        const d = await C().j(`${base}/hands?sort=${F.sort}&dir=${F.dir}&limit=40&offset=${F.offset}` + (F.game ? `&game=${encodeURIComponent(F.game)}` : "") + (clubQ ? "&" + clubQ : ""));
         F.rows = F.rows.concat(d.hands); F.total = d.total; F.offset += d.limit;
       } catch (e) { toast(e.message, "err"); }
       draw();
@@ -909,8 +1270,8 @@
     q("db-game").addEventListener("change", (e) => { F.game = e.target.value; load(true); });
     q("db-more").addEventListener("click", () => load(false));
     const api = openModal({
-      title: other ? `${other.name} — hands & stats` : "My hands",
-      sub: other ? "Every hand they have played. You see the cards you saw at the table: your own, and hands that were shown." : "Every hand you have played at any table, with the network's accuracy rating.",
+      title: (other ? `${other.name} — hands & stats` : "My hands & stats") + (clubName ? ` · ${clubName}` : ""),
+      sub: other ? `Every hand they played${clubName ? " in " + clubName : ""}. You see the cards you saw at the table: your own, and hands that were shown.` : `Every hand you played${clubName ? " in " + clubName : ""}, with the network's accuracy rating.`,
       body, wide: true, autofocus: false, buttons: [{ label: "Close", cls: "primary" }],
     });
     api.modal.classList.add("xwide");
@@ -924,9 +1285,15 @@
   const tone = (c) => (c > 0 ? "pos" : c < 0 ? "neg" : "");
 
   async function loadClub(force) {
-    if (!force && U.clubAt && Date.now() - U.clubAt < 30000) return;
-    U.clubAt = Date.now();
-    try { renderClub(await C().j("/games/api/community")); } catch (_) { /* the lobby works without it */ }
+    const cid = C().G.clubId;
+    if (!cid) { renderClub({ players: [] }); return; }  // (no club (yet): no numbers to show)
+    // (the 30 s throttle is per club: a switch, or the first load after the club is known, always fetches)
+    if (!force && U.clubAt && U.clubFor === cid && Date.now() - U.clubAt < 30000) return;
+    U.clubAt = Date.now(); U.clubFor = cid;
+    try {
+      const data = await C().j(`/games/api/community?club=${encodeURIComponent(cid)}`);
+      if (C().G.clubId === cid) renderClub(data);  // (a switch in the meantime: the newer answer wins)
+    } catch (_) { /* the lobby works without it */ }
   }
   function renderClub(data) {
     U.club = data;
@@ -1400,13 +1767,24 @@
     $("lb-myhands").addEventListener("click", () => openMyHands(""));
     $("lb-h2h").addEventListener("click", openMatrix);
     $("lb-allsess").addEventListener("click", openSessions);
-    $("join-form").addEventListener("submit", (e) => {
-      e.preventDefault();
-      const raw = $("join-input").value.trim();
-      const m = raw.match(/\/games\/t\/([A-Za-z0-9_-]+)/) || raw.match(/^([A-Za-z0-9_-]{4,})$/);
-      if (!m) return toast("Paste a table link or its code", "err");
-      C().openTable(m[1], true).catch((err) => toast(err.status === 404 ? "No table with that code" : err.message, "err"));
+    const takeLink = (id) => { const box = $(id), v = box.value; box.value = ""; box.blur(); return v; };
+    $("join-form").addEventListener("submit", (e) => { e.preventDefault(); joinByLink(takeLink("join-input")); });
+    $("club-switch").addEventListener("click", (e) => openClubMenu(e.currentTarget));
+    $("club-settings").addEventListener("click", openClubSettings);
+    $("club-invite").addEventListener("click", async () => {
+      const cid = C().G.clubId;
+      try {
+        const v = await C().j(`/games/api/clubs/${encodeURIComponent(cid)}`);
+        if (v.invite_code) copyText(inviteUrl(v.invite_code), `Invite link to ${v.name} copied`, "Club invite link");
+      } catch (err) { toast(err.message, "err"); }
     });
+    $("wel-create").addEventListener("submit", (e) => {
+      e.preventDefault();
+      const name = $("wel-name").value.trim();
+      if (!name) { toast("Give the club a name", "err"); $("wel-name").focus(); return; }
+      createClub(name);
+    });
+    $("wel-join").addEventListener("submit", (e) => { e.preventDefault(); joinByLink(takeLink("wel-link")); });
     $("brand-link").addEventListener("click", (e) => { e.preventDefault(); C().showLobby(false); });
     $("tb-back").addEventListener("click", () => C().showLobby(false));
     $("tb-invite").addEventListener("click", () => copyInvite(C().G.gameId));
@@ -1421,12 +1799,17 @@
     $("tb-prefs").addEventListener("click", openPrefs);
     $("tb-seat").addEventListener("click", (e) => seatMenu(e.currentTarget));
     $("tb-more").addEventListener("click", (e) => {
-      const s = C().G.state, on = !!C().G.prefs.sound;
-      openMenu(e.currentTarget, [
+      const s = C().G.state, on = !!C().G.prefs.sound, anchor = e.currentTarget;
+      // (a phone has no React button: the dock's right side is hidden there)
+      const react = () => setTimeout(() => openMenu(anchor, [{ header: "React" }].concat(Object.entries(HG.table.EMOTES).map(([k, g]) => ({
+        label: `${g}  ${k.toUpperCase()}`, onClick: () => C().tablePost("react", { emote: k }).catch(() => {}),
+      })))), 0);
+      openMenu(anchor, [
         { header: s ? s.name : "Table" },
         { icon: "i-link", label: "Copy invite link", disabled: !s || s.status !== "open", onClick: () => copyInvite(C().G.gameId) },
         { icon: "i-info", label: "Table info", onClick: openInfo },
         { icon: "i-clock", label: "Last hand", disabled: !s || !s.last_hand_no || !s.is_member, onClick: () => openHand(s.id, C().G.state.last_hand_no) },
+        { icon: "i-smile", label: "React", disabled: !s || !Number.isInteger(s.my_seat), onClick: react },
         "-",
         { icon: on ? "i-vol" : "i-mute", label: on ? "Sound on" : "Sound off", onClick: () => { C().savePrefs({ sound: !on }); renderSound(); } },
         { icon: "i-sliders", label: "Preferences", onClick: openPrefs },
@@ -1454,9 +1837,10 @@
     if (HG.play) HG.play.init();
   }
 
-  function showLobby() { $("lobby").hidden = false; $("table-view").hidden = true; closeDrawer(); U.lobbySig = ""; loadClub(true); }
+  function showLobby() { $("lobby").hidden = false; $("table-view").hidden = true; document.body.classList.add("in-lobby"); closeDrawer(); U.lobbySig = ""; loadClub(true); }
   function showTable() {
     $("lobby").hidden = true; $("table-view").hidden = false;
+    document.body.classList.remove("in-lobby");
     U.eventSeen = null; U.chatSig = ""; U.logSig = ""; U.ledgerSig = ""; U.hands = null; U.handsFor = null; U.unread = 0;
     $("hands-body").dataset.k = "";
   }
@@ -1464,14 +1848,26 @@
     const c = $("conn"), st = C().G.conn;
     c.className = "conn " + (st === "ok" ? "" : st);
     c.lastChild.textContent = st === "ok" ? "Live" : st === "slow" ? "Slow" : "Reconnecting…";
+    // A lost connection must be SEEN — on a phone the top bar has no room for the
+    // indicator above, and the frozen table looked perfectly normal.
+    let bar = $("connbar");
+    if (!bar) {
+      bar = h("div", { id: "connbar", role: "status", "aria-live": "polite" }, `<i></i><span><b>Connection lost</b> — reconnecting…</span>`);
+      bar.hidden = true;
+      document.body.appendChild(bar);
+    }
+    bar.hidden = st !== "off";
+    if (U.connWas === "off" && st === "ok") toast("Back online", "ok");
+    U.connWas = st;
   }
 
   function renderTop(s) {
     $("table-title").textContent = s.name;
-    $("table-sub").textContent = `PLO5 bomb pot · ${d2(s.stakes.bb_cents)} bb · ante ${d2(s.stakes.ante_cents)}`;
+    $("table-sub").textContent = `PLO5 bomb pot · ${d2(s.stakes.bb_cents)} bb · ante ${d2(s.stakes.ante_cents)}${s.club ? " · " + s.club.name : ""}`;
     const st = $("tb-status");
     const label = s.status !== "open" ? "Closed" : s.running ? "Live" : "Paused";
     st.textContent = label;
+    st.title = label;  // (a small phone shows "Live" as its dot only)
     st.className = "pill " + (label === "Live" ? "live" : label === "Paused" ? "paused" : "");
     $("tb-hand").textContent = s.hand_no ? `Hand #${s.hand_no}` : "";
     $("tb-hand").hidden = !s.hand_no;
@@ -1486,7 +1882,8 @@
       if (run.dataset.k !== k) {
         run.dataset.k = k;
         run.className = "btn sm " + (s.running ? "" : "start");
-        run.innerHTML = icon(s.running ? "i-pause" : "i-play", "sm") + `<span>${label}</span>`;
+        // (a phone gets the short label: the long one squeezed the status pill off the bar)
+        run.innerHTML = icon(s.running ? "i-pause" : "i-play", "sm") + `<span class="lbl-l">${label}</span><span class="lbl-s">${s.running ? "Pause" : "Start"}</span>`;
         run.disabled = !s.running && s.eligible_count < 2;
         run.title = s.running ? "Pause the game (the current hand finishes first)" : s.eligible_count < 2 ? "Needs two players with more than the ante" : "Start dealing";
       }
@@ -1501,10 +1898,13 @@
   function handleEvents(s, prev) {
     const evs = s.events || [];
     const last = evs.length ? evs[evs.length - 1].id : 0;
+    // the server restarted (new epoch): its event ids start again at 1 — show them
+    if (prev && prev.id === s.id && prev.epoch && s.epoch && prev.epoch !== s.epoch) U.eventSeen = 0;
     if (U.eventSeen != null && prev && prev.id === s.id) {
       evs.filter((e) => e.id > U.eventSeen).slice(-3).forEach((e) => {
         if (e.kind === "timeout" && e.seat === s.my_seat) { toast("You ran out of time — " + (e.text.includes("folded") ? "your hand was folded" : "you were checked"), "err", 5000); return; }
         if (e.kind === "request") { if (s.is_host && /asks to/.test(e.text)) { toast(e.text + " — open Manage › Chips", "gold", 6000); HG.sound && HG.sound.play("msg"); } return; }
+        if (e.kind === "joinreq") { if ((s.join_requests || []).length) HG.sound && HG.sound.play("msg"); return; }  // the card says it
         if (e.kind === "fair") { toast(e.text, "gold", 6000); return; } // a redone shuffle is always said out loud
         if (["join", "leave", "rebuy", "host", "settings", "run"].includes(e.kind)) toast(e.text, e.kind === "join" ? "ok" : "");
         if (e.kind === "join") HG.sound && HG.sound.play("sit");
@@ -1515,6 +1915,7 @@
   }
 
   function render(s, prev, opts) {
+    renderJoinReqs(s.join_requests);
     renderTop(s);
     HG.table.render(s, prev, opts);
     if (HG.play) HG.play.render(s, prev, opts);
@@ -1525,7 +1926,8 @@
 
   HG.ui = {
     init, render, renderLobby, showLobby, showTable, renderConn, toast, openModal, confirmDialog, openMenu, closeTop,
-    openSit, openTopUp, openAutoChips, openPlayer, openRequest, openLeave, openMyHands, noteFor, TAGS, openDrawer, openInfo, openPrefs, openHand, copyInvite, setRail, renderDock: (s) => HG.play && HG.play.render(s, s),
+    openSit, openTopUp, openAutoChips, openPlayer, openRequest, openLeave, openMyHands, noteFor, TAGS, openDrawer, openInfo, openPrefs, openHand, copyInvite, setRail, onMyTurn, renderDock: (s) => HG.play && HG.play.render(s, s),
+    openInvite, openClubGate, openClubSettings,
     onClock: (left, tm) => HG.play && HG.play.onClock(left, tm),
   };
 })();

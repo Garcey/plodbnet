@@ -47,25 +47,38 @@
       <symbol id="i-lock" viewBox="0 0 24 24"><path d="M6 11h12v9H6z" /><path d="M9 11V8a3 3 0 0 1 6 0v3" /></symbol>
       <symbol id="i-swap" viewBox="0 0 24 24"><path d="M7 8h12l-3-3M17 16H5l3 3" /></symbol>
       <symbol id="i-send" viewBox="0 0 24 24"><path d="M4 12l16-8-6 16-3-7-7-1z" /></symbol>
+      <symbol id="i-down" viewBox="0 0 24 24"><path d="M6 9.5l6 6 6-6" /></symbol>
       <symbol id="i-mark" viewBox="0 0 96 96"><path d="M28 12H68Q84 12 84 28V68Q84 84 68 84H28Q12 84 12 68V44Q12 30 26 30H44Q56 30 56 42V46Q56 56 46 56" stroke-width="11" /></symbol>
     </svg>
 
     <!-- ===================== LOBBY ===================== -->
-    <div id="lobby" class="view" hidden>
+    <div id="lobby" class="view loading" hidden>
       <header class="lb-top">
         <a class="brand" href="/games" id="brand-link">
           <svg class="ico brand-logo"><use href="#i-mark" /></svg>
           <span>WrapGTO</span><small>Home games</small>
         </a>
         <span class="spacer"></span>
-        <a class="btn ghost sm" href="/">Study &amp; Trainer</a>
+        <a class="btn ghost sm" href="/" title="Study &amp; Trainer"><span class="lg-only">Study &amp; Trainer</span><span class="sm-only">Study</span></a>
         <span class="userchip" id="userchip"></span>
         <form class="bar-form" method="post" action="/auth/logout">
           <button class="btn ghost sm" type="submit">Sign out</button>
         </form>
       </header>
       <main class="lb-main">
-        <section class="lb-hero">
+        <!-- the club this lobby shows (its tables, players and numbers): switch, invite, manage -->
+        <section class="lb-clubbar" id="lb-clubbar" hidden>
+          <button class="club-switch" id="club-switch" type="button" aria-haspopup="menu" title="Switch club">
+            <span class="club-badge" id="club-badge"></span>
+            <span class="club-txt"><small id="club-kicker">Club</small><b id="club-name"></b></span>
+            <svg class="ico sm"><use href="#i-down" /></svg>
+          </button>
+          <span class="club-meta" id="club-meta"></span>
+          <span class="spacer"></span>
+          <button class="btn sm" id="club-invite" type="button" title="Copy the club's invite link" aria-label="Invite" hidden><svg class="ico sm"><use href="#i-link" /></svg><span>Invite</span></button>
+          <button class="btn sm" id="club-settings" type="button" title="Members, invite link and club settings" aria-label="Members"><svg class="ico sm"><use href="#i-users" /></svg><span>Members</span><i class="req-n" id="club-req" hidden>0</i></button>
+        </section>
+        <section class="lb-hero" id="lb-hero">
           <div>
             <h1>Your private <em>bomb-pot</em> room</h1>
             <p>PLO5 double-board bomb pots with your friends. Everyone antes, the hand starts on the flop, and the ledger keeps the money straight.</p>
@@ -73,11 +86,32 @@
           <span class="spacer"></span>
           <div class="lb-actions">
             <form class="lb-join" id="join-form">
-              <input class="input" id="join-input" placeholder="Paste a table link or code" autocomplete="off" />
+              <input class="input" id="join-input" placeholder="Table or club link" autocomplete="off" aria-label="Paste a table or club link" />
               <button class="btn" type="submit">Join</button>
             </form>
             <button class="btn lg" id="lb-myhands" type="button"><svg class="ico"><use href="#i-chart" /></svg>My hands &amp; stats</button>
             <button class="btn gold lg" id="c-open" type="button"><svg class="ico"><use href="#i-plus" /></svg>Host a table</button>
+          </div>
+        </section>
+        <!-- in no club yet: start one, or join one with an invite link -->
+        <section class="lb-welcome" id="lb-welcome" hidden>
+          <div class="wel-card">
+            <span class="wel-ico"><svg class="ico lg"><use href="#i-users" /></svg></span>
+            <h2>Start a club</h2>
+            <p>Your own circle: host tables, invite friends with one link, and keep the leaderboard, profits and accuracy among yourselves.</p>
+            <form class="wel-form" id="wel-create">
+              <input class="input" id="wel-name" maxlength="40" placeholder="Club name, e.g. Friday night" autocomplete="off" />
+              <button class="btn gold" type="submit">Create club</button>
+            </form>
+          </div>
+          <div class="wel-card">
+            <span class="wel-ico"><svg class="ico lg"><use href="#i-link" /></svg></span>
+            <h2>Join a club</h2>
+            <p>Got an invite from a friend? Paste the link (or open it) and you're in — or you'll be let in by the club.</p>
+            <form class="wel-form" id="wel-join">
+              <input class="input" id="wel-link" placeholder="Paste an invite or table link" autocomplete="off" />
+              <button class="btn" type="submit">Join</button>
+            </form>
           </div>
         </section>
         <section class="lb-sec" id="lb-mine-sec" hidden>
@@ -141,6 +175,7 @@
                 <div id="pot-row">
                   <div id="pot-total" hidden><small>Total</small><span id="pot-total-amt"></span></div>
                   <div id="pot"><span class="chips" id="pot-chips"></span><small>Pot</small><span id="pot-amt">$0.00</span></div>
+                  <div id="live-pots" hidden></div>
                   <div id="street-tag"></div>
                 </div>
                 <div id="pots" hidden></div>

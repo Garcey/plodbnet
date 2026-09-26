@@ -80,13 +80,16 @@ def test_hidden_games_assets_cannot_be_reached_by_path_spelling(server):
             "/static//games.css",
             "/static//games.html",
             "/static/GAMES.JS",  # case-insensitive filesystems
-            "/games/",
-            "//games",
-            "/games//api/tables",
         ):
             r = _raw(client, "GET", raw)
             assert r.status_code == 404, (raw, r.status_code)
             assert "use strict" not in r.text
+    # Since clubs (2026-09-25) every SIGNED-IN user has the home-games pages; the
+    # anonymous visitor still gets the hidden 404 on every spelling of them.
+    for raw in ("/games/", "//games", "/games//api/tables"):
+        r = _raw(anon, "GET", raw)
+        assert r.status_code == 404, (raw, r.status_code)
+        assert "use strict" not in r.text
 
 
 def test_admin_and_study_gates_ignore_slash_tricks(server):

@@ -140,12 +140,23 @@ def test_the_september_database_upgrades_in_place_and_the_table_plays_on(tmp_pat
     club = host.get("/games/api/community").json()
     assert {p["name"] for p in club["players"]} == {"Holly", "Ray", "Sue"}
     assert {x["id"] for x in club["sessions"]} >= {"oldopen1", "oldshut1"}
+    # clubs (2026-09-25): the old circle became the MAIN club — every table that predates
+    # clubs, everyone who played or had the old flag — so its numbers carry on unchanged
+    clubs = ray.get("/games/api/clubs").json()["clubs"]
+    assert len(clubs) == 1 and clubs[0]["is_main"] and clubs[0]["open_tables"] == 1
+    main = host.get(f"/games/api/clubs/{clubs[0]['id']}").json()
+    assert {(m["name"], m["role"]) for m in main["members"]} == {("Holly", "owner"), ("Ray", "member"), ("Sue", "member")}
+    assert main["name"] == "Holly's club"
     # every new table / column exists exactly once, and a SECOND start on the same file is a no-op
     con = sqlite3.connect(db)
     tables = {r[0] for r in con.execute("select name from sqlite_master where type='table'")}
-    assert {"homegame_hands", "homegame_hand_results", "homegame_flows", "homegame_fair"} <= tables
+    assert {"homegame_hands", "homegame_hand_results", "homegame_flows", "homegame_fair",
+            "homegame_clubs", "homegame_club_members", "homegame_club_requests"} <= tables
     cols = {r[1] for r in con.execute("pragma table_info(homegames)")}
-    assert {"running", "deal_delay_ms", "time_bank_secs", "approve_buyins", "topup_mode", "show_grades", "excluded"} <= cols
+    assert {"running", "deal_delay_ms", "time_bank_secs", "approve_buyins", "topup_mode", "show_grades", "excluded",
+            "club_id"} <= cols
+    assert {r[0] for r in con.execute("select club_id from homegames")} == {clubs[0]["id"]}
     assert {"auto_stack_cents", "trusted", "topup_target_cents"} <= {r[1] for r in con.execute("pragma table_info(homegame_players)")}
     con.close()
     hg._ensure_schema()
+    assert hg.pub.DB.one("SELECT COUNT(*) c FROM homegame_clubs")["c"] == 1

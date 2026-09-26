@@ -161,7 +161,12 @@
     else if (!me) msg = s.seats.some((x) => x.empty) ? "<b>You're watching.</b> Pick an open seat on the table to join." : "<b>You're watching.</b> The table is full right now.";
     else if (me.leaving) { msg = "<b>Leaving after this hand.</b> You play it out as normal."; btns.push(["stay", "Stay", ""]); }
     else if (me.pending_remove) msg = "You're leaving — you'll be cashed out when this hand ends.";
-    else if (me.sitting_out) { msg = "<b>You're sitting out.</b>"; btns.push(["back", "I'm back", "primary"]); }
+    else if (me.sitting_out) {
+      msg = "<b>You're sitting out.</b>";
+      btns.push(["back", "I'm back", "primary"]);
+      // a host sitting out still runs the table: a paused game needs its Start button here too
+      if (s.is_host && !s.running && s.eligible_count >= 2) btns.push(["start", "Start game", "gold"]);
+    }
     else if (!(busy && me.in_hand) && me.stack_cents <= s.stakes.ante_cents) { msg = "<b>You're out of chips.</b> Reload to be dealt into the next hand."; btns.push(["topup", "Add chips", "gold"]); }
     else if (s.phase === "in_hand") msg = !me.in_hand ? "You'll be dealt in next hand." : me.folded ? "You folded — watching the rest of the hand." : me.all_in ? "<b>You're all in.</b> Good luck." : "";
     else if (s.runout.blocking) msg = (s.runout.shown_len || 0) >= 5 ? "<b>Showdown</b>" : "Running it out…";
@@ -222,7 +227,9 @@
         const lab = document.createElement("label");
         const on = me.sitting_out || me.sit_out_next;
         lab.className = "chk" + (on ? " on" : "");
-        lab.innerHTML = `<input type="checkbox" ${on ? "checked" : ""}/>${me.sitting_out ? "Sitting out" : "Sit out next hand"}`;
+        // (a phone gets the short label, so the three controls share one row and the table keeps the height)
+        lab.innerHTML = `<input type="checkbox" ${on ? "checked" : ""}/>${me.sitting_out ? "Sitting out" : '<span class="lg-only">Sit out next hand</span><span class="sm-only">Sit out</span>'}`;
+        lab.title = me.sitting_out ? "Untick to play the next hand" : "Sit out from the next hand on";
         lab.firstChild.addEventListener("change", (e) => {
           C().tablePost("sit_out", e.target.checked ? { on: true, next_hand: true } : { on: false }).catch(() => { P.leftSig = ""; });
         });
@@ -345,12 +352,22 @@
     const s = C().G.state;
     if (!s || !C().myTurn(s)) return;
     const k = e.key.toLowerCase();
+    // Compact layout (a phone, or a laptop's short window): the sizing panel is
+    // closed until the player reaches for Bet/Raise. R works like the button —
+    // the first press shows the size, the second bets it (it used to bet the
+    // minimum unseen) — and sizing keys open the panel so the size shows.
+    const reveal = () => {
+      if (!compact() || P.sizingOpen || !s.legal.raise) return false;
+      P.sizingOpen = true;
+      render(s, s);
+      return true;
+    };
     if (k === "f") { e.preventDefault(); doFold(); }
     else if (k === "c") { e.preventDefault(); doCall(); }
-    else if (k === "r" || k === "b") { e.preventDefault(); doRaise(); }
-    else if (s.legal.raise && (e.key === "ArrowUp" || e.key === "ArrowRight")) { e.preventDefault(); nudge(1); }
-    else if (s.legal.raise && (e.key === "ArrowDown" || e.key === "ArrowLeft")) { e.preventDefault(); nudge(-1); }
-    else if (s.legal.raise && /^[1-6]$/.test(e.key) && P.presets[Number(e.key) - 1]) { e.preventDefault(); C().G.raiseTouched = true; setRaise(s, P.presets[Number(e.key) - 1].to, "preset"); }
+    else if (k === "r" || k === "b") { e.preventDefault(); if (!reveal()) doRaise(); }
+    else if (s.legal.raise && (e.key === "ArrowUp" || e.key === "ArrowRight")) { e.preventDefault(); reveal(); nudge(1); }
+    else if (s.legal.raise && (e.key === "ArrowDown" || e.key === "ArrowLeft")) { e.preventDefault(); reveal(); nudge(-1); }
+    else if (s.legal.raise && /^[1-6]$/.test(e.key) && P.presets[Number(e.key) - 1]) { e.preventDefault(); reveal(); C().G.raiseTouched = true; setRaise(s, P.presets[Number(e.key) - 1].to, "preset"); }
   }
 
   function tickDeal() {

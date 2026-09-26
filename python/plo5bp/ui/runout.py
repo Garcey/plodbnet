@@ -51,6 +51,37 @@ def pot_layers(
     return layers
 
 
+def pot_groups(
+    total_commit: list[int], folded: list[bool]
+) -> list[dict[str, Any]]:
+    """The POTS as the table talks about them, deepest first: consecutive layers
+    the same players can win are one pot. A folded player's chips are dead money
+    in the pot they went into, not a side pot of their own — every fold used to
+    show up as a phantom "Side pot" in the award animation. A real side pot needs
+    someone all-in for less. Each group keeps its ``layers``: payouts are still
+    computed layer by layer, exactly like the engine (see ``build_awards``)."""
+    groups: list[dict[str, Any]] = []
+    for ly in reversed(pot_layers(total_commit, folded)):  # main pot (lowest level) first
+        if groups and groups[-1]["eligible"] == ly["eligible"]:
+            g = groups[-1]
+            g["chips"] += int(ly["chips"])
+            g["level"] = int(ly["level"])
+            g["layers"].append(ly)
+        else:
+            groups.append({"level": int(ly["level"]), "chips": int(ly["chips"]),
+                           "eligible": list(ly["eligible"]), "layers": [ly]})
+    groups.reverse()
+    return groups
+
+
+def display_pots(
+    total_commit: list[int], folded: list[bool]
+) -> list[dict[str, Any]]:
+    """``pot_groups`` that somebody can win, deepest first — the index of a pot
+    here is the ``pot`` of its award steps (``build_awards``)."""
+    return [g for g in pot_groups(total_commit, folded) if g["chips"] > 0 and g["eligible"]]
+
+
 def _distribute(amount: int, winners: list[int], button: int, n: int) -> dict[int, int]:
     if amount <= 0 or not winners:
         return {}
@@ -99,7 +130,12 @@ def build_awards(
     board_b: list[int],
     button: int,
 ) -> list[dict[str, Any]]:
-    """Animation script: deepest side pot → main, board A then board B."""
+    """Animation script: deepest side pot → main, board A then board B.
+
+    One step per pot and board (``pot`` = its index in ``display_pots``). The
+    amounts are still worked out layer by layer — each layer split half/half
+    across the boards, odd chips clockwise from the button — so every seat's
+    total is exactly what the engine pays."""
     n = len(total_commit)
     alive = [i for i in range(n) if not folded[i]]
     awards: list[dict[str, Any]] = []
@@ -114,18 +150,19 @@ def build_awards(
                     "shares": {str(alive[0]): int(sum(total_commit))},
                     "combos": {},
                     "uncontested": True,
+                    "pot": 0,
                 }
             )
         return awards
 
-    for layer in pot_layers(total_commit, folded):
-        elig = layer["eligible"]
-        chips = int(layer["chips"])
-        if chips <= 0 or not elig:
-            continue
-        half_a = chips // 2
-        half_b = chips - half_a
-        for board_key, board, half in (("a", board_a, half_a), ("b", board_b, half_b)):
+    for k, pot in enumerate(display_pots(total_commit, folded)):
+        elig = pot["eligible"]
+        for board_key, board in (("a", board_a), ("b", board_b)):
+            halves = [
+                int(ly["chips"]) // 2 if board_key == "a" else int(ly["chips"]) - int(ly["chips"]) // 2
+                for ly in pot["layers"]
+            ]
+            half = sum(halves)
             if half <= 0:
                 continue
             if len(elig) == 1:
@@ -140,24 +177,28 @@ def build_awards(
                 uncontested = False
             if not winners:
                 winners = list(elig)
-            shares = _distribute(half, winners, button, n)
+            shares: dict[int, int] = {}
+            for h in halves:  # layer by layer, like the engine
+                for seat, v in _distribute(h, winners, button, n).items():
+                    shares[seat] = shares.get(seat, 0) + int(v)
             awards.append(
                 {
                     "board": board_key,
                     "eligible": list(elig),
                     "winners": winners,
                     "chips": half,
-                    "shares": {str(k): int(v) for k, v in shares.items()},
+                    "shares": {str(s): int(v) for s, v in shares.items()},
                     "combos": {
-                        str(k): {
+                        str(s): {
                             "hole": v["hole"],
                             "board": v["board"],
                             "label": v["label"],
                         }
-                        for k, v in combos.items()
-                        if k in winners
+                        for s, v in combos.items()
+                        if s in winners
                     },
                     "uncontested": uncontested or len(elig) == 1,
+                    "pot": k,
                 }
             )
     return awards

@@ -722,14 +722,20 @@ def test_host_kick_mid_hand_removes_after(players):
     assert bob["seated"] is False
 
 
-def test_subscriber_without_flag_still_404(server, players):
-    _, _, adm = players
+def test_anyone_signed_in_sees_home_games_but_not_other_clubs_tables(server, players):
+    """Since clubs (2026-09-25) every signed-in user has the home games — a
+    subscription never mattered — but a club's tables stay its members'."""
+    a, _, adm = players
+    t = _create(a)  # alice's table is in the main club (the /admin grant put her there)
     c = TestClient(server.app)
     assert c.get("/auth/dev", params={"email": "subby@example.com"}).status_code == 200
     users = {u["email"]: u for u in adm.get("/admin/api/users").json()["users"]}
-    uid = users["subby@example.com"]["id"]
-    adm.post("/admin/api/grant", json={"user_id": uid, "action": "grant"})
+    adm.post("/admin/api/grant", json={"user_id": users["subby@example.com"]["id"], "action": "grant"})
     assert c.get("/state").status_code == 200
-    assert c.get("/games").status_code == 404
-    assert c.get("/static/games.js").status_code == 404
-    assert "Home games" not in (c.get("/").text or "")
+    assert c.get("/games").status_code == 200
+    assert c.get("/static/games.js").status_code == 404  # (served under /games/static only)
+    lobby = c.get("/games/api/tables").json()
+    assert lobby["clubs"] == [] and lobby["tables"] == []
+    r = c.get(f"/games/api/tables/{t['id']}")
+    assert r.status_code == 403 and r.json()["detail"]["error"] == "club"
+    assert c.post(f"/games/api/tables/{t['id']}/sit", json={"seat": 3, "buyin_cents": 4000}).status_code == 403
