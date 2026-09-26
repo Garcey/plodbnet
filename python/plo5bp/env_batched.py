@@ -133,6 +133,13 @@ class BatchedBombPotEnv:
                 "observation_encoded_minimal_subset_into",
             )
         )
+        # The full layout's in-place encoder (2026-09-26): same idea for the
+        # (N, OBS_DIM) rows of the full-obs runs, where the fresh array per step
+        # was ~137 MB at 29k envs (page faults + a copy on every step).
+        self._rust_full_into = (
+            bool(self._use_rust_encoder) and not self._rust_minimal
+            and hasattr(BatchedEngine, "observation_encoded_into")
+        )
         # Packed copy of self._obs (compact_obs layout), kept in step by the
         # in-place encoders when `enable_packed_obs` is on -- None otherwise.
         self._obs_bits: np.ndarray | None = None
@@ -486,6 +493,20 @@ class BatchedBombPotEnv:
                         None if em is None or bool(em.all())
                         else np.ascontiguousarray(em),
                         **self._packed_kwargs(),
+                    )
+                with record_function("step1a_unpack/post"):
+                    self._unpack_post(bundle)
+                return
+            if getattr(self, "_rust_full_into", False):
+                # Full layout, encoded straight into the cached buffer; rows
+                # with a False mask entry come back zeroed (same bits as the
+                # copy + zero below).
+                self._drop_packed_obs()
+                with record_function("step1a_bundle/obs_features_batch"):
+                    bundle = self._be.observation_encoded_into(
+                        self._obs_buffer(),
+                        None if em is None or bool(em.all())
+                        else np.ascontiguousarray(em),
                     )
                 with record_function("step1a_unpack/post"):
                     self._unpack_post(bundle)

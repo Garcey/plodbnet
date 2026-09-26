@@ -433,6 +433,57 @@ anchor` = v2 (head_version 2), `logistic` = v4 (3), `mixture` = v5 (4).
     critic stable at v ~3.2), HL-Gauss 51 bins / 1500 / 0.75, AGC 0.1, l2-init
     1e-4, AdamW b2 0.999 / wd 0.01, pool 8 x every 5 updates at mix 0.5,
     ev_runout_samples 64, bonuses 0, 16 minibatches.
+- **Deep dive 2026-09-26: the minimal-obs line is FAR behind the live model ->
+  vMin3 paused, vSix5 (the live lineage on the new pipeline) is the main run.**
+  - `scripts/h2h_cross.py A.pt B.pt` = h2h_eval for two checkpoints that read
+    DIFFERENT observations (layout and/or obs rev): each model is served the full
+    obs encoded at ITS rev, then `obs_adapter` — exactly how the site serves it
+    (numpy encoders read `encoding.OBS_SEMANTICS_REV` at call time; the env's own
+    pack is captured and re-encoded per model). `--selfcheck` proves the re-encode
+    equals the Rust encoder of an engine BUILT at rev 1 and at rev 2 (max diff 0).
+    Sanity: a model vs itself ~0 (vMin3 -0.01 +- 0.04, vSix4 -0.03 +- 0.03);
+    vMin3 u239 vs u200 +0.12 +- 0.05 (h2h_eval said +0.07 +- 0.03).
+  - vs the live `vSix4_1240` (full obs rev 1, 2048x4 / 1536x2, 1240 updates of
+    9M rows ~ 11B rows): vMin3 u239 (32x3 / 128x2 minimal, ~55B rows) -2.06 +-
+    0.04 bb/seat-hand sampled, -2.42 +- 0.03 argmax-vs-argmax; u200 -2.25 /
+    -2.67; vMin2 u150 (128x3 minimal) -4.35. Every tier, deep worst. The minimal
+    obs drops the engineered hand-strength features (made-hand categories,
+    opp-outcome MC equities, blockers, draws) — 5x more data did not make up for
+    them. The size sweep (all minimal) could never see this.
+  - Inside vMin3: head to head it improved strongly to ~u200 (u200 vs u150 +0.61
+    argmax) and was flat after (u239 vs u200 -0.02 argmax, +0.07 sampled) while
+    its edge over OLDER references fell (vs t3ent07 +1.50 at u200 -> +0.93 at
+    u235) = self-play drift; raise sizing collapsed toward min-raise (20% ->
+    54%, sizeH 1.91 -> 1.23 under sizing scale 0.1); KL/update 10x (gate); actor
+    rank99 18 -> 28 of 32 (u40 -> u239: near saturation). Paused cleanly at u242
+    (`runs/vMin3.stop`; resumable with its guardian).
+  - `scripts/vSix5_guardian.sh`: vSix4's exact recipe (v6, 2048x4 / 1536x2,
+    obs rev 1, entropy 0.16 = vSix4's annealed level, sizing scale 1.0, lr
+    1.5e-4) on the new pipeline: 880k envs, 70M-row target (~77M with the drain;
+    vSix4 used 9M), host batch + micro 200k, pinned CPUs, drain on, checkpoint
+    every update; warm from `vSix4_1240` (pool seeded 940/1215/1240; cold Adam).
+    Measured (before the in-place encoder): 68.7k rows/s (vMin3 ~620k — the full
+    obs costs 384-sample opp-outcome MC per row), 61 GiB RSS at 27.5M rows, GPU
+    13.6 GiB. A vSix5 checkpoint is a drop-in promotion for the live site
+    (same obs rev 1, same shapes).
+  - `observation_encoded_into` (engine) = the full layout's in-place encoder,
+    like the minimal ones: no fresh (N, 1171) array + copy per step (~137 MB of
+    page faults per step at 29k envs); bit-identical (`test_full_encoder_into.py`).
+    On the pod: rollout 864 s -> 541-688 s per ~77M rows (~106k rows/s).
+  - vSix5 vs the live vSix4_1240 (h2h_cross, fixed seed 2026; sampled / argmax):
+    at entropy 0.16 u1242 -0.01 / +0.08, u1244 -0.05 / +0.07, u1245 +0.00 /
+    +0.09; entropy -> 0.10 (anneal_control, after u1246's update) u1246 +0.38 /
+    +0.07, u1248 +0.50 / +0.13 (z 16 / 7), u1249 +0.56 / +0.20 (z 18 / 11).
+    Later checkpoints are also scored against vSix5_1248 (the live model since
+    the promotion) — runs/vsix5_eval.log on the desktop. vSix4's own 1240 vs 1215 was +0.27 /
+    -0.07: its late "gains" were entropy sharpening, not learning.
+    **vSix5_1248 PROMOTED to the live site 2026-09-26 08:04 UTC** (stub.pt;
+    backup `stub.pt.bak-pre-vSix5_1248`; no OBS_REV change — rev 1). Grades on
+    the site now come from a sharper policy (entropy 0.10 vs 0.16).
+  - The live model's own utilization (self-play probe): actor 2048x4 rank99
+    248-598 of 2048, 372/8192 dead (16% of the input layer); critic 1536x2
+    64% dead, rank99 23-69 — the full-obs nets have lots of slack: a full-obs
+    size sweep (e.g. distilled from vSix5 for a warm start) is the next size study.
 
 ### v5 (2026-07-06, IMPLEMENTED, not yet trained — V5_DESIGN.md canonical)
 
@@ -1425,7 +1476,13 @@ Premium tables pass (2026-09-21 — `tests/python/test_homegame_premium.py`):
   left to them; targets are capped by `max_buyin_cents`; while approval is on
   neither runs for an untrusted player (`_auto_chips_allowed`). A top-up sent
   with `queue: true` while holding cards is queued (`queued_topup_cents`) and
-  lands when the hand is over; without the flag it is still a 400.
+  lands when the hand is over; without the flag it is still a 400. Players
+  FIND the choice (2026-09-26 — it used to sit only behind the top bar's person
+  icon, so "Players choose" looked like no option): the Add chips dialog, the
+  Chips chooser and your own seat card carry an "Automatic chips" row
+  (`autoChipsRow` / `autoChipsNow` in `games.ui.js`, "Change" opens
+  `openAutoChips`), the host's Chips tab says where players set it, and a MODE
+  change is said to the table once (`_AUTO_MODE_LINES`, a "settings" event).
 - **Live push**: `GET …/stream` (SSE, async generator — never a threadpool
   thread per viewer; the view is built under the lock via
   `run_in_threadpool`) pushes the viewer's state whenever `_stream_sig`
@@ -1458,9 +1515,14 @@ Premium tables pass (2026-09-21 — `tests/python/test_homegame_premium.py`):
   scores every PLAYER decision with the Trainer's `compute_node_distribution` +
   `score_move(_v2)` from the actor's own seat; clock/away/host actions are not
   graded. Grades land in the record and as `acc_sum`/`acc_n` in
-  `homegame_hand_results` (session + lifetime accuracy are SQL sums). Table
-  setting `show_grades` (default on) = marks on everyone's actions; off = own
-  actions only (a mark on a mucked hand leaks a little about it). Lifetime:
+  `homegame_hand_results` (session + lifetime accuracy are SQL sums). Marks
+  FOLLOW THE CARDS (owner, 2026-09-26, `_hand_for_viewer`): a viewer sees the
+  marks on their own decisions and on hands they can see (tabled at showdown or
+  shown) — never on a mucked hand, in the replayer or in anyone's history (a
+  player's per-hand accuracy in `_my_hands` is None for a hand you couldn't see,
+  and an accuracy sort of someone else's hands only ranks their showdowns). The
+  hidden marks still count in every total. Table setting `show_grades` (default
+  on) = that rule; off = your own marks only. Lifetime:
   `GET /games/api/my/hands` (sort time|pot|net|accuracy, filter by table,
   paged) and `/games/api/my/stats` (net, accuracy, sessions, head-to-head in
   cents across tables); neither serves a hand its table is still revealing.
@@ -1603,6 +1665,29 @@ Premium tables pass (2026-09-21 — `tests/python/test_homegame_premium.py`):
   welcome (start one / join with a link). Signed out, `/games`, a table link or an
   invite link is a script-free sign-in page (`_invite_response`, `INVITE_HEADERS`)
   whose Google sign-in comes back to it (`_safe_next`: those three shapes only).
+- **Profile pictures, the host's last settings, bubbles (2026-09-26 —
+  `test_homegame_profile.py`)**: a player uploads a picture from the lobby's
+  account chip or the table's ≡ menu (`openAvatar`): the BROWSER crops the middle
+  square and re-encodes it at 256 px WebP/JPEG (`squareDataUrl` — small, and the
+  photo's EXIF/GPS is gone), `POST /games/api/me/avatar {data_url}`. The server
+  has no image library: `_image_info` reads the PNG / JPEG / WebP header only,
+  and the upload must match its declared type, be 16-1024 px and <= 200 KB
+  (`DELETE` removes it). Stored in SQLite (`homegame_avatars`, in the nightly
+  backup); served by `GET /games/api/avatars/{uid}?v=<content hash>` to the user
+  and anyone sharing a club (else 404) with nosniff + a `sandbox` CSP + immutable
+  caching. Every person object carries `avatar` (seats, chat, hand records, club
+  players / members / requests, `my_avatar` on the lobby + table views; cached
+  per user in `_avatar_url`); the client's `avatar(name, key, cls, url)` keeps
+  the initials under the picture and drops a picture that fails to load. A new
+  picture bumps the rev of every table the user sits at. HOST SETTINGS are
+  remembered per host (`homegame_host_prefs`, amounts in big blinds): saved at
+  create and after every host setting change; the create dialog pre-fills from
+  `GET /games/api/host_prefs` ("Use defaults" resets), and a create with
+  `remembered: true` also applies Manage's settings (grades, rabbit, runout
+  pause, automatic chips) through the host endpoints — scripts that don't ask
+  get plain defaults. Chat and emote BUBBLES live on the `#fx` layer anchored at
+  the seat — the viewer's own at the top of their hole cards, which sit above
+  every seat and used to hide their own emotes.
 - **Readiness pass (2026-09-25 — `test_homegame_clubs.py`,
   `test_homegame_client_reconnect.py`, `test_homegame_short_hands.py`, new
   cases in `test_homegame_table_ux.py`)**, after hours of bot play in the preview:

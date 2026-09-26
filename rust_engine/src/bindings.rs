@@ -2827,6 +2827,56 @@ impl PyBatchedEngine {
         self.encode_indexed(py, &idx)
     }
 
+    /// In-place `observation_encoded_batch` (2026-09-26): encodes every env's
+    /// OBS_DIM row straight into `out` -- the env's cached (N, OBS_DIM) f32 obs
+    /// buffer -- instead of returning a fresh array the caller then copies (at
+    /// 29k envs that was a 137 MB allocation + its page faults + a copy on EVERY
+    /// rollout step of the full-obs runs). Rows whose `encode_mask` entry is
+    /// False are zero-filled; every other row is zeroed and encoded by the same
+    /// `encode_obs_row` from the same packed state, so the buffer ends up
+    /// bit-identical to "encode into a fresh zeroed array, copy, zero the skipped
+    /// rows". Returns the aux dict of `observation_encoded_batch` without "obs".
+    #[pyo3(signature = (out, encode_mask=None))]
+    fn observation_encoded_into<'py>(
+        &self,
+        py: Python<'py>,
+        mut out: PyReadwriteArray2<'_, f32>,
+        encode_mask: Option<PyReadonlyArray1<'_, bool>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        const WHAT: &str = "observation_encoded_into";
+        self.require_plo_full(WHAT)?;
+        let n = self.states.len();
+        let d = obs_layout::OBS_DIM;
+        if !out.is_c_contiguous() || out.shape() != [n, d] {
+            return Err(PyValueError::new_err(format!(
+                "{WHAT}: out must be a C-contiguous ({n}, {d}) float32 array; got shape {:?}",
+                out.shape()
+            )));
+        }
+        let mask: Option<Vec<bool>> = match encode_mask {
+            None => None,
+            Some(m) => {
+                let m = m.as_slice()?;
+                if m.len() != n {
+                    return Err(PyValueError::new_err(format!(
+                        "{WHAT}: encode_mask has {} entries, expected {n}",
+                        m.len()
+                    )));
+                }
+                Some(m.to_vec())
+            }
+        };
+        let idx: Vec<usize> = (0..n).collect();
+        let out_s = out.as_slice_mut()?;
+        let (packed, legal_mask) = py.allow_threads(|| {
+            let (packed, legal_mask, cat_a, cat_b) = self.pack_full_with_cats(&idx);
+            let keep = |j: usize| mask.as_ref().map_or(true, |m| m[j]);
+            self.encode_full_rows_into(&packed, &cat_a, &cat_b, out_s, keep);
+            (packed, legal_mask)
+        });
+        full_aux_dict(py, packed, legal_mask)
+    }
+
     /// Bare-visibility (minimal) one-FFI encoder: finished (N, 796) f32 obs +
     /// the same aux fields the rollout reads. Skips opp-outcome MC, hero
     /// categories, SF/draw/blocker/v2/v7 feature blocks, and the expensive
@@ -3120,6 +3170,25 @@ fn check_minimal_obs_out(out: &PyReadwriteArray2<'_, f32>, n: usize, what: &str)
         )));
     }
     Ok(())
+}
+
+/// The aux fields the full encoders return next to (or instead of) "obs".
+fn full_aux_dict<'py>(
+    py: Python<'py>,
+    packed: PackedObservation,
+    legal_mask: Array2<bool>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("actor", packed.actor.into_pyarray(py))?;
+    d.set_item("legal_mask", legal_mask.into_pyarray(py))?;
+    d.set_item("min_raise", packed.min_raise.into_pyarray(py))?;
+    d.set_item("max_raise", packed.max_raise.into_pyarray(py))?;
+    d.set_item("total_commit", packed.total_commit.into_pyarray(py))?;
+    d.set_item("bet_to_call", packed.bet_to_call.into_pyarray(py))?;
+    d.set_item("street_commit", packed.street_commit.into_pyarray(py))?;
+    d.set_item("street", packed.street.into_pyarray(py))?;
+    d.set_item("pot", packed.pot.into_pyarray(py))?;
+    Ok(d)
 }
 
 /// The aux fields every minimal encoder returns next to (or instead of) "obs".
@@ -3586,75 +3655,86 @@ impl PyBatchedEngine {
         // (obs_layout + encode_obs_row assume dual boards, the 12-dim
         // opp-outcome block, and 32 history slots). NLH batches encode
         // via the numpy `encode_observation_batch_nlh` path.
-        if matches!(self.config.variant, Variant::NlhSingle) {
-            return Err(PyRuntimeError::new_err(
-                "observation_encoded_batch is PLO-only; NLH uses the \
-                 numpy batch encoder (observation_and_features_batch)",
-            ));
-        }
+        self.require_plo_full("observation_encoded_batch")?;
         let n = idx.len();
-        let s = self.config.num_seats;
-        let bb = self.config.bb;
-        let ante = self.config.ante;
-        let obs_rev = self.obs_rev;
-        let starting = self.config.starting_stacks.clone();
-
         let (obs_vec, packed, legal_mask) = py.allow_threads(|| {
-            let packed = self.pack_observation_indexed(idx, s);
-
-            // Legal mask + hero categories (serial; cheap per env). Mirrors
-            // observation_and_features_batch's loop.
-            let mut legal_mask = Array2::<bool>::default((n, NUM_ACTIONS));
-            let mut cat_a = vec![0u8; n];
-            let mut cat_b = vec![0u8; n];
-            for j in 0..n {
-                let state = match self.states[idx[j]].as_ref() {
-                    Some(st) => st,
-                    None => continue,
-                };
-                if !state.is_terminal() {
-                    let mask = state.legal_action_mask();
-                    for t in 0..NUM_ACTIONS {
-                        legal_mask[[j, t]] = mask[t];
-                    }
-                }
-                if let Some(a) = state.current_actor() {
-                    cat_a[j] = state.hero_category(a, 0);
-                    cat_b[j] = state.hero_category(a, 1);
-                }
-            }
-
+            let (packed, legal_mask, cat_a, cat_b) = self.pack_full_with_cats(idx);
             // Per-row encode in parallel. Each row is a disjoint OBS_DIM slice.
-            let inv_bb = 1.0f64 / (bb as f64);
             let mut obs_vec = vec![0f32; n * obs_layout::OBS_DIM];
-            obs_vec
-                .par_chunks_exact_mut(obs_layout::OBS_DIM)
-                .enumerate()
-                .for_each(|(j, row)| {
-                    encode_obs_row(
-                        &packed, j, s, cat_a[j], cat_b[j], inv_bb, bb, ante, &starting,
-                        obs_rev, row,
-                    );
-                });
-
+            self.encode_full_rows_into(&packed, &cat_a, &cat_b, &mut obs_vec, |_| true);
             (obs_vec, packed, legal_mask)
         });
 
         let obs_arr = Array2::from_shape_vec((n, obs_layout::OBS_DIM), obs_vec)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        let d = PyDict::new(py);
+        let d = full_aux_dict(py, packed, legal_mask)?;
         d.set_item("obs", obs_arr.into_pyarray(py))?;
-        d.set_item("actor", packed.actor.into_pyarray(py))?;
-        d.set_item("legal_mask", legal_mask.into_pyarray(py))?;
-        d.set_item("min_raise", packed.min_raise.into_pyarray(py))?;
-        d.set_item("max_raise", packed.max_raise.into_pyarray(py))?;
-        d.set_item("total_commit", packed.total_commit.into_pyarray(py))?;
-        d.set_item("bet_to_call", packed.bet_to_call.into_pyarray(py))?;
-        d.set_item("street_commit", packed.street_commit.into_pyarray(py))?;
-        d.set_item("street", packed.street.into_pyarray(py))?;
-        d.set_item("pot", packed.pot.into_pyarray(py))?;
         Ok(d)
+    }
+
+    fn require_plo_full(&self, what: &str) -> PyResult<()> {
+        if matches!(self.config.variant, Variant::NlhSingle) {
+            return Err(PyRuntimeError::new_err(format!(
+                "{what} is PLO-only; NLH uses the numpy batch encoder                  (observation_and_features_batch)"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Pack + legal mask + hero categories: everything the full encoder reads.
+    /// (The legal/category loop is serial; it is cheap per env.)
+    fn pack_full_with_cats(&self, idx: &[usize]) -> (PackedObservation, Array2<bool>, Vec<u8>, Vec<u8>) {
+        let n = idx.len();
+        let packed = self.pack_observation_indexed(idx, self.config.num_seats);
+        let mut legal_mask = Array2::<bool>::default((n, NUM_ACTIONS));
+        let mut cat_a = vec![0u8; n];
+        let mut cat_b = vec![0u8; n];
+        for j in 0..n {
+            let state = match self.states[idx[j]].as_ref() {
+                Some(st) => st,
+                None => continue,
+            };
+            if !state.is_terminal() {
+                let mask = state.legal_action_mask();
+                for t in 0..NUM_ACTIONS {
+                    legal_mask[[j, t]] = mask[t];
+                }
+            }
+            if let Some(a) = state.current_actor() {
+                cat_a[j] = state.hero_category(a, 0);
+                cat_b[j] = state.hero_category(a, 1);
+            }
+        }
+        (packed, legal_mask, cat_a, cat_b)
+    }
+
+    /// Zero, then encode, row j of `packed` into row j of `out` (n x OBS_DIM,
+    /// in parallel) for every j with `keep(j)`; the other rows are only zeroed
+    /// -- exactly what encoding into a fresh `vec![0f32; ..]` did.
+    fn encode_full_rows_into(
+        &self,
+        packed: &PackedObservation,
+        cat_a: &[u8],
+        cat_b: &[u8],
+        out: &mut [f32],
+        keep: impl Fn(usize) -> bool + Sync,
+    ) {
+        let s = self.config.num_seats;
+        let bb = self.config.bb;
+        let ante = self.config.ante;
+        let obs_rev = self.obs_rev;
+        let starting = &self.config.starting_stacks;
+        let inv_bb = 1.0f64 / (bb as f64);
+        out.par_chunks_exact_mut(obs_layout::OBS_DIM)
+            .enumerate()
+            .for_each(|(j, row)| {
+                row.fill(0.0);
+                if keep(j) {
+                    encode_obs_row(
+                        packed, j, s, cat_a[j], cat_b[j], inv_bb, bb, ante, starting, obs_rev, row,
+                    );
+                }
+            });
     }
 
     /// Bare-visibility pack+encode: finished (k, OBS_DIM_MINIMAL=796) f32 + aux.
