@@ -5349,6 +5349,7 @@ def _signin_html(head: str, text: str, next_path: str) -> str:
             '<meta name="viewport" content="width=device-width, initial-scale=1">'
             f"<title>{esc(head)} · Home games</title>"
             '<link rel="icon" type="image/svg+xml" href="/static/brand/wrap-app-icon-dark.svg">'
+            '<link rel="apple-touch-icon" sizes="180x180" href="/static/brand/apple-touch-icon.png">'
             '<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400..800&display=swap" rel="stylesheet">'
             f"<style>{_INVITE_CSS}</style></head><body><main class=\"card\">"
             f'<div class="brand">WrapGTO · Home games</div><h1>{esc(head)}</h1><p>{text}</p>'

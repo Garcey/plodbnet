@@ -4778,6 +4778,19 @@ if STATIC_DIR.exists():
             headers={"Cache-Control": "no-store, must-revalidate"},
         )
 
+    # iPhones use this icon for the home screen, favorites and share sheets,
+    # and fetch it from the site ROOT whenever a page doesn't name one. Square
+    # and opaque on purpose: iOS rounds the corners itself and paints
+    # see-through pixels black. public.OPEN_EXACT serves both paths signed out.
+    @app.get("/apple-touch-icon.png")
+    @app.get("/apple-touch-icon-precomposed.png")
+    def apple_touch_icon() -> FileResponse:
+        return FileResponse(
+            STATIC_DIR / "brand" / "apple-touch-icon.png",
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
 
 # --- Public service layer (auth / billing / admin / per-user state) ----------
 # Installed last so its middleware wraps every route above. Local build

@@ -151,7 +151,10 @@ STUDY_PATHS = {
 }
 # No auth at all:
 OPEN_PREFIXES = ("/static/", "/auth/", "/stripe/webhook", "/health")
-OPEN_EXACT = {"/", "/me", "/favicon.ico", "/terms", "/privacy"}
+OPEN_EXACT = {
+    "/", "/me", "/favicon.ico", "/terms", "/privacy",
+    "/apple-touch-icon.png", "/apple-touch-icon-precomposed.png",
+}
 # Free-tier metering (see AccessMiddleware): the explicit deal route, plus
 # the trainer routes that deal IMPLICITLY when the session has no live hand.
 NEW_HAND_PATH = "/trainer/new_hand"
@@ -847,10 +850,11 @@ class AccessMiddleware(BaseHTTPMiddleware):
         uid = request.session.get("uid")
         user = _user_by_id(int(uid)) if uid is not None else None
 
-        # Home games: 404 unless the signed-in user has the admin-granted
-        # flag (or is an admin). Do this BEFORE the /static open-prefix
-        # short-circuit and BEFORE the generic 401 so a signed-out probe
-        # of /games or /static/games.js looks like a missing page.
+        # Home games: signed out = the sign-in page for a browser, the hidden
+        # 404 for everything else (clubs, 2026-09-25: every signed-in user has
+        # them). Do this BEFORE the /static open-prefix short-circuit and
+        # BEFORE the generic 401 so a signed-out probe of /games or
+        # /static/games.js looks like a missing page.
         if _games_path(path) or _games_asset(path):
             if not _homegame_access(user):
                 hook = _GAMES_INVITE_HOOK

@@ -1265,6 +1265,13 @@ PLO5BP_PUBLIC=1 .venv/Scripts/python -m uvicorn plo5bp.ui.server:app --port 8765
   from user input via `_rebuild_env`. Study = manual hand entry → replay →
   recommendation; trainer = random deals. Nothing in either path calls the
   live routes, so gating is purely additive.
+- iPhone home-screen icon (2026-09-26, `test_touch_icon.py`): every page links
+  `static/brand/apple-touch-icon.png` and `/apple-touch-icon.png` +
+  `-precomposed.png` (in `public.OPEN_EXACT`, iOS probes the ROOT) serve it
+  signed out. It is SQUARE and OPAQUE on purpose — iOS rounds the corners
+  itself and paints see-through pixels black; `apple-touch-icon-180.png` is the
+  rounded brand original. `apple-mobile-web-app-title` gives the home-screen
+  name ("Home games" — games.js retitles the tab per table).
 
 The public build also mounts the **service layer** (`python/plo5bp/ui/public.py`,
 installed at the end of server.py only under the flag): Google sign-in
