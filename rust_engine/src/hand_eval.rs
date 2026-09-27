@@ -375,6 +375,50 @@ const PAIRS_6: [(usize, usize); 15] = [
     (4, 5),
 ];
 
+/// C(7,2) = 21 hole-pair index combinations for 7-card holes (PLO67 on the
+/// river after three red burns).
+const PAIRS_7: [(usize, usize); 21] = [
+    (0, 1),
+    (0, 2),
+    (0, 3),
+    (0, 4),
+    (0, 5),
+    (0, 6),
+    (1, 2),
+    (1, 3),
+    (1, 4),
+    (1, 5),
+    (1, 6),
+    (2, 3),
+    (2, 4),
+    (2, 5),
+    (2, 6),
+    (3, 4),
+    (3, 5),
+    (3, 6),
+    (4, 5),
+    (4, 6),
+    (5, 6),
+];
+
+/// Most hole cards a PLO hand holds (PLO67: 4 dealt + 3 red burns).
+pub const MAX_PLO_HOLE: usize = 7;
+/// C(MAX_PLO_HOLE, 2): the most exactly-2 hole pairs a PLO hand has.
+const MAX_PLO_PAIRS: usize = 21;
+
+/// The exactly-2 hole pairs of a `k`-card PLO hole (4..=7), in the fixed
+/// lexicographic order every evaluator iterates.
+#[inline]
+fn plo_pairs(k: usize) -> &'static [(usize, usize)] {
+    match k {
+        4 => &PAIRS_4,
+        5 => &PAIRS_5,
+        6 => &PAIRS_6,
+        7 => &PAIRS_7,
+        _ => panic!("PLO hole must have 4..=7 cards, got {k}"),
+    }
+}
+
 const TRIPLES_5: [(usize, usize, usize); 10] = [
     (0, 1, 2),
     (0, 1, 3),
@@ -388,28 +432,24 @@ const TRIPLES_5: [(usize, usize, usize); 10] = [
     (2, 3, 4),
 ];
 
-/// Partial-board PLO evaluator (4-, 5-, or 6-card holes). `board` may have 3, 4, or 5 cards.
+/// Partial-board PLO evaluator (4- to 7-card holes). `board` may have 3, 4, or 5 cards.
 /// Returns the best hand hero can currently make using exactly 2 hole + 3
 /// visible board cards. Used for the "current hand category" feature pre-river.
 pub fn evaluate_plo5_partial(hole: &[Card], board: &[Card]) -> HandRank {
     assert!(
-        (4..=6).contains(&hole.len()),
-        "PLO hole must have exactly 4 (PLO4), 5 (PLO5), or 6 (PLO6) cards"
+        (4..=MAX_PLO_HOLE).contains(&hole.len()),
+        "PLO hole must have 4..=7 cards (PLO4 / PLO67 4, PLO5 5, PLO6 6, PLO67 up to 7)"
     );
     assert!(
         board.len() >= 3 && board.len() <= 5,
         "partial board must have 3..=5 cards"
     );
     let t = tables();
-    let mut h = [0u32; 6];
+    let mut h = [0u32; MAX_PLO_HOLE];
     for (i, c) in hole.iter().enumerate() {
         h[i] = card_to_ck(*c);
     }
-    let pairs: &[(usize, usize)] = match hole.len() {
-        4 => &PAIRS_4,
-        5 => &PAIRS_5,
-        _ => &PAIRS_6,
-    };
+    let pairs: &[(usize, usize)] = plo_pairs(hole.len());
     let bn = board.len();
     let mut best_ck: u16 = u16::MAX;
     for i0 in 0..bn {
@@ -441,7 +481,7 @@ pub fn evaluate_plo5_partial(hole: &[Card], board: &[Card]) -> HandRank {
 
 /// Evaluate a k-card opponent hand on a 3..=5-card board under PLO5
 /// rules ("exactly 2 from hole + 3 from board"). Generalizes
-/// [`evaluate_plo5_partial`] to k = 2..=6 hole cards. Used for the
+/// [`evaluate_plo5_partial`] to k = 2..=7 hole cards. Used for the
 /// opp-vs-hero outcome-fraction features.
 ///
 /// For k=2 there is exactly one hole-pair choice. For k=3,4,5 the
@@ -449,8 +489,8 @@ pub fn evaluate_plo5_partial(hole: &[Card], board: &[Card]) -> HandRank {
 /// board-triple combinations and returns the strongest 5-card rank.
 pub fn evaluate_plo5_k_partial(hole: &[Card], board: &[Card]) -> HandRank {
     assert!(
-        hole.len() >= 2 && hole.len() <= 6,
-        "hole must have 2..=6 cards"
+        hole.len() >= 2 && hole.len() <= MAX_PLO_HOLE,
+        "hole must have 2..=7 cards"
     );
     assert!(
         board.len() >= 3 && board.len() <= 5,
@@ -459,7 +499,7 @@ pub fn evaluate_plo5_k_partial(hole: &[Card], board: &[Card]) -> HandRank {
     let t = tables();
     let kn = hole.len();
     let bn = board.len();
-    let mut h_ck = [0u32; 6];
+    let mut h_ck = [0u32; MAX_PLO_HOLE];
     for i in 0..kn {
         h_ck[i] = card_to_ck(hole[i]);
     }
@@ -492,7 +532,7 @@ pub fn evaluate_plo5_k_partial(hole: &[Card], board: &[Card]) -> HandRank {
 // BRD-7 (boat_plus_outs), BRD-12 (improve_outs), DUAL-2 (best_pair_mask).
 // All follow evaluate_plo5_partial's conventions: exactly-2-hole + 3-board,
 // lower ck = stronger, degenerate duplicate-card combos (ck == 0) skipped,
-// hole widths 4..=6 supported via the PAIRS_* tables.
+// hole widths 4..=7 supported via the PAIRS_* tables (`plo_pairs`).
 
 /// Best 5-card rank over the combos that USE an added board card `c`:
 /// exactly-2-hole pairs × (2 existing board cards + `c`). Combos NOT using
@@ -500,15 +540,11 @@ pub fn evaluate_plo5_k_partial(hole: &[Card], board: &[Card]) -> HandRank {
 /// the baseline category instead of re-enumerating the full board+c.
 fn best_rank_using_added(hole: &[Card], board: &[Card], c: Card) -> HandRank {
     let t = tables();
-    let mut h = [0u32; 6];
+    let mut h = [0u32; MAX_PLO_HOLE];
     for (i, hc) in hole.iter().enumerate() {
         h[i] = card_to_ck(*hc);
     }
-    let pairs: &[(usize, usize)] = match hole.len() {
-        4 => &PAIRS_4,
-        5 => &PAIRS_5,
-        _ => &PAIRS_6,
-    };
+    let pairs: &[(usize, usize)] = plo_pairs(hole.len());
     let ck_c = card_to_ck(c);
     let bn = board.len();
     let mut best_ck: u16 = u16::MAX;
@@ -532,23 +568,19 @@ fn best_rank_using_added(hole: &[Card], board: &[Card], c: Card) -> HandRank {
 /// Per-hole-pair best ck over all board triples. Returns (pair table, count);
 /// entries left at u16::MAX mean every triple for that pair was degenerate.
 /// Shared by improve_outs (combo-redundancy count) and best_pair_mask.
-fn pair_best_cks(hole: &[Card], board: &[Card]) -> ([u16; 15], usize) {
+fn pair_best_cks(hole: &[Card], board: &[Card]) -> ([u16; MAX_PLO_PAIRS], usize) {
     let t = tables();
-    let mut h = [0u32; 6];
+    let mut h = [0u32; MAX_PLO_HOLE];
     for (i, hc) in hole.iter().enumerate() {
         h[i] = card_to_ck(*hc);
     }
-    let pairs: &[(usize, usize)] = match hole.len() {
-        4 => &PAIRS_4,
-        5 => &PAIRS_5,
-        _ => &PAIRS_6,
-    };
+    let pairs: &[(usize, usize)] = plo_pairs(hole.len());
     let bn = board.len();
     let mut b = [0u32; 5];
     for i in 0..bn {
         b[i] = card_to_ck(board[i]);
     }
-    let mut best = [u16::MAX; 15];
+    let mut best = [u16::MAX; MAX_PLO_PAIRS];
     for i0 in 0..bn {
         for i1 in (i0 + 1)..bn {
             for i2 in (i1 + 1)..bn {
@@ -676,14 +708,10 @@ pub fn hero_board_one(
 /// `best_pair_mask` body given a precomputed `pair_best_cks` table.
 fn best_pair_mask_from_pairs(
     hole: &[Card],
-    pair_best: &[u16; 15],
+    pair_best: &[u16; MAX_PLO_PAIRS],
     n_pairs: usize,
 ) -> u8 {
-    let pairs: &[(usize, usize)] = match hole.len() {
-        4 => &PAIRS_4,
-        5 => &PAIRS_5,
-        _ => &PAIRS_6,
-    };
+    let pairs: &[(usize, usize)] = plo_pairs(hole.len());
     let mut best: Option<(u16, (u8, u8), (usize, usize))> = None;
     for (pi, &pb) in pair_best[..n_pairs].iter().enumerate() {
         if pb == u16::MAX {
@@ -974,23 +1002,19 @@ pub fn evaluate_nlh(hole: &[Card], board: &[Card]) -> HandRank {
     ck_to_hand_rank(safe_ck)
 }
 
-/// PLO evaluator (4-, 5-, or 6-card holes): exactly 2 from hole + 3 from board.
+/// PLO evaluator (4- to 7-card holes): exactly 2 from hole + 3 from board.
 /// Enumerates all C(hole, 2) × 10 combinations and returns the best rank.
 pub fn evaluate_plo5(hole: &[Card], board: &[Card; 5]) -> HandRank {
     assert!(
-        (4..=6).contains(&hole.len()),
-        "PLO hole must have exactly 4 (PLO4), 5 (PLO5), or 6 (PLO6) cards"
+        (4..=MAX_PLO_HOLE).contains(&hole.len()),
+        "PLO hole must have 4..=7 cards (PLO4 / PLO67 4, PLO5 5, PLO6 6, PLO67 up to 7)"
     );
     let t = tables();
-    let mut h = [0u32; 6];
+    let mut h = [0u32; MAX_PLO_HOLE];
     for (i, c) in hole.iter().enumerate() {
         h[i] = card_to_ck(*c);
     }
-    let pairs: &[(usize, usize)] = match hole.len() {
-        4 => &PAIRS_4,
-        5 => &PAIRS_5,
-        _ => &PAIRS_6,
-    };
+    let pairs: &[(usize, usize)] = plo_pairs(hole.len());
     let b: [u32; 5] = [
         card_to_ck(board[0]),
         card_to_ck(board[1]),
@@ -1025,30 +1049,27 @@ pub fn evaluate_plo5(hole: &[Card], board: &[Card; 5]) -> HandRank {
 /// 41^5 < 2^32: the regrouped u32 product is the same number.)
 #[derive(Clone, Copy)]
 pub struct PloPairs {
-    or: [u32; 15],
-    and: [u32; 15],
-    prod: [u32; 15],
+    or: [u32; MAX_PLO_PAIRS],
+    and: [u32; MAX_PLO_PAIRS],
+    prod: [u32; MAX_PLO_PAIRS],
     n: usize,
 }
 
 impl PloPairs {
     /// No pairs at all (a folded seat nobody ranks).
-    pub const EMPTY: PloPairs = PloPairs { or: [0; 15], and: [0; 15], prod: [0; 15], n: 0 };
+    pub const EMPTY: PloPairs =
+        PloPairs { or: [0; MAX_PLO_PAIRS], and: [0; MAX_PLO_PAIRS], prod: [0; MAX_PLO_PAIRS], n: 0 };
 
     pub fn new(hole: &[Card]) -> Self {
         assert!(
-            (4..=6).contains(&hole.len()),
-            "PLO hole must have exactly 4 (PLO4), 5 (PLO5), or 6 (PLO6) cards"
+            (4..=MAX_PLO_HOLE).contains(&hole.len()),
+            "PLO hole must have 4..=7 cards (PLO4 / PLO67 4, PLO5 5, PLO6 6, PLO67 up to 7)"
         );
-        let mut h = [0u32; 6];
+        let mut h = [0u32; MAX_PLO_HOLE];
         for (i, c) in hole.iter().enumerate() {
             h[i] = card_to_ck(*c);
         }
-        let pairs: &[(usize, usize)] = match hole.len() {
-            4 => &PAIRS_4,
-            5 => &PAIRS_5,
-            _ => &PAIRS_6,
-        };
+        let pairs: &[(usize, usize)] = plo_pairs(hole.len());
         let mut out = Self { n: pairs.len(), ..Self::EMPTY };
         for (k, &(a, b)) in pairs.iter().enumerate() {
             out.or[k] = h[a] | h[b];
@@ -1742,6 +1763,96 @@ mod tests {
                 }
             }
             assert_eq!(got, best);
+        }
+    }
+}
+
+#[cfg(test)]
+mod plo67_tests {
+    //! PLO67 holds up to SEVEN hole cards (4 dealt + one per red face-up
+    //! burn): every PLO evaluator must score them exactly like a brute
+    //! force over all C(k, 2) x C(board, 3) five-card hands.
+    use super::*;
+    use rand::seq::SliceRandom;
+    use rand_chacha::rand_core::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
+
+    fn brute(hole: &[Card], board: &[Card]) -> HandRank {
+        let mut best: Option<HandRank> = None;
+        for i in 0..hole.len() {
+            for j in (i + 1)..hole.len() {
+                for a in 0..board.len() {
+                    for b in (a + 1)..board.len() {
+                        for c in (b + 1)..board.len() {
+                            let r = evaluate_5(&[hole[i], hole[j], board[a], board[b], board[c]]);
+                            best = Some(best.map_or(r, |x| x.max(r)));
+                        }
+                    }
+                }
+            }
+        }
+        best.unwrap()
+    }
+
+    fn deal(rng: &mut ChaCha8Rng, k: usize, b: usize) -> (Vec<Card>, Vec<Card>) {
+        let mut deck: Vec<Card> = (0..52u8).map(Card::from_index).collect();
+        deck.shuffle(rng);
+        (deck[..k].to_vec(), deck[k..k + b].to_vec())
+    }
+
+    #[test]
+    fn seven_card_holes_match_brute_force_every_evaluator() {
+        let mut rng = ChaCha8Rng::seed_from_u64(67);
+        for k in 4..=7usize {
+            for _ in 0..400 {
+                let (hole, board) = deal(&mut rng, k, 5);
+                let full: [Card; 5] = board.clone().try_into().unwrap();
+                let want = brute(&hole, &board);
+                assert_eq!(evaluate_plo5(&hole, &full), want, "evaluate_plo5 k={k}");
+                assert_eq!(evaluate_plo5_partial(&hole, &board), want, "partial k={k}");
+                assert_eq!(evaluate_plo5_k_partial(&hole, &board), want, "k_partial k={k}");
+                // the EV-runout path: pairs encoded once, triples by mask
+                let ck = plo_best_ck(&PloPairs::new(&hole), &BoardTriples::new(&full), ALL_TRIPLES, u16::MAX);
+                assert_eq!(plo_rank_from_ck(ck), want, "PloPairs k={k}");
+                for known in [3usize, 4] {
+                    assert_eq!(
+                        evaluate_plo5_partial(&hole, &board[..known]),
+                        brute(&hole, &board[..known]),
+                        "partial k={k} board {known}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The 7th card must be able to play: trip aces need both hole aces,
+    /// dealt as the 6th and 7th cards (a pair only PAIRS_7 covers).
+    #[test]
+    fn the_seventh_card_plays() {
+        let c = |r: u8, s: u8| Card::new(r, s);
+        let hole = [c(0, 0), c(1, 1), c(5, 3), c(6, 2), c(3, 0), c(12, 3), c(12, 1)];
+        let board = [c(12, 0), c(11, 1), c(9, 2), c(2, 3), c(7, 1)];
+        assert_eq!(category(evaluate_plo5(&hole, &board)), CAT_TRIPS);
+        assert_eq!(category(evaluate_plo5_partial(&hole, &board[..3])), CAT_TRIPS);
+        // ... and exactly two hole cards still play: five hearts in hand
+        // with two on the board is no flush.
+        let hearts = [c(12, 2), c(11, 2), c(9, 2), c(7, 2), c(3, 2), c(0, 0), c(1, 1)];
+        let two = [c(5, 2), c(6, 2), c(2, 3), c(4, 0), c(8, 1)];
+        assert!(category(evaluate_plo5(&hearts, &two)) < CAT_FLUSH);
+    }
+
+    #[test]
+    fn hero_board_features_accept_seven_cards() {
+        let mut rng = ChaCha8Rng::seed_from_u64(76);
+        for _ in 0..50 {
+            let (hole, board) = deal(&mut rng, 7, 4);
+            let mut used = [false; 52];
+            for c in hole.iter().chain(board.iter()) {
+                used[c.index() as usize] = true;
+            }
+            let (_, _, combos, mask) = hero_board_one(&hole, &board, &used);
+            assert!(combos as usize <= 21);
+            assert_eq!(mask, 0, "the 5-slot mask is PLO5-only");
         }
     }
 }

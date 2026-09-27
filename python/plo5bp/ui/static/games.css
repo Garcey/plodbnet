@@ -227,6 +227,10 @@ input[type="range"]::-moz-range-thumb { width: 14px; height: 14px; border-radius
    the hero's cards 10% smaller with a little more overlap, a tighter face-down fan
    centred on the 3rd/4th card. Keep in step with ROW in games.table.js. */
 #stage.h6 { --hk: 0.9; --hov: 0.28; --fov: 0.6; --mid: 2.5; --rot: 6deg; }
+/* PLO67 (4 to 7 cards): laid out for its widest hand — the hero's cards 18% smaller with a
+   third of each tucked under the next; a face-down fan tighter (games.table.js sets each
+   fan's --mid to its own middle card as the hand grows). Keep in step with ROW[7]. */
+#stage.h7 { --hk: 0.82; --hov: 0.33; --fov: 0.62; --mid: 1.5; --rot: 5deg; }
 
 /* felt + rail */
 #felt { position: absolute; inset: 11% 7% 15% 7%; border-radius: 9999px;
@@ -1116,3 +1120,51 @@ button.userchip:hover { background: rgba(255, 255, 255, 0.09); border-color: rgb
 .avup-side { display: flex; flex-direction: column; gap: 10px; align-items: flex-start; min-width: 0; }
 .avup-side .btn { cursor: pointer; }
 @media (max-width: 420px) { .avup { flex-direction: column; text-align: center; } .avup-side { align-items: center; } }
+
+/* ==========================================================================
+   PLO67 (2026-09-27): the burn cards, dealt face up
+   ========================================================================== */
+/* the three burns sit in a column beside the boards (on a phone on its side: a row) */
+#burns { position: absolute; right: calc(100% + var(--u) * 0.8); top: 50%; transform: translateY(-50%); display: flex; flex-direction: column; align-items: center; gap: calc(var(--u) * 0.45); --cw: calc(var(--u) * 3.2); pointer-events: auto; }
+#burns[hidden] { display: none; }
+#burns::before { content: "Burns"; font-size: max(8px, calc(var(--u) * 0.78)); letter-spacing: 1.3px; text-transform: uppercase; font-weight: 700; color: rgba(255, 255, 255, 0.45); }
+#burns .slot-card { transition: box-shadow 0.3s, opacity 0.3s; }
+/* a red burn: everyone still in got a card */
+#burns .slot-card.red { border-color: transparent; box-shadow: 0 0 0 1.5px rgba(255, 107, 126, 0.9), 0 0 calc(var(--u) * 1.3) rgba(242, 86, 106, 0.45); border-radius: calc(var(--cw) * 0.11); }
+#burns .slot-card.red::after { content: "+1"; position: absolute; right: calc(var(--u) * -0.7); top: calc(var(--u) * -0.7); z-index: 2; padding: 1px calc(var(--u) * 0.35); border-radius: 999px; background: #e0405a; color: #fff; font: 700 max(8px, calc(var(--u) * 0.8)) var(--mono); box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45); }
+/* the rabbit's burns (after a fold-out): they dealt nobody anything */
+#burns .slot-card.rabbit { opacity: 0.55; }
+#burns .slot-card.rabbit::after { display: none; }
+#burns .slot-card.landed { animation: burnland 0.5s var(--ease); }
+@keyframes burnland { 40% { transform: scale(1.16); } }
+/* an upright phone: a short row on the street tag's line under the boards (the boards
+   say the street): a column beside them took the room the side seats' tabled hands need
+   at a showdown, and a row in the boards' block pushed board 1 into the top seats on a
+   short phone. The award caption drops below it (games.table.js layout keeps the room). */
+#stage.portrait #burns { right: auto; left: 50%; top: calc(100% + var(--u) * 0.5); transform: translateX(-50%); flex-direction: row; gap: calc(var(--u) * 0.55); --cw: calc(var(--u) * 2.5); }
+#stage.portrait #burns::before { margin-right: calc(var(--u) * 0.2); }
+/* (a row of small burns: the "+1" sits in the gap beside a red card, off its rank) */
+#stage.portrait #burns { gap: calc(var(--u) * 1.15); }
+#stage.portrait #burns .slot-card.red::after { right: calc(var(--u) * -1.35); top: calc(var(--u) * -0.6); }
+/* (on its side: the row stays narrow — the side seat is close — and the "+1" sits above its card) */
+#stage.wide #burns { gap: calc(var(--u) * 0.5); }
+#stage.wide #burns .slot-card.red::after { right: 50%; top: calc(var(--u) * -1.9); transform: translateX(50%); }
+#stage.portrait.burny #street-tag { display: none; }
+#stage.portrait.burny #award-caption { --cap-dy: 4.6; }
+#stage.wide #burns { flex-direction: row; --cw: calc(var(--u) * 2.7); right: calc(100% + var(--u) * 0.6); }
+#stage.wide #burns::before { display: none; } /* (no room for the word on a phone on its side: the red "+1"s say it) */
+/* a new burn, shown big over the boards before it drops into its slot */
+.card.burn-show { position: absolute; --cw: calc(var(--u) * 8); z-index: 40; pointer-events: none; will-change: transform; }
+.card.burn-show.red .card-f { box-shadow: 0 0 0 2px #ff6b7e, 0 0 calc(var(--cw) * 0.6) rgba(242, 86, 106, 0.8); }
+.burn-cap { position: absolute; transform: translate(-50%, calc(var(--u) * 6.4)); z-index: 41; pointer-events: none; padding: calc(var(--u) * 0.45) calc(var(--u) * 1.2); border-radius: 999px; background: rgba(3, 8, 10, 0.86); border: 1px solid rgba(255, 255, 255, 0.25); color: #fff; font-weight: 700; font-size: max(11px, calc(var(--u) * 1.15)); white-space: nowrap; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5); }
+.burn-cap.red { border-color: rgba(255, 107, 126, 0.85); color: #ffd6dc; background: rgba(58, 8, 18, 0.92); }
+/* the hand replayer and history: a street's burn */
+.rp-burns { display: inline-flex; align-items: center; gap: 6px; }
+.rp-burns small { font-size: 9.5px; letter-spacing: 1px; text-transform: uppercase; color: var(--tx-3); font-weight: 700; }
+.rp-center .rp-burns .mini-cards { --cw: 20px; min-height: 28px; }
+.log-street .burn-note { text-transform: none; letter-spacing: 0; font-weight: 600; color: var(--tx-3); }
+.log-street .burn-note.red { color: #ff9aa6; }
+/* a history row's hand of six or seven: smaller cards, tucked under each other, so the
+   hand and board 1 still fit beside the result (a row used to spill ~50 px) */
+.mini-cards.many { gap: 0; --cw: 14px; }
+.mini-cards.many .card + .card { margin-left: -3px; }

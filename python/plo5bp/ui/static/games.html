@@ -83,7 +83,7 @@
         <section class="lb-hero" id="lb-hero">
           <div>
             <h1>Your private <em>bomb-pot</em> room</h1>
-            <p>PLO5 and PLO6 double-board bomb pots with your friends. Everyone antes, the hand starts on the flop, and the ledger keeps the money straight.</p>
+            <p>PLO5, PLO6 and PLO67 double-board bomb pots with your friends. Everyone antes, the hand starts on the flop, and the ledger keeps the money straight.</p>
           </div>
           <span class="spacer"></span>
           <div class="lb-actions">
@@ -186,6 +186,8 @@
                 <div id="boards">
                   <div class="board" id="board-a"><span class="board-tag">1</span></div>
                   <div class="board" id="board-b"><span class="board-tag">2</span></div>
+                  <!-- PLO67: the burn cards, dealt face up (a red one deals everyone still in a card) -->
+                  <div id="burns" hidden title="Burn cards, dealt face up: a red one (diamond or heart) deals everyone still in the hand another card"></div>
                   <button type="button" id="rabbit-btn" hidden title="See the turn and river that would have come"><svg class="ico sm"><use href="#i-eye" /></svg><span>Click to reveal</span></button>
                 </div>
               </div>

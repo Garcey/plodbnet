@@ -37,9 +37,11 @@ impl GameState {
     /// [`Self::new_hand_with_mask`] from an EXPLICIT deck order instead of a
     /// seed (the home games' verifiable shuffle: the deck is sealed, re-permuted
     /// by the players' devices and dealt exactly as it lies). The deal order is
-    /// the same public contract: `hole_count` cards per seat index — EVERY
+    /// the same public contract: `hole_slots` cards per seat index — EVERY
     /// seat index, dealt in or not, so a card's slot never depends on who sat
-    /// out — seat 0 first, then full board A, then full board B.
+    /// out — seat 0 first, then full board A, then full board B, then the
+    /// burns (PLO67 only: a seat's slots beyond `hole_count` are its reserved
+    /// extra cards, handed out in slot order on red burns).
     /// `new_hand_with_mask(seed)` is exactly this with `Deck::new_shuffled(seed)`.
     pub fn new_hand_from_deck(
         config: GameConfig,
@@ -67,18 +69,27 @@ impl GameState {
         }
 
         let hole_count = config.variant.hole_count();
+        let hole_slots = config.variant.hole_slots();
         let num_boards = config.variant.num_boards();
 
-        // Deal order (determinism contract): `hole_count` cards per seat,
+        // Deal order (determinism contract): `hole_slots` cards per seat,
         // seat 0 first, then full board A, then full board B (two-board
-        // variants only).
+        // variants only), then the burns (PLO67 only). Every variant but
+        // PLO67 has `hole_slots == hole_count` and no burns: the same cards
+        // in the same order as before PLO67 existed.
         let mut hole_cards: Vec<Vec<Card>> = Vec::with_capacity(n);
+        let mut extra_holes: Vec<Vec<Card>> = Vec::with_capacity(n);
         for _ in 0..n {
-            let mut h = Vec::with_capacity(hole_count);
+            let mut h = Vec::with_capacity(hole_slots);
             for _ in 0..hole_count {
                 h.push(deck.deal_one());
             }
+            let mut extra = Vec::with_capacity(hole_slots - hole_count);
+            for _ in hole_count..hole_slots {
+                extra.push(deck.deal_one());
+            }
             hole_cards.push(h);
+            extra_holes.push(extra);
         }
 
         let mut full_board_a = [Card(0); 5];
@@ -92,6 +103,7 @@ impl GameState {
                 *c = deck.deal_one();
             }
         }
+        let full_burns: Vec<Card> = (0..config.variant.burn_count()).map(|_| deck.deal_one()).collect();
 
         assert_eq!(
             config.starting_stacks.len(),
@@ -172,6 +184,9 @@ impl GameState {
             folded,
             all_in,
             hole_cards,
+            extra_holes,
+            full_burns,
+            burns: Vec::new(),
             board_a,
             board_b,
             full_board_a,
@@ -194,6 +209,11 @@ impl GameState {
             eff_stack_cap_at_hand_start,
         };
         state.last_raise_size = state.config.bb;
+        // PLO67: the flop's burn is turned up before the flops come, and a
+        // red one deals every seat in the hand its fifth card.
+        if street == Street::Flop {
+            state.reveal_burn();
+        }
 
         state.actor = match blind_seats {
             Some((_, bb_seat)) => state.first_to_act_preflop(bb_seat),
@@ -377,7 +397,10 @@ impl GameState {
             stacks,
             folded,
             all_in,
+            extra_holes: vec![Vec::new(); hole_cards.len()],
             hole_cards,
+            full_burns: Vec::new(),
+            burns: Vec::new(),
             board_a,
             board_b,
             full_board_a,
@@ -676,7 +699,10 @@ impl GameState {
             stacks,
             folded,
             all_in,
+            extra_holes: vec![Vec::new(); hole_cards.len()],
             hole_cards,
+            full_burns: Vec::new(),
+            burns: Vec::new(),
             board_a: Vec::new(),
             board_b: Vec::new(),
             full_board_a: [Card(0); 5],
@@ -1047,7 +1073,10 @@ impl GameState {
         use rand_chacha::ChaCha8Rng;
         use rand_chacha::rand_core::SeedableRng;
         let n = self.config.num_seats;
-        if self.study_mode || num_samples == 0 {
+        // PLO67: the undealt burns decide how many cards each hand holds, so
+        // resampling only the boards would score hands that were never dealt.
+        // Nothing trains PLO67 (yet): the actual deal is the answer.
+        if self.study_mode || num_samples == 0 || self.config.variant.burn_count() > 0 {
             return self.payouts();
         }
         let alive_count = (0..n).filter(|&i| !self.folded[i]).count();
@@ -1420,9 +1449,10 @@ impl GameState {
         }
         let hole = &self.hole_cards[seat];
         let rank = match self.config.variant {
-            Variant::Plo4DoubleBomb | Variant::Plo5DoubleBomb | Variant::Plo6DoubleBomb => {
-                crate::hand_eval::evaluate_plo5_partial(hole, b)
-            }
+            Variant::Plo4DoubleBomb
+            | Variant::Plo5DoubleBomb
+            | Variant::Plo6DoubleBomb
+            | Variant::Plo67DoubleBomb => crate::hand_eval::evaluate_plo5_partial(hole, b),
             Variant::NlhSingle => crate::hand_eval::evaluate_nlh(hole, b),
         };
         (rank >> 20) as u8
@@ -2073,12 +2103,16 @@ impl GameState {
                     }
                 }
                 Street::Turn => {
+                    // PLO67: the turn's burn comes up (and may deal every
+                    // live seat a card) before the turn cards.
+                    self.reveal_burn();
                     self.board_a.push(self.full_board_a[3]);
                     if two_boards {
                         self.board_b.push(self.full_board_b[3]);
                     }
                 }
                 Street::River => {
+                    self.reveal_burn();
                     self.board_a.push(self.full_board_a[4]);
                     if two_boards {
                         self.board_b.push(self.full_board_b[4]);
@@ -2168,6 +2202,51 @@ impl GameState {
         self.close_round_or_run_out();
     }
 
+    /// PLO67: turn the next burn card face up; a red one deals every seat
+    /// still in the hand (all-in included, folded / sitting-out not) its
+    /// next reserved hole card. A no-op once every burn is up and for every
+    /// variant without burns. Runs BEFORE the street's board cards appear,
+    /// in every mode that reaches the street (played, run out, or at the
+    /// deal for the flop).
+    fn reveal_burn(&mut self) {
+        let k = self.burns.len();
+        let Some(&burn) = self.full_burns.get(k) else {
+            return;
+        };
+        self.burns.push(burn);
+        if !Variant::burn_is_red(burn) {
+            return;
+        }
+        for seat in 0..self.config.num_seats {
+            if self.folded[seat] {
+                continue;
+            }
+            let hc = self.config.variant.hole_count();
+            let got = self.hole_cards[seat].len() - hc;
+            if let Some(&card) = self.extra_holes[seat].get(got) {
+                self.hole_cards[seat].push(card);
+            }
+        }
+    }
+
+    /// PLO67: how many hole cards `seat` held on `street` (Showdown counts
+    /// as the river). A seat receives an extra card at every red burn while
+    /// it is in the hand, so its extras are a PREFIX of the red burns: on a
+    /// street it holds `hole_count + min(red burns up to that street, extras
+    /// it ever received)`. Every other variant: `hole_count` throughout.
+    pub fn hole_count_on(&self, seat: usize, street: Street) -> usize {
+        let hc = self.config.variant.hole_count();
+        let upto = match street {
+            Street::Preflop => 0,
+            Street::Flop => 1,
+            Street::Turn => 2,
+            Street::River | Street::Showdown => 3,
+        };
+        let red = self.burns.iter().take(upto).filter(|&&c| Variant::burn_is_red(c)).count();
+        let received = self.hole_cards[seat].len().saturating_sub(hc);
+        hc + red.min(received)
+    }
+
     fn finalize_terminal(&mut self) {
         // In production, reveal the full pre-dealt boards for observability.
         // In study mode, turn/river may be undealt (`Card(0)` sentinels) so
@@ -2184,6 +2263,118 @@ impl GameState {
         self.street = Street::Showdown;
         self.actor = None;
     }
+}
+
+/// PLO67 all-in runout equities: each contender's expected share of board A
+/// and of board B (0..=1, a tie splits), given what the table can SEE —
+/// the contenders' hole cards NOW, both boards so far and `dead` (the burns
+/// turned up). Everything else, folded hands included, is unknown and
+/// equally likely: every sample deals the rest of the hand exactly as the
+/// game does — per street a burn, then (if it is red) one card to every
+/// contender, then one card per board. Exact once both boards are complete.
+/// Monte Carlo over `samples` runouts from `seed` (deterministic).
+pub fn plo67_runout_equities(
+    holes: &[Vec<Card>],
+    board_a: &[Card],
+    board_b: &[Card],
+    dead: &[Card],
+    samples: u32,
+    seed: u64,
+) -> Result<Vec<[f64; 2]>, String> {
+    use rand::Rng;
+    use rand_chacha::ChaCha8Rng;
+    use rand_chacha::rand_core::SeedableRng;
+
+    let n = holes.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    if board_a.len() != board_b.len() || !(3..=5).contains(&board_a.len()) {
+        return Err("both boards need the same 3..=5 cards".into());
+    }
+    let mut used = [false; 52];
+    for c in holes.iter().flatten().chain(board_a).chain(board_b).chain(dead) {
+        let i = c.index() as usize;
+        if i >= 52 || used[i] {
+            return Err(format!("card {i} is out of range or appears twice"));
+        }
+        used[i] = true;
+    }
+    if holes.iter().any(|h| !(4..=crate::hand_eval::MAX_PLO_HOLE).contains(&h.len())) {
+        return Err("every hand holds 4..=7 cards".into());
+    }
+    let missing = 5 - board_a.len();
+    let mut stub: Vec<Card> = (0..52u8).filter(|&i| !used[i as usize]).map(Card::from_index).collect();
+    // the most a runout can take: per street a burn, one card per hand, two board cards
+    let need = missing * (3 + n);
+    if need > stub.len() {
+        return Err(format!("{} unseen cards cannot run out {missing} streets for {n} hands", stub.len()));
+    }
+    let score = |h: &[Card], a: &[Card; 5], b: &[Card; 5]| {
+        [crate::hand_eval::evaluate_plo5(h, a), crate::hand_eval::evaluate_plo5(h, b)]
+    };
+    // one runout's result: each board's best hand(s) take a share of 1
+    fn add_shares(acc: &mut [[f64; 2]], ranks: &[[u32; 2]]) {
+        for k in 0..2 {
+            let best = ranks.iter().map(|r| r[k]).max().unwrap_or(0);
+            let winners = ranks.iter().filter(|r| r[k] == best).count() as f64;
+            for (s, r) in ranks.iter().enumerate() {
+                if r[k] == best {
+                    acc[s][k] += 1.0 / winners;
+                }
+            }
+        }
+    }
+    let mut acc = vec![[0f64; 2]; n];
+    let mut full_a = [Card(0); 5];
+    let mut full_b = [Card(0); 5];
+    full_a[..board_a.len()].copy_from_slice(board_a);
+    full_b[..board_b.len()].copy_from_slice(board_b);
+    let mut ranks: Vec<[u32; 2]> = vec![[0, 0]; n];
+    if missing == 0 {
+        for (s, h) in holes.iter().enumerate() {
+            ranks[s] = score(h, &full_a, &full_b);
+        }
+        add_shares(&mut acc, &ranks);
+        return Ok(acc);
+    }
+    let samples = samples.max(1);
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let mut hands: Vec<Vec<Card>> = holes.to_vec();
+    for _ in 0..samples {
+        let mut next = 0usize;
+        let mut draw = |stub: &mut Vec<Card>| {
+            let j = rng.gen_range(next..stub.len());
+            stub.swap(next, j);
+            next += 1;
+            stub[next - 1]
+        };
+        for (h, base) in hands.iter_mut().zip(holes) {
+            h.truncate(base.len());
+        }
+        for street in 0..missing {
+            let burn = draw(&mut stub);
+            if Variant::burn_is_red(burn) {
+                for h in hands.iter_mut() {
+                    if h.len() < crate::hand_eval::MAX_PLO_HOLE {
+                        h.push(draw(&mut stub));
+                    }
+                }
+            }
+            full_a[board_a.len() + street] = draw(&mut stub);
+            full_b[board_b.len() + street] = draw(&mut stub);
+        }
+        for (s, h) in hands.iter().enumerate() {
+            ranks[s] = score(h, &full_a, &full_b);
+        }
+        add_shares(&mut acc, &ranks);
+    }
+    let inv = 1.0 / samples as f64;
+    for a in acc.iter_mut() {
+        a[0] *= inv;
+        a[1] *= inv;
+    }
+    Ok(acc)
 }
 
 /// Pinned 64-bit mixer behind every engine-derived RNG seed: FNV-1a over
@@ -4594,7 +4785,7 @@ mod review_2026_09_20_tests {
     /// seats MATCHED against their own commit; a folded seat loses its
     /// commit — minus anything above every alive seat's commit, which
     /// nobody ever matched.
-    fn assert_settlement(g: &GameState, tag: &str) {
+    pub(super) fn assert_settlement(g: &GameState, tag: &str) {
         assert!(g.is_terminal(), "{tag}: hand must be terminal");
         let n = g.config.num_seats;
         let p = g.payouts();
@@ -4754,7 +4945,7 @@ mod review_2026_09_20_tests {
 
     /// Drive one hand with random legal actions, checking the node
     /// invariants the C1 fix is responsible for; returns the terminal state.
-    fn play_random_hand(
+    pub(super) fn play_random_hand(
         cfg: GameConfig,
         seed: u64,
         button: usize,
@@ -5399,5 +5590,414 @@ mod review_2026_09_20_tests {
         )
         .unwrap();
         assert_ne!(a.hole_cards[0], c.hole_cards[0]);
+    }
+}
+
+#[cfg(test)]
+mod plo67_tests {
+    //! PLO67 (2026-09-27): four hole cards, the three burns dealt FACE UP,
+    //! and every red burn deals each seat still in the hand one more card.
+    use super::review_2026_09_20_tests::{assert_settlement, play_random_hand};
+    use super::*;
+    use crate::hand_eval::{evaluate_5, evaluate_plo5, HandRank};
+    use rand::Rng;
+    use rand_chacha::rand_core::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
+
+    const BB: u64 = 10_000;
+    const ANTE: u64 = 30_000;
+    // card index = rank * 4 + suit (suit 1 = diamonds, 2 = hearts: red)
+    const RED: [u8; 3] = [1, 2, 5]; // 2d 2h 3d
+    const BLACK: [u8; 3] = [0, 3, 4]; // 2c 2s 3c
+
+    fn cfg(stacks: &[u64]) -> GameConfig {
+        GameConfig {
+            num_seats: stacks.len(),
+            starting_stacks: stacks.to_vec(),
+            ante: ANTE,
+            bb: BB,
+            sb: 0,
+            variant: Variant::Plo67DoubleBomb,
+        }
+    }
+
+    /// A shuffled deck with `burns` in the three burn slots (7n+10..7n+13);
+    /// every other card keeps its shuffled order.
+    fn deck_with_burns(n: usize, burns: [u8; 3], seed: u64) -> Vec<u8> {
+        let order = crate::cards::Deck::new_shuffled(seed).order();
+        let mut rest: Vec<u8> = order.iter().copied().filter(|c| !burns.contains(c)).collect();
+        for (k, &b) in burns.iter().enumerate() {
+            rest.insert(7 * n + 10 + k, b);
+        }
+        assert_eq!(rest.len(), 52);
+        rest
+    }
+
+    fn deal(stacks: &[u64], order: &[u8]) -> GameState {
+        let deck = crate::cards::Deck::from_order(order).unwrap();
+        GameState::new_hand_from_deck(cfg(stacks), deck, 0, None)
+    }
+
+    fn idx(cards: &[Card]) -> Vec<u8> {
+        cards.iter().map(|c| c.index()).collect()
+    }
+
+    fn counts(g: &GameState, seat: usize) -> [usize; 3] {
+        [
+            g.hole_count_on(seat, Street::Flop),
+            g.hole_count_on(seat, Street::Turn),
+            g.hole_count_on(seat, Street::River),
+        ]
+    }
+
+    fn brute(hole: &[Card], board: &[Card; 5]) -> HandRank {
+        let mut best = 0;
+        for i in 0..hole.len() {
+            for j in (i + 1)..hole.len() {
+                for a in 0..5 {
+                    for b in (a + 1)..5 {
+                        for c in (b + 1)..5 {
+                            best = best.max(evaluate_5(&[hole[i], hole[j], board[a], board[b], board[c]]));
+                        }
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn deck_budget_is_five_seats_and_other_variants_are_unchanged() {
+        let v = Variant::Plo67DoubleBomb;
+        assert_eq!((v.hole_count(), v.hole_slots(), v.burn_count()), (4, 7, 3));
+        assert_eq!(v.max_seats(), 5);
+        assert_eq!(v.cards_needed(5), 48);
+        assert!(v.cards_needed(6) > crate::cards::DECK_SIZE);
+        assert!(v.pot_limit() && !v.has_preflop());
+        assert_eq!(v.num_boards(), 2);
+        for (v, hc, max) in [
+            (Variant::Plo4DoubleBomb, 4, 10),
+            (Variant::Plo5DoubleBomb, 5, 8),
+            (Variant::Plo6DoubleBomb, 6, 7),
+            (Variant::NlhSingle, 2, 23),
+        ] {
+            assert_eq!((v.hole_slots(), v.burn_count(), v.max_seats()), (hc, 0, max), "{v:?}");
+        }
+        for (red, card) in [(false, 0u8), (true, 1), (true, 2), (false, 3), (true, 50), (false, 51)] {
+            assert_eq!(Variant::burn_is_red(Card::from_index(card)), red, "card {card}");
+        }
+    }
+
+    #[test]
+    fn the_deal_follows_the_public_slot_map() {
+        for n in 2..=5usize {
+            for burns in [RED, BLACK] {
+                let order = deck_with_burns(n, burns, 70 + n as u64);
+                let g = deal(&vec![1_000_000; n], &order);
+                let held = if burns == RED { 5 } else { 4 };
+                for s in 0..n {
+                    assert_eq!(idx(&g.hole_cards[s]), order[7 * s..7 * s + held].to_vec(), "n {n} seat {s}");
+                    assert_eq!(idx(&g.extra_holes[s]), order[7 * s + 4..7 * s + 7].to_vec());
+                }
+                assert_eq!(idx(&g.full_board_a), order[7 * n..7 * n + 5].to_vec());
+                assert_eq!(idx(&g.full_board_b), order[7 * n + 5..7 * n + 10].to_vec());
+                assert_eq!(idx(&g.full_burns), burns.to_vec());
+                // the flop's burn is face up from the deal; the others wait
+                assert_eq!(idx(&g.burns), vec![burns[0]]);
+                assert_eq!((g.street, g.board_a.len(), g.board_b.len()), (Street::Flop, 3, 3));
+            }
+        }
+        // the seeded deal is the same contract: 48 distinct cards for 5 seats
+        let g = GameState::new_hand(cfg(&[500_000; 5]), 12345, 2);
+        let mut all: Vec<u8> = Vec::new();
+        for s in 0..5 {
+            // held + still reserved = the seat's seven slots
+            let held = g.hole_cards[s].len();
+            all.extend(idx(&g.hole_cards[s]));
+            all.extend(idx(&g.extra_holes[s][held - 4..]));
+        }
+        all.extend(idx(&g.full_board_a));
+        all.extend(idx(&g.full_board_b));
+        all.extend(idx(&g.full_burns));
+        assert_eq!(all.len(), 48);
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), 48);
+    }
+
+    #[test]
+    fn red_burns_deal_live_seats_and_all_in_seats_but_not_folded_ones() {
+        // Button 0: seat 1 acts first. Seat 2 is short (70k behind the ante).
+        let order = deck_with_burns(3, RED, 1);
+        let mut g = deal(&[1_000_000, 1_000_000, 100_000], &order);
+        assert!(g.hole_cards.iter().all(|h| h.len() == 5), "red flop burn: five cards each");
+        assert_eq!(g.actor, Some(1));
+        g.apply(Action::CheckCall); // seat 1 checks
+        g.apply(Action::AllIn); // seat 2 all-in (70k)
+        g.apply(Action::CheckCall); // seat 0 calls
+        g.apply(Action::Fold); // seat 1 folds
+        // one seat left with chips: the turn and river are run out, burns and all
+        assert!(g.is_terminal());
+        assert_eq!(idx(&g.burns), RED.to_vec());
+        assert_eq!(g.hole_cards.iter().map(|h| h.len()).collect::<Vec<_>>(), vec![7, 5, 7]);
+        assert_eq!(counts(&g, 0), [5, 6, 7]);
+        assert_eq!(counts(&g, 1), [5, 5, 5], "folded before the turn burn: no more cards");
+        assert_eq!(counts(&g, 2), [5, 6, 7], "all-in seats keep receiving cards");
+        for s in [0usize, 2] {
+            assert_eq!(idx(&g.hole_cards[s]), order[7 * s..7 * s + 7].to_vec());
+        }
+        // the showdown scores all seven cards: one layer of 230k (the folded
+        // seat's ante is dead money in it), half per board
+        let p = g.payouts();
+        assert_eq!(p.iter().sum::<i64>(), 0);
+        assert_eq!(p[1], -30_000);
+        let mut won = [0i64; 3];
+        for board in [&g.full_board_a, &g.full_board_b] {
+            let (r0, r2) = (brute(&g.hole_cards[0], board), brute(&g.hole_cards[2], board));
+            assert_eq!(evaluate_plo5(&g.hole_cards[0], board), r0);
+            assert_eq!(evaluate_plo5(&g.hole_cards[2], board), r2);
+            match r0.cmp(&r2) {
+                std::cmp::Ordering::Greater => won[0] += 115_000,
+                std::cmp::Ordering::Less => won[2] += 115_000,
+                std::cmp::Ordering::Equal => {
+                    won[0] += 57_500;
+                    won[2] += 57_500;
+                }
+            }
+        }
+        assert_eq!(p[0], won[0] - 100_000);
+        assert_eq!(p[2], won[2] - 100_000);
+        assert_settlement(&g, "red run-out");
+    }
+
+    #[test]
+    fn black_burns_deal_nothing() {
+        let order = deck_with_burns(3, BLACK, 2);
+        let mut g = deal(&[1_000_000; 3], &order);
+        for _ in 0..9 {
+            g.apply(Action::CheckCall);
+        }
+        assert!(g.is_terminal());
+        assert_eq!(idx(&g.burns), BLACK.to_vec());
+        for s in 0..3 {
+            assert_eq!(g.hole_cards[s].len(), 4);
+            assert_eq!(counts(&g, s), [4, 4, 4]);
+        }
+        assert_settlement(&g, "black check-down");
+    }
+
+    #[test]
+    fn a_seat_that_folds_misses_every_later_card() {
+        // burns: black flop, red turn, red river
+        let order = deck_with_burns(3, [BLACK[0], RED[0], RED[1]], 3);
+        let mut g = deal(&[1_000_000; 3], &order);
+        assert!(g.hole_cards.iter().all(|h| h.len() == 4));
+        g.apply(Action::CheckCall); // seat 1 checks
+        g.apply(Action::BetPct50); // seat 2 bets
+        g.apply(Action::Fold); // seat 0 folds
+        g.apply(Action::CheckCall); // seat 1 calls -> turn
+        assert_eq!(g.street, Street::Turn);
+        assert_eq!(g.burns.len(), 2);
+        assert_eq!(g.hole_cards.iter().map(|h| h.len()).collect::<Vec<_>>(), vec![4, 5, 5]);
+        g.apply(Action::CheckCall);
+        g.apply(Action::CheckCall); // -> river
+        assert_eq!(g.street, Street::River);
+        assert_eq!(g.hole_cards.iter().map(|h| h.len()).collect::<Vec<_>>(), vec![4, 6, 6]);
+        g.apply(Action::CheckCall);
+        g.apply(Action::CheckCall);
+        assert!(g.is_terminal());
+        assert_eq!(counts(&g, 0), [4, 4, 4]);
+        assert_eq!(counts(&g, 1), [4, 5, 6]);
+        assert_eq!(counts(&g, 2), [4, 5, 6]);
+        assert_settlement(&g, "fold before the red burns");
+    }
+
+    #[test]
+    fn a_fold_out_turns_up_no_more_burns() {
+        let order = deck_with_burns(2, RED, 4);
+        let mut g = deal(&[1_000_000; 2], &order);
+        // heads-up, button 0: seat 1 acts first
+        g.apply(Action::BetPct50);
+        g.apply(Action::Fold);
+        assert!(g.is_terminal());
+        assert_eq!(g.burns.len(), 1, "the hand ended on the flop");
+        assert_eq!(g.full_burns.len(), 3, "the rabbit can still show the rest");
+        assert_eq!(g.hole_cards[1].len(), 5);
+        assert_settlement(&g, "fold-out");
+    }
+
+    #[test]
+    fn everyone_all_in_from_the_ante_runs_out_every_burn() {
+        let order = deck_with_burns(4, RED, 5);
+        let g = deal(&[ANTE; 4], &order);
+        assert!(g.is_terminal(), "nobody can act: terminal at the deal");
+        assert_eq!(idx(&g.burns), RED.to_vec());
+        assert!(g.hole_cards.iter().all(|h| h.len() == 7));
+        assert_settlement(&g, "ante all-in");
+    }
+
+    #[test]
+    fn ev_payouts_are_the_actual_deal() {
+        let order = deck_with_burns(3, RED, 6);
+        let mut g = deal(&[1_000_000, 1_000_000, 100_000], &order);
+        g.apply(Action::CheckCall);
+        g.apply(Action::AllIn);
+        g.apply(Action::CheckCall);
+        g.apply(Action::Fold);
+        assert_eq!(g.payouts_ev(64, 9), g.payouts());
+    }
+
+    #[test]
+    fn runout_equities_are_exact_on_the_river_and_sum_to_one() {
+        let c = |i: u8| Card::from_index(i);
+        // river: complete boards -> the actual result, shares sum to 1 per board
+        let holes = vec![vec![c(48), c(49), c(0), c(4), c(8)], vec![c(44), c(45), c(1), c(5), c(9), c(13)]];
+        let a = [c(50), c(51), c(20), c(24), c(28)];
+        let b = [c(40), c(41), c(21), c(25), c(29)];
+        let eq = plo67_runout_equities(&holes, &a, &b, &[c(2)], 100, 1).unwrap();
+        for k in 0..2 {
+            let board = if k == 0 { &a } else { &b };
+            let (r0, r1) = (evaluate_plo5(&holes[0], board), evaluate_plo5(&holes[1], board));
+            let want = match r0.cmp(&r1) {
+                std::cmp::Ordering::Greater => [1.0, 0.0],
+                std::cmp::Ordering::Less => [0.0, 1.0],
+                std::cmp::Ordering::Equal => [0.5, 0.5],
+            };
+            assert_eq!([eq[0][k], eq[1][k]], want);
+        }
+        // flop all-in, three hands: shares are probabilities that sum to 1
+        let holes = vec![
+            vec![c(48), c(49), c(0), c(4)],
+            vec![c(44), c(45), c(1), c(5), c(9)],
+            vec![c(40), c(41), c(2), c(6)],
+        ];
+        let eq = plo67_runout_equities(&holes, &[c(50), c(51), c(20)], &[c(36), c(37), c(21)], &[c(3)], 2000, 7).unwrap();
+        for k in 0..2 {
+            let total: f64 = eq.iter().map(|e| e[k]).sum();
+            assert!((total - 1.0).abs() < 1e-9, "board {k}: {total}");
+        }
+        // deterministic from the seed
+        let again = plo67_runout_equities(&holes, &[c(50), c(51), c(20)], &[c(36), c(37), c(21)], &[c(3)], 2000, 7).unwrap();
+        assert_eq!(eq, again);
+        // a repeated card is refused, never a panic
+        assert!(plo67_runout_equities(&holes, &[c(48), c(51), c(20)], &[c(36), c(37), c(21)], &[], 10, 1).is_err());
+    }
+
+    #[test]
+    fn runout_equities_match_the_engine_deal_distribution() {
+        // The sampler must deal the rest of the hand the way the engine does:
+        // compare its flop-all-in equity with the frequency the engine's own
+        // run-outs produce over many shuffles of the unseen cards.
+        let order = deck_with_burns(2, [BLACK[0], RED[0], RED[1]], 11);
+        let g0 = deal(&[ANTE; 2], &order); // all-in from the ante: runs out at the deal
+        assert!(g0.is_terminal());
+        let holes: Vec<Vec<Card>> = (0..2).map(|s| order[7 * s..7 * s + 4].iter().map(|&i| Card::from_index(i)).collect()).collect();
+        let (fa, fb): (Vec<Card>, Vec<Card>) = (g0.full_board_a[..3].to_vec(), g0.full_board_b[..3].to_vec());
+        let burn0 = g0.full_burns[0];
+        let eq = plo67_runout_equities(&holes, &fa, &fb, &[burn0], 20_000, 3).unwrap();
+        // the engine: keep the visible cards, reshuffle every other card into its slots
+        let mut visible: Vec<u8> = holes.iter().flatten().map(|c| c.index()).collect();
+        visible.extend(fa.iter().chain(fb.iter()).map(|c| c.index()));
+        visible.push(burn0.index());
+        let unseen: Vec<u8> = (0..52u8).filter(|i| !visible.contains(i)).collect();
+        let mut rng = ChaCha8Rng::seed_from_u64(5);
+        let mut won = [[0f64; 2]; 2];
+        let trials = 20_000;
+        for _ in 0..trials {
+            let mut rest = unseen.clone();
+            for i in (1..rest.len()).rev() {
+                let j = rng.gen_range(0..=i);
+                rest.swap(i, j);
+            }
+            let mut deck = vec![0u8; 52];
+            let mut it = rest.into_iter();
+            for s in 0..2usize {
+                for k in 0..7 {
+                    deck[7 * s + k] = if k < 4 { holes[s][k].index() } else { it.next().unwrap() };
+                }
+            }
+            for m in 0..5 {
+                deck[14 + m] = if m < 3 { fa[m].index() } else { it.next().unwrap() };
+                deck[19 + m] = if m < 3 { fb[m].index() } else { it.next().unwrap() };
+            }
+            deck[24] = burn0.index();
+            deck[25] = it.next().unwrap();
+            deck[26] = it.next().unwrap();
+            for (k, v) in deck.iter_mut().enumerate().skip(27) {
+                *v = it.next().unwrap_or(k as u8);
+            }
+            // (the tail past the last slot is never dealt)
+            let tail: Vec<u8> = (0..52u8).filter(|c| !deck[..27].contains(c)).collect();
+            deck[27..].copy_from_slice(&tail);
+            let g = deal(&[ANTE; 2], &deck);
+            for (k, board) in [&g.full_board_a, &g.full_board_b].into_iter().enumerate() {
+                let (r0, r1) = (evaluate_plo5(&g.hole_cards[0], board), evaluate_plo5(&g.hole_cards[1], board));
+                match r0.cmp(&r1) {
+                    std::cmp::Ordering::Greater => won[0][k] += 1.0,
+                    std::cmp::Ordering::Less => won[1][k] += 1.0,
+                    std::cmp::Ordering::Equal => {
+                        won[0][k] += 0.5;
+                        won[1][k] += 0.5;
+                    }
+                }
+            }
+        }
+        for s in 0..2 {
+            for k in 0..2 {
+                let engine = won[s][k] / trials as f64;
+                assert!((engine - eq[s][k]).abs() < 0.025, "seat {s} board {k}: engine {engine} sampler {}", eq[s][k]);
+            }
+        }
+    }
+
+    #[test]
+    fn random_hands_settle_and_hold_the_right_number_of_cards() {
+        let mut rng = ChaCha8Rng::seed_from_u64(0x67);
+        for hand in 0..3_000u64 {
+            let n = rng.gen_range(2..=5usize);
+            let stacks: Vec<u64> = (0..n)
+                .map(|_| match rng.gen_range(0..4) {
+                    0 => rng.gen_range(1..=3 * BB),
+                    1 | 2 => rng.gen_range(3 * BB..=40 * BB),
+                    _ => rng.gen_range(40 * BB..=300 * BB),
+                })
+                .collect();
+            let mask = if n >= 3 && rng.gen_bool(0.3) {
+                let mut m = vec![true; n];
+                m[rng.gen_range(0..n)] = false;
+                Some(m)
+            } else {
+                None
+            };
+            let button = rng.gen_range(0..n);
+            let seed = rng.gen::<u64>();
+            let tag = format!("hand {hand} stacks {stacks:?} mask {mask:?} seed {seed}");
+            let g = play_random_hand(cfg(&stacks), seed, button, mask.clone(), &mut rng, &tag);
+            assert_settlement(&g, &tag);
+            let red = g.burns.iter().filter(|&&c| Variant::burn_is_red(c)).count();
+            for s in 0..n {
+                let dealt = mask.as_ref().map_or(true, |m| m[s]);
+                let have = g.hole_cards[s].len();
+                if !dealt {
+                    assert_eq!(have, 4, "{tag}: a sitting-out seat never gets extras");
+                } else if !g.folded[s] {
+                    assert_eq!(have, 4 + red, "{tag}: seat {s} in to the end");
+                } else {
+                    assert!(have <= 4 + red, "{tag}: folded seat {s}");
+                }
+                assert_eq!(g.hole_count_on(s, Street::River), have, "{tag}");
+                let hc = [Street::Flop, Street::Turn, Street::River].map(|st| g.hole_count_on(s, st));
+                assert!(hc[0] <= hc[1] && hc[1] <= hc[2], "{tag}: counts only grow");
+            }
+            // every card on the table is distinct
+            let mut all: Vec<u8> = g.hole_cards.iter().flat_map(|h| idx(h)).collect();
+            all.extend(idx(&g.board_a));
+            all.extend(idx(&g.board_b));
+            all.extend(idx(&g.burns));
+            let len = all.len();
+            all.sort_unstable();
+            all.dedup();
+            assert_eq!(all.len(), len, "{tag}: duplicate card");
+        }
     }
 }

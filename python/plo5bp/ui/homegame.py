@@ -1,4 +1,4 @@
-"""Private PLO5 / PLO6 double-board bomb-pot home games (PokerNow-style).
+"""Private PLO5 / PLO6 / PLO67 double-board bomb-pot home games (PokerNow-style).
 
 Installed only from ``public.install`` (public build). Access is the
 admin-granted ``homegame_access`` flag, independent of subscription;
@@ -10,6 +10,16 @@ burn cards online), chosen when the table is created and fixed for its life
 (like the blinds). Everything else is the same game. Only PLO5 decisions are
 graded (there is no PLO6 network yet), and the club's numbers are kept apart
 per game (``homegames.variant``).
+
+PLO67 (2026-09-27, the owner's friends' game): four hole cards, and the three
+burn cards are dealt FACE UP — one before the flops, one before the turns, one
+before the rivers. Every red burn deals everyone still in the hand (all-in
+players too, folded ones not) one more hole card: 4-5 cards on the flop, 4-6 on
+the turn, 4-7 on the river. Up to 5 seats (the slot map reserves seven cards a
+seat + 10 board + 3 burns = 48). The engine plays it (``plo67_double_bomb``);
+the view shows the burns turned up so far, an all-in runout reveals burn by
+burn with each hand trimmed to what it held on the street being shown, and a
+hand record keeps each seat's cards in deal order with its count per street.
 
 Stakes: small/big blind set the chip unit and the dollar ledger.
 Gameplay is ClubGG-style bomb pots — every in-hand seat posts the ante,
@@ -102,11 +112,13 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response, Streamin
 from starlette.concurrency import run_in_threadpool
 
 from plo5bp.actions import FOLD, GATE_CHECK_CALL, GATE_FOLD, GATE_RAISE
-from plo5bp.config import VARIANT_PLO5, VARIANT_PLO6, GameConfig
+from plo5bp.config import VARIANT_PLO5, VARIANT_PLO6, VARIANT_PLO67, GameConfig
 from plo5bp.env import BombPotEnv, StepInfo
 from plo5bp.ui.common import STREET_NAMES, position_name
 from plo5bp.ui.hand_describe import describe_made_hand
-from plo5bp.ui.runout import AWARD_SECS, board_equities, build_awards, display_pots, money_flows
+from plo5bp.ui.runout import (
+    AWARD_SECS, board_equities, build_awards, display_pots, money_flows, plo67_equities,
+)
 from plo5bp.ui import fairdeal
 from plo5bp.ui import public as pub
 
@@ -116,13 +128,18 @@ BB_CHIPS = 10_000
 TABLE_SEATS = 8  # the most seats any game has (PLO5); see GAMES for each game's own
 
 #: The games a table can deal: short code -> engine variant, hole cards per
-#: player, seat limit (one deck, no burn cards: seats x hole + 10 board <= 52),
-#: whether the network grades its decisions, and how the table names it.
+#: player ("hole" = the most a hand can hold = the verified shuffle's slots per
+#: seat; "dealt" = what a hand starts with), face-up burn cards, seat limit (one
+#: deck: seats x hole + 10 board + burns <= 52), whether the network grades its
+#: decisions, and how the table names it.
 GAMES: dict[str, dict[str, Any]] = {
-    "plo5": {"variant": VARIANT_PLO5, "hole": 5, "max_seats": 8, "graded": True,
-             "label": "PLO5", "name": "PLO5 double-board bomb pot"},
-    "plo6": {"variant": VARIANT_PLO6, "hole": 6, "max_seats": 7, "graded": False,
-             "label": "PLO6", "name": "PLO6 double-board bomb pot"},
+    "plo5": {"variant": VARIANT_PLO5, "hole": 5, "dealt": 5, "burns": 0, "max_seats": 8,
+             "graded": True, "label": "PLO5", "name": "PLO5 double-board bomb pot"},
+    "plo6": {"variant": VARIANT_PLO6, "hole": 6, "dealt": 6, "burns": 0, "max_seats": 7,
+             "graded": False, "label": "PLO6", "name": "PLO6 double-board bomb pot"},
+    # four cards dealt; every red face-up burn deals everyone still in the hand one more
+    "plo67": {"variant": VARIANT_PLO67, "hole": 7, "dealt": 4, "burns": 3, "max_seats": 5,
+              "graded": False, "label": "PLO67", "name": "PLO67 double-board bomb pot"},
 }
 DEFAULT_GAME = "plo5"
 
@@ -190,6 +207,17 @@ try:  # the binding itself (an old _engine build lacks it)
     FAIR_ON = FAIR_ON and hasattr(_env_mod._RustGameState, "reset_with_deck")
 except Exception:  # noqa: BLE001
     FAIR_ON = False
+try:  # PLO67 needs an engine that plays it (face-up burns, extra hole cards)
+    from plo5bp import _engine as _engine_mod
+    PLO67_ON = hasattr(_engine_mod, "plo67_runout_equities")
+except Exception:  # noqa: BLE001
+    PLO67_ON = False
+#: PLO67 all-in runout: extra seconds per street shown, so the burn can be
+#: presented (and, if it is red, a card dealt to every hand) before the board
+#: cards come. Not added when the host set the runout pause to 0 (instant).
+BURN_SHOW_S = 1.2
+#: Monte-Carlo runouts behind each street's PLO67 all-in equities (Rust, ~10 ms).
+PLO67_EQ_SAMPLES = 3000
 FAIR_REVEAL_S = 3.0        # a locked device has this long to reveal its number
 FAIR_RECOMMIT_S = 1.5      # after a voided attempt: window to commit to the new seal
 FAIR_COMMIT_GRACE_S = 0.6  # at the deal: wait this long for a known device's commit
@@ -525,7 +553,7 @@ def _parse_game(v: Any) -> str:
     for code, g in GAMES.items():
         if s in (code, g["variant"]):
             return code
-    raise HTTPException(status_code=400, detail="unknown game — choose PLO5 or PLO6")
+    raise HTTPException(status_code=400, detail="unknown game — choose PLO5, PLO6 or PLO67")
 
 
 def _game_filter(v: Any) -> str | None:
@@ -540,6 +568,7 @@ def _game_info(v: Any) -> dict[str, Any]:
     code = _norm_game(v)
     g = GAMES[code]
     return {"code": code, "label": g["label"], "name": g["name"], "hole": int(g["hole"]),
+            "dealt": int(g["dealt"]), "burns": int(g["burns"]),
             "max_seats": int(g["max_seats"]), "graded": bool(g["graded"])}
 
 
@@ -776,6 +805,9 @@ class LiveTable:
     rabbit_played_len: int = 3
     rabbit_full_a: list[int] = field(default_factory=list)
     rabbit_full_b: list[int] = field(default_factory=list)
+    # PLO67: all three burns of the finished hand (the rabbit and an all-in
+    # runout reveal them street by street, like the boards)
+    rabbit_burns: list[int] = field(default_factory=list)
     # --- 2026-09-21 -------------------------------------------------------
     deal_delay_secs: float = 0.0  # 0 = manual dealing
     time_bank_secs: int = 0  # per-seat reserve; 0 = off
@@ -850,7 +882,13 @@ class LiveTable:
 
     @property
     def hole_count(self) -> int:
+        """The most hole cards a hand holds here (= the shuffle's slots per seat)."""
         return int(self.game["hole"])
+
+    @property
+    def burns(self) -> int:
+        """Burn cards dealt face up (PLO67 3, else 0)."""
+        return int(self.game["burns"])
 
     def occupied(self) -> list[int]:
         return [i for i, s in enumerate(self.seats) if s is not None]
@@ -1873,7 +1911,7 @@ def _fair_hand_id(t: LiveTable, hand_no: int, attempt: int) -> str:
 
 def _fair_seal(t: LiveTable, hand_no: int, attempt: int) -> Any:
     return fairdeal.SealedDeck.create(
-        _fair_hand_id(t, hand_no, attempt), t.num_seats, hole=t.hole_count)
+        _fair_hand_id(t, hand_no, attempt), t.num_seats, hole=t.hole_count, burns=t.burns)
 
 
 def _fair_prepare_locked(t: LiveTable) -> None:
@@ -1883,7 +1921,8 @@ def _fair_prepare_locked(t: LiveTable) -> None:
     nxt = t.fair_next
     if nxt is not None and nxt.hand_no == t.hand_no + 1:
         # the slot map depends on the seat count (and on the hole cards per seat)
-        if nxt.sealed.num_seats != t.num_seats or nxt.sealed.hole != t.hole_count:
+        if (nxt.sealed.num_seats != t.num_seats or nxt.sealed.hole != t.hole_count
+                or nxt.sealed.burns != t.burns):
             _fair_void_locked(t, "the table was resized")
         return
     t.fair_next = FairPending(sealed=_fair_seal(t, t.hand_no + 1, 1), hand_no=t.hand_no + 1)
@@ -2101,6 +2140,7 @@ def _fair_view(t: LiveTable, viewer_id: int, visible: list[int]) -> dict[str, An
         out["hand"] = {
             "hand_no": int(meta.get("hand_no") or t.hand_no), "hand_id": fh.hand_id,
             "seal": fh.seal, "lock": fh.lock, "num_seats": fh.num_seats, "hole": fh.hole,
+            "burns": fh.burns,
             "contributors": [st for st, _ in fh.locked],
             "names": list(meta.get("names") or []),
             "voids": list(meta.get("voids") or []),
@@ -2134,6 +2174,7 @@ def _fair_transcript(t: LiveTable, viewer_id: int, hand_no: int) -> dict[str, An
         for b in ("a", "b"):
             bd = v["board"][b]
             visible += [c for c in list(bd["flop"]) + [bd["turn"], bd["river"]] if isinstance(c, int) and c >= 0]
+        visible += [int(c) for c in v.get("burns") or []]
     else:
         _require_member(t, viewer_id)
         rec_row = pub.DB.one("SELECT summary FROM homegame_hands WHERE game_id=? AND hand_no=?",
@@ -2143,6 +2184,7 @@ def _fair_transcript(t: LiveTable, viewer_id: int, hand_no: int) -> dict[str, An
             for srow in rec.get("seats") or []:
                 visible += [c for c in (srow.get("hole") or []) if isinstance(c, int) and c >= 0]
             visible += [int(c) for c in (rec.get("board_a") or []) + (rec.get("board_b") or [])]
+            visible += [int(c) for c in rec.get("burns") or []]
     out = sealed.public()
     out.update({"hand_no": int(hand_no), "names": list(meta.get("names") or []),
                 "voids": list(meta.get("voids") or []), "open": _fair_openings(sealed, visible)})
@@ -2192,11 +2234,20 @@ def _auto_deal_tick_locked(t: LiveTable) -> None:
         pass  # not dealable after all (e.g. auto-stack could not top up)
 
 
+def _street_pause(t: LiveTable) -> float:
+    """Seconds between the streets of an all-in runout: the host's setting,
+    plus the burn's moment in PLO67 (not when the host wants it instant)."""
+    pause = float(t.street_pause_secs if t.street_pause_secs is not None else 1.5)
+    if pause > 0 and math.isfinite(pause) and t.burns:
+        pause += BURN_SHOW_S
+    return pause
+
+
 def _runout_shown_len(t: LiveTable) -> int:
     if not t.runout_active:
         return 5
     start = max(3, int(t.runout_start_len or 3))
-    pause = float(t.street_pause_secs if t.street_pause_secs is not None else 1.5)
+    pause = _street_pause(t)
     if not (pause > 0) or not math.isfinite(pause):
         return 5
     started = t.runout_started_mono if t.runout_started_mono is not None else time.monotonic()
@@ -2210,7 +2261,7 @@ def _runout_award_index(t: LiveTable) -> int:
         return n
     if _runout_shown_len(t) < 5:
         return -1
-    pause = float(t.street_pause_secs if t.street_pause_secs is not None else 1.5)
+    pause = _street_pause(t)
     if not math.isfinite(pause):
         pause = 0.0
     start = max(3, int(t.runout_start_len or 3))
@@ -2266,6 +2317,9 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
     actor = None
     info = t.info
     holes: list[list[int] | None] = [None] * t.num_seats
+    # PLO67: a hand the viewer may see, in the order its cards came (the felt
+    # animates the card a red burn dealt — the display order is sorted)
+    seqs: list[list[int] | None] = [None] * t.num_seats
     in_hand = list(t.in_hand_mask or [])
     in_hand += [False] * (t.num_seats - len(in_hand))
     dealt = list(t.dealt_user_ids or [])
@@ -2275,6 +2329,9 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
     # fold-out, where the winner's hand used to be shown to the whole table
     # (and to unseated viewers) — every successful bluff was exposed.
     reveal = t.phase == "showdown" and bool(t.showdown_reveal)
+    # PLO67: while an all-in runout is revealing, every hand shows what it held
+    # on the street being shown (red burns still to come deal the rest)
+    trim_len = max(3, _runout_shown_len(t)) if (t.runout_active and t.burns) else None
     if t.env is not None and t.phase in ("in_hand", "showdown"):
         raw = _obs_dict(t.env)
         actor_raw = raw.get("actor")
@@ -2300,10 +2357,15 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
             # Tabled voluntarily after the hand ("show cards") — the player's
             # own choice, so it also covers a fold-out winner and a folded hand.
             shown = t.phase == "showdown" and i in t.shown_seats
+            cards_i = [int(c) for c in all_holes[i]]
+            if trim_len is not None and trim_len < 5:
+                cards_i = cards_i[: _hole_count_on(t, i, trim_len - 2)]
             if own or shown or (reveal and not folded[i]):
-                holes[i] = _sorted_hole([int(c) for c in all_holes[i]])
+                holes[i] = _sorted_hole(cards_i)
+                if t.burns:
+                    seqs[i] = list(cards_i)
             else:
-                holes[i] = [-1] * len(all_holes[i])  # facedown
+                holes[i] = [-1] * len(cards_i)  # facedown
     elif reveal and t.last_holes:
         holes = [_sorted_hole(h) if h and h[0] >= 0 else h for h in t.last_holes]
 
@@ -2322,6 +2384,19 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
     bb_src = [int(c) for c in bb_src]
     ba = _split_board(ba_src)
     bb = _split_board(bb_src)
+    # PLO67's face-up burns: one per street on the board (the rabbit and an
+    # all-in runout show them street by street, like the board cards)
+    burns_shown: list[int] = []
+    if t.burns and t.phase in ("in_hand", "showdown"):
+        src = [int(c) for c in raw.get("burns") or []] if t.phase == "in_hand" else list(t.rabbit_burns)
+        if t.phase == "showdown" and not src and raw:
+            src = [int(c) for c in raw.get("burns") or []]
+        burns_shown = src[: max(0, min(t.burns, len(ba_src) - 2))]
+    # the burns that came while the hand was played; the rest (a fold-out's
+    # rabbit) dealt nobody a card
+    burns_played = len(burns_shown)
+    if t.phase == "showdown" and t.rabbit_available and t.rabbit_shown:
+        burns_played = min(burns_played, max(0, int(t.rabbit_played_len or 3) - 2))
     street = STREET_NAMES.get(int(raw["street"]), "flop") if raw else None
     if t.runout_active:
         street = {3: "flop", 4: "turn", 5: "river"}.get(len(ba_src), street)
@@ -2402,6 +2477,7 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
                 {j for j, m in enumerate(in_hand) if m} if any(in_hand) else None,
             ),
             "hole": hole,
+            "hole_seq": seqs[i],
             "hand_desc": made,
             "auto_stack_cents": int(p.auto_stack_cents or 0) if p else 0,
             "pending_remove": bool(p and (p.user_id in t.pending_kicks or p.leave_after_hand)),
@@ -2506,7 +2582,7 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
         shown_awards = list(t.pot_awards[: max(0, award_idx + 1)])
     else:
         shown_awards = list(t.pot_awards or [])
-    pause = float(t.street_pause_secs if t.street_pause_secs is not None else 1.5)
+    pause = _street_pause(t)
     shown_len = _runout_shown_len(t) if t.runout_active else 0
     start_len = max(3, int(t.runout_start_len or 3))
     elapsed = (
@@ -2536,7 +2612,7 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
     now_wall = time.time()
     last_hand_no = t.hand_no if (t.phase != "in_hand" and not blocking) else t.hand_no - 1
     _fair_prepare_locked(t)
-    visible_cards = [int(c) for h in holes if h for c in h if int(c) >= 0] + ba_src + bb_src
+    visible_cards = [int(c) for h in holes if h for c in h if int(c) >= 0] + ba_src + bb_src + burns_shown
     return {
         "fair": _fair_view(t, viewer_id, visible_cards),
         "id": t.game_id,
@@ -2568,6 +2644,9 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
         },
         "seats": seats_out,
         "board": {"a": ba, "b": bb},
+        # PLO67: the burn cards turned face up so far (flop, turn, river); [] otherwise
+        "burns": burns_shown,
+        "burns_played": burns_played,
         "pot_chips": pot_chips,
         "pot_cents": chips_to_cents(pot_chips, t.bb_cents),
         "settled_pot_chips": (
@@ -2827,7 +2906,7 @@ def _deal_now_locked(t: LiveTable) -> None:
     env = _make_env(cfg)
     nxt = t.fair_next if FAIR_ON else None
     if nxt is not None and (nxt.hand_no != t.hand_no + 1 or nxt.sealed.num_seats != t.num_seats
-                            or nxt.sealed.hole != t.hole_count):
+                            or nxt.sealed.hole != t.hole_count or nxt.sealed.burns != t.burns):
         _fair_void_locked(t, "the table changed before the deal")
         raise HTTPException(status_code=409, detail="the shuffle is being redone")
     if nxt is not None:
@@ -2888,6 +2967,7 @@ def _deal_now_locked(t: LiveTable) -> None:
     t.rabbit_played_len = 3
     t.rabbit_full_a = []
     t.rabbit_full_b = []
+    t.rabbit_burns = []
     t.runout_active = False
     t.runout_start_len = 3
     t.runout_started_mono = None
@@ -2992,6 +3072,8 @@ def _record_hand_locked(
         full_b = [int(c) for c in (raw.get("board_b") or [])]
         n_board = len(full_a) if t.showdown_reveal else max(3, int(t.rabbit_played_len or 3))
         commit = [int(x) for x in (raw.get("total_commit") or [])]
+        # PLO67: the burns turned up while the hand was played (one per street)
+        played_burns = [int(c) for c in (raw.get("burns") or [])][: max(0, n_board - 2)] if t.burns else []
         seats = []
         winners: list[tuple[str, int]] = []
         for i in range(t.num_seats):
@@ -3016,6 +3098,11 @@ def _record_hand_locked(
                 "shown": bool(t.showdown_reveal and not is_folded),
                 "hole": _sorted_hole([int(c) for c in all_holes[i]]) if i < len(all_holes) else [],
             })
+            if t.burns and i < len(all_holes):
+                # PLO67: the cards in the order they came (the first four, then one
+                # per red burn) and how many the seat held on the flop / turn / river
+                seats[-1]["hole_seq"] = [int(c) for c in all_holes[i]]
+                seats[-1]["counts"] = [_hole_count_on(t, i, st) for st in (1, 2, 3)]
             if delta > 0:
                 winners.append((name, chips_to_cents(delta, t.bb_cents)))
         pot_cents = chips_to_cents(sum(commit), t.bb_cents)
@@ -3046,6 +3133,7 @@ def _record_hand_locked(
             "showdown": bool(t.showdown_reveal),
             "board_a": full_a[:n_board],
             "board_b": full_b[:n_board],
+            "burns": played_burns,
             "actions": actions,
             "ante_chips": int(t.ante_chips),
             "bb_chips": BB_CHIPS,
@@ -3271,6 +3359,7 @@ def _capture_rabbit(t: LiveTable, played_len: int) -> None:
     full_b = [int(c) for c in (raw.get("board_b") or [])]
     t.rabbit_full_a = full_a
     t.rabbit_full_b = full_b
+    t.rabbit_burns = _all_burns(t)
     t.leftover_stacks = [int(x) for x in (raw.get("stacks") or [])]
     t.terminal_pot = int(raw.get("pot") or 0)
     t.terminal_commit = [int(x) for x in (raw.get("total_commit") or [])]
@@ -3316,7 +3405,10 @@ def _capture_rabbit(t: LiveTable, played_len: int) -> None:
     )
     # The award steps carry the index of the pot they pay from (``build_awards``).
     t.pots = _named_pots(display_pots(commit[: t.num_seats], folded_full))
-    _compute_runout_equities(t, {i: holes[i] for i in alive if holes[i]}, full_a, full_b)
+    if t.burns:
+        _compute_plo67_equities(t, alive, full_a, full_b)
+    else:
+        _compute_runout_equities(t, {i: holes[i] for i in alive if holes[i]}, full_a, full_b)
 
 
 def _named_pots(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3380,6 +3472,48 @@ def _compute_runout_equities(
             )
     except Exception:  # noqa: BLE001
         logger.exception("runout equities failed (table %s)", t.game_id)
+        t.equity_by_len = {}
+
+
+def _all_burns(t: LiveTable) -> list[int]:
+    """PLO67: all three burns of the current hand (a reveal accessor — the
+    view trims them to the streets shown). [] for every other game."""
+    if not t.burns or t.env is None:
+        return []
+    fn = getattr(t.env._rs, "all_burns", None)
+    return [int(c) for c in fn()] if fn is not None else []
+
+
+def _hole_count_on(t: LiveTable, seat: int, street: int) -> int:
+    """PLO67: the hole cards ``seat`` held on ``street`` (1 flop, 2 turn,
+    3 river) — the engine's own count (a seat's extras are a prefix of the red
+    burns it was in the hand for)."""
+    return int(t.env._rs.hole_count_on(int(seat), int(street)))
+
+
+def _compute_plo67_equities(
+    t: LiveTable, alive: list[int], full_a: list[int], full_b: list[int]
+) -> None:
+    """PLO67's per-street runout equities: on each street the runout will show,
+    every alive hand as it was THEN, the burns up so far dead, and the rest —
+    burns still to come, the cards the red ones deal, the boards — sampled the
+    way the game deals them (``runout.plo67_equities``, Rust). Once per hand,
+    like ``_compute_runout_equities``; cosmetic, a failure never stops a hand."""
+    t.equity_by_len = {}
+    if len(alive) < 2 or t.env is None:
+        return
+    try:
+        all_holes = t.env.all_hole_cards()
+        burns = list(t.rabbit_burns)
+        for n in range(max(3, int(t.runout_start_len or 3)), 6):
+            holes = {i: [int(c) for c in all_holes[i]][: _hole_count_on(t, i, n - 2)] for i in alive}
+            seed = zlib.crc32(f"{t.game_id}:{t.hand_no}:{n}".encode())
+            t.equity_by_len[(n, n)] = plo67_equities(
+                holes, full_a[:n], full_b[:n], burns[: n - 2],
+                samples=PLO67_EQ_SAMPLES, seed=seed,
+            )
+    except Exception:  # noqa: BLE001
+        logger.exception("PLO67 runout equities failed (table %s)", t.game_id)
         t.equity_by_len = {}
 
 
@@ -4335,11 +4469,12 @@ def _valid_num_seats(n: int, variant: str = DEFAULT_GAME) -> int:
     g = GAMES[_norm_game(variant)]
     top = int(g["max_seats"])
     if not (MIN_SEATS <= n <= top):
-        raise HTTPException(
-            status_code=400,
-            detail=f"seats must be {MIN_SEATS}–{top}"
-            + ("" if top == TABLE_SEATS else f" ({g['label']}: {g['hole']} cards each use up the deck)"),
+        why = (
+            "" if top == TABLE_SEATS
+            else f" ({g['label']}: up to {g['hole']} cards each plus {g['burns']} face-up burns use up the deck)"
+            if g["burns"] else f" ({g['label']}: {g['hole']} cards each use up the deck)"
         )
+        raise HTTPException(status_code=400, detail=f"seats must be {MIN_SEATS}–{top}" + why)
     return n
 
 
@@ -4397,6 +4532,8 @@ def _hand_for_viewer(
         mine = int(s.get("user_id") or -1) == int(viewer_id)
         if not (mine or s.get("shown")):
             s2["hole"] = None
+            if "hole_seq" in s2:  # (PLO67: the deal order would say the same cards)
+                s2["hole_seq"] = None
         s2["is_me"] = mine
         s2["avatar"] = _avatar_url(s.get("user_id"))
         s2.pop("user_id", None)
@@ -4966,6 +5103,8 @@ def _create_table(user: Any, body: dict) -> LiveTable:
             status_code=400, detail=f"table name is limited to {MAX_NAME_LEN} characters"
         )
     variant = _parse_game(body.get("variant")) if body.get("variant") is not None else DEFAULT_GAME
+    if GAMES[variant]["burns"] and not PLO67_ON:
+        raise HTTPException(status_code=400, detail="this server's engine does not deal PLO67 yet")
     n = (
         _valid_num_seats(pub.body_int(body, "num_seats"), variant)
         if body.get("num_seats") is not None

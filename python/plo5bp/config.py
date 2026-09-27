@@ -13,16 +13,27 @@ VARIANT_PLO4 = "plo4_double_bomb"
 #: PLO6 double-board bomb pot: identical rules to PLO5 double-board
 #: (two boards, pot-limit, ante-only, starts at the flop) with 6 hole cards.
 VARIANT_PLO6 = "plo6_double_bomb"
+#: PLO67 double-board bomb pot (a home-game format, 2026-09-27): PLO5
+#: double-board rules with FOUR hole cards and the three burn cards dealt
+#: FACE UP (before the flops, turns, rivers); each red burn deals every seat
+#: still in the hand one more hole card (4-5 on the flop, 4-6 on the turn,
+#: 4-7 on the river). At most 5 seats: 7 reserved slots each + 10 + 3 burns.
+VARIANT_PLO67 = "plo67_double_bomb"
 #: No-limit hold'em, single board: 2 hole cards, best-5-of-7, NL cap,
 #: SB/BB blinds + per-player ante, preflop betting round.
 VARIANT_NLH = "nlh_single"
 
-_VARIANTS = (VARIANT_PLO5, VARIANT_PLO4, VARIANT_PLO6, VARIANT_NLH)
+_VARIANTS = (VARIANT_PLO5, VARIANT_PLO4, VARIANT_PLO6, VARIANT_PLO67, VARIANT_NLH)
 
-#: Hole cards per seat (mirrors Rust ``Variant::hole_count``).
-_HOLE_COUNT = {VARIANT_PLO4: 4, VARIANT_PLO5: 5, VARIANT_PLO6: 6, VARIANT_NLH: 2}
+#: Hole cards per seat AT THE DEAL (mirrors Rust ``Variant::hole_count``).
+_HOLE_COUNT = {VARIANT_PLO4: 4, VARIANT_PLO5: 5, VARIANT_PLO6: 6, VARIANT_PLO67: 4, VARIANT_NLH: 2}
+#: Deck slots reserved per seat = the most hole cards a seat can hold
+#: (mirrors Rust ``Variant::hole_slots``; only PLO67 grows mid-hand).
+_HOLE_SLOTS = {**_HOLE_COUNT, VARIANT_PLO67: 7}
+#: Burn cards dealt face up (mirrors Rust ``Variant::burn_count``).
+_BURNS = {v: (3 if v == VARIANT_PLO67 else 0) for v in _VARIANTS}
 #: Boards per hand (mirrors Rust ``Variant::num_boards``).
-_NUM_BOARDS = {VARIANT_PLO4: 2, VARIANT_PLO5: 2, VARIANT_PLO6: 2, VARIANT_NLH: 1}
+_NUM_BOARDS = {VARIANT_PLO4: 2, VARIANT_PLO5: 2, VARIANT_PLO6: 2, VARIANT_PLO67: 2, VARIANT_NLH: 1}
 
 #: Table-size bounds every consumer is built for: the observation encoders
 #: lay out 8 seat slots (``encoding._MAX_SEATS``) and the engine needs two
@@ -68,13 +79,15 @@ class GameConfig:
             raise ValueError(
                 f"num_seats must be in {MIN_SEATS}..{MAX_SEATS}, got {self.num_seats}"
             )
-        hole, boards = _HOLE_COUNT[self.variant], _NUM_BOARDS[self.variant]
-        cards_needed = self.num_seats * hole + 5 * boards
+        hole, boards = _HOLE_SLOTS[self.variant], _NUM_BOARDS[self.variant]
+        burns = _BURNS[self.variant]
+        cards_needed = self.num_seats * hole + 5 * boards + burns
         if cards_needed > _DECK_SIZE:
             raise ValueError(
                 f"{self.variant} cannot deal {self.num_seats} seats from one deck: "
-                f"{self.num_seats} x {hole} hole + {5 * boards} board = {cards_needed} "
-                f"cards (max {(_DECK_SIZE - 5 * boards) // hole} seats)"
+                f"{self.num_seats} x {hole} hole + {5 * boards} board"
+                + (f" + {burns} burns" if burns else "")
+                + f" = {cards_needed} cards (max {(_DECK_SIZE - 5 * boards - burns) // hole} seats)"
             )
         if self.bb <= 0:
             raise ValueError(f"bb must be positive, got {self.bb}")
@@ -116,9 +129,19 @@ class GameConfig:
 
     @property
     def hole_count(self) -> int:
-        """Hole cards per seat for this variant (mirrors Rust
-        ``Variant::hole_count``)."""
+        """Hole cards per seat at the deal for this variant (mirrors Rust
+        ``Variant::hole_count``; PLO67 grows from here on red burns)."""
         return _HOLE_COUNT[self.variant]
+
+    @property
+    def hole_slots(self) -> int:
+        """The most hole cards a seat can hold (PLO67 7, else ``hole_count``)."""
+        return _HOLE_SLOTS[self.variant]
+
+    @property
+    def burn_count(self) -> int:
+        """Burn cards dealt face up (PLO67 3, else 0)."""
+        return _BURNS[self.variant]
 
     @property
     def resolved_stacks(self) -> tuple[int, ...]:

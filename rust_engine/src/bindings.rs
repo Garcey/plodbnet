@@ -23,10 +23,11 @@ fn parse_variant(s: &str) -> PyResult<Variant> {
         "plo4_double_bomb" => Ok(Variant::Plo4DoubleBomb),
         "plo5_double_bomb" => Ok(Variant::Plo5DoubleBomb),
         "plo6_double_bomb" => Ok(Variant::Plo6DoubleBomb),
+        "plo67_double_bomb" => Ok(Variant::Plo67DoubleBomb),
         "nlh_single" => Ok(Variant::NlhSingle),
         _ => Err(PyValueError::new_err(format!(
             "unknown variant '{s}' (expected 'plo4_double_bomb', 'plo5_double_bomb', \
-             'plo6_double_bomb', or 'nlh_single')"
+             'plo6_double_bomb', 'plo67_double_bomb', or 'nlh_single')"
         ))),
     }
 }
@@ -130,7 +131,7 @@ fn validate_table(num_seats: usize, variant: Variant, bb: u64) -> PyResult<()> {
         // Every encoder scales by 1/bb: bb == 0 yields a non-finite obs.
         return Err(PyValueError::new_err("bb must be >= 1"));
     }
-    let needed = num_seats * variant.hole_count() + 5 * variant.num_boards();
+    let needed = variant.cards_needed(num_seats);
     if needed > crate::cards::DECK_SIZE {
         return Err(PyValueError::new_err(format!(
             "{num_seats} seats need {needed} cards for this variant; the deck has {}",
@@ -671,6 +672,10 @@ impl PyGameState {
         let board_b: Vec<u8> = g.board_b.iter().map(|c| c.index()).collect();
         d.set_item("board_a", board_a)?;
         d.set_item("board_b", board_b)?;
+        // PLO67: the burn cards turned face up so far (one per street
+        // reached); empty for every other variant.
+        let burns: Vec<u8> = g.burns.iter().map(|c| c.index()).collect();
+        d.set_item("burns", burns)?;
 
         d.set_item("street", g.street.index() as i64)?;
         d.set_item("pot", g.pot)?;
@@ -960,9 +965,10 @@ impl PyGameState {
         Ok(d)
     }
 
-    /// All seats' hole cards as raw indices, 5 per seat. Trainer-only
-    /// accessor for opponent reveal at hand end; never feed into
-    /// observations mid-hand.
+    /// All seats' hole cards as raw indices — the variant's hole count per
+    /// seat (PLO67: what each seat holds NOW, 4-7). Trainer-only accessor
+    /// for opponent reveal at hand end; never feed into observations
+    /// mid-hand.
     fn all_hole_cards(&self) -> PyResult<Vec<Vec<u8>>> {
         let g = self.get()?;
         Ok(g.hole_cards
@@ -970,6 +976,65 @@ impl PyGameState {
             .map(|h| h.iter().map(|c| c.index()).collect())
             .collect())
     }
+
+    /// PLO67: the burn cards turned up so far (the same list as the
+    /// observation's `burns`). Empty for every other variant.
+    fn burns(&self) -> PyResult<Vec<u8>> {
+        Ok(self.get()?.burns.iter().map(|c| c.index()).collect())
+    }
+
+    /// PLO67: ALL three pre-dealt burns, turned up or not — a reveal
+    /// accessor like `all_hole_cards` (the rabbit hunt after a fold-out
+    /// shows the burns that would have come). Never an observation.
+    fn all_burns(&self) -> PyResult<Vec<u8>> {
+        Ok(self.get()?.full_burns.iter().map(|c| c.index()).collect())
+    }
+
+    /// PLO67: the hole cards `seat` held on `street` (1 = flop, 2 = turn,
+    /// 3 = river, 4 = showdown): a seat's extras are a prefix of the red
+    /// burns it was in the hand for. Every other variant: its hole count.
+    fn hole_count_on(&self, seat: usize, street: u8) -> PyResult<usize> {
+        let g = self.get()?;
+        if seat >= g.config.num_seats {
+            return Err(PyValueError::new_err("seat out of range"));
+        }
+        let st = match street {
+            0 => crate::state::Street::Preflop,
+            1 => crate::state::Street::Flop,
+            2 => crate::state::Street::Turn,
+            3 | 4 => crate::state::Street::River,
+            _ => return Err(PyValueError::new_err(format!("street {street} must be 0..=4"))),
+        };
+        Ok(g.hole_count_on(seat, st))
+    }
+}
+
+/// PLO67 all-in runout equities for the home games' felt: each contender's
+/// share of board A and board B (see `engine::plo67_runout_equities`).
+/// `holes` = the contenders' hole cards NOW (4-7 each), `dead` = the burns
+/// turned up. Returns `[(share_a, share_b), ...]` in `holes` order.
+#[pyfunction]
+#[pyo3(signature = (holes, board_a, board_b, dead, samples=3000, seed=0))]
+pub fn plo67_runout_equities(
+    py: Python<'_>,
+    holes: Vec<Vec<u8>>,
+    board_a: Vec<u8>,
+    board_b: Vec<u8>,
+    dead: Vec<u8>,
+    samples: u32,
+    seed: u64,
+) -> PyResult<Vec<(f64, f64)>> {
+    let bad = |v: &[u8]| v.iter().any(|&c| c >= 52);
+    if holes.iter().any(|h| bad(h)) || bad(&board_a) || bad(&board_b) || bad(&dead) {
+        return Err(PyValueError::new_err("card index out of range"));
+    }
+    let cards = |v: &[u8]| v.iter().map(|&c| Card::from_index(c)).collect::<Vec<_>>();
+    let holes: Vec<Vec<Card>> = holes.iter().map(|h| cards(h)).collect();
+    let (a, b, d) = (cards(&board_a), cards(&board_b), cards(&dead));
+    let out = py
+        .allow_threads(move || crate::engine::plo67_runout_equities(&holes, &a, &b, &d, samples, seed))
+        .map_err(PyValueError::new_err)?;
+    Ok(out.into_iter().map(|e| (e[0], e[1])).collect())
 }
 
 /// Mirror of `python/plo5bp/rollout.py:_aggression_bonus_bb`. Pot-fraction
@@ -1948,6 +2013,13 @@ impl PyBatchedEngine {
         }
         let variant = parse_variant(variant)?;
         validate_table(num_seats, variant, bb)?;
+        if variant.burn_count() > 0 {
+            // The packers lay hole cards out at a fixed width, and PLO67 hands
+            // grow mid-hand (face-up burns deal extra cards): serial only.
+            return Err(PyValueError::new_err(
+                "plo67_double_bomb is not supported by the batched engine (nothing trains it yet)",
+            ));
+        }
         let obs_rev = resolve_obs_rev(obs_rev)?;
         // opp_outcome_mc == 0 is allowed: skips the fused outcome_features_mc
         // pass entirely (zeros the opp-outcome / per-board / share-bound

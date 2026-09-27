@@ -36,18 +36,25 @@
   }
   const d2 = (c) => C().dollars(c);
   const d0 = (c) => (c % 100 ? d2(c) : d2(c).replace(/\.00$/, ""));  // "$100", "$12.50": preset buttons are narrow
-  // The games a table can deal (2026-09-26: PLO6 next to PLO5). The server says which one
-  // a table deals (s.variant / s.game); this is the lobby's copy for the create dialog, the
-  // tags and the club's per-game numbers. Seat limits: one deck, no burn cards (7 x 6 + 10 = 52).
+  // The games a table can deal (2026-09-26: PLO6 next to PLO5; 2026-09-27: PLO67). The
+  // server says which one a table deals (s.variant / s.game); this is the lobby's copy for
+  // the create dialog, the tags and the club's per-game numbers. Seat limits: one deck
+  // (7 x 6 + 10 = 52; PLO67 reserves seven cards a player + 10 + 3 face-up burns = 48 at 5).
   const GAMES = {
     plo5: { label: "PLO5", name: "PLO5 double-board bomb pot", hole: 5, word: "five", maxSeats: 8, seats: [2, 4, 6, 8], graded: true },
     plo6: { label: "PLO6", name: "PLO6 double-board bomb pot", hole: 6, word: "six", maxSeats: 7, seats: [2, 4, 6, 7], graded: false },
+    plo67: { label: "PLO67", name: "PLO67 double-board bomb pot", hole: 7, dealt: 4, burns: 3, word: "four", maxSeats: 5, seats: [2, 3, 4, 5], graded: false },
   };
   const gameOf = (v) => GAMES[v] || GAMES.plo5;
   const gameNote = (v) => {
     const G = gameOf(v), cards = G.word[0].toUpperCase() + G.word.slice(1);
-    return `${cards} cards each, up to ${G.maxSeats} players · ${G.graded ? "every decision graded by the network" : `not graded yet (there is no ${G.label} network)`}`;
+    const deal = G.burns ? `${cards} cards each + one more for every red burn (the burns are dealt face up)` : `${cards} cards each`;
+    return `${deal}, up to ${G.maxSeats} players · ${G.graded ? "every decision graded by the network" : `not graded yet (there is no ${G.label} network)`}`;
   };
+  // PLO67 in one paragraph (the table's info card and the Game guide)
+  const BURN_RULES = "The three burn cards are dealt <b>face up</b>: one before the flops, one before the turns, one before the rivers. " +
+    "Every <b>red</b> burn (diamond or heart) deals everyone still in the hand — all-in players too — one more hole card: " +
+    "4-5 cards on the flop, 4-6 on the turn, up to 7 on the river.";
 
   // ------------------------------------------------------------------ toasts
   function toast(msg, kind, ms) {
@@ -1119,7 +1126,9 @@
     if (cur && cur.id === s.id) renderRail(cur, true);
   }
   function miniCards(list, extra) {
-    return `<span class="mini-cards ${extra || ""}" data-cards="${(list || []).join(",")}"></span>`;
+    // (a PLO67 hand holds up to seven: its row of mini cards tucks together to fit — games.css .many)
+    const many = (list || []).length > 5 ? " many" : "";
+    return `<span class="mini-cards ${extra || ""}${many}" data-cards="${(list || []).join(",")}"></span>`;
   }
   function fillMiniCards(root) {
     root.querySelectorAll(".mini-cards[data-cards]").forEach((m) => {
@@ -1184,7 +1193,26 @@
     const boardN = over ? Math.max(3, (rec.board_a || []).length) : street === "river" ? 5 : street === "turn" ? 4 : 3;
     return { seats, pot, street, next, over, boardN, last: k > 0 ? rec.actions[k - 1] : null };
   }
+  // PLO67: a seat's cards on the street being replayed (0 flop, 1 turn, 2 river): the
+  // first `counts[i]` of its cards in the order they came, shown high to low — or that
+  // many face down for a hand the viewer may not see. Other games: the stored hand.
+  function replayHole(x, rec, boardN) {
+    const i = Math.max(0, Math.min(2, boardN - 3));
+    const counts = x.counts || null, n = counts ? counts[i] : (x.hole ? x.hole.length : rec.hole_count || 5);
+    if (x.hole_seq && x.hole_seq.length) return x.hole_seq.slice(0, n).sort((a, b) => b - a);
+    if (x.hole && x.hole.length && x.hole[0] >= 0 && !counts) return x.hole;
+    return Array(n).fill("x");
+  }
 
+  // "turn · burn 7♦, everyone in gets a card" — PLO67's face-up burn of a street (else "")
+  const cardName = (c) => "23456789TJQKA"[Math.floor(c / 4)].replace("T", "10") + "♣♦♥♠"[c % 4];
+  function burnNote(rec, street) {
+    const j = { flop: 0, turn: 1, river: 2 }[String(street).toLowerCase()];
+    const b = j == null ? null : (rec.burns || [])[j];
+    if (b == null) return "";
+    const red = b % 4 === 1 || b % 4 === 2;
+    return ` <span class="burn-note ${red ? "red" : ""}">· burn ${cardName(b)}${red ? " — everyone in gets a card" : ""}</span>`;
+  }
   async function openHand(gid, no) {
     let rec;
     try { rec = await C().j(`/games/api/tables/${gid}/hands/${no}`); } catch (e) { return toast(e.message, "err"); }
@@ -1219,15 +1247,18 @@
         const p = st.seats[x.seat];
         const acting = st.next && st.next.seat === x.seat;
         const known = x.hole && x.hole.length && x.hole[0] >= 0;
-        const cards = p.folded && !known ? "" : `<span class="mini-cards" data-cards="${known ? x.hole.join(",") : Array(rec.hole_count || 5).fill("x").join(",")}"></span>`;
+        const cards = p.folded && !known ? "" : `<span class="mini-cards" data-cards="${replayHole(x, rec, st.boardN).join(",")}"></span>`;
         const res = st.over ? `<b class="num ${x.delta_cents > 0 ? "pos" : x.delta_cents < 0 ? "neg" : "muted"}">${x.delta_cents > 0 ? "+" : ""}${d2(x.delta_cents)}</b>` : "";
         html += `<div class="rp-seat ${p.folded ? "folded" : ""} ${acting ? "acting" : ""}" style="left:${px}%;top:${py}%">${cards}` +
           `<div class="rp-plate">${avatar(x.name, x.name, "sm", x.avatar)}<div><b>${esc(names[x.seat])}${x.seat === rec.button ? ' <i class="rp-d">D</i>' : ""}</b><span class="num">${d2(Math.max(0, p.stack))}</span></div></div>` +
           (p.bet > 0 ? `<span class="rp-bet num">${d2(p.bet)}</span>` : "") + res + `</div>`;
       });
+      // PLO67: the burns turned up by this street (a red one dealt everyone still in a card)
+      const burns = (rec.burns || []).slice(0, Math.max(0, st.boardN - 2));
       html += `<div class="rp-center"><span class="rp-pot num">Pot ${d2(st.pot)}</span>` +
         `<span class="mini-cards" data-cards="${(rec.board_a || []).slice(0, st.boardN).join(",")}"></span>` +
-        `<span class="mini-cards" data-cards="${(rec.board_b || []).slice(0, st.boardN).join(",")}"></span></div>`;
+        `<span class="mini-cards" data-cards="${(rec.board_b || []).slice(0, st.boardN).join(",")}"></span>` +
+        (burns.length ? `<span class="rp-burns" title="Burn cards, face up: a red one deals everyone still in the hand another card"><small>Burns</small><span class="mini-cards" data-cards="${burns.join(",")}"></span></span>` : "") + `</div>`;
       const felt = q("rp-felt");
       felt.innerHTML = html;
       fillMiniCards(felt);
@@ -1250,8 +1281,13 @@
     // action list (click = jump to just after that action)
     let list = "", street = null;
     (rec.actions || []).forEach((a2, i) => {
-      if (a2.street !== street) { street = a2.street; list += `<div class="log-street">${esc(street)}</div>`; }
+      if (a2.street !== street) { street = a2.street; list += `<div class="log-street">${esc(street)}${burnNote(rec, street)}</div>`; }
       list += `<button type="button" class="log-row k-${kindOfAction(a2)}" data-i="${i}"><span class="nm">${esc(names[a2.seat] || "?")}</span><span class="lb">${esc(a2.label)}</span>${gradeChip(gradeAt[i], true)}</button>`;
+    });
+    // PLO67: a street run out with nobody to act still turned its burn up (and dealt the cards)
+    const seenStreets = new Set((rec.actions || []).map((x) => String(x.street).toLowerCase()));
+    ["flop", "turn", "river"].slice(0, (rec.burns || []).length).forEach((st) => {
+      if (!seenStreets.has(st)) list += `<div class="log-street">${st}${burnNote(rec, st)}</div>`;
     });
     q("rp-list").innerHTML = list || `<div class="muted">No betting — everyone was all-in from the ante.</div>`;
     q("rp-list").addEventListener("click", (e) => { const r = e.target.closest(".log-row"); if (r) go(Number(r.dataset.i) + 1); });
@@ -1795,7 +1831,7 @@
         row("Buy-in", set.min_buyin_cents || set.max_buyin_cents ? `${set.min_buyin_cents ? d2(set.min_buyin_cents) : "any"} – ${set.max_buyin_cents ? d2(set.max_buyin_cents) : "any"}` : "No limits") +
         row("Seats", s.num_seats) + row("Decision time", s.decision_secs ? s.decision_secs + "s" : "No clock") + row("Time bank", set.time_bank_secs ? set.time_bank_secs + "s per player" : "Off") +
         row("Next hand", set.deal_delay_secs ? `dealt automatically after ${set.deal_delay_secs}s` : "dealt manually") + row("Rabbit hunt", set.allow_rabbit ? "Allowed" : "Off") + row("Lobby", set.listed ? "Listed" : "Link only") + `</div>` +
-        `<div class="grp"><h4>How a hand works</h4><p style="margin:0;color:var(--tx-2);font-size:13px;line-height:1.5">Everyone dealt in posts the ante — no blinds. You get ${gameOf(s.variant).word} cards and the hand starts on the flop with <b>two boards</b>. Betting is pot-limit. At showdown each board awards half the pot to the best hand using exactly two hole cards and three board cards.${gameOf(s.variant).graded ? "" : ` ${gameOf(s.variant).label} decisions are not graded — there is no ${gameOf(s.variant).label} network yet.`}</p></div>`,
+        `<div class="grp"><h4>How a hand works</h4><p style="margin:0;color:var(--tx-2);font-size:13px;line-height:1.5">Everyone dealt in posts the ante — no blinds. You get ${gameOf(s.variant).word} cards and the hand starts on the flop with <b>two boards</b>. ${gameOf(s.variant).burns ? BURN_RULES + " " : ""}Betting is pot-limit. At showdown each board awards half the pot to the best hand using exactly two hole cards and three board cards.${gameOf(s.variant).graded ? "" : ` ${gameOf(s.variant).label} decisions are not graded — there is no ${gameOf(s.variant).label} network yet.`}</p></div>`,
       buttons: [{ label: "Copy invite link", cls: "", onClick: () => { copyInvite(s.id); return false; } }, { label: "Done", cls: "primary" }],
     });
   }

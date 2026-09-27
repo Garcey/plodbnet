@@ -749,6 +749,36 @@ later.
   untrained, so those hands are never graded; a trained PLO6 net would be wired
   in through `homegame.GAMES["plo6"]["graded"]` + a PLO6 `grade_hand` model.
 
+### PLO67 (`plo67_double_bomb`, 2026-09-27 — the owner's friends' format)
+
+PLO double-board bomb pot with FOUR hole cards and the three burn cards dealt
+FACE UP (one before the flops, turns, rivers). Every RED burn (diamond or heart)
+deals every seat still in the hand — all-in seats too, folded / sitting-out seats
+not — one more hole card: 4-5 on the flop, 4-6 on the turn, 4-7 on the river.
+Exactly 2 hole + 3 board per board, as ever. Home games only (serial engine).
+
+- Engine (`state.rs` / `engine.rs`): `Variant::hole_count` = cards at the DEAL (4),
+  `hole_slots` = the most a seat can hold (7 — every other variant: `hole_count`),
+  `burn_count` (3, else 0), `max_seats` = (52 - 10 - burns) / slots = **5**,
+  `cards_needed(n)`. Deal order extends the contract (unchanged for the others):
+  `hole_slots` per seat INDEX (a seat's slots past `hole_count` are its reserved
+  extras, `GameState.extra_holes`, handed out front first), board A, board B, then
+  the burns (`full_burns`). `reveal_burn` runs before a street's board cards —
+  at the deal for the flop, in `close_round_or_run_out` for the turn / river (so
+  run-outs deal extras too); a fold-out turns up no more burns (`burns` = those
+  seen). `hole_count_on(seat, street)` = 4 + min(red burns up to that street,
+  extras received) — a seat's extras are a prefix of the red burns. `payouts_ev`
+  returns the actual deal for PLO67 (undealt burns change the HANDS). Every PLO
+  evaluator takes 4..=7 hole cards (`PAIRS_7`, `plo_pairs`, `MAX_PLO_HOLE`) —
+  exact for the other variants (pinned vs brute force). The batched engine
+  refuses PLO67 (fixed-width packers; nothing trains it).
+- Bindings: `observation_dict()["burns"]`, `burns()`, `all_burns()` (reveal
+  accessor — the rabbit), `hole_count_on(seat, street)`, and the pyfunction
+  `plo67_runout_equities(holes, board_a, board_b, dead, samples, seed)`: Monte
+  Carlo whole runouts dealt the game's way (burn, a card to every hand if red,
+  a card per board), ~10 ms / 3000 samples; pinned against the engine's own
+  deals (`runout_equities_match_the_engine_deal_distribution`).
+
 ## NLH variant (`nlh_single`)
 
 The engine/trainer serve a second game: single-board no-limit hold'em —
@@ -1063,9 +1093,11 @@ Two drivers in `python/plo5bp/rollout.py`:
   `BombPotEnv.reset_with_deck`): the seeded deal IS this with
   `Deck::new_shuffled(seed)` — bit-identical observations and payouts, pinned
   by `tests/python/test_reset_with_deck.py` and a Rust test. Deal order is a
-  public contract the home games' verifiable shuffle depends on: `hole_count`
-  cards per seat INDEX (dealt in or not), seat 0 first, then full board A,
-  then full board B. Do not reorder it.
+  public contract the home games' verifiable shuffle depends on: `hole_slots`
+  cards per seat INDEX (dealt in or not; = `hole_count` for every variant but
+  PLO67, whose slots past the first four are the extras red burns hand out),
+  seat 0 first, then full board A, then full board B, then the burns (PLO67
+  only). Do not reorder it.
 
 ## Config surface
 
@@ -1487,7 +1519,7 @@ Service-layer rules (review 2026-09-20 — keep them):
 **Home games** (`ui/homegame.py`, `static/games.*`, every signed-in user since
 clubs — a club's tables, members and numbers are its members' only; signed out
 = a sign-in page for a browser, the hidden 404 otherwise): PokerNow-style private PLO5 /
-PLO6 double-board tables over `BombPotEnv` (minimal obs, actual payouts, HTTP
+PLO6 / PLO67 double-board tables over `BombPotEnv` (minimal obs, actual payouts, HTTP
 polling, per-table RLock + clock watchdog). Invariants: hole cards are
 revealed only when ≥ 2 hands are live at terminal (an uncontested winner
 stays face-down); "own" cards are shown against the user id DEALT into the
@@ -1546,6 +1578,50 @@ PLO6 tables (2026-09-26 — `tests/python/test_homegame_plo6.py`; owner request)
   ungraded game has no podium and its cards meter hands won; a player's stats
   window opens on the club's game with All games / per-game switch. A new
   per-game aggregate must filter `g.variant` (`_games_played`, `_games_summary`).
+
+PLO67 tables (2026-09-27 — `tests/python/test_homegame_plo67.py`; owner /goal):
+
+- `GAMES["plo67"]`: `hole` 7 (= the shuffle's slots per seat and the view's
+  `hole_count`: the felt is laid out for the widest hand), `dealt` 4, `burns` 3,
+  **5 seats max**, never graded; `PLO67_ON` (the engine has the pyfunction) gates
+  creating one. `game` info carries `dealt` + `burns` for every game.
+- View: `burns` = the burns turned up so far (one per street on the board: the
+  rabbit / an all-in runout reveal them street by street), `burns_played` = how
+  many belonged to the hand (a fold-out's rabbit turns up burns that dealt nobody
+  anything), and per seat `hole_seq` = a hand the viewer may see in DEAL order
+  (the felt animates the card a red burn dealt — display order is sorted). While an
+  all-in runout reveals, every hand shows what it held on the street shown
+  (`_hole_count_on`), and each street waits `BURN_SHOW_S` (1.2 s) longer
+  (`_street_pause`; not when the host set the pause to 0). Equities per street =
+  `_compute_plo67_equities` (the Rust sampler, hands as they were then, shown
+  burns dead) — `board_equities`' per-board marginal does not apply.
+- Record: `burns` (the hand's), per seat `hole_seq` + `counts` [flop, turn,
+  river]; `_hand_for_viewer` hides `hole_seq` with `hole` (counts are public).
+  The replayer shows each seat's first `counts[street]` cards of `hole_seq` (face
+  down: that many backs), the burns so far, and "turn · burn A♦ — everyone in gets
+  a card" street lines (run-out streets included).
+- **Verified shuffle**: `SealedDeck(hole=7, burns=3)`; burn j = slot `7n+10+j`
+  (`fairdeal.burn_slot`; transcripts carry `burns` only when nonzero — PLO5/PLO6
+  unchanged); `hand_id` ends `:plo67`. The browser (`games.fair.js`) allows a hand
+  of m cards only its seat's FIRST m slots (a later extra shown early is refused —
+  for every game, same result for PLO5/PLO6), checks burn slots, and
+  `holeCountProblem`: a live hand holds exactly 4 + the red burns played, a folded
+  one no more; a transcript whose `burns` differ from the table's is refused.
+- **Felt** (`games.table.js` `planBurns` / `presentBurn` / `growCards`, `#burns` in
+  games.html, the PLO67 block at the end of games.css): the burn strip is a column
+  left of the boards (desktop / tablet), a short row under them on an upright phone
+  (a column took the side seats' tabled-row room), a row left of board 1 on a phone
+  on its side. A new burn is shown big over the boards, flipped, captioned ("Red
+  burn · everyone in gets a card" / "Black burn · no card"), then drops into its
+  slot (`BURN_MS`); a red one's cards fly to every live hand after it (`extraAt`)
+  and the street's board cards wait for both (`boardAt`). At a deal the four go out
+  first, then the flop's burn, then (red) the fifth. A growing row keeps its cards
+  (a face-up one slides them aside — FLIP with the translate property) instead of
+  rebuilding. `#stage.h7`: hero cards 0.82x / 0.33 overlap, fans centred per seat
+  (`--mid` inline). Measured with 7-card hands at 375x812 / 375x667 / 768x1024 /
+  812x375 / 1366x768: 0 overlaps (`measure_showdown.js` + the burn strip).
+  History rows tuck 6-7 card hands (`.mini-cards.many`).
+- Club numbers: nothing new — `GAMES` drives the per-game switch / stats.
 
 Premium tables pass (2026-09-21 — `tests/python/test_homegame_premium.py`):
 

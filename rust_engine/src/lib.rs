@@ -34,6 +34,11 @@ fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
         crate::bindings::compute_aggression_bonus_batch,
         m
     )?)?;
+    // PLO67 home-game runouts (face-up burns deal extra hole cards).
+    m.add_function(pyo3::wrap_pyfunction!(
+        crate::bindings::plo67_runout_equities,
+        m
+    )?)?;
     m.add_function(pyo3::wrap_pyfunction!(
         crate::bindings::aggression_record_batch,
         m

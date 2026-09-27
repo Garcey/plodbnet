@@ -132,7 +132,8 @@ def test_a_plo6_table_seats_at_most_seven_and_says_what_it_deals(cast, hg):
     six = _create(host, variant="plo6").json()
     assert six["variant"] == "plo6" and six["hole_count"] == 6 and six["num_seats"] == 7, "7-max by default"
     assert six["game"] == {"code": "plo6", "label": "PLO6", "name": "PLO6 double-board bomb pot", "hole": 6,
-                           "max_seats": 7, "graded": False}
+                           "dealt": 6, "burns": 0, "max_seats": 7, "graded": False}
+    assert six["burns"] == [], "no face-up burns outside PLO67"
     five = _create(host).json()
     assert five["variant"] == "plo5" and five["hole_count"] == 5 and five["num_seats"] == 8, "PLO5 is unchanged"
     assert five["game"]["graded"] is True and five["game"]["max_seats"] == 8
@@ -393,7 +394,7 @@ def test_the_club_keeps_its_numbers_apart_per_game(cast, hg):
     me_all = p[7].get(f"/games/api/my/stats?{q()}").json()
     assert me6["variant"] == "plo6" and me6["hands"] == n6 and me6["net_cents"] == net6
     assert me_all["variant"] is None and me_all["hands"] == n5 + n6 and me_all["net_cents"] == net5 + net6
-    assert {g["code"]: g["hands"] for g in me_all["games"]} == {"plo5": n5, "plo6": n6}
+    assert {g["code"]: g["hands"] for g in me_all["games"]} == {"plo5": n5, "plo6": n6, "plo67": 0}
     assert {s["id"]: s["variant"] for s in me_all["sessions"]} == {five: "plo5", six: "plo6"}
     assert sum(v["net_cents"] for v in me6["versus"]) == net6
     # … and somebody else's, the same way

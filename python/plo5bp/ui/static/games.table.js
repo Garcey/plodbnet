@@ -22,13 +22,22 @@
   // room of a five-card one, so the tuned layout holds: the hero's cards are 10% smaller
   // and overlap a little more, a face-down fan tucks tighter, a tabled row starts tighter.
   // (keep in step with the #stage.h6 variables in games.css)
+  // PLO67 (2026-09-27) holds 4 to 7: the table is laid out for its widest hand (seven
+  // cards, 18% smaller, a third of each tucked under the next — #stage.h7) and every
+  // row shows what the hand holds now.
   const ROW = {
     5: { heroK: 1, heroOv: 0.24, openOv: 0.3, openMax: 0.56 },
     6: { heroK: 0.9, heroOv: 0.28, openOv: 0.4, openMax: 0.6 },
+    7: { heroK: 0.82, heroOv: 0.33, openOv: 0.45, openMax: 0.62 },
   };
-  const rowOf = (n) => ROW[n >= 6 ? 6 : 5];
+  const rowOf = (n) => ROW[n >= 7 ? 7 : n >= 6 ? 6 : 5];
+  // PLO67's face-up burns: how long one is presented (big card, flip, into its slot),
+  // then the card a red one deals every hand still in, then the street's board cards.
+  const BURN_MS = 1150, EXTRA_MS = 520;
+  const isRed = (c) => c % 4 === 1 || c % 4 === 2;
   const T = {
-    ready: false, tableId: null, n: 0, hero: 0, seated: false, hole: 5,
+    ready: false, tableId: null, n: 0, hero: 0, seated: false, hole: 5, dealt: 5, burnN: 0,
+    burnSlots: [], burnCards: [],
     seats: [], bets: [], geom: null, boards: { a: [], b: [] },
     boardCards: { a: [], b: [] }, heroCards: [], potCents: null,
     awardKey: null, foldoutKey: null, handNo: null, chatSeen: null, reactSeen: 0,
@@ -184,6 +193,8 @@
     fixed.push([g.cx - potHalf - u * 8.4, pot[1], g.cx - potHalf, pot[3]]); // the street total, left of the pot
     if (!g.portrait && !g.wide) fixed.push([g.cx + potHalf, pot[1], g.cx + potHalf + u * 9, pot[3]]); // the street tag, right of it
     fixed.push(boards);
+    const burnBox = $("burns");  // (PLO67: the burn strip hangs outside the boards' box)
+    if (burnBox && !burnBox.hidden && burnBox.offsetWidth) fixed.push(rectOf(burnBox));
     if (g.portrait) fixed.push([g.cx - u * 5, boards[3] + u * 0.5, g.cx + u * 5, boards[3] + u * 2.6]); // street tag
     const heroV = T.seated ? T.seats[T.hero] : null;
     let heroCards = null;
@@ -328,7 +339,8 @@
       const lo = (n % 2 === 0 || g.wide ? g.cy - H / 2 + seatBottom(g.u) + betRoom : g.fy + g.u * 2) + ch / 2;
       const cardsTop = g.wide ? g.h - g.u * (1 + g.heroCw * 1.38) : g.cy + H / 2 - g.u * (3.5 + g.heroCw * 1.38);
       // under the boards: the hero's bet, or (at showdown) the award caption — whichever is taller
-      const underRoom = Math.max(betRoom, captionHeight(g) + g.u * (g.portrait ? 3.4 : 1.4));
+      // (upright PLO67: the burn row takes the street tag's line; the caption sits 1.7 u lower — games.css)
+      const underRoom = Math.max(betRoom, captionHeight(g) + g.u * (g.portrait ? (T.burnN ? 5.1 : 3.4) : 1.4));
       const hi = (T.seated ? cardsTop - underRoom : g.fy + g.fh - g.u * 2) - ch / 2;
       centerY = lo <= hi ? Math.max(lo, Math.min(hi, centerY)) : (lo + hi) / 2;
     }
@@ -395,7 +407,7 @@
     if (!g || !T.seats.length) return;
     const st = $("stage").getBoundingClientRect();
     const blocks = [];
-    for (const id of ["boards", "pots", "pot-row", "street-tag"]) {
+    for (const id of ["boards", "pots", "pot-row", "street-tag", "burns"]) {
       const e = $(id);
       if (!e || e.hidden || !e.offsetWidth) continue;
       const r = e.getBoundingClientRect();
@@ -515,8 +527,22 @@
   function build(s) {
     T.tableId = s.id; T.n = s.num_seats; T.hero = s.hero_seat || 0;
     T.seated = s.my_seat != null;
-    T.hole = s.hole_count || 5;  // (the table's game: PLO5 deals five, PLO6 six)
-    $("stage").classList.toggle("h6", T.hole >= 6);
+    T.hole = s.hole_count || 5;  // (the table's game: PLO5 deals five, PLO6 six, PLO67 up to seven)
+    T.dealt = (s.game && s.game.dealt) || T.hole;
+    T.burnN = (s.game && s.game.burns) || 0;
+    $("stage").classList.toggle("h6", T.hole === 6);
+    $("stage").classList.toggle("h7", T.hole >= 7);
+    $("stage").classList.toggle("burny", T.burnN > 0);
+    const bh = $("burns");  // PLO67: one slot per face-up burn (flop, turn, river)
+    bh.querySelectorAll(".slot-card").forEach((x) => x.remove());
+    T.burnSlots = []; T.burnCards = [];
+    for (let j = 0; j < T.burnN; j++) {
+      const slot = el("div", "slot-card");
+      slot.dataset.street = ["Flop", "Turn", "River"][j] || "";
+      bh.appendChild(slot);
+      T.burnSlots.push(slot);
+    }
+    bh.hidden = !T.burnN;
     const seatsEl = $("seats"), betsEl = $("bets");
     seatsEl.innerHTML = ""; betsEl.innerHTML = ""; $("fx").innerHTML = "";
     T.seats = []; T.bets = [];
@@ -834,8 +860,13 @@
     }
     const wasOpen = host.classList.contains("open");
     if (wasOpen !== open) { host.classList.toggle("open", open); placeCards(sv); }
-    // a NEW hand always gets freshly dealt cards (never last hand's, flipped back)
-    if (ctx.dealing || sv.cardEls.length !== hole.length) {
+    // PLO67: a red burn dealt this hand one more card — add it, keep the others
+    const grows = !ctx.dealing && T.burnN > 0 && sv.cardEls.length > 0 && hole.length > sv.cardEls.length && wasOpen === open;
+    if (grows) {
+      growCards(host, sv.cardEls, hole, open, ctx, T.geom ? [T.geom.cx - sv.x, T.geom.cy - sv.y] : null, sv.rel);
+      sv.cardEls = Array.from(host.children);
+    } else if (ctx.dealing || sv.cardEls.length !== hole.length) {
+      // a NEW hand always gets freshly dealt cards (never last hand's, flipped back)
       sv.cardEls.forEach((c) => c.remove());
       sv.cardEls = hole.map((c, k) => {
         const ce = cardEl(-1);
@@ -843,19 +874,57 @@
         if (ctx.dealing && T.geom) {
           ce.style.setProperty("--fx", T.geom.cx - sv.x + "px");
           ce.style.setProperty("--fy", T.geom.cy - sv.y + "px");
-          ce.style.animationDelay = (sv.rel * T.hole + k) * 24 + "ms";
+          // (PLO67: a red flop burn's card comes after the burn has been shown)
+          ce.style.animationDelay = (k >= T.dealt ? ctx.extraAt + sv.rel * 60 : (sv.rel * T.dealt + k) * 24) + "ms";
           ce.classList.add("deal-in");
         }
         host.appendChild(ce);
         return ce;
       });
     }
+    if (T.burnN) host.style.setProperty("--mid", String((hole.length - 1) / 2));  // (the fan's middle card)
     hole.forEach((c, k) => {
       const ce = sv.cardEls[k];
-      if (c >= 0 && ce.dataset.c !== String(c) && ctx.animate) {
+      if (c >= 0 && ce.dataset.c !== String(c) && ctx.animate && !ce._fresh) {
         setTimeout(() => setCard(ce, c), 60 + k * 70);
         if (k === 0) play("flip");
       } else setCard(ce, c);
+      ce._fresh = false;
+    });
+  }
+
+  // PLO67: `hole` holds the row's cards plus the ones a red burn just dealt. A face-up
+  // row keeps each card where the new order puts it and slides the others aside as the
+  // new one flies in (after the burn has been shown); a face-down row just grows.
+  // `from` = where the dealer's cards come from, relative to the row's seat.
+  function growCards(host, els, hole, open, ctx, from, rel) {
+    const at = ctx.extraAt + (rel || 0) * 60;
+    const before = new Map(els.map((e) => [e, e.getBoundingClientRect().left]));
+    const pool = els.slice();
+    const out = hole.map((c, k) => {
+      let ce = open ? pool.find((e) => e.dataset.c === String(c)) : pool[0];
+      if (ce && (open || k < els.length)) { pool.splice(pool.indexOf(ce), 1); return ce; }
+      ce = cardEl(c);
+      ce._fresh = true;
+      if (ctx.animate && from) {
+        ce.style.setProperty("--fx", from[0] + "px");
+        ce.style.setProperty("--fy", from[1] + "px");
+        ce.style.animationDelay = at + "ms";
+        ce.classList.add("deal-in");
+        setTimeout(() => play("deal"), at);
+      }
+      return ce;
+    });
+    pool.forEach((e) => e.remove());  // (a card the new hand no longer holds: never in PLO67)
+    out.forEach((ce, k) => { ce.style.setProperty("--i", String(k)); host.appendChild(ce); });
+    if (!ctx.animate) return;
+    // FLIP: the cards that were there wait for the burn, then slide to their new places
+    out.forEach((ce) => {
+      const x0 = before.get(ce);
+      if (x0 == null) return;
+      const dx = x0 - ce.getBoundingClientRect().left;
+      if (Math.abs(dx) < 0.5) return;
+      ce.animate([{ translate: `${dx}px 0` }, { translate: "0 0" }], { duration: 320, delay: at, easing: "cubic-bezier(.3,.6,.25,1)", fill: "backwards" });
     });
   }
 
@@ -870,20 +939,33 @@
     }
     const key = hole.join(",");
     if (host.dataset.k !== key) {
+      const was = (host.dataset.k || "").split(",").filter(Boolean);
       host.dataset.k = key;
-      T.heroCards.forEach((c) => c.remove());
-      T.heroCards = hole.map((c, k) => {
-        const ce = cardEl(ctx.dealing ? -1 : c);
-        if (ctx.dealing) {
-          ce.style.setProperty("--fx", "0px");
-          ce.style.setProperty("--fy", `calc(var(--u) * -22)`);
-          ce.style.animationDelay = k * 70 + "ms";
-          ce.classList.add("deal-in");
-          setTimeout(() => setCard(ce, c), 380 + k * 80);
-        }
-        host.appendChild(ce);
-        return ce;
-      });
+      const grows = !ctx.dealing && T.burnN > 0 && T.heroCards.length > 0 && hole.length > T.heroCards.length &&
+        was.every((c) => hole.includes(Number(c)));
+      if (grows) {
+        // PLO67: the red burn's card joins your hand (in its place in the order)
+        growCards(host, T.heroCards, hole, true, ctx, [0, -(T.geom ? T.geom.u * 22 : 120)], 0);
+        T.heroCards = Array.from(host.children);
+      } else {
+        // (PLO67: the card a red flop burn deals comes after the burn is shown)
+        const extras = new Set(me.hole_seq && T.burnN ? me.hole_seq.slice(T.dealt) : []);
+        T.heroCards.forEach((c) => c.remove());
+        let d = 0;
+        T.heroCards = hole.map((c, k) => {
+          const ce = cardEl(ctx.dealing ? -1 : c);
+          if (ctx.dealing) {
+            const late = extras.has(c), at = late ? ctx.extraAt : d++ * 70;
+            ce.style.setProperty("--fx", "0px");
+            ce.style.setProperty("--fy", `calc(var(--u) * -22)`);
+            ce.style.animationDelay = at + "ms";
+            ce.classList.add("deal-in");
+            setTimeout(() => setCard(ce, c), at + 380 + (late ? 0 : k * 10));
+          }
+          host.appendChild(ce);
+          return ce;
+        });
+      }
     }
     host.classList.toggle("folded", !!me.folded);
   }
@@ -895,7 +977,8 @@
     return out;
   }
   function updateBoards(s, ctx) {
-    let delayBase = ctx.collected ? 380 : 0;
+    // (PLO67: a street's cards come after its burn — and the card a red one deals)
+    let delayBase = Math.max(ctx.collected ? 380 : 0, ctx.boardAt || 0);
     let flipped = 0;
     for (const k of ["a", "b"]) {
       const cards = s.phase === "waiting" ? [] : boardList(s.board[k]);
@@ -924,6 +1007,75 @@
     const label = s.phase === "waiting" ? "" : s.phase === "showdown" ? (s.runout.active ? (s.runout.blocking && (s.runout.shown_len || 0) < 5 ? (s.street || "") : "Showdown") : "") : (s.street || "");
     if (tag.textContent !== label) tag.textContent = label;
     return flipped;
+  }
+
+  // --------------------------------------------------------------- the burns
+  // PLO67: the burn cards come FACE UP, one before each street's board cards. A new
+  // burn is shown big over the boards and flipped, then drops into its slot beside
+  // them; a red one says so, and every hand still in gets one more card (the seat rows
+  // above animate that). Returns [when the extra cards fly, when the board cards come]
+  // in ms from now, so the rest of the render can wait for it.
+  function planBurns(s, prev, ctx) {
+    if (!T.burnN) return [0, 0];
+    const cards = s.phase === "waiting" ? [] : s.burns || [];
+    const played = Number.isInteger(s.burns_played) ? s.burns_played : cards.length;
+    const cur = T.burnCards;
+    const same = cards.length >= cur.length && cur.every((c, j) => c === cards[j]);
+    if (!same) { T.burnSlots.forEach((slot) => { slot.innerHTML = ""; }); T.burnCards = []; }
+    const have = T.burnCards.length;
+    // the hole cards go out first when a hand is dealt
+    let t = ctx.dealing ? (s.seats.filter((x) => x.in_hand).length * T.dealt) * 24 + 420 : ctx.collected ? 380 : 0;
+    let red = false;
+    for (let j = have; j < cards.length; j++) {
+      const c = cards[j], slot = T.burnSlots[j];
+      if (!slot) continue;
+      const ce = cardEl(c);  // (hidden until the presented burn lands on it)
+      if (ctx.animate) ce.style.opacity = "0";
+      slot.appendChild(ce);
+      if (ctx.animate) {
+        presentBurn(slot, ce, c, t, j >= played);
+        t += BURN_MS;
+        if (isRed(c) && j < played) red = true;
+      }
+    }
+    T.burnCards = cards.slice();
+    T.burnSlots.forEach((slot, j) => {
+      slot.classList.toggle("red", j < cards.length && isRed(cards[j]) && j < played);
+      slot.classList.toggle("rabbit", j < cards.length && j >= played);
+    });
+    if (!ctx.animate || cards.length === have) return [0, 0];
+    return [t, t + (red ? EXTRA_MS : 0)];
+  }
+  function presentBurn(slot, slotCard, c, delay, rabbit) {
+    const fx = $("fx"), g = T.geom;
+    if (!g) { slotCard.style.opacity = ""; return; }
+    setTimeout(() => {
+      if (!slotCard.isConnected) return;
+      const [bx, by] = centerOf($("boards")), [sx, sy] = centerOf(slot);
+      const big = cardEl(-1, "burn-show");
+      big.style.left = bx + "px";
+      big.style.top = by + "px";
+      fx.appendChild(big);
+      const red = isRed(c) && !rabbit;
+      const cap = el("div", "burn-cap" + (red ? " red" : ""));
+      cap.textContent = rabbit ? "Burn" : red ? "Red burn · everyone in gets a card" : "Black burn · no card";
+      cap.style.left = bx + "px";
+      cap.style.top = by + "px";
+      fx.appendChild(cap);
+      play("flip");
+      setTimeout(() => { setCard(big, c); if (red) big.classList.add("red"); }, 200);
+      const w = big.getBoundingClientRect().width || g.u * 8, sw = slot.getBoundingClientRect().width || g.u * 3;
+      // (each phase eases on its own: an effect-wide curve squeezed the moment it is shown)
+      const a = big.animate([
+        { transform: "translate(-50%, -50%) scale(0.35)", opacity: 0, easing: "cubic-bezier(.2,.8,.3,1)" },
+        { transform: "translate(-50%, -50%) scale(1)", opacity: 1, offset: 0.16 },
+        { transform: "translate(-50%, -50%) scale(1)", opacity: 1, offset: 0.64, easing: "cubic-bezier(.5,0,.25,1)" },
+        { transform: `translate(calc(-50% + ${sx - bx}px), calc(-50% + ${sy - by}px)) scale(${sw / w})`, opacity: 1 },
+      ], { duration: BURN_MS - 120, fill: "forwards" });
+      cap.animate([{ opacity: 0 }, { opacity: 1, offset: 0.2 }, { opacity: 1, offset: 0.75 }, { opacity: 0 }], { duration: BURN_MS + 500, fill: "forwards" });
+      a.onfinish = a.oncancel = () => { big.remove(); slotCard.style.opacity = ""; slot.classList.add("landed"); setTimeout(() => slot.classList.remove("landed"), 600); };
+      setTimeout(() => cap.remove(), BURN_MS + 600);
+    }, delay);
   }
 
   // ------------------------------------------------------------- pot + bets
@@ -1334,7 +1486,8 @@
       if (globalThis.ResizeObserver) { T.ro = new ResizeObserver(() => { layout(); if (HG.core.G.state) placeRabbit(HG.core.G.state); }); T.ro.observe($("stage-box")); }
       else globalThis.addEventListener("resize", layout);
     }
-    const rebuilt = T.tableId !== s.id || T.n !== s.num_seats || T.hero !== (s.hero_seat || 0) || T.seated !== (s.my_seat != null) || T.hole !== (s.hole_count || 5);
+    const rebuilt = T.tableId !== s.id || T.n !== s.num_seats || T.hero !== (s.hero_seat || 0) || T.seated !== (s.my_seat != null) || T.hole !== (s.hole_count || 5)
+      || T.burnN !== ((s.game && s.game.burns) || 0);
     if (rebuilt) build(s);
     const samePrev = !!prev && prev.id === s.id && !rebuilt;
     const animate = samePrev && anim() && !document.hidden;
@@ -1362,9 +1515,10 @@
         setTimeout(() => play(k === "fold" ? "fold" : k === "check" ? "check" : k === "allin" ? "allin" : "chip"), j * 120);
       });
     }
-    if (ctx.dealing) { for (let j = 0; j < T.hole; j++) setTimeout(() => play("deal"), j * 95); }
+    if (ctx.dealing) { for (let j = 0; j < T.dealt; j++) setTimeout(() => play("deal"), j * 95); }
 
     ctx.collected = updateMoney(s, prev, ctx);
+    [ctx.extraAt, ctx.boardAt] = planBurns(s, prev, ctx);  // (PLO67; [0, 0] otherwise)
     s.seats.forEach((seat, i) => updateSeat(i, seat, s, ctx));
     updateHero(s, ctx);
     updateBoards(s, ctx);

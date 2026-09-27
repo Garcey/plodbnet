@@ -407,3 +407,39 @@ def board_equities(
         for s, v in shares.items():
             out[s][key] = round(v, 4)
     return out
+
+
+# --- PLO67 all-in equity ------------------------------------------------------
+#
+# PLO67 deals its burn cards face up and every red one gives each hand still in
+# one more card, so the cards still to come change the HANDS too, not only the
+# boards: no per-board marginal enumeration applies. The engine samples whole
+# runouts the way the game deals them (burn, then a card to every hand if it is
+# red, then one card per board — `rust_engine/src/engine.rs:
+# plo67_runout_equities`, pinned there against the engine's own deals).
+
+
+def plo67_equities(
+    holes: dict[int, list[int]],
+    board_a: list[int],
+    board_b: list[int],
+    burns: list[int],
+    *,
+    samples: int = 3000,
+    seed: int = 0,
+) -> dict[int, dict[str, float]]:
+    """``board_equities`` for PLO67: each ALIVE seat's share of each board
+    (0..1) given its hole cards NOW, the boards so far and the burns turned up
+    (dead cards). Deterministic from ``seed``; exact once both boards are
+    complete."""
+    from plo5bp import _engine
+
+    seats = sorted(holes)
+    if not seats:
+        return {}
+    eq = _engine.plo67_runout_equities(
+        [[int(c) for c in holes[s]] for s in seats],
+        [int(c) for c in board_a], [int(c) for c in board_b], [int(c) for c in burns],
+        int(samples), int(seed) & 0xFFFFFFFFFFFFFFFF,
+    )
+    return {s: {"a": round(float(a), 4), "b": round(float(b), 4)} for s, (a, b) in zip(seats, eq)}

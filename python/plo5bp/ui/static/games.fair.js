@@ -127,18 +127,43 @@
   }
   // every card on a state payload, with the slots it is allowed to come from. The
   // slot map: seat s's hole cards are slots h*s .. h*s+h-1 (h = hole cards per
-  // player: 5 in PLO5, 6 in PLO6 — the table's game), board A h*n.., board B h*n+5..
+  // player: 5 in PLO5, 6 in PLO6, 7 in PLO67 — the table's game), board A h*n..,
+  // board B h*n+5.., PLO67's face-up burns h*n+10.. (flop, turn, river). A hand of
+  // m cards holds its seat's FIRST m slots: PLO67 deals four and then the next slot
+  // at every red burn, so a card shown early from a later slot is refused.
   const holeOf = (s) => (s && Number.isInteger(s.hole_count) && s.hole_count > 0 ? s.hole_count : 5);
+  const burnsOf = (s) => (s && s.game && Number.isInteger(s.game.burns) ? s.game.burns : 0);
   function visibleCards(s) {
     const out = [], n = s.num_seats, h = holeOf(s);
-    (s.seats || []).forEach((seat, i) => (seat.hole || []).forEach((c) => {
-      if (Number.isInteger(c) && c >= 0) out.push([c, Array.from({ length: h }, (_, k) => h * i + k)]);
-    }));
+    (s.seats || []).forEach((seat, i) => {
+      const hole = seat.hole || [], m = Math.min(h, hole.length);
+      hole.forEach((c) => {
+        if (Number.isInteger(c) && c >= 0) out.push([c, Array.from({ length: m }, (_, k) => h * i + k)]);
+      });
+    });
     [["a", 0], ["b", 5]].forEach(([k, off]) => {
       const bd = (s.board || {})[k] || {};
       (bd.flop || []).concat([bd.turn, bd.river]).forEach((c, m) => { if (Number.isInteger(c) && c >= 0) out.push([c, [h * n + off + m]]); });
     });
+    (s.burns || []).forEach((c, j) => { if (Number.isInteger(c) && c >= 0) out.push([c, [h * n + 10 + j]]); });
     return out;
+  }
+  // PLO67: a hand still in holds exactly its four + one card per red burn shown
+  // (a folded one no more than that) — so no extra card was dealt on a black burn
+  // and none held back on a red one. The reason it breaks the rule, else null.
+  const isRed = (c) => c % 4 === 1 || c % 4 === 2;
+  function holeCountProblem(s) {
+    if (!burnsOf(s)) return null;
+    // (a fold-out's rabbit turns up burns that came after the hand: they dealt nobody)
+    const burns = (s.burns || []).slice(0, Number.isInteger(s.burns_played) ? s.burns_played : undefined);
+    const dealt = (s.game && s.game.dealt) || 4, red = burns.filter(isRed).length;
+    for (const seat of s.seats || []) {
+      const hole = seat.hole || [];
+      if (!hole.length || !seat.in_hand) continue;
+      if (seat.folded ? hole.length > dealt + red : hole.length !== dealt + red)
+        return `seat ${seat.seat + 1} holds ${hole.length} cards after ${red} red burn${red === 1 ? "" : "s"}`;
+    }
+    return null;
   }
 
   // ------------------------------------------------------------ device memory
@@ -199,6 +224,8 @@
   // -------------------------------------------------------------------- check
   function checkCards(s, h, rec) {
     if (!rec.perm) return;
+    const counted = holeCountProblem(s);
+    if (counted) { fail(h.hand_id, rec, counted); return; }
     for (const [card, slots] of visibleCards(s)) {
       if (rec.checked[card]) continue;
       const op = (h.open || {})[String(card)];
@@ -231,6 +258,7 @@
           if (tr.hand_id !== h.hand_id || tr.seal !== h.seal) throw new FairError("the transcript is for a different sealed deck");
           // (the slot map follows the table's game: a transcript for another one is refused)
           if ((tr.hole || 5) !== holeOf(s)) throw new FairError("the transcript deals a different number of hole cards than this table");
+          if ((tr.burns || 0) !== burnsOf(s)) throw new FairError("the transcript's face-up burns do not match this table's game");
           rec.perm = verifyTranscript(tr, mine);
           rec.tr = tr;
           rec.status = mine ? "mine" : (tr.locked || []).length ? "others" : "none";
@@ -347,5 +375,5 @@
   }
 
   HG.fair = { init, onState, openPanel, checkPast, SPEC,
-    __api: { sha, permutation, verifyTranscript, verifyOpening, visibleCards, nonceCommitment, lockOf, cutOf, sealOf, cardCommitment, FairError, F, commit, reveal } };
+    __api: { sha, permutation, verifyTranscript, verifyOpening, visibleCards, holeCountProblem, nonceCommitment, lockOf, cutOf, sealOf, cardCommitment, FairError, F, commit, reveal } };
 })();

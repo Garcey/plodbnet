@@ -92,6 +92,16 @@ pub enum Variant {
     /// rule except each seat is dealt 4 hole cards (classic Omaha hole
     /// width). Deck feasibility: 6 seats × 4 + 10 board = 34 ≤ 52.
     Plo4DoubleBomb,
+    /// PLO67 double-board bomb pot (a home-game format, 2026-09-27): the
+    /// `Plo5DoubleBomb` rules (two boards, pot-limit, ante-only, hands start
+    /// at the flop, exactly-2-hole + 3-board eval) with FOUR hole cards and
+    /// the three burn cards dealt FACE UP — one before the flops, one before
+    /// the turns, one before the rivers. A red burn (diamond or heart) deals
+    /// every seat still in the hand — all-in seats included, folded ones not
+    /// — one more hole card, so a hand holds 4-5 cards on the flop, 4-6 on
+    /// the turn and 4-7 on the river. Deck: 7 reserved hole slots per seat +
+    /// 10 board + 3 burns (5 seats × 7 + 13 = 48 ≤ 52; 6 seats need 55).
+    Plo67DoubleBomb,
     /// No-limit hold'em, single board: 2 hole cards, best-5-of-7
     /// any-combo eval, no-limit cap, SB/BB blinds + per-player ante,
     /// betting starts preflop.
@@ -99,18 +109,42 @@ pub enum Variant {
 }
 
 impl Variant {
+    /// Hole cards each seat holds when the hand is DEALT (PLO67: 4, more
+    /// arrive on red burns — see [`Self::hole_slots`]).
     pub fn hole_count(self) -> usize {
         match self {
-            Variant::Plo4DoubleBomb => 4,
+            Variant::Plo4DoubleBomb | Variant::Plo67DoubleBomb => 4,
             Variant::Plo5DoubleBomb => 5,
             Variant::Plo6DoubleBomb => 6,
             Variant::NlhSingle => 2,
         }
     }
 
+    /// Deck slots reserved per seat INDEX in the deal order = the most hole
+    /// cards a seat can ever hold: PLO67 4 + one per red burn = 7; every
+    /// other variant deals its whole hand up front (`hole_count`).
+    pub fn hole_slots(self) -> usize {
+        match self {
+            Variant::Plo67DoubleBomb => 7,
+            v => v.hole_count(),
+        }
+    }
+
+    /// Burn cards dealt FACE UP, one before each postflop street's cards
+    /// (PLO67: 3). Zero for every other variant (online deals burn nothing).
+    pub fn burn_count(self) -> usize {
+        match self {
+            Variant::Plo67DoubleBomb => 3,
+            _ => 0,
+        }
+    }
+
     pub fn num_boards(self) -> usize {
         match self {
-            Variant::Plo4DoubleBomb | Variant::Plo5DoubleBomb | Variant::Plo6DoubleBomb => 2,
+            Variant::Plo4DoubleBomb
+            | Variant::Plo5DoubleBomb
+            | Variant::Plo6DoubleBomb
+            | Variant::Plo67DoubleBomb => 2,
             Variant::NlhSingle => 1,
         }
     }
@@ -118,7 +152,10 @@ impl Variant {
     pub fn pot_limit(self) -> bool {
         matches!(
             self,
-            Variant::Plo4DoubleBomb | Variant::Plo5DoubleBomb | Variant::Plo6DoubleBomb
+            Variant::Plo4DoubleBomb
+                | Variant::Plo5DoubleBomb
+                | Variant::Plo6DoubleBomb
+                | Variant::Plo67DoubleBomb
         )
     }
 
@@ -128,12 +165,25 @@ impl Variant {
         matches!(self, Variant::NlhSingle)
     }
 
-    /// Most seats one 52-card deck can deal: `hole_count` per seat plus
-    /// five cards per board. PLO4 10, PLO5 8, PLO6 7, NLH 23. A pure deck
-    /// bound — the observation encoders cap tables at 8 seats on their
-    /// own (enforced by the Python `GameConfig`). (review 2026-09-20 C4)
+    /// Most seats one 52-card deck can deal: `hole_slots` per seat plus
+    /// five cards per board plus the burns. PLO4 10, PLO5 8, PLO6 7, PLO67
+    /// 5, NLH 23. A pure deck bound — the observation encoders cap tables
+    /// at 8 seats on their own (enforced by the Python `GameConfig`).
+    /// (review 2026-09-20 C4)
     pub fn max_seats(self) -> usize {
-        (crate::cards::DECK_SIZE - 5 * self.num_boards()) / self.hole_count()
+        (crate::cards::DECK_SIZE - 5 * self.num_boards() - self.burn_count()) / self.hole_slots()
+    }
+
+    /// Cards one hand of `num_seats` seats takes from the deck (every seat
+    /// index gets its `hole_slots`, dealt in or not).
+    pub fn cards_needed(self, num_seats: usize) -> usize {
+        num_seats * self.hole_slots() + 5 * self.num_boards() + self.burn_count()
+    }
+
+    /// A burn card that deals every live seat an extra hole card (PLO67):
+    /// diamonds (suit 1) and hearts (suit 2).
+    pub fn burn_is_red(card: crate::cards::Card) -> bool {
+        matches!(card.suit(), 1 | 2)
     }
 }
 
@@ -218,9 +268,22 @@ pub struct GameState {
     pub stacks: Vec<u64>,
     pub folded: Vec<bool>,
     pub all_in: Vec<bool>,
-    /// Per-seat hole cards, `config.variant.hole_count()` each. Sized by
-    /// what was actually dealt so no reader can see phantom cards.
+    /// Per-seat hole cards, `config.variant.hole_count()` each at the deal
+    /// (PLO67: one more per red burn while the seat is in the hand). Sized
+    /// by what was actually dealt so no reader can see phantom cards.
     pub hole_cards: Vec<Vec<Card>>,
+    /// PLO67: each seat's RESERVED extra hole cards (deal slots
+    /// `hole_count..hole_slots` of its index), handed out front first — one
+    /// per red burn to every seat still in the hand. A handed-out card stays
+    /// listed (it is ALSO in `hole_cards`); the rest were never dealt and
+    /// are never observed. Empty per seat for every other variant.
+    pub extra_holes: Vec<Vec<Card>>,
+    /// PLO67: the three pre-dealt burn cards (flop, turn, river burn).
+    /// Empty for every other variant.
+    pub full_burns: Vec<Card>,
+    /// PLO67: the burns turned face up so far — one per street reached
+    /// (the flop's at the deal). A progressive view of `full_burns`.
+    pub burns: Vec<Card>,
     pub board_a: Vec<Card>,
     pub board_b: Vec<Card>,
     /// Pre-dealt full board A; `board_a` above is a progressive view.
