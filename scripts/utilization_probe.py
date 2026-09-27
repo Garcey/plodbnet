@@ -166,6 +166,7 @@ def build_selfplay_batch(actor, rows, obs_mode="minimal", seed=0,
     import importlib.util
 
     from plo5bp.env_batched import BatchedBombPotEnv
+    from plo5bp.rollout import TRAIN_OPP_OUTCOME_MC  # the full layout's outcome features
     from plo5bp.rollout import _rotate_opp_holes_batch
 
     spec = importlib.util.spec_from_file_location(
@@ -182,7 +183,7 @@ def build_selfplay_batch(actor, rows, obs_mode="minimal", seed=0,
                 (2, 3, 4, 5, 6), 1.0, 300.0, BB, 3 * BB, rng,
                 stack_dist=tier, seats_dist="uniform", variant=variant, sb=0,
             )
-            env = BatchedBombPotEnv(tables, cfg, opp_outcome_mc=0, obs_mode=obs_mode)
+            env = BatchedBombPotEnv(tables, cfg, obs_mode=obs_mode, opp_outcome_mc=TRAIN_OPP_OUTCOME_MC if obs_mode == "full" else 0)
             env.reset_batch(
                 rng.integers(0, 2**63 - 1, size=tables, dtype=np.int64).astype(np.uint64),
                 rng.integers(0, cfg.num_seats, size=tables).astype(np.uint8),

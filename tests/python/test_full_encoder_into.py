@@ -147,3 +147,99 @@ def test_into_argument_validation(monkeypatch) -> None:
         env._be.observation_encoded_into(np.zeros((OBS_DIM, 8), np.float32).T)
     with pytest.raises(ValueError, match="encode_mask"):
         env._be.observation_encoded_into(np.zeros((8, OBS_DIM), np.float32), np.ones(7, bool))
+
+
+# --------------------------------------------------------------------------
+# Packed outputs for the FULL layout (2026-09-26): the in-place full encoders
+# also write the compact packed copy (or only it, out=None), like the minimal
+# ones -- the rollout's uploads gather those packed rows instead of re-reading
+# and packing the ~4.7 KB dense rows.
+# --------------------------------------------------------------------------
+
+from plo5bp.compact_obs import FULL_LAYOUT, pack_rows_np  # noqa: E402
+
+_needs_full_packed = pytest.mark.skipif(
+    not getattr(BatchedEngine, "FULL_INTO_PACKED", False),
+    reason="engine without the full layout's packed in-place outputs",
+)
+
+
+def _assert_full_packed_copy(env: BatchedBombPotEnv, ctx: str) -> None:
+    bits, real = pack_rows_np(env._obs, np.arange(env.n), FULL_LAYOUT)
+    assert np.array_equal(env._obs_bits, bits), f"{ctx}: bits"
+    assert np.array_equal(_bits(env._obs_real), _bits(real)), f"{ctx}: reals"
+
+
+@_needs_full_packed
+@pytest.mark.parametrize("seats,n,seed", [(2, 24, 41), (6, 40, 42)])
+def test_full_env_packed_copy_tracks_every_refresh(seats, n, seed, monkeypatch) -> None:
+    cfg = GameConfig(num_seats=seats, starting_stack=400000, ante=30000, bb=10000)
+    env = _full_env(n, cfg, monkeypatch, into=True)
+    rng = np.random.default_rng(seed)
+    env.reset_batch(
+        rng.integers(0, 2**63 - 1, size=n, dtype=np.int64).astype(np.uint64),
+        rng.integers(0, seats, size=n).astype(np.uint8),
+    )
+    assert env.enable_packed_obs(FULL_LAYOUT) and env.packed_obs() is not None
+    _assert_full_packed_copy(env, "enable")
+    for step in range(40):
+        gates, chips = _legal_actions(env, rng)
+        nt = np.asarray(env._be.apply_hybrid_batch(gates, chips), dtype=bool)
+        if step % 7 == 3:
+            env._refresh(encode_mask=np.zeros(n, dtype=bool))  # all-skipped branch
+        else:
+            env._refresh(encode_mask=~nt)
+        _assert_full_packed_copy(env, f"step {step} refresh")
+        if nt.any():
+            env._be.reset_terminal_batch(
+                rng.integers(0, 2**63 - 1, size=n, dtype=np.int64).astype(np.uint64),
+                rng.integers(0, seats, size=n).astype(np.uint8), nt,
+            )
+            env._refresh_subset(nt)
+            _assert_full_packed_copy(env, f"step {step} refresh_subset")
+
+
+@_needs_full_packed
+@pytest.mark.parametrize("seats,n,seed", [(2, 24, 51), (6, 40, 52)])
+def test_full_env_packed_only_tracks_dense_twin(seats, n, seed, monkeypatch) -> None:
+    cfg = GameConfig(num_seats=seats, starting_stack=400000, ante=30000, bb=10000)
+    lean = _full_env(n, cfg, monkeypatch, into=True)
+    twin = _full_env(n, cfg, monkeypatch, into=True)
+    rng = np.random.default_rng(seed)
+    seeds = rng.integers(0, 2**63 - 1, size=n, dtype=np.int64).astype(np.uint64)
+    buttons = rng.integers(0, seats, size=n).astype(np.uint8)
+    for e in (lean, twin):
+        e.reset_batch(seeds, buttons)
+    assert lean.enable_packed_obs(FULL_LAYOUT, dense=False)
+    assert twin.enable_packed_obs(FULL_LAYOUT)
+    assert np.isnan(lean._obs).all()
+
+    def same(ctx: str) -> None:
+        assert np.array_equal(lean._obs_bits, twin._obs_bits), f"{ctx}: bits"
+        assert np.array_equal(_bits(lean._obs_real), _bits(twin._obs_real)), f"{ctx}: reals"
+        for name in _CACHED:
+            assert np.array_equal(getattr(lean, name), getattr(twin, name)), f"{ctx}: {name}"
+        assert np.isnan(lean._obs).all(), f"{ctx}: dense rows were written"
+
+    same("enable")
+    for step in range(40):
+        gates, chips = _legal_actions(twin, rng)
+        nt = np.asarray(lean._be.apply_hybrid_batch(gates, chips), dtype=bool)
+        assert np.array_equal(nt, np.asarray(twin._be.apply_hybrid_batch(gates, chips), dtype=bool))
+        mask = np.zeros(n, dtype=bool) if step % 7 == 3 else ~nt
+        lean._refresh(encode_mask=mask)
+        twin._refresh(encode_mask=mask)
+        same(f"step {step} refresh")
+        if nt.any():
+            ns = rng.integers(0, 2**63 - 1, size=n, dtype=np.int64).astype(np.uint64)
+            nb = rng.integers(0, seats, size=n).astype(np.uint8)
+            for e in (lean, twin):
+                e._be.reset_terminal_batch(ns, nb, nt)
+                e._refresh_subset(nt)
+            same(f"step {step} refresh_subset")
+    s_lean = lean.reset_batch(seeds, buttons)
+    s_twin = twin.reset_batch(seeds, buttons)
+    assert np.array_equal(_bits(s_lean.obs), _bits(s_twin.obs))
+    same("reset_batch")
+    assert lean.enable_packed_obs(FULL_LAYOUT, dense=True)
+    assert np.array_equal(_bits(lean._obs), _bits(twin._obs))

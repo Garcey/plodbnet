@@ -101,6 +101,15 @@ def _gather_rows(
     _gather_rows_multi([(src, dst)], rows, start)
 
 # Output slabs the Rust flush writes (compact observation storage only).
+def _rust_flush_out(slabs: dict, lo: int, hi: int) -> dict:
+    """The Rust flush's output views of rows [lo, hi): a float16 obs_real slab
+    (obs_real_f16) goes as its uint16 view under "obs_real_f16"."""
+    out = {key: slabs[key][lo:hi] for key in _RUST_FLUSH_OUT_KEYS}
+    if out["obs_real"].dtype == np.float16:
+        out["obs_real_f16"] = out.pop("obs_real").view(np.uint16)
+    return out
+
+
 _RUST_FLUSH_OUT_KEYS = (
     "obs_bits", "obs_real", "gm", "ga", "rc", "sz", "an", "ru", "oh",
     "lp", "glp", "alp", "v", "ret", "adv", "last",
@@ -1632,7 +1641,9 @@ def _obs_spec(
     assert layout.obs_dim == int(obs_dim), (layout.obs_dim, obs_dim)
     return {
         "obs_bits": ((layout.n_bytes,), np.uint8, torch.uint8),
-        "obs_real": ((layout.n_real,), np.float32, torch.float32),
+        # float16 under TrainingConfig.obs_real_f16 (the output slabs only;
+        # the per-step pool and the act-time uploads stay float32).
+        "obs_real": ((layout.n_real,), layout.real_np_dtype, layout.real_torch_dtype),
     }
 
 
@@ -1645,9 +1656,10 @@ def _alloc_obs_pool(
 ) -> dict[str, np.ndarray]:
     """The per-step observation pool (rows appended at decision time, gathered
     into the output slabs at hand end), in the slabs' observation layout."""
+    pool_layout = layout.pool_layout if layout is not None else None
     return {
         key: np.empty((int(cap), *shape), dtype=np_dtype)
-        for key, (shape, np_dtype, _td) in _obs_spec(obs_dim, layout).items()
+        for key, (shape, np_dtype, _td) in _obs_spec(obs_dim, pool_layout).items()
     }
 
 
@@ -1677,7 +1689,11 @@ def _resolve_obs_layout(
     global _WARNED_DENSE_FALLBACK
     if not bool(getattr(train_config, "compact_obs", True)):
         return None
-    layout = layout_for(variant, str(getattr(train_config, "obs_mode", "full")))
+    layout = layout_for(
+        variant,
+        str(getattr(train_config, "obs_mode", "full")),
+        real_f16=bool(getattr(train_config, "obs_real_f16", False)),
+    )
     if layout is not None and not RUST_PACKER_AVAILABLE:
         if not _WARNED_DENSE_FALLBACK:
             print(
@@ -2339,7 +2355,8 @@ def collect_rollout_batched(
     # copies them, see step3c/obs_pack); opponents alternate slots 1 and 2.
     # Compact layout -> rows cross PCIe packed and unpack on the device.
     _step_h2d = _PinnedStepH2D(
-        n_envs, env.obs_dim, device, n_slots=3, layout=obs_layout
+        n_envs, env.obs_dim, device, n_slots=3,
+        layout=obs_layout.pool_layout if obs_layout is not None else None,
     )
     # The env packs every observation as it encodes it (same bytes as
     # pack_rows_into), so the uploads below gather packed rows instead of
@@ -3228,7 +3245,7 @@ def collect_rollout_batched(
                             holes_rot_cache.reshape(n_envs * S, 5 * _hole_w),
                             np.float32(gamma), np.float32(lam),
                             np.float32(retroactive_bonus_c),
-                            {key: slabs[key][wcursor:end] for key in _RUST_FLUSH_OUT_KEYS},
+                            _rust_flush_out(slabs, wcursor, end),
                         )
                         assert written == n_new, (written, n_new)
                         aggr_bonus_steps += int(b_steps)
@@ -3361,6 +3378,11 @@ def collect_rollout_batched(
                         tf = traj_flat
                         obs_idx = tf["obs_idx"][tsel]
                         for key, pool_arr in step_obs_pool.items():
+                            if slabs[key].dtype != pool_arr.dtype:
+                                # float16 slab (obs_real_f16): numpy's
+                                # round-to-nearest-even cast, as the Rust flush.
+                                slabs[key][wcursor:end] = pool_arr[obs_idx]
+                                continue
                             np.take(
                                 pool_arr, obs_idx, axis=0,
                                 out=slabs[key][wcursor:end],

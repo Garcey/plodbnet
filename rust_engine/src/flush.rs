@@ -59,10 +59,51 @@ fn get_rw<'py, T: numpy::Element>(
     Ok(arr)
 }
 
+/// IEEE-754 binary16 bits of `x`, rounded to nearest even -- numpy's
+/// `astype(np.float16)` bit for bit (overflow -> inf, NaN stays NaN).
+/// Half-precision rollout storage (2026-09-26, TrainingConfig.obs_real_f16).
+#[inline]
+pub fn f32_to_f16_bits(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32;
+    let man = b & 0x007f_ffff;
+    if exp == 0xff {
+        return sign | 0x7c00 | if man != 0 { 0x0200 | (man >> 13) as u16 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        let m = man | 0x0080_0000;
+        let shift = (14 - e) as u32;
+        let rem = m & ((1u32 << shift) - 1);
+        let half = 1u32 << (shift - 1);
+        let mut r = m >> shift;
+        if rem > half || (rem == half && (r & 1) == 1) {
+            r += 1;
+        }
+        return sign | r as u16;
+    }
+    let mut r = ((e as u32) << 10) | (man >> 13);
+    let rem = man & 0x1fff;
+    if rem > 0x1000 || (rem == 0x1000 && (r & 1) == 1) {
+        r += 1;
+    }
+    sign | r as u16
+}
+
 /// Raw output pointers; every (hand, seat) writes a disjoint row block.
+/// Exactly one of `real` (float32 slab) / `real16` (float16 slab, as u16
+/// bits) is non-null.
 struct Out {
     bits: *mut u8,
     real: *mut f32,
+    real16: *mut u16,
     gm: *mut bool,
     ga: *mut i64,
     rc: *mut i64,
@@ -227,7 +268,16 @@ pub fn flush_trajectories<'py>(
     }
 
     let mut o_bits = get_rw::<u8>(out, "obs_bits")?;
-    let mut o_real = get_rw::<f32>(out, "obs_real")?;
+    // Half-precision storage: the caller passes the float16 slab as its u16
+    // view under "obs_real_f16" instead of "obs_real".
+    let half = out.get_item("obs_real_f16")?.is_some();
+    let mut o_real = if half { None } else { Some(get_rw::<f32>(out, "obs_real")?) };
+    let mut o_real16 = if half { Some(get_rw::<u16>(out, "obs_real_f16")?) } else { None };
+    let o_real_len = match (&o_real, &o_real16) {
+        (Some(a), _) => a.len(),
+        (_, Some(a)) => a.len(),
+        _ => 0,
+    };
     let mut o_gm = get_rw::<bool>(out, "gm")?;
     let mut o_ga = get_rw::<i64>(out, "ga")?;
     let mut o_rc = get_rw::<i64>(out, "rc")?;
@@ -244,7 +294,7 @@ pub fn flush_trajectories<'py>(
     let mut o_last = get_rw::<bool>(out, "last")?;
     for (name, len, w) in [
         ("obs_bits", o_bits.len(), nb),
-        ("obs_real", o_real.len(), nr),
+        ("obs_real", o_real_len, nr),
         ("gm", o_gm.len(), gm_w),
         ("ga", o_ga.len(), 1),
         ("rc", o_rc.len(), 1),
@@ -268,7 +318,14 @@ pub fn flush_trajectories<'py>(
     }
     let o = Out {
         bits: o_bits.as_slice_mut()?.as_mut_ptr(),
-        real: o_real.as_slice_mut()?.as_mut_ptr(),
+        real: match o_real.as_mut() {
+            Some(a) => a.as_slice_mut()?.as_mut_ptr(),
+            None => std::ptr::null_mut(),
+        },
+        real16: match o_real16.as_mut() {
+            Some(a) => a.as_slice_mut()?.as_mut_ptr(),
+            None => std::ptr::null_mut(),
+        },
         gm: o_gm.as_slice_mut()?.as_mut_ptr(),
         ga: o_ga.as_slice_mut()?.as_mut_ptr(),
         rc: o_rc.as_slice_mut()?.as_mut_ptr(),
@@ -398,7 +455,15 @@ pub fn flush_trajectories<'py>(
                     // every index was bounds-checked above.
                     unsafe {
                         std::ptr::copy_nonoverlapping(pb.as_ptr().add(p * nb), o.bits.add(r * nb), nb);
-                        std::ptr::copy_nonoverlapping(pr.as_ptr().add(p * nr), o.real.add(r * nr), nr);
+                        if o.real16.is_null() {
+                            std::ptr::copy_nonoverlapping(pr.as_ptr().add(p * nr), o.real.add(r * nr), nr);
+                        } else {
+                            let src = pr.as_ptr().add(p * nr);
+                            let dst = o.real16.add(r * nr);
+                            for c in 0..nr {
+                                *dst.add(c) = f32_to_f16_bits(*src.add(c));
+                            }
+                        }
                         std::ptr::copy_nonoverlapping(pg.as_ptr().add(p * gm_w), o.gm.add(r * gm_w), gm_w);
                         *o.ga.add(r) = gate[base + l] as i64;
                         *o.rc.add(r) = chips[base + l];

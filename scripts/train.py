@@ -405,6 +405,53 @@ def _atomic_torch_save(obj: object, path: Path) -> None:
     os.replace(tmp, path)
 
 
+def _dump_batch_diagnostics(batch, path: str, max_rows: int = 2_000_000) -> None:
+    """`PLO5BP_DUMP_BATCH=<file.npz>` (2026-09-26, the regression diagnosis): a
+    random sample of the collected rollout -- the critic's value at sampling
+    time, the returns (Monte-Carlo returns with --gae-lambda 1.0), the gate
+    action + legality, the normalized advantage, and the street / pot / hero
+    stack columns of the FULL obs layout -- for offline critic and policy
+    diagnostics. train.py then exits without updating."""
+    import numpy as _np
+
+    n = int(batch.values.shape[0])
+    idx = _np.sort(_np.random.default_rng(0).choice(n, size=min(n, max_rows), replace=False))
+    it = torch.as_tensor(idx)
+    obs = batch.obs[it].float().cpu().numpy()
+    street = obs[:, 156:160].argmax(axis=1) if obs.shape[1] > 187 else _np.zeros(len(idx), _np.int64)
+    out = {
+        "values": batch.values[it].float().cpu().numpy(),
+        "returns": batch.returns[it].float().cpu().numpy(),
+        "advantages": batch.advantages[it].float().cpu().numpy(),
+        "gate_actions": batch.gate_actions[it].cpu().numpy(),
+        "gate_masks": batch.gate_masks[it].cpu().numpy(),
+        "anchor_actions": batch.anchor_actions[it].cpu().numpy(),
+        "street": street,
+        "pot_bb": obs[:, 184] if obs.shape[1] > 187 else _np.zeros(len(idx), _np.float32),
+        "to_call_bb": obs[:, 185] if obs.shape[1] > 187 else _np.zeros(len(idx), _np.float32),
+        "hero_stack_bb": obs[:, 176] if obs.shape[1] > 187 else _np.zeros(len(idx), _np.float32),
+        "rows_total": _np.asarray([n]),
+    }
+    if getattr(batch, "ent_coef_rows", None) is not None:
+        out["ent_coef"] = batch.ent_coef_rows[it].float().cpu().numpy()
+    if getattr(batch, "is_terminal", None) is not None:
+        out["is_terminal"] = batch.is_terminal[it].cpu().numpy()
+    out["opp_holes"] = batch.opp_holes[it].cpu().numpy()
+    out["sizing"] = batch.sizing[it].cpu().numpy()
+    out["old_gate_logp"] = batch.old_gate_logp[it].float().cpu().numpy()
+    _np.savez_compressed(path, **out)
+    # The observations themselves (float16, exact for the 0/1 columns) for
+    # offline critic experiments: PLO5BP_DUMP_OBS_ROWS rows (default 3M) of the
+    # same sample, in its order, as <path>.obs16.npy.
+    k = min(len(idx), int(os.environ.get("PLO5BP_DUMP_OBS_ROWS", "3000000")))
+    if k > 0:
+        obs16 = _np.lib.format.open_memmap(
+            path + ".obs16.npy", mode="w+", dtype=_np.float16, shape=(k, obs.shape[1])
+        )
+        obs16[:] = obs[:k].astype(_np.float16)
+        obs16.flush()
+
+
 def _optimizer_sidecar_path(ckpt_path: Path) -> Path:
     """`<dir>/<family base>.optim.pt` for a checkpoint of that family
     (`vSix4_65.pt` and `vSix4.pt` -> `vSix4.optim.pt`).
@@ -1185,6 +1232,12 @@ def main() -> None:
         help="Observation layout. full=OBS_DIM 1171 (default). minimal=bare table-visible 796 (cards, street, active/all-in, stacks, pot/to_call/min/max, commits, seat-exists, button, history). Cold-start only; no warm-start from full-obs checkpoints. Skips opp-outcome MC for speed.",
     )
     parser.add_argument(
+        "--obs-real-f16", action="store_true",
+        help="Store the compact rollout rows' real columns as float16 (~1.9x "
+        "the rows per GiB on the full layout; not bit-exact -- see "
+        "TrainingConfig.obs_real_f16). For the longest rollouts.",
+    )
+    parser.add_argument(
         "--no-compact-obs",
         action="store_true",
         help="Store rollout observations as dense float32 rows instead of the "
@@ -1729,6 +1782,50 @@ def main() -> None:
         help="Residual blocks in the centralized critic torso.",
     )
     parser.add_argument(
+        "--critic-act", choices=("relu", "silu", "gelu"), default="relu",
+        help="Critic torso activation (2026-09-26 redesign: silu cannot die the "
+        "way the vSix5 critic's ReLUs did).",
+    )
+    parser.add_argument(
+        "--critic-in-norm", action=argparse.BooleanOptionalAction, default=False,
+        help="LayerNorm between the critic's input Linear and its activation.",
+    )
+    parser.add_argument(
+        "--critic-v-raw", action=argparse.BooleanOptionalAction, default=False,
+        help="Read the distributional critic's V as the mean of its predicted "
+        "return distribution (unbiased) instead of symexp(E[symlog]) (reads "
+        "high-variance states too low).",
+    )
+    parser.add_argument(
+        "--critic-extra-epochs", type=int, default=0,
+        help="Critic-only passes over each rollout after the PPO epochs.",
+    )
+    parser.add_argument(
+        "--critic-minibatches", type=int, default=0,
+        help="Minibatches per critic-only epoch (0 = --num-minibatches): more, "
+        "smaller critic steps per rollout.",
+    )
+    parser.add_argument(
+        "--critic-q-norm", action=argparse.BooleanOptionalAction, default=False,
+        help="Divide the Q regression losses by the minibatch return variance "
+        "(+1) so they do not drown the value cross-entropy in the critic torso.",
+    )
+    parser.add_argument(
+        "--critic-fresh", action="store_true",
+        help="With --load-checkpoint: do not load the checkpoint's critic (start "
+        "the critic from random init; the actor's Adam moments still restore).",
+    )
+    parser.add_argument(
+        "--critic-init", type=Path, default=None,
+        help="With --load-checkpoint: load the critic from this file instead "
+        "(a checkpoint's 'critic' or a bare critic state dict).",
+    )
+    parser.add_argument(
+        "--actor-freeze-updates", type=int, default=0,
+        help="The first N updates of this run train ONLY the critic (the actor "
+        "is frozen): a new critic learns before its advantages steer the actor.",
+    )
+    parser.add_argument(
         "--kl-anchor-coef",
         type=float,
         default=0.0,
@@ -2148,6 +2245,7 @@ def main() -> None:
         num_layers=args.num_layers,
         obs_mode=args.obs_mode,
         compact_obs=not args.no_compact_obs,
+        obs_real_f16=args.obs_real_f16,
         micro_batch_rows=int(args.micro_batch_rows),
         batch_on_host=bool(args.batch_on_host),
         batched_opponents=not args.no_batched_opponents,
@@ -2165,6 +2263,12 @@ def main() -> None:
         retroactive_bonus_c=args.retroactive_bonus_c,
         critic_hidden_dim=args.critic_hidden_dim,
         critic_num_blocks=args.critic_num_blocks,
+        critic_act=args.critic_act,
+        critic_in_norm=args.critic_in_norm,
+        critic_v_raw=args.critic_v_raw,
+        critic_extra_epochs=args.critic_extra_epochs,
+        critic_minibatches=args.critic_minibatches,
+        critic_q_norm=args.critic_q_norm,
         kl_anchor_coef=args.kl_anchor_coef,
         kl_anchor_ema=args.kl_anchor_ema,
         target_kl=args.target_kl,
@@ -2241,7 +2345,7 @@ def main() -> None:
     else:
         print(
             f"[obs-storage] compact ({_obs_layout.name}): {_obs_layout.n_flag} 0/1 "
-            f"columns as bits + {_obs_layout.n_real} verbatim f32 = "
+            f"columns as bits + {_obs_layout.n_real} verbatim {'f16' if _obs_layout.real_dtype == 'float16' else 'f32'} = "
             f"{_obs_layout.row_bytes:,} B per stored observation (dense "
             f"{4 * obs_dim:,} B, {4 * obs_dim / _obs_layout.row_bytes:.1f}x smaller)"
         )
@@ -2289,6 +2393,9 @@ def main() -> None:
         hlgauss_sigma=train_cfg.value_hlgauss_sigma,
         q_fold_zero=train_cfg.q_fold_zero,
         q_base_raw=train_cfg.q_base_raw,
+        act=train_cfg.critic_act,
+        in_norm=train_cfg.critic_in_norm,
+        v_raw=train_cfg.critic_v_raw,
     )
     critic.to(train_cfg.device)
     print(f"[device] learner on {train_cfg.device}")
@@ -2348,12 +2455,27 @@ def main() -> None:
             ckpt_cfg.get("critic_num_blocks", train_cfg.critic_num_blocks)
         )
         ckpt_gate_count = ckpt.get("gate_count")
-        if ckpt_critic_hidden != train_cfg.critic_hidden_dim:
+        # A NEW critic (--critic-fresh / --critic-init) does not come from this
+        # checkpoint: its shape / Q-semantics guards do not apply. Otherwise the
+        # redesign's choices must match (act / v_raw leave no shape trace, so a
+        # silent mismatch would load cleanly and compute something else).
+        _new_critic = bool(args.critic_fresh or args.critic_init is not None)
+        if not _new_critic:
+            for _ck, _cur in (("critic_act", train_cfg.critic_act),
+                              ("critic_in_norm", train_cfg.critic_in_norm),
+                              ("critic_v_raw", train_cfg.critic_v_raw)):
+                _was = ckpt_cfg.get(_ck, {"critic_act": "relu"}.get(_ck, False))
+                if _was != _cur:
+                    raise SystemExit(
+                        f"{_ck} mismatch: checkpoint={_was!r} vs flags={_cur!r}. "
+                        "Pass --critic-fresh (or --critic-init) to start a new critic."
+                    )
+        if ckpt_critic_hidden != train_cfg.critic_hidden_dim and not _new_critic:
             raise SystemExit(
                 f"critic_hidden_dim mismatch: checkpoint={ckpt_critic_hidden} "
                 f"vs --critic-hidden-dim={train_cfg.critic_hidden_dim}"
             )
-        if ckpt_critic_blocks != train_cfg.critic_num_blocks:
+        if ckpt_critic_blocks != train_cfg.critic_num_blocks and not _new_critic:
             raise SystemExit(
                 f"critic_num_blocks mismatch: checkpoint={ckpt_critic_blocks} "
                 f"vs --critic-num-blocks={train_cfg.critic_num_blocks}"
@@ -2377,6 +2499,8 @@ def main() -> None:
         # the old base), so a silent warm-start across a flip would train
         # against shifted targets. Old checkpoints lack the keys -> False.
         for _qk in ("q_fold_zero", "q_base_raw"):
+            if _new_critic:
+                break
             if bool(ckpt_cfg.get(_qk, False)) != bool(getattr(train_cfg, _qk)):
                 raise SystemExit(
                     f"{_qk} mismatch: checkpoint="
@@ -2447,10 +2571,24 @@ def main() -> None:
                     hlgauss_sigma=train_cfg.value_hlgauss_sigma,
                     q_fold_zero=train_cfg.q_fold_zero,
                     q_base_raw=train_cfg.q_base_raw,
+                    act=train_cfg.critic_act,
+                    in_norm=train_cfg.critic_in_norm,
+                    v_raw=train_cfg.critic_v_raw,
                 )
                 critic.to(train_cfg.device)
         model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt)
         crit_sd = ckpt["critic"]
+        # Critic redesign (2026-09-26): --critic-fresh keeps the NEW critic's
+        # random init; --critic-init loads a critic from another file (a
+        # checkpoint's "critic", or a bare critic state dict). The actor's
+        # Adam moments still restore (PPOTrainer.allow_actor_only_moments).
+        if args.critic_init is not None:
+            _ci = torch.load(args.critic_init, map_location="cpu", weights_only=False)
+            crit_sd = _ci.get("critic", _ci) if isinstance(_ci, dict) else _ci
+            print(f"[critic] initialized from {args.critic_init}")
+        elif args.critic_fresh:
+            crit_sd = {k: v.detach().cpu() for k, v in critic.state_dict().items()}
+            print("[critic] --critic-fresh: the checkpoint's critic is NOT loaded (new random init)")
         ck_adv = crit_sd.get("adv_head.weight")
         if (
             critic.q_actions > 0
@@ -2548,6 +2686,7 @@ def main() -> None:
     # A3 + A14: warm Adam + the original l2-init references from the rolling
     # sidecar (PRODUCTION BEHAVIOR CHANGE — see _restore_optimizer_sidecar).
     if args.load_checkpoint is not None:
+        trainer.allow_actor_only_moments = bool(args.critic_fresh or args.critic_init is not None)
         if args.optimizer_sidecar:
             _restore_optimizer_sidecar(trainer, args.load_checkpoint, restored_update)
         else:
@@ -2625,7 +2764,11 @@ def main() -> None:
 
     # Live anneal control (step changes + manual tier-coef overrides)
     # without pausing training — see --anneal-step help.
-    anneal_control_file = Path("runs/anneal_control.json")
+    # PLO5BP_ANNEAL_CONTROL: a per-run control file, so runs that share the
+    # pod (recipe searches) never read each other's live edits.
+    anneal_control_file = Path(
+        os.environ.get("PLO5BP_ANNEAL_CONTROL", "").strip() or "runs/anneal_control.json"
+    )
     live_anneal_step = float(args.anneal_step)
     live_lr = float(train_cfg.lr)
     # Flat (non-tier) entropy coefs — what NLH / plain --stack-dist runs
@@ -2870,6 +3013,7 @@ def main() -> None:
         resource_sampler.start()
 
     consecutive_rollbacks = 0
+    _update0 = update  # this run's first loop update (--actor-freeze-updates)
     while True:
         if stop_requested["flag"]:
             break
@@ -3034,6 +3178,15 @@ def main() -> None:
         if resource_sampler is not None:
             resource_sampler.set_phase("optimize", update=update)
         _t_opt0 = time.perf_counter()
+        _dump = os.environ.get("PLO5BP_DUMP_BATCH", "").strip()
+        if _dump:  # diagnostics: save a sample of this rollout, skip the update
+            _dump_batch_diagnostics(batch, _dump)
+            print(f"[diag] rollout sample written to {_dump}; exiting before the update")
+            return
+        trainer.actor_frozen = (update - _update0) < int(args.actor_freeze_updates)
+        if trainer.actor_frozen:
+            print(f"[critic-warmup] update {update}: actor FROZEN, critic-only passes "
+                  f"({train_cfg.ppo_epochs + train_cfg.critic_extra_epochs} epochs)")
         stats = trainer.update(batch, rng, entropy_coef=update_entropy_coef)
         _t_opt1 = time.perf_counter()
         if resource_sampler is not None:

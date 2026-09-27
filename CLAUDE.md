@@ -100,6 +100,17 @@ anchor` = v2 (head_version 2), `logistic` = v4 (3), `mixture` = v5 (4).
 
 ### Current state (2026-09-20 — read this before the older v5 notes)
 
+- **HEADLINE 2026-09-26 evening: `vSix6` is the main run** (see the "Regression
+  diagnosis + redesign" bullets below): the vSix5 line had converged (not
+  regressed); vSix6 = actor 1024x3 + rebuilt 1536x2 SiLU critic, entropy 0.06,
+  ~164M rows/update at 1.76M envs, half-precision storage, faster engine.
+  Guardian `scripts/vSix6_guardian.sh`, stop `runs/vSix6.stop`, its own control
+  file `runs/vSix6.control.json`. **The live site serves vSix6_1300 since
+  2026-09-26 23:42 UTC** (its 1024x3 actor + the vSix5_1248 critic, because the
+  deployed site code cannot rebuild the new SiLU critic, which only feeds the
+  review's true EV; backup `stub.pt.bak-pre-vSix6_1300`). vs vSix5_1248: sampled
+  +0.34 (z 13), argmax-vs-argmax +0.08 (z 4), top action vs its sampled play
+  +0.895 (vSix5_1248's own +0.979 — the one metric it does not win).
 - **Obs**: PLO OBS_DIM is **1171** (v7-obs tail 1020..1171: STK/BRD/DUAL
   blocks, V7_DESIGN.md / V7_OBS_CANDIDATES.md), minimal layout 796
   (`--obs-mode minimal`, vMin1), NLH 995. The fused **Rust obs encoder is
@@ -484,6 +495,88 @@ anchor` = v2 (head_version 2), `logistic` = v4 (3), `mixture` = v5 (4).
     248-598 of 2048, 372/8192 dead (16% of the input layer); critic 1536x2
     64% dead, rank99 23-69 — the full-obs nets have lots of slack: a full-obs
     size sweep (e.g. distilled from vSix5 for a warm start) is the next size study.
+- **Regression diagnosis + redesign (2026-09-26 evening, owner /goal "it stopped
+  improving and regresses — redesign it").** vSix5 stopped at u1290 (18:06 UTC).
+  - NOT a regression: a 9-checkpoint round robin (`scripts/h2h_league.py`:
+    shared deals, least-squares ratings, residuals = non-transitivity) is
+    transitive (residual RMS ~ pair se); late checkpoints sit +-0.1 around 1248's
+    level (1288 rated = 1248). The u1248-1258 "peak" was a lucky high right after
+    the entropy drop. The real problem is a STALL: argmax ratings of u940..u1288
+    all within +-0.1 bb/seat-hand — every sampled gain since u940 was entropy.
+  - Updates are noise around a converged fixed point: weights random-walk
+    (displacement ~ sqrt(k) steps, consecutive deltas cos -0.35); two one-update
+    runs from u1290 differing only in --seed (`scripts/update_snr.py`) agree on
+    their gate log-prob changes at corr +0.13 (params cos 0.53 actor / 0.87
+    critic). Weight averaging (`scripts/average_checkpoints.py`) is neutral. A
+    single update moves argmax-vs-argmax h2h by up to +-0.18, so judge by several
+    checkpoints, never one.
+  - The critic was broken: `PLO5BP_DUMP_BATCH=<file>` (train.py: dump a rollout
+    sample, obs as <file>.obs16.npy, then exit) + `--gae-lambda 1.0` +
+    `scripts/critic_calibration.py`: V = symexp(E[symlog]) reads 43% LOW (2-2.5x
+    low in its upper deciles, +7.9 bb on the river) — a log-space average; the
+    raw-space mean of the same distribution is within ~1 bb. EV only 0.29. The
+    utilization probe: critic input layer 77% dead. `scripts/critic_offline.py`
+    (held-out CE on the dump): a FRESH SiLU critic trained ~1,500 small steps
+    beats the 15B-row critic (2.60 vs 2.755). Online, the fresh critic first
+    FAILED (r1crit): 16 huge minibatches per epoch = too few steps, and the Q
+    loss (raw bb^2, ~1e3) drowned the value cross-entropy (~3) in the shared
+    torso (q ran away to 1e4) -> `--critic-q-norm` and `--critic-minibatches`.
+    Then a second trap: with a zero-init adv_head the fold column starts at
+    Q_fold = V (~+8 bb) and the 15x fold supervision drags the shared torso to
+    fix it — the value CE went 2.57 -> 3.64 within 100 steps (offline repro;
+    the online warm-up showed 3.65). A new critic needs `--q-fold-zero` (Q_fold
+    pinned to its exact truth 0: folding ends the seat's future rewards) — with
+    it the CE holds at 2.55.
+  - Actor capacity is NOT binding (`scripts/distill_size.py`: students distilled
+    from u1290 on 2M states — held-out gate KL 256x3 .0062, 512x3 .0043, 1024x3
+    .0034, same-size 2048x4 .0031; h2h vs the teacher -0.05..-0.09 for all, the
+    same-size copy -0.05 = the method's floor).
+  - New flags (all default OFF = the old behavior): `--critic-act {relu,silu,
+    gelu}`, `--critic-in-norm`, `--critic-v-raw` (V = raw-space mean),
+    `--critic-q-norm` (Q losses / (return var + 1)), `--critic-extra-epochs N`,
+    `--critic-minibatches N` (critic-only passes, many small steps),
+    `--critic-fresh` / `--critic-init PATH` (a new critic with the ACTOR's Adam
+    moments + l2-init refs still restored), `--actor-freeze-updates N` (critic-only
+    warm-up), `--obs-real-f16` (compact rows' real columns stored float16: 1,022
+    vs 1,956 B per full-layout row; the Rust flush converts == numpy's cast;
+    pinned by `test_obs_real_f16.py`; NOT bit-exact), `PLO5BP_ANNEAL_CONTROL`
+    (a per-run live-control file — runs sharing the pod read each other's
+    `runs/anneal_control.json` otherwise). The critic's choices ride in an
+    `_arch` buffer so `build_critic_from_state_dict` rebuilds it (the old site
+    code fails to load such a critic -> it only disables the review's true EV).
+    `scripts/convert_offline_critic.py` turns an offline candidate into a
+    `--critic-init` file; `scripts/recipe_run.sh STEM NODE UPDATES [flags]` = the
+    vSix5 recipe at a search scale (220k envs, 15M rows) for parallel candidates.
+  - Engine (bit-exact, pinned): the actor's hand categories in
+    `pack_full_with_cats` run in parallel (was a serial loop, up to ~100 ms/step
+    on the river); the opp-outcome MC's k=2 pair ranks come from a per-env,
+    per-street `BoardPairTable` shared by every seat that acts on the street
+    (`outcome_features_mc_shared`; MC cost -60% at 6 seats, test
+    `shared_pair_table_matches_outcome_features_mc`); the full layout's in-place
+    encoders write the packed copy too, or ONLY it (`FULL_INTO_PACKED`,
+    `observation_encoded_subset_into`; the CUDA rollout then never writes the
+    4.7 KB dense rows — digest-identical, `PLO5BP_NO_FULL_PACKED=1` = old path);
+    `plo_board_strength_batch` (every player's made-hand strength).
+  - Recipe rounds (`scripts/recipe_run.sh`, 15M rows/update, all from u1290
+    with the same random stream; `scripts/round_summary.py` = per-run means
+    over checkpoints; vs u1290, sampled / argmax-vs-argmax):
+    round 1 (old critic, 2048x4): entropy 0.10 +0.05 / +0.14; 0.06 (+ sizing
+    0.3) +0.34 / -0.03; 0.03 +0.50 / -0.10 (the argmax loss sits in the DEEP
+    tier). Round 2 (entropy 0.06, new critic): 2048x4 + pool +0.32 / +0.01
+    (= the old critic's run), 2048x4 no pool +0.27 / 0.00, distilled 1024x3
+    +0.37 / +0.14, 512x3 +0.34 / +0.13 — the small students win, and keep
+    their deep-tier argmax (+0.2 vs -0.1). The new critic's loss kept falling
+    (2.55 -> 2.44) while the old one's rose (2.70 -> 2.74).
+  - **vSix6** (`scripts/vSix6_guardian.sh`) = the result: actor 1024x3 (warm
+    from r2b = the distilled student after round 2), critic 1536x2 SiLU
+    (offline 1536x2 ~ 2048x3 at 2.2x less compute; first launch installs
+    `checkpoints/critic_silu1536x2_u1290.pt` + one critic-only update), entropy
+    0.06, sizing-entropy 0.3, 1 extra critic epoch of 128 minibatches,
+    `--no-grad-checkpoint`, `--obs-real-f16`, host batch, obs rev 1 (drop-in for
+    the live site; its old code cannot rebuild the new critic -> only the
+    review's true EV is off until a deploy). Metrics: sampled h2h and TOP action
+    vs sampled play against the live vSix5_1248 (argmax-vs-argmax flips on
+    genuinely mixed spots — a weak signal).
 
 ### v5 (2026-07-06, IMPLEMENTED, not yet trained — V5_DESIGN.md canonical)
 
@@ -603,7 +696,8 @@ v2 specifics:
 Pod stem families: `optimized<N>` (v1, retired — `launch_auto.sh` /
 `watchdog_auto.sh`), `vTwo<N>`/`vFour<N>`/`vFive<N>` (PLO5 v2/v4/v5 —
 guardian scripts per stem), the current `vSix<N>` (`--v6`,
-`vSix4_guardian.sh`), `vMin1` (minimal obs, `vMin1_guardian.sh`), `vMin2`
+`vSix4_guardian.sh` ... `vSix6_guardian.sh` = the 2026-09-26 redesign, the
+main run; the round stems `r1*`/`r2*` = its recipe search), `vMin1` (minimal obs, `vMin1_guardian.sh`), `vMin2`
 (fresh minimal-obs stem on rev-2 values, compact storage, 44M rows,
 `vMin2_guardian.sh` — started 2026-09-23 as the size sweep's 128x3 baseline),
 and

@@ -1652,6 +1652,71 @@ pub fn unpack_obs_rows(
 /// [`crate::double_board::double_board_payout`] function so Python can
 /// verify side-pot handling without driving a real GameState.
 ///
+/// Current made-hand STRENGTH of PLO holdings on one board, batched
+/// (2026-09-26, critic hand-strength inputs): row i = the best hand
+/// `holes[i]` can make with exactly 2 of its cards and 3 of the first
+/// `board_len[i]` cards of `board[i]`, as 7463 - (Cactus-Kev rank), i.e.
+/// 1 (worst high card) ..= 7462 (royal flush). 0 when the board has fewer
+/// than 3 cards or the row holds a 255 (empty) hole card. Rows in parallel.
+#[pyfunction]
+pub fn plo_board_strength_batch<'py>(
+    py: Python<'py>,
+    holes: PyReadonlyArray2<'_, u8>,
+    board: PyReadonlyArray2<'_, u8>,
+    board_len: PyReadonlyArray1<'_, u8>,
+) -> PyResult<Bound<'py, PyArray1<u16>>> {
+    use crate::hand_eval::*;
+    let hv = holes.as_array();
+    let bv = board.as_array();
+    let lv = board_len.as_array();
+    let n = hv.shape()[0];
+    let hw = hv.shape()[1];
+    if !(4..=6).contains(&hw) || bv.shape() != [n, 5] || lv.len() != n {
+        return Err(PyValueError::new_err(
+            "holes must be (N, 4|5|6), board (N, 5), board_len (N,)",
+        ));
+    }
+    if hv.iter().chain(bv.iter()).any(|&c| c != 255 && c >= 52) {
+        return Err(PyValueError::new_err("card index out of range (0..52 or 255)"));
+    }
+    let hs = hv.as_standard_layout().to_owned();
+    let bs = bv.as_standard_layout().to_owned();
+    let ls = lv.to_owned();
+    let out: Vec<u16> = py.allow_threads(|| {
+        (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let len = ls[i] as usize;
+                let hrow = hs.row(i);
+                if len < 3 || len > 5 || hrow.iter().any(|&c| c >= 52) {
+                    return 0u16;
+                }
+                let brow = bs.row(i);
+                if brow.iter().take(len).any(|&c| c >= 52) {
+                    return 0u16;
+                }
+                let hole: Vec<Card> = hrow.iter().map(|&c| Card::from_index(c)).collect();
+                let b: Vec<Card> = brow.iter().take(len).map(|&c| Card::from_index(c)).collect();
+                let r = evaluate_plo5_partial(&hole, &b);
+                let (cat, within) = (r >> 20, r & 0xF_FFFF);
+                let hi: u32 = match cat {
+                    CAT_STRAIGHT_FLUSH => 10,
+                    CAT_QUADS => 166,
+                    CAT_FULL_HOUSE => 322,
+                    CAT_FLUSH => 1599,
+                    CAT_STRAIGHT => 1609,
+                    CAT_TRIPS => 2467,
+                    CAT_TWO_PAIR => 3325,
+                    CAT_PAIR => 6185,
+                    _ => 7462,
+                };
+                (7463 - (hi - within)) as u16
+            })
+            .collect()
+    });
+    Ok(Array1::from_vec(out).into_pyarray(py))
+}
+
 /// `hole_cards` must be `hole_count * num_seats` card indices (5 or 6 per
 /// seat), flat-packed by seat
 /// (seat 0's 5 cards, then seat 1's 5 cards, ...). `board_a` / `board_b`
@@ -1824,6 +1889,12 @@ pub struct PyBatchedEngine {
     /// batched == fresh serial). Accessed only serially (locked outside the
     /// parallel MC), so the Mutex adds no contention and keeps the pyclass Sync.
     outcome_cache: std::sync::Mutex<OutcomeCache>,
+    /// Per-env board pair-rank table of the opp-outcome MC
+    /// (`GameState::board_pair_table`, 2026-09-26): computed once per street
+    /// and shared by every seat that acts on it, instead of re-evaluating the
+    /// same ~1,000 two-card holdings for each seat. Keyed on the boards, so a
+    /// stale table is never used (`outcome_features_mc_shared` checks the key).
+    board_tables: Vec<std::sync::Mutex<Option<crate::engine::BoardPairTable>>>,
     /// Observation-semantics revision the fused encoders emit, fixed at
     /// construction (see `OBS_REV_ENV`).
     obs_rev: u8,
@@ -1895,6 +1966,7 @@ impl PyBatchedEngine {
             },
             opp_outcome_mc,
             outcome_cache: std::sync::Mutex::new(OutcomeCache::new(num_envs, num_seats)),
+            board_tables: (0..num_envs).map(|_| std::sync::Mutex::new(None)).collect(),
             obs_rev,
         })
     }
@@ -2836,23 +2908,31 @@ impl PyBatchedEngine {
     /// `encode_obs_row` from the same packed state, so the buffer ends up
     /// bit-identical to "encode into a fresh zeroed array, copy, zero the skipped
     /// rows". Returns the aux dict of `observation_encoded_batch` without "obs".
-    #[pyo3(signature = (out, encode_mask=None))]
+    #[pyo3(signature = (out, encode_mask=None, flag_cols=None, real_cols=None, out_bits=None, out_real=None))]
     fn observation_encoded_into<'py>(
         &self,
         py: Python<'py>,
-        mut out: PyReadwriteArray2<'_, f32>,
+        mut out: Option<PyReadwriteArray2<'_, f32>>,
         encode_mask: Option<PyReadonlyArray1<'_, bool>>,
+        flag_cols: Option<PyReadonlyArray1<'_, i64>>,
+        real_cols: Option<PyReadonlyArray1<'_, i64>>,
+        mut out_bits: Option<PyReadwriteArray2<'_, u8>>,
+        mut out_real: Option<PyReadwriteArray2<'_, f32>>,
     ) -> PyResult<Bound<'py, PyDict>> {
         const WHAT: &str = "observation_encoded_into";
         self.require_plo_full(WHAT)?;
         let n = self.states.len();
         let d = obs_layout::OBS_DIM;
-        if !out.is_c_contiguous() || out.shape() != [n, d] {
-            return Err(PyValueError::new_err(format!(
-                "{WHAT}: out must be a C-contiguous ({n}, {d}) float32 array; got shape {:?}",
-                out.shape()
-            )));
+        if let Some(o) = out.as_ref() {
+            if !o.is_c_contiguous() || o.shape() != [n, d] {
+                return Err(PyValueError::new_err(format!(
+                    "{WHAT}: out must be a C-contiguous ({n}, {d}) float32 array; got shape {:?}",
+                    o.shape()
+                )));
+            }
         }
+        let plan = pack_plan_for_width(WHAT, n, d, flag_cols, real_cols, &out_bits, &out_real)?;
+        require_some_output(WHAT, out.is_some(), plan.is_some())?;
         let mask: Option<Vec<bool>> = match encode_mask {
             None => None,
             Some(m) => {
@@ -2867,15 +2947,83 @@ impl PyBatchedEngine {
             }
         };
         let idx: Vec<usize> = (0..n).collect();
-        let out_s = out.as_slice_mut()?;
-        let (packed, legal_mask) = py.allow_threads(|| {
+        let out_s = match out.as_mut() {
+            Some(o) => Some(o.as_slice_mut()?),
+            None => None,
+        };
+        let sinks = packed_slices(&mut out_bits, &mut out_real)?;
+        let (packed, legal_mask, res) = py.allow_threads(|| {
             let (packed, legal_mask, cat_a, cat_b) = self.pack_full_with_cats(&idx);
             let keep = |j: usize| mask.as_ref().map_or(true, |m| m[j]);
-            self.encode_full_rows_into(&packed, &cat_a, &cat_b, out_s, keep);
-            (packed, legal_mask)
+            let rows = out_s.map(|o| pick_rows(o, d, &idx));
+            let sinks = sinks.zip(plan.as_ref()).map(|((b, r), pl)| {
+                (pl, pick_rows(b, pl.nb, &idx), pick_rows(r, pl.nr, &idx))
+            });
+            let res = self.encode_full_rows_sinks(&packed, &cat_a, &cat_b, rows, sinks, keep);
+            (packed, legal_mask, res)
         });
+        res.map_err(|(j, c, v)| pack_encoder_error(WHAT, idx[j], c, v))?;
         full_aux_dict(py, packed, legal_mask)
     }
+
+    /// In-place full-layout SUBSET encoder (2026-09-26): re-packs and
+    /// re-encodes only the envs in `indices` (strictly increasing), writing
+    /// each row into `out[indices[j]]` and/or the packed copy's rows; other
+    /// rows are untouched. The aux arrays are compact (k rows), exactly as
+    /// `observation_encoded_subset_batch`'s. Bit-identical to that + a scatter.
+    #[pyo3(signature = (indices, out=None, flag_cols=None, real_cols=None, out_bits=None, out_real=None))]
+    fn observation_encoded_subset_into<'py>(
+        &self,
+        py: Python<'py>,
+        indices: PyReadonlyArray1<'_, i64>,
+        mut out: Option<PyReadwriteArray2<'_, f32>>,
+        flag_cols: Option<PyReadonlyArray1<'_, i64>>,
+        real_cols: Option<PyReadonlyArray1<'_, i64>>,
+        mut out_bits: Option<PyReadwriteArray2<'_, u8>>,
+        mut out_real: Option<PyReadwriteArray2<'_, f32>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        const WHAT: &str = "observation_encoded_subset_into";
+        self.require_plo_full(WHAT)?;
+        let n = self.states.len();
+        let d = obs_layout::OBS_DIM;
+        if let Some(o) = out.as_ref() {
+            if !o.is_c_contiguous() || o.shape() != [n, d] {
+                return Err(PyValueError::new_err(format!(
+                    "{WHAT}: out must be a C-contiguous ({n}, {d}) float32 array; got shape {:?}",
+                    o.shape()
+                )));
+            }
+        }
+        let plan = pack_plan_for_width(WHAT, n, d, flag_cols, real_cols, &out_bits, &out_real)?;
+        require_some_output(WHAT, out.is_some(), plan.is_some())?;
+        let idx = checked_env_indices(indices.as_slice()?, n, WHAT)?;
+        if idx.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(PyValueError::new_err(format!(
+                "{WHAT}: indices must be strictly increasing (unique, sorted)"
+            )));
+        }
+        let out_s = match out.as_mut() {
+            Some(o) => Some(o.as_slice_mut()?),
+            None => None,
+        };
+        let sinks = packed_slices(&mut out_bits, &mut out_real)?;
+        let (packed, legal_mask, res) = py.allow_threads(|| {
+            let (packed, legal_mask, cat_a, cat_b) = self.pack_full_with_cats(&idx);
+            let rows = out_s.map(|o| pick_rows(o, d, &idx));
+            let sinks = sinks.zip(plan.as_ref()).map(|((b, r), pl)| {
+                (pl, pick_rows(b, pl.nb, &idx), pick_rows(r, pl.nr, &idx))
+            });
+            let res = self.encode_full_rows_sinks(&packed, &cat_a, &cat_b, rows, sinks, |_| true);
+            (packed, legal_mask, res)
+        });
+        res.map_err(|(j, c, v)| pack_encoder_error(WHAT, idx[j], c, v))?;
+        full_aux_dict(py, packed, legal_mask)
+    }
+
+    /// The full-layout in-place encoders accept packed outputs and `out=None`
+    /// (packed-only), like the minimal ones -- a capability flag for Python.
+    #[classattr]
+    const FULL_INTO_PACKED: bool = true;
 
     /// Bare-visibility (minimal) one-FFI encoder: finished (N, 796) f32 obs +
     /// the same aux fields the rollout reads. Skips opp-outcome MC, hero
@@ -3078,6 +3226,22 @@ fn pack_plan_for(
     out_bits: &Option<PyReadwriteArray2<'_, u8>>,
     out_real: &Option<PyReadwriteArray2<'_, f32>>,
 ) -> PyResult<Option<PackPlan>> {
+    pack_plan_for_width(
+        what, n, obs_layout_minimal::OBS_DIM_MINIMAL, flag_cols, real_cols, out_bits, out_real,
+    )
+}
+
+/// `pack_plan_for` for a `d`-wide row (the full layout's in-place encoders,
+/// 2026-09-26).
+fn pack_plan_for_width(
+    what: &str,
+    n: usize,
+    d: usize,
+    flag_cols: Option<PyReadonlyArray1<'_, i64>>,
+    real_cols: Option<PyReadonlyArray1<'_, i64>>,
+    out_bits: &Option<PyReadwriteArray2<'_, u8>>,
+    out_real: &Option<PyReadwriteArray2<'_, f32>>,
+) -> PyResult<Option<PackPlan>> {
     let (flag_cols, real_cols, out_bits, out_real) = match (flag_cols, real_cols, out_bits, out_real) {
         (None, None, None, None) => return Ok(None),
         (Some(f), Some(r), Some(b), Some(o)) => (f, r, b, o),
@@ -3087,7 +3251,6 @@ fn pack_plan_for(
             )))
         }
     };
-    let d = obs_layout_minimal::OBS_DIM_MINIMAL;
     let cols = |v: &[i64]| -> PyResult<Vec<usize>> {
         v.iter()
             .map(|&x| {
@@ -3387,12 +3550,19 @@ impl PyBatchedEngine {
             };
             // Expensive fused pass — only for the changed envs (12 joint
             // fractions + 8 per-board dims, obs v2 P1).
+            let tables = &self.board_tables;
             let fresh: Vec<(usize, [f32; 22])> = recompute
                 .par_iter()
                 .map(|&i| {
                     let mut out = [0.0f32; 22];
                     if let Some(state) = states[idx[i]].as_ref() {
-                        let fr = state.outcome_features_mc(opp_outcome_mc);
+                        // One env per row here, so its table lock is uncontended.
+                        let mut slot = tables[idx[i]].lock().unwrap();
+                        let key = crate::engine::BoardPairTable::key_of(&state.board_a, &state.board_b);
+                        if slot.as_ref().map_or(true, |t| t.key != key) {
+                            *slot = state.board_pair_table();
+                        }
+                        let fr = state.outcome_features_mc_shared(opp_outcome_mc, slot.as_ref());
                         out.copy_from_slice(&fr[..22]);
                     }
                     (i, out)
@@ -3689,23 +3859,96 @@ impl PyBatchedEngine {
         let mut legal_mask = Array2::<bool>::default((n, NUM_ACTIONS));
         let mut cat_a = vec![0u8; n];
         let mut cat_b = vec![0u8; n];
-        for j in 0..n {
-            let state = match self.states[idx[j]].as_ref() {
-                Some(st) => st,
-                None => continue,
-            };
-            if !state.is_terminal() {
-                let mask = state.legal_action_mask();
-                for t in 0..NUM_ACTIONS {
-                    legal_mask[[j, t]] = mask[t];
+        // Per env: legality + the actor's made-hand category on each board.
+        // The categories are two PLO evaluations per env (10-100 five-card
+        // evals each) -- this loop was SERIAL and cost up to ~100 ms per step
+        // at 29k envs on the river (2026-09-26), so it runs in parallel now;
+        // the values are identical.
+        let states = &self.states;
+        let per_env: Vec<([bool; NUM_ACTIONS], u8, u8)> = idx
+            .par_iter()
+            .map(|&i| {
+                let mut row = [false; NUM_ACTIONS];
+                let (mut ca, mut cb) = (0u8, 0u8);
+                if let Some(state) = states[i].as_ref() {
+                    if !state.is_terminal() {
+                        let mask = state.legal_action_mask();
+                        row[..NUM_ACTIONS].copy_from_slice(&mask[..NUM_ACTIONS]);
+                    }
+                    if let Some(a) = state.current_actor() {
+                        ca = state.hero_category(a, 0);
+                        cb = state.hero_category(a, 1);
+                    }
                 }
+                (row, ca, cb)
+            })
+            .collect();
+        for (j, (row, ca, cb)) in per_env.into_iter().enumerate() {
+            for t in 0..NUM_ACTIONS {
+                legal_mask[[j, t]] = row[t];
             }
-            if let Some(a) = state.current_actor() {
-                cat_a[j] = state.hero_category(a, 0);
-                cat_b[j] = state.hero_category(a, 1);
-            }
+            cat_a[j] = ca;
+            cat_b[j] = cb;
         }
         (packed, legal_mask, cat_a, cat_b)
+    }
+
+    /// `encode_full_rows_into` with optional dense rows and optional packed
+    /// sinks (row j of `packed` -> `rows[j]` and/or the packed `(bits[j],
+    /// reals[j])`): packed-only encodes each row into a per-task scratch row
+    /// and packs it (the same bytes `pack_rows_into` would give the dense row).
+    /// Err((j, col, value)) when a flag column is not exactly 0/1.
+    fn encode_full_rows_sinks(
+        &self,
+        packed: &PackedObservation,
+        cat_a: &[u8],
+        cat_b: &[u8],
+        rows: Option<Vec<&mut [f32]>>,
+        sinks: Option<(&PackPlan, Vec<&mut [u8]>, Vec<&mut [f32]>)>,
+        keep: impl Fn(usize) -> bool + Sync,
+    ) -> Result<(), (usize, usize, f32)> {
+        let s = self.config.num_seats;
+        let bb = self.config.bb;
+        let ante = self.config.ante;
+        let obs_rev = self.obs_rev;
+        let starting = &self.config.starting_stacks;
+        let inv_bb = 1.0f64 / (bb as f64);
+        let enc = |j: usize, row: &mut [f32]| {
+            row.fill(0.0);
+            if keep(j) {
+                encode_obs_row(packed, j, s, cat_a[j], cat_b[j], inv_bb, bb, ante, starting, obs_rev, row);
+            }
+        };
+        let Some(rows) = rows else {
+            let Some((plan, bits, reals)) = sinks else {
+                return Ok(());
+            };
+            return bits
+                .into_par_iter()
+                .zip(reals.into_par_iter())
+                .enumerate()
+                .try_for_each_init(
+                    || vec![0f32; obs_layout::OBS_DIM],
+                    |row, (j, (b, r))| {
+                        enc(j, row);
+                        pack_obs_row_runs(row, &plan.flag_runs, &plan.real_runs, &plan.flags, &plan.reals, b, r)
+                            .map_err(|(c, v)| (j, c, v))
+                    },
+                );
+        };
+        let Some((plan, bits, reals)) = sinks else {
+            rows.into_par_iter().enumerate().for_each(|(j, row)| enc(j, row));
+            return Ok(());
+        };
+        rows.into_par_iter()
+            .zip(bits.into_par_iter())
+            .zip(reals.into_par_iter())
+            .enumerate()
+            .try_for_each(|(j, ((row, b), r))| {
+                enc(j, row);
+                pack_obs_row_runs(row, &plan.flag_runs, &plan.real_runs, &plan.flags, &plan.reals, b, r)
+                    .map_err(|(c, v)| (j, c, v))
+            })
     }
 
     /// Zero, then encode, row j of `packed` into row j of `out` (n x OBS_DIM,
@@ -6123,6 +6366,7 @@ mod encoder_port_tests {
             config: config.clone(),
             opp_outcome_mc: 0,
             outcome_cache: std::sync::Mutex::new(OutcomeCache::new(1, s)),
+            board_tables: vec![std::sync::Mutex::new(None)],
             obs_rev,
         };
         let packed = engine.pack_observation_indexed(&[0], s);

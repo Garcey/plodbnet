@@ -214,6 +214,12 @@ def _adaptive_grad_clip_(params, clip: float, eps: float = 1e-3) -> None:
                 g.mul_(max_norm / g_norm.clamp_min(1e-12))
 
 
+def critic_ok_for_extra(rolled_back: bool, critic_params: list) -> bool:
+    """Critic-only passes run only when there is a critic and the update was
+    not rolled back (a hard KL trip restores the pre-update weights)."""
+    return bool(critic_params) and not rolled_back
+
+
 class PPOTrainer:
     def __init__(
         self,
@@ -339,6 +345,7 @@ class PPOTrainer:
         # stems). Only wired when the critic actually HAS the head; the
         # coef gates training (0 = head stays zero-init).
         self._q_aux_coef = float(getattr(config, "q_aux_coef", 0.0))
+        self._critic_q_norm = bool(getattr(config, "critic_q_norm", False))
         # Dense fold-column supervision (see TrainingConfig.q_fold_sup_coef):
         # fold's forward return is exactly 0, so q[..., GATE_FOLD] gets a
         # perfect-label MSE on every fold-LEGAL row, weighted into q_loss.
@@ -444,17 +451,32 @@ class PPOTrainer:
         if not isinstance(state, dict) or shapes is None:
             return False, "sidecar has no optimizer state"
         want = [tuple(p.shape) for p in self._all_params]
-        if [tuple(s) for s in shapes] != want:
-            return False, "parameter shapes differ from this run's model/critic"
+        have = [tuple(s) for s in shapes]
+        keep = None
+        if have != want:
+            # A NEW critic (train.py --critic-fresh / --critic-init) against a
+            # sidecar of the same actor: restore the ACTOR's moments (the first
+            # len(actor) entries -- the order is actor then critic) and start
+            # only the critic cold. Anything else is still refused.
+            n_act = len(self._actor_params)
+            if not (getattr(self, "allow_actor_only_moments", False)
+                    and have[:n_act] == want[:n_act]):
+                return False, "parameter shapes differ from this run's model/critic"
+            keep = n_act
         for idx, st in state.items():
+            if keep is not None and int(idx) >= keep:
+                continue
             m = st.get("exp_avg")
             if m is not None and tuple(m.shape) != want[int(idx)]:
                 return False, f"moment shape mismatch at param {idx}"
+        if keep is not None:
+            state = {k: v for k, v in state.items() if int(k) < keep}
         self.optimizer.load_state_dict({
             "state": state,
             "param_groups": self.optimizer.state_dict()["param_groups"],
         })
-        return True, f"{len(state)} tensors"
+        return True, (f"{len(state)} tensors" if keep is None
+                      else f"ACTOR ONLY, {len(state)} tensors; the new critic starts cold")
 
     def load_l2_init_refs(self, sidecar: dict) -> "tuple[bool, str]":
         """Re-attach the ORIGINAL decay-to-init reference tensors (A14) so the
@@ -465,6 +487,17 @@ class PPOTrainer:
             return False, "l2_init_coef is 0 (no references in use)"
         refs = sidecar.get("l2_init") or {}
         if set(refs) != set(self._l2_init_names):
+            if getattr(self, "allow_actor_only_moments", False):
+                # A new critic: restore the references the sidecar still has
+                # (the actor's), the new critic's anchor at its own init.
+                done = 0
+                with torch.no_grad():
+                    for name, (_p, p0) in zip(self._l2_init_names, self._l2_init_pairs):
+                        r = refs.get(name)
+                        if r is not None and tuple(r.shape) == tuple(p0.shape):
+                            p0.copy_(r.to(p0.device, p0.dtype))
+                            done += 1
+                return True, f"{done} of {len(self._l2_init_names)} tensors (new critic's own init for the rest)"
             return False, "sidecar l2_init names differ from this run's trunk"
         for name, (_p, p0) in zip(self._l2_init_names, self._l2_init_pairs):
             if tuple(refs[name].shape) != tuple(p0.shape):
@@ -516,6 +549,17 @@ class PPOTrainer:
             mb.gate_actions,
         )
 
+    def _q_norm(self, mb):
+        """TrainingConfig.critic_q_norm (2026-09-26): the Q regression's MSE
+        terms divided by the minibatch's return variance (+1, detached), so a
+        chip-scale Q loss (~1e3 bb^2) no longer drowns the value head's
+        cross-entropy (~3 nats) in the shared critic torso -- which kept a
+        FRESH critic from learning its value distribution at all (vSix5 r1crit:
+        v 3.6 -> 4.0 while q ran away to 1e4). 1.0 when off (the old loss)."""
+        if not getattr(self, "_critic_q_norm", False):
+            return 1.0
+        return 1.0 / (mb.returns.float().var().detach() + 1.0)
+
     def _q_fold_sup_term(
         self,
         mb: Batch,
@@ -538,7 +582,7 @@ class PPOTrainer:
         if self._q_fold_sup <= 0.0:
             return q_loss
         fold_ok = mb.gate_masks[..., GATE_FOLD].float()
-        fold_mse = (q_all[..., GATE_FOLD].pow(2) * fold_ok).sum() / (
+        fold_mse = self._q_norm(mb) * (q_all[..., GATE_FOLD].pow(2) * fold_ok).sum() / (
             fold_ok.sum().clamp_min(1.0) if fold_denom is None else fold_denom
         )
         return q_loss + self._q_fold_sup * fold_mse
@@ -625,7 +669,7 @@ class PPOTrainer:
                         q_taken = q_all.gather(
                             -1, self._q_index(mb, q_all)[..., None]
                         ).squeeze(-1)
-                        q_loss = (q_taken - mb.returns).pow(2).mean()
+                        q_loss = (q_taken - mb.returns).pow(2).mean() * self._q_norm(mb)
                         q_loss = self._q_fold_sup_term(mb, q_all, q_loss, fold_denom, weight)
                     value_loss = self.critic.hlgauss_value_loss(
                         value_logits, mb.returns
@@ -646,7 +690,7 @@ class PPOTrainer:
                         q_taken = q_all.gather(
                             -1, self._q_index(mb, q_all)[..., None]
                         ).squeeze(-1)
-                        q_loss = (q_taken - mb.returns).pow(2).mean()
+                        q_loss = (q_taken - mb.returns).pow(2).mean() * self._q_norm(mb)
                         q_loss = self._q_fold_sup_term(mb, q_all, q_loss, fold_denom, weight)
                     elif self._critic_fwd is not None:
                         value = self._critic_fwd(
@@ -842,6 +886,92 @@ class PPOTrainer:
             "qt_n": qt_n,
         }
 
+    def _critic_only_terms(
+        self,
+        mb: Batch,
+        value_coef: float,
+        weight: float,
+        fold_denom: torch.Tensor | None,
+    ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor]":
+        """(loss, value_loss, q_loss) of the critic ALONE on one minibatch (or
+        micro-batch chunk, `weight` = its share of the minibatch rows): the same
+        value and Q terms `_minibatch_terms` adds, without the actor. Used by
+        the critic-only passes (TrainingConfig.critic_extra_epochs) and the
+        actor-frozen warm-up (`actor_frozen`)."""
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self._cuda):
+            opp = opp_holes_multihot(mb.opp_holes)
+            q_all = None
+            if self._distributional:
+                _v, value_logits, q_all = self._critic_train(mb.obs, opp)
+                value_loss = self.critic.hlgauss_value_loss(value_logits, mb.returns)
+            else:
+                if self._q_aux_coef > 0.0 and self._critic_qv is not None:
+                    value, q_all = self._critic_qv(mb.obs, opp)
+                else:
+                    value = self._critic_fwd(mb.obs, opp)
+                value_loss = 0.5 * (value.float() - mb.returns).pow(2).mean()
+            q_loss = torch.zeros((), device=value_loss.device)
+            if self._q_aux_coef > 0.0 and q_all is not None:
+                q_taken = q_all.gather(-1, self._q_index(mb, q_all)[..., None]).squeeze(-1)
+                q_loss = (q_taken.float() - mb.returns).pow(2).mean() * self._q_norm(mb)
+                q_loss = self._q_fold_sup_term(mb, q_all, q_loss, fold_denom, weight)
+        loss = weight * value_coef * value_loss + self._q_aux_coef * q_loss
+        return loss, value_loss, q_loss
+
+    def _critic_only_epochs(
+        self,
+        batch: Batch,
+        rng: np.random.Generator,
+        host_loader,
+        micro: int,
+        value_coef: float,
+        epochs: int,
+        device: torch.device,
+    ) -> "tuple[torch.Tensor, torch.Tensor, int]":
+        """`epochs` passes over the rollout training ONLY the critic: every
+        actor parameter keeps grad None, so AdamW skips it (no step, no decay,
+        moments untouched). Same minibatches, micro-batching, AGC and split
+        grad clip as the PPO loop. Returns (sum value loss, sum q loss, steps)."""
+        tot_v = torch.zeros((), device=device)
+        tot_q = torch.zeros((), device=device)
+        steps = 0
+        n_rows = int(batch.obs.shape[0])
+        k = int(getattr(self.config, "critic_minibatches", 0) or 0)
+        bs = max(1, -(-n_rows // k)) if k > 0 else self.config.batch_size
+        for _ in range(int(epochs)):
+            for sel in iter_minibatch_indices(batch, bs, rng):
+                n_mb = int(sel.shape[0])
+                self.optimizer.zero_grad(set_to_none=True)
+                fold_denom = None
+                if self._q_fold_sup > 0.0:
+                    gm_sel = (
+                        host_loader.gate_mask_rows(sel)
+                        if host_loader is not None
+                        else batch.gate_masks[sel]
+                    )
+                    fold_denom = gm_sel[..., GATE_FOLD].float().sum().clamp_min(1.0)
+                chunk = micro if 0 < micro < n_mb else n_mb
+                for lo in range(0, n_mb, chunk):
+                    sub = sel[lo : lo + chunk]
+                    mb = (
+                        host_loader.gather(sub)
+                        if host_loader is not None
+                        else gather_minibatch(batch, sub)
+                    )
+                    w = float(int(sub.shape[0])) / float(n_mb)
+                    loss, vl, ql = self._critic_only_terms(mb, value_coef, w, fold_denom)
+                    loss.backward()
+                    tot_v += w * vl.detach().float()
+                    tot_q += ql.detach().float()
+                    del mb
+                if self._agc_clip > 0.0:
+                    _adaptive_grad_clip_(self._agc_params, self._agc_clip)
+                nn.utils.clip_grad_norm_(self._critic_params, 0.5)
+                self.optimizer.step()
+                steps += 1
+        self.optimizer.zero_grad(set_to_none=True)
+        return tot_v, tot_q, steps
+
     def update(
         self,
         batch: Batch,
@@ -909,8 +1039,12 @@ class PPOTrainer:
                     st["exp_avg"].clone() if "exp_avg" in st else None,
                     st["exp_avg_sq"].clone() if "exp_avg_sq" in st else None,
                 ))
+        # Actor-frozen warm-up (train.py --actor-freeze-updates): a fresh
+        # critic learns from this rollout before its advantages steer the actor.
+        actor_frozen = bool(getattr(self, "actor_frozen", False))
+        extra_epochs = int(getattr(cfg, "critic_extra_epochs", 0) or 0)
         with record_function("step12/inner_loop"):
-            for _ in range(cfg.ppo_epochs):
+            for _ in range(0 if actor_frozen else cfg.ppo_epochs):
                 if kl_stopped_at >= 0:
                     break
                 for sel in iter_minibatch_indices(batch, cfg.batch_size, rng):
@@ -1084,7 +1218,18 @@ class PPOTrainer:
                         total_anchor_kl += anchor_kl.float()
                         total_beta_kl += beta_kl.float()
                     count += 1
-        self._ema_update_ref()
+        crit_steps = 0
+        crit_epochs = (cfg.ppo_epochs + extra_epochs) if actor_frozen else extra_epochs
+        if crit_epochs > 0 and critic_ok_for_extra(rolled_back_flag, self._critic_params):
+            with record_function("step12e/critic_only"):
+                cv, cq, crit_steps = self._critic_only_epochs(
+                    batch, rng, host_loader, micro, value_coef, crit_epochs, device
+                )
+            if actor_frozen:
+                # Report the critic's own losses in the value / q columns.
+                total_value, total_q, count = cv, cq, crit_steps
+        if not actor_frozen:
+            self._ema_update_ref()
         denom = max(count, 1)
         with record_function("step13/stats_sync"):
             return PPOStats(

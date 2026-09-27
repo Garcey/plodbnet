@@ -72,6 +72,25 @@ class CompactObsLayout:
     flag_cols: np.ndarray  # (F,) int64
     real_cols: np.ndarray  # (R,) int64
     _torch_cache: dict = field(default_factory=dict, repr=False)
+    # Storage dtype of the real columns in the rollout's OUTPUT slabs (and so
+    # in Batch.obs). "float16" (2026-09-26, TrainingConfig.obs_real_f16)
+    # halves them -- ~1.9x the rows per GiB for the full layout -- at IEEE
+    # half precision (relative 5e-4): NOT bit-exact, a deliberate trade for
+    # rollout length. The per-step pool stays float32 (`pool_layout`).
+    real_dtype: str = "float32"
+
+    @property
+    def real_np_dtype(self) -> type:
+        return np.float16 if self.real_dtype == "float16" else np.float32
+
+    @property
+    def real_torch_dtype(self) -> torch.dtype:
+        return torch.float16 if self.real_dtype == "float16" else torch.float32
+
+    @property
+    def pool_layout(self) -> "CompactObsLayout":
+        """The float32 twin (the per-step pool and the act-time uploads)."""
+        return _F32_TWIN.get(self.name, self)
 
     @property
     def n_flag(self) -> int:
@@ -88,7 +107,7 @@ class CompactObsLayout:
     @property
     def row_bytes(self) -> int:
         """Stored bytes per observation row (dense: 4 * obs_dim)."""
-        return self.n_bytes + 4 * self.n_real
+        return self.n_bytes + np.dtype(self.real_np_dtype).itemsize * self.n_real
 
     def torch_consts(
         self, device: torch.device
@@ -122,18 +141,27 @@ def _layout_from_mask(name: str, flag_mask: np.ndarray) -> CompactObsLayout:
 
 MINIMAL_LAYOUT = _layout_from_mask("minimal", FLAG_MASK_MINIMAL)
 FULL_LAYOUT = _layout_from_mask("full", FLAG_MASK_FULL)
+MINIMAL_LAYOUT_F16 = CompactObsLayout(
+    "minimal_f16", MINIMAL_LAYOUT.obs_dim, MINIMAL_LAYOUT.flag_cols,
+    MINIMAL_LAYOUT.real_cols, real_dtype="float16",
+)
+FULL_LAYOUT_F16 = CompactObsLayout(
+    "full_f16", FULL_LAYOUT.obs_dim, FULL_LAYOUT.flag_cols,
+    FULL_LAYOUT.real_cols, real_dtype="float16",
+)
+_F32_TWIN = {"minimal_f16": MINIMAL_LAYOUT, "full_f16": FULL_LAYOUT}
 
 
-def layout_for(variant: str, obs_mode: str) -> CompactObsLayout | None:
+def layout_for(variant: str, obs_mode: str, real_f16: bool = False) -> CompactObsLayout | None:
     """The compact layout for a (variant, obs_mode) collection, or None to
     keep dense storage (NLH: its 995-wide layout is not mapped — the NLH PPO
-    lineage is retired)."""
+    lineage is retired). `real_f16`: the half-precision storage twin."""
     if variant not in _PLO_VARIANTS:
         return None
     if obs_mode == "minimal":
-        return MINIMAL_LAYOUT
+        return MINIMAL_LAYOUT_F16 if real_f16 else MINIMAL_LAYOUT
     if obs_mode == "full":
-        return FULL_LAYOUT
+        return FULL_LAYOUT_F16 if real_f16 else FULL_LAYOUT
     raise ValueError(f"unknown obs_mode {obs_mode!r} (expected 'full' or 'minimal')")
 
 
@@ -186,6 +214,8 @@ def unpack(
     column scatters, in row chunks that bound the temporaries."""
     k = int(bits.shape[0])
     out = torch.empty((k, layout.obs_dim), dtype=torch.float32, device=bits.device)
+    if real.dtype != torch.float32:  # half-precision storage (obs_real_f16)
+        real = real.to(torch.float32)
     if bits.device.type == "cpu" and _rust_unpack_obs_rows is not None:
         if k:
             _rust_unpack_obs_rows(
@@ -222,9 +252,9 @@ class PackedObs:
                 f"PackedObs bits must be (N, {layout.n_bytes}) uint8, got "
                 f"{tuple(bits.shape)} {bits.dtype}"
             )
-        if real.dtype != torch.float32 or real.dim() != 2 or real.shape[1] != layout.n_real:
+        if real.dtype != layout.real_torch_dtype or real.dim() != 2 or real.shape[1] != layout.n_real:
             raise ValueError(
-                f"PackedObs real must be (N, {layout.n_real}) float32, got "
+                f"PackedObs real must be (N, {layout.n_real}) {layout.real_dtype}, got "
                 f"{tuple(real.shape)} {real.dtype}"
             )
         if bits.shape[0] != real.shape[0] or bits.device != real.device:
@@ -243,7 +273,7 @@ class PackedObs:
 
     @property
     def nbytes(self) -> int:
-        return int(self.bits.numel()) + 4 * int(self.real.numel())
+        return int(self.bits.numel()) + self.real.element_size() * int(self.real.numel())
 
     def __len__(self) -> int:
         return int(self.bits.shape[0])

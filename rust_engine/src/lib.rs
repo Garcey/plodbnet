@@ -62,6 +62,10 @@ fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
         crate::bindings::pair_features_batch,
         m
     )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        crate::bindings::plo_board_strength_batch,
+        m
+    )?)?;
     // Observation-semantics revision this binary reads from PLO5BP_OBS_REV
     // (review 2026-09-20); encoding.py cross-checks it at import.
     m.add_function(pyo3::wrap_pyfunction!(

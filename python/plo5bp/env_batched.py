@@ -140,6 +140,14 @@ class BatchedBombPotEnv:
             bool(self._use_rust_encoder) and not self._rust_minimal
             and hasattr(BatchedEngine, "observation_encoded_into")
         )
+        # ... which (engine 2026-09-26) also write the packed copy, or ONLY it
+        # (out=None), and have a subset variant -- the full layout can keep the
+        # packed copy in step like the minimal one.
+        self._rust_full_packed = bool(self._rust_full_into) and bool(
+            getattr(BatchedEngine, "FULL_INTO_PACKED", False)
+        ) and hasattr(BatchedEngine, "observation_encoded_subset_into") and (
+            os.environ.get("PLO5BP_NO_FULL_PACKED", "").strip() != "1"
+        )  # PLO5BP_NO_FULL_PACKED=1: the pre-2026-09-26 dense path (A/B, digests)
         # Packed copy of self._obs (compact_obs layout), kept in step by the
         # in-place encoders when `enable_packed_obs` is on -- None otherwise.
         self._obs_bits: np.ndarray | None = None
@@ -500,13 +508,17 @@ class BatchedBombPotEnv:
             if getattr(self, "_rust_full_into", False):
                 # Full layout, encoded straight into the cached buffer; rows
                 # with a False mask entry come back zeroed (same bits as the
-                # copy + zero below).
-                self._drop_packed_obs()
+                # copy + zero below). With the packed encoders (2026-09-26)
+                # the packed copy is written in the same pass, or ONLY it.
+                if not getattr(self, "_rust_full_packed", False):
+                    self._drop_packed_obs()
                 with record_function("step1a_bundle/obs_features_batch"):
                     bundle = self._be.observation_encoded_into(
-                        self._obs_buffer(),
+                        self._obs_buffer() if self._dense_obs else None,
                         None if em is None or bool(em.all())
                         else np.ascontiguousarray(em),
+                        **(self._packed_kwargs()
+                           if getattr(self, "_rust_full_packed", False) else {}),
                     )
                 with record_function("step1a_unpack/post"):
                     self._unpack_post(bundle)
@@ -611,13 +623,14 @@ class BatchedBombPotEnv:
         (the rollout collector's CUDA upload path). `_snapshot` unpacks."""
         if layout is None or int(layout.obs_dim) != int(self._obs_dim):
             return False
-        if not (
-            getattr(self, "_rust_minimal_into", False)
-            and getattr(BatchedEngine, "MINIMAL_INTO_PACKED", False)
-        ):
+        minimal_ok = getattr(self, "_rust_minimal_into", False) and getattr(
+            BatchedEngine, "MINIMAL_INTO_PACKED", False
+        )
+        full_ok = getattr(self, "_rust_full_packed", False)
+        if not (minimal_ok or full_ok):
             return False
-        want_dense = bool(dense) or not getattr(
-            BatchedEngine, "MINIMAL_INTO_PACKED_ONLY", False
+        want_dense = bool(dense) or not (
+            full_ok or getattr(BatchedEngine, "MINIMAL_INTO_PACKED_ONLY", False)
         )
         if self._packed_layout is layout and self._obs_bits is not None:
             self._set_dense_obs(want_dense)
@@ -781,6 +794,21 @@ class BatchedBombPotEnv:
             # compact encode + scatter below); the aux arrays stay compact.
             with record_function("step1a_bundle/obs_features_subset"):
                 bundle = self._be.observation_encoded_minimal_subset_into(
+                    idx_i64,
+                    self._obs if self._dense_obs else None,
+                    **self._packed_kwargs(),
+                )
+            obs_sub = None
+            actors_sub = np.asarray(bundle["actor"], dtype=np.int8)
+        elif (
+            self._use_rust_encoder
+            and getattr(self, "_rust_full_packed", False)
+            and (not self._dense_obs or self._obs_is_buffer())
+        ):
+            # Full layout, rows straight into self._obs[idx] and/or the packed
+            # copy (2026-09-26; bit-identical to the encode + scatter below).
+            with record_function("step1a_bundle/obs_features_subset"):
+                bundle = self._be.observation_encoded_subset_into(
                     idx_i64,
                     self._obs if self._dense_obs else None,
                     **self._packed_kwargs(),

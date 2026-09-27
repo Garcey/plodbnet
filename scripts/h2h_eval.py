@@ -37,6 +37,7 @@ import torch  # noqa: E402
 
 from plo5bp import encoding as _encoding  # noqa: E402
 from plo5bp.env_batched import BatchedBombPotEnv  # noqa: E402
+from plo5bp.rollout import TRAIN_OPP_OUTCOME_MC  # noqa: E402
 from plo5bp.network import build_actor_from_state_dict  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
@@ -75,7 +76,10 @@ def play_config(game_cfg, models, deals, obs_mode, device, rng, ev_samples, gree
     n_seats = game_cfg.num_seats
     n = 2 * deals
     env = BatchedBombPotEnv(
-        n, game_cfg, ev_runout_samples=ev_samples, opp_outcome_mc=0, obs_mode=obs_mode
+        n, game_cfg, ev_runout_samples=ev_samples, obs_mode=obs_mode,
+        # the full layout's opp-outcome features (dims 982-989) at the training
+        # sample count; 0 fed full-obs models zeros there (minimal obs has none)
+        opp_outcome_mc=TRAIN_OPP_OUTCOME_MC if obs_mode == "full" else 0,
     )
     seeds = rng.integers(0, 2**63 - 1, size=deals, dtype=np.int64).astype(np.uint64)
     buttons = rng.integers(0, n_seats, size=deals).astype(np.uint8)

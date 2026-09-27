@@ -151,6 +151,13 @@ class TrainingConfig:
     # layout (2.4x full), which is what lets rollout_length grow. False = the
     # old dense float32 rows (A/B, debugging). NLH always stores dense.
     compact_obs: bool = True
+    # Half-precision storage of the compact rows' REAL columns in the
+    # rollout's output (2026-09-26): ~1.9x the rows per GiB on the full
+    # layout (1,022 B vs 1,956 B per observation), at IEEE float16 precision
+    # (relative 5e-4; the largest real column, the pot in bb, stays far
+    # below the 65,504 limit). NOT bit-exact: the PPO update sees the rows
+    # rounded, the act-time forward saw them unrounded. False = float32.
+    obs_real_f16: bool = False
     # PPO micro-batching (2026-09-23): split each minibatch into chunks of at
     # most this many rows, accumulating gradients (per-row means weighted by
     # each chunk's share of rows; the fold-supervision term keeps its
@@ -319,6 +326,26 @@ class TrainingConfig:
     # v1 runs — the critic is only built when train.py constructs one.
     critic_hidden_dim: int = 1536
     critic_num_blocks: int = 2
+    # Critic redesign (2026-09-26 regression diagnosis; network.CentralCritic):
+    # torso activation, LayerNorm'd input block, and V read out as the mean of
+    # the predicted return distribution. Defaults = the pre-redesign critic.
+    critic_act: str = "relu"
+    critic_in_norm: bool = False
+    critic_v_raw: bool = False
+    # Critic-only passes over each rollout AFTER the PPO epochs (value + Q
+    # losses, the actor untouched). 0 = the pre-2026-09-26 update. A fresh
+    # critic beat the 15B-row vSix5 critic after 3 passes over 1.6M rows, so
+    # the critic gets more gradient steps per (expensive) rollout.
+    critic_extra_epochs: int = 0
+    # Minibatches per CRITIC-ONLY epoch (0 = the PPO's num_minibatches). The
+    # PPO epochs take ~16 huge steps per rollout -- far too few optimizer
+    # steps for a critic (a fresh one lagged the old at 16/epoch while ~1,500
+    # small steps offline beat it), so the critic passes take many smaller ones.
+    critic_minibatches: int = 0
+    # Scale the Q regression's MSE terms (q_aux, fold supervision) by
+    # 1 / (minibatch return variance + 1) -- see PPOTrainer._q_norm. For new
+    # critics; False = the pre-2026-09-26 raw bb^2 losses.
+    critic_q_norm: bool = False
     # Weight on the actor's own value head ("display head" for the UI)
     # when a CentralCritic owns the GAE values. Plain regression, no
     # clipping; small so it stays subordinate to the policy loss.

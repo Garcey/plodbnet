@@ -121,14 +121,24 @@ class _ResidualBlock(nn.Module):
     (Nauman 2024). Off by default → no `norm.*` params, byte-identical to the
     pre-v6 block."""
 
-    def __init__(self, dim: int, use_norm: bool = False):
+    def __init__(self, dim: int, use_norm: bool = False, act: str = "relu"):
         super().__init__()
         self.norm = nn.LayerNorm(dim) if use_norm else None
         self.linear = nn.Linear(dim, dim)
+        self._act = _ACTS[act]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = x if self.norm is None else self.norm(x)
-        return x + F.relu(self.linear(h))
+        return x + self._act(self.linear(h))
+
+
+# Torso activations by name. "relu" is every pre-2026-09-26 network; the
+# critic redesign (2026-09-26) uses "silu": a ReLU unit whose pre-activation
+# goes negative on every input stops learning for good, and the vSix5 critic
+# had lost 77% of its input layer that way.
+_ACTS = {"relu": F.relu, "silu": F.silu, "gelu": F.gelu}
+_ACT_MODULES = {"relu": nn.ReLU, "silu": nn.SiLU, "gelu": nn.GELU}
+_ACT_IDS = {"relu": 0, "silu": 1, "gelu": 2}
 
 
 class ActorCritic(nn.Module):
@@ -1107,16 +1117,41 @@ class CentralCritic(nn.Module):
         hlgauss_sigma: float = 0.75,
         q_fold_zero: bool = False,
         q_base_raw: bool = False,
+        act: str = "relu",
+        in_norm: bool = False,
+        v_raw: bool = False,
     ):
         super().__init__()
-        input_block = nn.Sequential(
-            nn.Linear(obs_dim + opp_dim, hidden_dim), nn.ReLU()
-        )
+        # Critic redesign (2026-09-26): `act` for every torso activation,
+        # `in_norm` = a LayerNorm between the input Linear and its activation,
+        # `v_raw` = V read out as the MEAN of the predicted return distribution
+        # (sum_i p_i symexp(c_i)) instead of symexp(E[symlog]) -- the latter is
+        # a log-space average that reads every high-variance state too low
+        # (vSix5 u1290 on held-out Monte-Carlo returns: +4.0 bb low overall,
+        # 2x low in its upper value deciles; the raw mean -1.3). Defaults =
+        # the pre-redesign critic, byte-identical; any non-default choice is
+        # recorded in the persistent `_arch` buffer so a state dict rebuilds
+        # itself (build_critic_from_state_dict).
+        if act not in _ACTS:
+            raise ValueError(f"critic act must be one of {sorted(_ACTS)}, got {act!r}")
+        self.act_name = act
+        self.in_norm = bool(in_norm)
+        self.v_raw = bool(v_raw)
+        layers: list[nn.Module] = [nn.Linear(obs_dim + opp_dim, hidden_dim)]
+        if self.in_norm:
+            layers.append(nn.LayerNorm(hidden_dim))
+        layers.append(_ACT_MODULES[act]())
+        input_block = nn.Sequential(*layers)
         blocks = [
-            _ResidualBlock(hidden_dim, use_norm=torso_layernorm)
+            _ResidualBlock(hidden_dim, use_norm=torso_layernorm, act=act)
             for _ in range(num_blocks)
         ]
         self.torso = nn.Sequential(input_block, *blocks)
+        if act != "relu" or self.in_norm or self.v_raw:
+            self.register_buffer(
+                "_arch",
+                torch.tensor([_ACT_IDS[act], int(self.in_norm), int(self.v_raw)], dtype=torch.int64),
+            )
         # Value head: scalar (default) OR a distributional HL-Gauss categorical
         # head over a SYMLOG-transformed support (V6 internals). Symlog packs the
         # huge double-board reward range (tiny 20bb pots to ~1500bb six-way
@@ -1173,6 +1208,8 @@ class CentralCritic(nn.Module):
                 "q_base_raw needs the distributional value head "
                 "(value_bins > 0) — the raw base is a readout of its bins"
             )
+        if self.v_raw and self.value_bins <= 0:
+            raise ValueError("v_raw needs the distributional value head (value_bins > 0)")
 
     def _value_from_z(self, z: torch.Tensor) -> torch.Tensor:
         """Scalar V from torso features: squeeze for the scalar head, or
@@ -1180,8 +1217,16 @@ class CentralCritic(nn.Module):
         q_values, rollout, UI) sees a plain scalar either way."""
         if self.value_bins > 0:
             probs = F.softmax(self.value_head(z), dim=-1)
-            return _symexp((probs * self._value_centers).sum(-1))
+            return self._v_from_probs(probs)
         return self.value_head(z).squeeze(-1)
+
+    def _v_from_probs(self, probs: torch.Tensor) -> torch.Tensor:
+        """Scalar V of the distributional head: the raw-space mean of the
+        predicted distribution under `v_raw`, else (legacy) symexp of its
+        symlog-space mean."""
+        if getattr(self, "v_raw", False):
+            return (probs * self._raw_value_centers).sum(-1)
+        return _symexp((probs * self._value_centers).sum(-1))
 
     def _q_from_z(
         self,
@@ -1203,10 +1248,10 @@ class CentralCritic(nn.Module):
         params get zero gradient and stay at zero-init."""
         if self.q_actions <= 0:
             return None
-        if self.q_base_raw:
+        if self.q_base_raw and not getattr(self, "v_raw", False):
             base = (probs * self._raw_value_centers).sum(-1)
         else:
-            base = v
+            base = v  # under v_raw, V already IS the raw-space mean
         q = base.detach()[..., None] + self.adv_head(z)
         if self.q_fold_zero:
             q = torch.cat([torch.zeros_like(q[..., :1]), q[..., 1:]], dim=-1)
@@ -1229,7 +1274,7 @@ class CentralCritic(nn.Module):
         z = _maybe_checkpoint(self.torso, torch.cat([obs, opp_multihot], dim=-1), getattr(self, "_grad_checkpoint", False))
         if self.value_bins > 0:
             probs = F.softmax(self.value_head(z), dim=-1)
-            v = _symexp((probs * self._value_centers).sum(-1))
+            v = self._v_from_probs(probs)
         else:
             probs = None
             v = self.value_head(z).squeeze(-1)
@@ -1245,7 +1290,7 @@ class CentralCritic(nn.Module):
         if self.value_bins > 0:
             logits = self.value_head(z)
             probs = F.softmax(logits, dim=-1)
-            v = _symexp((probs * self._value_centers).sum(-1))
+            v = self._v_from_probs(probs)
         else:
             logits = None
             probs = None
@@ -1311,6 +1356,13 @@ def build_critic_from_state_dict(
         q_actions = int(state_dict["adv_head.weight"].shape[0])
     vb = int(state_dict["value_head.weight"].shape[0])
     value_bins = vb if vb > 1 else 0  # scalar head is shape (1, hidden)
+    # The critic redesign's choices ride in the `_arch` buffer (absent = the
+    # legacy ReLU / no input norm / symlog-mean readout critic).
+    arch_kwargs: dict = {}
+    if "_arch" in state_dict:
+        a = [int(x) for x in state_dict["_arch"].tolist()]
+        ids = {v: k for k, v in _ACT_IDS.items()}
+        arch_kwargs = {"act": ids[a[0]], "in_norm": bool(a[1]), "v_raw": bool(a[2])}
     support_kwargs: dict = {}
     if value_support is not None:
         support_kwargs["value_support"] = float(value_support)
@@ -1326,6 +1378,7 @@ def build_critic_from_state_dict(
         q_fold_zero=q_fold_zero,
         q_base_raw=q_base_raw,
         **support_kwargs,
+        **arch_kwargs,
     )
     critic.load_state_dict(state_dict)
     return critic

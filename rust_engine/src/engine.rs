@@ -1576,6 +1576,59 @@ impl GameState {
     ///   12-dim block folds into its residual.
     /// - 19: tie on BOTH boards.
     pub fn outcome_features_mc(&self, mc_samples: usize) -> Vec<f32> {
+        self.outcome_features_mc_shared(mc_samples, None)
+    }
+
+    /// The pair-rank table `outcome_features_mc`'s k=2 exhaustive pass reads,
+    /// for EVERY 2-card holding of cards on neither board (2026-09-26): it
+    /// depends only on the two boards, so one table serves every seat that
+    /// acts on this street -- the batched packer keeps one per env and the
+    /// k=2 pass becomes lookups (the evaluations were most of the MC's cost,
+    /// and they were repeated for each acting seat). `None` before both
+    /// boards have a flop (the MC returns zeros there anyway).
+    pub fn board_pair_table(&self) -> Option<BoardPairTable> {
+        if self.board_a.len() < 3 || self.board_b.len() < 3 {
+            return None;
+        }
+        let mut on_board = [false; 52];
+        for c in self.board_a.iter().chain(self.board_b.iter()) {
+            on_board[c.index() as usize] = true;
+        }
+        let mut t = BoardPairTable {
+            key: BoardPairTable::key_of(&self.board_a, &self.board_b),
+            ranks_a: vec![0u32; 52 * 52],
+            ranks_b: vec![0u32; 52 * 52],
+        };
+        let mut pair = [Card::from_index(0); 2];
+        for c0 in 0..52u8 {
+            if on_board[c0 as usize] {
+                continue;
+            }
+            for c1 in (c0 + 1)..52u8 {
+                if on_board[c1 as usize] {
+                    continue;
+                }
+                pair[0] = Card::from_index(c0);
+                pair[1] = Card::from_index(c1);
+                let k = c0 as usize * 52 + c1 as usize;
+                t.ranks_a[k] = crate::hand_eval::evaluate_plo5_k_partial(&pair, &self.board_a);
+                t.ranks_b[k] = crate::hand_eval::evaluate_plo5_k_partial(&pair, &self.board_b);
+            }
+        }
+        Some(t)
+    }
+
+    /// `outcome_features_mc` with the k=2 pass's pair ranks read from `shared`
+    /// (a `board_pair_table()` of THESE boards) instead of evaluated: the same
+    /// ranks, so the same output bit for bit (pinned by
+    /// `shared_pair_table_matches_outcome_features_mc`). A table of other
+    /// boards is ignored (falls back to evaluating).
+    pub fn outcome_features_mc_shared(
+        &self,
+        mc_samples: usize,
+        shared: Option<&BoardPairTable>,
+    ) -> Vec<f32> {
+        let shared = shared.filter(|t| t.key == BoardPairTable::key_of(&self.board_a, &self.board_b));
         // N_OUT 20 → 22 (2026-07-12, DUAL-4): dims 20/21 append the k=2
         // guaranteed-pot-share bounds g_min/g_max. Dims 0..20 stay
         // byte-identical to the pre-append body — the P1 pin test compares
@@ -1710,10 +1763,18 @@ impl GameState {
                     for &i in idx.iter() {
                         opp_buf.push(unseen[i]);
                     }
-                    let opp_a =
-                        crate::hand_eval::evaluate_plo5_k_partial(&opp_buf, &self.board_a);
-                    let opp_b =
-                        crate::hand_eval::evaluate_plo5_k_partial(&opp_buf, &self.board_b);
+                    let (opp_a, opp_b) = match shared {
+                        Some(t) => {
+                            // idx[0] < idx[1] and `unseen` ascends, so the
+                            // card indices are ordered too.
+                            let k = opp_buf[0].index() as usize * 52 + opp_buf[1].index() as usize;
+                            (t.ranks_a[k], t.ranks_b[k])
+                        }
+                        None => (
+                            crate::hand_eval::evaluate_plo5_k_partial(&opp_buf, &self.board_a),
+                            crate::hand_eval::evaluate_plo5_k_partial(&opp_buf, &self.board_b),
+                        ),
+                    };
                     // P1: record this pair's per-board ranks for the k=3/4
                     // MC arms (idx[0] < idx[1] by the combination enumerator).
                     tab_a[idx[0] * PAIR_STRIDE + idx[1]] = opp_a;
@@ -2305,6 +2366,32 @@ pub fn compute_eff_stack_cap(starting_stacks: &[u64], folded: &[bool]) -> Vec<u6
         cap[i] = starting_stacks[i].min(max_other);
     }
     cap
+}
+
+/// Board-only pair ranks for the opp-outcome MC (see
+/// `GameState::board_pair_table`): entry `c0 * 52 + c1` (c0 < c1, neither on
+/// a board) = that 2-card holding's best PLO rank on board A / board B.
+#[derive(Clone, Debug)]
+pub struct BoardPairTable {
+    pub key: [u8; 12],
+    pub ranks_a: Vec<u32>,
+    pub ranks_b: Vec<u32>,
+}
+
+impl BoardPairTable {
+    /// Both boards' cards in deal order + lengths (255-padded).
+    pub fn key_of(board_a: &[Card], board_b: &[Card]) -> [u8; 12] {
+        let mut k = [255u8; 12];
+        for (j, c) in board_a.iter().enumerate().take(5) {
+            k[j] = c.index();
+        }
+        for (j, c) in board_b.iter().enumerate().take(5) {
+            k[5 + j] = c.index();
+        }
+        k[10] = board_a.len() as u8;
+        k[11] = board_b.len() as u8;
+        k
+    }
 }
 
 #[cfg(test)]
@@ -3913,6 +4000,51 @@ mod outcome_mc_p1_tests {
             bb: 10_000,
             sb: 0,
             variant,
+        }
+    }
+
+    #[test]
+    fn shared_pair_table_matches_outcome_features_mc() {
+        // The batched packer's shared board table (2026-09-26) must change
+        // nothing: every variant x street x seat count x hero, one table per
+        // (hand, street) shared by all heroes, compared bit for bit with the
+        // self-evaluating path -- plus a STALE table (another street's), which
+        // must be ignored.
+        let variants = [
+            Variant::Plo5DoubleBomb,
+            Variant::Plo4DoubleBomb,
+            Variant::Plo6DoubleBomb,
+        ];
+        for &variant in variants.iter() {
+            for &num_seats in &[2usize, 3, 6] {
+                for seed in 0..4u64 {
+                    let mut g = GameState::new_hand(variant_cfg(variant, num_seats), 1000 + seed, 1);
+                    let mut stale: Option<BoardPairTable> = None;
+                    for street in 0..3usize {
+                        if street == 1 {
+                            reveal_turn(&mut g);
+                        }
+                        if street == 2 {
+                            reveal_river(&mut g);
+                        }
+                        let table = g.board_pair_table().expect("both boards have a flop");
+                        for hero in 0..num_seats {
+                            g.actor = Some(hero);
+                            for &mc in &[1usize, 64, 384] {
+                                let a = g.outcome_features_mc(mc);
+                                let b = g.outcome_features_mc_shared(mc, Some(&table));
+                                let bits = |v: &Vec<f32>| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                                assert_eq!(bits(&a), bits(&b), "{variant:?} seats {num_seats} seed {seed} street {street} hero {hero} mc {mc}");
+                                if let Some(t) = stale.as_ref() {
+                                    let c = g.outcome_features_mc_shared(mc, Some(t));
+                                    assert_eq!(bits(&a), bits(&c), "stale table used");
+                                }
+                            }
+                        }
+                        stale = Some(table);
+                    }
+                }
+            }
         }
     }
 

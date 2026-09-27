@@ -61,6 +61,7 @@ def build_states(actor, rows: int, obs_mode: str, seed: int = 0, tables: int = 2
     """Self-play decision states of `actor` (sampling its policy) on 30 table
     configs, 10 per tier, drawn like training; a uniform sample of `rows`."""
     from plo5bp.env_batched import BatchedBombPotEnv
+    from plo5bp.rollout import TRAIN_OPP_OUTCOME_MC  # the full layout's outcome features
 
     spec = importlib.util.spec_from_file_location("_train", REPO / "scripts" / "train.py")
     train = importlib.util.module_from_spec(spec)
@@ -74,7 +75,7 @@ def build_states(actor, rows: int, obs_mode: str, seed: int = 0, tables: int = 2
                 (2, 3, 4, 5, 6), 1.0, 300.0, BB, 3 * BB, rng,
                 stack_dist=tier, seats_dist="uniform", variant="plo5_double_bomb", sb=0,
             )
-            env = BatchedBombPotEnv(tables, cfg, opp_outcome_mc=0, obs_mode=obs_mode)
+            env = BatchedBombPotEnv(tables, cfg, obs_mode=obs_mode, opp_outcome_mc=TRAIN_OPP_OUTCOME_MC if obs_mode == "full" else 0)
             env.reset_batch(
                 rng.integers(0, 2**63 - 1, size=tables, dtype=np.int64).astype(np.uint64),
                 rng.integers(0, cfg.num_seats, size=tables).astype(np.uint8),
