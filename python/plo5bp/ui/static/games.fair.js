@@ -125,15 +125,18 @@
     if (expectSlots && !expectSlots.includes(slot)) throw new FairError(`card ${card} was dealt from slot ${slot}, which is not its place`);
     if (cardCommitment(String(tr.hand_id), pos, salt, card) !== tr.commitments[pos]) throw new FairError(`card ${card} does not open the sealed position ${pos}`);
   }
-  // every card on a state payload, with the slots it is allowed to come from
+  // every card on a state payload, with the slots it is allowed to come from. The
+  // slot map: seat s's hole cards are slots h*s .. h*s+h-1 (h = hole cards per
+  // player: 5 in PLO5, 6 in PLO6 — the table's game), board A h*n.., board B h*n+5..
+  const holeOf = (s) => (s && Number.isInteger(s.hole_count) && s.hole_count > 0 ? s.hole_count : 5);
   function visibleCards(s) {
-    const out = [], n = s.num_seats;
+    const out = [], n = s.num_seats, h = holeOf(s);
     (s.seats || []).forEach((seat, i) => (seat.hole || []).forEach((c) => {
-      if (Number.isInteger(c) && c >= 0) out.push([c, [5 * i, 5 * i + 1, 5 * i + 2, 5 * i + 3, 5 * i + 4]]);
+      if (Number.isInteger(c) && c >= 0) out.push([c, Array.from({ length: h }, (_, k) => h * i + k)]);
     }));
     [["a", 0], ["b", 5]].forEach(([k, off]) => {
       const bd = (s.board || {})[k] || {};
-      (bd.flop || []).concat([bd.turn, bd.river]).forEach((c, m) => { if (Number.isInteger(c) && c >= 0) out.push([c, [5 * n + off + m]]); });
+      (bd.flop || []).concat([bd.turn, bd.river]).forEach((c, m) => { if (Number.isInteger(c) && c >= 0) out.push([c, [h * n + off + m]]); });
     });
     return out;
   }
@@ -226,6 +229,8 @@
         const mine = m && (m.state === "revealed" || m.state === "revealing") ? m : null;
         try {
           if (tr.hand_id !== h.hand_id || tr.seal !== h.seal) throw new FairError("the transcript is for a different sealed deck");
+          // (the slot map follows the table's game: a transcript for another one is refused)
+          if ((tr.hole || 5) !== holeOf(s)) throw new FairError("the transcript deals a different number of hole cards than this table");
           rec.perm = verifyTranscript(tr, mine);
           rec.tr = tr;
           rec.status = mine ? "mine" : (tr.locked || []).length ? "others" : "none";

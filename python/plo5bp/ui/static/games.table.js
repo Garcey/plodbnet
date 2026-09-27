@@ -18,8 +18,17 @@
   };
 
   const $ = (id) => document.getElementById(id);
+  // Card rows per game (2026-09-26: PLO6 next to PLO5). A six-card row takes about the
+  // room of a five-card one, so the tuned layout holds: the hero's cards are 10% smaller
+  // and overlap a little more, a face-down fan tucks tighter, a tabled row starts tighter.
+  // (keep in step with the #stage.h6 variables in games.css)
+  const ROW = {
+    5: { heroK: 1, heroOv: 0.24, openOv: 0.3, openMax: 0.56 },
+    6: { heroK: 0.9, heroOv: 0.28, openOv: 0.4, openMax: 0.6 },
+  };
+  const rowOf = (n) => ROW[n >= 6 ? 6 : 5];
   const T = {
-    ready: false, tableId: null, n: 0, hero: 0, seated: false,
+    ready: false, tableId: null, n: 0, hero: 0, seated: false, hole: 5,
     seats: [], bets: [], geom: null, boards: { a: [], b: [] },
     boardCards: { a: [], b: [] }, heroCards: [], potCents: null,
     awardKey: null, foldoutKey: null, handNo: null, chatSeen: null, reactSeen: 0,
@@ -179,7 +188,7 @@
     const heroV = T.seated ? T.seats[T.hero] : null;
     let heroCards = null;
     if (heroV) {
-      const cw = u * g.heroCw, half = (cw * 4.04) / 2, hx = g.wide ? g.cx - u * 5.5 : g.cx;
+      const cw = u * g.heroCw, half = (cw * g.heroSpan) / 2, hx = g.wide ? g.cx - u * 5.5 : g.cx;
       const top = g.wide ? g.h - u * (1 + g.heroCw * 1.38) : heroV.y - u * (3.5 + g.heroCw * 1.38);
       heroCards = [hx - half, top, hx + half, top + cw * 1.38];
       fixed.push(heroCards);
@@ -285,9 +294,12 @@
     ins.t = Math.max(ins.t, (u * 9.3) / h);
     if (wide) { ins.t = (u * 7) / h; ins.b = (u * 3) / h; ins.l = ins.r = 0.07; }
     const fx = w * ins.l, fy = h * ins.t, fw = w * (1 - ins.l - ins.r), fh = h * (1 - ins.t - ins.b);
-    // hero card width in units — keep in step with #hero-hole in games.css
-    const heroCw = wide ? 6 : portrait ? 6.6 : 6.3;
-    return { w, h, u, portrait, wide, heroCw, fx, fy, fw, fh, cx: fx + fw / 2, cy: fy + fh / 2 };
+    // hero card width in units — keep in step with #hero-hole in games.css (--hk scales it
+    // for six cards); the row is heroSpan cards wide (each card after the first overlaps)
+    const row = rowOf(T.hole);
+    const heroCw = (wide ? 6 : portrait ? 6.6 : 6.3) * row.heroK;
+    const heroSpan = T.hole - (T.hole - 1) * row.heroOv;
+    return { w, h, u, portrait, wide, heroCw, heroSpan, fx, fy, fw, fh, cx: fx + fw / 2, cy: fy + fh / 2 };
   }
 
   function layout() {
@@ -361,6 +373,15 @@
     fitSeats();
   }
 
+  // A tabled row's geometry (fitSeats places it, fitPots keeps the pots clear of it):
+  // card width, how many cards, and the band it covers (a winning card lifts 0.18 of
+  // a card). (keep in step with .seat-cards.open in games.css)
+  function openRow(sv, g) {
+    const n = sv.cardEls.length || T.hole, cw = g.u * (g.wide ? 3 : 3.5);
+    const cy = sv.y + g.u * (g.wide ? -0.4 : -5.5);
+    return { n, cw, cy, top: cy - cw * 0.87, bot: cy + cw * 0.69, row: rowOf(n), width: (ov) => (n - (n - 1) * ov) * cw };
+  }
+
   // Tabled (face-up) cards sit over the avatar and a seat's showdown labels hang
   // under it. On a phone the seats on the table's long sides are level with the
   // boards: a five-card row reached over the end card of a board, and a label
@@ -374,12 +395,14 @@
     if (!g || !T.seats.length) return;
     const st = $("stage").getBoundingClientRect();
     const blocks = [];
-    for (const id of ["boards", "pots", "pot-row", "street-tag", "award-caption"]) {
+    for (const id of ["boards", "pots", "pot-row", "street-tag"]) {
       const e = $(id);
       if (!e || e.hidden || !e.offsetWidth) continue;
       const r = e.getBoundingClientRect();
       blocks.push([r.left - st.left, r.top - st.top, r.right - st.left, r.bottom - st.top]);
     }
+    const capBox = captionLanding(g, st);
+    if (capBox) blocks.push(capBox);
     const box = (e) => { const r = e.getBoundingClientRect(); return [r.left - st.left, r.top - st.top, r.right - st.left, r.bottom - st.top]; };
     const labels = T.seats.map((sv) => {
       const w = sv.x == null ? 0 : sv.hand.offsetWidth;
@@ -390,7 +413,7 @@
     const mains = T.seats.map((sv) => (sv.x == null || !sv.main.offsetWidth ? null : box(sv.main)));
     const hz = $("hero-zone");
     const heroBox = hz && !hz.hidden && hz.offsetWidth ? box(hz) : null;
-    const cw = g.u * (g.wide ? 3 : 3.5), gap = g.u * 0.4, edge = g.u * 0.6;
+    const gap = g.u * 0.4, edge = g.u * 0.6;
     const labelBox = [], rowBox = [];
     T.seats.forEach((sv, i) => {
       if (sv.x == null) return;
@@ -414,17 +437,14 @@
       hx = Math.round(hx);
       if (sv.labelShift !== hx) { sv.labelShift = hx; sv.hand.style.setProperty("--hx", hx + "px"); }
       // the tabled cards
-      const n = sv.cardEls.length || 5;
-      const width = (ov) => (n - (n - 1) * ov) * cw;  // (keep in step with .seat-cards.open in games.css)
-      const cy = sv.y + g.u * (g.wide ? -0.4 : -5.5);
-      const top = cy - cw * 0.87, bot = cy + cw * 0.69;  // (a winning card lifts 0.18 of a card)
-      let ov = 0.3, hw = width(ov) / 2;
+      const { n, cw, top, bot, row, width } = openRow(sv, g);
+      let ov = row.openOv, hw = width(ov) / 2;
       let c = Math.max(g.u + hw, Math.min(g.w - g.u - hw, sv.x));
       const hits = blocks.filter((b) => b[1] < bot && b[3] > top && b[0] < c + hw + gap && b[2] > c - hw - gap);
       const inner = !hits.length ? null : left ? Math.min(...hits.map((b) => b[0])) - gap : Math.max(...hits.map((b) => b[2])) + gap;
       if (inner != null && n > 1 && (left ? sv.x < inner : sv.x > inner)) {  // (beside the block, not over it)
         const room = left ? inner - edge : g.w - edge - inner;
-        ov = Math.min(0.56, Math.max(0.3, (n - room / cw) / (n - 1)));
+        ov = Math.min(row.openMax, Math.max(row.openOv, (n - room / cw) / (n - 1)));
         hw = width(ov) / 2;
         c = left ? Math.max(edge + hw, Math.min(inner - hw, sv.x)) : Math.min(g.w - edge - hw, Math.max(inner + hw, sv.x));
       }
@@ -454,11 +474,25 @@
     d.classList.toggle("covered", covered);
   }
 
+  // Where the award caption LANDS (stage coordinates). It slides in (capin: from higher
+  // up and smaller) and this runs in its first frame — its live box was the wrong one: a
+  // tabled row level with where it ends up (the side seats of a 7-seat table, PLO6's
+  // default) was left under it. Layout box (offsets ignore transforms) + its resting
+  // shift: -50% across, --cap-dy units down (games.css; the only place it is set).
+  function captionLanding(g, st) {
+    const cap = $("award-caption"), host = $("center");
+    if (!cap || cap.hidden || !cap.offsetWidth || !host) return null;
+    const hr = host.getBoundingClientRect();  // (#center: a pure translate — its box is exact)
+    const dy = (parseFloat(getComputedStyle(cap).getPropertyValue("--cap-dy")) || 0) * g.u;
+    const left = hr.left - st.left + cap.offsetLeft - cap.offsetWidth / 2, top = hr.top - st.top + cap.offsetTop + dy;
+    return [left, top, left + cap.offsetWidth, top + cap.offsetHeight];
+  }
+
   function placeCards(sv) {
     const c = sv.cards;
     if (c.classList.contains("open")) {
       c.style.setProperty("--cx", (sv.openShift || 0) + "px");
-      c.style.setProperty("--ov", String(sv.openOv || 0.3));
+      c.style.setProperty("--ov", String(sv.openOv || rowOf(sv.cardEls.length || T.hole).openOv));
       // (wide: no air above the top seats — tabled cards sit ON the avatar)
       c.style.setProperty("--cy", T.geom && T.geom.wide ? "calc(var(--u) * -0.4)" : "calc(var(--u) * -5.5)");
     } else {
@@ -481,6 +515,8 @@
   function build(s) {
     T.tableId = s.id; T.n = s.num_seats; T.hero = s.hero_seat || 0;
     T.seated = s.my_seat != null;
+    T.hole = s.hole_count || 5;  // (the table's game: PLO5 deals five, PLO6 six)
+    $("stage").classList.toggle("h6", T.hole >= 6);
     const seatsEl = $("seats"), betsEl = $("bets");
     seatsEl.innerHTML = ""; betsEl.innerHTML = ""; $("fx").innerHTML = "";
     T.seats = []; T.bets = [];
@@ -807,7 +843,7 @@
         if (ctx.dealing && T.geom) {
           ce.style.setProperty("--fx", T.geom.cx - sv.x + "px");
           ce.style.setProperty("--fy", T.geom.cy - sv.y + "px");
-          ce.style.animationDelay = (sv.rel * 5 + k) * 24 + "ms";
+          ce.style.animationDelay = (sv.rel * T.hole + k) * 24 + "ms";
           ce.classList.add("deal-in");
         }
         host.appendChild(ce);
@@ -1185,7 +1221,8 @@
     if (!host || host.hidden || !T.geom) return;
     const total = $("pot-total");
     const flank = host.id === "live-pots" && !total.hidden ? total.offsetWidth + T.geom.u * 1.1 : 0;
-    const key = `${host.dataset.k}|${T.geom.w}x${T.geom.h}|${Math.round(flank)}`;
+    const tabled = T.seats.map((sv) => (sv.cards.classList.contains("open") ? sv.cardEls.length : 0)).join("");
+    const key = `${host.dataset.k}|${T.geom.w}x${T.geom.h}|${Math.round(flank)}|${tabled}`;
     if (host.dataset.fit === key) return;
     host.dataset.fit = key;
     host.classList.remove("tight");
@@ -1205,10 +1242,19 @@
       const lw = sv.x == null ? 0 : sv.hand.offsetWidth;
       if (lw) {
         const r = sv.hand.getBoundingClientRect();
-        if (r.bottom <= pr.top || r.top >= pr.bottom) continue;
-        if (st.left + sv.x < mid) room = Math.min(room, 2 * (mid - (st.left + 4 + lw) - gap));
-        else room = Math.min(room, 2 * (st.right - 4 - lw - mid - gap));
+        if (!(r.bottom <= pr.top || r.top >= pr.bottom)) {
+          if (st.left + sv.x < mid) room = Math.min(room, 2 * (mid - (st.left + 4 + lw) - gap));
+          else room = Math.min(room, 2 * (st.right - 4 - lw - mid - gap));
+        }
       }
+      // … and so does a tabled row, down to its tightest fan: on a 7-seat table (PLO6's
+      // default) the upper side seats' rows are level with the pots of an all-in runout
+      if (sv.x == null || !sv.cards.classList.contains("open") || !sv.cardEls.length) continue;
+      const o = openRow(sv, T.geom);
+      if (st.top + o.bot <= pr.top || st.top + o.top >= pr.bottom) continue;
+      const need = T.geom.u * 0.6 + o.width(o.row.openMax);  // (fitSeats' stage-edge inset + the row)
+      if (sv.x < T.geom.w / 2) room = Math.min(room, 2 * (mid - (st.left + need) - gap));
+      else room = Math.min(room, 2 * (st.right - need - mid - gap));
     }
     room -= 2 * flank;
     if (host.offsetWidth <= room) return;
@@ -1288,7 +1334,7 @@
       if (globalThis.ResizeObserver) { T.ro = new ResizeObserver(() => { layout(); if (HG.core.G.state) placeRabbit(HG.core.G.state); }); T.ro.observe($("stage-box")); }
       else globalThis.addEventListener("resize", layout);
     }
-    const rebuilt = T.tableId !== s.id || T.n !== s.num_seats || T.hero !== (s.hero_seat || 0) || T.seated !== (s.my_seat != null);
+    const rebuilt = T.tableId !== s.id || T.n !== s.num_seats || T.hero !== (s.hero_seat || 0) || T.seated !== (s.my_seat != null) || T.hole !== (s.hole_count || 5);
     if (rebuilt) build(s);
     const samePrev = !!prev && prev.id === s.id && !rebuilt;
     const animate = samePrev && anim() && !document.hidden;
@@ -1316,7 +1362,7 @@
         setTimeout(() => play(k === "fold" ? "fold" : k === "check" ? "check" : k === "allin" ? "allin" : "chip"), j * 120);
       });
     }
-    if (ctx.dealing) { for (let j = 0; j < 5; j++) setTimeout(() => play("deal"), j * 95); }
+    if (ctx.dealing) { for (let j = 0; j < T.hole; j++) setTimeout(() => play("deal"), j * 95); }
 
     ctx.collected = updateMoney(s, prev, ctx);
     s.seats.forEach((seat, i) => updateSeat(i, seat, s, ctx));

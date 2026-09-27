@@ -1,8 +1,15 @@
-"""Private PLO5 double-board bomb-pot home games (PokerNow-style).
+"""Private PLO5 / PLO6 double-board bomb-pot home games (PokerNow-style).
 
 Installed only from ``public.install`` (public build). Access is the
 admin-granted ``homegame_access`` flag, independent of subscription;
 the HTTP middleware 404s the whole ``/games`` tree for everyone else.
+
+The game (2026-09-26): a table deals PLO5 (five hole cards, up to 8 seats) or
+PLO6 (six hole cards, up to 7 seats — 7 x 6 + two boards is the whole deck; no
+burn cards online), chosen when the table is created and fixed for its life
+(like the blinds). Everything else is the same game. Only PLO5 decisions are
+graded (there is no PLO6 network yet), and the club's numbers are kept apart
+per game (``homegames.variant``).
 
 Stakes: small/big blind set the chip unit and the dollar ledger.
 Gameplay is ClubGG-style bomb pots — every in-hand seat posts the ante,
@@ -95,7 +102,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response, Streamin
 from starlette.concurrency import run_in_threadpool
 
 from plo5bp.actions import FOLD, GATE_CHECK_CALL, GATE_FOLD, GATE_RAISE
-from plo5bp.config import VARIANT_PLO5, GameConfig
+from plo5bp.config import VARIANT_PLO5, VARIANT_PLO6, GameConfig
 from plo5bp.env import BombPotEnv, StepInfo
 from plo5bp.ui.common import STREET_NAMES, position_name
 from plo5bp.ui.hand_describe import describe_made_hand
@@ -106,7 +113,18 @@ from plo5bp.ui import public as pub
 logger = logging.getLogger("plo5bp.ui.homegame")
 
 BB_CHIPS = 10_000
-TABLE_SEATS = 8
+TABLE_SEATS = 8  # the most seats any game has (PLO5); see GAMES for each game's own
+
+#: The games a table can deal: short code -> engine variant, hole cards per
+#: player, seat limit (one deck, no burn cards: seats x hole + 10 board <= 52),
+#: whether the network grades its decisions, and how the table names it.
+GAMES: dict[str, dict[str, Any]] = {
+    "plo5": {"variant": VARIANT_PLO5, "hole": 5, "max_seats": 8, "graded": True,
+             "label": "PLO5", "name": "PLO5 double-board bomb pot"},
+    "plo6": {"variant": VARIANT_PLO6, "hole": 6, "max_seats": 7, "graded": False,
+             "label": "PLO6", "name": "PLO6 double-board bomb pot"},
+}
+DEFAULT_GAME = "plo5"
 
 # Hard limits (review 2026-09-20 G4/G13). Every money field is capped far
 # below what sqlite (i64) / the engine (u64) can hold, so a value that made
@@ -228,7 +246,8 @@ CREATE TABLE IF NOT EXISTS homegames (
   topup_below_cents INTEGER NOT NULL DEFAULT 0,
   show_grades INTEGER NOT NULL DEFAULT 1,
   excluded INTEGER NOT NULL DEFAULT 0,
-  allow_rathole INTEGER NOT NULL DEFAULT 0
+  allow_rathole INTEGER NOT NULL DEFAULT 0,
+  variant TEXT NOT NULL DEFAULT 'plo5'
 );
 CREATE TABLE IF NOT EXISTS homegame_hands (
   game_id TEXT NOT NULL,
@@ -380,6 +399,8 @@ def _ensure_schema() -> None:
             ("show_grades", "INTEGER NOT NULL DEFAULT 1"),
             ("excluded", "INTEGER NOT NULL DEFAULT 0"),
             ("allow_rathole", "INTEGER NOT NULL DEFAULT 0"),
+            # 2026-09-26: PLO6 tables. Every table before it dealt PLO5.
+            ("variant", "TEXT NOT NULL DEFAULT 'plo5'"),
         ):
             if col not in cols:
                 pub.DB._conn.execute(f"ALTER TABLE homegames ADD COLUMN {col} {ddl}")
@@ -489,6 +510,37 @@ def apportion_cents(total_cents: int, chips: list[int]) -> list[int]:
             out[i] += 1
             left -= 1
     return out
+
+
+def _norm_game(v: Any) -> str:
+    """A stored / loaded game code; anything unknown is the original game."""
+    s = str(v or "").strip().lower()
+    return s if s in GAMES else DEFAULT_GAME
+
+
+def _parse_game(v: Any) -> str:
+    """The game a request names: ``plo5`` / ``plo6`` (the engine's variant names
+    are accepted too). Unknown = 400, never a silent PLO5."""
+    s = str(v or "").strip().lower()
+    for code, g in GAMES.items():
+        if s in (code, g["variant"]):
+            return code
+    raise HTTPException(status_code=400, detail="unknown game — choose PLO5 or PLO6")
+
+
+def _game_filter(v: Any) -> str | None:
+    """A stats query's game (None = every game)."""
+    if v is None or str(v).strip().lower() in ("", "all"):
+        return None
+    return _parse_game(v)
+
+
+def _game_info(v: Any) -> dict[str, Any]:
+    """What a client needs to know about a game (served on every table view)."""
+    code = _norm_game(v)
+    g = GAMES[code]
+    return {"code": code, "label": g["label"], "name": g["name"], "hole": int(g["hole"]),
+            "max_seats": int(g["max_seats"]), "graded": bool(g["graded"])}
 
 
 def _sorted_hole(cards: list[int] | None) -> list[int] | None:
@@ -784,11 +836,21 @@ class LiveTable:
     join_checked_mono: float = 0.0
     club_info: dict[str, Any] | None = None
     club_checked_mono: float = 0.0
+    # The game dealt here (GAMES code) — chosen at creation, fixed for the table's life.
+    variant: str = DEFAULT_GAME
     lock: threading.RLock = field(default_factory=threading.RLock)
 
     @property
     def ante_chips(self) -> int:
         return cents_to_chips(self.ante_cents, self.bb_cents)
+
+    @property
+    def game(self) -> dict[str, Any]:
+        return GAMES[_norm_game(self.variant)]
+
+    @property
+    def hole_count(self) -> int:
+        return int(self.game["hole"])
 
     def occupied(self) -> list[int]:
         return [i for i, s in enumerate(self.seats) if s is not None]
@@ -1016,6 +1078,7 @@ def _load_table(game_id: str) -> LiveTable:
         topup_all_below_cents=_row_int(row, "topup_below_cents", 0),
         show_grades=bool(_row_int(row, "show_grades", 1)),
         allow_rathole=bool(_row_int(row, "allow_rathole", 0)),
+        variant=_norm_game(row["variant"] if "variant" in row.keys() else None),
     )
     # A hand dealt (hand_no is saved at the deal) but never recorded was cut short
     # by a restart. It is void — stacks are saved only when a hand ends, so everyone
@@ -1801,8 +1864,16 @@ def _timeout_tick_locked(t: LiveTable) -> None:
 
 def _fair_hand_id(t: LiveTable, hand_no: int, attempt: int) -> str:
     """Names ONE sealed deck. ``epoch`` (per in-memory load of the table) keeps an
-    id from ever naming two different seals across a restart or an eviction."""
-    return f"{t.game_id}:{int(hand_no)}:{int(attempt)}:{t.epoch}"
+    id from ever naming two different seals across a restart or an eviction. A
+    game other than PLO5 is named in it too, so every commitment (and the seal)
+    also says which slot map the deck is dealt by."""
+    gid = f"{t.game_id}:{int(hand_no)}:{int(attempt)}:{t.epoch}"
+    return gid if _norm_game(t.variant) == DEFAULT_GAME else f"{gid}:{_norm_game(t.variant)}"
+
+
+def _fair_seal(t: LiveTable, hand_no: int, attempt: int) -> Any:
+    return fairdeal.SealedDeck.create(
+        _fair_hand_id(t, hand_no, attempt), t.num_seats, hole=t.hole_count)
 
 
 def _fair_prepare_locked(t: LiveTable) -> None:
@@ -1811,13 +1882,11 @@ def _fair_prepare_locked(t: LiveTable) -> None:
         return
     nxt = t.fair_next
     if nxt is not None and nxt.hand_no == t.hand_no + 1:
-        if nxt.sealed.num_seats != t.num_seats:  # the slot map depends on the seat count
+        # the slot map depends on the seat count (and on the hole cards per seat)
+        if nxt.sealed.num_seats != t.num_seats or nxt.sealed.hole != t.hole_count:
             _fair_void_locked(t, "the table was resized")
         return
-    t.fair_next = FairPending(
-        sealed=fairdeal.SealedDeck.create(_fair_hand_id(t, t.hand_no + 1, 1), t.num_seats),
-        hand_no=t.hand_no + 1,
-    )
+    t.fair_next = FairPending(sealed=_fair_seal(t, t.hand_no + 1, 1), hand_no=t.hand_no + 1)
     t.rev += 1
 
 
@@ -1944,7 +2013,7 @@ def _fair_void_locked(t: LiveTable, reason: str, seats: list[int] | None = None)
     }]
     was_pending = bool(nxt.pending)
     t.fair_next = FairPending(
-        sealed=fairdeal.SealedDeck.create(_fair_hand_id(t, nxt.hand_no, nxt.attempt + 1), t.num_seats),
+        sealed=_fair_seal(t, nxt.hand_no, nxt.attempt + 1),
         hand_no=nxt.hand_no, attempt=nxt.attempt + 1, barred=set(nxt.barred), voids=voids,
     )
     _emit(t, "fair", "Shuffle redone — " + (
@@ -2031,7 +2100,7 @@ def _fair_view(t: LiveTable, viewer_id: int, visible: list[int]) -> dict[str, An
         meta = t.fair_hand_meta or {}
         out["hand"] = {
             "hand_no": int(meta.get("hand_no") or t.hand_no), "hand_id": fh.hand_id,
-            "seal": fh.seal, "lock": fh.lock, "num_seats": fh.num_seats,
+            "seal": fh.seal, "lock": fh.lock, "num_seats": fh.num_seats, "hole": fh.hole,
             "contributors": [st for st, _ in fh.locked],
             "names": list(meta.get("names") or []),
             "voids": list(meta.get("voids") or []),
@@ -2216,11 +2285,11 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
         for i in range(t.num_seats):
             if i >= len(all_holes) or not in_hand[i]:
                 # The engine deals EVERY seat, dealt-in or not; a masked-out
-                # seat's five cards are live-deck information.
+                # seat's hole cards are live-deck information.
                 continue
             # (review 2026-09-20 G2) "Own" = the user who was DEALT this hand,
             # not whoever sits in the seat now: a seated-but-not-dealt player
-            # used to see five dead cards mid-hand, and a newcomer taking the
+            # used to see dead hole cards mid-hand, and a newcomer taking the
             # seat after the hand saw the previous occupant's mucked cards.
             own = dealt[i] is not None and dealt[i] == viewer_id
             occupant = t.seats[i].user_id if t.seats[i] is not None else None
@@ -2472,6 +2541,10 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
         "fair": _fair_view(t, viewer_id, visible_cards),
         "id": t.game_id,
         "name": t.name,
+        # the game dealt here: PLO5 / PLO6 (hole cards per player, seat limit, graded?)
+        "variant": _norm_game(t.variant),
+        "game": _game_info(t.variant),
+        "hole_count": t.hole_count,
         "status": t.status,
         "phase": t.phase,
         "hand_no": t.hand_no,
@@ -2749,11 +2822,12 @@ def _deal_now_locked(t: LiveTable) -> None:
         starting_stacks=stacks,
         ante=t.ante_chips,
         bb=BB_CHIPS,
-        variant=VARIANT_PLO5,
+        variant=t.game["variant"],
     )
     env = _make_env(cfg)
     nxt = t.fair_next if FAIR_ON else None
-    if nxt is not None and (nxt.hand_no != t.hand_no + 1 or nxt.sealed.num_seats != t.num_seats):
+    if nxt is not None and (nxt.hand_no != t.hand_no + 1 or nxt.sealed.num_seats != t.num_seats
+                            or nxt.sealed.hole != t.hole_count):
         _fair_void_locked(t, "the table changed before the deal")
         raise HTTPException(status_code=409, detail="the shuffle is being redone")
     if nxt is not None:
@@ -2962,6 +3036,8 @@ def _record_hand_locked(
         record = {
             "hand_no": int(t.hand_no),
             "ended_at": pub._now(),
+            "variant": _norm_game(t.variant),
+            "hole_count": int(t.hole_count),
             "button": int(t.button),
             "num_seats": int(t.num_seats),
             "bb_cents": int(t.bb_cents),
@@ -2977,7 +3053,9 @@ def _record_hand_locked(
                 {"from": int(a), "to": int(b), "cents": chips_to_cents(int(v), t.bb_cents)}
                 for (a, b), v in sorted(flows.items())
             ],
-            "grades": None,  # filled in by the background grader
+            # filled in by the background grader; a game without a network is
+            # never graded (an empty list, not "still being worked out")
+            "grades": None if t.game["graded"] else [],
             "fair": (
                 {"hand_id": t.fair_hand.hand_id,
                  "contributors": [st for st, _ in t.fair_hand.locked],
@@ -3041,11 +3119,13 @@ _GRADE_THREAD: threading.Thread | None = None
 
 def _enqueue_grading(t: LiveTable, mask: list[bool], uid_of: dict[int, int]) -> None:
     """Hand over a finished hand to the grader (cheap: a snapshot of plain
-    values — the worker never touches the live table)."""
-    if not GRADING_ON or not t.hand_actions or not (t.hand_seed or t.hand_deck):
+    values — the worker never touches the live table). Only games the network
+    knows are graded: there is no PLO6 network (yet)."""
+    if not GRADING_ON or not t.game["graded"] or not t.hand_actions or not (t.hand_seed or t.hand_deck):
         return
     _GRADE_Q.put({
         "game_id": t.game_id, "hand_no": int(t.hand_no), "seed": int(t.hand_seed),
+        "variant": _norm_game(t.variant),
         "deck": list(t.hand_deck or []),
         "button": int(t.button), "num_seats": int(t.num_seats),
         "stacks": [int(x) for x in (t.hand_start_stacks or [])],
@@ -3087,6 +3167,8 @@ def grade_hand(job: dict[str, Any]) -> list[dict[str, Any]]:
     from plo5bp.ui import server as srv
     from plo5bp.ui import trainer as tr
 
+    if not GAMES[_norm_game(job.get("variant"))]["graded"]:
+        return []  # (never queued; a PLO5 network must never grade another game)
     model = srv.MODEL
     device = next(model.parameters()).device
     cfg = GameConfig(
@@ -4246,11 +4328,17 @@ def _valid_deal_delay(secs: float) -> float:
     return float(secs)
 
 
-def _valid_num_seats(n: int) -> int:
+def _valid_num_seats(n: int, variant: str = DEFAULT_GAME) -> int:
+    """Seats for a table of this game. PLO6 stops at 7: six cards each for seven
+    players plus the two boards is the whole deck (there are no burn cards)."""
     n = int(n)
-    if not (MIN_SEATS <= n <= TABLE_SEATS):
+    g = GAMES[_norm_game(variant)]
+    top = int(g["max_seats"])
+    if not (MIN_SEATS <= n <= top):
         raise HTTPException(
-            status_code=400, detail=f"seats must be {MIN_SEATS}–{TABLE_SEATS}"
+            status_code=400,
+            detail=f"seats must be {MIN_SEATS}–{top}"
+            + ("" if top == TABLE_SEATS else f" ({g['label']}: {g['hole']} cards each use up the deck)"),
         )
     return n
 
@@ -4259,7 +4347,7 @@ def _resize_locked(t: LiveTable, n: int) -> None:
     """Change the seat count (caller is inside ``_mutation``). Between hands
     only; shrinking needs the removed seats empty. The button stays on a seat
     that still exists."""
-    n = _valid_num_seats(n)
+    n = _valid_num_seats(n, t.variant)
     if _hand_busy(t):
         raise HTTPException(status_code=400, detail="wait for the hand to finish")
     if n < t.num_seats and any(s is not None for s in t.seats[n:]):
@@ -4457,19 +4545,46 @@ def _club_clause(clubs: list[str] | None, col: str = "g.club_id") -> tuple[str, 
     return f" AND {col} IN ({','.join('?' * len(clubs))})", list(clubs)
 
 
-def _community(viewer_id: int, club_id: str, can_manage: bool) -> dict[str, Any]:
-    """ONE club's numbers (rankings never mix clubs). ``can_manage`` = the club's
-    owner: sees excluded sessions and may exclude / restore them."""
+def _games_played(where: str, args: list[Any]) -> dict[str, int]:
+    """Hands per game in a stats scope (``where`` over ``g`` = homegames, ``r`` =
+    homegame_hand_results): which game switches a stats view offers."""
+    out: dict[str, int] = {}
+    for r in pub.DB.q(
+        "SELECT g.variant v, COUNT(DISTINCT r.game_id || ':' || r.hand_no) n "
+        f"FROM homegame_hand_results r JOIN homegames g ON g.id=r.game_id WHERE {where} GROUP BY g.variant",
+        tuple(args),
+    ):
+        code = _norm_game(r["v"])
+        out[code] = out.get(code, 0) + int(r["n"] or 0)
+    return out
+
+
+def _games_summary(played: dict[str, int]) -> list[dict[str, Any]]:
+    return [{"code": c, "label": g["label"], "hands": int(played.get(c, 0)), "graded": bool(g["graded"])}
+            for c, g in GAMES.items()]
+
+
+def _community(viewer_id: int, club_id: str, can_manage: bool,
+               variant: str | None = None) -> dict[str, Any]:
+    """ONE club's numbers (rankings never mix clubs) for ONE game: PLO5 and PLO6
+    are different games, so their profits, accuracy and head-to-head are kept
+    apart (2026-09-26). ``variant`` None = the game the club has played most.
+    ``can_manage`` = the club's owner: sees excluded sessions and may exclude /
+    restore them."""
     skip = _revealing_now()
     guard = "".join(" AND NOT (r.game_id=? AND r.hand_no=?)" for _ in skip)
     gargs = [x for pair in skip for x in pair]
+    played = _games_played(f"g.excluded=0 AND g.club_id=?{guard}", [club_id] + gargs)
+    if variant is None:
+        variant = max(GAMES, key=lambda c: (played.get(c, 0), c == DEFAULT_GAME))
     rows = pub.DB.q(
         "SELECT r.user_id, u.name, u.email, COUNT(*) hands, SUM(r.delta_cents) net, "
         "SUM(r.acc_sum) a, SUM(r.acc_n) n, SUM(CASE WHEN r.delta_cents>0 THEN 1 ELSE 0 END) wins, "
         "COUNT(DISTINCT r.game_id) sessions, MAX(r.delta_cents) best "
         "FROM homegame_hand_results r JOIN homegames g ON g.id=r.game_id "
-        f"JOIN users u ON u.id=r.user_id WHERE g.excluded=0 AND g.club_id=?{guard} GROUP BY r.user_id",
-        tuple([club_id] + gargs),
+        f"JOIN users u ON u.id=r.user_id WHERE g.excluded=0 AND g.club_id=? AND g.variant=?{guard} "
+        "GROUP BY r.user_id",
+        tuple([club_id, variant] + gargs),
     )
     players = [
         {
@@ -4489,8 +4604,8 @@ def _community(viewer_id: int, club_id: str, can_manage: bool) -> dict[str, Any]
     gross: dict[tuple[int, int], float] = {}
     for r in pub.DB.q(
         "SELECT f.payer, f.payee, SUM(f.chips * g.bb_cents) v FROM homegame_flows f "
-        f"JOIN homegames g ON g.id=f.game_id WHERE g.excluded=0 AND g.club_id=?{fguard} "
-        "GROUP BY f.payer, f.payee", tuple([club_id] + gargs),
+        f"JOIN homegames g ON g.id=f.game_id WHERE g.excluded=0 AND g.club_id=? AND g.variant=?{fguard} "
+        "GROUP BY f.payer, f.payee", tuple([club_id, variant] + gargs),
     ):
         gross[(int(r["payer"]), int(r["payee"]))] = float(r["v"] or 0) / BB_CHIPS
     pairs = []
@@ -4499,7 +4614,7 @@ def _community(viewer_id: int, club_id: str, can_manage: bool) -> dict[str, Any]
         if net > 0.5:  # b is up `cents` on a
             pairs.append({"from": a, "to": b, "cents": int(round(net))})
     sess = pub.DB.q(
-        "SELECT g.id, g.name, g.status, g.excluded, g.created_at, g.closed_at, g.hand_no, "
+        "SELECT g.id, g.name, g.variant, g.status, g.excluded, g.created_at, g.closed_at, g.hand_no, "
         "g.sb_cents, g.bb_cents, g.ante_cents, "
         "(SELECT COUNT(*) FROM homegame_players p WHERE p.game_id=g.id AND p.buyin_cents>0) players "
         "FROM homegames g WHERE g.club_id=? " + ("" if can_manage else "AND g.excluded=0 ") +
@@ -4507,9 +4622,13 @@ def _community(viewer_id: int, club_id: str, can_manage: bool) -> dict[str, Any]
     )
     return {
         "club": club_id, "players": players, "pairs": pairs,
+        # the game these numbers are for, and every game with its hand count (the switch)
+        "variant": variant, "games": _games_summary(played),
         "can_manage": bool(can_manage), "is_admin": bool(can_manage),
+        # (every session of the club, each tagged with its game — a list, not a total)
         "sessions": [
-            {"id": r["id"], "name": r["name"], "open": r["status"] == "open",
+            {"id": r["id"], "name": r["name"], "variant": _norm_game(r["variant"]),
+             "open": r["status"] == "open",
              "excluded": bool(int(r["excluded"] or 0)), "created_at": r["created_at"],
              "closed_at": r["closed_at"], "hands": int(r["hand_no"] or 0),
              "players": int(r["players"] or 0), "sb_cents": int(r["sb_cents"]),
@@ -4557,12 +4676,13 @@ _MY_SORTS = {
 
 def _my_hands(viewer_id: int, sort: str, direction: str, game_id: str | None,
               offset: int, limit: int, player_id: int | None = None,
-              clubs: list[str] | None = None) -> dict[str, Any]:
+              clubs: list[str] | None = None, variant: str | None = None) -> dict[str, Any]:
     """``player_id``'s hands (default: the viewer's own). The club is private and
     everyone may browse everyone's history — but the CARDS in it follow the live
     table's rule for the VIEWER: their own, plus hands that were tabled or shown.
     Browsing Riley's history never turns over a hand Riley mucked, and neither
-    do its accuracy marks (they still count in Riley's totals)."""
+    do its accuracy marks (they still count in Riley's totals). ``variant`` =
+    one game's hands only (None = every game)."""
     player = int(player_id) if player_id is not None else int(viewer_id)
     col = _MY_SORTS.get(sort, _MY_SORTS["time"])
     if player != int(viewer_id) and sort == "accuracy":
@@ -4578,6 +4698,9 @@ def _my_hands(viewer_id: int, sort: str, direction: str, game_id: str | None,
     if game_id:
         where += " AND r.game_id=?"
         args.append(str(game_id))
+    if variant:
+        where += " AND g.variant=?"
+        args.append(str(variant))
     # A hand is never served while its table is still playing / revealing it.
     live = {}
     with HUB._lock:
@@ -4591,7 +4714,7 @@ def _my_hands(viewer_id: int, sort: str, direction: str, game_id: str | None,
     )["c"]
     rows = pub.DB.q(
         "SELECT r.game_id, r.hand_no, r.delta_cents, r.acc_sum, r.acc_n, h.ended_at, "
-        "h.pot_cents, h.summary, g.name AS table_name FROM homegame_hand_results r "
+        "h.pot_cents, h.summary, g.name AS table_name, g.variant FROM homegame_hand_results r "
         "JOIN homegame_hands h ON h.game_id=r.game_id AND h.hand_no=r.hand_no "
         "JOIN homegames g ON g.id=r.game_id "
         f"WHERE {where} ORDER BY ({col} IS NULL), {col} {'DESC' if desc else 'ASC'}, "
@@ -4615,6 +4738,7 @@ def _my_hands(viewer_id: int, sort: str, direction: str, game_id: str | None,
         seen = player == int(viewer_id) or bool(me and me.get("shown"))
         hands.append({
             "game_id": r["game_id"], "table_name": r["table_name"],
+            "variant": _norm_game(r["variant"]),
             "hand_no": int(r["hand_no"]), "ended_at": r["ended_at"],
             "pot_cents": int(r["pot_cents"]), "net_cents": int(r["delta_cents"]),
             "accuracy": (round(float(r["acc_sum"]) / int(r["acc_n"]), 1)
@@ -4626,11 +4750,18 @@ def _my_hands(viewer_id: int, sort: str, direction: str, game_id: str | None,
     return {"hands": hands, "total": int(total), "offset": offset, "limit": limit}
 
 
-def _my_stats(viewer_id: int, clubs: list[str] | None = None) -> dict[str, Any]:
-    """A player's numbers, within ``clubs`` (None = everything they played)."""
+def _my_stats(viewer_id: int, clubs: list[str] | None = None,
+              variant: str | None = None) -> dict[str, Any]:
+    """A player's numbers, within ``clubs`` (None = everything they played), for
+    one game (``variant``) or all of them. ``games`` = hands per game in the same
+    scope, whatever ``variant`` is (the switch between them)."""
     uid = int(viewer_id)
     who = pub._user_by_id(uid)
     scope, sargs = _club_clause(clubs)
+    played = _games_played(f"r.user_id=? AND g.excluded=0{scope}", [uid] + sargs)
+    if variant:
+        scope += " AND g.variant=?"
+        sargs = sargs + [str(variant)]
     tot = pub.DB.one(
         "SELECT COUNT(*) hands, COALESCE(SUM(r.delta_cents),0) net, COALESCE(SUM(r.acc_sum),0) a, "
         "COALESCE(SUM(r.acc_n),0) n, SUM(CASE WHEN r.delta_cents>0 THEN 1 ELSE 0 END) wins "
@@ -4638,7 +4769,7 @@ def _my_stats(viewer_id: int, clubs: list[str] | None = None) -> dict[str, Any]:
         f"WHERE r.user_id=? AND g.excluded=0{scope}", tuple([uid] + sargs),
     )
     sessions = pub.DB.q(
-        "SELECT g.id, g.name, g.status, g.sb_cents, g.bb_cents, g.ante_cents, COUNT(*) hands, "
+        "SELECT g.id, g.name, g.variant, g.status, g.sb_cents, g.bb_cents, g.ante_cents, COUNT(*) hands, "
         "SUM(r.delta_cents) net, SUM(r.acc_sum) a, SUM(r.acc_n) n, MAX(h.ended_at) last "
         "FROM homegame_hand_results r JOIN homegames g ON g.id=r.game_id "
         "JOIN homegame_hands h ON h.game_id=r.game_id AND h.hand_no=r.hand_no "
@@ -4665,11 +4796,13 @@ def _my_stats(viewer_id: int, clubs: list[str] | None = None) -> dict[str, Any]:
     n = int(tot["n"] or 0)
     return {
         "user_id": uid, "name": _display_name(who) if who is not None else f"player-{uid}",
+        "variant": variant, "games": _games_summary(played),
         "hands": int(tot["hands"] or 0), "wins": int(tot["wins"] or 0),
         "net_cents": int(tot["net"] or 0),
         "accuracy": round(float(tot["a"]) / n, 1) if n else None, "graded": n,
         "sessions": [
-            {"id": r["id"], "name": r["name"], "open": r["status"] == "open",
+            {"id": r["id"], "name": r["name"], "variant": _norm_game(r["variant"]),
+             "open": r["status"] == "open",
              "sb_cents": int(r["sb_cents"]), "bb_cents": int(r["bb_cents"]),
              "ante_cents": int(r["ante_cents"]), "hands": int(r["hands"]),
              "net_cents": int(r["net"] or 0),
@@ -4761,6 +4894,7 @@ def _host_prefs_of(t: LiveTable) -> dict[str, Any]:
         return round(int(cents or 0) / bb, 4)
 
     return {
+        "variant": _norm_game(t.variant),
         "bb_cents": bb, "ante_bb": per_bb(t.ante_cents), "num_seats": int(t.num_seats),
         "buyin_bb": per_bb(t.default_buyin_cents), "min_buyin_bb": per_bb(t.min_buyin_cents),
         "max_buyin_bb": per_bb(t.max_buyin_cents),
@@ -4831,10 +4965,11 @@ def _create_table(user: Any, body: dict) -> LiveTable:
         raise HTTPException(
             status_code=400, detail=f"table name is limited to {MAX_NAME_LEN} characters"
         )
+    variant = _parse_game(body.get("variant")) if body.get("variant") is not None else DEFAULT_GAME
     n = (
-        _valid_num_seats(pub.body_int(body, "num_seats"))
+        _valid_num_seats(pub.body_int(body, "num_seats"), variant)
         if body.get("num_seats") is not None
-        else TABLE_SEATS
+        else int(GAMES[variant]["max_seats"])
     )
     bb = _parse_cents(body, "bb_cents", 100)
     sb = _parse_cents(body, "sb_cents", max(1, bb // 2))  # (nobody posts it: the chip unit is the bb)
@@ -4896,6 +5031,7 @@ def _create_table(user: Any, body: dict) -> LiveTable:
         listed=listed,
         approve_buyins=approve,
         allow_rathole=rathole,
+        variant=variant,
     )
     # The table row and the host's seat land together or not at all.
     with pub.DB.transaction():
@@ -4903,11 +5039,11 @@ def _create_table(user: Any, body: dict) -> LiveTable:
             "INSERT INTO homegames(id,host_user_id,name,num_seats,sb_cents,bb_cents,"
             "ante_cents,default_buyin_cents,status,running,decision_secs,button,"
             "hand_no,created_at,deal_delay_ms,time_bank_secs,min_buyin_cents,"
-            "max_buyin_cents,listed,approve_buyins,allow_rathole,club_id) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "max_buyin_cents,listed,approve_buyins,allow_rathole,club_id,variant) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (gid, int(user["id"]), name, n, sb, bb, ante, buyin, "open", 0, secs,
              0, 0, pub._now(), int(round(delay * 1000)), bank, lo, hi,
-             1 if listed else 0, 1 if approve else 0, 1 if rathole else 0, club_id),
+             1 if listed else 0, 1 if approve else 0, 1 if rathole else 0, club_id, variant),
         )
         # Host sits seat 0 with the default buy-in so they can deal once a
         # second player sits.
@@ -4933,6 +5069,7 @@ def _lobby_row(row: Any, viewer_id: int | None = None) -> dict[str, Any]:
     return {
         "id": row["id"],
         "name": row["name"],
+        "variant": _norm_game(row["variant"] if "variant" in row.keys() else None),
         "num_seats": row["num_seats"],
         "seated": len(players),
         "sb_cents": row["sb_cents"],
@@ -4977,7 +5114,7 @@ def _my_sessions(viewer_id: int, club_id: str | None = None, limit: int = 12) ->
     """The viewer's finished sessions (closed tables they played at), in one club."""
     scope, sargs = _club_clause([club_id] if club_id else None)
     rows = pub.DB.q(
-        "SELECT g.id, g.name, g.sb_cents, g.bb_cents, g.ante_cents, g.hand_no, "
+        "SELECT g.id, g.name, g.variant, g.sb_cents, g.bb_cents, g.ante_cents, g.hand_no, "
         "g.closed_at, p.buyin_cents, p.leftover_cents FROM homegame_players p "
         "JOIN homegames g ON g.id=p.game_id "
         f"WHERE p.user_id=? AND g.status='closed' AND p.buyin_cents>0 AND g.excluded=0{scope} "
@@ -4993,6 +5130,7 @@ def _my_sessions(viewer_id: int, club_id: str | None = None, limit: int = 12) ->
         out.append({
             "id": r["id"],
             "name": r["name"],
+            "variant": _norm_game(r["variant"]),
             "sb_cents": int(r["sb_cents"]),
             "bb_cents": int(r["bb_cents"]),
             "ante_cents": int(r["ante_cents"]),
@@ -5607,16 +5745,17 @@ def _invite_response(request: Request, path: str, user: Any) -> Response | None:
     game_id, code = m.group(1), m.group(2)
     if game_id:
         table = pub.DB.one(
-            "SELECT g.name, g.status, u.name AS host_name, c.name AS club_name FROM homegames g "
+            "SELECT g.name, g.status, g.variant, u.name AS host_name, c.name AS club_name FROM homegames g "
             "JOIN users u ON u.id=g.host_user_id LEFT JOIN homegame_clubs c ON c.id=g.club_id WHERE g.id=?",
             (game_id,),
         )
         if table is None or table["status"] != "open":
             return None
         club = f" in <b>{esc(str(table['club_name']))}</b>" if table["club_name"] else ""
+        label = GAMES[_norm_game(table["variant"])]["label"]
         html = _signin_html(
             f"You're invited to {table['name']}",
-            f"<b>{esc(str(table['host_name'] or 'A friend'))}</b> is hosting a PLO5 double-board bomb-pot "
+            f"<b>{esc(str(table['host_name'] or 'A friend'))}</b> is hosting a {label} double-board bomb-pot "
             f"game{club}. Sign in with Google to join — you'll come straight back to the table.",
             path,
         )
@@ -5628,14 +5767,14 @@ def _invite_response(request: Request, path: str, user: Any) -> Response | None:
         html = _signin_html(
             f"Join {club['name']}",
             f"<b>{esc(_display_name(owner) if owner else 'A friend')}</b> invited you to their home-games club: "
-            "PLO5 double-board bomb pots with friends, with the stats kept inside the club. "
+            "PLO5 and PLO6 double-board bomb pots with friends, with the stats kept inside the club. "
             "Sign in with Google to join.",
             path,
         )
     else:
         html = _signin_html(
             "Home games",
-            "PLO5 double-board bomb pots with your friends, in private clubs. Sign in with Google to start a "
+            "PLO5 and PLO6 double-board bomb pots with your friends, in private clubs. Sign in with Google to start a "
             "club or join one.",
             "/games",
         )
@@ -5969,15 +6108,18 @@ def install(app: FastAPI, *, static_dir: Path) -> None:
 
     @app.get("/games/api/my/hands")
     def api_my_hands(sort: str = "time", dir: str = "desc", game: str | None = None,
-                     offset: int = 0, limit: int = 40, club: str | None = None):
-        """The signed-in player's hand database (one club's, or all of it)."""
+                     offset: int = 0, limit: int = 40, club: str | None = None,
+                     variant: str | None = None):
+        """The signed-in player's hand database (one club's, or all of it; one
+        game's — ``variant`` plo5 / plo6 — or every game's). ``game`` = one table."""
         uid = _uid()
-        return _my_hands(uid, sort, dir, game, offset, limit, clubs=_scope_clubs(uid, club, own=True))
+        return _my_hands(uid, sort, dir, game, offset, limit, clubs=_scope_clubs(uid, club, own=True),
+                         variant=_game_filter(variant))
 
     @app.get("/games/api/my/stats")
-    def api_my_stats(club: str | None = None):
+    def api_my_stats(club: str | None = None, variant: str | None = None):
         uid = _uid()
-        return _my_stats(uid, clubs=_scope_clubs(uid, club, own=True))
+        return _my_stats(uid, clubs=_scope_clubs(uid, club, own=True), variant=_game_filter(variant))
 
     def _avatar_changed(uid: int) -> None:
         """The tables this player sits at redraw with the new picture now."""
@@ -6019,31 +6161,38 @@ def install(app: FastAPI, *, static_dir: Path) -> None:
         return Response(bytes(row["data"]), media_type=row["mime"], headers=AVATAR_HEADERS)
 
     @app.get("/games/api/community")
-    def api_community(club: str | None = None):
-        """One club's numbers: player cards, the pairwise money, all sessions. The
-        rankings never mix clubs. (No club named: the main club, else the first.)"""
+    def api_community(club: str | None = None, variant: str | None = None):
+        """One club's numbers for ONE game (``variant`` plo5 / plo6; none = the
+        club's most-played game): player cards, the pairwise money, all sessions.
+        The rankings never mix clubs, nor games. (No club named: the main club,
+        else the first.)"""
         uid = _uid()
+        game = _game_filter(variant)
         if not club:
             mine = _my_clubs(uid)
             if not mine:
-                return {"club": None, "players": [], "pairs": [], "sessions": [], "can_manage": False, "is_admin": False}
+                return {"club": None, "players": [], "pairs": [], "sessions": [], "can_manage": False,
+                        "is_admin": False, "variant": game or DEFAULT_GAME, "games": _games_summary({})}
             club = mine[0]["id"]
         row, role = _require_club(club, uid)
-        return _community(uid, str(row["id"]), role == "owner")
+        return _community(uid, str(row["id"]), role == "owner", variant=game)
 
     @app.get("/games/api/players/{player_id}/stats")
-    def api_player_stats(player_id: int, club: str | None = None):
+    def api_player_stats(player_id: int, club: str | None = None, variant: str | None = None):
         uid = _uid()
         if pub._user_by_id(int(player_id)) is None:
             raise HTTPException(status_code=404, detail="Not Found")
-        return _my_stats(int(player_id), clubs=_scope_clubs(uid, club, own=int(player_id) == uid))
+        return _my_stats(int(player_id), clubs=_scope_clubs(uid, club, own=int(player_id) == uid),
+                         variant=_game_filter(variant))
 
     @app.get("/games/api/players/{player_id}/hands")
     def api_player_hands(player_id: int, sort: str = "time", dir: str = "desc",
-                         game: str | None = None, offset: int = 0, limit: int = 40, club: str | None = None):
+                         game: str | None = None, offset: int = 0, limit: int = 40, club: str | None = None,
+                         variant: str | None = None):
         uid = _uid()
         return _my_hands(uid, sort, dir, game, offset, limit, player_id=int(player_id),
-                         clubs=_scope_clubs(uid, club, own=int(player_id) == uid))
+                         clubs=_scope_clubs(uid, club, own=int(player_id) == uid),
+                         variant=_game_filter(variant))
 
     @app.post("/games/api/tables/{game_id}/remove_chips")
     def api_remove_chips(game_id: str, body: dict = Body({})):

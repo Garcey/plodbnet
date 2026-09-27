@@ -146,6 +146,7 @@ input[type="range"]::-moz-range-thumb { width: 14px; height: 14px; border-radius
 .pill.live::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 0 rgba(53, 200, 120, 0.6); animation: pulse 1.8s infinite; }
 .pill.paused { background: rgba(245, 167, 66, 0.14); color: #ffc877; }
 .pill.gold { background: rgba(236, 201, 119, 0.14); color: var(--gold); }
+.pill.game { background: rgba(24, 210, 195, 0.12); color: #8fe9df; letter-spacing: 0.6px; } /* PLO5 / PLO6 */
 .pill.host { background: rgba(236, 201, 119, 0.14); color: var(--gold); }
 @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(53, 200, 120, 0.55); } 70% { box-shadow: 0 0 0 7px rgba(53, 200, 120, 0); } 100% { box-shadow: 0 0 0 0 rgba(53, 200, 120, 0); } }
 
@@ -222,6 +223,10 @@ input[type="range"]::-moz-range-thumb { width: 14px; height: 14px; border-radius
 #stage-wrap { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; position: relative; }
 #stage-box { flex: 1; min-height: 0; position: relative; display: flex; align-items: center; justify-content: center; overflow: hidden; }
 #stage { position: relative; flex: none; }
+/* PLO6 (six hole cards): every card row takes about the room of a five-card one —
+   the hero's cards 10% smaller with a little more overlap, a tighter face-down fan
+   centred on the 3rd/4th card. Keep in step with ROW in games.table.js. */
+#stage.h6 { --hk: 0.9; --hov: 0.28; --fov: 0.6; --mid: 2.5; --rot: 6deg; }
 
 /* felt + rail */
 #felt { position: absolute; inset: 11% 7% 15% 7%; border-radius: 9999px;
@@ -263,8 +268,8 @@ input[type="range"]::-moz-range-thumb { width: 14px; height: 14px; border-radius
 .slot-card { width: var(--cw); height: calc(var(--cw) * 1.38); border-radius: calc(var(--cw) * 0.11); border: 1px dashed rgba(255, 255, 255, 0.1); position: relative; }
 .slot-card .card { position: absolute; inset: 0; --cw: inherit; width: 100%; height: 100%; }
 #street-tag { grid-column: 3; justify-self: start; font-size: max(9px, calc(var(--u) * 0.95)); letter-spacing: 2.2px; font-weight: 700; color: rgba(255, 255, 255, 0.5); text-transform: uppercase; white-space: nowrap; }
-#award-caption { position: absolute; left: 50%; top: 100%; transform: translate(-50%, calc(var(--u) * 0.9)); padding: calc(var(--u) * 0.5) calc(var(--u) * 1.4); border-radius: 999px; background: linear-gradient(180deg, rgba(40, 30, 6, 0.92), rgba(24, 18, 3, 0.92)); border: 1px solid rgba(236, 201, 119, 0.55); color: #ffe9b0; font-weight: 600; font-size: max(11px, calc(var(--u) * 1.25)); white-space: nowrap; box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5); animation: capin 0.35s var(--ease); max-width: 92vw; overflow: hidden; text-overflow: ellipsis; }
-@keyframes capin { from { opacity: 0; transform: translate(-50%, 0) scale(0.92); } }
+#award-caption { position: absolute; left: 50%; top: 100%; --cap-dy: 0.9; transform: translate(-50%, calc(var(--u) * var(--cap-dy))); padding: calc(var(--u) * 0.5) calc(var(--u) * 1.4); border-radius: 999px; background: linear-gradient(180deg, rgba(40, 30, 6, 0.92), rgba(24, 18, 3, 0.92)); border: 1px solid rgba(236, 201, 119, 0.55); color: #ffe9b0; font-weight: 600; font-size: max(11px, calc(var(--u) * 1.25)); white-space: nowrap; box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5); animation: capin 0.35s var(--ease); max-width: 92vw; overflow: hidden; text-overflow: ellipsis; }
+@keyframes capin { from { opacity: 0; transform: translate(-50%, 0) scale(0.92); } } /* (fitSeats places rows by where it LANDS: --cap-dy) */
 
 /* cards */
 .card { --cw: calc(var(--u) * 5); width: var(--cw); height: calc(var(--cw) * 1.38); perspective: 600px; flex: none; position: relative; transition: transform 0.3s var(--ease), opacity 0.3s, filter 0.3s; }
@@ -343,7 +348,7 @@ input[type="range"]::-moz-range-thumb { width: 14px; height: 14px; border-radius
 .seat-badge.k-loss { color: #ff9aa6; border-color: rgba(242, 86, 106, 0.4); font-family: var(--mono); }
 .seat-badge.k-away { color: #ffc877; border-color: rgba(245, 167, 66, 0.45); text-transform: uppercase; letter-spacing: 0.6px; font-size: max(8.5px, calc(var(--u) * 0.92)); }
 .seat-cards { position: absolute; left: 50%; top: calc(var(--u) * 2.8); display: flex; transform: translate(-50%, -50%) translate(var(--cx, 0), var(--cy, 0)); z-index: 1; --cw: calc(var(--u) * 2.7); pointer-events: none; transition: transform 0.35s var(--ease); }
-.seat-cards .card { --cw: inherit; margin-left: calc(var(--cw) * -0.52); transform: rotate(calc((var(--i) - 2) * 7deg)) translateY(calc((var(--i) - 2) * (var(--i) - 2) * var(--cw) * 0.035)); }
+.seat-cards .card { --cw: inherit; margin-left: calc(var(--cw) * var(--fov, 0.52) * -1); transform: rotate(calc((var(--i) - var(--mid, 2)) * var(--rot, 7deg))) translateY(calc((var(--i) - var(--mid, 2)) * (var(--i) - var(--mid, 2)) * var(--cw) * 0.035)); }
 .seat-cards .card:first-child { margin-left: 0; }
 .seat-cards.open { --cw: calc(var(--u) * 3.5); z-index: 7; }
 .seat-cards.open .card { margin-left: calc(var(--cw) * var(--ov, 0.3) * -1); transform: none; } /* (--ov: fitOpenRows in games.table.js) */
@@ -371,8 +376,8 @@ input[type="range"]::-moz-range-thumb { width: 14px; height: 14px; border-radius
 
 /* hero zone */
 #hero-zone { position: absolute; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; align-items: center; gap: calc(var(--u) * 0.5); z-index: 8; pointer-events: none; }
-#hero-hole { display: flex; --cw: calc(var(--u) * 6.6); }
-#hero-hole .card { --cw: inherit; margin-left: calc(var(--cw) * -0.24); }
+#hero-hole { display: flex; --cw: calc(var(--u) * 6.6 * var(--hk, 1)); }
+#hero-hole .card { --cw: inherit; margin-left: calc(var(--cw) * var(--hov, 0.24) * -1); }
 #hero-hole .card:first-child { margin-left: 0; }
 #hero-hole.folded .card { filter: grayscale(0.7) brightness(0.5); }
 #hero-hand-labels { flex: none; display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; align-items: center; min-height: 26px; padding: 0 12px; z-index: 15; }
@@ -661,19 +666,19 @@ details.adv > div { display: flex; flex-direction: column; gap: 14px; margin-top
 #stage.wide #boards { flex-direction: row; gap: calc(var(--u) * 1.4); }
 #stage.wide .board { --cw: calc(var(--u) * 4.2); padding: calc(var(--u) * 0.3) calc(var(--u) * 0.4); }
 #stage.wide #center { gap: calc(var(--u) * 0.6); }
-#stage.wide #hero-hole { --cw: calc(var(--u) * 6); }
+#stage.wide #hero-hole { --cw: calc(var(--u) * 6 * var(--hk, 1)); }
 #stage.wide .seat-cards.open { --cw: calc(var(--u) * 3); z-index: 9; }
 #stage.wide .seat-hand { display: none; }
 #stage.wide #street-tag { display: none; }
 /* upright phone: the pot's row is short, the felt under the boards is not */
 #stage.portrait #street-tag { position: absolute; left: 50%; top: 100%; transform: translate(-50%, calc(var(--u) * 0.6)); }
-#stage.portrait #award-caption { transform: translate(-50%, calc(var(--u) * 2.9)); width: max-content; max-width: calc(var(--u) * 35); white-space: normal; text-align: center; line-height: 1.25; } /* under the street tag, between the side seats */
+#stage.portrait #award-caption { --cap-dy: 2.9; width: max-content; max-width: calc(var(--u) * 35); white-space: normal; text-align: center; line-height: 1.25; } /* under the street tag, between the side seats */
 /* desktop: a flat table — every unit of height between the far seat's bet and
    the hero's bet counts (games.table.js centres the block in what is left) */
 #stage:not(.portrait):not(.wide) #center { gap: calc(var(--u) * 0.7); }
 #stage:not(.portrait):not(.wide) #boards { gap: calc(var(--u) * 0.55); }
 #stage:not(.portrait):not(.wide) .board { --cw: calc(var(--u) * 5.3); }
-#stage:not(.portrait):not(.wide) #hero-hole { --cw: calc(var(--u) * 6.3); }
+#stage:not(.portrait):not(.wide) #hero-hole { --cw: calc(var(--u) * 6.3 * var(--hk, 1)); }
 @media (max-height: 560px) and (orientation: landscape) {
   #tbar { min-height: 42px; padding: 3px 8px; }
   #dock { min-height: 0; padding: 4px 10px 6px; }
@@ -763,6 +768,8 @@ textarea.input { height: auto; min-height: 84px; padding: 10px 12px; resize: ver
    The club (2026-09-24): podium, player cards, head-to-head matrix
    ========================================================================== */
 .lb-sec-h .spacer { flex: 1; }
+.lb-game { margin: -4px 0 14px; } /* the club's game switch (PLO5 / PLO6 numbers apart) */
+.db-games { margin-bottom: 10px; } /* the same switch in a player's hands & stats */
 .lb-sec-h .btn { align-self: center; }
 .podium { display: grid; grid-template-columns: repeat(3, minmax(0, 190px)); justify-content: center; align-items: end; gap: 10px; margin: 6px 0 22px; }
 .pod-col { display: flex; flex-direction: column; align-items: center; gap: 3px; padding: 0; border: 0; background: none; color: inherit; font: inherit; cursor: pointer; min-width: 0; }

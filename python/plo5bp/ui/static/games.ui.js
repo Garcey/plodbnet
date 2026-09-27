@@ -36,6 +36,18 @@
   }
   const d2 = (c) => C().dollars(c);
   const d0 = (c) => (c % 100 ? d2(c) : d2(c).replace(/\.00$/, ""));  // "$100", "$12.50": preset buttons are narrow
+  // The games a table can deal (2026-09-26: PLO6 next to PLO5). The server says which one
+  // a table deals (s.variant / s.game); this is the lobby's copy for the create dialog, the
+  // tags and the club's per-game numbers. Seat limits: one deck, no burn cards (7 x 6 + 10 = 52).
+  const GAMES = {
+    plo5: { label: "PLO5", name: "PLO5 double-board bomb pot", hole: 5, word: "five", maxSeats: 8, seats: [2, 4, 6, 8], graded: true },
+    plo6: { label: "PLO6", name: "PLO6 double-board bomb pot", hole: 6, word: "six", maxSeats: 7, seats: [2, 4, 6, 7], graded: false },
+  };
+  const gameOf = (v) => GAMES[v] || GAMES.plo5;
+  const gameNote = (v) => {
+    const G = gameOf(v), cards = G.word[0].toUpperCase() + G.word.slice(1);
+    return `${cards} cards each, up to ${G.maxSeats} players · ${G.graded ? "every decision graded by the network" : `not graded yet (there is no ${G.label} network)`}`;
+  };
 
   // ------------------------------------------------------------------ toasts
   function toast(msg, kind, ms) {
@@ -214,7 +226,7 @@
       `<div class="tcard-host">Hosted by ${esc(t.host_name)}${t.is_host ? " (you)" : ""}${other}</div></div>` +
       `<span class="pill ${t.running ? "live" : "paused"}">${t.running ? "Live" : "Paused"}</span></div>` +
       miniFelt(t) +
-      `<div class="tcard-meta"><span class="pill gold num">${d2(t.bb_cents)} bb</span>` +
+      `<div class="tcard-meta"><span class="pill game">${gameOf(t.variant).label}</span><span class="pill gold num">${d2(t.bb_cents)} bb</span>` +
       `<span class="pill">${icon("i-users", "sm")}${t.seated}/${t.num_seats}</span>` +
       (t.hand_no ? `<span class="pill num">Hand #${t.hand_no}</span>` : "") +
       (t.listed ? "" : `<span class="pill">${icon("i-lock", "sm")}Link only</span>`) + "</div>";
@@ -273,7 +285,7 @@
     const sess = data.sessions || [];
     $("lb-sess-sec").hidden = !sess.length;
     $("lb-sessions").innerHTML = sess.map((x) =>
-      `<div class="sess" data-id="${esc(x.id)}" role="button" tabindex="0" title="Open this session: final ledger and every hand"><div><b>${esc(x.name)}</b><br><small>${d2(x.bb_cents)} bb · ante ${d2(x.ante_cents)}</small></div>` +
+      `<div class="sess" data-id="${esc(x.id)}" role="button" tabindex="0" title="Open this session: final ledger and every hand"><div><b>${esc(x.name)}</b><br><small>${gameOf(x.variant).label} · ${d2(x.bb_cents)} bb · ante ${d2(x.ante_cents)}</small></div>` +
       `<small class="opt">${x.hands} hand${x.hands === 1 ? "" : "s"}</small><small class="opt">in for ${d2(x.buyin_cents)}</small>` +
       `<b class="num ${x.net_cents >= 0 ? "pos" : "neg"}">${x.net_cents >= 0 ? "+" : ""}${d2(x.net_cents)}</b></div>`).join("");
     wireSessions();
@@ -567,15 +579,19 @@
       return `<div class="seg" id="${id}">${list.map(([v, l]) => `<button type="button" data-v="${v}" class="${v === cur2 ? "on" : ""}">${l}</button>`).join("")}</div>`;
     };
     const secs = (v) => (v ? `${v}s` : "Off");
+    // the game (PLO5 / PLO6): fixed for the table's life; the seat choices follow it
+    const game0 = GAMES[P.variant] ? P.variant : "plo5";
+    const seatsFor = (g, want) => { const G = gameOf(g); return segHtml("c-seats", G.seats.map((n) => [n, String(n)]), Math.min(G.maxSeats, num(want, G.maxSeats)), String); };
     const body = h("div", { style: "display:flex;flex-direction:column;gap:16px" });
     body.innerHTML =
       (prefs ? `<div class="setrow"><div><b>Your settings from last time</b><small>Stakes, seats, clock and buy-ins — and Manage's too: automatic chips, grades, rabbit</small></div><button type="button" class="btn sm" id="c-reset">Use defaults</button></div>` : "") +
       (clubs.length > 1 ? `<label class="field"><span>Club</span><select class="input" id="c-club">${clubs.map((c) => `<option value="${esc(c.id)}" ${c.id === cur.id ? "selected" : ""}>${esc(c.name)}</option>`).join("")}</select><small>Only this club's members can see and join the table</small></label>` : "") +
       `<label class="field"><span>Table name</span><input type="text" id="c-name" maxlength="60" value="${esc((me.name || "My").split(" ")[0])}'s game"/></label>` +
+      `<div class="field"><span>Game</span><div class="seg" id="c-game">${Object.entries(GAMES).map(([k, G]) => `<button type="button" data-v="${k}" class="${k === game0 ? "on" : ""}">${G.label}</button>`).join("")}</div><small id="c-game-note">${gameNote(game0)}</small></div>` +
       `<div class="row3" style="grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto;align-items:start">` +
       `<label class="field"><span>Big blind</span>${moneyInput("c-bb", bb0)}<small>The chip unit and the minimum bet</small></label>` +
       `<label class="field"><span>Ante, in big blinds</span><div class="money unit-bb"><input class="input" id="c-ante-bb" inputmode="decimal" autocomplete="off" value="${anteBB0}"/></div><small id="c-ante-eq">= $3.00 per player, every hand</small></label>` +
-      `<div class="field"><span>Seats</span>${segHtml("c-seats", [2, 4, 6, 8].map((n) => [n, String(n)]), num(P.num_seats, 8), String)}</div></div>` +
+      `<div class="field" id="c-seats-f"><span>Seats</span>${seatsFor(game0, P.num_seats)}</div></div>` +
       `<label class="field"><span>Your buy-in</span>${moneyInput("c-buyin", Math.round(bb0 * buyinBB0))}<small>Nobody posts blinds — every hand is a bomb pot: everyone antes and the action starts on the flop.</small></label>` +
       `<details class="adv"><summary>More options</summary><div>` +
       `<div class="row2"><label class="field"><span>Min buy-in</span>${moneyInput("c-min", Math.round(bb0 * num(P.min_buyin_bb, 0)))}<small>0 = no minimum</small></label><label class="field"><span>Max buy-in</span>${moneyInput("c-max", Math.round(bb0 * num(P.max_buyin_bb, 0)))}<small>0 = no maximum</small></label></div>` +
@@ -588,6 +604,13 @@
       `</div></details>`;
     segWire(body);
     const q = (id) => body.querySelector("#" + id);
+    const gameVal = () => { const on = body.querySelector("#c-game button.on"); return on ? on.dataset.v : "plo5"; };
+    q("c-game").addEventListener("pick", (e) => {
+      const f = q("c-seats-f"), want = segVal(body, "c-seats");
+      f.innerHTML = `<span>Seats</span>${seatsFor(e.detail, want)}`;
+      segWire(f);
+      q("c-game-note").textContent = gameNote(e.detail);
+    });
     const reset = q("c-reset");
     if (reset) reset.addEventListener("click", () => { closeTop(); setTimeout(() => openCreate(true), 260); });
     const bbCents = () => Math.max(1, C().toCents(q("c-bb").value) || 0);
@@ -612,7 +635,7 @@
             const bb = bbCents();
             if (anteBB() <= 0) { toast("The ante must be at least a fraction of a big blind", "err"); return false; }
             const payload = {
-              name: q("c-name").value.trim() || "Home game",
+              name: q("c-name").value.trim() || "Home game", variant: gameVal(),
               bb_cents: bb, sb_cents: Math.max(1, Math.round(bb / 2)),
               ante_cents: anteCents(), default_buyin_cents: C().toCents(q("c-buyin").value),
               min_buyin_cents: C().toCents(q("c-min").value) || 0, max_buyin_cents: C().toCents(q("c-max").value) || 0,
@@ -1070,7 +1093,7 @@
       (pays.length ? `<button class="btn sm block" id="settle-copy" style="margin-top:10px">${icon("i-copy", "sm")}Copy summary</button>` : "") + `</div>` +
       (stats.length ? `<div class="rsec"><h4>Session stats</h4><table class="ledger"><thead><tr><th>Player</th><th>Hands</th><th>Won</th><th>Best</th><th title="Average score of their decisions against the network (0-100)">Acc.</th></tr></thead><tbody>` +
         stats.map((r) => `<tr class="${r.is_me ? "me" : ""}"><td>${esc(r.name)}</td><td>${r.hands}</td><td>${r.wins}</td><td>${d2(r.biggest_win_cents)}</td><td>${r.accuracy == null ? "–" : Math.round(r.accuracy) + "%"}</td></tr>`).join("") + `</tbody></table>` +
-        `<div class="muted" style="font-size:11.5px;margin-top:6px">Accuracy = how closely each decision matched the network, graded in the background after every hand.</div></div>` : "") +
+        `<div class="muted" style="font-size:11.5px;margin-top:6px">${gameOf(s.variant).graded ? "Accuracy = how closely each decision matched the network, graded in the background after every hand." : `${gameOf(s.variant).label} decisions are not graded — there is no ${gameOf(s.variant).label} network yet.`}</div></div>` : "") +
       (((U.hands && U.hands.h2h) || []).length ? `<div class="rsec"><h4>Head to head — this table</h4>` + U.hands.h2h.map((x) => `<div class="settle-row"><span>${esc(x.to)} is up on ${esc(x.from)}</span><b>${d2(x.cents)}</b></div>`).join("") + `</div>` : "") +
       `<button class="btn sm block" id="ledger-myhands" style="margin-top:14px">${icon("i-chart", "sm")}My hands &amp; lifetime stats</button>`;
     const mh = $("ledger-myhands");
@@ -1181,7 +1204,7 @@
       `<div class="rp-ctl"><button class="btn sm" id="rp-first" title="Start of the hand (Home)">⏮</button><button class="btn" id="rp-prev" title="Back one action (←)">◀</button>` +
       `<span class="rp-step num" id="rp-step"></span><button class="btn primary" id="rp-next" title="Play the next action (→)">▶</button><button class="btn sm" id="rp-last" title="End of the hand (End)">⏭</button>` +
       `<span class="spacer"></span>${rec.fair && HG.fair ? `<button class="btn sm" id="rp-fair" title="Re-check this hand's sealed deck, its cut and every card you can see">${icon("i-shield", "sm")}<span>Check shuffle</span></button>` : ""}` +
-      `<button class="btn gold sm" id="rp-study" title="Send this exact spot to the Study tab">${icon("i-chart", "sm")}Open in Study</button></div></div>` +
+      (studyable(rec) ? `<button class="btn gold sm" id="rp-study" title="Send this exact spot to the Study tab">${icon("i-chart", "sm")}Open in Study</button>` : "") + `</div></div>` +
       `<div class="rp-side"><div class="rsec" style="margin-top:0"><h4>Action</h4><div id="rp-list" class="rp-list"></div></div><div id="rp-result"></div></div>`;
     const q = (id) => body.querySelector("#" + id);
 
@@ -1196,7 +1219,7 @@
         const p = st.seats[x.seat];
         const acting = st.next && st.next.seat === x.seat;
         const known = x.hole && x.hole.length && x.hole[0] >= 0;
-        const cards = p.folded && !known ? "" : `<span class="mini-cards" data-cards="${known ? x.hole.join(",") : "x,x,x,x,x"}"></span>`;
+        const cards = p.folded && !known ? "" : `<span class="mini-cards" data-cards="${known ? x.hole.join(",") : Array(rec.hole_count || 5).fill("x").join(",")}"></span>`;
         const res = st.over ? `<b class="num ${x.delta_cents > 0 ? "pos" : x.delta_cents < 0 ? "neg" : "muted"}">${x.delta_cents > 0 ? "+" : ""}${d2(x.delta_cents)}</b>` : "";
         html += `<div class="rp-seat ${p.folded ? "folded" : ""} ${acting ? "acting" : ""}" style="left:${px}%;top:${py}%">${cards}` +
           `<div class="rp-plate">${avatar(x.name, x.name, "sm", x.avatar)}<div><b>${esc(names[x.seat])}${x.seat === rec.button ? ' <i class="rp-d">D</i>' : ""}</b><span class="num">${d2(Math.max(0, p.stack))}</span></div></div>` +
@@ -1243,7 +1266,7 @@
     q("rp-prev").addEventListener("click", () => go(k - 1));
     q("rp-next").addEventListener("click", () => go(k + 1));
     q("rp-last").addEventListener("click", () => go(N));
-    q("rp-study").addEventListener("click", () => openInStudy(rec, k));
+    if (q("rp-study")) q("rp-study").addEventListener("click", () => openInStudy(rec, k));
     const fairBtn = q("rp-fair");
     if (fairBtn) fairBtn.addEventListener("click", async () => {
       fairBtn.disabled = true;
@@ -1270,8 +1293,8 @@
     const graded = (rec.grades || []).length;
     const api = openModal({
       title: `Hand #${rec.hand_no}${rec.table_name ? " · " + rec.table_name : ""}`,
-      sub: `Pot ${d2(rec.pot_cents)} · ante ${d2(rec.ante_cents)} · ${rec.showdown ? "showdown" : "won without showdown"}` +
-        (rec.grades == null ? " · accuracy is still being worked out" : graded ? "" : " · no graded decisions") + " · use ← → to step",
+      sub: `${gameOf(rec.variant).label} · Pot ${d2(rec.pot_cents)} · ante ${d2(rec.ante_cents)} · ${rec.showdown ? "showdown" : "won without showdown"}` +
+        (!gameOf(rec.variant).graded ? ` · ${gameOf(rec.variant).label} isn't graded yet` : rec.grades == null ? " · accuracy is still being worked out" : graded ? "" : " · no graded decisions") + " · use ← → to step",
       body, wide: true, autofocus: false, buttons: [{ label: "Close", cls: "primary" }],
       onClose: () => document.removeEventListener("keydown", onKey),
     });
@@ -1282,7 +1305,10 @@
   // The Study tab works on the signed-in user's own server-side session, so a
   // spot is "copied" by driving Study's normal API: reset, stakes, seats + stacks
   // (hero = seat 0, clockwise), cards dealt so far, then the actions up to here.
+  // (Study deals PLO5 — five hole cards; a hand of another game has no spot to copy there)
+  function studyable(rec) { return (rec.variant || "plo5") === "plo5"; }
   async function openInStudy(rec, k) {
+    if (!studyable(rec)) return toast(`Study works with PLO5 hands — this was ${gameOf(rec.variant).label}`, "err");
     const dealt = rec.seats.map((x) => x.seat);
     if (dealt.length > 6) return toast(`Study handles up to 6 players — this hand had ${dealt.length}`, "err");
     const N = rec.actions.length;
@@ -1349,36 +1375,62 @@
   // --------------------------------------------------- lifetime hand database
   // `player` = {user_id, name} opens somebody else's database (the club is private:
   // everyone may browse everyone — cards still follow the table's reveal rule).
-  async function openMyHands(gameId, player, clubId) {
+  // `variant` = one game's numbers (PLO5 / PLO6 are different games: the club section
+  // opens this on the game it shows); a switch changes it once more than one was played.
+  async function openMyHands(gameId, player, clubId, variant) {
     const other = player && !player.is_me ? player : null;
     const base = other ? `/games/api/players/${other.user_id}` : "/games/api/my";
     // (one club's numbers — the club's lobby, or the club of the table it was opened from)
     const club = clubId || C().G.clubId;
-    const clubQ = club ? `club=${encodeURIComponent(club)}` : "";
     const clubName = (currentClub() && currentClub().id === club && currentClub().name) || "";
+    const F = { sort: "time", dir: "desc", game: gameId || "", variant: variant || "", offset: 0, rows: [], total: 0 };
+    const qs = () => [club ? `club=${encodeURIComponent(club)}` : "", F.variant ? `variant=${encodeURIComponent(F.variant)}` : ""].filter(Boolean).join("&");
     let stats;
-    try { stats = await C().j(base + "/stats" + (clubQ ? "?" + clubQ : "")); } catch (e) { return toast(e.message, "err"); }
-    const F = { sort: "time", dir: "desc", game: gameId || "", offset: 0, rows: [], total: 0 };
+    const loadStats = async () => { stats = await C().j(base + "/stats" + (qs() ? "?" + qs() : "")); };
+    try { await loadStats(); } catch (e) { return toast(e.message, "err"); }
     const acc = (v) => (v == null ? "–" : Math.round(v) + "%");
+    const played = () => (stats.games || []).filter((g) => g.hands > 0);
     const body = h("div", { class: "db" });
     body.innerHTML =
-      `<div class="pcard-stats"><div><b>${stats.hands}</b><small>Hands</small></div><div><b class="${stats.net_cents > 0 ? "pos" : stats.net_cents < 0 ? "neg" : ""}">${stats.net_cents > 0 ? "+" : ""}${d2(stats.net_cents)}</b><small>Lifetime net</small></div>` +
-      `<div><b>${acc(stats.accuracy)}</b><small>Accuracy (${stats.graded} decisions)</small></div><div><b>${stats.hands ? Math.round((100 * stats.wins) / stats.hands) + "%" : "–"}</b><small>Hands won</small></div></div>` +
-      ((stats.versus || []).length ? `<div class="rsec"><h4>Head to head${clubName ? " — " + esc(clubName) : ""}</h4><div class="vs">${stats.versus.map((v) => `<span class="vs-chip"><span>${esc(v.name)}</span><b class="num ${v.net_cents > 0 ? "pos" : v.net_cents < 0 ? "neg" : ""}">${v.net_cents > 0 ? "+" : ""}${d2(v.net_cents)}</b></span>`).join("")}</div></div>` : "") +
-      `<div class="db-bar"><select class="input" id="db-game"><option value="">All sessions (${(stats.sessions || []).length})</option>${(stats.sessions || []).map((x) => `<option value="${esc(x.id)}" ${x.id === F.game ? "selected" : ""}>${esc(x.name)} · ${x.hands} hands · ${x.net_cents >= 0 ? "+" : ""}${d2(x.net_cents)}${x.accuracy == null ? "" : " · " + acc(x.accuracy)}</option>`).join("")}</select>` +
+      `<div id="db-head"></div>` +
+      `<div class="db-bar"><select class="input" id="db-game"></select>` +
       `<div class="seg" id="db-sort">${[["time", "Date"], ["pot", "Pot size"], ["net", "Profit / loss"], ["accuracy", "Accuracy"]].map(([v, l]) => `<button type="button" data-v="${v}" class="${v === "time" ? "on" : ""}">${l}</button>`).join("")}</div>` +
       `<button class="btn sm" id="db-dir" title="Reverse the order">↓ High to low</button></div>` +
       `<div id="db-list"></div><button class="btn block" id="db-more" hidden>Load more</button>`;
     const q = (id) => body.querySelector("#" + id);
+    segWire(body);  // (the sort: wired once — the game switch is wired with each paint of the head)
+    const paintHead = () => {
+      const games = played().map((g) => g.code);
+      if (F.variant && !games.includes(F.variant)) games.push(F.variant);
+      const ungraded = !!F.variant && !gameOf(F.variant).graded;
+      const sw = games.length > 1
+        ? `<div class="seg db-games" id="db-v">${[["", "All games"]].concat(games.map((c) => [c, gameOf(c).label])).map(([v, l]) => `<button type="button" data-v="${v}" class="${v === F.variant ? "on" : ""}">${l}</button>`).join("")}</div>` : "";
+      q("db-head").innerHTML = sw +
+        `<div class="pcard-stats"><div><b>${stats.hands}</b><small>${F.variant ? gameOf(F.variant).label + " hands" : "Hands"}</small></div><div><b class="${stats.net_cents > 0 ? "pos" : stats.net_cents < 0 ? "neg" : ""}">${stats.net_cents > 0 ? "+" : ""}${d2(stats.net_cents)}</b><small>${F.variant ? "Net" : "Lifetime net"}</small></div>` +
+        (ungraded ? `<div><b>–</b><small>Not graded (no ${gameOf(F.variant).label} network)</small></div>` : `<div><b>${acc(stats.accuracy)}</b><small>Accuracy (${stats.graded} decisions)</small></div>`) +
+        `<div><b>${stats.hands ? Math.round((100 * stats.wins) / stats.hands) + "%" : "–"}</b><small>Hands won</small></div></div>` +
+        ((stats.versus || []).length ? `<div class="rsec"><h4>Head to head${F.variant ? " · " + gameOf(F.variant).label : ""}${clubName ? " — " + esc(clubName) : ""}</h4><div class="vs">${stats.versus.map((v) => `<span class="vs-chip"><span>${esc(v.name)}</span><b class="num ${v.net_cents > 0 ? "pos" : v.net_cents < 0 ? "neg" : ""}">${v.net_cents > 0 ? "+" : ""}${d2(v.net_cents)}</b></span>`).join("")}</div></div>` : "");
+      const sess = stats.sessions || [], tag = !F.variant && played().length > 1;
+      q("db-game").innerHTML = `<option value="">All sessions (${sess.length})</option>` + sess.map((x) => `<option value="${esc(x.id)}" ${x.id === F.game ? "selected" : ""}>${esc(x.name)}${tag ? " · " + gameOf(x.variant).label : ""} · ${x.hands} hands · ${x.net_cents >= 0 ? "+" : ""}${d2(x.net_cents)}${x.accuracy == null ? "" : " · " + acc(x.accuracy)}</option>`).join("");
+      if (!sw) return;
+      segWire(q("db-head"));
+      q("db-v").addEventListener("pick", async (e) => {
+        F.variant = e.detail; F.game = "";
+        try { await loadStats(); } catch (err) { toast(err.message, "err"); return; }
+        paintHead();
+        load(true);
+      });
+    };
     const draw = () => {
       const host = q("db-list");
       host.innerHTML = F.rows.length ? "" : `<div class="muted" style="text-align:center;padding:26px">${other ? "No hands here yet." : "No hands yet. Every hand you play at this club's tables lands here."}</div>`;
+      const tag = !F.variant && played().length > 1;  // (every game in one list: say which each hand was)
       F.rows.forEach((x) => {
         const net = x.net_cents;
         const row = h("button", { class: "hand-row db-row", type: "button" },
           `<span class="no">#${x.hand_no}</span><span style="display:flex;align-items:center;min-width:0">${x.my_hole ? miniCards(x.my_hole) : ""}${miniCards(x.board_a, "gap")}${miniCards(x.board_b, "gap")}</span>` +
           `<span class="net ${net > 0 ? "pos" : net < 0 ? "neg" : "muted"}">${net > 0 ? "+" : ""}${d2(net)}</span>` +
-          `<span></span><span class="who">${esc(x.table_name)} · ${esc(String(x.ended_at || "").slice(0, 10))} · pot ${d2(x.pot_cents)}${x.showdown ? " · showdown" : ""}</span><span class="muted num" style="font-size:11.5px">${x.accuracy == null ? "" : acc(x.accuracy)}</span>`);
+          `<span></span><span class="who">${esc(x.table_name)}${tag ? " · " + gameOf(x.variant).label : ""} · ${esc(String(x.ended_at || "").slice(0, 10))} · pot ${d2(x.pot_cents)}${x.showdown ? " · showdown" : ""}</span><span class="muted num" style="font-size:11.5px">${x.accuracy == null ? "" : acc(x.accuracy)}</span>`);
         row.addEventListener("click", () => openHand(x.game_id, x.hand_no));
         host.appendChild(row);
       });
@@ -1389,19 +1441,19 @@
     const load = async (reset) => {
       if (reset) { F.offset = 0; F.rows = []; }
       try {
-        const d = await C().j(`${base}/hands?sort=${F.sort}&dir=${F.dir}&limit=40&offset=${F.offset}` + (F.game ? `&game=${encodeURIComponent(F.game)}` : "") + (clubQ ? "&" + clubQ : ""));
+        const d = await C().j(`${base}/hands?sort=${F.sort}&dir=${F.dir}&limit=40&offset=${F.offset}` + (F.game ? `&game=${encodeURIComponent(F.game)}` : "") + (qs() ? "&" + qs() : ""));
         F.rows = F.rows.concat(d.hands); F.total = d.total; F.offset += d.limit;
       } catch (e) { toast(e.message, "err"); }
       draw();
     };
-    segWire(body);
+    paintHead();
     q("db-sort").addEventListener("pick", (e) => { F.sort = e.detail; load(true); });
     q("db-dir").addEventListener("click", () => { F.dir = F.dir === "desc" ? "asc" : "desc"; load(true); });
     q("db-game").addEventListener("change", (e) => { F.game = e.target.value; load(true); });
     q("db-more").addEventListener("click", () => load(false));
     const api = openModal({
       title: (other ? `${other.name} — hands & stats` : "My hands & stats") + (clubName ? ` · ${clubName}` : ""),
-      sub: other ? `Every hand they played${clubName ? " in " + clubName : ""}. You see the cards you saw at the table: your own, and hands that were shown.` : `Every hand you played${clubName ? " in " + clubName : ""}, with the network's accuracy rating.`,
+      sub: other ? `Every hand they played${clubName ? " in " + clubName : ""}. You see the cards you saw at the table: your own, and hands that were shown.` : `Every hand you played${clubName ? " in " + clubName : ""}, with the network's accuracy rating (PLO5).`,
       body, wide: true, autofocus: false, buttons: [{ label: "Close", cls: "primary" }],
     });
     api.modal.classList.add("xwide");
@@ -1414,24 +1466,53 @@
   const signed = (c) => (c > 0 ? "+" : c < 0 ? "−" : "") + d2(Math.abs(c));
   const tone = (c) => (c > 0 ? "pos" : c < 0 ? "neg" : "");
 
+  // PLO5 and PLO6 are different games: the club's numbers are shown one game at a time
+  // (2026-09-26). The server picks the club's most-played game; a switch picks another,
+  // remembered per club in this browser.
+  const CLUB_GAME_KEY = "hg.clubgame.v1";
+  function clubGames() { try { return JSON.parse(localStorage.getItem(CLUB_GAME_KEY) || "{}") || {}; } catch (_) { return {}; } }
+  function clubGameFor(cid) { const v = clubGames()[cid]; return GAMES[v] ? v : ""; }
+  function setClubGame(cid, v) {
+    const all = clubGames();
+    all[cid] = v;
+    try { localStorage.setItem(CLUB_GAME_KEY, JSON.stringify(all)); } catch (_) { /* private mode: this visit only */ }
+  }
   async function loadClub(force) {
     const cid = C().G.clubId;
     if (!cid) { renderClub({ players: [] }); return; }  // (no club (yet): no numbers to show)
     // (the 30 s throttle is per club: a switch, or the first load after the club is known, always fetches)
     if (!force && U.clubAt && U.clubFor === cid && Date.now() - U.clubAt < 30000) return;
     U.clubAt = Date.now(); U.clubFor = cid;
+    const v = clubGameFor(cid);
     try {
-      const data = await C().j(`/games/api/community?club=${encodeURIComponent(cid)}`);
+      const data = await C().j(`/games/api/community?club=${encodeURIComponent(cid)}` + (v ? `&variant=${encodeURIComponent(v)}` : ""));
       if (C().G.clubId === cid) renderClub(data);  // (a switch in the meantime: the newer answer wins)
     } catch (_) { /* the lobby works without it */ }
   }
   function renderClub(data) {
     U.club = data;
     const players = data.players || [];
-    $("lb-club-sec").hidden = !players.length;
-    if (!players.length) return;
+    const G = gameOf(data.variant), played = (data.games || []).filter((g) => g.hands > 0);
+    $("lb-club-sec").hidden = !players.length && !played.length;
+    if ($("lb-club-sec").hidden) return;
+    // the game switch: once the club has played more than one game
+    const codes = played.map((g) => g.code);
+    if (data.variant && !codes.includes(data.variant)) codes.push(data.variant);
+    const sw = $("lb-game");
+    sw.hidden = codes.length < 2;
+    sw.innerHTML = codes.map((c) => {
+      const n = ((data.games || []).find((g) => g.code === c) || { hands: 0 }).hands;
+      return `<button type="button" data-v="${c}" class="${c === data.variant ? "on" : ""}" title="${n} hand${n === 1 ? "" : "s"} played">${gameOf(c).label}</button>`;
+    }).join("");
+    $("lb-club-sub").textContent = `${G.label} · ${players.length} player${players.length === 1 ? "" : "s"} · ${G.graded ? "accuracy is the network's rating of every decision" : `${G.label} isn't graded yet (there is no ${G.label} network)`}`;
+    if (!players.length) {
+      $("lb-podium").hidden = true;
+      $("lb-players").innerHTML = `<div class="lb-empty" style="grid-column:1/-1"><b>No ${G.label} hands yet</b>The club's ${G.label} numbers show up here after its first ${G.label} hand.</div>`;
+      return;
+    }
     // podium: accuracy, among players with enough graded decisions to mean something
-    const rated = players.filter((p) => p.accuracy != null);
+    // (a game the network doesn't grade has no podium)
+    const rated = G.graded ? players.filter((p) => p.accuracy != null) : [];
     const ranked = rated.filter((p) => p.graded >= MIN_RANKED).sort((a, b) => b.accuracy - a.accuracy || b.graded - a.graded);
     const early = rated.filter((p) => p.graded < MIN_RANKED).sort((a, b) => b.accuracy - a.accuracy || b.graded - a.graded);
     const top = ranked.concat(early).slice(0, 3);
@@ -1445,19 +1526,21 @@
       `<span class="pod-sub">${p.graded} decision${p.graded === 1 ? "" : "s"}${p.graded < MIN_RANKED ? " · provisional" : ""}</span>` +
       `<span class="pod-step"><b>${place}</b></span></button>`;
     pod.innerHTML = step(top[1], 2) + step(top[0], 1) + step(top[2], 3);
-    // one card per player, biggest winner first
+    // one card per player, biggest winner first (an ungraded game's meter: hands won)
     $("lb-players").innerHTML = players.map((p) => {
-      const pct = p.accuracy == null ? 0 : Math.max(0, Math.min(100, p.accuracy));
+      const won = p.hands ? Math.round((100 * p.wins) / p.hands) : 0;
+      const pct = !G.graded ? won : p.accuracy == null ? 0 : Math.max(0, Math.min(100, p.accuracy));
       return `<button type="button" class="plcard ${p.is_me ? "me" : ""}" data-uid="${p.user_id}">` +
         `<span class="plcard-top">${avatar(p.name, p.name, "", p.avatar)}<span class="plcard-name"><b>${esc(p.name)}</b><small>${p.hands} hand${p.hands === 1 ? "" : "s"} · ${p.sessions} session${p.sessions === 1 ? "" : "s"}</small></span>` +
         `<b class="num plcard-net ${tone(p.net_cents)}">${signed(p.net_cents)}</b></span>` +
-        `<span class="plcard-acc"><span class="plcard-meter"><i style="width:${pct}%"></i></span><b class="num">${accTxt(p.accuracy)}</b></span>` +
-        `<span class="plcard-foot"><span>Accuracy${p.graded ? ` · ${p.graded} decisions` : " · not rated yet"}</span><span>Won ${p.hands ? Math.round((100 * p.wins) / p.hands) : 0}% · best ${d2(p.best_cents)}</span></span></button>`;
+        `<span class="plcard-acc"><span class="plcard-meter"><i style="width:${pct}%"></i></span><b class="num">${G.graded ? accTxt(p.accuracy) : won + "%"}</b></span>` +
+        (G.graded
+          ? `<span class="plcard-foot"><span>Accuracy${p.graded ? ` · ${p.graded} decisions` : " · not rated yet"}</span><span>Won ${won}% · best ${d2(p.best_cents)}</span></span></button>`
+          : `<span class="plcard-foot"><span>Hands won · not graded</span><span>best ${d2(p.best_cents)}</span></span></button>`);
     }).join("");
-    $("lb-club-sub").textContent = `${players.length} player${players.length === 1 ? "" : "s"} · accuracy is the network's rating of every decision`;
     document.querySelectorAll("#lb-podium [data-uid], #lb-players [data-uid]").forEach((b) => b.addEventListener("click", () => {
       const p = players.find((x) => String(x.user_id) === b.dataset.uid);
-      if (p) openMyHands("", { user_id: p.user_id, name: p.name, is_me: p.is_me });
+      if (p) openMyHands("", { user_id: p.user_id, name: p.name, is_me: p.is_me }, null, data.variant);
     }));
   }
 
@@ -1467,7 +1550,7 @@
     const data = U.club;
     if (!data || !(data.players || []).length) return toast("No hands played yet", "");
     const ps = data.players.filter((p) => (data.pairs || []).some((x) => x.from === p.user_id || x.to === p.user_id));
-    if (ps.length < 2) return toast("No money has changed hands yet", "");
+    if (ps.length < 2) return toast(`No money has changed hands at ${gameOf(data.variant).label} yet`, "");
     const net = {};
     (data.pairs || []).forEach((x) => { net[x.to + ":" + x.from] = x.cents; net[x.from + ":" + x.to] = -x.cents; });
     const peak = Math.max(1, ...Object.values(net).map(Math.abs));
@@ -1487,9 +1570,10 @@
       `<p class="muted" style="font-size:12px;margin:12px 0 0">Read across: a green cell is what that player has won from the player in the column. Every pot is traced layer by layer — side pots, split boards and quartered pots each go to who really paid for them.</p>`;
     body.querySelectorAll("th[data-uid]").forEach((th) => th.addEventListener("click", () => {
       const p = ps.find((x) => String(x.user_id) === th.dataset.uid);
-      if (p) openMyHands("", { user_id: p.user_id, name: p.name, is_me: p.is_me });
+      if (p) openMyHands("", { user_id: p.user_id, name: p.name, is_me: p.is_me }, null, data.variant);
     }));
-    const api = openModal({ title: "Head to head", sub: "Who has won what from whom, across every recorded session.", body, wide: true, autofocus: false, buttons: [{ label: "Close", cls: "primary" }] });
+    const G = gameOf(data.variant);
+    const api = openModal({ title: `Head to head · ${G.label}`, sub: `Who has won what from whom at ${G.label}, across every recorded session.`, body, wide: true, autofocus: false, buttons: [{ label: "Close", cls: "primary" }] });
     api.modal.classList.add("xwide");
   }
 
@@ -1501,7 +1585,7 @@
       body.innerHTML = (data.is_admin ? `<p class="muted" style="font-size:12.5px;margin:0 0 12px">Excluding a session takes it out of everyone's stats, hand lists and head-to-head. Nothing is deleted — you can restore it here any time. An open table is closed first.</p>` : "") +
         (rows.length ? rows.map((x) =>
           `<div class="sess ${x.excluded ? "excluded" : ""}" data-id="${esc(x.id)}"><div><b>${esc(x.name)}</b>${x.open ? ` <span class="pill live">Open</span>` : ""}${x.excluded ? ` <span class="pill">Excluded</span>` : ""}<br>` +
-          `<small>${esc(String(x.created_at || "").slice(0, 10))} · ${d2(x.bb_cents)} bb · ante ${d2(x.ante_cents)}</small></div>` +
+          `<small>${esc(String(x.created_at || "").slice(0, 10))} · ${gameOf(x.variant).label} · ${d2(x.bb_cents)} bb · ante ${d2(x.ante_cents)}</small></div>` +
           `<small class="opt">${x.hands} hand${x.hands === 1 ? "" : "s"}</small><small class="opt">${x.players} player${x.players === 1 ? "" : "s"}</small>` +
           `<span class="sess-act"><button class="btn sm" data-open="${esc(x.id)}" type="button">Open</button>` +
           (data.is_admin ? `<button class="btn sm ${x.excluded ? "" : "danger"}" data-ex="${esc(x.id)}" data-on="${x.excluded ? "0" : "1"}" type="button">${x.excluded ? "Restore" : "Exclude"}</button>` : "") + `</span></div>`).join("")
@@ -1570,10 +1654,12 @@
     let html = `<div class="dr-head"><h3>${icon("i-crown")}Manage table</h3><button class="icon-btn" id="dr-x" aria-label="Close">${icon("i-x")}</button></div>` +
       `<div class="dr-tabs">${tabs.map(([k, l]) => `<button data-t="${k}" class="${k === U.drawerTab ? "on" : ""}">${l}</button>`).join("")}</div><div class="dr-body">`;
     if (U.drawerTab === "game") {
+      const maxSeats = (s.game && s.game.max_seats) || gameOf(s.variant).maxSeats;
       html += `<div class="grp"><h4>Table</h4><label class="field"><span>Name</span><input type="text" id="m-name" maxlength="60" value="${esc(s.name)}"/></label>` +
+        `<div class="field"><span>Game</span><input type="text" class="input" disabled value="${esc(gameOf(s.variant).name)}"/><small>Fixed once a table is created — host another table for the other game</small></div>` +
         `<div class="row2"><label class="field"><span>Ante</span>${moneyInput("m-ante", st.ante_cents)}<small>Applies from the next hand</small></label>` +
         `<div class="field"><span>Big blind (chip unit)</span><input type="text" class="input num" disabled value="${d2(st.bb_cents)}"/><small>Fixed once a table is created</small></div></div>` +
-        `<div class="field"><span>Seats</span>${segHtml("m-seats", [2, 3, 4, 5, 6, 7, 8].map((n) => [n, String(n)]), s.num_seats)}<small>Between hands only — the higher seats must be empty to shrink</small></div></div>` +
+        `<div class="field"><span>Seats</span>${segHtml("m-seats", Array.from({ length: maxSeats - 1 }, (_, i) => [i + 2, String(i + 2)]), s.num_seats)}<small>Between hands only — the higher seats must be empty to shrink${maxSeats < 8 ? ` · ${gameOf(s.variant).label} seats up to ${maxSeats} (one deck)` : ""}</small></div></div>` +
         `<div class="grp"><h4>Buy-ins</h4><div class="row3"><label class="field"><span>Minimum</span>${moneyInput("m-min", set.min_buyin_cents)}</label><label class="field"><span>Default</span>${moneyInput("m-dflt", st.default_buyin_cents)}</label><label class="field"><span>Maximum</span>${moneyInput("m-max", set.max_buyin_cents)}</label></div><p>0 = no limit. The maximum also caps top-ups.</p></div>` +
         `<div class="grp"><h4>Privacy &amp; extras</h4><div class="setrow"><div><b>List in the lobby</b><small>Off = link only</small></div><label class="switch"><input type="checkbox" id="m-listed" ${set.listed ? "checked" : ""}/><i></i></label></div>` +
         `<div class="setrow"><div><b>Accuracy marks on shown hands</b><small>Everyone sees the network's marks on their own decisions, and on hands tabled at showdown — never on a mucked hand. Off = only their own</small></div><label class="switch"><input type="checkbox" id="m-grades" ${set.show_grades ? "checked" : ""}/><i></i></label></div>` +
@@ -1704,12 +1790,12 @@
     const set = s.settings, st = s.stakes;
     const row = (k, v) => `<div class="settle-row"><span class="muted">${k}</span><b style="color:var(--tx)">${v}</b></div>`;
     openModal({
-      title: s.name, sub: "PLO5 double-board bomb pot", autofocus: false,
+      title: s.name, sub: gameOf(s.variant).name, autofocus: false,
       body: `<div>${row("Big blind (chip unit)", d2(st.bb_cents))}${row("Ante", `${d2(st.ante_cents)} (${(st.ante_cents / st.bb_cents).toFixed(st.ante_cents % st.bb_cents ? 1 : 0)} bb)`)}` +
         row("Buy-in", set.min_buyin_cents || set.max_buyin_cents ? `${set.min_buyin_cents ? d2(set.min_buyin_cents) : "any"} – ${set.max_buyin_cents ? d2(set.max_buyin_cents) : "any"}` : "No limits") +
         row("Seats", s.num_seats) + row("Decision time", s.decision_secs ? s.decision_secs + "s" : "No clock") + row("Time bank", set.time_bank_secs ? set.time_bank_secs + "s per player" : "Off") +
         row("Next hand", set.deal_delay_secs ? `dealt automatically after ${set.deal_delay_secs}s` : "dealt manually") + row("Rabbit hunt", set.allow_rabbit ? "Allowed" : "Off") + row("Lobby", set.listed ? "Listed" : "Link only") + `</div>` +
-        `<div class="grp"><h4>How a hand works</h4><p style="margin:0;color:var(--tx-2);font-size:13px;line-height:1.5">Everyone dealt in posts the ante — no blinds. You get five cards and the hand starts on the flop with <b>two boards</b>. Betting is pot-limit. At showdown each board awards half the pot to the best hand using exactly two hole cards and three board cards.</p></div>`,
+        `<div class="grp"><h4>How a hand works</h4><p style="margin:0;color:var(--tx-2);font-size:13px;line-height:1.5">Everyone dealt in posts the ante — no blinds. You get ${gameOf(s.variant).word} cards and the hand starts on the flop with <b>two boards</b>. Betting is pot-limit. At showdown each board awards half the pot to the best hand using exactly two hole cards and three board cards.${gameOf(s.variant).graded ? "" : ` ${gameOf(s.variant).label} decisions are not graded — there is no ${gameOf(s.variant).label} network yet.`}</p></div>`,
       buttons: [{ label: "Copy invite link", cls: "", onClick: () => { copyInvite(s.id); return false; } }, { label: "Done", cls: "primary" }],
     });
   }
@@ -1908,6 +1994,13 @@
     $("c-open").addEventListener("click", () => openCreate());
     $("lb-myhands").addEventListener("click", () => openMyHands(""));
     $("lb-h2h").addEventListener("click", openMatrix);
+    $("lb-game").addEventListener("click", (e) => {
+      const b = e.target.closest("button[data-v]"), cid = C().G.clubId;
+      if (!b || !cid || b.classList.contains("on")) return;
+      setClubGame(cid, b.dataset.v);
+      $("lb-game").querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
+      loadClub(true);
+    });
     $("lb-allsess").addEventListener("click", openSessions);
     const takeLink = (id) => { const box = $(id), v = box.value; box.value = ""; box.blur(); return v; };
     $("join-form").addEventListener("submit", (e) => { e.preventDefault(); joinByLink(takeLink("join-input")); });
@@ -2006,7 +2099,7 @@
 
   function renderTop(s) {
     $("table-title").textContent = s.name;
-    $("table-sub").textContent = `PLO5 bomb pot · ${d2(s.stakes.bb_cents)} bb · ante ${d2(s.stakes.ante_cents)}${s.club ? " · " + s.club.name : ""}`;
+    $("table-sub").textContent = `${gameOf(s.variant).label} bomb pot · ${d2(s.stakes.bb_cents)} bb · ante ${d2(s.stakes.ante_cents)}${s.club ? " · " + s.club.name : ""}`;
     const st = $("tb-status");
     const label = s.status !== "open" ? "Closed" : s.running ? "Live" : "Paused";
     st.textContent = label;

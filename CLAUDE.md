@@ -745,6 +745,9 @@ later.
 - NOT ported (deliberately, same as NLH): study mode / what-if
   (`new_study` is 5-card and variant-guarded — trainer UI + study are the
   product phase), OCR (N/A). Entropy seeds untuned; training ops TBD.
+- PLO6 IS dealt in the home games (2026-09-26, "PLO6 tables" under Home games):
+  untrained, so those hands are never graded; a trained PLO6 net would be wired
+  in through `homegame.GAMES["plo6"]["graded"]` + a PLO6 `grade_hand` model.
 
 ## NLH variant (`nlh_single`)
 
@@ -1483,8 +1486,8 @@ Service-layer rules (review 2026-09-20 — keep them):
 
 **Home games** (`ui/homegame.py`, `static/games.*`, every signed-in user since
 clubs — a club's tables, members and numbers are its members' only; signed out
-= a sign-in page for a browser, the hidden 404 otherwise): PokerNow-style private PLO5
-double-board tables over `BombPotEnv` (minimal obs, actual payouts, HTTP
+= a sign-in page for a browser, the hidden 404 otherwise): PokerNow-style private PLO5 /
+PLO6 double-board tables over `BombPotEnv` (minimal obs, actual payouts, HTTP
 polling, per-table RLock + clock watchdog). Invariants: hole cards are
 revealed only when ≥ 2 hands are live at terminal (an uncontested winner
 stays face-down); "own" cards are shown against the user id DEALT into the
@@ -1500,6 +1503,49 @@ progressively (no unrevealed card anywhere); chat/rabbit need table
 membership; new tables default to a 30 s clock and the watchdog auto-acts
 Away actors even on clock-less tables; a mid-hand leave folds/checks now
 and cashes out at hand end.
+
+PLO6 tables (2026-09-26 — `tests/python/test_homegame_plo6.py`; owner request):
+
+- A table deals **PLO5 or PLO6**, chosen at creation and fixed for its life like
+  the blinds (`homegames.variant` = `plo5` | `plo6`, `homegame.GAMES`; host another
+  table to switch). PLO6 = six hole cards, **7 seats max** (7 x 6 + 10 = 52: the
+  whole deck, no burn cards) — `_valid_num_seats(n, variant)`, a create without
+  `num_seats` gets the game's max. The engine plays it (`GameConfig(variant=
+  GAMES[v]["variant"])`); `runout.py` / `hand_describe` are hole-count generic
+  (pinned against the engine's PLO6 payouts by a randomized sweep).
+- **Never graded**: only `GAMES[v]["graded"]` hands reach the grader
+  (`_enqueue_grading`; `grade_hand` refuses another game too); a PLO6 record has
+  `grades: []` (not `None` = "still being worked out") and no `acc_n`.
+- Records carry `variant` + `hole_count`; the view `variant`, `game` {code, label,
+  name, hole, max_seats, graded} and `hole_count`; lobby rows, sessions and hand
+  lists carry `variant`. The replayer draws that many face-down cards and hides
+  "Open in Study" (Study deals PLO5; `openInStudy` refuses another game).
+- **Verified shuffle**: the slot map is `h·s+k`, boards `h·n..` with `h` =
+  `SealedDeck.hole` (5 when absent — PLO5 transcripts unchanged; public
+  transcripts and the store carry `hole`); a non-PLO5 `hand_id` ends in `:plo6`, so
+  the seal names the game. `games.fair.js` maps slots by `s.hole_count` and refuses
+  a transcript whose `hole` differs from the table's.
+- **Felt**: `#stage.h6` (games.css) + `ROW` (games.table.js) — a six-card row takes
+  about a five-card row's room: hero cards 0.9x with 0.28 overlap, a tighter
+  face-down fan (`--fov/--mid/--rot`), tabled rows from 0.4 overlap up to 0.6. Keep
+  the two in step. Found with PLO6's 7-seat default and fixed for every table:
+  `fitSeats` places rows by where the award caption LANDS (`captionLanding`,
+  `--cap-dy`: capin slides it in from higher up, so its first-frame box was wrong),
+  and `fitPots` keeps pots clear of tabled rows at their tightest fan (7 seats put
+  the upper side seats level with a runout's pots). Measured with
+  `measure_showdown.js` on 7-player PLO6 tables: no real overlap at 360-430 px
+  phones (a few 1-3 px corner slivers — a label on a board's end card), phone
+  landscape, tablet and desktop; an SE-size 375x667 multi-pot (3+) runout
+  keeps 2-3 px touches between the two top seats' badges and the pot pills (an
+  11 px gap for 16 px pills) — like PLO5's SE-size corner touches.
+- **Club numbers per game**: `/games/api/community?variant=` (default = the club's
+  most-played game; `games` = hands per game for the switch; players + pairs
+  filtered; sessions all, each tagged); `my/stats|hands` and `players/{id}/stats|
+  hands` take `variant` (absent = every game; `games` breakdown). Lobby: the
+  `#lb-game` switch (remembered per club, localStorage `hg.clubgame.v1`); an
+  ungraded game has no podium and its cards meter hands won; a player's stats
+  window opens on the club's game with All games / per-game switch. A new
+  per-game aggregate must filter `g.variant` (`_games_played`, `_games_summary`).
 
 Premium tables pass (2026-09-21 — `tests/python/test_homegame_premium.py`):
 

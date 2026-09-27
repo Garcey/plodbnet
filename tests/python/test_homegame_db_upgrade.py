@@ -113,6 +113,7 @@ def test_the_september_database_upgrades_in_place_and_the_table_plays_on(tmp_pat
     # columns the old rows never had come up with their documented defaults
     assert s["settings"]["approve_buyins"] is False and s["settings"]["show_grades"] is True
     assert s["settings"]["listed"] is True and s["settings"]["allow_rabbit"] is True
+    assert s["variant"] == "plo5" and s["hole_count"] == 5, "every table from before PLO6 deals PLO5"
     assert s["fair"]["supported"] == hg.FAIR_ON and (not hg.FAIR_ON or s["fair"]["next"]["hand_no"] == 42)
     # … and the table simply plays on: start, deal hand 42, fold it out, history + club stats work
     r = host.post("/games/api/tables/oldopen1/run", json={"running": True})
@@ -154,7 +155,8 @@ def test_the_september_database_upgrades_in_place_and_the_table_plays_on(tmp_pat
             "homegame_clubs", "homegame_club_members", "homegame_club_requests"} <= tables
     cols = {r[1] for r in con.execute("pragma table_info(homegames)")}
     assert {"running", "deal_delay_ms", "time_bank_secs", "approve_buyins", "topup_mode", "show_grades", "excluded",
-            "club_id"} <= cols
+            "club_id", "variant"} <= cols
+    assert {r[0] for r in con.execute("select variant from homegames")} == {"plo5"}
     assert {r[0] for r in con.execute("select club_id from homegames")} == {clubs[0]["id"]}
     assert {"auto_stack_cents", "trusted", "topup_target_cents"} <= {r[1] for r in con.execute("pragma table_info(homegame_players)")}
     con.close()

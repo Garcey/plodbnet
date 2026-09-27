@@ -28,8 +28,11 @@ the browser's is ``static/games.fair.js``):
     shuffle ``perm`` (SHA-256 counter stream, rejection sampling — no modulo
     bias). The deck that is dealt is ``F[slot] = D[perm[slot]]``.
 6.  DEAL.  Public slot map, fixed before anything is known: seat ``s``'s k-th
-    hole card is slot ``5s+k`` (every seat index, dealt in or not), board A is
-    ``5n..5n+4``, board B ``5n+5..5n+9`` (``n`` = seats at the table).
+    hole card is slot ``h·s+k`` (every seat index, dealt in or not), board A is
+    ``h·n..h·n+4``, board B ``h·n+5..h·n+9`` (``n`` = seats at the table, ``h`` =
+    hole cards per player: 5 in PLO5, 6 in PLO6 — the transcript's ``hole``,
+    5 when absent; a PLO6 table also names its game in ``hand_id``, so the
+    seal itself says which map applies).
 7.  OPEN.  Every card a player is ever shown comes with ``(slot, pos, salt)``;
     the device checks ``pos == perm[slot]``, that the slot is the right one for
     where the card appeared, and that ``c[pos]`` opens to exactly that card.
@@ -61,7 +64,8 @@ from typing import Any, Iterable
 
 SPEC = "wrapgto-fair-v1"
 DECK_SIZE = 52
-HOLE = 5
+HOLE = 5  # hole cards per player when a transcript names none (PLO5)
+HOLE_COUNTS = (5, 6)  # PLO5, PLO6
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -124,12 +128,12 @@ def permutation(cut: str) -> list[int]:
     return perm
 
 
-def hole_slot(seat: int, k: int) -> int:
-    return HOLE * int(seat) + int(k)
+def hole_slot(seat: int, k: int, hole: int = HOLE) -> int:
+    return int(hole) * int(seat) + int(k)
 
 
-def board_slot(num_seats: int, board: str, m: int) -> int:
-    return HOLE * int(num_seats) + (0 if board == "a" else 5) + int(m)
+def board_slot(num_seats: int, board: str, m: int, hole: int = HOLE) -> int:
+    return int(hole) * int(num_seats) + (0 if board == "a" else 5) + int(m)
 
 
 # --- the server's side ---------------------------------------------------------------
@@ -144,6 +148,7 @@ class SealedDeck:
     num_seats: int
     key: str                      # 32 random bytes (hex): salts derive from it
     deck: list[int]               # D — the sealed order
+    hole: int = HOLE              # hole cards per player: the slot map (PLO5 5, PLO6 6)
     commitments: list[str] = field(default_factory=list)
     seal: str = ""
     locked: list[tuple[int, str]] = field(default_factory=list)
@@ -156,14 +161,16 @@ class SealedDeck:
 
     @classmethod
     def create(cls, hand_id: str, num_seats: int, *, key: str | None = None,
-               deck: list[int] | None = None) -> "SealedDeck":
+               deck: list[int] | None = None, hole: int = HOLE) -> "SealedDeck":
         if deck is None:
             deck = list(range(DECK_SIZE))
             secrets.SystemRandom().shuffle(deck)
         if sorted(int(c) for c in deck) != list(range(DECK_SIZE)):
             raise ValueError("a sealed deck is a permutation of all 52 cards")
+        if int(hole) not in HOLE_COUNTS or int(hole) * int(num_seats) + 10 > DECK_SIZE:
+            raise ValueError(f"{num_seats} seats x {hole} hole cards + two boards do not fit one deck")
         sd = cls(hand_id=str(hand_id), num_seats=int(num_seats),
-                 key=key or secrets.token_hex(32), deck=[int(c) for c in deck])
+                 key=key or secrets.token_hex(32), deck=[int(c) for c in deck], hole=int(hole))
         sd.commitments = [card_commitment(sd.hand_id, i, sd.salt(i), sd.deck[i])
                           for i in range(DECK_SIZE)]
         sd.seal = seal_of(sd.hand_id, sd.commitments)
@@ -206,7 +213,7 @@ class SealedDeck:
     def public(self) -> dict[str, Any]:
         """The transcript: everything except the unopened cards."""
         return {
-            "spec": SPEC, "hand_id": self.hand_id, "num_seats": self.num_seats,
+            "spec": SPEC, "hand_id": self.hand_id, "num_seats": self.num_seats, "hole": self.hole,
             "seal": self.seal, "commitments": list(self.commitments),
             "locked": [[s, c] for s, c in self.locked], "lock": self.lock,
             "reveals": [[s, n] for s, n in self.reveals], "cut": self.cut,
@@ -214,12 +221,14 @@ class SealedDeck:
 
     # compact form kept in the database (commitments are recomputed from it)
     def to_store(self) -> dict[str, Any]:
-        return {"hand_id": self.hand_id, "n": self.num_seats, "key": self.key, "deck": list(self.deck),
+        return {"hand_id": self.hand_id, "n": self.num_seats, "hole": self.hole, "key": self.key,
+                "deck": list(self.deck),
                 "locked": [[s, c] for s, c in self.locked], "reveals": [[s, n] for s, n in self.reveals]}
 
     @classmethod
     def from_store(cls, d: dict[str, Any]) -> "SealedDeck":
-        sd = cls.create(d["hand_id"], int(d["n"]), key=d["key"], deck=list(d["deck"]))
+        sd = cls.create(d["hand_id"], int(d["n"]), key=d["key"], deck=list(d["deck"]),
+                        hole=int(d.get("hole") or HOLE))  # (stored before PLO6: always 5)
         sd.set_lock({int(s): c for s, c in d.get("locked") or []})
         sd.finish({int(s): n for s, n in d.get("reveals") or []})
         return sd
