@@ -52,11 +52,9 @@ import torch
 from plo5bp.actions import GATE_CHECK_CALL, GATE_FOLD, GATE_RAISE
 from plo5bp.config import GameConfig
 from plo5bp.env import BombPotEnv
-from plo5bp.network import (
-    build_actor_from_state_dict,
-    build_critic_from_state_dict,
-    opp_holes_multihot,
-)
+from plo5bp.evaluation import load_actor as _eval_load_actor
+from plo5bp.evaluation import load_critic as _eval_load_critic
+from plo5bp.network import opp_holes_multihot
 from plo5bp.rollout import _rotate_opp_holes
 
 GATE_CC = GATE_CHECK_CALL  # scratchpad probes name the check/call gate GATE_CC
@@ -147,32 +145,18 @@ def load_checkpoint(path):
     """(actor, critic) — critic is None for an actor-only checkpoint (no
     'critic' block). Both nets are eval / frozen / inference-only."""
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    cfgb = ckpt.get("config", {}) or {}
-    actor = build_actor_from_state_dict(
-        ckpt["model"],
-        int(cfgb.get("hidden_dim", 128)),
-        int(cfgb.get("num_layers", 2)),
-    ).eval()
-    for p in actor.parameters():
-        p.requires_grad_(False)
+    # The actor's size from the checkpoint (never a 128x2 default), the obs
+    # revision checked against this process's (plo5bp.evaluation).
+    actor, _meta = _eval_load_actor(ckpt)
     critic = None
     if "critic" in ckpt and ckpt["critic"] is not None:
         # This suite reads Q, so the critic must be rebuilt with the run's
-        # unsniffable forward semantics + TRAINED value support from the
-        # checkpoint's config stamp (review 2026-09-20 A19): at the builder
-        # defaults a support-3000 + q_base_raw critic reads Q up to ~113bb
-        # off (V exact), and q_fold_zero / q_base_raw stems were being probed
-        # as if the flags were off. Old checkpoints lack the keys -> the
-        # defaults they trained with.
-        critic = build_critic_from_state_dict(
-            ckpt["critic"],
-            q_fold_zero=bool(cfgb.get("q_fold_zero", False)),
-            q_base_raw=bool(cfgb.get("q_base_raw", False)),
-            value_support=cfgb.get("value_support"),
-            value_hlgauss_sigma=cfgb.get("value_hlgauss_sigma"),
-        ).eval()
-        for p in critic.parameters():
-            p.requires_grad_(False)
+        # unsniffable forward semantics + TRAINED value support (review
+        # 2026-09-20 A19): at the builder defaults a support-3000 + q_base_raw
+        # critic reads Q up to ~113bb off (V exact). build_critic_from_
+        # checkpoint takes them from ckpt["arch"], else the config stamp (old
+        # checkpoints lack the keys -> the defaults they trained with).
+        critic = _eval_load_critic(ckpt)
     return actor, critic
 
 

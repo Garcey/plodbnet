@@ -12,7 +12,7 @@ pokernow.user.js (Tampermonkey, in your browser)
     reads the table DOM on every change (MutationObserver)
     │  POST pokernow.v1 JSON  (GM_xmlhttpRequest)
     ▼
-POST /pokernow/ingest        (plo5bp.ui.server)
+POST /pokernow/ingest        (plo5bp.ui.live, local build only)
     map_payload() → FrameState → EventReconstructor → Session → _rebuild_env
     ▼
 Study UI shows the live hand + model recommendation
@@ -43,11 +43,14 @@ bypasses those restrictions, which is why the script declares `@connect`.
 If the server runs on a non-default port, edit `INGEST_URL` at the top of the
 userscript.
 
-**Updating:** Tampermonkey does not auto-update a pasted script. After pulling a
-new `pokernow.user.js` (check `@version` — currently **1.2.0**), paste it over
-the old one.
+**Installing / updating (1.3.0+):** with the local study server running, open
+<http://127.0.0.1:8765/pokernow/pokernow.user.js> — Tampermonkey offers to
+install it, and from then on updates it from there by itself (`@updateURL`).
+A copy pasted by hand before 1.3.0 does not update: open that link once. The
+server knows each script's version (`collector` in every payload); an older
+one shows "update your PokerNow userscript" in the UI's PokerNow status.
 
-## Delivery guarantees (v1.2.0)
+## Delivery guarantees (v1.3.0)
 
 The server rebuilds each hand from the *ordered* stream of distinct frames, so
 the collector treats a frame as something that may be late but must not vanish:
@@ -62,6 +65,11 @@ the collector treats a frame as something that may be late but must not vanish:
   remembered one. If PokerNow replaced the table element, the observer is
   re-attached and the missed state is sent as a real frame; with no table on
   screen nothing is sent and the UI's "connected" status lapses.
+- **Queue limit** (60 frames — the server unreachable for a long stretch): the
+  oldest frames are dropped, but never silently. The next frame sent carries
+  `gap` = how many were lost, the badge counts them (`N dropped`), and the UI's
+  PokerNow status warns that the hand in progress may be out of sync until the
+  next hand starts.
 - **All-in** is reported only when the DOM says so (the stack label reads
   "All In", or the seat carries an all-in class). A seat whose stack number is
   merely missing is sent as `stackDollars: null, allIn: false` — unknown, not
@@ -92,8 +100,12 @@ play — it's a study aid, not a bot.
 
 - PLO5 double-board **bomb pots** (the project's variant): 5-card hole + two
   boards (`run-1` / `run-2`), ante → flop (both boards) → turn → river.
-- Variable table size (heads-up through full ring); seats are ordered
-  geometrically (hero = engine seat 0, then clockwise).
+- Variable table size, heads-up to 8 players (the engine's limit: a
+  9-or-10-handed hand is refused with a message in the status line); seats
+  are ordered geometrically (hero = engine seat 0, then clockwise).
+- Only PLO5 double-board hands are followed: a table dealing another hand
+  width (PLO4/PLO6/hold'em) or a single board is refused with a message
+  instead of getting wrong advice.
 
 Set the table's bb / ante / $-per-bb in the study UI's config so chip amounts
 map correctly (same requirement as the ClubGG path).

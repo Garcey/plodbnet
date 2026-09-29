@@ -61,6 +61,7 @@ from plo5bp.gto.obs_from_label import ObsSynthesisStats, labels_to_supervised_ro
 from plo5bp.gto.policy_net import (
     label_provenance_problem,
     load_policy_checkpoint,
+    probe_n_problem,
     save_policy_checkpoint,
 )
 from plo5bp.gto.train import derive_training_provenance
@@ -74,7 +75,8 @@ DEFAULT_MAX_GATE_KL_VS_CARD_BLIND = 0.60  # model KL <= 0.6 × card-blind KL
 DEFAULT_MAX_MEAN_ANCHOR_KL = 0.15  # uniform over legal anchors ≈ 0.7–1.0
 DEFAULT_MAX_JAM_FREQ_GAP = 0.05  # holdout-wide |target − model| jam frequency
 DEFAULT_MAX_MEAN_JAM_GAP = 0.15  # per-row mean |target − model|
-DEFAULT_MIN_N = 1  # unit tests; production scripts raise this
+DEFAULT_MIN_N = 1  # library default (unit tests); the CLI uses BADGE_MIN_PROBE_N and the
+# badge itself refuses a probe over fewer rows whatever this gate was (TOOL-019).
 DEFAULT_MIN_PURE_N = 1  # 0 pure nodes = the pure gate is UNVERIFIED → fail
 # Below this a baseline carries no card information worth beating.
 _BASELINE_FLOOR = 0.02
@@ -472,6 +474,9 @@ def stamp_probe_on_checkpoint(
         problems.append(f"holdout labels: {hold_problem}")
     if not result.passed:
         problems.append("probe gates failed: " + "; ".join(result.reasons))
+    size_problem = probe_n_problem(probe_dict)
+    if size_problem is not None:
+        problems.append(size_problem)
     meta["gto_badge_note"] = "; ".join(problems) if problems else None
     # Drop non-serializable / load-only keys before resave
     for k in ("path", "model", "actor", "policy", "is_gto_validated"):

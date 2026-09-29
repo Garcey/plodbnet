@@ -11,8 +11,8 @@
 
 use crate::cards::Card;
 use crate::hand_eval::{
-    evaluate_nlh, evaluate_plo5, one_new_card_table, plo_best_ck, plo_rank_from_ck,
-    triple_masks, BoardTriples, HandRank, PloPairs, ALL_TRIPLES,
+    evaluate_nlh, evaluate_plo, one_new_card_table, plo_best_ck, plo_rank_from_ck, triple_masks,
+    BoardTriples, HandRank, PloPairs, ALL_TRIPLES,
 };
 
 /// Most seats a [`PotLayers`] bitmask holds (the engine's tables are far smaller).
@@ -46,10 +46,16 @@ impl PotLayers {
     pub fn new(folded: &[bool], total_commit: &[u64]) -> Self {
         let n = total_commit.len();
         assert_eq!(folded.len(), n);
-        assert!(n <= MAX_LAYER_SEATS, "PotLayers supports at most {MAX_LAYER_SEATS} seats");
+        assert!(
+            n <= MAX_LAYER_SEATS,
+            "PotLayers supports at most {MAX_LAYER_SEATS} seats"
+        );
         let mut alive = (0..n).filter(|&i| !folded[i]);
         if let (Some(only), None) = (alive.next(), alive.next()) {
-            return Self { single_survivor: Some(only), layers: Vec::new() };
+            return Self {
+                single_survivor: Some(only),
+                layers: Vec::new(),
+            };
         }
         let mut levels: Vec<u64> = total_commit.to_vec();
         levels.sort_unstable();
@@ -73,9 +79,17 @@ impl PotLayers {
                     eligible |= 1 << i;
                 }
             }
-            layers.push(PotLayer { level, layer_each, chips, eligible });
+            layers.push(PotLayer {
+                level,
+                layer_each,
+                chips,
+                eligible,
+            });
         }
-        Self { single_survivor: None, layers }
+        Self {
+            single_survivor: None,
+            layers,
+        }
     }
 }
 
@@ -98,7 +112,14 @@ pub fn double_board_payout(
     let layers = PotLayers::new(folded, total_commit);
     let mut result = vec![0u64; n];
     double_board_payout_layers(
-        &layers, hole_cards, folded, total_commit, board_a, board_b, button, &mut result,
+        &layers,
+        hole_cards,
+        folded,
+        total_commit,
+        board_a,
+        board_b,
+        button,
+        &mut result,
     );
     result
 }
@@ -122,7 +143,17 @@ pub fn double_board_payout_layers(
     out: &mut [u64],
 ) {
     payout_layers_inner(
-        layers, None, hole_cards, folded, total_commit, board_a, board_b, button, out,
+        layers,
+        Showdown::Double {
+            board_a,
+            board_b,
+            ranker: None,
+        },
+        hole_cards,
+        folded,
+        total_commit,
+        button,
+        out,
     );
 }
 
@@ -143,12 +174,14 @@ pub fn double_board_payout_runout(
 ) {
     payout_layers_inner(
         layers,
-        Some(ranker),
+        Showdown::Double {
+            board_a,
+            board_b,
+            ranker: Some(ranker),
+        },
         hole_cards,
         folded,
         total_commit,
-        board_a,
-        board_b,
         button,
         out,
     );
@@ -161,7 +194,7 @@ pub fn double_board_payout_runout(
 /// exactly ONE card still to come -- per possible card (see
 /// `hand_eval::one_new_card_table`). A sample then evaluates only the
 /// triples holding two or more new cards (none after a turn all-in).
-/// Ranks equal `evaluate_plo5` exactly: every combo keeps its own CK, and
+/// Ranks equal `evaluate_plo` exactly: every combo keeps its own CK, and
 /// the best of a hand is a min over the same set of combos.
 pub struct RunoutRanker {
     pairs: Vec<PloPairs>,
@@ -193,7 +226,10 @@ impl RunoutRanker {
         let known = known.min(5);
         let (fixed, _one, multi) = triple_masks(known);
         let tables = next_card_tables && (1..5).contains(&known);
-        let (ta, tb) = (BoardTriples::new(board_a), BoardTriples::new(board_b));
+        let (ta, tb) = (
+            BoardTriples::of_known(board_a, known),
+            BoardTriples::of_known(board_b, known),
+        );
         let n = hole_cards.len();
         let mut pairs = Vec::with_capacity(n);
         let mut fixed_a = Vec::with_capacity(n);
@@ -201,7 +237,11 @@ impl RunoutRanker {
         let mut next_a = Vec::new();
         let mut next_b = Vec::new();
         for i in 0..n {
-            let p = if folded[i] { PloPairs::EMPTY } else { PloPairs::new(&hole_cards[i]) };
+            let p = if folded[i] {
+                PloPairs::EMPTY
+            } else {
+                PloPairs::new(&hole_cards[i])
+            };
             fixed_a.push(plo_best_ck(&p, &ta, fixed, u16::MAX));
             fixed_b.push(plo_best_ck(&p, &tb, fixed, u16::MAX));
             if tables {
@@ -216,7 +256,15 @@ impl RunoutRanker {
             pairs.push(p);
         }
         let var_mask = if tables { multi } else { ALL_TRIPLES & !fixed };
-        Self { pairs, fixed_a, fixed_b, next_a, next_b, known, var_mask }
+        Self {
+            pairs,
+            fixed_a,
+            fixed_b,
+            next_a,
+            next_b,
+            known,
+            var_mask,
+        }
     }
 
     fn rank_alive(
@@ -242,15 +290,31 @@ impl RunoutRanker {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The boards a hand is settled on.
+#[derive(Clone, Copy)]
+enum Showdown<'a> {
+    /// PLO double board: each layer splits in halves, one per board, each to
+    /// the best exactly-2-hole hand(s) there (ranked through `ranker` when an
+    /// EV runout built one).
+    Double {
+        board_a: &'a [Card; 5],
+        board_b: &'a [Card; 5],
+        ranker: Option<&'a RunoutRanker>,
+    },
+    /// NLH single board: each layer goes whole to the best any-5-of-7 hand(s).
+    Single { board: &'a [Card; 5] },
+}
+
+/// The one side-pot settlement (ENG-020: the single board used to have its
+/// own copy of the layer loop and the refund rules): chips won per seat into
+/// `out` (overwritten). Each alive seat's hand is ranked at most once per
+/// board -- lazily, the first time a layer on that board has chips to award.
 fn payout_layers_inner(
     layers: &PotLayers,
-    ranker: Option<&RunoutRanker>,
+    showdown: Showdown<'_>,
     hole_cards: &[Vec<Card>],
     folded: &[bool],
     total_commit: &[u64],
-    board_a: &[Card; 5],
-    board_b: &[Card; 5],
     button: usize,
     out: &mut [u64],
 ) {
@@ -268,27 +332,44 @@ fn payout_layers_inner(
             refund_orphan_layer(out, total_commit, layer.level, layer.layer_each);
             continue;
         }
-        let half_a = layer.chips / 2;
-        let half_b = layer.chips - half_a;
-        if half_a > 0 {
+        let (share_a, share_b) = match showdown {
+            Showdown::Double { .. } => (layer.chips / 2, layer.chips - layer.chips / 2),
+            Showdown::Single { .. } => (layer.chips, 0),
+        };
+        if share_a > 0 {
             if !have_a {
-                match ranker {
-                    Some(r) => r.rank_alive(&mut ranks_a, folded, board_a, &r.fixed_a, &r.next_a),
-                    None => rank_alive(&mut ranks_a, hole_cards, folded, board_a, n),
+                match showdown {
+                    Showdown::Double {
+                        board_a,
+                        ranker: Some(r),
+                        ..
+                    } => r.rank_alive(&mut ranks_a, folded, board_a, &r.fixed_a, &r.next_a),
+                    Showdown::Double { board_a, .. } => {
+                        rank_alive(&mut ranks_a, hole_cards, folded, board_a, n, evaluate_plo)
+                    }
+                    Showdown::Single { board } => {
+                        rank_alive(&mut ranks_a, hole_cards, folded, board, n, evaluate_nlh_5)
+                    }
                 }
                 have_a = true;
             }
-            award_half_ranked(out, layer.eligible, &ranks_a, half_a, button);
+            award_half_ranked(out, layer.eligible, &ranks_a, share_a, button);
         }
-        if half_b > 0 {
+        if share_b > 0 {
+            let Showdown::Double {
+                board_b, ranker, ..
+            } = showdown
+            else {
+                unreachable!("a single board awards every layer on board A");
+            };
             if !have_b {
                 match ranker {
                     Some(r) => r.rank_alive(&mut ranks_b, folded, board_b, &r.fixed_b, &r.next_b),
-                    None => rank_alive(&mut ranks_b, hole_cards, folded, board_b, n),
+                    None => rank_alive(&mut ranks_b, hole_cards, folded, board_b, n, evaluate_plo),
                 }
                 have_b = true;
             }
-            award_half_ranked(out, layer.eligible, &ranks_b, half_b, button);
+            award_half_ranked(out, layer.eligible, &ranks_b, share_b, button);
         }
     }
 }
@@ -299,12 +380,18 @@ fn rank_alive(
     folded: &[bool],
     board: &[Card; 5],
     n: usize,
+    evaluate: fn(&[Card], &[Card; 5]) -> HandRank,
 ) {
     for i in 0..n {
         if !folded[i] {
-            ranks[i] = evaluate_plo5(&hole_cards[i], board);
+            ranks[i] = evaluate(&hole_cards[i], board);
         }
     }
+}
+
+/// NLH's any-5-of-7 rank on a full board.
+fn evaluate_nlh_5(hole: &[Card], board: &[Card; 5]) -> HandRank {
+    evaluate_nlh(hole, board)
 }
 
 /// `award_half` over precomputed ranks: `half` chips to the best hand(s)
@@ -384,66 +471,40 @@ pub fn single_board_payout(
     let n = hole_cards.len();
     assert_eq!(folded.len(), n);
     assert_eq!(total_commit.len(), n);
+    let layers = PotLayers::new(folded, total_commit);
     let mut result = vec![0u64; n];
-
-    // Fold-out: single survivor takes every matched chip (no showdown).
-    let alive: Vec<usize> = (0..n).filter(|&i| !folded[i]).collect();
-    if alive.len() == 1 {
-        award_single_survivor(&mut result, alive[0], total_commit);
-        return result;
-    }
-
-    // Rank every alive seat once; layers only re-select among eligible.
-    let ranks: Vec<Option<HandRank>> = (0..n)
-        .map(|i| {
-            if folded[i] {
-                None
-            } else {
-                Some(evaluate_nlh(&hole_cards[i], board))
-            }
-        })
-        .collect();
-
-    let mut levels: Vec<u64> = total_commit.iter().copied().collect();
-    levels.sort_unstable();
-    levels.dedup();
-
-    let mut prev_level = 0u64;
-    for &level in &levels {
-        if level == 0 {
-            continue;
-        }
-        let contributors: u64 = total_commit.iter().filter(|&&c| c >= level).count() as u64;
-        let layer_each = level - prev_level;
-        let layer_chips = layer_each * contributors;
-        prev_level = level;
-        if layer_chips == 0 {
-            continue;
-        }
-
-        let eligible: Vec<usize> = (0..n)
-            .filter(|&i| total_commit[i] >= level && !folded[i])
-            .collect();
-
-        if eligible.is_empty() {
-            refund_orphan_layer(&mut result, total_commit, level, layer_each);
-            continue;
-        }
-
-        let best = eligible
-            .iter()
-            .map(|&s| ranks[s].expect("eligible seat must have a rank"))
-            .max()
-            .unwrap();
-        let winners: Vec<usize> = eligible
-            .iter()
-            .copied()
-            .filter(|&s| ranks[s] == Some(best))
-            .collect();
-        distribute_evenly(&mut result, &winners, layer_chips, button);
-    }
-
+    single_board_payout_layers(
+        &layers,
+        hole_cards,
+        folded,
+        total_commit,
+        board,
+        button,
+        &mut result,
+    );
     result
+}
+
+/// [`single_board_payout`] over a prebuilt [`PotLayers`] (an EV payout builds
+/// them once for all its runouts), writing chips won per seat into `out`.
+pub fn single_board_payout_layers(
+    layers: &PotLayers,
+    hole_cards: &[Vec<Card>],
+    folded: &[bool],
+    total_commit: &[u64],
+    board: &[Card; 5],
+    button: usize,
+    out: &mut [u64],
+) {
+    payout_layers_inner(
+        layers,
+        Showdown::Single { board },
+        hole_cards,
+        folded,
+        total_commit,
+        button,
+        out,
+    );
 }
 
 /// Fold-out settlement: the lone survivor collects, from every seat, at
@@ -496,7 +557,7 @@ fn award_half(
     }
     let ranks: Vec<HandRank> = eligible
         .iter()
-        .map(|&s| evaluate_plo5(&hole_cards[s], board))
+        .map(|&s| evaluate_plo(&hole_cards[s], board))
         .collect();
     let best = *ranks.iter().max().unwrap();
     let winners: Vec<usize> = eligible
@@ -509,7 +570,9 @@ fn award_half(
 }
 
 /// Split `amount` evenly across `recipients`; award odd-chip remainder to
-/// recipients clockwise from `button + 1`.
+/// recipients clockwise from `button + 1` (the reference implementations'
+/// list form of [`distribute_evenly_mask`]).
+#[cfg(test)]
 fn distribute_evenly(result: &mut [u64], recipients: &[usize], amount: u64, button: usize) {
     if amount == 0 || recipients.is_empty() {
         return;
@@ -542,6 +605,7 @@ fn distribute_evenly(result: &mut [u64], recipients: &[usize], amount: u64, butt
 mod tests {
     use super::*;
     use crate::cards::Card;
+    use crate::test_util::{c, xorshift};
 
     /// The pre-2026-09-23 implementation, verbatim: per-call layer build,
     /// every eligible seat re-evaluated per layer. Reference for the
@@ -561,7 +625,7 @@ mod tests {
             award_single_survivor(&mut result, alive[0], total_commit);
             return result;
         }
-        let mut levels: Vec<u64> = total_commit.iter().copied().collect();
+        let mut levels: Vec<u64> = total_commit.to_vec();
         levels.sort_unstable();
         levels.dedup();
         let mut prev_level = 0u64;
@@ -593,14 +657,7 @@ mod tests {
 
     #[test]
     fn rank_once_layers_match_the_reference_on_random_hands() {
-        // Deterministic xorshift so the sweep is reproducible without rand.
-        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
-        let mut next = move |m: u64| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x % m
-        };
+        let mut next = xorshift(0x9E37_79B9_7F4A_7C15);
         for case in 0..20_000 {
             let n = 2 + next(5) as usize; // 2..=6 seats
             let hole_w = 4 + next(3) as usize; // PLO4/5/6
@@ -627,27 +684,126 @@ mod tests {
             }
             // few distinct levels, some shared, odd sizes, the odd zero
             let commit: Vec<u64> = (0..n)
-                .map(|_| if next(10) == 0 { 0 } else { 1 + next(6) * 997 + next(3) })
+                .map(|_| {
+                    if next(10) == 0 {
+                        0
+                    } else {
+                        1 + next(6) * 997 + next(3)
+                    }
+                })
                 .collect();
             let button = next(n as u64) as usize;
-            let want = double_board_payout_reference(&hole, &folded, &commit, &board_a, &board_b, button);
+            let want =
+                double_board_payout_reference(&hole, &folded, &commit, &board_a, &board_b, button);
             let got = double_board_payout(&hole, &folded, &commit, &board_a, &board_b, button);
-            assert_eq!(got, want, "case {case}: folded {folded:?} commit {commit:?} button {button}");
+            assert_eq!(
+                got, want,
+                "case {case}: folded {folded:?} commit {commit:?} button {button}"
+            );
+        }
+    }
+
+    /// The single-board payout before it moved onto the shared layer loop
+    /// (ENG-020), verbatim: its own level walk, eager NLH ranks, list-based
+    /// winners. Reference for the test below.
+    fn single_board_payout_reference(
+        hole_cards: &[Vec<Card>],
+        folded: &[bool],
+        total_commit: &[u64],
+        board: &[Card; 5],
+        button: usize,
+    ) -> Vec<u64> {
+        let n = hole_cards.len();
+        let mut result = vec![0u64; n];
+        let alive: Vec<usize> = (0..n).filter(|&i| !folded[i]).collect();
+        if alive.len() == 1 {
+            award_single_survivor(&mut result, alive[0], total_commit);
+            return result;
+        }
+        let ranks: Vec<Option<HandRank>> = (0..n)
+            .map(|i| (!folded[i]).then(|| evaluate_nlh(&hole_cards[i], board)))
+            .collect();
+        let mut levels: Vec<u64> = total_commit.to_vec();
+        levels.sort_unstable();
+        levels.dedup();
+        let mut prev_level = 0u64;
+        for &level in &levels {
+            if level == 0 {
+                continue;
+            }
+            let contributors = total_commit.iter().filter(|&&c| c >= level).count() as u64;
+            let layer_each = level - prev_level;
+            let layer_chips = layer_each * contributors;
+            prev_level = level;
+            if layer_chips == 0 {
+                continue;
+            }
+            let eligible: Vec<usize> = (0..n)
+                .filter(|&i| total_commit[i] >= level && !folded[i])
+                .collect();
+            if eligible.is_empty() {
+                refund_orphan_layer(&mut result, total_commit, level, layer_each);
+                continue;
+            }
+            let best = eligible.iter().map(|&s| ranks[s].unwrap()).max().unwrap();
+            let winners: Vec<usize> = eligible
+                .iter()
+                .copied()
+                .filter(|&s| ranks[s] == Some(best))
+                .collect();
+            distribute_evenly(&mut result, &winners, layer_chips, button);
+        }
+        result
+    }
+
+    #[test]
+    fn single_board_layers_match_the_reference_on_random_hands() {
+        let mut next = xorshift(0x2545_F491_4F6C_DD1D);
+        for case in 0..20_000 {
+            let n = 2 + next(8) as usize; // 2..=9 seats
+            let mut deck: Vec<u8> = (0..52).collect();
+            for i in (1..52).rev() {
+                let j = next(i as u64 + 1) as usize;
+                deck.swap(i, j);
+            }
+            let mut it = deck.into_iter().map(Card::from_index);
+            let hole: Vec<Vec<Card>> = (0..n).map(|_| (&mut it).take(2).collect()).collect();
+            let mut board = [Card(0); 5];
+            for c in board.iter_mut() {
+                *c = it.next().unwrap();
+            }
+            let mut folded: Vec<bool> = (0..n).map(|_| next(4) == 0).collect();
+            if case % 7 == 0 {
+                for f in folded.iter_mut() {
+                    *f = true;
+                }
+                folded[next(n as u64) as usize] = false;
+            }
+            let commit: Vec<u64> = (0..n)
+                .map(|_| {
+                    if next(10) == 0 {
+                        0
+                    } else {
+                        1 + next(6) * 997 + next(3)
+                    }
+                })
+                .collect();
+            let button = next(n as u64) as usize;
+            let want = single_board_payout_reference(&hole, &folded, &commit, &board, button);
+            let got = single_board_payout(&hole, &folded, &commit, &board, button);
+            assert_eq!(
+                got, want,
+                "case {case}: folded {folded:?} commit {commit:?} button {button}"
+            );
         }
     }
 
     /// The EV-runout ranker (pairs encoded once, known-card triples scored
-    /// once) must rank every hand exactly like `evaluate_plo5`: same payout
+    /// once) must rank every hand exactly like `evaluate_plo`: same payout
     /// for every sampled runout, whatever the number of cards already out.
     #[test]
     fn runout_ranker_matches_the_plain_evaluator() {
-        let mut x: u64 = 0xD1B5_4A32_D192_ED03;
-        let mut next = move |m: u64| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x % m
-        };
+        let mut next = xorshift(0xD1B5_4A32_D192_ED03);
         for case in 0..4_000 {
             let n = 2 + next(5) as usize; // 2..=6 seats
             let hole_w = 4 + next(3) as usize; // PLO4/5/6
@@ -663,8 +819,7 @@ mod tests {
             let mut folded: Vec<bool> = (0..n).map(|_| next(4) == 0).collect();
             folded[next(n as u64) as usize] = false;
             folded[(next(n as u64) as usize + 1) % n] = false;
-            let commit: Vec<u64> =
-                (0..n).map(|_| 1 + next(6) * 997 + next(3)).collect();
+            let commit: Vec<u64> = (0..n).map(|_| 1 + next(6) * 997 + next(3)).collect();
             let button = next(n as u64) as usize;
             // Known prefix fixed; the ranker sees junk in the unknown slots.
             let mut board_a = [Card(0); 5];
@@ -701,14 +856,13 @@ mod tests {
                     double_board_payout_runout(
                         &layers, ranker, &hole, &folded, &commit, &a, &b, button, &mut got,
                     );
-                    assert_eq!(got, want, "case {case} sample {sample} known {known} tables {t}");
+                    assert_eq!(
+                        got, want,
+                        "case {case} sample {sample} known {known} tables {t}"
+                    );
                 }
             }
         }
-    }
-
-    fn c(rank: u8, suit: u8) -> Card {
-        Card::new(rank, suit)
     }
 
     /// Test fixtures use fixed-size arrays; the payout API takes
@@ -756,7 +910,7 @@ mod tests {
         let commit = vec![1000u64, 1000];
         // Board A: unpaired low, no flush/straight — AA beats KK pair.
         let board_a = [c(6, 0), c(5, 1), c(3, 2), c(1, 0), c(0, 3)]; // 8 7 5 3 2
-        // Board B: Kh Ks + junk → seat 1 makes quad kings.
+                                                                     // Board B: Kh Ks + junk → seat 1 makes quad kings.
         let board_b = [c(11, 0), c(11, 1), c(5, 2), c(3, 3), c(0, 3)]; // KK 7 5 2
         let result = double_board_payout(&holes(&hole), &folded, &commit, &board_a, &board_b, 0);
         assert_eq!(result, vec![1000u64, 1000]);
@@ -793,7 +947,7 @@ mod tests {
         let commit = vec![1000u64, 1000];
         // Board A: rainbow no flush; AA + K + T + 7 kickers same for both.
         let board_a = [c(11, 1), c(8, 2), c(5, 3), c(3, 0), c(1, 3)]; // Kd Th 7s 5c 3s
-        // Board B: 3 clubs present → seat 0 uses Jc+Qc + board clubs → Q-high flush.
+                                                                      // Board B: 3 clubs present → seat 0 uses Jc+Qc + board clubs → Q-high flush.
         let board_b = [c(7, 0), c(5, 0), c(3, 0), c(4, 1), c(0, 2)]; // 9c 7c 5c 6d 2h
         let result = double_board_payout(&holes(&hole), &folded, &commit, &board_a, &board_b, 0);
         // Board A chops (500 each). Board B to seat 0 (1000).

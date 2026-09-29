@@ -23,6 +23,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from plo5bp.cfr_app import __version__
 from plo5bp.cfr_app.paths import data_root, export_dir, uploads_dir
 from plo5bp.cfr_app.ranges import apply_ranges, parse_range, toggle_class
 from plo5bp.cfr_app.session import SolveSession, root_presets
@@ -35,7 +36,9 @@ from plo5bp.cfr_app.strategy_view import (
     summarize_report_light,
 )
 from plo5bp.cfr_app.tree_model import build_abstract_tree, compare_strategies
-from plo5bp.gto.cfr_api import SIZE_PRESETS, rust_cfr_available
+from plo5bp.cfr_app.view_cache import ViewCache
+from plo5bp.gto.cfr_api import SIZE_PRESETS, estimate_memory, rust_cfr_available
+from plo5bp.gto.jsonio import atomic_write_text
 from plo5bp.gto.preflop_class import preflop_class_label
 from plo5bp.gto.roots import CLUBGG_NLH_ROOT
 
@@ -44,7 +47,7 @@ logger = logging.getLogger("plo5bp.cfr_app")
 STATIC_DIR = Path(__file__).parent / "static"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
-app = FastAPI(title="CFR Solver Desktop", version="0.3.0")
+app = FastAPI(title="CFR Solver Desktop", version=__version__)
 session = SolveSession()
 
 # ---------------------------------------------------------------------------
@@ -84,11 +87,17 @@ def _hostname(netloc: str) -> str:
 @app.middleware("http")
 async def _local_only_guard(request: Request, call_next):
     allowed = _allowed_hosts()
-    if _hostname(request.headers.get("host", "")) not in allowed:
+    host = _hostname(request.headers.get("host", ""))
+    # "*" = remote mode (scripts/cfr_app.py --allow-remote, TOOL-058): any Host,
+    # but a request that names an Origin must come from the page's own origin.
+    remote = "*" in allowed
+    if not remote and host not in allowed:
         return JSONResponse({"detail": "forbidden: non-local Host header"}, status_code=403)
     origin = request.headers.get("origin")
-    if origin is not None and _hostname(urlsplit(origin).netloc) not in allowed:
-        return JSONResponse({"detail": "forbidden: cross-origin request"}, status_code=403)
+    if origin is not None:
+        o_host = _hostname(urlsplit(origin).netloc)
+        if (o_host != host) if remote else (o_host not in allowed):
+            return JSONResponse({"detail": "forbidden: cross-origin request"}, status_code=403)
     if request.method in _UNSAFE_METHODS:
         ctype = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
         token_ok = secrets.compare_digest(request.headers.get(TOKEN_HEADER, ""), API_TOKEN)
@@ -99,8 +108,9 @@ async def _local_only_guard(request: Request, call_next):
             )
     return await call_next(request)
 
-# In-memory cache of last fully loaded view (for filter paging without re-parse)
-_view_cache: dict[str, Any] = {"key": None, "view": None}
+# Built views (filter / page / node clicks without a re-parse). Thread-safe LRU:
+# live-view ticks and file opens run concurrently in the threadpool (TOOL-022).
+_view_cache = ViewCache()
 
 
 class RootBody(BaseModel):
@@ -136,6 +146,8 @@ class ConfigBody(BaseModel):
     time_budget_secs: float = 0.0
     poll_every: int = 50
     unlimited: bool = False
+    # (TOOL-030) exploitability check every N seconds while solving (0 = off)
+    expl_check_secs: float = 0.0
 
 
 class SolveRequest(BaseModel):
@@ -201,7 +213,7 @@ def health() -> dict[str, Any]:
         "ok": True,
         "rust_cfr": rust_cfr_available(),
         "app": "cfr_desktop",
-        "version": "0.3.0",
+        "version": __version__,
     }
 
 
@@ -215,7 +227,8 @@ def meta() -> dict[str, Any]:
             {"id": 2, "name": "Turn", "board_cards": 4},
             {"id": 3, "name": "River", "board_cards": 5},
         ],
-        "algorithms": ["dcfr", "mccfr_es"],
+        "algorithms": [a["id"] for a in ALGORITHMS],
+        "algorithm_info": ALGORITHMS,
         "card_abstractions": ["none", "ochs"],
         "clubgg": {
             "bb": CLUBGG_NLH_ROOT.bb,
@@ -232,6 +245,51 @@ def meta() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Solve jobs
 # ---------------------------------------------------------------------------
+
+
+# The solve algorithms the app offers, with where each one applies (TOOL-008 /
+# TOOL-017: "threads" means something different for each).
+ALGORITHMS: list[dict[str, Any]] = [
+    {
+        "id": "dcfr_vector",
+        "label": "Full-range DCFR",
+        "for": "Heads-up river and turn",
+        "streets": [2, 3],
+        "hu_only": True,
+        "threads": "Threads: turn roots solve their rivers in parallel",
+    },
+    {
+        "id": "dcfr",
+        "label": "Sampled DCFR",
+        "for": "Postflop (flops use hand buckets)",
+        "streets": [1, 2, 3],
+        "hu_only": False,
+        "threads": "Deals per iteration (sampled one after another, not in parallel)",
+    },
+    {
+        "id": "mccfr_es",
+        "label": "External-sampling MCCFR",
+        "for": "Preflop and multiway",
+        "streets": [0, 1, 2, 3],
+        "hu_only": False,
+        "threads": None,
+    },
+]
+
+
+def algorithm_for_root(street: int, num_seats: int, wanted: str | None) -> str:
+    """The algorithm a root is solved with: ``wanted`` when it applies to the
+    root, else the nearest one that does. Preflop roots run MCCFR when DCFR was
+    asked for (the rule /api/solve always had); a full-range request on a root it
+    cannot solve (flop, multiway) falls back to ``dcfr`` — what that tag always
+    ran there (sampled DCFR heads-up; the native solver routes multiway roots to
+    DCFR-discounted MCCFR)."""
+    wanted = (wanted or "dcfr").strip().lower()
+    if street == 0 and wanted in ("dcfr", "dcfr_vector"):
+        return "mccfr_es"
+    if wanted == "dcfr_vector" and (num_seats > 2 or street not in (2, 3)):
+        return "dcfr"
+    return wanted
 
 
 def _root_dict(body: RootBody) -> dict[str, Any]:
@@ -261,9 +319,11 @@ def api_solve(body: SolveRequest) -> dict[str, Any]:
         cfg_d["algorithm"] = body.root.algorithm
     if body.root.card_abstraction:
         cfg_d["card_abstraction"] = body.root.card_abstraction
-    # Preflop defaults to mccfr_es when user left dcfr
-    if int(root_d.get("street", 3)) == 0 and cfg_d.get("algorithm") == "dcfr":
-        cfg_d["algorithm"] = "mccfr_es"
+    # Preflop / multiway roots run MCCFR when the client asked for DCFR, and a
+    # full-range request on a flop falls back to sampled DCFR.
+    cfg_d["algorithm"] = algorithm_for_root(
+        int(root_d.get("street", 3)), int(root_d.get("num_seats", 2)), cfg_d.get("algorithm")
+    )
     try:
         job = session.start(root_d, cfg_d, save=body.save, label=body.label)
     except ValueError as e:
@@ -344,16 +404,13 @@ def api_job_view(
             409,
             f"job {job_id} has no report yet (status={j.get('status')}) — wait for first progress tick",
         )
-    cache_key = ("job", job_id, sig)
-    if _view_cache.get("key") == cache_key and _view_cache.get("view"):
-        view = _view_cache["view"]
-    else:
-        try:
-            view = load_report(rep, source=j.get("out_path") if sig and sig[0] == "final" else None)
-        except Exception as e:
-            raise HTTPException(400, f"view failed: {e}") from e
-        _view_cache["key"] = cache_key
-        _view_cache["view"] = view
+    source = j.get("out_path") if sig and sig[0] == "final" else None
+    try:
+        view = _view_cache.get_or_build(
+            ("job", job_id, sig), lambda: load_report(rep, source=source)
+        )
+    except Exception as e:
+        raise HTTPException(400, f"view failed: {e}") from e
     return _view_payload(
         view,
         seat=seat,
@@ -379,27 +436,37 @@ def api_job_view(
 # ---------------------------------------------------------------------------
 
 
+# Files above this are listed without a peek (listing must stay instant).
+LIBRARY_PEEK_MAX_BYTES = 2_000_000
+
+
 @app.get("/api/library")
 def api_library(max_files: int = 300, peek: bool = True) -> dict[str, Any]:
-    items = list_strategy_library(max_files=max_files)
-    if peek:
-        for it in items:
-            # Skip huge dumps (e.g. 300k-iter push/fold) — listing must stay instant.
-            if int(it.get("size") or 0) > 2_000_000:
-                it["kind"] = "large"
-                continue
-            try:
-                s = summarize_report_light(it["path"])
-                it["kind"] = s.get("kind")
-                it["street"] = s.get("street")
-                it["board_str"] = s.get("board_str")
-                it["iterations_run"] = s.get("iterations_run")
-                it["exploitability_bb"] = s.get("exploitability_bb")
-                it["num_infosets"] = s.get("num_infosets")
-                it["root_id"] = s.get("root_id")
-            except Exception:
-                it["kind"] = "unknown"
-    return {"items": items, "count": len(items)}
+    """Strategy files, newest first (TOOL-055: one scan of the data folder,
+    metadata / sidecars / empty files left out; an interrupted solve's last
+    snapshot is listed as ``interrupted`` — TOOL-031 — but never the live one)."""
+    live = session.active_job()
+    exclude = [live["progress_file"]] if live and live.get("progress_file") else []
+    items = list_strategy_library(max_files=max_files, exclude=exclude)
+    out = []
+    for it in items:
+        it["kind"] = it.get("kind_hint")
+        if not peek or int(it.get("size") or 0) > LIBRARY_PEEK_MAX_BYTES:
+            it["kind"] = it["kind"] or "large"
+            out.append(it)
+            continue
+        try:
+            s = summarize_report_light(it["path"])
+        except Exception:
+            continue  # not JSON we can read: not a strategy
+        if not s.get("num_infosets"):
+            continue  # metadata / empty: nothing to open
+        it["kind"] = s.get("kind") or it["kind"]
+        for key in ("street", "board_str", "iterations_run", "exploitability_bb",
+                    "expl_kind", "num_infosets", "root_id"):
+            it[key] = s.get(key)
+        out.append(it)
+    return {"items": out, "count": len(out)}
 
 
 @app.get("/api/library/peek")
@@ -422,9 +489,7 @@ def api_library_load(body: LoadPathRequest) -> dict[str, Any]:
     # this route used to parse the same — possibly 100+ MB — file three times.)
     data = job.get("report") or {}
     try:
-        view = load_report(data, source=str(p))
-        _view_cache["key"] = _file_cache_key(p)
-        _view_cache["view"] = view
+        _view_cache.put(_file_cache_key(p), load_report(data, source=str(p)))
     except Exception as e:
         logger.warning("view load failed: %s", e)
     return {
@@ -447,16 +512,10 @@ def api_view(
     runout: str | None = None,
 ) -> dict[str, Any]:
     p = _safe_path(path)
-    cache_key = _file_cache_key(p)
-    if _view_cache.get("key") == cache_key and _view_cache.get("view"):
-        view = _view_cache["view"]
-    else:
-        try:
-            view = load_report(p)
-        except Exception as e:
-            raise HTTPException(400, f"view failed: {e}") from e
-        _view_cache["key"] = cache_key
-        _view_cache["view"] = view
+    try:
+        view = _view_cache.get_or_build(_file_cache_key(p), lambda: load_report(p))
+    except Exception as e:
+        raise HTTPException(400, f"view failed: {e}") from e
     return _view_payload(
         view,
         seat=seat,
@@ -468,9 +527,19 @@ def api_view(
     )
 
 
+# Largest strategy file the viewer accepts by upload (the stream stops reading here).
+UPLOAD_MAX_BYTES = 80 * 1024 * 1024
+_UPLOAD_CHUNK = 1 << 20
+
+
 @app.post("/api/upload")
 async def api_upload(file: UploadFile = File(...)) -> dict[str, Any]:
-    """Upload a SolveReport / chart JSON into the viewer (GTOW-style open file)."""
+    """Upload a SolveReport / chart JSON into the viewer (GTOW-style open file).
+
+    (TOOL-051) Reads the upload in chunks and stops at ``UPLOAD_MAX_BYTES``
+    (it used to read everything, then check), parses it ONCE and hands that one
+    dict to the view builder and the session (it was parsed three times).
+    """
     name = (file.filename or "upload.json").strip()
     if not name.lower().endswith(".json"):
         raise HTTPException(400, "only .json strategy files are accepted")
@@ -478,18 +547,20 @@ async def api_upload(file: UploadFile = File(...)) -> dict[str, Any]:
     safe = re.sub(r"[^\w.\-]+", "_", Path(name).name)[:120] or "upload.json"
     if not safe.lower().endswith(".json"):
         safe += ".json"
-    up_dir = uploads_dir()  # (review 2026-09-20 J4) env-overridable
-    up_dir.mkdir(parents=True, exist_ok=True)
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    dest = up_dir / f"{stamp}_{safe}"
-    raw = await file.read()
-    if len(raw) > 80 * 1024 * 1024:
-        raise HTTPException(400, "file too large (max 80 MB)")
-    if not raw.strip():
+    buf = bytearray()
+    while True:
+        chunk = await file.read(_UPLOAD_CHUNK)
+        if not chunk:
+            break
+        buf += chunk
+        if len(buf) > UPLOAD_MAX_BYTES:
+            raise HTTPException(
+                413, f"file too large (max {UPLOAD_MAX_BYTES // (1024 * 1024)} MB)"
+            )
+    if not bytes(buf).strip():
         raise HTTPException(400, "empty file")
     try:
-        text = raw.decode("utf-8")
-        data = __import__("json").loads(text)
+        data = json.loads(bytes(buf).decode("utf-8"))
     except Exception as e:
         raise HTTPException(400, f"invalid JSON: {e}") from e
     if not isinstance(data, dict):
@@ -505,16 +576,18 @@ async def api_upload(file: UploadFile = File(...)) -> dict[str, Any]:
             400,
             "unrecognized strategy format — need strategy.infosets, hands[], or infosets[]",
         )
-    dest.write_text(text, encoding="utf-8")
+    up_dir = uploads_dir()  # (review 2026-09-20 J4) env-overridable
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    dest = up_dir / f"{stamp}_{safe}"
     try:
-        view = load_report(dest)
+        view = load_report(data, source=str(dest))
     except Exception as e:
-        dest.unlink(missing_ok=True)
         raise HTTPException(400, f"could not parse strategy: {e}") from e
-    _view_cache["key"] = _file_cache_key(dest.resolve())
-    _view_cache["view"] = view
+    atomic_write_text(dest, bytes(buf).decode("utf-8"))  # only a file the viewer can open is kept
+    del buf
+    _view_cache.put(_file_cache_key(dest.resolve()), view)
     try:
-        job = session.load_report_file(dest)
+        job = session.load_report_file(dest, data=data)
         job_id = job.get("job_id")
     except Exception:
         job_id = None
@@ -544,6 +617,42 @@ def api_validate_root(body: RootBody) -> dict[str, Any]:
         return {"ok": True, "root": r.as_dict(), "ranges": ranges}
     except ValueError as e:
         return {"ok": False, "error": str(e)}
+
+
+@app.post("/api/estimate")
+def api_estimate(body: SolveRequest) -> dict[str, Any]:
+    """(TOOL-032) What a solve of this root + config will need BEFORE it runs:
+    memory against the machine's budget, infosets, public tree size, and the
+    reason the solver would refuse it. Validate shows it next to "Root OK"."""
+    from plo5bp.cfr_app.session import _config_from_dict, _root_from_dict, validate_root_for_app
+
+    try:
+        root_d, _ranges = apply_ranges(_root_dict(body.root))
+        r = _root_from_dict(root_d)
+        validate_root_for_app(r)
+        cfg_d = body.config.model_dump()
+        cfg_d["algorithm"] = algorithm_for_root(int(r.street), int(r.num_seats), cfg_d.get("algorithm"))
+        if body.root.card_abstraction:
+            cfg_d["card_abstraction"] = body.root.card_abstraction
+        cfg = _config_from_dict(cfg_d)
+        est = estimate_memory(r, cfg)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    except RuntimeError as e:  # an engine build without the estimate
+        return {"ok": False, "error": str(e)}
+    mb = float(est.get("est_mb") or 0.0)
+    budget_mb = float(est.get("budget_bytes") or 0) / (1024 * 1024)
+    return {
+        "ok": True,
+        "algorithm": cfg.algorithm,
+        "est_mb": mb,
+        "budget_mb": budget_mb,
+        "est_infosets": int(est.get("est_infosets") or 0),
+        "public_nodes": int(est.get("public_nodes") or 0),
+        "tree_truncated": bool(est.get("tree_truncated")),
+        "refuse_reason": est.get("refuse_reason"),
+        "card_abstraction": est.get("card_abstraction"),
+    }
 
 
 class RangeParseRequest(BaseModel):
@@ -660,6 +769,8 @@ def api_job_progress(job_id: str) -> dict[str, Any]:
             if j.get("exploitability_bb") is not None
             else rep.get("exploitability_bb")
         ),
+        # (TOOL-021) what kind of number it is — a poll estimate, exact, a proxy
+        "expl_kind": j.get("expl_kind") or rep.get("expl_kind"),
         "num_infosets": n_info,
         "has_live_strategy": bool(has_live),
         "unlimited": bool(j.get("unlimited")),

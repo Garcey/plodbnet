@@ -11,7 +11,11 @@
 # keeps the LAST value), e.g.
 #   bash scripts/recipe_run.sh r1e06 1 8 --entropy-coef 0.06 --sizing-entropy-scale 0.3
 # Every candidate of a wave starts from the same weights, optimizer state, pool
-# and random stream (the resume seed is (seed, 1290)): common random numbers.
+# and random stream (the resume seed is (seed, 1290)) -- common random numbers
+# for the FIRST update only: the shared stream then drifts with each policy's
+# hand lengths (a re-deal wave draws n_envs seeds). For truly paired waves add
+# --crn-streams (per-update / per-(env, hand) streams, ML-004; not the stream
+# the waves so far ran on).
 # Log: runs/STEM.log; checkpoints STEM_1292.pt, ...; stop: touch runs/STEM.stop
 # and kill -TERM the trainer (it finishes its update and saves).
 set -uo pipefail

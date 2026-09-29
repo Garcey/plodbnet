@@ -100,9 +100,7 @@ pub fn game_state_from_solver_root(
     g.full_board_b = [Card(0); 5];
 
     // Placeholder holes
-    g.hole_cards = (0..num_seats)
-        .map(|_| vec![Card(50), Card(51)])
-        .collect();
+    g.hole_cards = (0..num_seats).map(|_| vec![Card(50), Card(51)]).collect();
 
     // First postflop actor = left of button
     g.button = num_seats.saturating_sub(1);
@@ -175,7 +173,9 @@ pub fn assign_holes_for_obs(
     }
     for &c in &hero_hole {
         if used[c as usize] {
-            return Err(CfrError::InvalidRoot("hero hole collides with board".into()));
+            return Err(CfrError::InvalidRoot(
+                "hero hole collides with board".into(),
+            ));
         }
         used[c as usize] = true;
     }
@@ -198,7 +198,9 @@ pub fn assign_holes_for_obs(
             next += 1;
         }
         if h.len() != 2 {
-            return Err(CfrError::InvalidRoot("not enough cards for opp holes".into()));
+            return Err(CfrError::InvalidRoot(
+                "not enough cards for opp holes".into(),
+            ));
         }
         g.hole_cards[s] = h;
     }
@@ -226,16 +228,14 @@ pub fn replay_cfr_path(g: &mut GameState, path: &[String]) -> Result<(), CfrErro
             let min_r = g.min_raise_chips();
             let max_r = g.max_raise_chips();
             if min_r > 0 && max_r >= min_r {
-                g.apply_raise_chips(max_r).map_err(|e| {
-                    CfrError::InvalidRoot(format!("ALLIN apply_raise: {e:?}"))
-                })?;
+                g.apply_raise_chips(max_r)
+                    .map_err(|e| CfrError::InvalidRoot(format!("ALLIN apply_raise: {e:?}")))?;
             } else {
                 g.apply(Action::CheckCall);
             }
         } else if let Some(pm) = parse_raise_pm(&up) {
-            let chips = raise_pm_chips(g, pm).ok_or_else(|| {
-                CfrError::InvalidRoot(format!("illegal RAISE_{pm}"))
-            })?;
+            let chips = raise_pm_chips(g, pm)
+                .ok_or_else(|| CfrError::InvalidRoot(format!("illegal RAISE_{pm}")))?;
             g.apply_raise_chips(chips)
                 .map_err(|e| CfrError::InvalidRoot(format!("RAISE_{pm}: {e:?}")))?;
         } else {
@@ -246,6 +246,7 @@ pub fn replay_cfr_path(g: &mut GameState, path: &[String]) -> Result<(), CfrErro
 }
 
 /// Solver root + hole + path → live engine node for observation encoding.
+#[allow(clippy::too_many_arguments)]
 pub fn game_state_from_cfr_label(
     pot: u64,
     stacks: &[u64],
@@ -269,8 +270,7 @@ pub fn assert_chip_parity_hu_river(
     board: &[u8; 5],
     bb: u64,
 ) -> Result<(), String> {
-    let ps = PublicState::river_hu_root(pot, stack, board, bb)
-        .map_err(|e| e.to_string())?;
+    let ps = PublicState::river_hu_root(pot, stack, board, bb).map_err(|e| e.to_string())?;
     let gs = game_state_from_solver_root(2, pot, &[stack, stack], board, bb, Street::River)
         .map_err(|e| e.to_string())?;
 
@@ -309,16 +309,19 @@ pub fn assert_apply_sequence_parity(
     bb: u64,
     raise_chips: u64,
 ) -> Result<(), String> {
-    let mut ps = PublicState::river_hu_root(pot, stack, board, bb)
-        .map_err(|e| e.to_string())?;
+    let mut ps = PublicState::river_hu_root(pot, stack, board, bb).map_err(|e| e.to_string())?;
     let mut gs = game_state_from_solver_root(2, pot, &[stack, stack], board, bb, Street::River)
         .map_err(|e| e.to_string())?;
 
     ps.apply_raise(raise_chips).map_err(|e| e.to_string())?;
-    gs.apply_raise_chips(raise_chips).map_err(|e| e.to_string())?;
+    gs.apply_raise_chips(raise_chips)
+        .map_err(|e| e.to_string())?;
 
     if ps.pot != gs.pot {
-        return Err(format!("pot after raise: public={} engine={}", ps.pot, gs.pot));
+        return Err(format!(
+            "pot after raise: public={} engine={}",
+            ps.pot, gs.pot
+        ));
     }
     if ps.bet_to_call != gs.bet_to_call {
         return Err(format!(
@@ -417,12 +420,16 @@ mod tests {
         let stacks = [300_000u64, 100_000];
         let mut ps = PublicState::postflop_root(2, 100_000, &stacks, &board, 10_000, 3).unwrap();
         let mut gs =
-            game_state_from_solver_root(2, 100_000, &stacks, &board, 10_000, Street::River).unwrap();
+            game_state_from_solver_root(2, 100_000, &stacks, &board, 10_000, Street::River)
+                .unwrap();
         apply_abstract(&mut ps, AbstractAction::AllIn).unwrap();
         replay_cfr_path(&mut gs, &["ALLIN".to_string()]).unwrap();
         assert_eq!(ps.pot, gs.pot);
         assert_eq!(ps.bet_to_call, gs.bet_to_call);
-        assert_eq!(ps.bet_to_call, 100_000, "covering ALLIN must raise to the cap");
+        assert_eq!(
+            ps.bet_to_call, 100_000,
+            "covering ALLIN must raise to the cap"
+        );
         assert_eq!(&ps.stacks[..2], &gs.stacks[..]);
         assert_eq!(ps.actor.map(|a| a as usize), gs.actor);
         // ...and the short stack's reply (call all-in) matches too.

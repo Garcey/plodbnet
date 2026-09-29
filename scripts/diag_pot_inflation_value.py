@@ -1,7 +1,7 @@
 """Quantify how much of the value-head loss comes from pot inflation.
 
 Verification step #1 from
-``.claude/plans/the-last-thing-i-woolly-swing.md``. Constructs a
+``docs/plans/the-last-thing-i-woolly-swing.md``. Constructs a
 heads-up bomb-pot river check-down spot with hero holding 22223
 (four 2s + 3) the way the live UI session sees it: engine has 6
 seats, posts 6 antes, and 4 sitting-out seats auto-check across

@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# wrapgto-watch — is the site healthy? Install: /usr/local/sbin/wrapgto-watch, run
+# every 5 minutes by wrapgto-watch.timer (ops/SERVER_SETUP.md, "Monitoring").
+#
+# Checks: the app service and the Cloudflare tunnel are running · /health answers
+# and the model, critic and observation revision are right · the disk has room ·
+# last night's backup exists and opens (and the off-site copy is fresh, when set up).
+#
+# Alerts (/etc/wrapgto/alerts.env — ops/alerts.env.example):
+#   NTFY_URL       a private ntfy topic (https://ntfy.sh/<long random name>): a phone
+#                  notification when something BREAKS, again every 6 h while it stays
+#                  broken, and once when it is fixed — never "all fine" spam
+#   HC_WATCH_URL   a healthchecks.io check pinged on every healthy run (and <url>/fail
+#                  otherwise): it alerts on its own when the pings STOP, i.e. when the
+#                  whole server is down — what no script on the server can report
+# An external uptime check on https://wrapgto.com/health (UptimeRobot, Better Stack)
+# completes the picture: it also sees DNS / Cloudflare / tunnel problems.
+#
+#   wrapgto-watch           one round of checks (exit 1 when something is wrong)
+#   wrapgto-watch --test    send a test notification
+set -uo pipefail
+
+APP="${WRAPGTO_APP:-/opt/wrapgto/app}"
+KEEP="${WRAPGTO_BACKUPS:-/opt/wrapgto/backups}"
+CONF="${WRAPGTO_ALERTS_CONF:-/etc/wrapgto/alerts.env}"
+STATE_DIR="${WRAPGTO_WATCH_STATE:-/var/lib/wrapgto-watch}"
+UNIT="${WRAPGTO_UNIT:-wrapgto}"
+PORT="${WRAPGTO_PORT:-8770}"
+REALERT_S=$((6 * 3600))
+PY="${WRAPGTO_PY:-$(command -v python3 || echo "$APP/.venv/bin/python")}"
+TOOL="$APP/ops/deploytool.py"
+
+# The config first: WRAPGTO_DISK_MAX_PCT may come from it.
+# shellcheck source=/dev/null
+if [ -r "$CONF" ]; then set -a; . "$CONF"; set +a; fi
+DISK_MAX="${WRAPGTO_DISK_MAX_PCT:-85}"
+case "$DISK_MAX" in ''|*[!0-9]*) DISK_MAX=85 ;; esac
+
+notify() {  # $1 = title, $2 = message
+  if [ -n "${NTFY_URL:-}" ]; then
+    local auth=()
+    if [ -n "${NTFY_TOKEN:-}" ]; then auth=(-H "Authorization: Bearer $NTFY_TOKEN"); fi
+    curl -fsS -m 10 --retry 2 "${auth[@]}" -H "Title: $1" -H "Tags: warning" \
+      --data-raw "$2" "$NTFY_URL" >/dev/null 2>&1 || true
+  fi
+}
+
+if [ "${1:-}" = "--test" ]; then
+  notify "WrapGTO: test" "wrapgto-watch on $(hostname) can reach you."
+  echo "test notification sent (if NTFY_URL is set in $CONF)"
+  exit 0
+fi
+
+problems=()
+# A deploy stops the app for a minute or two: no alert for that, unless it runs for
+# over an hour. A change whose process died half-way is an alert of its own.
+DEPLOYS="$(dirname "$APP")/deploys"
+if [ -f "$DEPLOYS/.current" ]; then
+  dpid="$(sed -n 's/.* pid \([0-9]*\) .*/\1/p' "$DEPLOYS/.current" 2>/dev/null)"
+  if [ -n "$dpid" ] && kill -0 "$dpid" 2>/dev/null; then
+    if [ -z "$(find "$DEPLOYS/.current" -mmin +60 2>/dev/null)" ]; then
+      echo "a deploy is running ($(cat "$DEPLOYS/.current")) — checks skipped this round"
+      exit 0
+    fi
+    problems+=("a deploy has been running for over an hour: $(cat "$DEPLOYS/.current")")
+  fi
+fi
+if [ -f "$DEPLOYS/state" ]; then
+  problems+=("a deploy/rollback/promote was interrupted half-way — run: bash scripts/deploy_prod.sh recover")
+fi
+systemctl is-active --quiet "$UNIT" || problems+=("the app service ($UNIT) is not running")
+if systemctl list-unit-files cloudflared.service >/dev/null 2>&1; then
+  systemctl is-active --quiet cloudflared || problems+=("the Cloudflare tunnel (cloudflared) is not running")
+fi
+if [ -f "$TOOL" ]; then
+  out="$("$PY" "$TOOL" health --once --url "http://127.0.0.1:$PORT/health" 2>&1)" \
+    || problems+=("health: $(printf '%s' "$out" | grep '^!!' | sed 's/^!! //' | head -3 | tr '\n' ' ')")
+else
+  curl -fsS -m 10 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 || problems+=("/health does not answer")
+fi
+for mnt in / "$(dirname "$APP")"; do
+  pct="$(df --output=pcent "$mnt" 2>/dev/null | tail -1 | tr -dc '0-9')"
+  if [ -n "$pct" ] && [ "$pct" -ge "$DISK_MAX" ]; then problems+=("disk $mnt is ${pct}% full"); fi
+done
+if [ -f "$TOOL" ]; then
+  out="$("$PY" "$TOOL" backup-check --dir "$KEEP" --max-age-hours 26 2>&1)" \
+    || problems+=("backup: $(printf '%s' "$out" | grep '^!!' | sed 's/^!! //' | head -2 | tr '\n' ' ')")
+fi
+if [ -f "$KEEP/.offsite-ok" ] && [ -n "$(find "$KEEP/.offsite-ok" -mmin +$((26 * 60)) 2>/dev/null)" ]; then
+  problems+=("the off-site backup copy is more than a day old")
+fi
+
+mkdir -p "$STATE_DIR"
+now="$(date +%s)"
+last_state="$(cat "$STATE_DIR/state" 2>/dev/null || echo ok)"
+last_alert="$(cat "$STATE_DIR/alerted" 2>/dev/null || echo 0)"
+if [ "${#problems[@]}" -eq 0 ]; then
+  echo "all healthy"
+  if [ "$last_state" != "ok" ]; then notify "WrapGTO: fixed" "Everything is healthy again ($(hostname))."; fi
+  echo ok > "$STATE_DIR/state"
+  if [ -n "${HC_WATCH_URL:-}" ]; then curl -fsS -m 10 --retry 2 "$HC_WATCH_URL" >/dev/null 2>&1 || true; fi
+  exit 0
+fi
+msg="$(printf '%s\n' "${problems[@]}")"
+printf '%s\n' "$msg"
+if [ "$last_state" = "ok" ] || [ $((now - last_alert)) -ge "$REALERT_S" ]; then
+  notify "WrapGTO: problem" "$msg"
+  echo "$now" > "$STATE_DIR/alerted"
+fi
+echo bad > "$STATE_DIR/state"
+if [ -n "${HC_WATCH_URL:-}" ]; then curl -fsS -m 10 --retry 2 --data-raw "$msg" "$HC_WATCH_URL/fail" >/dev/null 2>&1 || true; fi
+exit 1

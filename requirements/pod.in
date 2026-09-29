@@ -1,0 +1,11 @@
+# The training pod's DIRECT dependencies (RunPod, CUDA). Install:
+#   pip install -r requirements/pod.in
+#   maturin develop --release        (from the repo root)
+# then record exactly what got installed, so the next pod matches:
+#   pip freeze --exclude-editable > requirements/pod-freeze.txt   (and commit it)
+# cu128 = CUDA 12.8 wheels (Blackwell / RTX PRO 6000 and Ampere alike).
+--extra-index-url https://download.pytorch.org/whl/cu128
+numpy>=1.26,<3
+torch>=2.2
+maturin>=1.7,<2
+pytest>=8.0

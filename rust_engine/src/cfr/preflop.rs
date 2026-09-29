@@ -143,7 +143,7 @@ mod tests {
 
     #[test]
     fn class_ids_cover_169() {
-        let mut seen = vec![false; 169];
+        let mut seen = [false; 169];
         for c0 in 0..52u8 {
             for c1 in (c0 + 1)..52u8 {
                 let id = PreflopHandClass::from_cards(c0, c1).id() as usize;

@@ -18,6 +18,8 @@ torch = pytest.importorskip("torch")
 from plo5bp.config import GameConfig  # noqa: E402
 from plo5bp.ocr.events import EventReconstructor  # noqa: E402
 from plo5bp.ui import server  # noqa: E402
+from plo5bp.ui.live import clubgg, pokernow as pn_live, tracking  # noqa: E402
+from plo5bp.ui.live.state import live_state  # noqa: E402
 
 H1 = ["Ts", "As", "4h", "3d", "2d"]
 H2 = ["Qs", "Qd", "7h", "7d", "5c"]
@@ -37,12 +39,12 @@ def _configure(n: int = 2) -> None:
     s.hero_seat = 0
     s.dollars_per_bb = 1.0
     server._new_session_defaults()
-    server._reset_live_tracking()
-    server.pokernow_runner._reconstructor = None
-    server.pokernow_runner.last_error = None
-    server.ocr_runner._reconstructor = None
-    server.ocr_runner.running = False
-    server._set_active_reconstructor(None)
+    tracking._reset_live_tracking()
+    pn_live.pokernow_runner._reconstructor = None
+    pn_live.pokernow_runner.last_error = None
+    clubgg.ocr_runner._reconstructor = None
+    clubgg.ocr_runner.running = False
+    tracking._set_active_reconstructor(None)
     server._rebuild_env()
 
 
@@ -57,12 +59,12 @@ def _session():
     s.game_config = GameConfig(starting_stack=400000)
     s.dollars_per_bb = 2.0
     server._new_session_defaults()
-    server._reset_live_tracking()
-    server.pokernow_runner._reconstructor = None
-    server.pokernow_runner.last_error = None
-    server.ocr_runner._reconstructor = None
-    server._set_active_reconstructor(None)
-    server._note_live_source(None)
+    tracking._reset_live_tracking()
+    pn_live.pokernow_runner._reconstructor = None
+    pn_live.pokernow_runner.last_error = None
+    clubgg.ocr_runner._reconstructor = None
+    tracking._set_active_reconstructor(None)
+    tracking._note_live_source(None)
     server._rebuild_env()
 
 
@@ -106,7 +108,7 @@ def _engine() -> dict:
 
 
 def test_f14_seat_count_increase_does_not_wedge_the_ingest():
-    r = server.pokernow_runner
+    r = pn_live.pokernow_runner
     r.handle_payload(_hu(hero_cards=H1, button=6, hero_actor=True))
     r.handle_payload(_hu(hero_cards=H1, button=6, hero_bet=9.0, vil_actor=True,
                          hero_stack=77.0))
@@ -133,12 +135,15 @@ def test_f14_seat_count_increase_does_not_wedge_the_ingest():
         assert server.session.num_seats == 3
         assert len(_engine()["folded"]) == 3
     assert server.session.hand_in_hand_mask == frozenset({0, 1, 2})
-    assert _log() == []
+    # Hero (engine seat 0, first after the button) has the turn in the engine
+    # while the DOM shows "New" (engine 1) acting on two frames: hero checked
+    # silently — the turn passed (TOOL-002). It used to stay stuck on hero.
+    assert _log() == [(CHECK, 0)]
 
 
 def test_f14_seat_count_decrease_does_not_wedge_the_ingest():
     _configure(n=3)
-    r = server.pokernow_runner
+    r = pn_live.pokernow_runner
 
     def three(actor_a, actor_b, a_stack=80, a_bet=None, pot=18):
         return {
@@ -166,7 +171,7 @@ def test_f14_seat_count_decrease_does_not_wedge_the_ingest():
 
 
 def test_i5_engine_view_on_the_hand_start_tick_is_the_new_hand(monkeypatch):
-    r = server.pokernow_runner
+    r = pn_live.pokernow_runner
     r.handle_payload(_hu(hero_cards=H1, button=6, hero_actor=True))
     r.handle_payload(_hu(hero_cards=H1, button=6, hero_bet=9.0, vil_actor=True,
                          hero_stack=77.0))
@@ -175,14 +180,14 @@ def test_i5_engine_view_on_the_hand_start_tick_is_the_new_hand(monkeypatch):
     assert _log() == [(RAISE, 18), (RAISE, 60)]
 
     views = []
-    real = server._engine_view_from_session
+    real = tracking._engine_view_from_session
 
     def spy(*a, **k):
         v = real(*a, **k)
         views.append(v)
         return v
 
-    monkeypatch.setattr(server, "_engine_view_from_session", spy)
+    monkeypatch.setattr(pn_live, "_engine_view_from_session", spy)
     # Hand 2's first flop frame: new cards, button moved to hero.
     r.handle_payload(_hu(hero_cards=H2, button=1, vil_actor=True,
                          hero_stack=71.0, vil_stack=77.0))
@@ -198,15 +203,15 @@ def test_i5_engine_view_on_the_hand_start_tick_is_the_new_hand(monkeypatch):
 
 
 def test_i9_pokernow_reconstructor_is_registered_on_every_payload():
-    r = server.pokernow_runner
+    r = pn_live.pokernow_runner
     r.handle_payload(_hu(hero_cards=H1, button=6, hero_actor=True))
     mine = r._reconstructor
 
     # A ClubGG session ran in between and left ITS reconstructor registered;
     # same seat count, so PokerNow does not build (and re-register) a new one.
     stale = EventReconstructor(num_seats=server.session.num_seats)
-    server.ocr_runner._reconstructor = stale
-    server._set_active_reconstructor(stale)
+    clubgg.ocr_runner._reconstructor = stale
+    tracking._set_active_reconstructor(stale)
 
     # Hand 2: pre-flop frame (antes shown as bets), flop frame, villain bets.
     r.handle_payload(_hu(hero_cards=H2, button=1, flop=False, hero_bet=6.0,
@@ -214,7 +219,7 @@ def test_i9_pokernow_reconstructor_is_registered_on_every_payload():
     r.handle_payload(_hu(hero_cards=H2, button=1, vil_actor=True,
                          hero_stack=80.0, vil_stack=56.0))
     assert r._reconstructor is mine
-    assert server._active_reconstructor() is mine
+    assert tracking._active_reconstructor() is mine
     assert _log() == []  # used to be a phantom ante RAISE 12 + CALL
     r.handle_payload(_hu(hero_cards=H2, button=1, vil_bet=9.0, hero_actor=True,
                          hero_stack=80.0, vil_stack=47.0))
@@ -224,19 +229,19 @@ def test_i9_pokernow_reconstructor_is_registered_on_every_payload():
 
 
 def test_i9_ocr_runner_unregisters_its_reconstructor_when_it_stops():
-    runner = server.ocr_runner
+    runner = clubgg.ocr_runner
     runner._reconstructor = EventReconstructor(num_seats=6)
-    server._set_active_reconstructor(runner._reconstructor)
+    tracking._set_active_reconstructor(runner._reconstructor)
     runner._retire_reconstructor()
-    assert server._LIVE_RECONSTRUCTOR is None
-    assert server._active_reconstructor() is None
+    assert tracking._LIVE_RECONSTRUCTOR is None
+    assert tracking._active_reconstructor() is None
 
     # Never unregisters somebody else's.
     other = EventReconstructor(num_seats=2)
-    server._set_active_reconstructor(other)
+    tracking._set_active_reconstructor(other)
     runner._reconstructor = EventReconstructor(num_seats=6)
     runner._retire_reconstructor()
-    assert server._active_reconstructor() is other
+    assert tracking._active_reconstructor() is other
 
 
 # --- I9: bare button change = correction, not a new hand --------------------------------
@@ -244,7 +249,7 @@ def test_i9_ocr_runner_unregisters_its_reconstructor_when_it_stops():
 
 def test_i9_button_dom_lag_corrects_the_button_without_wiping_the_hand(monkeypatch):
     s = server.session
-    r = server.pokernow_runner
+    r = pn_live.pokernow_runner
     r.handle_payload(_hu(hero_cards=H1, button=6, hero_actor=True))
     # Hand 2 starts on the hero-card signal while the button DOM still shows
     # the old seat (6 = villain); the TRUE button is hero, so villain acts first.
@@ -256,12 +261,12 @@ def test_i9_button_dom_lag_corrects_the_button_without_wiping_the_hand(monkeypat
     # Under the stale button the walk had to invent a hero check first.
     assert _log() == [(CHECK, 0), (RAISE, 18)]
     cards_before = (list(s.hero_hole), list(s.flop_a), list(s.flop_b))
-    hole_baseline = s.last_hero_hole
+    hole_baseline = live_state.last_hero_hole
 
     calls = []
-    real = server._begin_new_hand
+    real = tracking._begin_new_hand
     monkeypatch.setattr(
-        server, "_begin_new_hand", lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+        pn_live, "_begin_new_hand", lambda *a, **k: (calls.append(1), real(*a, **k))[1]
     )
     # The dealer-button DOM catches up.
     r.handle_payload(_hu(hero_cards=H2, button=1, vil_bet=9.0, hero_actor=True,
@@ -272,7 +277,7 @@ def test_i9_button_dom_lag_corrects_the_button_without_wiping_the_hand(monkeypat
     assert s.game_config.resolved_stacks == (172, 124)  # was re-seeded to (172, 106)
     assert (list(s.hero_hole), list(s.flop_a), list(s.flop_b)) == cards_before
     assert s.hand_in_hand_mask == frozenset({0, 1})
-    assert s.last_hero_hole == hole_baseline
+    assert live_state.last_hero_hole == hole_baseline
     # The street is re-derived under the corrected acting order.
     assert [(e["gate"], e["chips"], e["seat"]) for e in s.action_log] == [(RAISE, 18, 1)]
     raw = _engine()
@@ -284,7 +289,7 @@ def test_i9_button_dom_lag_corrects_the_button_without_wiping_the_hand(monkeypat
 
 def test_i9_button_correction_before_any_action_keeps_everything(monkeypatch):
     s = server.session
-    r = server.pokernow_runner
+    r = pn_live.pokernow_runner
     r.handle_payload(_hu(hero_cards=H1, button=6, hero_actor=True))
     r.handle_payload(_hu(hero_cards=H2, button=6, vil_actor=True,
                          hero_stack=80.0, vil_stack=56.0))
@@ -292,9 +297,9 @@ def test_i9_button_correction_before_any_action_keeps_everything(monkeypatch):
     s._card_slot_locked["river_cards"][0] = True
     cfg = s.game_config
     calls = []
-    real = server._begin_new_hand
+    real = tracking._begin_new_hand
     monkeypatch.setattr(
-        server, "_begin_new_hand", lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+        pn_live, "_begin_new_hand", lambda *a, **k: (calls.append(1), real(*a, **k))[1]
     )
     r.handle_payload(_hu(hero_cards=H2, button=1, vil_actor=True,
                          hero_stack=80.0, vil_stack=56.0, pot=12.5))
@@ -306,12 +311,12 @@ def test_i9_button_correction_before_any_action_keeps_everything(monkeypatch):
 
 
 def test_i9_button_change_with_unreadable_hero_cards_is_still_a_new_hand(monkeypatch):
-    r = server.pokernow_runner
+    r = pn_live.pokernow_runner
     r.handle_payload(_hu(hero_cards=H1, button=6, hero_actor=True))
     calls = []
-    real = server._begin_new_hand
+    real = tracking._begin_new_hand
     monkeypatch.setattr(
-        server, "_begin_new_hand", lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+        pn_live, "_begin_new_hand", lambda *a, **k: (calls.append(1), real(*a, **k))[1]
     )
     # Hero's cards are not readable ⇒ the button is the only new-hand signal.
     frame = _hu(hero_cards=[None] * 5, button=1, vil_actor=True)
@@ -327,7 +332,7 @@ def test_i9_button_change_with_unreadable_hero_cards_is_still_a_new_hand(monkeyp
 def test_i9_hand_start_mid_street_accounts_for_visible_commits():
     """PokerNow attaches while villain's $9 bet is already on the table."""
     s = server.session
-    r = server.pokernow_runner
+    r = pn_live.pokernow_runner
     r.handle_payload(_hu(hero_cards=H2, button=1, vil_bet=9.0, hero_actor=True,
                          hero_stack=80.0, vil_stack=47.0, pot=21.0))
     # starting = behind + commit + ante: 94 + 18 + 12 (was 94 + 12 = 106).
@@ -343,7 +348,7 @@ def test_i9_ante_bets_still_on_display_are_not_flop_bets():
     """Should the first flop frame still show the $6 ante bets, they are
     neither folded into the stacks nor re-derived as actions."""
     s = server.session
-    r = server.pokernow_runner
+    r = pn_live.pokernow_runner
     r.handle_payload(_hu(hero_cards=H2, button=1, hero_bet=6.0, vil_bet=6.0,
                          vil_actor=True, hero_stack=80.0, vil_stack=56.0))
     assert s.game_config.resolved_stacks == (172, 124)  # behind + ante only
@@ -363,7 +368,7 @@ def test_i9_clubgg_seeding_ignores_pixel_commit_reads():
         seats=(SeatObs(seat=0, stack_chips=8000, committed_chips=0, folded=False),
                SeatObs(seat=1, stack_chips=4700, committed_chips=900, folded=False)),
     )
-    server._begin_new_hand(fs, button_seat=0, hero_hole_indices=None)
+    tracking._begin_new_hand(fs, button_seat=0, hero_hole_indices=None)
     assert server.session.game_config.resolved_stacks == (172, 106)
 
 
@@ -386,7 +391,7 @@ def _ring(n: int) -> dict:
 @pytest.mark.parametrize("n", [9, 10])
 def test_b8_tables_above_the_engine_limit_are_refused_gracefully(n):
     s = server.session
-    r = server.pokernow_runner
+    r = pn_live.pokernow_runner
     cfg, env = s.game_config, s.env
     for _ in range(3):
         r.handle_payload(_ring(n))  # never raises, never 500-loops
@@ -407,22 +412,22 @@ def test_b8_tables_above_the_engine_limit_are_refused_gracefully(n):
 
 def test_f10_first_pokernow_frame_after_clubgg_resets_the_hand_start_machine():
     s = server.session
-    server._note_live_source("ocr")
+    tracking._note_live_source("ocr")
     # What a ClubGG session leaves behind.
     s.hand_in_hand_mask = frozenset({0, 1})
     s.folded_this_hand = frozenset({1})
     s.sitting_out_seats = frozenset({1})
-    s.last_hero_hole = (1, 2, 3, 4, 5)
-    s._pending_anchor_fs = object()
-    s._pending_stable_ticks = 9
+    live_state.last_hero_hole = (1, 2, 3, 4, 5)
+    live_state.pending_anchor_fs = object()
+    live_state.pending_stable_ticks = 9
 
-    r = server.pokernow_runner
+    r = pn_live.pokernow_runner
     r.handle_payload(_hu(hero_cards=H1, button=6, flop=False, hero_bet=6.0,
                          vil_bet=6.0))  # pre-flop: no hand-start yet
-    assert server._LIVE_SOURCE == "pokernow"
+    assert tracking._LIVE_SOURCE == "pokernow"
     assert not s.hand_in_hand_mask and s.folded_this_hand == frozenset()
-    assert s.last_hero_hole is None
-    assert s._pending_anchor_fs is None and s._pending_stable_ticks == 0
+    assert live_state.last_hero_hole is None
+    assert live_state.pending_anchor_fs is None and live_state.pending_stable_ticks == 0
 
     r.handle_payload(_hu(hero_cards=H1, button=6, hero_actor=True))
     assert s.hand_in_hand_mask == frozenset({0, 1})
@@ -434,15 +439,15 @@ def test_f10_first_pokernow_frame_after_clubgg_resets_the_hand_start_machine():
 
 def test_f10_a_stray_ocr_stop_does_not_reset_a_pokernow_hand():
     s = server.session
-    r = server.pokernow_runner
+    r = pn_live.pokernow_runner
     r.handle_payload(_hu(hero_cards=H1, button=6, hero_actor=True))
     r.handle_payload(_hu(hero_cards=H1, button=6, hero_bet=9.0, vil_actor=True,
                          hero_stack=77.0))
     assert _log() == [(RAISE, 18)]
 
-    server.ocr_runner._retire_reconstructor()  # what /ocr/stop ends with
-    assert server._LIVE_SOURCE == "pokernow"
-    assert server._active_reconstructor() is r._reconstructor
+    clubgg.ocr_runner._retire_reconstructor()  # what /ocr/stop ends with
+    assert tracking._LIVE_SOURCE == "pokernow"
+    assert tracking._active_reconstructor() is r._reconstructor
 
     r.handle_payload(_hu(hero_cards=H1, button=6, hero_bet=9.0, vil_bet=30.0,
                          hero_actor=True, hero_stack=77.0, vil_stack=32.0))
@@ -457,7 +462,7 @@ def test_h7_dom_card_colliding_with_a_user_override_is_not_locked():
     from plo5bp.ocr.types import Card
 
     s = server.session
-    r = server.pokernow_runner
+    r = pn_live.pokernow_runner
     r.handle_payload(_hu(hero_cards=H1, button=6, hero_actor=True))
     turn_a = Card.parse("8c")
     turn_a_idx = turn_a.rank * 4 + turn_a.suit
@@ -472,3 +477,49 @@ def test_h7_dom_card_colliding_with_a_user_override_is_not_locked():
     assert s.turn_cards == [None, turn_a_idx]  # the duplicate was not committed
     assert s._card_slot_locked["turn_cards"] == [False, True]
     assert r.last_error is None  # used to be "rebuild failed: duplicate card"
+
+
+# --- TOOL-015: a PLO4 table is refused, the session untouched ---------------------
+
+
+def test_tool015_non_plo5_table_is_refused_without_touching_the_session():
+    r = server_pn = pn_live.pokernow_runner
+    before = (server.session.num_seats, list(server.session.hero_hole),
+              list(server.session.action_log))
+    p = _hu(hero_cards=H1, button=6, hero_actor=True)
+    p["heroCards"] = list(p["heroCards"])[:4]
+    for s in p["seats"]:
+        if s.get("isHero"):
+            s["cards"] = list(p["heroCards"])
+    server_pn.handle_payload(p)
+    assert "hero holds 4 cards" in (r.last_error or "")
+    after = (server.session.num_seats, list(server.session.hero_hole),
+             list(server.session.action_log))
+    assert after == before
+
+
+# --- TOOL-016 / TOOL-040: outdated collector, gaps in the stream -------------------------
+
+
+def test_an_outdated_collector_is_called_out():
+    r = pn_live.pokernow_runner
+    p = _hu(hero_cards=H1, button=6, hero_actor=True)
+    r.handle_payload(p)  # no `collector`: a pre-1.3.0 script
+    st = r.status()
+    assert st["collector_outdated"] is True
+    assert any("update your PokerNow userscript" in w for w in st["warnings"])
+    p = dict(p, collector="1.3.0", potDollars=12.5)
+    r.handle_payload(p)
+    st = r.status()
+    assert st["collector"] == "1.3.0" and st["collector_outdated"] is False
+    assert not any("update your" in w for w in st["warnings"])
+
+
+def test_a_gap_warns_until_the_next_hand():
+    r = pn_live.pokernow_runner
+    r.handle_payload(dict(_hu(hero_cards=H1, button=6, hero_actor=True), collector="1.3.0"))
+    r.handle_payload(dict(_hu(hero_cards=H1, button=6, vil_actor=True), collector="1.3.0", gap=4))
+    assert any("4 PokerNow frame(s) were lost" in w for w in r.status()["warnings"])
+    # The next hand (new hero cards) starts clean.
+    r.handle_payload(dict(_hu(hero_cards=H2, button=1, vil_actor=True), collector="1.3.0"))
+    assert not any("were lost" in w for w in r.status()["warnings"])

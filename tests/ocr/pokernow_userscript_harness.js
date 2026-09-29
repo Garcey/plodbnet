@@ -336,6 +336,31 @@ scenario('payload keeps the pokernow.v1 shape the server validates', () => {
   assert.deepStrictEqual(p.seats[0].cards, HERO);
 });
 
+scenario('payload names the collector version (TOOL-016)', () => {
+  const w = makeWorld();
+  headsUp(w);
+  w.start();
+  assert.strictEqual(w.body(0).collector, '1.3.0');
+});
+
+scenario('a trimmed queue marks the gap on the next frame sent and on the badge (TOOL-040)', () => {
+  const w = makeWorld();
+  headsUp(w);
+  w.start();
+  w.requests[0].onerror(); // server offline: the frame goes back on the queue
+  for (let i = 0; i < 70; i++) { // 70 more distinct states while backing off
+    headsUp(w, { heroStack: 100 + i });
+    w.mutate();
+  }
+  assert.strictEqual(w.requests.length, 1, 'nothing sent while backing off');
+  w.advance(RETRY_MS);
+  // 71 queued, 60 kept: the 11 oldest were dropped and the next frame says so.
+  assert.strictEqual(w.body(1).gap, 11);
+  w.requests[1].onload({ status: 200 });
+  assert.match(w.badge.textContent, /11 dropped/);
+  assert.ok(!('gap' in w.body(2)), 'reported once, on one frame');
+});
+
 let ran = 0;
 const only = process.argv[3];
 for (const [name, fn] of scenarios) {

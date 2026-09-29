@@ -47,7 +47,13 @@ def main() -> int:
     p.add_argument("--iters", type=int, default=200)
     p.add_argument("--threads", type=int, default=1)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--algorithm", type=str, default="dcfr")
+    p.add_argument(
+        "--algorithm",
+        type=str,
+        default="dcfr",
+        help="dcfr (sampled; HU postflop), dcfr_vector (full ranges every iteration: HU "
+        "river / turn, ~100-300 iterations), mccfr_es (preflop / multiway)",
+    )
     p.add_argument(
         "--size-preset",
         type=str,
@@ -55,6 +61,10 @@ def main() -> int:
         choices=list(SIZE_PRESETS.keys()),
     )
     p.add_argument("--target-expl", type=float, default=0.5)
+    # Stakes in engine chips (default: the ClubGG 5/10 + $5 ante table).
+    p.add_argument("--bb-chips", type=int, default=10_000)
+    p.add_argument("--sb-chips", type=int, default=5_000)
+    p.add_argument("--ante-chips", type=int, default=5_000)
     p.add_argument("--out", type=Path, default=None)
     args = p.parse_args()
 
@@ -94,6 +104,9 @@ def main() -> int:
                 pot_bb=float(args.pot_bb),
                 postflop_stack_bb=float(args.stack_bb) * 0.4,
                 seed=int(args.seed),
+                bb_chips=int(args.bb_chips),
+                sb_chips=int(args.sb_chips),
+                ante_chips=int(args.ante_chips),
             )
         )
         print(json.dumps(rep, indent=2))
@@ -102,9 +115,12 @@ def main() -> int:
             args.out.write_text(json.dumps(rep, indent=2) + "\n", encoding="utf-8")
         return 0
 
+    stakes = dict(bb_chips=args.bb_chips, sb_chips=args.sb_chips, ante_chips=args.ante_chips)
     if args.preflop:
-        root = RootSpec.preflop_hu(stack_bb=args.stack_bb)
-        if args.algorithm == "dcfr":
+        pot_bb = (args.sb_chips + args.bb_chips + 2 * args.ante_chips) / float(args.bb_chips)
+        root = RootSpec(street=0, pot_bb=pot_bb, effective_stack_bb=args.stack_bb, board=[],
+                        **stakes)
+        if args.algorithm in ("dcfr", "dcfr_vector"):
             args.algorithm = "mccfr_es"
     else:
         street = 3 if args.street is None else int(args.street)
@@ -117,6 +133,7 @@ def main() -> int:
             board=board,
             num_seats=args.num_seats,
             raise_sizes_pm=sizes,
+            **stakes,
         )
 
     cfg = SolveConfig(
@@ -126,16 +143,26 @@ def main() -> int:
         algorithm=args.algorithm,
         target_exploitability_bb=args.target_expl,
     )
+    if args.out is not None:
+        # (TOOL-006) the native solver streams the report straight to --out
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        cfg.report_path = str(args.out)
     try:
         report = solve(root, cfg)
     except ValueError as e:
         print(f"[cfr] invalid: {e}", file=sys.stderr)
         return 2
 
-    print(json.dumps(report.as_dict(), indent=2))
+    # The summary, not the (possibly 100+ MB) strategy: --out has the whole report.
+    summary = {k: v for k, v in report.as_dict().items() if k != "strategy"}
+    strat = report.strategy or {}
+    summary["num_infosets"] = strat.get("num_infosets", len(strat.get("infosets") or []))
+    print(json.dumps(summary, indent=2))
     if args.out is not None:
-        report.write_json(args.out)
+        report.write_json(args.out)  # no-op when streamed there already
         print(f"[cfr] wrote {args.out}")
+    else:
+        print("[cfr] pass --out FILE.json to save the strategy")
 
     if report.status == "not_implemented":
         print("[cfr] binding missing — run: .venv/Scripts/maturin develop --release")

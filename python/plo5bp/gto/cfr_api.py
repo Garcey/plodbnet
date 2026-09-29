@@ -6,13 +6,13 @@ script/batch contract: ``RootSpec`` / ``SolveConfig`` / ``solve()``.
 
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
 from plo5bp.gto.iso import TEACHER_USE_ISOMORPHISM
+from plo5bp.gto.jsonio import atomic_write_json, jsonable
 from plo5bp.gto.roots import CLUBGG_NLH_ROOT
 from plo5bp.gto.teacher import root_fingerprint
 
@@ -30,6 +30,48 @@ STREET_PREFLOP = 0
 STREET_FLOP = 1
 STREET_TURN = 2
 STREET_RIVER = 3
+
+# (TOOL-032) RAM budget for a solve's infoset table: CFR_RAM_BUDGET_MB, else 60%
+# of this machine's memory (at least 1 GB), else the solver's 8 GB default.
+RAM_BUDGET_ENV = "CFR_RAM_BUDGET_MB"
+
+
+def physical_ram_mb() -> int | None:
+    """Total physical memory in MB, or None when it cannot be read."""
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class _MemStatus(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            st = _MemStatus()
+            st.dwLength = ctypes.sizeof(_MemStatus)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                return int(st.ullTotalPhys // (1024 * 1024))
+            return None
+        pages, size = os.sysconf("SC_PHYS_PAGES"), os.sysconf("SC_PAGE_SIZE")
+        return int(pages * size // (1024 * 1024)) if pages > 0 and size > 0 else None
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def default_ram_budget_mb() -> int:
+    """The budget new configs get (0 = the solver's own 8 GB default)."""
+    raw = os.environ.get(RAM_BUDGET_ENV, "").strip()
+    if raw:
+        try:
+            return max(64, int(float(raw)))
+        except ValueError:
+            pass
+    total = physical_ram_mb()
+    return max(1024, int(total * 0.6)) if total else 0
 
 
 @dataclass
@@ -201,6 +243,9 @@ class SolveConfig:
     thread_num: int = 1
     seed: int = 0
     use_isomorphism: bool = True
+    # "dcfr" (chance-sampled, HU postflop), "dcfr_vector" (full ranges every
+    # iteration — HU river / turn only, TOOL-008), "mccfr_es" (preflop /
+    # multiway), "linear", "cfr"; the native solver validates the tag.
     algorithm: str = "dcfr"
     card_abstraction: str = "none"
     # Kill-safe continuous solve: 0 = unlimited wall clock.
@@ -210,8 +255,17 @@ class SolveConfig:
     poll_every: int = 500
     # While this path exists, solver spin-pauses (resume by deleting it).
     pause_file: str = ""
-    # Partial SolveReport JSON written every poll_every iters for live UI.
+    # Live UI progress: counters every poll_every iters to <progress_file>.counters,
+    # the full strategy snapshot here at most every progress_secs (TOOL-005).
     progress_file: str = ""
+    progress_secs: float = 2.0
+    # (TOOL-006) Stream the finished report to this file; the returned
+    # SolveReport then carries only a strategy summary (+ report_path).
+    report_path: str = ""
+    # (TOOL-030) Check exploitability every N seconds while solving (0 = off).
+    expl_check_secs: float = 0.0
+    # (TOOL-032) Infoset-table budget in MB; default: see default_ram_budget_mb().
+    ram_budget_mb: int = field(default_factory=default_ram_budget_mb)
 
     def validate(self) -> None:
         # max_iterations == 0 means unlimited — allowed HERE because callers
@@ -227,6 +281,10 @@ class SolveConfig:
             raise ValueError("time_budget_secs must be >= 0")
         if self.poll_every < 1:
             raise ValueError("poll_every must be >= 1")
+        if self.expl_check_secs < 0 or self.progress_secs < 0:
+            raise ValueError("expl_check_secs and progress_secs must be >= 0")
+        if self.ram_budget_mb < 0:
+            raise ValueError("ram_budget_mb must be >= 0")
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -253,18 +311,57 @@ class SolveReport:
     iterations_run: int
     exploitability_bb: float | None
     notes: list[str]
+    # (TOOL-006) Set when the native solver streamed the full report to a file:
+    # ``strategy`` is then only a summary {root_id, num_infosets, …}.
+    report_path: str | None = None
+
+    @property
+    def streamed(self) -> bool:
+        return bool(self.report_path) and bool(self.strategy.get("infosets_omitted"))
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        """The report as a dict. SHALLOW: the root / config / strategy dicts are
+        shared with this object, not copied — ``dataclasses.asdict`` deep-copied
+        100k+ infoset dicts per call (TOOL-006)."""
+        return {
+            "status": self.status,
+            "root": self.root,
+            "config": self.config,
+            "strategy": self.strategy,
+            "iterations_run": self.iterations_run,
+            "exploitability_bb": self.exploitability_bb,
+            "notes": self.notes,
+        }
 
     def write_json(self, path: Path | str) -> None:
         """Atomic (temp file + rename): a kill mid-write must not leave a
-        truncated strategy where a finished one is expected (review F10)."""
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(self.as_dict(), indent=2) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
+        truncated strategy where a finished one is expected (review F10).
+        Strict, compact JSON through the shared writer (TOOL-048 / TOOL-006);
+        a streamed report is COPIED from its file (never parsed)."""
+        if self.streamed:
+            import shutil
+
+            dest = Path(path)
+            if dest.resolve() == Path(self.report_path).resolve():
+                return
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dest.with_name(f"{dest.name}.{os.getpid()}.tmp")
+            try:
+                shutil.copyfile(self.report_path, tmp)
+                os.replace(tmp, dest)
+            finally:
+                tmp.unlink(missing_ok=True)
+            return
+        atomic_write_json(path, self.as_dict())
+
+    def load_full(self) -> dict[str, Any]:
+        """The full report dict (parses the streamed file when there is one)."""
+        if self.streamed:
+            import json
+
+            with open(self.report_path, encoding="utf-8") as f:
+                return json.load(f)
+        return self.as_dict()
 
     @property
     def is_mc_br_proxy(self) -> bool:
@@ -282,8 +379,25 @@ def rust_cfr_available() -> bool:
         return False
 
 
-def solve(root: RootSpec, config: SolveConfig | None = None) -> SolveReport:
-    """Solve a root via Rust CFR when available; else raise."""
+def solve(
+    root: RootSpec,
+    config: SolveConfig | None = None,
+    *,
+    root_extra: dict[str, str] | None = None,
+) -> SolveReport:
+    """Solve a root with the native (Rust) CFR solver.
+
+    Raises ``ValueError`` for an invalid root / config (Python checks here, the
+    native solver's own checks otherwise). When the extension was built without
+    the solver (:func:`rust_cfr_available` is False) nothing is raised: the
+    returned report has ``status="not_implemented"``, no infosets and a note
+    saying to rebuild — callers check ``status`` (TOOL-050).
+
+    With ``config.report_path`` the native solver streams the full report to
+    that file (TOOL-006) and the returned report's ``strategy`` is a summary;
+    ``root_extra`` then adds display-only string fields to the file's ``root``
+    (the desktop app's ``range_*_text``).
+    """
     root.validate()
     cfg = config or SolveConfig()
     cfg.validate()
@@ -330,10 +444,18 @@ def solve(root: RootSpec, config: SolveConfig | None = None) -> SolveReport:
         poll_every=int(cfg.poll_every),
         pause_file=str(cfg.pause_file or ""),
         progress_file=str(cfg.progress_file or ""),
+        progress_secs=float(cfg.progress_secs),
+        report_path=str(cfg.report_path or ""),
+        root_extra=[(str(k), str(v)) for k, v in (root_extra or {}).items()],
+        expl_check_secs=float(cfg.expl_check_secs),
+        ram_budget_mb=int(cfg.ram_budget_mb),
     )
-    root_d = _jsonable(dict(raw["root"]))
-    strat_d = _jsonable(dict(raw["strategy"]))
-    cfg_d = _jsonable(dict(raw["config"]))
+    # (TOOL-006) The binding already returns plain dict / list / str / int /
+    # float / bool / None values (the board is list[int]); the old `_jsonable`
+    # pass re-copied every infoset for nothing.
+    root_d = dict(raw["root"])
+    strat_d = dict(raw["strategy"])
+    cfg_d = dict(raw["config"])
     return SolveReport(
         status=str(raw["status"]),
         root=root_d,
@@ -346,24 +468,60 @@ def solve(root: RootSpec, config: SolveConfig | None = None) -> SolveReport:
             else float(raw["exploitability_bb"])
         ),
         notes=[str(n) for n in (raw.get("notes") or [])],
+        report_path=str(cfg.report_path) if cfg.report_path else None,
     )
 
 
-def _jsonable(obj: Any) -> Any:
-    """Coerce PyO3 / numpy leftovers into JSON-friendly Python types."""
-    if isinstance(obj, dict):
-        return {str(k): _jsonable(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_jsonable(x) for x in obj]
-    if isinstance(obj, (bytes, bytearray)):
-        return list(obj)
-    if isinstance(obj, (int, float, str, bool)) or obj is None:
-        return obj
-    # Path / numpy scalar etc.
+def estimate_memory(root: RootSpec, config: SolveConfig | None = None) -> dict[str, Any]:
+    """(TOOL-032) What a solve of ``root`` will need BEFORE it runs: estimated
+    infosets / MB, public tree size, the budget, and ``refuse_reason`` when the
+    solver would refuse it. Raises ValueError for an invalid root."""
+    root.validate()
+    cfg = config or SolveConfig()
+    from plo5bp import _engine  # type: ignore
+
+    if not hasattr(_engine, "cfr_estimate_memory"):
+        raise RuntimeError("this engine build has no cfr_estimate_memory — rebuild the extension")
+    kwargs: dict[str, Any] = dict(
+        street=int(root.street),
+        pot_bb=float(root.pot_bb),
+        effective_stack_bb=float(root.effective_stack_bb),
+        board=[int(c) for c in root.board],
+        raise_sizes_pm=[int(x) for x in root.raise_sizes_pm],
+        max_iterations=int(cfg.max_iterations),
+        thread_num=int(cfg.thread_num),
+        card_abstraction=str(cfg.card_abstraction),
+        num_seats=int(root.num_seats),
+        bb_chips=int(root.bb_chips),
+        sb_chips=int(root.sb_chips),
+        ante_chips=int(root.ante_chips),
+        allin_atom=bool(root.allin_atom),
+        stacks_bb=[float(x) for x in root.stacks_bb],
+        ram_budget_mb=int(cfg.ram_budget_mb),
+        time_budget_secs=float(cfg.time_budget_secs),
+        # (TOOL-008) the full-range solver builds its whole tree up front, and
+        # its report holds one row per hand in the ranges.
+        algorithm=str(cfg.algorithm),
+        range_oop=str(root.range_oop or ""),
+        range_ip=str(root.range_ip or ""),
+    )
     try:
-        return obj.item()  # type: ignore[attr-defined]
-    except Exception:
-        return str(obj)
+        return dict(_engine.cfr_estimate_memory(**kwargs))
+    except TypeError:
+        # An engine built before these keywords: the sampled estimate.
+        for key in ("algorithm", "range_oop", "range_ip"):
+            kwargs.pop(key)
+        return dict(_engine.cfr_estimate_memory(**kwargs))
+
+
+def native_parse_range(spec: str, board: Sequence[int] = ()) -> list[float]:
+    """(TOOL-029) The native parser's 1326 combo weights for ``spec``."""
+    from plo5bp import _engine  # type: ignore
+
+    return list(_engine.cfr_parse_range(str(spec), [int(c) for c in board]))
+
+
+_jsonable = jsonable  # moved to plo5bp.gto.jsonio (TOOL-048)
 
 
 def solve_kuhn(iterations: int = 5000) -> dict[str, Any]:

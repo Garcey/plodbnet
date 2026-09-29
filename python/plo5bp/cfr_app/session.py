@@ -25,6 +25,7 @@ from plo5bp.cfr_app.solve_worker import sanitize_json, write_json_atomic
 from plo5bp.gto.cfr_api import (
     SIZE_PRESETS,
     RootSpec,
+    default_ram_budget_mb,
     SolveConfig,
     SolveReport,
     rust_cfr_available,
@@ -70,6 +71,8 @@ class JobState:
     # Live counters mirrored from progress_file (updated by poll helpers).
     iterations_run: int = 0
     exploitability_bb: float | None = None
+    # (TOOL-021) what kind of number exploitability_bb is ("mc_poll", "exact_infoset", …)
+    expl_kind: str | None = None
     num_infosets: int = 0
     unlimited: bool = False
     # (review 2026-09-20 E10) when Stop was pressed — lets the supervisor kill a
@@ -98,6 +101,7 @@ class JobState:
             "progress_message": self.progress_message,
             "iterations_run": self.iterations_run,
             "exploitability_bb": self.exploitability_bb,
+            "expl_kind": self.expl_kind,
             "num_infosets": self.num_infosets,
             "unlimited": self.unlimited,
             "stop_requested_at": self.stop_requested_at,
@@ -133,6 +137,8 @@ def light_report(rep: dict[str, Any] | None, job: "JobState | None" = None) -> d
         "num_infosets": int(n or 0),
         "infosets_omitted": True,
     }
+    if out.get("expl_kind") is None:
+        out["expl_kind"] = _expl_kind(rep.get("notes"))
     if job is not None:
         if out.get("iterations_run") is None and job.iterations_run is not None:
             out["iterations_run"] = job.iterations_run
@@ -148,16 +154,36 @@ _RE_HEAD_INT = {
     k: re.compile(rf'"{k}"\s*:\s*(\d+)') for k in ("iterations_run", "num_infosets")
 }
 _RE_HEAD_EXPL = re.compile(r'"exploitability_bb"\s*:\s*(null|-?[0-9.eE+\-]+)')
+_RE_HEAD_KIND = re.compile(r'"expl_kind"\s*:\s*"([a-z_]+)"')
+
+
+def _expl_kind(notes: Any) -> str | None:
+    """``expl_kind=<kind>`` from report notes (TOOL-021)."""
+    for n in notes or []:
+        for tok in str(n).split():
+            if tok.startswith("expl_kind="):
+                return tok[len("expl_kind="):].strip(",;") or None
+    return None
 
 
 def read_progress_counters(path: Path | str) -> dict[str, Any] | None:
-    """Live counters from a progress file WITHOUT parsing it.
+    """Live counters of a solve WITHOUT parsing its strategy snapshot.
 
-    (review 2026-09-20 E4) The file carries the full strategy (157 MB on the
-    default river preset); json.loads of it took seconds per poll. The counters
-    are in the first few hundred bytes, so read a 4 KB head and pick them out.
-    Returns None if the file is missing/unreadable or the head has no counters.
+    (TOOL-005) The solver writes the counters every ``poll_every`` iterations to
+    ``<progress_file>.counters`` (a few hundred bytes) and the full snapshot only
+    every few seconds, so the counters file is the fresher one when it exists.
+    (review 2026-09-20 E4) Otherwise the counters are the first few hundred bytes
+    of the progress file itself: read a 4 KB head and pick them out.
+    Returns None if nothing readable has counters yet.
     """
+    for cand in (f"{path}.counters", path):
+        got = _read_head_counters(cand)
+        if got is not None:
+            return got
+    return None
+
+
+def _read_head_counters(path: Path | str) -> dict[str, Any] | None:
     try:
         with open(path, "rb") as f:
             head = f.read(_PROGRESS_HEAD_BYTES).decode("utf-8", errors="replace")
@@ -172,6 +198,9 @@ def read_progress_counters(path: Path | str) -> dict[str, Any] | None:
         m = rx.search(head)
         if m:
             out[key] = int(m.group(1))
+    k = _RE_HEAD_KIND.search(head)
+    if k:
+        out["expl_kind"] = k.group(1)
     m = _RE_HEAD_EXPL.search(head)
     if m and m.group(1) != "null":
         try:
@@ -339,7 +368,8 @@ class SolveSession:
         stop_path = self.work_dir / f"{job_id}.stop"
         pause_path = self.work_dir / f"{job_id}.pause"
         progress_path = self.work_dir / f"{job_id}.progress.json"
-        for p in (stop_path, pause_path, progress_path):
+        sidecar_path = job_sidecar_path(self.work_dir, job_id)
+        for p in (stop_path, pause_path, progress_path, Path(f"{progress_path}.counters")):
             if p.exists():
                 try:
                     p.unlink()
@@ -386,6 +416,18 @@ class SolveSession:
             self._jobs[job_id] = job
             self._active_id = job_id
             self._prune_history()
+        # (TOOL-031) What was being solved, next to the live snapshot: if the app
+        # dies mid-solve, the Library lists that snapshot as "interrupted" and
+        # opens it with the right board / root. Removed with the snapshot when
+        # the job finishes normally.
+        try:
+            write_json_atomic(
+                str(sidecar_path),
+                {"job_id": job_id, "root": job.root, "config": job.config,
+                 "created_at": job.created_at, "label": label or None},
+            )
+        except OSError:
+            pass
 
         t = threading.Thread(
             target=self._run_job,
@@ -484,6 +526,7 @@ class SolveSession:
                 job.num_infosets = int(counters.get("num_infosets") or job.num_infosets or 0)
                 if counters.get("exploitability_bb") is not None:
                     job.exploitability_bb = float(counters["exploitability_bb"])
+                    job.expl_kind = counters.get("expl_kind")
             stop_pending = job.stop_requested_at is not None or (
                 job.stop_file and Path(job.stop_file).exists()
             )
@@ -558,9 +601,20 @@ class SolveSession:
         threading.Thread(target=_run, name=f"cfr-kuhn-{job_id}", daemon=True).start()
         return job
 
-    def load_report_file(self, path: Path | str) -> dict[str, Any]:
+    def load_report_file(
+        self, path: Path | str, *, data: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Register a saved report as a finished job. Pass ``data`` when the
+        caller already parsed ``path`` (upload / library load parse ONCE —
+        TOOL-051). Only the scalars are kept; the file stays the source of truth.
+        """
         p = Path(path)
-        data = sanitize_json(json.loads(p.read_text(encoding="utf-8")))
+        if data is None:
+            # Unwraps rejected batch reports and dresses an interrupted solve's
+            # snapshot (TOOL-031) — see strategy_view.read_strategy_json.
+            from plo5bp.cfr_app.strategy_view import read_strategy_json
+
+            data = read_strategy_json(p)
         if not isinstance(data, dict):
             raise ValueError("strategy file must be a JSON object")
         job_id = f"load_{uuid.uuid4().hex[:8]}"
@@ -573,18 +627,23 @@ class SolveSession:
             created_at=time.time(),
             started_at=time.time(),
             finished_at=time.time(),
-            root=data.get("root") if isinstance(data.get("root"), dict) else {},
-            config=data.get("config") if isinstance(data.get("config"), dict) else {},
+            # Small dicts straight from the file: sanitized, since they reach
+            # JSON responses (a NaN there used to 500 every /api/jobs poll).
+            root=sanitize_json(data.get("root")) if isinstance(data.get("root"), dict) else {},
+            config=sanitize_json(data.get("config")) if isinstance(data.get("config"), dict) else {},
             # (review 2026-09-20 E4) Keep the scalars only. Every Library "Open"
             # used to pin a full parsed report in memory (×40 history slots) that
             # each /api/jobs poll then deep-copied; the file is the source of
             # truth and full_report() re-reads it (mtime-cached) on demand.
-            report=light_report(data),
+            report=sanitize_json(light_report(data)),
             out_path=str(p),
             progress_message="loaded from disk",
             notes=[f"loaded:{p.name}"],
             iterations_run=int(data.get("iterations_run") or 0),
-            exploitability_bb=float(expl) if isinstance(expl, (int, float)) else None,
+            expl_kind=_expl_kind(data.get("notes")),
+            exploitability_bb=(
+                float(expl) if isinstance(expl, (int, float)) and math.isfinite(expl) else None
+            ),
             num_infosets=n_infosets,
         )
         if job.report is not None:
@@ -650,11 +709,12 @@ class SolveSession:
             # (review 2026-09-20 E12) the final report supersedes the live
             # snapshot; a leftover progress file also let refresh_progress()
             # clobber the final counters and showed up in the Library.
-            doomed = ["stop_file", "pause_file"]
+            doomed = [job.stop_file, job.pause_file]
+            if job.progress_file:
+                doomed.append(f"{job.progress_file}.counters")
             if not keep_progress:
-                doomed.append("progress_file")
-            for attr in doomed:
-                p = getattr(job, attr, None)
+                doomed += [job.progress_file, str(job_sidecar_path(self.work_dir, job.job_id))]
+            for p in doomed:
                 if p:
                     try:
                         Path(p).unlink(missing_ok=True)
@@ -678,9 +738,11 @@ class SolveSession:
             job.finished_at = time.time()
             job.iterations_run = int(rep_d.get("iterations_run") or 0)
             job.exploitability_bb = rep_d.get("exploitability_bb")
+            job.expl_kind = _expl_kind(rep_d.get("notes"))
             strat = rep_d.get("strategy") or {}
             if isinstance(strat, dict):
-                job.num_infosets = len(strat.get("infosets") or [])
+                n = strat.get("num_infosets")  # a streamed report's summary (TOOL-006)
+                job.num_infosets = int(n) if n is not None else len(strat.get("infosets") or [])
             # (review 2026-09-20 E4) Once the report is on disk keep only its
             # scalars in memory; full_report() reloads out_path for the viewer.
             # save=False jobs have no file, so they keep the full dict.
@@ -704,7 +766,7 @@ class SolveSession:
         ignored) — the job's terminal state is set here in that case. Raises on
         a worker error or a native crash; ``_run_job`` turns that into ``error``.
         """
-        from plo5bp.cfr_app.solve_worker import run_solve
+        from plo5bp.cfr_app.solve_worker import meta_path_for, run_solve
 
         self.work_dir.mkdir(parents=True, exist_ok=True)
         # save=True: the child writes straight to out_path (no second copy of a
@@ -746,9 +808,14 @@ class SolveSession:
                 proc.join(5.0)
                 break
 
+        meta_path = Path(meta_path_for(str(result_path)))
         try:
             if result_path.is_file():
                 # A result beats everything, even if we also pulled the trigger.
+                if meta_path.is_file() and not scratch:
+                    # (TOOL-006) The report is already at out_path; the parent
+                    # needs only its scalars — never parse 100+ MB again.
+                    return json.loads(meta_path.read_text(encoding="utf-8"))
                 return json.loads(result_path.read_text(encoding="utf-8"))
             if killed:
                 why = (
@@ -779,9 +846,13 @@ class SolveSession:
             )
         finally:
             error_path.unlink(missing_ok=True)
+            meta_path.unlink(missing_ok=True)
             if scratch:
                 result_path.unlink(missing_ok=True)
-            Path(f"{result_path}.tmp").unlink(missing_ok=True)
+            # A child killed mid-write leaves its temp file (jsonio names it
+            # `<name>.<child pid>.tmp`; older builds used `<name>.tmp`).
+            for leftover in result_path.parent.glob(f"{result_path.name}*.tmp"):
+                leftover.unlink(missing_ok=True)
 
     def _prune_history(self) -> None:
         if len(self._jobs) <= self._history_limit:
@@ -797,6 +868,11 @@ class SolveSession:
             old = finished.pop(0)
             if old.job_id != self._active_id:
                 self._jobs.pop(old.job_id, None)
+
+
+def job_sidecar_path(work_dir: Path | str, job_id: str) -> Path:
+    """``<job_id>.job.json``: root + config of a job, beside its live snapshot."""
+    return Path(work_dir) / f"{job_id}.job.json"
 
 
 def validate_root_for_app(root: RootSpec) -> None:
@@ -883,6 +959,11 @@ def _config_from_dict(d: dict[str, Any]) -> SolveConfig:
         poll_every=int(d.get("poll_every", 50)),
         pause_file=str(d.get("pause_file") or ""),
         progress_file=str(d.get("progress_file") or ""),
+        progress_secs=float(d.get("progress_secs", 2.0)),
+        report_path=str(d.get("report_path") or ""),
+        expl_check_secs=float(d.get("expl_check_secs", 0.0) or 0.0),
+        # (TOOL-032) the machine's budget unless the caller set one
+        ram_budget_mb=int(d["ram_budget_mb"]) if d.get("ram_budget_mb") else default_ram_budget_mb(),
     )
 
 
@@ -921,7 +1002,8 @@ def root_presets() -> list[dict[str, Any]]:
             "effective_stack_bb": 50.0,
             "board": [12, 28, 38, 41, 45],  # sample board
             "num_seats": 2,
-            "algorithm": "dcfr",
+            # (TOOL-008) full-range DCFR: < 0.05 bb in ~100 iterations here
+            "algorithm": "dcfr_vector",
             "size_preset": "standard",
             "raise_sizes_pm": list(SIZE_PRESETS["standard"]),
         },
@@ -933,7 +1015,7 @@ def root_presets() -> list[dict[str, Any]]:
             "effective_stack_bb": 50.0,
             "board": [48, 44, 40, 36, 32],
             "num_seats": 2,
-            "algorithm": "dcfr",
+            "algorithm": "dcfr_vector",
             "size_preset": "micro",
             "raise_sizes_pm": list(SIZE_PRESETS["micro"]),
         },
@@ -951,6 +1033,22 @@ def root_presets() -> list[dict[str, Any]]:
             "allin_atom": True,
             "ante_chips": 0,
             "stacks_bb": [10.0, 10.0, 10.0, 10.0],
+        },
+        {
+            "id": "turn_hu_ranges",
+            "label": "HU Turn pot=10bb stack=20bb (ranges)",
+            "street": 2,
+            "pot_bb": 10.0,
+            "effective_stack_bb": 20.0,
+            "board": [12, 28, 38, 41],
+            "num_seats": 2,
+            # (TOOL-008) every river, every hand: ~0.02 bb after 100 iterations
+            # (~7 s on 8 threads); the ranges keep the report near 600k rows.
+            "algorithm": "dcfr_vector",
+            "size_preset": "micro",
+            "raise_sizes_pm": list(SIZE_PRESETS["micro"]),
+            "range_oop": "22+,A2s+,K9s+,Q9s+,J9s+,T9s,98s,87s,A9o+,KTo+,QTo+,JTo",
+            "range_ip": "22+,A2s+,K8s+,Q9s+,J9s+,T8s+,97s+,86s+,76s,65s,A8o+,KTo+,QTo+,JTo",
         },
         {
             "id": "flop_hu_ochs",

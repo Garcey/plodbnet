@@ -1,7 +1,8 @@
-"""Best made-hand description for a PLO5 hand on one board (ClubGG-style).
+"""Best made-hand description for a PLO hand on one board (ClubGG-style).
 
-Pure helper: given a seat's 5 hole-card indices and a board's dealt
-community-card indices (3-5), enumerate the exactly-2-hole + 3-board PLO
+Pure helper: given a seat's hole-card indices (4-7: PLO4/5/6 and PLO67's growing
+hands) and a board's dealt community-card indices (3-5), enumerate the
+exactly-2-hole + 3-board PLO
 combinations, pick the best 5-card hand, and format it the way ClubGG
 labels it ("three of a kind, Qs", "a straight 10-A", "a flush A high",
 "a pair of 8s", "four of a kind, 8s", "a straight flush, 9-K").
@@ -10,13 +11,14 @@ Card index convention matches the engine: ``rank = idx // 4`` (0='2' ..
 12='A'), ``suit = idx % 4``. Category ordering matches rust_engine
 hand_eval CAT_* (0=high card .. 8=straight flush); ``best_hand_category``
 is pinned against the engine's ``hero_category`` over thousands of dealt
-hands in tests/python/test_hand_describe.py, so a label can never disagree
+hands in tests/python/homegame/test_hand_describe.py, so a label can never disagree
 with how a showdown actually ranks.
 """
 
 from __future__ import annotations
 
 from collections import Counter
+from functools import lru_cache
 from itertools import combinations
 from typing import Any
 
@@ -78,8 +80,14 @@ def _known(cards) -> list[int]:
 
 
 def _best(hole, board) -> tuple[int, tuple, tuple] | None:
-    hole = _known(hole)
-    board = _known(board)
+    # (the best over EVERY combination does not depend on the cards' order, so
+    # the cache is keyed on the sorted cards: a view builds the same labels for
+    # every viewer and every push — PERF-005)
+    return _best_sorted(tuple(sorted(_known(hole))), tuple(sorted(_known(board))))
+
+
+@lru_cache(maxsize=4096)
+def _best_sorted(hole: tuple, board: tuple) -> tuple[int, tuple, tuple] | None:
     if len(hole) < 2 or len(board) < 3:
         return None
     best: tuple[int, tuple, tuple] | None = None

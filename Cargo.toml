@@ -1,12 +1,40 @@
 [workspace]
 members = ["rust_engine"]
+# The Criterion benchmarks (TEST-026) are a workspace of their own, so no build
+# of the engine ever resolves or downloads their dependencies.
+exclude = ["rust_engine/bench"]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.75"
+# The compiler rust-toolchain.toml pins (ENG-008): the only version the engine is
+# built and tested with, so an older one is refused up front with a clear message.
+rust-version = "1.93"
 
 [profile.release]
 lto = "fat"
 codegen-units = 1
-strip = true
+# Strip the debug info but keep the symbol table: a panic backtrace or a `perf`
+# profile on the pod / the server still names the functions (ENG-033). The code
+# is identical either way.
+strip = "debuginfo"
+
+# `cargo test --profile fasttest --lib`: release optimisation without the
+# whole-program LTO pass, so a rebuild takes a fraction of the time, plus debug
+# assertions and overflow checks to catch more in tests. The engine's outputs
+# do not depend on LTO (the golden digests hold under both profiles).
+[profile.fasttest]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+debug-assertions = true
+overflow-checks = true
+strip = "none"
+
+# Release code with line tables, for `perf` / flamegraphs:
+# `maturin develop --profile profiling` or `cargo build --profile profiling`.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"

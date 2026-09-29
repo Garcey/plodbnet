@@ -1,1 +1,27 @@
+# Line endings: git stores every text file with LF; each checkout converts to the
+# platform's convention (core.autocrlf) EXCEPT the files that must keep one ending
+# everywhere. The deploy exports from git, so the server always gets LF.
+* text=auto
+
+# Run by bash (on the pod, the server, CI and Git Bash): always LF.
 *.sh text eol=lf
+ops/bin/* text eol=lf
+scripts/hooks/* text eol=lf
+# Windows-only scripts: always CRLF.
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Never touched by line-ending conversion.
+*.png binary
+*.ico binary
+*.jpg binary
+*.webp binary
+*.pt binary
+*.pyd binary
+*.so binary
+*.whl binary
+*.gz binary
+*.tgz binary
+*.db binary
+*.npz binary
+*.npy binary

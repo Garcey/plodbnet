@@ -329,21 +329,28 @@ fn expand_range_item(item: &str, numeric_mode: bool) -> Result<Vec<usize>, Strin
         if txt.is_empty() || !txt.chars().all(|c| c.is_ascii_digit()) {
             return Err("expected a combo id after '#'".into());
         }
-        let id: usize = txt.parse().map_err(|_| "combo id out of range".to_string())?;
+        let id: usize = txt
+            .parse()
+            .map_err(|_| "combo id out of range".to_string())?;
         if id >= NUM_COMBOS {
             return Err(format!("combo id must be 0..{}", NUM_COMBOS - 1));
         }
         return Ok(vec![id]);
     }
     if all_digits && parse_class_label(item).is_none() {
-        return Err("two-digit token is not a hand (ranks 2-9 only); write a combo id as #N".into());
+        return Err(
+            "two-digit token is not a hand (ranks 2-9 only); write a combo id as #N".into(),
+        );
     }
     let ch: Vec<char> = item.chars().collect();
     // Explicit combo: rank suit rank suit.
     if ch.len() == 4 {
-        if let (Some(r0), Some(s0), Some(r1), Some(s1)) =
-            (rank_of(ch[0]), suit_of(ch[1]), rank_of(ch[2]), suit_of(ch[3]))
-        {
+        if let (Some(r0), Some(s0), Some(r1), Some(s1)) = (
+            rank_of(ch[0]),
+            suit_of(ch[1]),
+            rank_of(ch[2]),
+            suit_of(ch[3]),
+        ) {
             let (c0, c1) = (r0 * 4 + s0, r1 * 4 + s1);
             if c0 == c1 {
                 return Err("both cards are the same".into());
@@ -366,16 +373,37 @@ fn expand_range_item(item: &str, numeric_mode: bool) -> Result<Vec<usize>, Strin
         }
         if pair_a {
             for r in la.hi.min(lb.hi)..=la.hi.max(lb.hi) {
-                class_combos(ClassLabel { hi: r, lo: r, suit: Suitedness::Both }, &mut out);
+                class_combos(
+                    ClassLabel {
+                        hi: r,
+                        lo: r,
+                        suit: Suitedness::Both,
+                    },
+                    &mut out,
+                );
             }
         } else if la.hi == lb.hi {
             for lo in la.lo.min(lb.lo)..=la.lo.max(lb.lo) {
-                class_combos(ClassLabel { hi: la.hi, lo, suit: la.suit }, &mut out);
+                class_combos(
+                    ClassLabel {
+                        hi: la.hi,
+                        lo,
+                        suit: la.suit,
+                    },
+                    &mut out,
+                );
             }
         } else if la.hi - la.lo == lb.hi - lb.lo {
             let gap = la.hi - la.lo;
             for hi in la.hi.min(lb.hi)..=la.hi.max(lb.hi) {
-                class_combos(ClassLabel { hi, lo: hi - gap, suit: la.suit }, &mut out);
+                class_combos(
+                    ClassLabel {
+                        hi,
+                        lo: hi - gap,
+                        suit: la.suit,
+                    },
+                    &mut out,
+                );
             }
         } else {
             return Err("run ends must share the high card or the gap".into());
@@ -384,14 +412,29 @@ fn expand_range_item(item: &str, numeric_mode: bool) -> Result<Vec<usize>, Strin
     }
     // Plus: QQ+, ATs+, KT+
     if let Some(base) = item.strip_suffix('+') {
-        let l = parse_class_label(base).ok_or_else(|| "expected CLASS+, e.g. QQ+ or ATs+".to_string())?;
+        let l = parse_class_label(base)
+            .ok_or_else(|| "expected CLASS+, e.g. QQ+ or ATs+".to_string())?;
         if l.hi == l.lo {
             for r in l.hi..=12 {
-                class_combos(ClassLabel { hi: r, lo: r, suit: Suitedness::Both }, &mut out);
+                class_combos(
+                    ClassLabel {
+                        hi: r,
+                        lo: r,
+                        suit: Suitedness::Both,
+                    },
+                    &mut out,
+                );
             }
         } else {
             for lo in l.lo..l.hi {
-                class_combos(ClassLabel { hi: l.hi, lo, suit: l.suit }, &mut out);
+                class_combos(
+                    ClassLabel {
+                        hi: l.hi,
+                        lo,
+                        suit: l.suit,
+                    },
+                    &mut out,
+                );
             }
         }
         return Ok(out);
@@ -402,7 +445,9 @@ fn expand_range_item(item: &str, numeric_mode: bool) -> Result<Vec<usize>, Strin
             class_combos(l, &mut out);
             Ok(out)
         }
-        None => Err("not a combo id, AhKh combo, class (AA/AKs/AKo/AK), CLASS+ or CLASS-CLASS".into()),
+        None => {
+            Err("not a combo id, AhKh combo, class (AA/AKs/AKo/AK), CLASS+ or CLASS-CLASS".into())
+        }
     }
 }
 
@@ -434,12 +479,7 @@ pub fn combo_ranks_on_board(board: &[u8; 5]) -> Vec<u32> {
 
 /// Equity of hero combo vs villain range on fixed board (already ranked).
 /// Returns P(win) + 0.5*P(tie) in [0,1], or 0 if blocked.
-pub fn equity_vs_range(
-    hero_id: usize,
-    hero_rank: u32,
-    villain: &Range,
-    ranks: &[u32],
-) -> f64 {
+pub fn equity_vs_range(hero_id: usize, hero_rank: u32, villain: &Range, ranks: &[u32]) -> f64 {
     if hero_rank == 0 {
         return 0.0;
     }
@@ -490,7 +530,7 @@ mod tests {
     fn uniform_blocks_board() {
         let r = Range::uniform_unblocked(&[0, 1, 2, 3, 4]);
         let (c0, c1) = combo_cards(0); // cards 0,1 — both on board if board starts 0,1
-        // combo 0 is (0,1) which is blocked
+                                       // combo 0 is (0,1) which is blocked
         assert_eq!(c0, 0);
         assert_eq!(c1, 1);
         assert_eq!(r.weights[0], 0.0);
@@ -505,7 +545,9 @@ mod tests {
     // ---- (review 2026-09-20 D12) parser ----
 
     fn live(spec: &str) -> usize {
-        Range::parse(spec, &[]).unwrap_or_else(|e| panic!("{spec:?}: {e}")).live_combos()
+        Range::parse(spec, &[])
+            .unwrap_or_else(|e| panic!("{spec:?}: {e}"))
+            .live_combos()
     }
 
     fn card(rank: u8, suit: u8) -> u8 {
@@ -558,7 +600,10 @@ mod tests {
         assert_eq!(live("AA;KK ,  QQ\r\n"), 18);
         let a = Range::parse("AA,AA,AA,KK", &[]).unwrap();
         let b = Range::parse("AA,KK", &[]).unwrap();
-        assert_eq!(a.weights, b.weights, "duplicates must not accumulate weight");
+        assert_eq!(
+            a.weights, b.weights,
+            "duplicates must not accumulate weight"
+        );
         // Last token wins.
         let r = Range::parse("AA:0.5,AhAd:1", &[]).unwrap();
         assert_eq!(r.weights[cards_to_combo(card(12, 2), card(12, 1))], 1.0);
@@ -578,7 +623,11 @@ mod tests {
         // A human "44" is pocket fours.
         assert_eq!(live("44"), 6);
         assert_eq!(live("44:0.5,55:0.5"), 12);
-        assert_eq!(live("98:0.5"), 16, "two digits next to nothing unambiguous = class 98");
+        assert_eq!(
+            live("98:0.5"),
+            16,
+            "two digits next to nothing unambiguous = class 98"
+        );
         // The desktop app's canonical form: zero-padded 4-digit ids mixed with
         // class tokens. Anything but a TWO-digit token is always an id.
         let r = Range::parse("0044:0.5,1224:0.25,KK", &[]).unwrap();
@@ -587,12 +636,17 @@ mod tests {
         assert_eq!(live("AA,7:1"), 7);
         assert!(Range::parse("AA,1326", &[]).is_err());
         assert!(Range::parse("#1326", &[]).is_err());
-        assert!(Range::parse("AA,10", &[]).is_err(), "'10' is neither a hand nor a sure id");
+        assert!(
+            Range::parse("AA,10", &[]).is_err(),
+            "'10' is neither a hand nor a sure id"
+        );
     }
 
     #[test]
     fn parse_errors_instead_of_uniform_fallback() {
-        for bad in ["AKx", "AA:abc", "AA:-1", "AAs", "XY", "AA,,K", "QQ++", "AA:nan"] {
+        for bad in [
+            "AKx", "AA:abc", "AA:-1", "AAs", "XY", "AA,,K", "QQ++", "AA:nan",
+        ] {
             assert!(Range::parse(bad, &[]).is_err(), "{bad:?} must not parse");
         }
         // Entirely board-blocked range → error (used to become uniform).

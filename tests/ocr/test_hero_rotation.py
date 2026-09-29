@@ -21,7 +21,7 @@ from plo5bp.ocr import cards as card_mod
 from plo5bp.ocr import extract as extract_mod
 from plo5bp.ocr.types import RANK_CHARS, SUIT_CHARS
 
-FIXTURES = Path(__file__).parent / "fixtures" / "rotation"
+FIXTURES = Path(__file__).parent / "fixtures" / "rotation"  # see conftest.find_frame
 
 # filename -> the 5 hero hole cards (slot 0..4), as "<rank><suit>" strings.
 # Hands confirmed from the live captures; slot 0 = leftmost (fan bottom),
@@ -50,8 +50,8 @@ def _card_str(card) -> str | None:
 
 @_skip_no_templates
 @pytest.mark.parametrize("fname,expected", LABELED.items(), ids=list(LABELED))
-def test_hero_hole_reads_after_derotation(fname: str, expected: list[str]):
-    path = FIXTURES / fname
+def test_hero_hole_reads_after_derotation(fname: str, expected: list[str], frame_finder):
+    path = frame_finder(fname) or FIXTURES / fname
     if not path.exists():
         pytest.skip(f"fixture {fname} not present")
     img = cv2.imread(str(path))
@@ -61,8 +61,8 @@ def test_hero_hole_reads_after_derotation(fname: str, expected: list[str]):
 
 
 @_skip_no_templates
-def test_noise_frame_reads_no_hero_cards():
-    path = FIXTURES / NOISE_FRAME
+def test_noise_frame_reads_no_hero_cards(frame_finder):
+    path = frame_finder(NOISE_FRAME) or FIXTURES / NOISE_FRAME
     if not path.exists():
         pytest.skip(f"fixture {NOISE_FRAME} not present")
     img = cv2.imread(str(path))

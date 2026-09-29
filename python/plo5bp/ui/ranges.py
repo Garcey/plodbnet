@@ -25,7 +25,7 @@ aggregate to grid cells. Design invariants:
   ``ai`` / ``summary.allin``. (review 2026-09-20 H5)
 - **Bit-exact**: grid rows are `pack_range_nlh` + the training batch
   encoder, pinned bit-exact against serial study observations by
-  tests/python/test_ranges.py. The observation is villain-blind, so one
+  tests/python/site/test_ranges.py. The observation is villain-blind, so one
   ephemeral env serves all 1326 combos.
 - **Reach weighting** is per-seat and gate-level: the acting seat's range
   entering a node is the product of its own earlier action probabilities
@@ -66,7 +66,7 @@ import math
 import threading
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 import numpy as np
 import torch
@@ -125,21 +125,27 @@ def cell_key(lo: int, hi: int) -> str:
     return f"{RANK_CHARS[hi_r]}{RANK_CHARS[lo_r]}{'s' if suited else 'o'}"
 
 
+#: Longest action/cards line a query may send (BE-025). A real NLH hand is
+#: far shorter; the reach weighting replays every earlier node (a replay +
+#: a ~1,200-row forward each), so an unbounded line cost O(n^2) work.
+MAX_LINE = 60
+
+
 class LineEntry(BaseModel):
-    t: str  # "a" | "cards"
-    gate: str | None = None
+    t: Literal["a", "cards"]
+    gate: Literal["fold", "check_call", "raise"] | None = None
     #: Raise-BY delta in bb (engine chips the actor adds), NOT the raise-to
     #: total — see the module docstring. Finiteness is checked in `_replay`
     #: so a NaN/inf answers 400 like every other bad line entry (a pydantic
     #: `allow_inf_nan=False` would answer 422 with a non-string detail).
     chips_bb: float | None = None
-    cards: list[int] | None = None
+    cards: list[int] | None = Field(default=None, max_length=5)
 
 
 class RangeQuery(BaseModel):
     seats: int = Field(6, ge=2, le=6)
     stack_bb: float = Field(100.0, gt=1.0, le=1000.0)
-    line: list[LineEntry] = Field(default_factory=list)
+    line: list[LineEntry] = Field(default_factory=list, max_length=MAX_LINE)
     node: int | None = None  # view the state after this many entries
 
 
@@ -291,7 +297,7 @@ def canonical_range_pack(
     rows of a range pack share one public state, so the edits are computed
     once from row 0 and tiled. Returns ``(pack, root_config)``; pinned
     bit-exact against `canonical_serve_obs` by
-    tests/python/test_review_trainer_ranges.py.
+    tests/python/site/test_review_trainer_ranges.py.
     """
     m = int(np.asarray(pack["actor"]).shape[0])
     street = int(pack["street"][0])
@@ -613,7 +619,6 @@ def create_ranges_router(
         canonical combo vector (blocked combos handled by exclusion at the
         display node)."""
         reach = np.ones(len(ALL_COMBOS), dtype=np.float64)
-        applied = 0
         for i, e in enumerate(q.line[:k]):
             if e.t != "a":
                 continue
@@ -622,7 +627,6 @@ def create_ranges_router(
                 continue
             gate = _GATES[e.gate or "check_call"]
             reach[node.live_idx] *= node.gate_probs[:, gate].astype(np.float64)
-            applied += 1
         return reach
 
     @router.post("/ranges/query")

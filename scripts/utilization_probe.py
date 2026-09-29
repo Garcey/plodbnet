@@ -53,11 +53,9 @@ import torch.nn.functional as F
 
 from plo5bp.config import GameConfig
 from plo5bp.env import BombPotEnv
-from plo5bp.network import (
-    build_actor_from_state_dict,
-    build_critic_from_state_dict,
-    opp_holes_multihot,
-)
+from plo5bp.evaluation import load_actor, load_critic, load_checkpoint
+from plo5bp.evaluation.tables import sample_table
+from plo5bp.network import opp_holes_multihot
 from plo5bp.rollout import _rotate_opp_holes
 
 GATE_FOLD, GATE_CC, GATE_RAISE = 0, 1, 2
@@ -163,48 +161,29 @@ def build_selfplay_batch(actor, rows, obs_mode="minimal", seed=0,
     30 table configs (10 per training tier), `tables` hands each, played to
     the end with the actor sampling its policy; returns a uniform sample of
     `rows` (obs, rotated opponent holes, gate masks) over all states met."""
-    import importlib.util
-
     from plo5bp.env_batched import BatchedBombPotEnv
     from plo5bp.rollout import TRAIN_OPP_OUTCOME_MC  # the full layout's outcome features
     from plo5bp.rollout import _rotate_opp_holes_batch
 
-    spec = importlib.util.spec_from_file_location(
-        "_train", Path(__file__).resolve().parent / "train.py"
-    )
-    train = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(train)
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
     obs_l, opp_l, mask_l = [], [], []
     for tier in ("clubgg", "clubgg_deep", "deep"):
         for _ in range(10):
-            cfg, _ = train._sample_game_config(
-                (2, 3, 4, 5, 6), 1.0, 300.0, BB, 3 * BB, rng,
-                stack_dist=tier, seats_dist="uniform", variant=variant, sb=0,
-            )
+            cfg = sample_table(tier, rng, variant)
             env = BatchedBombPotEnv(tables, cfg, obs_mode=obs_mode, opp_outcome_mc=TRAIN_OPP_OUTCOME_MC if obs_mode == "full" else 0)
             env.reset_batch(
                 rng.integers(0, 2**63 - 1, size=tables, dtype=np.int64).astype(np.uint64),
                 rng.integers(0, cfg.num_seats, size=tables).astype(np.uint8),
             )
             holes = np.asarray(env._be.all_hole_cards_batch(), dtype=np.uint8)
-            all_rows = np.arange(tables)
             while not env._dones.all():
                 live = np.nonzero(~env._dones)[0]
                 actors = env._actors[live].astype(np.int64)
                 obs_l.append(env._obs[live].copy())
                 mask_l.append(env._gate_mask[live].copy())
                 opp_l.append(_rotate_opp_holes_batch(holes, live, actors))
-                safe = np.where(env._actors >= 0, env._actors, 0).astype(np.intp)
-                to_call = np.maximum(
-                    env._bet_to_call.astype(np.int64)
-                    - env._street_commit[all_rows, safe].astype(np.int64), 0,
-                )
-                sizing = np.stack(
-                    [env._min_raise.astype(np.int64), env._max_raise.astype(np.int64),
-                     env._pot.astype(np.int64), to_call], axis=-1,
-                )
+                sizing = env.sizing()
                 gates = np.zeros(tables, dtype=np.uint8)
                 chips = np.zeros(tables, dtype=np.uint64)
                 with torch.no_grad():
@@ -435,21 +414,13 @@ def write_record(record, out_path):
 # Loading + driver
 # --------------------------------------------------------------------------
 def load_ckpt(path):
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    cfgb = ckpt.get("config", {}) or {}
-    actor = build_actor_from_state_dict(
-        ckpt["model"], int(cfgb.get("hidden_dim", 128)),
-        int(cfgb.get("num_layers", 2)),
-    ).eval()
-    critic = build_critic_from_state_dict(ckpt["critic"]).eval()
-    for p in actor.parameters():
-        p.requires_grad_(False)
-    for p in critic.parameters():
-        p.requires_grad_(False)
-    obs_mode = str(cfgb.get("obs_mode", "full") or "full").strip().lower()
-    if obs_mode not in ("full", "minimal"):
-        obs_mode = "full"
-    return actor, critic, obs_mode
+    """(actor, critic, obs_mode): sizes from the checkpoint itself, and the
+    process's PLO5BP_OBS_REV must be the checkpoint's (plo5bp.evaluation)."""
+    ckpt = load_checkpoint(path)
+    actor, meta = load_actor(ckpt)
+    meta["path"] = str(path)
+    critic = load_critic(ckpt)
+    return actor, critic, meta["obs_mode"]
 
 
 def main(argv=None):

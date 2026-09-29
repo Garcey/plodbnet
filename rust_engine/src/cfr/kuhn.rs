@@ -47,10 +47,7 @@ impl Node {
     fn avg_strategy(&self) -> [f64; N_ACTIONS] {
         let norm: f64 = self.strategy_sum.iter().sum();
         if norm > 0.0 {
-            [
-                self.strategy_sum[0] / norm,
-                self.strategy_sum[1] / norm,
-            ]
+            [self.strategy_sum[0] / norm, self.strategy_sum[1] / norm]
         } else {
             [0.5, 0.5]
         }
@@ -96,12 +93,12 @@ fn terminal_util_for_player(history: &str, cards: [usize; 2], player: usize) -> 
         return if folder == player { -1.0 } else { 1.0 };
     }
     // Showdown after call (ends with bet and previous bet exists)
-    let winner = if cards[player] > cards[opponent] {
+
+    if cards[player] > cards[opponent] {
         2.0
     } else {
         -2.0
-    };
-    winner
+    }
 }
 
 /// CFR returning utility for the **current player**.
@@ -402,7 +399,11 @@ mod tests {
                 .map(|a| s[a] * eval(nodes, policy, cards, &next(a), br_player))
                 .sum()
         }
-        let hists: [&str; 2] = if br_player == 0 { ["", "pb"] } else { ["p", "b"] };
+        let hists: [&str; 2] = if br_player == 0 {
+            ["", "pb"]
+        } else {
+            ["p", "b"]
+        };
         let keys: Vec<String> = (0..3)
             .flat_map(|c| hists.iter().map(move |h| infoset_key(c, h)))
             .collect();
@@ -448,7 +449,10 @@ mod tests {
             for p in 0..2 {
                 let fast = best_response_value(&nodes, p);
                 let slow = brute_force_br(&nodes, p);
-                assert!((fast - slow).abs() < 1e-12, "iters={iters} p={p}: {fast} vs {slow}");
+                assert!(
+                    (fast - slow).abs() < 1e-12,
+                    "iters={iters} p={p}: {fast} vs {slow}"
+                );
             }
             assert!(exploitability_avg(&nodes) >= -1e-12);
         }
@@ -466,7 +470,7 @@ mod tests {
     fn kuhn_king_bets_often() {
         let rep = solve_kuhn(10_000);
         // card 2 = K at root ""
-        let key = 2 * 10 + 0;
+        let key = 2 * 10;
         if let Some(s) = rep.strategies.get(&key) {
             assert!(s[1] > 0.4, "K bet freq {}", s[1]);
         } else {

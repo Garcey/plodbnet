@@ -17,6 +17,8 @@ torch = pytest.importorskip("torch")
 from plo5bp.config import GameConfig  # noqa: E402
 from plo5bp.ocr.types import Card, FrameState, SeatObs  # noqa: E402
 from plo5bp.ui import server  # noqa: E402
+from plo5bp.ui.live import clubgg, routes as live_routes, tracking  # noqa: E402
+from plo5bp.ui.live.state import live_state  # noqa: E402
 
 
 def _c(rank: int, suit: int) -> Card:
@@ -38,7 +40,9 @@ def _fs(
     seats: tuple[SeatObs, ...],
     button: int | None = 2,
     hero: tuple[Card | None, ...] | None = None,
-    pot: int | None = 0,
+    # Unreadable by default: these tests are about the button / mask / card
+    # machinery, not the ante gate (tested with explicit pots).
+    pot: int | None = None,
     flop_a_visible: bool = False,
 ) -> FrameState:
     if hero is None:
@@ -70,20 +74,18 @@ def _reset_session():
     server.session.button_seat = 0
     server.session.hero_seat = 0
     server.session.sitting_out_seats = frozenset()
-    server.session.observed_stacks = ()
-    server.session.observed_pot = None
-    server.session.last_hero_hole = None
-    server.session._pending_button = None
-    server.session._pending_sitting_out = None
-    server.session._pending_stable_ticks = 0
-    server.session._pending_anchor_fs = None
-    server.session._pending_mask_additions = frozenset()
-    server.session._pending_mask_additions_ticks = 0
-    server.ocr_runner._reconstructor = None
-    server.ocr_runner.running = False
-    server.ocr_runner.latest_frame = None
-    import asyncio as _asyncio
-    server.ocr_runner._tick_lock = _asyncio.Lock()
+    live_state.observed_stacks = ()
+    live_state.observed_pot = None
+    live_state.last_hero_hole = None
+    live_state.pending_button = None
+    live_state.pending_sitting_out = None
+    live_state.pending_stable_ticks = 0
+    live_state.pending_anchor_fs = None
+    live_state.pending_mask_additions = frozenset()
+    live_state.pending_mask_additions_ticks = 0
+    clubgg.ocr_runner._reconstructor = None
+    clubgg.ocr_runner.running = False
+    clubgg.ocr_runner.latest_frame = None
     server._new_session_defaults()
     yield
 
@@ -95,50 +97,50 @@ def _reset_session():
 
 
 def test_card_debounce_commits_only_after_n_stable_ticks():
-    n = server._CARD_STABLE_TICKS
+    n = tracking._CARD_STABLE_TICKS
     idx = 42
     for _ in range(n - 1):
-        server._ocr_apply_card_slot("hero_hole", 0, idx, debounce=True)
+        tracking._ocr_apply_card_slot("hero_hole", 0, idx, debounce=True)
         assert server.session.hero_hole[0] is None
         assert server.session._card_slot_locked["hero_hole"][0] is False
-    server._ocr_apply_card_slot("hero_hole", 0, idx, debounce=True)
+    tracking._ocr_apply_card_slot("hero_hole", 0, idx, debounce=True)
     assert server.session.hero_hole[0] == idx
     assert server.session._card_slot_locked["hero_hole"][0] is True
 
 
 def test_card_debounce_varied_reads_never_lock():
     # Simulate the reveal animation: a different (wrong) card every tick.
-    for t in range(server._CARD_STABLE_TICKS * 3):
-        server._ocr_apply_card_slot("hero_hole", 0, 10 + t, debounce=True)
+    for t in range(tracking._CARD_STABLE_TICKS * 3):
+        tracking._ocr_apply_card_slot("hero_hole", 0, 10 + t, debounce=True)
     assert server.session.hero_hole[0] is None
     assert server.session._card_slot_locked["hero_hole"][0] is False
 
 
 def test_card_debounce_none_tick_resets_the_run():
-    n = server._CARD_STABLE_TICKS
+    n = tracking._CARD_STABLE_TICKS
     idx = 42
     for _ in range(n - 1):
-        server._ocr_apply_card_slot("hero_hole", 0, idx, debounce=True)
+        tracking._ocr_apply_card_slot("hero_hole", 0, idx, debounce=True)
     # A no-read tick breaks the streak.
-    server._ocr_apply_card_slot("hero_hole", 0, None, debounce=True)
-    server._ocr_apply_card_slot("hero_hole", 0, idx, debounce=True)
+    tracking._ocr_apply_card_slot("hero_hole", 0, None, debounce=True)
+    tracking._ocr_apply_card_slot("hero_hole", 0, idx, debounce=True)
     assert server.session.hero_hole[0] is None  # streak restarted, not enough yet
     for _ in range(n - 1):
-        server._ocr_apply_card_slot("hero_hole", 0, idx, debounce=True)
+        tracking._ocr_apply_card_slot("hero_hole", 0, idx, debounce=True)
     assert server.session.hero_hole[0] == idx
 
 
 def test_card_apply_is_immediate_when_not_debounced():
     # Rescan / explicit edits commit on a single read.
-    server._ocr_apply_card_slot("hero_hole", 1, 42, debounce=False)
+    tracking._ocr_apply_card_slot("hero_hole", 1, 42, debounce=False)
     assert server.session.hero_hole[1] == 42
     assert server.session._card_slot_locked["hero_hole"][1] is True
 
 
 def test_card_debounce_does_not_overwrite_a_locked_slot():
-    server._ocr_apply_card_slot("hero_hole", 2, 40, debounce=False)  # lock it
-    for _ in range(server._CARD_STABLE_TICKS + 2):
-        server._ocr_apply_card_slot("hero_hole", 2, 7, debounce=True)
+    tracking._ocr_apply_card_slot("hero_hole", 2, 40, debounce=False)  # lock it
+    for _ in range(tracking._CARD_STABLE_TICKS + 2):
+        tracking._ocr_apply_card_slot("hero_hole", 2, 7, debounce=True)
     assert server.session.hero_hole[2] == 40  # unchanged
 
 
@@ -147,16 +149,16 @@ def test_card_debounce_does_not_overwrite_a_locked_slot():
 
 def test_ocr_cents_to_engine_chips_at_defaults():
     # bb=10000, $20/bb → 1 cent = 5 engine chips.
-    assert server._ocr_cents_to_engine_chips(34000) == 170000
-    assert server._ocr_cents_to_engine_chips(145513) == 727565
-    assert server._ocr_cents_to_engine_chips(41361) == 206805
-    assert server._ocr_cents_to_engine_chips(24650) == 123250
+    assert tracking._ocr_cents_to_engine_chips(34000) == 170000
+    assert tracking._ocr_cents_to_engine_chips(145513) == 727565
+    assert tracking._ocr_cents_to_engine_chips(41361) == 206805
+    assert tracking._ocr_cents_to_engine_chips(24650) == 123250
 
 
 def test_ocr_cents_to_engine_chips_rounding():
     # $0.01 at defaults = 5 chips (rounded).
-    assert server._ocr_cents_to_engine_chips(1) == 5
-    assert server._ocr_cents_to_engine_chips(0) == 0
+    assert tracking._ocr_cents_to_engine_chips(1) == 5
+    assert tracking._ocr_cents_to_engine_chips(0) == 0
 
 
 # --- SeatAction → action_log entry --------------------------------------
@@ -169,7 +171,7 @@ def test_seat_action_raise_passes_chips_through():
     from plo5bp.ocr.events import SeatAction
 
     ev = SeatAction(seat=3, gate="raise", chips=90_000)
-    entry = server._seat_action_to_log_entry(ev)
+    entry = tracking._seat_action_to_log_entry(ev)
     assert entry["chips"] == 90_000
 
 
@@ -178,7 +180,7 @@ def test_seat_action_non_raise_gates_log_zero_chips():
 
     for gate in ("fold", "check_call"):
         ev = SeatAction(seat=2, gate=gate, chips=0)
-        entry = server._seat_action_to_log_entry(ev)
+        entry = tracking._seat_action_to_log_entry(ev)
         assert entry["chips"] == 0
 
 
@@ -196,13 +198,13 @@ def test_stability_gate_needs_two_consecutive_ticks():
         _seat(5, folded=True),
     )
     fs = _fs(seats=seats)
-    server._mirror_observable_state(fs)
+    tracking._mirror_observable_state(fs)
     assert server.session.sitting_out_seats == frozenset()
-    assert server.session._pending_sitting_out == frozenset({3, 5})
-    assert server.session._pending_stable_ticks == 1
+    assert live_state.pending_sitting_out == frozenset({3, 5})
+    assert live_state.pending_stable_ticks == 1
 
     # Second matching tick commits the snapshot.
-    server._mirror_observable_state(fs)
+    tracking._mirror_observable_state(fs)
     assert server.session.sitting_out_seats == frozenset({3, 5})
 
 
@@ -217,20 +219,20 @@ def test_stability_gate_rejects_single_glitch_frame():
     )
     # Two good ticks → commit {3, 5}.
     fs_good = _fs(seats=seats_good)
-    server._mirror_observable_state(fs_good)
-    server._mirror_observable_state(fs_good)
+    tracking._mirror_observable_state(fs_good)
+    tracking._mirror_observable_state(fs_good)
     assert server.session.sitting_out_seats == frozenset({3, 5})
 
     # One glitched tick (everyone folded, button None) must not commit.
     seats_glitch = tuple(_seat(i, folded=True) for i in range(6))
     fs_glitch = _fs(seats=seats_glitch, button=None)
-    server._mirror_observable_state(fs_glitch)
+    tracking._mirror_observable_state(fs_glitch)
     # sitting_out_seats still holds the prior valid commit.
     assert server.session.sitting_out_seats == frozenset({3, 5})
 
     # Subsequent good frame resets the gate back to the correct set.
-    server._mirror_observable_state(fs_good)
-    server._mirror_observable_state(fs_good)
+    tracking._mirror_observable_state(fs_good)
+    tracking._mirror_observable_state(fs_good)
     assert server.session.sitting_out_seats == frozenset({3, 5})
 
 
@@ -247,8 +249,8 @@ def test_begin_new_hand_converts_ocr_cents_to_engine_chips():
         _seat(5, folded=True),
     )
     fs = _fs(seats=seats)
-    server._mirror_observable_state(fs)
-    server._mirror_observable_state(fs)
+    tracking._mirror_observable_state(fs)
+    tracking._mirror_observable_state(fs)
 
     # Committed sitting-out → hand start fired → cfg.starting_stacks
     # reflects OCR reads (cents * 5 + ante).
@@ -277,14 +279,14 @@ def test_rewind_resync_re_detects_participants():
         _seat(5, folded=True),
     )
     fs_a = _fs(seats=seats_a)
-    server._mirror_observable_state(fs_a)
-    server._mirror_observable_state(fs_a)
+    tracking._mirror_observable_state(fs_a)
+    tracking._mirror_observable_state(fs_a)
     assert server.session.sitting_out_seats == frozenset({3, 5})
 
     # Step 2: user rewinds → "fresh" frame that looks like nothing
     # special. Participant set should NOT spontaneously change — stays
     # locked at {3, 5}.
-    server._mirror_observable_state(fs_a)
+    tracking._mirror_observable_state(fs_a)
     assert server.session.sitting_out_seats == frozenset({3, 5})
 
     # Step 3: next hand begins with different participants (s4 now out
@@ -301,8 +303,8 @@ def test_rewind_resync_re_detects_participants():
     # Mid-hand `_begin_new_hand` is gated by the locked-mode debouncer
     # (`_STABILITY_TICKS_REQUIRED_LOCKED`). Pump enough ticks for the new
     # snapshot to clear that threshold so button_changed can fire.
-    for _ in range(server._STABILITY_TICKS_REQUIRED_LOCKED):
-        server._mirror_observable_state(fs_b)
+    for _ in range(tracking._STABILITY_TICKS_REQUIRED_LOCKED):
+        tracking._mirror_observable_state(fs_b)
     assert server.session.sitting_out_seats == frozenset({3, 4})
     assert server.session.button_seat == 3
 
@@ -321,10 +323,10 @@ def test_anchor_fs_seeds_stacks_from_pre_commit_frame():
         _seat(5, folded=True),
     )
     fs_pre = _fs(seats=seats_pre)
-    server._mirror_observable_state(fs_pre)
+    tracking._mirror_observable_state(fs_pre)
     # Anchor captured on first observation of the snapshot.
-    assert server.session._pending_anchor_fs is fs_pre
-    assert server.session._pending_stable_ticks == 1
+    assert live_state.pending_anchor_fs is fs_pre
+    assert live_state.pending_stable_ticks == 1
 
     # Tick 2: same snapshot, but SB just bet $180 → stack now $1,455.13.
     seats_post = (
@@ -336,7 +338,7 @@ def test_anchor_fs_seeds_stacks_from_pre_commit_frame():
         _seat(5, folded=True),
     )
     fs_post = _fs(seats=seats_post)
-    server._mirror_observable_state(fs_post)
+    tracking._mirror_observable_state(fs_post)
 
     # Hand-start committed → seeding used the pre-bet anchor, not fs_post.
     cfg = server.session.game_config
@@ -345,7 +347,7 @@ def test_anchor_fs_seeds_stacks_from_pre_commit_frame():
     assert cfg.resolved_stacks[2] == expected_sb_pre
     assert cfg.resolved_stacks[2] != expected_sb_post
     # Anchor consumed.
-    assert server.session._pending_anchor_fs is None
+    assert live_state.pending_anchor_fs is None
 
 
 # --- anchor stack sanity check (Phase 6c) -------------------------------
@@ -365,7 +367,7 @@ def test_begin_new_hand_rejects_glitched_in_hand_stack_read():
         _seat(5, folded=True),
     )
     fs = _fs(seats=seats)
-    server._begin_new_hand(fs, button_seat=2, hero_hole_indices=None)
+    tracking._begin_new_hand(fs, button_seat=2, hero_hole_indices=None)
     cfg = server.session.game_config
     # Seat 1's resolved stack should NOT have been seeded from the 0
     # read — it should retain its pre-existing value (default 200000).
@@ -389,10 +391,10 @@ def test_mirror_delays_hand_start_when_all_ticks_have_glitched_anchor():
         _seat(5, folded=True),
     )
     fs_glitch = _fs(seats=glitched_seats)
-    server._mirror_observable_state(fs_glitch)
-    server._mirror_observable_state(fs_glitch)
+    tracking._mirror_observable_state(fs_glitch)
+    tracking._mirror_observable_state(fs_glitch)
     # Stable for 2 ticks, but commit delayed because anchor is glitched.
-    assert server.session._pending_stable_ticks >= 2
+    assert live_state.pending_stable_ticks >= 2
     assert not server.session.hand_in_hand_mask
 
 
@@ -408,8 +410,8 @@ def test_anchor_upgrade_swaps_glitched_anchor_for_clean_tick():
         _seat(5, folded=True),
     )
     fs_glitch = _fs(seats=glitched_seats)
-    server._mirror_observable_state(fs_glitch)
-    assert server.session._pending_anchor_fs is fs_glitch
+    tracking._mirror_observable_state(fs_glitch)
+    assert live_state.pending_anchor_fs is fs_glitch
 
     # Tick 2: same snapshot (button + sitting_out unchanged), but seat 1
     # reads cleanly now. Anchor must be upgraded to this cleaner fs,
@@ -423,7 +425,7 @@ def test_anchor_upgrade_swaps_glitched_anchor_for_clean_tick():
         _seat(5, folded=True),
     )
     fs_clean = _fs(seats=clean_seats)
-    server._mirror_observable_state(fs_clean)
+    tracking._mirror_observable_state(fs_clean)
 
     # Commit fired — hand_in_hand_mask populated, anchor consumed.
     assert server.session.hand_in_hand_mask == frozenset({0, 1, 2, 4})
@@ -446,8 +448,8 @@ def test_sticky_mask_survives_banner_flicker():
         _seat(5, folded=True),
     )
     fs_good = _fs(seats=seats_good)
-    server._mirror_observable_state(fs_good)
-    server._mirror_observable_state(fs_good)
+    tracking._mirror_observable_state(fs_good)
+    tracking._mirror_observable_state(fs_good)
     assert server.session.hand_in_hand_mask == frozenset({0, 1, 2, 4})
     assert server.session.sitting_out_seats == frozenset({3, 5})
 
@@ -462,7 +464,7 @@ def test_sticky_mask_survives_banner_flicker():
         _seat(5, folded=True),
     )
     fs_flicker = _fs(seats=seats_flicker)
-    server._mirror_observable_state(fs_flicker)
+    tracking._mirror_observable_state(fs_flicker)
     # Sticky mask wins: seat 1 stays in the hand.
     assert server.session.sitting_out_seats == frozenset({3, 5})
     assert server.session.hand_in_hand_mask == frozenset({0, 1, 2, 4})
@@ -479,8 +481,8 @@ def test_mid_hand_fold_event_updates_sitting_out_without_restart():
         _seat(5, folded=True),
     )
     fs = _fs(seats=seats)
-    server._mirror_observable_state(fs)
-    server._mirror_observable_state(fs)
+    tracking._mirror_observable_state(fs)
+    tracking._mirror_observable_state(fs)
     assert server.session.hand_in_hand_mask == frozenset({0, 1, 2, 4})
     pre_cfg = server.session.game_config
 
@@ -508,8 +510,8 @@ def test_mid_hand_fold_event_updates_sitting_out_without_restart():
         _seat(5, folded=True),
     )
     fs_after = _fs(seats=seats_after_fold)
-    server._mirror_observable_state(fs_after)
-    server._mirror_observable_state(fs_after)
+    tracking._mirror_observable_state(fs_after)
+    tracking._mirror_observable_state(fs_after)
 
     # Mask unchanged, fold tracked in folded_this_hand, config untouched.
     assert server.session.hand_in_hand_mask == frozenset({0, 1, 2, 4})
@@ -530,8 +532,8 @@ def test_new_hand_on_button_rotation_clears_folded_this_hand():
         _seat(5, folded=True),
     )
     fs_h1 = _fs(seats=seats_h1, button=2)
-    server._mirror_observable_state(fs_h1)
-    server._mirror_observable_state(fs_h1)
+    tracking._mirror_observable_state(fs_h1)
+    tracking._mirror_observable_state(fs_h1)
     server.session.folded_this_hand = frozenset({1})
 
     # Hand 2: button rotates → real hand-start.
@@ -544,17 +546,19 @@ def test_new_hand_on_button_rotation_clears_folded_this_hand():
         _seat(5, folded=True),
     )
     fs_h2 = _fs(seats=seats_h2, button=3)
-    server._mirror_observable_state(fs_h2)
-    server._mirror_observable_state(fs_h2)
+    tracking._mirror_observable_state(fs_h2)
+    tracking._mirror_observable_state(fs_h2)
     assert server.session.button_seat == 3
     assert server.session.folded_this_hand == frozenset()
 
 
 def test_anchor_fs_rebaselines_reconstructor_to_pre_commit_frame():
-    # Ensure the reconstructor exists (normally created in OcrRunner.start).
+    # Ensure the reconstructor exists and is the live one (normally done by
+    # OcrRunner.start).
     from plo5bp.ocr.events import EventReconstructor
 
-    server.ocr_runner._reconstructor = EventReconstructor(num_seats=6)
+    clubgg.ocr_runner._reconstructor = EventReconstructor(num_seats=6)
+    tracking._set_active_reconstructor(clubgg.ocr_runner._reconstructor)
 
     seats_pre = (
         _seat(0, stack=34000),
@@ -565,7 +569,7 @@ def test_anchor_fs_rebaselines_reconstructor_to_pre_commit_frame():
         _seat(5, folded=True),
     )
     fs_pre = _fs(seats=seats_pre)
-    server._mirror_observable_state(fs_pre)
+    tracking._mirror_observable_state(fs_pre)
 
     seats_post = (
         _seat(0, stack=34000),
@@ -576,10 +580,10 @@ def test_anchor_fs_rebaselines_reconstructor_to_pre_commit_frame():
         _seat(5, folded=True),
     )
     fs_post = _fs(seats=seats_post)
-    server._mirror_observable_state(fs_post)
+    tracking._mirror_observable_state(fs_post)
 
     # Reconstructor baseline is the pre-bet anchor, not the post-bet fs.
-    rec = server.ocr_runner._reconstructor
+    rec = clubgg.ocr_runner._reconstructor
     assert rec.last_fs is fs_pre
     assert rec.last_fs is not fs_post
     # The pre-bet seat stack is preserved for the next step's diff.
@@ -625,12 +629,12 @@ def test_reconcile_missed_folds_adds_one_fold_per_missing_seat():
     # tick only PARKS the first sighting; nothing is appended yet. This test
     # used to pin the single-frame behaviour, which retired a live seat on a
     # one-frame card-back miss.
-    assert server._reconcile_missed_folds_on_street_reveal(fs) is False
+    assert tracking._reconcile_missed_folds_on_street_reveal(fs) is False
     assert server.session.folded_this_hand == frozenset({1})
     assert len(server.session.action_log) == 2
-    assert server.session._pending_reveal_folds == frozenset({2, 4})
+    assert live_state.pending_reveal_folds == frozenset({2, 4})
     # The follow-up tick still reads both seats folded → reconcile.
-    assert server._reconcile_missed_folds_on_street_reveal(fs) is True
+    assert tracking._reconcile_missed_folds_on_street_reveal(fs) is True
 
     assert server.session.folded_this_hand == frozenset({1, 2, 4})
     assert server.session.sitting_out_seats == frozenset({1, 2, 3, 4, 5})
@@ -665,7 +669,7 @@ def test_reconcile_missed_folds_noop_when_no_missing():
         _seat(5, folded=True),
     )
     fs = _fs(seats=seats)
-    server._reconcile_missed_folds_on_street_reveal(fs)
+    tracking._reconcile_missed_folds_on_street_reveal(fs)
 
     assert server.session.action_log == log_before
     assert server.session.folded_this_hand == frozenset({1, 4})
@@ -680,7 +684,7 @@ def test_reconcile_missed_folds_skips_when_mask_empty():
 
     seats = tuple(_seat(i, folded=True) for i in range(6))
     fs = _fs(seats=seats)
-    server._reconcile_missed_folds_on_street_reveal(fs)
+    tracking._reconcile_missed_folds_on_street_reveal(fs)
 
     assert server.session.action_log == []
     assert server.session.folded_this_hand == frozenset()
@@ -702,11 +706,11 @@ def test_engine_view_populates_sitting_out_from_session():
         _seat(5, stack=145513),
     )
     fs = _fs(seats=seats)
-    server._mirror_observable_state(fs)
-    server._mirror_observable_state(fs)
+    tracking._mirror_observable_state(fs)
+    tracking._mirror_observable_state(fs)
     assert server.session.sitting_out_seats == frozenset({1, 3})
 
-    view = server._engine_view_from_session()
+    view = tracking._engine_view_from_session()
     assert view.sitting_out == (False, True, False, True, False, False)
     # Sanity: the engine's own folded array won't reflect sitting-out
     # between polls until `_auto_fold_sitting_out` runs during replay —
@@ -778,8 +782,8 @@ def test_mid_hand_mask_expansion_adds_late_render_participant():
         _seat(5, folded=True),
     )
     fs_anchor = _fs(seats=seats_anchor)
-    server._mirror_observable_state(fs_anchor)
-    server._mirror_observable_state(fs_anchor)
+    tracking._mirror_observable_state(fs_anchor)
+    tracking._mirror_observable_state(fs_anchor)
     assert server.session.hand_in_hand_mask == frozenset({0})
 
     # Tick 1 of recovery: fastaf's cards-back now reads — folded=False.
@@ -792,13 +796,13 @@ def test_mid_hand_mask_expansion_adds_late_render_participant():
         _seat(5, folded=True),
     )
     fs1 = _fs(seats=seats_recovered)
-    server._mirror_observable_state(fs1)
+    tracking._mirror_observable_state(fs1)
     # Not yet — only 1 stable tick.
     assert server.session.hand_in_hand_mask == frozenset({0})
 
     # Tick 2: same observation persists → expand.
     fs2 = _fs(seats=seats_recovered)
-    server._mirror_observable_state(fs2)
+    tracking._mirror_observable_state(fs2)
     assert server.session.hand_in_hand_mask == frozenset({0, 2})
     assert server.session.sitting_out_seats == frozenset({1, 3, 4, 5})
 
@@ -818,8 +822,8 @@ def test_mid_hand_mask_expansion_does_not_add_late_rebuy():
         _seat(5, folded=True),
     )
     fs_anchor = _fs(seats=seats_anchor)
-    server._mirror_observable_state(fs_anchor)
-    server._mirror_observable_state(fs_anchor)
+    tracking._mirror_observable_state(fs_anchor)
+    tracking._mirror_observable_state(fs_anchor)
     assert server.session.hand_in_hand_mask == frozenset({0})
 
     # Several ticks later: seat 1's stack populates as $400 but they
@@ -834,9 +838,9 @@ def test_mid_hand_mask_expansion_does_not_add_late_rebuy():
         _seat(5, folded=True),
     )
     fs_rebuy = _fs(seats=seats_with_rebuy_stack)
-    server._mirror_observable_state(fs_rebuy)
-    server._mirror_observable_state(fs_rebuy)
-    server._mirror_observable_state(fs_rebuy)
+    tracking._mirror_observable_state(fs_rebuy)
+    tracking._mirror_observable_state(fs_rebuy)
+    tracking._mirror_observable_state(fs_rebuy)
 
     # Mask never grew: rebuyer stays out of this hand.
     assert server.session.hand_in_hand_mask == frozenset({0})
@@ -859,8 +863,8 @@ def test_mid_hand_mask_expansion_excludes_already_folded_seats():
         _seat(5, folded=True),
     )
     fs_anchor = _fs(seats=seats_anchor)
-    server._mirror_observable_state(fs_anchor)
-    server._mirror_observable_state(fs_anchor)
+    tracking._mirror_observable_state(fs_anchor)
+    tracking._mirror_observable_state(fs_anchor)
     assert server.session.hand_in_hand_mask == frozenset({0, 2})
 
     # fastaf folds — server marks them in folded_this_hand (mirrors
@@ -879,8 +883,8 @@ def test_mid_hand_mask_expansion_excludes_already_folded_seats():
         _seat(5, folded=True),
     )
     fs_spur = _fs(seats=seats_spurious)
-    server._mirror_observable_state(fs_spur)
-    server._mirror_observable_state(fs_spur)
+    tracking._mirror_observable_state(fs_spur)
+    tracking._mirror_observable_state(fs_spur)
 
     # Mask unchanged; seat 2 stays in folded_this_hand.
     assert server.session.hand_in_hand_mask == frozenset({0, 2})
@@ -899,8 +903,8 @@ def test_mid_hand_mask_expansion_resets_on_changed_candidates():
         _seat(4, folded=True),
         _seat(5, folded=True),
     )
-    server._mirror_observable_state(_fs(seats=seats_anchor))
-    server._mirror_observable_state(_fs(seats=seats_anchor))
+    tracking._mirror_observable_state(_fs(seats=seats_anchor))
+    tracking._mirror_observable_state(_fs(seats=seats_anchor))
     assert server.session.hand_in_hand_mask == frozenset({0})
 
     # Tick A: seat 2 reads folded=False (one-frame glitch).
@@ -912,13 +916,13 @@ def test_mid_hand_mask_expansion_resets_on_changed_candidates():
         _seat(4, folded=True),
         _seat(5, folded=True),
     )
-    server._mirror_observable_state(_fs(seats=seats_glitch))
+    tracking._mirror_observable_state(_fs(seats=seats_glitch))
     # Tick B: seat 2 back to folded=True. Different candidate set,
     # debouncer resets.
-    server._mirror_observable_state(_fs(seats=seats_anchor))
+    tracking._mirror_observable_state(_fs(seats=seats_anchor))
 
     assert server.session.hand_in_hand_mask == frozenset({0})
-    assert server.session._pending_mask_additions_ticks == 0
+    assert live_state.pending_mask_additions_ticks == 0
 
 
 # --- false hand-start guard: button must actually move ------------------
@@ -942,15 +946,15 @@ def test_anti_collusion_reveal_does_not_trigger_false_hand_start():
 
     # First-commit path seeds button=2 and last_hero_hole=hand1.
     fs_h1 = _fs(seats=seats_full, hero=hand1, button=2)
-    server._mirror_observable_state(fs_h1)
-    server._mirror_observable_state(fs_h1)
+    tracking._mirror_observable_state(fs_h1)
+    tracking._mirror_observable_state(fs_h1)
     assert server.session.button_seat == 2
-    assert server.session.last_hero_hole == h1_idx
+    assert live_state.last_hero_hole == h1_idx
     assert server.session.hand_in_hand_mask == frozenset(range(6))
 
     # Pump into lock mode (_ticks_since_hand_start >= _LOCK_AFTER_TICKS).
-    for _ in range(server._LOCK_AFTER_TICKS):
-        server._mirror_observable_state(fs_h1)
+    for _ in range(tracking._LOCK_AFTER_TICKS):
+        tracking._mirror_observable_state(fs_h1)
 
     # Mid-hand: seat 1 folds, hero hole goes hidden, flop appears.
     seats_with_fold = (
@@ -968,7 +972,7 @@ def test_anti_collusion_reveal_does_not_trigger_false_hand_start():
         flop_a_visible=True,
     )
     for _ in range(2):
-        server._mirror_observable_state(fs_hidden)
+        tracking._mirror_observable_state(fs_hidden)
 
     # Anti-collusion reveal: hero hole becomes hand2 cards (disjoint
     # from last_hero_hole=hand1). Button stays on seat 2. Pump past
@@ -979,8 +983,8 @@ def test_anti_collusion_reveal_does_not_trigger_false_hand_start():
         button=2,
         flop_a_visible=True,
     )
-    for _ in range(server._STABILITY_TICKS_REQUIRED_LOCKED + 2):
-        server._mirror_observable_state(fs_revealed)
+    for _ in range(tracking._STABILITY_TICKS_REQUIRED_LOCKED + 2):
+        tracking._mirror_observable_state(fs_revealed)
 
     # Guard worked: `_begin_new_hand` was not called, so seat 1 stays
     # in the mask (would otherwise be dropped as `folded=True` at the
@@ -998,19 +1002,19 @@ def test_real_hand_boundary_still_fires_when_button_moves():
 
     seats_full = tuple(_seat(i, stack=100_000) for i in range(6))
     fs_h1 = _fs(seats=seats_full, hero=hand1, button=2)
-    server._mirror_observable_state(fs_h1)
-    server._mirror_observable_state(fs_h1)
+    tracking._mirror_observable_state(fs_h1)
+    tracking._mirror_observable_state(fs_h1)
     assert server.session.button_seat == 2
 
-    for _ in range(server._LOCK_AFTER_TICKS):
-        server._mirror_observable_state(fs_h1)
+    for _ in range(tracking._LOCK_AFTER_TICKS):
+        tracking._mirror_observable_state(fs_h1)
 
     # Hand 2 boundary: button rotates 2 → 4 (skipping seat 3, which is
     # legal when seat 3 is sitting out at a smaller table). New hero
     # cards too. Pump past the lock-mode debounce threshold.
     fs_h2 = _fs(seats=seats_full, hero=hand2, button=4)
-    for _ in range(server._STABILITY_TICKS_REQUIRED_LOCKED):
-        server._mirror_observable_state(fs_h2)
+    for _ in range(tracking._STABILITY_TICKS_REQUIRED_LOCKED):
+        tracking._mirror_observable_state(fs_h2)
 
     # Trigger fired: button updated.
     assert server.session.button_seat == 4
@@ -1020,10 +1024,10 @@ def _pump_into_lock(button: int, hero):
     """Bootstrap + lock a hand on `button` so the next move is the locked path."""
     seats_full = tuple(_seat(i, stack=100_000) for i in range(6))
     fs = _fs(seats=seats_full, hero=hero, button=button)
-    server._mirror_observable_state(fs)
-    server._mirror_observable_state(fs)
-    for _ in range(server._LOCK_AFTER_TICKS):
-        server._mirror_observable_state(fs)
+    tracking._mirror_observable_state(fs)
+    tracking._mirror_observable_state(fs)
+    for _ in range(tracking._LOCK_AFTER_TICKS):
+        tracking._mirror_observable_state(fs)
     assert server.session.button_seat == button
 
 
@@ -1038,11 +1042,11 @@ def test_button_move_fires_despite_sitting_out_flicker():
     _pump_into_lock(2, h1)
 
     # Button rotates 2 -> 4; a DIFFERENT non-hero seat reads folded each tick.
-    for k in range(server._BUTTON_STABLE_TICKS_LOCKED):
+    for k in range(tracking._BUTTON_STABLE_TICKS_LOCKED):
         flick = tuple(
             _seat(i, stack=100_000, folded=(i == 1 + (k % 3))) for i in range(6)
         )
-        server._mirror_observable_state(_fs(seats=flick, hero=h2, button=4))
+        tracking._mirror_observable_state(_fs(seats=flick, hero=h2, button=4))
     assert server.session.button_seat == 4  # fired despite the flicker
 
 
@@ -1052,8 +1056,8 @@ def test_button_glitch_below_threshold_does_not_fire():
     _pump_into_lock(2, h1)
     seats_full = tuple(_seat(i, stack=100_000) for i in range(6))
     glitch = _fs(seats=seats_full, hero=h1, button=5)
-    for _ in range(server._BUTTON_STABLE_TICKS_LOCKED - 1):
-        server._mirror_observable_state(glitch)
+    for _ in range(tracking._BUTTON_STABLE_TICKS_LOCKED - 1):
+        tracking._mirror_observable_state(glitch)
     assert server.session.button_seat == 2  # too few stable ticks → no fire
 
 
@@ -1073,13 +1077,13 @@ def _fake_extractor(monkeypatch, fake_fs) -> None:
 
     fake = types.ModuleType("plo5bp.ocr.extract")
     fake.extract_frame_state = lambda img, num_seats: fake_fs
+    fake.fit_to_calibration = lambda img: (img, None)
     monkeypatch.setitem(sys.modules, "plo5bp.ocr.extract", fake)
 
 
 def test_rescan_hole_preserves_action_log_button_and_board(monkeypatch):
     """Rescan Hole replaces hero cards from a fresh OCR read without
     touching action_log, button_seat, hand_in_hand_mask, or the board."""
-    import asyncio as _asyncio
 
     server.session.action_log = [
         {"gate": 1, "chips": 0},
@@ -1098,8 +1102,8 @@ def test_rescan_hole_preserves_action_log_button_and_board(monkeypatch):
     server.session.hero_hole = [None] * 5
     server.session._card_slot_locked["hero_hole"] = [False] * 5
 
-    server.ocr_runner.running = True
-    server.ocr_runner.latest_frame = object()
+    clubgg.ocr_runner.running = True
+    clubgg.ocr_runner.latest_frame = object()
 
     # Hero cards picked to avoid colliding with the pre-set board
     # (which uses idx 10, 11, 20, 21, 30, 31). Kings and Queens, idx >= 40.
@@ -1111,8 +1115,8 @@ def test_rescan_hole_preserves_action_log_button_and_board(monkeypatch):
     )
     _fake_extractor(monkeypatch, fake_fs)
 
-    req = server.OcrRescanRequest(target="hole")
-    _asyncio.run(server.ocr_rescan(req))
+    req = live_routes.OcrRescanRequest(target="hole")
+    live_routes.ocr_rescan(req)
 
     expected_hero = [
         12 * 4 + 0, 12 * 4 + 1, 11 * 4 + 0, 11 * 4 + 1, 10 * 4 + 0,
@@ -1129,7 +1133,6 @@ def test_rescan_hole_rolls_back_on_duplicate_card(monkeypatch):
     """A rescan that would duplicate an existing board card must roll
     back the targeted group's spec + locks, raise 400, and leave the
     engine state intact (rebuilt from the pre-call spec)."""
-    import asyncio as _asyncio
     from fastapi import HTTPException
 
     server.session.action_log = []
@@ -1143,8 +1146,8 @@ def test_rescan_hole_rolls_back_on_duplicate_card(monkeypatch):
     server.session.hero_hole = list(pre_hero)
     server.session._card_slot_locked["hero_hole"] = list(pre_locks)
 
-    server.ocr_runner.running = True
-    server.ocr_runner.latest_frame = object()
+    clubgg.ocr_runner.running = True
+    clubgg.ocr_runner.latest_frame = object()
 
     # Card(rank=2, suit=2) → engine idx 2*4+2 = 10, collides with flop_a[0].
     fake_fs = _fs(
@@ -1155,9 +1158,9 @@ def test_rescan_hole_rolls_back_on_duplicate_card(monkeypatch):
     )
     _fake_extractor(monkeypatch, fake_fs)
 
-    req = server.OcrRescanRequest(target="hole")
+    req = live_routes.OcrRescanRequest(target="hole")
     with pytest.raises(HTTPException) as excinfo:
-        _asyncio.run(server.ocr_rescan(req))
+        live_routes.ocr_rescan(req)
     assert excinfo.value.status_code == 400
     assert "rescan hole failed" in str(excinfo.value.detail)
     assert server.session.hero_hole == pre_hero

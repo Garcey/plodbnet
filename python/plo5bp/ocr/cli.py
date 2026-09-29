@@ -10,12 +10,8 @@ import json
 import sys
 from pathlib import Path
 
-import cv2
 
-from plo5bp.ocr.extract import extract_frame_state
-
-
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="plo5bp.ocr")
     ap.add_argument("image", type=Path, help="Path to a PNG/JPEG frame")
     ap.add_argument(
@@ -26,11 +22,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument(
         "--pretty",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=True,
-        help="Pretty-print JSON output",
+        help="Pretty-print JSON output (default); --no-pretty prints one line",
     )
-    args = ap.parse_args(argv)
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    # OpenCV is only needed to run (the pixel extras are optional).
+    import cv2
+
+    from plo5bp.ocr.extract import extract_frame_state
 
     img = cv2.imread(str(args.image))
     if img is None:

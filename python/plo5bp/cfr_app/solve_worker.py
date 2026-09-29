@@ -13,9 +13,11 @@ the config dict, and the Rust solver reads/writes them exactly as before.
 
 Results travel by file, never through a pipe: a report can exceed 100 MB, and a
 large payload on a multiprocessing pipe deadlocks a parent that joins before it
-drains. The child writes ``result_path`` atomically (tmp + ``os.replace``); on a
-Python-level failure it writes a small ``error_path`` instead. A native crash
-writes neither, which the parent detects from the exit code.
+drains. The native solver streams the report to ``result_path`` itself (TOOL-006:
+no nested-dict / sanitize / json.dump copies of the strategy in the child) and the
+child writes its scalars to ``<result_path>.meta.json`` — all the parent reads for
+a saved job. On a Python-level failure it writes a small ``error_path`` instead. A
+native crash writes neither, which the parent detects from the exit code.
 
 Must stay importable with no side effects: ``spawn`` re-imports this module in
 the child. Arguments are plain dicts/strings so they pickle.
@@ -23,36 +25,27 @@ the child. Arguments are plain dicts/strings so they pickle.
 
 from __future__ import annotations
 
-import json
-import math
-import os
 import traceback
 from typing import Any
 
 
-def sanitize_json(obj: Any) -> Any:
-    """Replace NaN/±inf with None so the result is strict JSON.
+# One implementation for the whole CFR / GTO stack (TOOL-048). ``sanitize_json``
+# replaces NaN / ±inf with None: ``json.dumps`` happily emits bare ``NaN``, which
+# Starlette's JSONResponse then refuses — one NaN in a report used to 500 every
+# ``/api/jobs`` poll (review 2026-09-20).
+from plo5bp.gto.jsonio import atomic_write_json, sanitize_json  # noqa: E402
 
-    (review 2026-09-20) ``json.dumps`` happily emits bare ``NaN``, which
-    Starlette's JSONResponse then refuses (``allow_nan=False``) — one NaN in a
-    report used to 500 every ``/api/jobs`` poll.
-    """
-    if isinstance(obj, float):
-        return obj if math.isfinite(obj) else None
-    if isinstance(obj, dict):
-        return {k: sanitize_json(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [sanitize_json(v) for v in obj]
-    return obj
+__all__ = ["meta_path_for", "run_solve", "sanitize_json", "write_json_atomic"]
 
 
 def write_json_atomic(path: str, payload: Any) -> None:
-    """Write strict JSON to ``path`` via a temp file + ``os.replace``."""
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(sanitize_json(payload), f, allow_nan=False)
-        f.write("\n")
-    os.replace(tmp, path)
+    """Write strict JSON to ``path`` via a sibling temp file + ``os.replace``."""
+    atomic_write_json(path, payload)
+
+
+def meta_path_for(result_path: str) -> str:
+    """The small scalars-only file beside a streamed report (TOOL-006)."""
+    return f"{result_path}.meta.json"
 
 
 def run_solve(
@@ -70,11 +63,17 @@ def run_solve(
 
         root = _root_from_dict(root_d)
         cfg = _config_from_dict(config_d)
-        report = solve(root, cfg)
+        cfg.report_path = result_path
+        # The user's range wording rides into the report's root, for the viewer.
+        extra = {k: str(root_d[k]) for k in ("range_oop_text", "range_ip_text") if root_d.get(k)}
+        report = solve(root, cfg, root_extra=extra)
+        if isinstance(report, SolveReport) and report.streamed:
+            write_json_atomic(meta_path_for(result_path), report.as_dict())
+            return
         rep_d = report.as_dict() if isinstance(report, SolveReport) else dict(report)
         from plo5bp.cfr_app.ranges import attach_range_text
 
-        attach_range_text(rep_d, root_d)  # user's range wording, for the viewer
+        attach_range_text(rep_d, root_d)
         write_json_atomic(result_path, rep_d)
     except BaseException as e:  # noqa: BLE001 — PyO3 PanicException is a BaseException
         try:

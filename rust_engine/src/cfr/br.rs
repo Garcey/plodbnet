@@ -6,14 +6,9 @@ use super::actions::{apply_abstract, legal_actions, AbstractAction};
 use super::infoset::{Infoset, InfosetKey};
 use super::public_state::PublicState;
 
+/// Action-line key (TOOL-027: numeric codes, fixed mixer — see hashing.rs).
 fn history_hash(actions: &[AbstractAction]) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    for a in actions {
-        a.label().hash(&mut h);
-    }
-    h.finish()
+    super::hashing::actions_hash(actions)
 }
 
 /// Monte-Carlo PERFECT-INFORMATION best-response gap given an infoset table
@@ -27,6 +22,7 @@ fn history_hash(actions: &[AbstractAction]) -> u64 {
 ///
 /// `sample_deal` returns (private_views per seat, terminal_eval closure state).
 /// `terminal` maps (state, seat) → chip EV for seat under the sampled deal.
+#[allow(clippy::too_many_arguments)]
 pub fn mc_exploitability_bb<FTerm, FRoot>(
     infosets: &HashMap<InfosetKey, Infoset>,
     raise_pm: &[u32],
@@ -75,6 +71,7 @@ where
     (total / samples as f64) / num_seats as f64 / bb
 }
 
+#[allow(clippy::too_many_arguments)]
 fn avg_value<FTerm>(
     infosets: &HashMap<InfosetKey, Infoset>,
     state: &PublicState,
@@ -117,6 +114,7 @@ where
     v
 }
 
+#[allow(clippy::too_many_arguments)]
 fn br_value<FTerm>(
     infosets: &HashMap<InfosetKey, Infoset>,
     state: &PublicState,
@@ -184,9 +182,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::super::infoset::Infoset;
     use super::super::actions::AbstractAction;
+    use super::super::infoset::Infoset;
+    use super::*;
 
     #[test]
     fn empty_infosets_zero_expl() {

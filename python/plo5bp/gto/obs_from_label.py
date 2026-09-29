@@ -13,7 +13,7 @@ seats are ``None`` and stacks are the street-start stacks. A played hand's
 obs carries prior-street history, hand-total commits and blind flags — inputs
 that are ALWAYS zero in training. :func:`canonical_serve_obs` rebuilds the
 same canonical form from a live env's raw obs; ``PolicyNetHost`` serves that,
-so train == serve (pinned by ``tests/python/test_review_gto_serve_parity.py``).
+so train == serve (pinned by ``tests/python/gto/test_review_gto_serve_parity.py``).
 
 Obs kinds (:func:`obs_from_label_detailed`):
 

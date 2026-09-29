@@ -49,12 +49,15 @@ State/replay invariants:
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import math
 import os
+import statistics
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -62,7 +65,7 @@ from typing import Any, Callable, Literal
 import numpy as np
 import torch
 import torch.nn.functional as F
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, model_validator
 
 from plo5bp.actions import (
@@ -73,39 +76,36 @@ from plo5bp.actions import (
 )
 from plo5bp.config import GameConfig, VARIANT_NLH, VARIANT_PLO5
 from plo5bp.env import BombPotEnv, StepInfo
-from plo5bp.eval import model_policy
 from plo5bp.gto.backend import PpoSolverHost, StrategyBackend, make_ppo_host
 from plo5bp.gto.policy_host import try_load_gto_host
 from plo5bp.network import ActorCritic, CentralCritic, obs_adapter
 from plo5bp.rollout import _critic_values, _rotate_opp_holes
 from plo5bp.sizing import (
-    ANCHOR_COUNT,
     PLO_ANCHOR_SPEC,
     anchor_grid_np,
     anchor_grid_torch,
     sizing_from_info,
 )
 from plo5bp.ui.common import (
+    FORMAT_EXPERIMENTAL,
+    ActionRequest,
+    GATE_NAME_TO_IDX,
+    GATE_SLUGS,
     STREET_NAMES,
-    anchor_label,
-    anchor_label_spec,
+    anchors_payload as _common_anchors_payload,
     chips_to_bb,
-    history_entries,
+    engine_variant as _common_engine_variant,
+    env_flag,
+    format_defaults,
     position_name,
+    table_state as _table_state,
+    to_call_chips as _common_to_call_chips,
     validate_card_list,
 )
 from plo5bp.ui.hand_describe import describe_made_hand, describe_made_hand_nlh
 
-# UI format id (mirrors server.FORMAT_EXPERIMENTAL). Same PLO5 engine rules;
-# only the served checkpoint / obs projection differ.
-FORMAT_EXPERIMENTAL = "experimental"
-
-
-def _engine_variant(fmt_id: str) -> str:
-    """Map a UI format id onto the engine GameConfig.variant string."""
-    if fmt_id == FORMAT_EXPERIMENTAL:
-        return VARIANT_PLO5
-    return fmt_id
+#: UI format id -> engine variant (the admin candidate slot plays PLO5).
+_engine_variant = _common_engine_variant
 
 
 logger = logging.getLogger("plo5bp.ui.trainer")
@@ -115,14 +115,8 @@ def _public_mode() -> bool:
     `mc_rollouts` cap, `_ts` failing closed) use this rather than the
     import-time `_PUBLIC` constant so they hold no matter which module was
     imported first or how a test toggles the flag."""
-    return os.environ.get("PLO5BP_PUBLIC", "").strip().lower() in (
-        "1", "true", "yes", "on",
-    )
+    return env_flag("PLO5BP_PUBLIC")
 
-
-# Mirrors server.PLO5BP_PUBLIC (avoids a circular import): in the public
-# build the state payload must carry no trace of the live-capture fields.
-_PUBLIC = _public_mode()
 
 BB_CHIPS = 10000
 
@@ -162,8 +156,11 @@ _PERSIST_RETRY_SLEEP_S = 0.02
 # `supports()` and the format's PPO host served it instead.
 BACKEND_PPO_FALLBACK = "ppo_fallback"
 
-GATE_SLUGS = {GATE_FOLD: "fold", GATE_CHECK_CALL: "check_call", GATE_RAISE: "raise"}
-GATE_NAME_TO_IDX = {v: k for k, v in GATE_SLUGS.items()}
+#: How long a trainer request waits for its session's lock before a polite
+#: 429 (PERF-013). The public build already runs one user's requests one at a
+#: time (the access layer queues them); this bounds the local build and any
+#: in-process caller.
+SESSION_LOCK_TIMEOUT_S = float(os.environ.get("PLO5BP_SESSION_LOCK_TIMEOUT_S", "20"))
 
 CATEGORIES = ("best", "correct", "inaccuracy", "wrong", "blunder")
 CATEGORY_MARKS = {
@@ -525,10 +522,16 @@ def compute_node_distribution(
         spec = getattr(model, "anchor_spec", PLO_ANCHOR_SPEC)
         sizing = sizing_from_info(info)
         sizing_t = torch.from_numpy(sizing[None, :]).to(device)
-        with torch.no_grad():
+        with torch.inference_mode():
             gate_logits, anchor_head_out, refine, value = model(obs_t, gm_t)
             gate_probs = F.softmax(gate_logits, dim=-1).squeeze(0).tolist()
-            _act_out = model.act(obs_t, gm_t, sizing_t, deterministic=True)
+            # (PERF-016) `act` is exactly `forward` + `_act_from_heads`: reuse
+            # the heads above instead of a second forward pass (bit-identical;
+            # deterministic, so no random numbers are drawn).
+            _act_out = model._act_from_heads(
+                gate_logits, anchor_head_out, refine, value, sizing_t,
+                deterministic=True,
+            )
             # Anchor histogram via the model's own (head-agnostic) anchor
             # distribution: flat softmax for v2, discretized-logistic for v4.
             anchor_probs = (
@@ -618,28 +621,11 @@ def _anchors_payload(
     bb: int,
     spec: Any = PLO_ANCHOR_SPEC,
 ) -> list[dict[str, Any]]:
-    """Legal-only anchor histogram rows for client rendering. The lists
-    are spec-length (PLO 11 / NLH 12 incl. the ALL-IN atom)."""
-    return [
-        {
-            "k": int(k),
-            "label": anchor_label_spec(spec, int(k)),
-            # Pot fraction (None for the ALL-IN atom, whose chips are max_raise
-            # not a pot fraction). WITHOUT this the client's hi.frac is
-            # undefined and betCurveSVG falls into idxMode (the NLH all-in
-            # ladder layout) — skipping the chips-space axis AND the mixture
-            # size labels. Parity with the study rec (_recommendation_v2).
-            "frac": (
-                None if (spec.allin_atom and int(k) == spec.count - 1)
-                else spec.fracs_pm[int(k)] / 1000.0
-            ),
-            "prob": round(float(anchor_probs[k]), 4),
-            "chips": int(anchor_chips[k]),
-            "chips_bb": round(chips_to_bb(int(anchor_chips[k]), bb), 4),
-        }
-        for k in range(len(anchor_legal))
-        if bool(anchor_legal[k])
-    ]
+    """Legal-only anchor histogram rows for client rendering — the ONE
+    builder in `common.anchors_payload`, shared with the Study
+    recommendation (BE-010). `frac` (None for the ALL-IN atom) must be there:
+    without it the client's betCurveSVG falls into the NLH ladder layout."""
+    return _common_anchors_payload(spec, anchor_probs, anchor_chips, anchor_legal, bb)
 
 
 def _stable_seed(*parts: int) -> int:
@@ -673,14 +659,20 @@ class TrainerSettings(BaseModel):
     )
     hero_position_mode: Literal["random", "kth"] = "random"
     hero_kth: int = Field(1, ge=1, le=6)  # 1 = first to act (left of BTN)
+    # Drill filter (site FEAT-018): re-deal until the hero's FIRST decision is
+    # this kind of spot — "first" (you open the street), "facing_bet",
+    # "checked_to" (someone checked, nothing to call), "multiway" (3+ still
+    # in). "any" = every deal, the old behaviour.
+    spot: Literal["any", "first", "facing_bet", "checked_to", "multiway"] = "any"
     ante_bb: float = Field(3.0, ge=0.0, le=100.0)
     # Monte-Carlo rollouts per EV-loss candidate; 0 disables EV loss.
     # 16 keeps a deviating /trainer/act under ~1s with the 2048x4 net on CPU.
     # The PUBLIC build clamps this to MC_ROLLOUTS_PUBLIC_CAP (see
     # `_cap_settings`); 256 is the local-build ceiling.
     mc_rollouts: int = Field(16, ge=0, le=256)
-    # Display conversion: dollars per 1bb when the UI is in $ mode.
-    dollars_per_bb: float = Field(20.0, gt=0.0, le=100000.0)
+    # Display conversion: dollars per 1bb when the UI is in $ mode (the
+    # Study tab's default too — common.FORMAT_DEFAULTS, BE-019).
+    dollars_per_bb: float = Field(2.0, gt=0.0, le=100000.0)
 
     @model_validator(mode="after")
     def _check_ranges(self) -> "TrainerSettings":
@@ -705,6 +697,12 @@ class TrainerSettings(BaseModel):
 # local build keeps the model's own 0..256 range.
 MC_ROLLOUTS_PUBLIC_CAP = 32
 
+# Recent finished hands kept per player (and how many the state lists).
+RECENT_HANDS_MAX = 20
+RECENT_HANDS_SHOWN = 12
+# Drill filter: deals tried before settling for the last one (site FEAT-018).
+SPOT_MAX_DEALS = 30
+
 
 def mc_rollouts_cap() -> int:
     """Largest `mc_rollouts` the running build honours."""
@@ -723,27 +721,29 @@ def _cap_settings(settings: TrainerSettings) -> TrainerSettings:
 
 
 def _default_settings(variant: str) -> TrainerSettings:
-    """The format's factory settings. PLO5 = the TrainerSettings field
-    defaults (20bb bomb pot, 3bb ante, $20/bb). NLH = the 5/10($5)
-    table: 100bb top-off baseline, 100-250bb random band, 0.5bb ante,
-    $10/bb. Each format OWNS its settings object — switching formats
-    swaps objects, never overwrites values (a shared object once leaked
-    NLH's 0.5bb ante into PLO5 hands across a restart, 2026-07-04)."""
-    if variant == VARIANT_NLH:
-        return TrainerSettings(
-            stack_bb=100.0,
-            stack_min_bb=100.0,
-            stack_max_bb=250.0,
-            stacks_per_seat_bb=[(100.0, 100.0)] * 6,
-            ante_bb=0.5,
-            dollars_per_bb=10.0,
-        )
-    return TrainerSettings()
+    """The format's factory settings, from the ONE per-format table the
+    Study tab opens with too (`common.FORMAT_DEFAULTS`, BE-019): PLO5 =
+    20bb bomb pot, 3bb ante, $2/bb; NLH = the 5/10($5) table: 100bb top-off
+    baseline, 100-250bb random band, 0.5bb ante, $10/bb. Each format OWNS
+    its settings object — switching formats swaps objects, never overwrites
+    values (a shared object once leaked NLH's 0.5bb ante into PLO5 hands
+    across a restart, 2026-07-04)."""
+    d = format_defaults(variant)
+    stack = float(d["stack_bb"])
+    extra: dict[str, Any] = {}
+    if _engine_variant(variant) == VARIANT_NLH:
+        extra = {"stack_min_bb": 100.0, "stack_max_bb": 250.0}
+    return TrainerSettings(
+        stack_bb=stack,
+        stacks_per_seat_bb=[(stack, stack)] * 6,
+        ante_bb=float(d["ante_bb"]),
+        dollars_per_bb=float(d["dollars_per_bb"]),
+        **extra,
+    )
 
 
-class TrainerActRequest(BaseModel):
-    gate: str = Field(..., pattern=r"^(fold|check_call|raise)$")
-    chips: int | None = Field(default=None, ge=0)
+#: One action — the same request model as the Study API (BE-010).
+TrainerActRequest = ActionRequest
 
 
 class WhatifRequest(BaseModel):
@@ -757,6 +757,10 @@ class WhatifRequest(BaseModel):
 
 class StatsResetRequest(BaseModel):
     scope: Literal["session", "lifetime"]
+
+
+class OpenHandRequest(BaseModel):
+    id: str = Field(..., min_length=1, max_length=64, pattern=r"^[0-9a-f]+$")
 
 
 # --- Records ------------------------------------------------------------------
@@ -791,6 +795,10 @@ class DecisionRecord:
     # zero before summing biased every total upward.
     ev_loss_bb: float | None = None
     ev_loss_signed_bb: float | None = None
+    # (BE-006) Standard error of the MC estimate above (bb), from the paired
+    # per-rollout differences of the two candidates: the display shows the
+    # loss rounded to 0.1bb WITH this band, so noise isn't read as signal.
+    ev_loss_se_bb: float | None = None
     # Hero's total committed chips AT the decision node (= chips forfeited
     # on a fold). Rebases the EV components to forward-facing (fold = 0).
     hero_committed_chips: int = 0
@@ -838,9 +846,34 @@ class HandRecord:
     all_holes: list[list[int]] = field(default_factory=list)
     all_holes_dealt: list[list[int]] = field(default_factory=list)
     is_repeat: bool = False
+    # A drill-filter candidate (site FEAT-018): if it ends before the hero's
+    # first decision it is dropped, never recorded or counted.
+    trial: bool = False
     # Set once this hand's decisions were folded into the stats blocks
     # (`_commit_hand_stats`, at hand end) — guards against a double commit.
     stats_committed: bool = False
+    # The terminal frame's review block, built once (PERF-019): every later
+    # projection of the finished hand — the act response, GET /trainer/state
+    # polls — reuses it instead of replaying and re-running the networks.
+    review_cache: dict[str, Any] | None = None
+
+
+def _ev_display(x: float | None) -> float | None:
+    """An EV figure as shown to the user: 0.1bb. The MC estimate's own
+    standard error is ~1bb at the default 16 rollouts, so more decimals were
+    noise read as signal (BE-006); the stored values keep full precision."""
+    return None if x is None else round(float(x), 1)
+
+
+def _paired_se_bb(best: list[float], user: list[float], bb: int) -> float | None:
+    """Standard error (bb) of mean(best) - mean(user) from the per-rollout
+    payoffs of the two candidates (common random numbers: rollout i of each
+    arm starts from the same random stream, so pairing them is valid)."""
+    n = min(len(best), len(user))
+    if n < 2:
+        return None
+    diffs = [(b - u) / float(bb) for b, u in zip(best[:n], user[:n])]
+    return round(statistics.stdev(diffs) / math.sqrt(n), 4)
 
 
 def _finite(x: Any, default: float = 0.0) -> float:
@@ -940,9 +973,15 @@ class TrainerSession:
         stats_path: Path | None = None,
         critic: CentralCritic | None = None,
         backend: StrategyBackend | None = None,
+        formats: dict[str, dict[str, Any]] | None = None,
     ):
         self.model = model
         self.device = device
+        # The server's live per-format registry (`server.FORMATS`), when given:
+        # a model the admin reloads / promotes there reaches this session at
+        # its next hand (`_refresh_format_model`, OPS-027).
+        self.formats = formats
+        self._format_version: Any = None
         # Centralized critic (sees all hole cards) for the review's
         # "true EV" readout. None on v1 / when the checkpoint lacks one
         # → review shows only the actor's own (blind) value estimate.
@@ -971,8 +1010,12 @@ class TrainerSession:
         self.hand_no = 0
         self.session_stats = StatsBlock()
         self.lifetime_stats = StatsBlock()
+        # Finished hands, newest first (site FEAT-027): enough to reopen a
+        # hand's review later (config + seed + button + action log + graded
+        # decisions — a hand is a pure function of those). Persisted with the
+        # stats file, capped at RECENT_HANDS_MAX.
+        self.recent_hands: list[dict[str, Any]] = []
         self.rng = np.random.default_rng()
-        self._policy = model_policy(model, deterministic=False)
         self._obs_adapt = obs_adapter(model)
         # The critic is paired with the FORMAT's PPO actor (they were trained
         # together and share an obs width) — NOT with whatever network the
@@ -991,7 +1034,7 @@ class TrainerSession:
         self._load_persisted()
 
     def _sync_from_backend(self) -> None:
-        """`self.model` / `_policy` / `_obs_adapt` ALWAYS mirror the network
+        """`self.model` / `_obs_adapt` ALWAYS mirror the network
         the ACTIVE backend serves (anchor-spec labels, direct callers).
 
         (review 2026-09-20 H3) `set_backend` did this; `set_format(...,
@@ -1007,7 +1050,6 @@ class TrainerSession:
             return
         self.model = m
         self.device = getattr(self.backend, "device", self.device)
-        self._policy = model_policy(m, deterministic=False)
         self._obs_adapt = obs_adapter(m)
 
     def _refresh_ppo_host(self) -> None:
@@ -1085,7 +1127,6 @@ class TrainerSession:
         self._format_model = model
         self.critic = critic
         self._critic_obs_adapt = obs_adapter(model)
-        self._policy = model_policy(model, deterministic=False)
         self._obs_adapt = obs_adapter(model)
         if backend is not None:
             self.backend = backend
@@ -1099,6 +1140,35 @@ class TrainerSession:
         self._sync_from_backend()
         self.hand = None
         self.settings = self.settings_by_variant[variant]
+        entry = (self.formats or {}).get(variant) or {}
+        self._format_version = entry.get("version")
+
+    def _refresh_format_model(self) -> None:
+        """(OPS-027) Adopt a model the admin reloaded / promoted in the live
+        registry — at a hand boundary only, never mid-hand (a hand's review
+        and EV replays stay on the model that played it). The critic follows
+        its actor; a non-PPO backend (the NLH teacher) keeps serving and only
+        its PPO fallback is re-pointed."""
+        entry = (self.formats or {}).get(self.variant)
+        if not entry:
+            return
+        version = entry.get("version")
+        model = entry.get("model")
+        if version is None or version == self._format_version or model is None:
+            return
+        self._format_version = version
+        if model is self._format_model and entry.get("critic") is self.critic:
+            return
+        self.model = model
+        self._format_model = model
+        self.critic = entry.get("critic")
+        self._critic_obs_adapt = obs_adapter(model)
+        self._obs_adapt = obs_adapter(model)
+        if isinstance(self.backend, PpoSolverHost):
+            self.backend.rebind(model, self.device)
+        self._refresh_ppo_host()
+        self._sync_from_backend()
+        logger.info("trainer session picked up %s model version %s", self.variant, version)
 
     def set_settings(self, settings: TrainerSettings) -> None:
         """Replace the ACTIVE format's settings (and keep the per-format
@@ -1132,6 +1202,11 @@ class TrainerSession:
             logger.warning("trainer stats file %s unreadable (%s) — starting fresh",
                            self.stats_path, e)
             return
+        recent = data.get("recent_hands") if isinstance(data, dict) else None
+        if isinstance(recent, list):
+            self.recent_hands = [
+                r for r in recent if isinstance(r, dict) and isinstance(r.get("id"), str)
+            ][:RECENT_HANDS_MAX]
         try:
             self.lifetime_stats = StatsBlock.from_dict(data.get("lifetime", {}))
             # v2 schema: settings stored PER FORMAT. The legacy v1
@@ -1163,6 +1238,7 @@ class TrainerSession:
                 variant: s.model_dump()
                 for variant, s in self.settings_by_variant.items()
             },
+            "recent_hands": self.recent_hands,
         }
         try:
             self.stats_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1186,7 +1262,7 @@ class TrainerSession:
 
     # -- dealing ---------------------------------------------------------------
 
-    def _draw_stacks(self, n: int) -> tuple[int, ...]:
+    def _draw_stacks(self, n: int, hero_seat: int = 0) -> tuple[int, ...]:
         s = self.settings
         if s.stacks_mode == "fixed":
             return (int(round(s.stack_bb * BB_CHIPS)),) * n
@@ -1196,15 +1272,59 @@ class TrainerSession:
                           * BB_CHIPS))
                 for _ in range(n)
             )
-        # per_seat
-        out = []
-        for i in range(n):
-            lo, hi = s.stacks_per_seat_bb[i]
+        # per_seat: entry j is the seat j places to the hero's left — "You",
+        # "1st to your left", … in the settings (site ST-030). It used to index
+        # engine seats directly, and the hero's engine seat is random, so the
+        # rows meant nothing a player could see on the table.
+        out = [0] * n
+        for j in range(n):
+            lo, hi = s.stacks_per_seat_bb[j]
             v = lo if lo >= hi else float(self.rng.uniform(lo, hi))
-            out.append(int(round(v * BB_CHIPS)))
+            out[(hero_seat + j) % n] = int(round(v * BB_CHIPS))
         return tuple(out)
 
     def new_hand(self, repeat: bool = False) -> list[dict[str, Any]]:
+        """Deal a hand (or the same one again). With a drill filter set
+        (`settings.spot`), deal until the hero's first decision is that kind
+        of spot — at most SPOT_MAX_DEALS tries, then the last deal stands.
+        Tried-and-dropped deals take no hand number and count nowhere."""
+        spot = getattr(self.settings, "spot", "any")
+        if repeat or spot == "any":
+            return self._deal_one(repeat)
+        start_no = self.hand_no
+        frames: list[dict[str, Any]] = []
+        for _ in range(SPOT_MAX_DEALS):
+            self.hand_no = start_no
+            frames = self._deal_one(False, trial=True)
+            if self._spot_matches(spot):
+                break
+        if self.hand is not None:
+            self.hand.trial = False
+        return frames
+
+    def _spot_matches(self, spot: str) -> bool:
+        h = self.hand
+        if h is None or h.terminal or h.last_info is None or h.last_info.terminal:
+            return False
+        raw = h.env.observation_dict()
+        actor = raw.get("actor")
+        if actor is None or int(actor) != h.hero_seat:
+            return False
+        street = int(raw["street"])
+        before = [a for a in h.action_log if int(a["street"]) == street]
+        to_call = _to_call_chips(raw, h.hero_seat)
+        if spot == "first":
+            return not before
+        if spot == "facing_bet":
+            return to_call > 0
+        if spot == "checked_to":
+            return to_call == 0 and bool(before)
+        if spot == "multiway":
+            return sum(1 for f in raw["folded"] if not f) >= 3
+        return True
+
+    def _deal_one(self, repeat: bool, trial: bool = False) -> list[dict[str, Any]]:
+        self._refresh_format_model()
         s = self.settings
         if repeat:
             if self.hand is None:
@@ -1228,7 +1348,7 @@ class TrainerSession:
                 starting_stack=int(round(s.stack_bb * BB_CHIPS)),
                 ante=int(round(s.ante_bb * BB_CHIPS)),
                 bb=BB_CHIPS,
-                starting_stacks=self._draw_stacks(n),
+                starting_stacks=self._draw_stacks(n, hero_seat),
                 # NLH: the 5/10 structure — sb = bb/2, live preflop.
                 sb=BB_CHIPS // 2 if eng == VARIANT_NLH else 0,
                 variant=eng,
@@ -1251,12 +1371,13 @@ class TrainerSession:
             all_holes=[sorted(h, reverse=True) for h in env.all_hole_cards()],
             all_holes_dealt=env.all_hole_cards(),
             is_repeat=repeat,
+            trial=trial,
         )
         frames: list[dict[str, Any]] = []
         if env.is_terminal():
             # Everyone all-in from antes at deal time (stack <= ante):
             # the engine runs the boards out during reset.
-            self._finalize(np.asarray(env._rs.payouts(), dtype=np.float32))
+            self._finalize(np.asarray(env.payouts(), dtype=np.float32))
             frames.append(self.project_state())
         else:
             frames.append(self.project_state())  # fresh deal, pre-action
@@ -1265,6 +1386,34 @@ class TrainerSession:
 
     def _opp_seed(self, h: HandRecord) -> int:
         return _stable_seed(h.seed, len(h.action_log), 0x5DEECE66D)
+
+    def _sample_action(
+        self, host: StrategyBackend, obs: np.ndarray, info: StepInfo, rng_seed: int
+    ) -> tuple[int, int]:
+        """One sampled action at a node, re-seeded from `rng_seed`.
+
+        (PERF-015) The global RNG lock used to wrap the whole `host.act` —
+        the network's forward pass included — so every user's opponent moves
+        queued behind every other user's forwards. For the PPO host the
+        forward draws no random numbers: it now runs OUTSIDE the lock and
+        only seed -> sample (`_act_from_heads`) runs inside. `act` is exactly
+        forward + `_act_from_heads`, so the actions are bit-identical. Other
+        hosts (and v1 nets) keep the whole call under the lock."""
+        model = getattr(host, "model", None)
+        if not isinstance(host, PpoSolverHost) or not hasattr(model, "_act_from_heads"):
+            with _TORCH_RNG_LOCK:
+                return host.act(obs, info, deterministic=False, rng_seed=rng_seed)
+        adapt = self._ppo_obs_adapt if host is self._ppo_host else obs_adapter(model)
+        device = host.device
+        with torch.no_grad():
+            o = torch.from_numpy(adapt(obs)).unsqueeze(0).to(device)
+            m = torch.from_numpy(info.gate_mask).unsqueeze(0).to(device)
+            b = torch.from_numpy(sizing_from_info(info)[None, :]).to(device)
+            heads = model(o, m)
+            with _TORCH_RNG_LOCK:
+                torch.manual_seed(int(rng_seed) & 0x7FFFFFFFFFFFFFFF)
+                out = model._act_from_heads(*heads, b, deterministic=False)
+        return int(out.gate.item()), int(out.chips.item())
 
     def _advance(self, frames: list[dict[str, Any]] | None = None) -> None:
         """Opponents act (sampled) until it's hero's turn or the hand ends.
@@ -1281,7 +1430,7 @@ class TrainerSession:
             if info.actor is None:
                 if h.env.is_terminal():
                     self._finalize(
-                        np.asarray(h.env._rs.payouts(), dtype=np.float32)
+                        np.asarray(h.env.payouts(), dtype=np.float32)
                     )
                 break
             actor = int(info.actor)
@@ -1303,13 +1452,9 @@ class TrainerSession:
                 # through StrategyBackend so T1 PolicyNet swaps cleanly —
                 # via the host that COVERS this node (`_backend_for`).
                 host, _tag = self._backend_for(info)
-                with _TORCH_RNG_LOCK:
-                    gate, chips = host.act(
-                        h.last_obs,
-                        info,
-                        deterministic=False,
-                        rng_seed=self._opp_seed(h),
-                    )
+                gate, chips = self._sample_action(
+                    host, h.last_obs, info, self._opp_seed(h)
+                )
             obs, rewards, done, info2 = h.env.step_hybrid(gate, chips)
             entry = {"seat": actor, "gate": int(gate), "chips": int(chips),
                      "street": street}
@@ -1344,9 +1489,121 @@ class TrainerSession:
         assert h is not None
         h.terminal = True
         h.rewards_bb = [round(float(r) / h.config.bb, 4) for r in rewards]
+        if h.trial:
+            return  # a drill-filter candidate that ended before the hero acted
+        try:
+            self._record_recent(h)
+        except Exception:  # noqa: BLE001 — history is a convenience; never break a hand
+            logger.exception("trainer: could not record the finished hand")
         if not h.is_repeat:
             self._commit_hand_stats(h)
-            self._persist()
+        self._persist()
+
+    # -- recent hands (site FEAT-027 / FEAT-017) ----------------------------------
+
+    def _record_recent(self, h: HandRecord) -> None:
+        cfg = h.config
+        scores = [float(d.score) for d in h.decisions]
+        rec = {
+            "id": os.urandom(6).hex(),
+            "hand_no": int(h.hand_no),
+            "variant": self.variant,
+            "t": round(time.time(), 1),
+            "seed": int(h.seed),
+            "button": int(h.button),
+            "hero_seat": int(h.hero_seat),
+            "config": {
+                "num_seats": int(cfg.num_seats),
+                "starting_stack": int(cfg.starting_stack),
+                "ante": int(cfg.ante),
+                "bb": int(cfg.bb),
+                "sb": int(cfg.sb),
+                "starting_stacks": [int(x) for x in cfg.resolved_stacks],
+                "variant": str(cfg.variant),
+            },
+            "action_log": [
+                {k: (bool(v) if k == "auto" else int(v)) for k, v in a.items()}
+                for a in h.action_log
+            ],
+            "decisions": [dataclasses.asdict(d) for d in h.decisions],
+            "rewards_bb": [float(x) for x in (h.rewards_bb or [])],
+            "is_repeat": bool(h.is_repeat),
+            "position": self._position_of(h.hero_seat),
+            "score": round(sum(scores) / len(scores), 1) if scores else None,
+        }
+        self.recent_hands.insert(0, rec)
+        del self.recent_hands[RECENT_HANDS_MAX:]
+
+    def recent_summaries(self) -> list[dict[str, Any]]:
+        out = []
+        for r in self.recent_hands[:RECENT_HANDS_SHOWN]:
+            rewards = r.get("rewards_bb") or []
+            hero = int(r.get("hero_seat", 0))
+            out.append({
+                "id": r["id"],
+                "hand_no": r.get("hand_no"),
+                "format": r.get("variant"),
+                "t": r.get("t"),
+                "position": r.get("position"),
+                "seats": (r.get("config") or {}).get("num_seats"),
+                "net_bb": rewards[hero] if hero < len(rewards) else None,
+                "score": r.get("score"),
+                "moves": len(r.get("decisions") or []),
+                "repeat": bool(r.get("is_repeat")),
+            })
+        return out
+
+    def open_recent(self, rid: str) -> None:
+        """Make a recent hand the current (finished) hand, so the review,
+        what-if and Repeat work on it exactly as they did when it ended.
+        Its decisions were already counted — it is never counted again."""
+        rec = next((r for r in self.recent_hands if r.get("id") == rid), None)
+        if rec is None:
+            raise HTTPException(status_code=404, detail="That hand is no longer in your recent hands.")
+        if rec.get("variant") != self.variant:
+            raise HTTPException(
+                status_code=409,
+                detail="That hand was played in another format — switch format to open it.",
+            )
+        c = rec["config"]
+        config = GameConfig(
+            num_seats=int(c["num_seats"]),
+            starting_stack=int(c["starting_stack"]),
+            ante=int(c["ante"]),
+            bb=int(c["bb"]),
+            starting_stacks=tuple(int(x) for x in c["starting_stacks"]),
+            sb=int(c["sb"]),
+            variant=str(c["variant"]),
+        )
+        env = BombPotEnv(config)
+        obs, info = env.reset(int(rec["seed"]), int(rec["button"]))
+        holes = env.all_hole_cards()
+        log = [dict(a) for a in rec["action_log"]]
+        for a in log:
+            obs, _, _, info = env.step_hybrid(int(a["gate"]), int(a["chips"]))
+        names = {f.name for f in dataclasses.fields(DecisionRecord)}
+        decisions = [
+            DecisionRecord(**{k: v for k, v in d.items() if k in names})
+            for d in rec["decisions"]
+        ]
+        self.hand = HandRecord(
+            hand_no=int(rec["hand_no"]),
+            seed=int(rec["seed"]),
+            button=int(rec["button"]),
+            hero_seat=int(rec["hero_seat"]),
+            config=config,
+            env=env,
+            last_obs=obs,
+            last_info=info,
+            action_log=log,
+            decisions=decisions,
+            terminal=True,
+            rewards_bb=[float(x) for x in rec["rewards_bb"]],
+            all_holes=[sorted(h, reverse=True) for h in holes],
+            all_holes_dealt=holes,
+            is_repeat=bool(rec["is_repeat"]),
+            stats_committed=True,
+        )
 
     def _commit_hand_stats(self, h: HandRecord) -> None:
         """Fold a COMPLETED hand into the session + lifetime blocks.
@@ -1448,23 +1705,34 @@ class TrainerSession:
         )
 
         street = int(raw["street"])
+        # (BE-004) The Monte-Carlo EV estimate runs BEFORE the live engine is
+        # stepped (it replays the recorded prefix, which is exactly the log so
+        # far), and a failure in it only means "EV loss unavailable" — it used
+        # to raise AFTER hero's move was applied, leaving a hand with no
+        # DecisionRecord that nothing would ever move again.
+        try:
+            self._estimate_ev_loss(decision)
+        except Exception:  # noqa: BLE001 — a cosmetic estimate never blocks play
+            logger.exception("trainer EV-loss estimate failed (hand %s)", h.hand_no)
+            decision.ev_user_bb = decision.ev_best_bb = None
+            decision.ev_loss_bb = decision.ev_loss_signed_bb = None
+            decision.ev_loss_se_bb = None
         obs, rewards, done, info2 = h.env.step_hybrid(gate_idx, chips)
         h.action_log.append({"seat": int(h.hero_seat), "gate": int(gate_idx),
                              "chips": int(chips), "street": street})
         h.opp_actions_since_hero = []
         h.last_obs, h.last_info = obs, info2
-        # Record the decision (+ its EV-loss estimate and feedback) BEFORE
-        # building any terminal frame. The terminal frame's review block is
-        # gated on the decision being in h.decisions; a multiway all-in run-out
-        # snapshots its terminal frame INSIDE _advance — i.e. before the old
-        # post-branch append — so it shipped `review: null`, and the review pane
-        # only ever opened via the post-animation applyState(final). On long
-        # run-out animations the client's animSeq abort skips that settle and
-        # the review never appeared. Recording first makes the terminal frame
-        # self-sufficient. (Non-terminal frames stay review-less — the review
-        # block is also gated on h.terminal.) It must also precede _finalize:
-        # the hand's stats are committed there from h.decisions.
-        self._estimate_ev_loss(decision)
+        # Record the decision BEFORE building any terminal frame. The terminal
+        # frame's review block is gated on the decision being in h.decisions; a
+        # multiway all-in run-out snapshots its terminal frame INSIDE _advance —
+        # i.e. before the old post-branch append — so it shipped `review: null`,
+        # and the review pane only ever opened via the post-animation
+        # applyState(final). On long run-out animations the client's animSeq
+        # abort skips that settle and the review never appeared. Recording
+        # first makes the terminal frame self-sufficient. (Non-terminal frames
+        # stay review-less — the review block is also gated on h.terminal.) It
+        # must also precede _finalize: the hand's stats are committed there
+        # from h.decisions.
         h.decisions.append(decision)
         frames: list[dict[str, Any]] = []
         if done:
@@ -1472,9 +1740,30 @@ class TrainerSession:
             frames.append(self.project_state())
         else:
             frames.append(self.project_state())  # hero's action landed
-            self._advance(frames)
+            try:
+                self._advance(frames)
+            except Exception:  # noqa: BLE001 — /trainer/state resumes the hand
+                logger.exception("trainer opponents failed to act (hand %s)", h.hand_no)
         # Stats are committed per hand in _finalize (see _commit_hand_stats).
         return frames
+
+    def resume(self) -> bool:
+        """(BE-004) Move a live hand that is waiting on an OPPONENT (or on a
+        moot auto-check) — the state an interrupted `_advance` leaves behind.
+        Returns True when it advanced. Safe to call any time."""
+        h = self.hand
+        if h is None or h.terminal or h.last_info is None:
+            return False
+        actor = h.last_info.actor
+        if actor is None:
+            if h.env.is_terminal():
+                self._advance()
+                return True
+            return False
+        if int(actor) == h.hero_seat and not _betting_moot(h.last_info.raw_obs, int(actor)):
+            return False
+        self._advance()
+        return True
 
     def _feedback_payload(
         self, d: DecisionRecord, reveal_ev: bool = True
@@ -1514,7 +1803,8 @@ class TrainerSession:
             # Which host graded this decision ("ppo_fallback" = the active GTO
             # host does not cover this node; the PPO net served it).
             "backend": d.backend,
-            "ev_loss_bb": round(d.ev_loss_bb, 3) if (has_ev and reveal_ev) else None,
+            "ev_loss_bb": _ev_display(d.ev_loss_bb) if (has_ev and reveal_ev) else None,
+            "ev_loss_se_bb": _ev_display(d.ev_loss_se_bb) if (has_ev and reveal_ev) else None,
             "ev_loss_hidden": bool(has_ev and not reveal_ev),
         }
 
@@ -1551,8 +1841,15 @@ class TrainerSession:
             return
         node_seed = _stable_seed(h.seed, d.action_log_idx, 0xEC0FFEE)
         prefix = h.action_log[: d.action_log_idx]
-        ev_user = self._rollout_ev(h, prefix, d.user_gate, d.user_chips, n, node_seed)
-        ev_best = self._rollout_ev(h, prefix, d.rec_gate, d.rec_chips, n, node_seed)
+        per_user: list[float] = []
+        per_best: list[float] = []
+        ev_user = self._rollout_ev(
+            h, prefix, d.user_gate, d.user_chips, n, node_seed, per_rollout=per_user
+        )
+        ev_best = self._rollout_ev(
+            h, prefix, d.rec_gate, d.rec_chips, n, node_seed, per_rollout=per_best
+        )
+        d.ev_loss_se_bb = _paired_se_bb(per_best, per_user, h.config.bb)
         # Forward-facing EV: rebase by the chips already committed at this
         # node (sunk), so a fold reads as 0 EV instead of -(committed). The
         # offset is identical for both candidates, so the loss is unchanged.
@@ -1572,6 +1869,7 @@ class TrainerSession:
         chips: int,
         n: int,
         node_seed: int,
+        per_rollout: list[float] | None = None,
     ) -> float:
         """Mean hero payoff (bb) over `n` network-vs-network continuations
         of this deal after `prefix` + the candidate action. Same
@@ -1587,7 +1885,7 @@ class TrainerSession:
         the snapshot makes the draws exactly the uninterrupted
         `manual_seed(node_seed)` stream no matter what other threads seed in
         between, so values are bit-identical to the hold-the-lock version
-        (pinned by tests/python/test_review_trainer_session.py).
+        (pinned by tests/python/site/test_review_trainer_session.py).
 
         (review 2026-09-20, GTO serve==train) Continuations are sampled by
         the host that SERVES each node (`_backend_for`), the same one that
@@ -1604,7 +1902,10 @@ class TrainerSession:
         envs in rollout order), all inside one lock region."""
         hero = h.hero_seat
         total = 0.0
-        live: list[list[Any]] = []  # [env, obs, info]
+        # Per-rollout payoffs in rollout order (chips), for the estimate's
+        # standard error (BE-006). The mean below is summed exactly as before.
+        per = [0.0] * n
+        live: list[list[Any]] = []  # [env, obs, info, rollout index]
         for i in range(n):
             # EV runouts: grade all-in continuations by expected value over
             # board runouts instead of one sampled runout — same rollout
@@ -1616,16 +1917,18 @@ class TrainerSession:
                 obs, _, _, info = env.step_hybrid(a["gate"], a["chips"])
             obs, rewards, done, info = env.step_hybrid(gate, chips)
             if not done:
-                live.append([env, obs, info])
+                live.append([env, obs, info, i])
                 continue
             total += float(rewards[hero])
+            per[i] = float(rewards[hero])
             if i == 0:
                 # The replay is a pure function of (config, seed, button,
                 # prefix, candidate): if the candidate ends the hand (a fold,
                 # a closing call) all n copies end identically — add the same
                 # reward n-1 more times instead of replaying them.
-                for _ in range(n - 1):
+                for k in range(n - 1):
                     total += float(rewards[hero])
+                    per[k + 1] = float(rewards[hero])
                 break
 
         # Lockstep: one sampling region per depth across all live rollouts.
@@ -1661,6 +1964,14 @@ class TrainerSession:
                     ).to(ppo.device),
                 )
             actions: list[tuple[int, int] | None] = [None] * len(live)
+            # (PERF-015) The batched forward draws no random numbers, so it
+            # runs BEFORE taking the process-wide RNG lock; only the sampling
+            # (`_act_from_heads`) runs inside. `act` = forward + that, so the
+            # draws are bit-identical to the all-inside version.
+            heads_b = None
+            if batch_in is not None and hasattr(batch_in[0], "_act_from_heads"):
+                with torch.no_grad():
+                    heads_b = batch_in[0](batch_in[1], batch_in[2])
             with _TORCH_RNG_LOCK:
                 if rng_state is None:
                     torch.manual_seed(node_seed)
@@ -1669,9 +1980,14 @@ class TrainerSession:
                 if batch_in is not None:
                     model_b, obs_b, gm_b, sizing_b = batch_in
                     with torch.no_grad():
-                        _mc_out = model_b.act(
-                            obs_b, gm_b, sizing_b, deterministic=False
-                        )
+                        if heads_b is not None:
+                            _mc_out = model_b._act_from_heads(
+                                *heads_b, sizing_b, deterministic=False
+                            )
+                        else:
+                            _mc_out = model_b.act(
+                                obs_b, gm_b, sizing_b, deterministic=False
+                            )
                     for j, g, c in zip(
                         batch_idx, _mc_out.gate.tolist(), _mc_out.chips.tolist()
                     ):
@@ -1689,9 +2005,12 @@ class TrainerSession:
                 obs2, rewards, done, info2 = x[0].step_hybrid(action[0], action[1])
                 if done:
                     total += float(rewards[hero])
+                    per[x[3]] = float(rewards[hero])
                 else:
-                    nxt.append([x[0], obs2, info2])
+                    nxt.append([x[0], obs2, info2, x[3]])
             live = nxt
+        if per_rollout is not None:
+            per_rollout[:] = per
         return total / n / h.config.bb
 
     # -- review / what-if ------------------------------------------------------------
@@ -1862,10 +2181,11 @@ class TrainerSession:
                 "marks": CATEGORY_MARKS[d.category],
                 "gate_ratio": round(d.gate_ratio, 4),
                 "size_q": round(d.size_q, 4),
-                "ev_user_bb": d.ev_user_bb,
-                "ev_best_bb": d.ev_best_bb,
-                "ev_loss_bb": d.ev_loss_bb,
-                "ev_loss_signed_bb": d.ev_loss_signed_bb,
+                "ev_user_bb": _ev_display(d.ev_user_bb),
+                "ev_best_bb": _ev_display(d.ev_best_bb),
+                "ev_loss_bb": _ev_display(d.ev_loss_bb),
+                "ev_loss_signed_bb": _ev_display(d.ev_loss_signed_bb),
+                "ev_loss_se_bb": _ev_display(d.ev_loss_se_bb),
             })
             if d.head_version >= 2:
                 nc["user_anchor"] = d.user_anchor
@@ -1928,10 +2248,11 @@ class TrainerSession:
             "actor_commit_chips": d.actor_commit_chips,
             "backend": d.backend,
             "pot_chips": d.pot_chips,
-            "ev_user_bb": d.ev_user_bb,
-            "ev_best_bb": d.ev_best_bb,
-            "ev_loss_bb": d.ev_loss_bb,
-            "ev_loss_signed_bb": d.ev_loss_signed_bb,
+            "ev_user_bb": _ev_display(d.ev_user_bb),
+            "ev_best_bb": _ev_display(d.ev_best_bb),
+            "ev_loss_bb": _ev_display(d.ev_loss_bb),
+            "ev_loss_signed_bb": _ev_display(d.ev_loss_signed_bb),
+            "ev_loss_se_bb": _ev_display(d.ev_loss_se_bb),
         }
         if d.head_version >= 2:
             current["head_version"] = 2
@@ -1965,8 +2286,8 @@ class TrainerSession:
                 "to_call_chips": int(d.to_call_chips),
                 "actor_commit_chips": int(d.actor_commit_chips),
                 "backend": d.backend,
-                "ev_loss_bb": round(d.ev_loss_bb, 3)
-                if d.ev_loss_bb is not None else None,
+                "ev_loss_bb": _ev_display(d.ev_loss_bb),
+                "ev_loss_se_bb": _ev_display(d.ev_loss_se_bb),
             }
             for d in h.decisions
         ]
@@ -2026,7 +2347,8 @@ class TrainerSession:
         revealed). Sliced from the terminal boards — boards only grow."""
         h = self.hand
         assert h is not None
-        raw = dict(h.env._rs.observation_dict())
+        # Boards only — skip the opponent Monte-Carlo (PERF-021).
+        raw = h.env.observation_dict()
         ba = [int(c) for c in raw["board_a"]]
         bb_ = [int(c) for c in raw["board_b"]]
         street = d.street
@@ -2199,7 +2521,8 @@ class TrainerSession:
             info = h.last_info
         cfg = h.config
         bb = cfg.bb
-        raw = dict(env._rs.observation_dict())
+        # Public fields only — skip the opponent Monte-Carlo (PERF-021).
+        raw = env.observation_dict()
 
         actor_raw = raw.get("actor")
         actor = int(actor_raw) if actor_raw is not None else None
@@ -2224,63 +2547,28 @@ class TrainerSession:
         if reveal is None:
             reveal = h.terminal
 
-        seats: list[dict[str, Any]] = []
-        for seat in range(cfg.num_seats):
+        def hole_of(seat: int) -> list[int] | None:
             if seat == h.hero_seat:
-                hole: list[int] | None = (
-                    card_spec_override["hero_hole"]  # type: ignore[assignment]
+                return (
+                    card_spec_override["hero_hole"]  # type: ignore[return-value]
                     if card_spec_override is not None
                     else list(h.all_holes[seat])
                 )
-            elif reveal:
-                hole = list(h.all_holes[seat])
-            else:
-                hole = None
-            seats.append({
-                "seat": seat,
-                "position": self._position_of(seat),
-                "stack_chips": int(raw["stacks"][seat]),
-                "stack_bb": round(chips_to_bb(int(raw["stacks"][seat]), bb), 4),
-                "committed_this_street_bb": round(
-                    chips_to_bb(int(raw["street_commit"][seat]), bb), 4
-                ),
-                "committed_total_bb": round(
-                    chips_to_bb(int(raw["total_commit"][seat]), bb), 4
-                ),
-                "committed_this_street_chips": int(raw["street_commit"][seat]),
-                "folded": bool(raw["folded"][seat]),
-                "participant": True,
-                "all_in": bool(raw["all_in"][seat]),
-                "is_actor": actor is not None and seat == actor,
-                "is_hero": seat == h.hero_seat,
-                "hole": hole,
-            })
+            return list(h.all_holes[seat]) if reveal else None
 
-        if actor is not None and info is not None and not info.terminal:
-            gm = info.gate_mask
-            legal = {
-                "fold": bool(gm[GATE_FOLD]),
-                "check_call": bool(gm[GATE_CHECK_CALL]),
-                "raise": bool(gm[GATE_RAISE]),
-            }
-            max_chips = int(info.max_raise_chips)
-            min_chips = min(int(info.min_raise_chips), max_chips)
-            # Short-shove: collapse to a single point so the UI renders an
-            # All-in button (matches the study projection).
-            if legal["raise"] and min_chips == 0 and max_chips > 0:
-                min_chips = max_chips
-            raise_bounds = {
-                "min_chips": min_chips,
-                "max_chips": max_chips,
-                "min_bb": round(chips_to_bb(min_chips, bb), 4),
-                "max_bb": round(chips_to_bb(max_chips, bb), 4),
-            }
-            to_call = _to_call_chips(raw, actor)
-        else:
-            legal = {k: False for k in ("fold", "check_call", "raise")}
-            raise_bounds = {"min_chips": 0, "max_chips": 0,
-                            "min_bb": 0.0, "max_bb": 0.0}
-            to_call = 0
+        # The table half (seats, pot, buttons, raise window, history, chip
+        # scale) is the Study's own: `common.table_state` (BE-008). Nobody
+        # acts at a terminal node.
+        table = _table_state(
+            raw,
+            cfg,
+            button_seat=h.button,
+            hero_seat=h.hero_seat,
+            info=info if (info is not None and not info.terminal) else None,
+            dollars_per_bb=self.settings.dollars_per_bb,
+            position_of=self._position_of,
+            hole_of=hole_of,
+        )
 
         is_nlh = _engine_variant(self.variant) == VARIANT_NLH
         if card_spec_override is not None:
@@ -2331,59 +2619,34 @@ class TrainerSession:
         if review is None and live and h.terminal and h.decisions:
             # Open review on the last hero decision, but attach its
             # node_current so the dual-EV node view is populated from the
-            # first frame (one extra replay+forward+critic at hand-end).
-            last = h.decisions[-1]
-            _e, _o, _i = self._replay_to_node(last.action_log_idx)
-            review = self.review_block(
-                len(h.decisions) - 1,
-                node_idx=last.action_log_idx,
-                node_current=self._node_view(last.action_log_idx, _o, _i),
-            )
+            # first frame (one replay+forward+critic at hand end — ONCE: the
+            # finished hand never changes, so every later projection reuses
+            # it, PERF-019).
+            if h.review_cache is None:
+                last = h.decisions[-1]
+                _e, _o, _i = self._replay_to_node(last.action_log_idx)
+                h.review_cache = self.review_block(
+                    len(h.decisions) - 1,
+                    node_idx=last.action_log_idx,
+                    node_current=self._node_view(last.action_log_idx, _o, _i),
+                )
+            review = h.review_cache
 
         state = {
-            "num_seats": cfg.num_seats,
-            "button_seat": h.button,
-            "hero_seat": h.hero_seat,
-            "actor": actor,
-            "seats": seats,
+            **table,
             "card_spec": card_spec,
             "hero_hand_desc": hero_hand_desc,
             "hero_info_complete": True,
             "hero_blocking_reason": None,
             "modified_cards": [],
-            "pot_chips": int(raw["pot"]),
-            "pot_bb": round(chips_to_bb(int(raw["pot"]), bb), 4),
-            # Settled pot ("Pot") = pot minus this street's live commits;
-            # pot_chips is the grand "Total Pot".
-            "settled_pot_chips": int(raw["pot"]) - sum(int(x) for x in raw["street_commit"]),
-            "settled_pot_bb": round(
-                chips_to_bb(
-                    int(raw["pot"]) - sum(int(x) for x in raw["street_commit"]), bb
-                ), 4
-            ),
-            "bet_to_call_chips": int(raw["bet_to_call"]),
-            "bet_to_call_bb": round(chips_to_bb(int(raw["bet_to_call"]), bb), 4),
-            "to_call_chips": int(to_call),
-            "to_call_bb": round(chips_to_bb(int(to_call), bb), 4),
-            "street": STREET_NAMES.get(int(raw["street"]), "flop"),
-            "history": history_entries(raw, self._position_of, bb),
-            "legal": legal,
-            "raise_bounds": raise_bounds,
             "terminal": terminal,
             "terminal_message": terminal_message,
             "awaiting_next_street": None,
             "recommendation": None,
             "can_undo": False,
-            "chip_scale": {
-                "bb_chips": int(bb),
-                "ante_chips": int(cfg.ante),
-                "dollars_per_bb": float(self.settings.dollars_per_bb),
-            },
-            "starting_stacks_chips": [int(s) for s in cfg.resolved_stacks],
-            "starting_stacks_bb": [
-                round(chips_to_bb(int(s), bb), 4) for s in cfg.resolved_stacks
-            ],
-            **({} if _PUBLIC else {"simple_ocr_mode": False}),
+            # The public build's payload carries no trace of the live-capture
+            # fields (read when it runs, like the other public guards).
+            **({} if _public_mode() else {"simple_ocr_mode": False}),
             "format": self.variant,
             "trainer": {
                 "settings": self.settings.model_dump(),
@@ -2431,6 +2694,9 @@ class TrainerSession:
                     "session": self.session_stats.project(),
                     "lifetime": self.lifetime_stats.project(),
                 },
+                # Newest-first summaries of finished hands (reopen with
+                # POST /trainer/hands/open).
+                "recent": self.recent_summaries(),
                 "review": review,
             },
         }
@@ -2507,11 +2773,8 @@ def _study_replay(
     return obs, info
 
 
-def _to_call_chips(obs: dict[str, Any], actor: int) -> int:
-    current_commit = int(obs["street_commit"][actor])
-    stack = int(obs["stacks"][actor])
-    bet_to_call = int(obs["bet_to_call"])
-    return min(max(0, bet_to_call - current_commit), stack)
+#: The amount-to-call rule lives in `common` (BE-010).
+_to_call_chips = _common_to_call_chips
 
 
 # A stack at or below this is "dust": chips that can neither make nor
@@ -2576,25 +2839,36 @@ def create_trainer_router(
     critic: CentralCritic | None = None,
     formats: dict[str, dict[str, Any]] | None = None,
     gto_checkpoint: str | Path | None = None,
+    gto_host: StrategyBackend | None = None,
 ) -> APIRouter:
-    # Optional T1 host: env PLO5BP_GTO_CHECKPOINT or explicit path.
-    gto_path = gto_checkpoint or os.environ.get("PLO5BP_GTO_CHECKPOINT", "").strip() or None
-    gto_host = try_load_gto_host(gto_path, device=device) if gto_path else None
-    default_ts = TrainerSession(model, device, critic=critic)
-    if gto_host is not None and default_ts.variant == VARIANT_NLH:
-        default_ts.set_backend(gto_host)
+    """The /trainer/* routes. ``gto_host`` = an already-loaded NLH teacher
+    (the server shares ITS host: loading the checkpoint twice cost startup
+    time and memory, PERF-023); else ``gto_checkpoint`` /
+    ``PLO5BP_GTO_CHECKPOINT`` names one to load here."""
+    if gto_host is None:
+        gto_path = gto_checkpoint or os.environ.get("PLO5BP_GTO_CHECKPOINT", "").strip() or None
+        gto_host = try_load_gto_host(gto_path, device=device) if gto_path else None
+    # Per-format (model, critic) registry mirroring server.FORMATS; used
+    # by set_format to swap what the CURRENT trainer session serves, and by
+    # every session to pick up a reloaded model at its next hand.
+    router_formats = formats if formats is not None else {}
+    # The local build's single session. The public build never uses one (each
+    # user gets their own), so it isn't built there (BE-016).
+    default_ts = (
+        None if _public_mode()
+        else TrainerSession(model, device, critic=critic, formats=router_formats)
+    )
     router = APIRouter(prefix="/trainer")
     router.trainer_session = default_ts  # type: ignore[attr-defined]  # test hook
-    # Per-format (model, critic) registry mirroring server.FORMATS; used
-    # by set_format to swap what the CURRENT trainer session serves.
-    router_formats = formats or {}
 
     def _ts() -> TrainerSession:
         if _SESSION_RESOLVER is not None:
             resolved = _SESSION_RESOLVER()
             if resolved is not None:
+                if getattr(resolved, "formats", None) is None:
+                    resolved.formats = router_formats
                 return resolved
-        if _public_mode():
+        if _public_mode() or default_ts is None:
             # FAIL CLOSED (review 2026-09-20, latent): the default session is
             # ONE object shared by every caller. In the public build a request
             # that reaches here without a per-user session (auth middleware
@@ -2607,6 +2881,22 @@ def create_trainer_router(
             raise HTTPException(status_code=401, detail="sign in required")
         return default_ts
 
+    @contextmanager
+    def _locked(ts: TrainerSession):
+        """(PERF-013) The session lock, with a deadline: a request that
+        cannot get it in time answers 429 "busy" instead of parking a worker
+        thread (the pool is shared by every user) behind a stuck request."""
+        if not ts.lock.acquire(timeout=SESSION_LOCK_TIMEOUT_S):
+            raise HTTPException(
+                status_code=429,
+                detail="Still working on your previous move — try again in a moment.",
+                headers={"Retry-After": "1"},
+            )
+        try:
+            yield
+        finally:
+            ts.lock.release()
+
     def set_format(variant: str) -> None:
         """Switch the resolved trainer session's game format (called by
         the study server's POST /format so both tabs track one game)."""
@@ -2614,7 +2904,7 @@ def create_trainer_router(
         if entry is None:
             raise ValueError(f"no model registered for format {variant!r}")
         ts = _ts()
-        with ts.lock:
+        with _locked(ts):
             # T1: NLH + GTO checkpoint → PolicyNetHost; else PPO host for format.
             be = None
             if variant == VARIANT_NLH and gto_host is not None:
@@ -2626,18 +2916,38 @@ def create_trainer_router(
     def _ensure_hand(ts: TrainerSession) -> None:
         if ts.hand is None:
             ts.new_hand()
+        else:
+            # (BE-004) A hand an interrupted request left waiting on an
+            # opponent moves on here instead of staying stuck.
+            ts.resume()
 
-    @router.get("/state")
-    def trainer_state() -> dict[str, Any]:
-        ts = _ts()
-        with ts.lock:
+    def _state(ts: TrainerSession, *, deal: bool) -> dict[str, Any]:
+        with _locked(ts):
+            if ts.hand is None and not deal:
+                raise HTTPException(
+                    status_code=409, detail="no active hand",
+                )
             _ensure_hand(ts)
             return {"state": ts.project_state()}
+
+    @router.get("/state")
+    def trainer_state(request: Request) -> dict[str, Any]:
+        """The trainer table. Deals the first hand when there is none — but
+        only for the app's own fetch() (BE-013): a browser navigation, link
+        preview or prefetch of this URL must not deal (and, with the paywall
+        on, spend a free hand)."""
+        ts = _ts()
+        return _state(ts, deal=not _passive_get(request))
+
+    @router.post("/state")
+    def trainer_state_post() -> dict[str, Any]:
+        """Same as GET, as an explicitly state-changing verb (deals if needed)."""
+        return _state(_ts(), deal=True)
 
     @router.post("/settings")
     def trainer_settings(req: TrainerSettings) -> dict[str, Any]:
         ts = _ts()
-        with ts.lock:
+        with _locked(ts):
             # Applies to the ACTIVE format only (each format owns its
             # settings; set_settings keeps the per-format registry in sync).
             ts.set_settings(req)
@@ -2648,14 +2958,14 @@ def create_trainer_router(
     @router.post("/new_hand")
     def trainer_new_hand() -> dict[str, Any]:
         ts = _ts()
-        with ts.lock:
+        with _locked(ts):
             frames = ts.new_hand()
             return {"state": ts.project_state(), "frames": frames}
 
     @router.post("/repeat")
     def trainer_repeat() -> dict[str, Any]:
         ts = _ts()
-        with ts.lock:
+        with _locked(ts):
             if ts.hand is None:
                 raise HTTPException(status_code=400, detail="no hand to repeat")
             frames = ts.new_hand(repeat=True)
@@ -2664,7 +2974,7 @@ def create_trainer_router(
     @router.post("/act")
     def trainer_act(req: TrainerActRequest) -> dict[str, Any]:
         ts = _ts()
-        with ts.lock:
+        with _locked(ts):
             # No `_ensure_hand` here (review 2026-09-20 F9 / F6): with no live
             # hand (restart, LRU eviction, format switch) the old path dealt a
             # fresh — unmetered — hand and applied the client's stale action to
@@ -2678,7 +2988,7 @@ def create_trainer_router(
         decision: int = 0, node: int | None = None
     ) -> dict[str, Any]:
         ts = _ts()
-        with ts.lock:
+        with _locked(ts):
             if node is not None:
                 return {"state": ts.review_at_node(node)}
             d = ts._decision_for(decision)
@@ -2693,13 +3003,21 @@ def create_trainer_router(
     @router.post("/whatif")
     def trainer_whatif(req: WhatifRequest) -> dict[str, Any]:
         ts = _ts()
-        with ts.lock:
+        with _locked(ts):
             return {"state": ts.whatif(req)}
+
+    @router.post("/hands/open")
+    def trainer_open_hand(req: OpenHandRequest) -> dict[str, Any]:
+        """Reopen a recent finished hand's review (site FEAT-027)."""
+        ts = _ts()
+        with _locked(ts):
+            ts.open_recent(req.id)
+            return {"state": ts.project_state()}
 
     @router.post("/stats/reset")
     def trainer_stats_reset(req: StatsResetRequest) -> dict[str, Any]:
         ts = _ts()
-        with ts.lock:
+        with _locked(ts):
             if req.scope == "session":
                 ts.session_stats = StatsBlock()
             else:
@@ -2709,3 +3027,14 @@ def create_trainer_router(
             return {"state": ts.project_state()}
 
     return router
+
+
+def _passive_get(request: Request) -> bool:
+    """A GET the user did not make from the app: a navigation (address bar,
+    link), a link preview or a prefetch. The app's fetch() is mode
+    cors/same-origin; clients that send no fetch metadata count as the app."""
+    h = request.headers
+    purpose = (h.get("sec-purpose") or h.get("purpose") or "").lower()
+    if "prefetch" in purpose or "prerender" in purpose:
+        return True
+    return (h.get("sec-fetch-mode") or "").lower() == "navigate"

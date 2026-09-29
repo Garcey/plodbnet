@@ -278,8 +278,10 @@
     const nx = f.next;
     if (nx && Number.isInteger(s.my_seat) && nx.you && !nx.you.barred) {
       // (a seal this device has not committed to — new hand, redone shuffle, or the
-      // same id under a different seal: always a fresh number, never a reused one)
-      if (nx.stage === "commit" && (!F.mem[nx.hand_id] || F.mem[nx.hand_id].seal !== nx.seal)) commit(s, nx);
+      // same id under a different seal: always a fresh number, never a reused one; and
+      // after a change of seats (FEAT-013) a commitment names the old seat: commit again)
+      const m0 = F.mem[nx.hand_id];
+      if (nx.stage === "commit" && (!m0 || m0.seal !== nx.seal || m0.seat !== s.my_seat)) commit(s, nx);
       else if (nx.stage === "reveal") reveal(s, nx);
     }
     if (f.hand) checkHand(s, f.hand);
@@ -287,12 +289,14 @@
   }
 
   // --------------------------------------------------------------------- tell
+  // [tone, words, tooltip, icon] — the icon says it too: a phone shows only the icon
+  // (CPY-009: the idle pill used to say "Verified" in the unverified grey)
   const LABEL = {
-    mine: ["ok", "Verified shuffle", "Your device helped cut this deck, and every card you have been shown checks out."],
-    others: ["mid", "Shuffle cut by others", "Other players' devices cut this deck; yours did not take part in this hand. Every card you have been shown checks out."],
-    none: ["off", "Unverified shuffle", "Nobody's device took part in this hand's shuffle. The deck was sealed before the deal (no card could be swapped), but its order was the server's alone."],
-    pending: ["mid", "Checking…", "Checking this hand's shuffle."],
-    failed: ["bad", "SHUFFLE CHECK FAILED", ""],
+    mine: ["ok", "Verified shuffle", "Your device helped cut this deck, and every card you have been shown checks out.", "i-shield"],
+    others: ["mid", "Shuffle cut by others", "Other players' devices cut this deck; yours did not take part in this hand. Every card you have been shown checks out.", "i-shield"],
+    none: ["off", "Not verified", "Nobody's device took part in this hand's shuffle. The deck was sealed before the deal (no card could be swapped), but its order was the server's alone.", "i-warn"],
+    pending: ["mid", "Checking…", "Checking this hand's shuffle.", "i-shield0"],
+    failed: ["bad", "SHUFFLE CHECK FAILED", "", "i-warn"],
   };
   function alarm(hid, why) {
     if (F.alarmed[hid]) return;
@@ -301,7 +305,7 @@
       HG.ui.openModal({
         title: "This hand's shuffle did not check out",
         sub: "Your device could not confirm that this hand was dealt fairly. Tell the table and keep this message.",
-        body: `<div class="fair-alarm"><b>${HG.core.esc(why)}</b><small>Hand ${HG.core.esc(hid)}</small></div>`,
+        body: HG.core.html`<div class="fair-alarm"><b>${why}</b><small>Hand ${hid}</small></div>`,
         buttons: [{ label: "Details", onClick: () => { openPanel(); } }, { label: "OK", cls: "primary" }],
       });
     }
@@ -315,39 +319,45 @@
     const show = !!(f && f.supported && (h || f.next));
     btn.hidden = !show;
     if (!show) return;
-    const status = rec ? rec.status : (f.next && f.next.pending ? "shuffling" : "idle");
-    const [tone, text] = status === "shuffling" ? ["mid", "Shuffling…"] : status === "idle" ? ["off", "Verified shuffle"] : LABEL[status];
+    const you = f.next && f.next.you;
+    const benched = !!(you && you.barred && Number.isInteger(s.my_seat));
+    const status = rec ? rec.status : benched ? "benched" : (f.next && f.next.pending ? "shuffling" : "idle");
+    const n = you && you.benched_hands;
+    const [tone, text, tip, ico] = status === "shuffling" ? ["mid", "Shuffling…", "Confirming the shuffle with the players' devices…", "i-shield0"]
+      : status === "idle" ? ["off", "Deck sealed", "The next deck is sealed; your device takes part in cutting it.", "i-lock"]
+        // (this device missed confirming a shuffle in time: it sits the next ones out — HGT-012)
+        : status === "benched" ? ["off", "Shuffle: sitting out", `Your device didn't confirm a shuffle in time${n ? `, so it sits out the next ${n} hand${n === 1 ? "" : "s"}' shuffles` : ", so it sits this one out"}. Keep this page open and in front between hands.`, "i-shield0"]
+          : (LABEL[status] || ["mid", "Checking…", "", "i-shield0"]);
     btn.className = "pill fair " + tone;
     btn.lastElementChild.textContent = text;
-    btn.title = status === "idle" ? "The next deck is sealed; your device takes part in cutting it." : (LABEL[status] || ["", "", "Confirming the shuffle with the players' devices…"])[2] || (rec && rec.error) || "";
+    const use = btn.querySelector("use");
+    if (use && use.getAttribute("href") !== "#" + ico) use.setAttribute("href", "#" + ico);
+    btn.title = tip || (rec && rec.error) || "";
+    btn.setAttribute("aria-label", `${text}. ${btn.title}`);
   }
   function openPanel() {
     const s = HG.core.G.state, f = s && s.fair;
     if (!f || !HG.ui) return;
-    const esc = HG.core.esc;
+    const html = HG.core.html;  // (markup only through html``: every value escaped — FE-003)
     const h = f.hand, rec = h && F.hands[h.hand_id];
     const short = (x) => (x ? `${String(x).slice(0, 10)}…${String(x).slice(-6)}` : "–");
     const st = rec ? rec.status : "pending";
-    const names = (h && h.names ? h.names : []).map(([, nm]) => esc(nm)).join(", ");
+    const names = (h && h.names ? h.names : []).map(([, nm]) => nm).join(", ");
     const voids = Object.entries(f.void_counts || {});
     const body = document.createElement("div");
     body.className = "fair-panel";
-    body.innerHTML =
-      (h ? `<div class="fair-now ${LABEL[st][0]}"><b>${esc(LABEL[st][1])}</b><span>${esc(st === "failed" ? (rec.error || "") : LABEL[st][2])}</span></div>` +
-        `<dl class="fair-facts"><dt>Hand</dt><dd class="num">#${h.hand_no}</dd><dt>Sealed deck</dt><dd class="num" title="${esc(h.seal)}">${esc(short(h.seal))}</dd>` +
-        `<dt>Cut by</dt><dd>${names || "nobody's device"}</dd><dt>Cards checked</dt><dd class="num">${rec ? Object.keys(rec.checked).length : 0} of ${visibleCards(s).length} on your screen</dd>` +
-        ((h.voids || []).length ? `<dt>Redone</dt><dd>${h.voids.map((v) => esc((v.names || []).join(", ") || v.reason)).join(" · ")}</dd>` : "") + `</dl>`
-        : `<div class="fair-now mid"><b>The next deck is sealed</b><span>Your device takes part in cutting it when the hand is dealt.</span></div>`) +
-      `<div class="fair-how"><h4>How it works</h4><ol>` +
-      `<li>Before anyone contributes, the server <b>seals</b> a shuffled deck: it publishes a fingerprint of every card position that it cannot change afterwards.</li>` +
-      `<li>Every seated device picks a secret random number and publishes only a fingerprint of it.</li>` +
-      `<li>Only once it has seen everyone's fingerprints under that same seal does your device <b>reveal</b> its number.</li>` +
-      `<li>The revealed numbers <b>re-shuffle the sealed deck</b>. Nobody — not the server, not the other players together — could know or choose the result, as long as your own number was random.</li>` +
-      `<li>Every card you are shown comes with a proof that it is the card the seal and the cut put there. Cards nobody is shown stay sealed: a mucked hand stays mucked.</li></ol>` +
-      `<p>A device that commits and then does not reveal forces a fresh deck. That is a visible re-roll: it is announced at the table with the player's name.</p>` +
-      `<p class="muted">What this cannot do: stop the site's operator from looking at cards on the server. It proves the deal was random and unaltered — not that nobody peeked.</p></div>` +
-      `<div class="fair-tally"><span>This session on this device</span><b class="num">${F.tally.mine}</b> cut by you · <b class="num">${F.tally.others}</b> by others · <b class="num">${F.tally.none}</b> unverified${F.tally.failed ? ` · <b class="num neg">${F.tally.failed} FAILED</b>` : ""}` +
-      (voids.length ? `<br><span>Shuffles redone because a device did not confirm</span>${voids.map(([nm, n]) => `${esc(nm)} <b class="num">${n}</b>`).join(" · ")}` : "") + `</div>`;
+    HG.core.put(body, html`${h ? html`<div class="fair-now ${LABEL[st][0]}"><b>${LABEL[st][1]}</b><span>${st === "failed" ? (rec.error || "") : LABEL[st][2]}</span></div>
+        <dl class="fair-facts"><dt>Hand</dt><dd class="num">#${h.hand_no}</dd><dt>Sealed deck</dt><dd class="num" title="${h.seal}">${short(h.seal)}</dd><dt>Cut by</dt><dd>${names || "nobody's device"}</dd><dt>Cards checked</dt><dd class="num">${rec ? Object.keys(rec.checked).length : 0} of ${visibleCards(s).length} on your screen</dd>${(h.voids || []).length ? html`<dt>Redone</dt><dd>${h.voids.map((v) => (v.names || []).join(", ") || v.reason).join(" · ")}</dd>` : ""}</dl>`
+        : html`<div class="fair-now mid"><b>The next deck is sealed</b><span>Your device takes part in cutting it when the hand is dealt.</span></div>`}
+      <div class="fair-how"><h4>How it works</h4><ol>
+      <li>Before anyone contributes, the server <b>seals</b> a shuffled deck: it publishes a fingerprint of every card position that it cannot change afterwards.</li>
+      <li>Every seated device picks a secret random number and publishes only a fingerprint of it.</li>
+      <li>Only once it has seen everyone's fingerprints under that same seal does your device <b>reveal</b> its number.</li>
+      <li>The revealed numbers <b>re-shuffle the sealed deck</b>. Nobody — not the server, not the other players together — could know or choose the result, as long as your own number was random.</li>
+      <li>Every card you are shown comes with a proof that it is the card the seal and the cut put there. Cards nobody is shown stay sealed to every player: a mucked hand stays mucked.</li></ol>
+      <p>A device that commits and then does not reveal forces a fresh deck. That is a visible re-roll: it is announced at the table with the player's name.</p>
+      <p class="muted">What this cannot do: stop the site's operator from looking at cards on the server. The server keeps every hand it deals — the shuffled deck and every player's cards, folded hands too — to grade decisions and to prove old deals. No player is ever shown a card the table didn't show, but whoever runs the server could read them in its database. The shuffle proves the deal was random and unaltered — not that nobody peeked.</p></div>
+      <div class="fair-tally"><span>This session on this device</span><b class="num">${F.tally.mine}</b> cut by you · <b class="num">${F.tally.others}</b> by others · <b class="num">${F.tally.none}</b> unverified${F.tally.failed ? html` · <b class="num neg">${F.tally.failed} FAILED</b>` : ""}${voids.length ? html`<br><span>Shuffles redone because a device did not confirm</span>${voids.map(([nm, n], i) => html`${i ? " · " : ""}${nm} <b class="num">${n}</b>`)}` : ""}</div>`);
     const buttons = [];
     if (rec && rec.tr) buttons.push({ label: "Copy transcript", onClick: async () => { await copy(JSON.stringify({ transcript: rec.tr, my_number: (F.mem[h.hand_id] || {}).nonce || null, my_seat: (F.mem[h.hand_id] || {}).seat }, null, 1)); return false; } });
     buttons.push({ label: "Close", cls: "primary" });
@@ -355,7 +365,7 @@
   }
   async function copy(text) {
     try { await navigator.clipboard.writeText(text); HG.ui.toast("Copied — anyone can re-check it with the published method", "ok"); }
-    catch (_) { HG.ui.openModal({ title: "Transcript", body: `<textarea class="input" style="width:100%;height:260px" readonly>${HG.core.esc(text)}</textarea>`, buttons: [{ label: "Done", cls: "primary" }] }); }
+    catch (_) { HG.ui.openModal({ title: "Transcript", body: HG.core.html`<textarea class="input transcript" readonly>${text}</textarea>`, buttons: [{ label: "Done", cls: "primary" }] }); }
   }
   // history: check a finished hand's transcript + the cards this viewer may see
   async function checkPast(gid, handNo) {

@@ -1,6 +1,8 @@
 //! NLH CFR solver (preflop → river, multiway-capable), ClubGG chip rules.
 //!
 //! - DCFR for HU postflop (flop/turn with runouts, river exact)
+//! - Vectorized full-range DCFR for HU river / turn roots (`algorithm =
+//!   "dcfr_vector"`, [`vector`]): every hand pair and every river each iteration
 //! - External-sampling MCCFR for preflop / multiway
 //! - Compact [`public_state::PublicState`] (engine parity via engine_bridge)
 //!
@@ -9,7 +11,7 @@
 //!
 //! | kind | where | what it is |
 //! |---|---|---|
-//! | `exact_infoset` | HU river; HU turn when it fits the time allowance | vectorized infoset best response over all combos (turn: exact expectation over rivers) |
+//! | `exact_infoset` | HU river; HU turn when it fits the time allowance; every `dcfr_vector` solve | vectorized infoset best response over all combos (turn: exact expectation over rivers) |
 //! | `sampled_runout_br` | HU flop; HU turn fallback | same best response against a sampled runout grid (upper-biased) |
 //! | `mc_poll` | any HU postflop | the final pass ran out of time; value is the last in-loop poll |
 //! | `mc_br_proxy` | HU preflop, multiway | perfect-information deal-BR proxy — not a Nash certificate |
@@ -20,6 +22,7 @@ pub mod br;
 pub mod card_abs;
 pub mod dcfr;
 pub mod engine_bridge;
+pub mod hashing;
 pub mod infoset;
 pub mod known_spot;
 pub mod kuhn;
@@ -30,8 +33,10 @@ pub mod preflop;
 pub mod public_state;
 pub mod py_api;
 pub mod range;
+pub mod rng;
 pub mod showdown;
 pub mod types;
+pub mod vector;
 
 use types::{RootSpec, SolveConfig, SolveReport, StreetRoot};
 
@@ -46,6 +51,12 @@ pub fn solve(root: &RootSpec, config: &SolveConfig) -> Result<SolveReport, CfrEr
         && (cfg.card_abstraction == "none" || cfg.card_abstraction.is_empty())
     {
         cfg.card_abstraction = "ochs".into();
+    }
+
+    if cfg.is_vector() {
+        // Full-range DCFR (TOOL-008): HU river / turn only — it refuses the
+        // rest with a message naming the algorithm to use instead.
+        return vector::solve_vector_dcfr(root, &cfg);
     }
 
     if root.num_seats > 2 {
@@ -124,13 +135,8 @@ mod tests {
 
     #[test]
     fn solve_flop_with_runouts() {
-        let root = RootSpec::postflop_hu(
-            StreetRoot::Flop,
-            8.0,
-            20.0,
-            vec![0, 5, 10],
-            vec![500, 1000],
-        );
+        let root =
+            RootSpec::postflop_hu(StreetRoot::Flop, 8.0, 20.0, vec![0, 5, 10], vec![500, 1000]);
         let mut cfg = SolveConfig::default();
         cfg.max_iterations = 60;
         cfg.seed = 11;
@@ -276,7 +282,10 @@ mod tests {
         for stack in [0.4, 0.9, 1.0] {
             let mut root = RootSpec::preflop_hu(stack, 10_000, 5_000, 0);
             root.raise_sizes_pm = vec![1000];
-            assert!(matches!(solve(&root, &cfg), Err(CfrError::InvalidRoot(_))), "{stack}");
+            assert!(
+                matches!(solve(&root, &cfg), Err(CfrError::InvalidRoot(_))),
+                "{stack}"
+            );
         }
         // Just above the blind: a real (tiny) tree that terminates.
         for stack in [1.6, 2.0] {
@@ -305,13 +314,24 @@ mod tests {
         let river = |pot: f64, stack: f64| {
             RootSpec::postflop_hu(StreetRoot::River, pot, stack, board.clone(), vec![1000])
         };
-        for (pot, stack) in [(0.00004, 50.0), (10.0, 0.00004), (1e15, 1e15), (10.0, f64::MAX)] {
+        for (pot, stack) in [
+            (0.00004, 50.0),
+            (10.0, 0.00004),
+            (1e15, 1e15),
+            (10.0, f64::MAX),
+        ] {
             let err = solve(&river(pot, stack), &cfg).expect_err("degenerate chips");
-            assert!(matches!(err, CfrError::InvalidRoot(_)), "{pot}/{stack}: {err}");
+            assert!(
+                matches!(err, CfrError::InvalidRoot(_)),
+                "{pot}/{stack}: {err}"
+            );
         }
         let mut tiny_bb = river(0.4, 50.0);
         tiny_bb.bb_chips = 1;
-        assert!(matches!(solve(&tiny_bb, &cfg), Err(CfrError::InvalidRoot(_))));
+        assert!(matches!(
+            solve(&tiny_bb, &cfg),
+            Err(CfrError::InvalidRoot(_))
+        ));
         let mut mw = river(10.0, 0.00004);
         mw.num_seats = 3;
         cfg.algorithm = "mccfr_es".into();
@@ -331,7 +351,10 @@ mod tests {
         );
         let mut cfg = SolveConfig::default();
         cfg.max_iterations = 0;
-        assert!(matches!(solve(&root, &cfg), Err(CfrError::InvalidConfig(_))));
+        assert!(matches!(
+            solve(&root, &cfg),
+            Err(CfrError::InvalidConfig(_))
+        ));
         cfg.time_budget_secs = 0.05;
         cfg.target_exploitability_bb = 0.0;
         let rep = solve(&root, &cfg).expect("budgeted unlimited run");
@@ -361,7 +384,9 @@ mod tests {
         let rep = solve(&root, &cfg).expect("ranged");
         assert_eq!(rep.status, "ok");
         assert!(
-            rep.notes.iter().any(|n| n == "ranges=parsed oop=parsed:4 ip=parsed:4"),
+            rep.notes
+                .iter()
+                .any(|n| n == "ranges=parsed oop=parsed:4 ip=parsed:4"),
             "{:?}",
             rep.notes
         );
@@ -383,6 +408,9 @@ mod tests {
         root.range_ip = String::new();
         root.range_oop = String::new();
         let rep = solve(&root, &cfg).expect("uniform");
-        assert!(rep.notes.iter().any(|n| n.starts_with("ranges=uniform_fallback")));
+        assert!(rep
+            .notes
+            .iter()
+            .any(|n| n.starts_with("ranges=uniform_fallback")));
     }
 }

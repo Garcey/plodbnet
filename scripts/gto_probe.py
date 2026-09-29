@@ -36,6 +36,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT / "python") not in sys.path:
     sys.path.insert(0, str(_ROOT / "python"))
 
+from plo5bp.gto.policy_net import BADGE_MIN_PROBE_N  # noqa: E402
 from plo5bp.gto.probe import (  # noqa: E402
     DEFAULT_MAX_JAM_FREQ_GAP,
     DEFAULT_MAX_MEAN_ANCHOR_KL,
@@ -75,7 +76,14 @@ def main() -> int:
         default=DEFAULT_MAX_MEAN_JAM_GAP,
         help="Per-row mean |target - model| jam frequency",
     )
-    p.add_argument("--min-n", type=int, default=1)
+    p.add_argument(
+        "--min-n",
+        type=int,
+        default=BADGE_MIN_PROBE_N,
+        help=f"Minimum holdout rows (default {BADGE_MIN_PROBE_N}). Lower it to probe a small "
+        "holdout for diagnostics; the badge still needs >= "
+        f"{BADGE_MIN_PROBE_N} rows whatever this is (TOOL-019)",
+    )
     p.add_argument("--min-pure-n", type=int, default=DEFAULT_MIN_PURE_N)
     p.add_argument(
         "--allow-no-pure",

@@ -1,0 +1,20 @@
+# The Rust compiler every machine builds the engine with (ENG-008 / REPO-017).
+#
+# rustup reads this file for every `cargo` / `maturin` run in this repo, so the
+# desktop, the training pod, the production server and CI all compile the engine
+# with exactly this version instead of whatever each one happens to have. The
+# engine's outputs are pinned by golden digests (rust_engine/src/bindings/
+# golden_tests.rs); a pinned compiler keeps a toolchain change from ever being
+# the unexplained difference between two machines.
+#
+# rustup installs it on first use (the deploy and CI install it explicitly). By
+# hand: rustup toolchain install 1.93.1 --profile minimal -c rustfmt -c clippy
+#
+# Moving to a newer compiler is a deliberate change: edit the version here, in
+# `rust-version` (Cargo.toml) and in SETUP.md, run `bash scripts/rust_check.sh`
+# (format, lints and the Rust tests, golden digests included) and the Python
+# suite, then commit.
+[toolchain]
+channel = "1.93.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

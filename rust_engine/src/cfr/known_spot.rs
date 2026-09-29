@@ -183,23 +183,45 @@ mod tests {
     fn jam_check_spot_nuts_jam_air_checks() {
         let rep = solve_jam_check_spot(150_000, 7).expect("spot");
         eprintln!("known spot: {rep:?}");
-        assert!(rep.tree_is_jam_or_check, "tree must be CHECK|ALLIN then FOLD|CALL");
-        assert!(rep.notes.iter().any(|n| n.starts_with("expl_kind=exact_infoset")));
+        assert!(
+            rep.tree_is_jam_or_check,
+            "tree must be CHECK|ALLIN then FOLD|CALL"
+        );
+        assert!(rep
+            .notes
+            .iter()
+            .any(|n| n.starts_with("expl_kind=exact_infoset")));
         assert!(
             rep.exploitability_bb < 0.5,
             "jam/check river exact expl {} bb (want < 0.5)",
             rep.exploitability_bb
         );
-        assert!(rep.call_quads_vs_jam > 0.97, "nuts must call a jam: {}", rep.call_quads_vs_jam);
+        assert!(
+            rep.call_quads_vs_jam > 0.97,
+            "nuts must call a jam: {}",
+            rep.call_quads_vs_jam
+        );
         assert!(
             rep.ip_jam_quads_after_check > 0.95,
             "nuts in position must jam after a check: {}",
             rep.ip_jam_quads_after_check
         );
-        assert!(rep.fold_worst_vs_jam > 0.95, "5-4 must fold to a jam: {}", rep.fold_worst_vs_jam);
-        assert!(rep.jam_air_unopened < 0.4, "air should mostly check: {}", rep.jam_air_unopened);
+        assert!(
+            rep.fold_worst_vs_jam > 0.95,
+            "5-4 must fold to a jam: {}",
+            rep.fold_worst_vs_jam
+        );
+        assert!(
+            rep.jam_air_unopened < 0.4,
+            "air should mostly check: {}",
+            rep.jam_air_unopened
+        );
         // Not everything jams / nothing is degenerate.
-        assert!(rep.jam_freq_mean > 0.1 && rep.jam_freq_mean < 0.7, "{}", rep.jam_freq_mean);
+        assert!(
+            rep.jam_freq_mean > 0.1 && rep.jam_freq_mean < 0.7,
+            "{}",
+            rep.jam_freq_mean
+        );
     }
 
     #[test]

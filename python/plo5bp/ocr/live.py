@@ -1,22 +1,23 @@
-"""Window-targeted screen capture for OCR Phase 2.
+"""Window-targeted screen capture for live ClubGG OCR.
 
 Two capture paths:
 
-* mss + GDI BitBlt (`capture` / `capture_by_match`) — backs CLI
-  fixture tools like ``scripts/save_capture_with_rois.py``. Works
-  on any window whose ``SetWindowDisplayAffinity`` is unset.
+* mss + GDI BitBlt (`capture` / `capture_by_match`) — for windows whose
+  ``SetWindowDisplayAffinity`` is unset (it can NOT see a ClubGG table).
 * Windows.Graphics.Capture (`start_wgc_capture`) — used by the live
   OCR runner. Replicates OBS's "Windows 10 (1903 and up)" capture
   source: WGC reads from the DWM compositor surface, which has the
   protected window's actual content. ClubGG sets WDA on its tables,
   so the WGC path is the only one that captures real content there.
 
-Both return BGR numpy arrays at the window's native resolution;
-downstream ROIs are fractional so any output size works.
+Both return BGR numpy arrays at the window's native resolution; the live
+runner brings them to the ROI calibration geometry first
+(`extract.fit_to_calibration`).
 """
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
@@ -144,11 +145,11 @@ def find_window(match: str) -> WindowMatch:
 def capture(match: WindowMatch) -> "np.ndarray":
     """Grab the window's current pixels as a BGR numpy array.
 
-    No rescale — output is the window's native size. Fractional ROIs
-    are aspect-invariant, so they work at any frame size; rescaling
-    the source to a different aspect (e.g. 1927x1391 ClubGG → 1920x1080)
-    distorts card-glyph aspect and breaks NCC against templates
-    cropped from native screenshots.
+    No rescale — output is the window's native size. Fractional ROIs are
+    NOT aspect-invariant (the layout moves with the window's shape) and the
+    glyph extractor has absolute pixel floors, so callers check the frame
+    with `rois.frame_geometry` (a same-aspect frame of another size is
+    rescaled to the calibration size; another aspect is refused).
     """
     import cv2
     import mss
@@ -169,6 +170,8 @@ def capture_by_match(match_str: str) -> tuple[WindowMatch, "np.ndarray"]:
 def start_wgc_capture(
     hwnd: int,
     on_frame: Callable[["np.ndarray"], None],
+    *,
+    min_interval_s: float = 0.0,
 ):
     """Start a free-threaded Windows.Graphics.Capture session against `hwnd`.
 
@@ -176,6 +179,11 @@ def start_wgc_capture(
     passed to ``on_frame`` from the WGC binding's worker thread (so the
     callback must be thread-safe). Returns a ``CaptureControl``; call
     ``.stop()`` to end the session.
+
+    ``min_interval_s``: frames arriving sooner than this after the last one
+    handed on are dropped BEFORE the copy. ClubGG repaints at display rate
+    (~8 MB per 1927x1391 frame) while the OCR loop reads one frame per poll,
+    so the runner passes half its poll period.
 
     The WGC source surfaces frames from the DWM compositor, which holds
     the protected-window content even when ``SetWindowDisplayAffinity``
@@ -193,8 +201,14 @@ def start_wgc_capture(
         draw_border=False,
     )
 
+    last_kept = [float("-inf")]
+
     @capture.event
     def on_frame_arrived(frame, capture_control):  # noqa: ARG001
+        now = time.monotonic()
+        if now - last_kept[0] < min_interval_s:
+            return
+        last_kept[0] = now
         bgr = np.ascontiguousarray(frame.frame_buffer[:, :, :3])
         on_frame(bgr)
 

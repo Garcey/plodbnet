@@ -31,6 +31,14 @@ def main() -> int:
     p.add_argument("--stack-bb", type=float, default=50.0)
     p.add_argument("--size-preset", type=str, default="coarse")
     p.add_argument("--iters", type=int, default=100)
+    p.add_argument(
+        "--algorithm",
+        choices=("dcfr", "dcfr_vector"),
+        default="dcfr",
+        help="dcfr_vector = full-range DCFR for river / turn roots (TOOL-008): ~100-300 "
+        "iterations reach < 0.05 bb where sampled dcfr needs 200k for ~1 bb; flop roots "
+        "stay on sampled dcfr",
+    )
     p.add_argument("--workers", type=int, default=1)
     p.add_argument(
         "--streets",
@@ -65,6 +73,7 @@ def main() -> int:
         size_preset=args.size_preset,
         iters=args.iters,
         streets=streets,
+        algorithm=args.algorithm,
     )
     max_expl = None if args.no_expl_floor else args.max_expl_bb
     man = run_batch(

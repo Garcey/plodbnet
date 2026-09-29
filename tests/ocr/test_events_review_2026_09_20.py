@@ -2,7 +2,7 @@
 
 Synthetic `FrameState` sequences through the real `EventReconstructor` — no
 pixels, no OpenCV, no server. Each block names the review item it pins and
-mirrors the reviewer's repro script (`.claude/reviews/repro-2026-09-20/
+mirrors the reviewer's repro script (`docs/reviews/repro-2026-09-20/
 agent_ocr/h*.py`). The I4 block additionally replays every emitted action
 through a REAL engine env, because "the engine rejects it and the action is
 lost" is only provable against the engine.

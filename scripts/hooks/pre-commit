@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Refuses a commit that would add a secret (a key, a token, a private key, an
+# .env file, a database). Turn it on once per clone:
+#     git config core.hooksPath scripts/hooks
+# Uses gitleaks when it is installed (winget install gitleaks.gitleaks), otherwise a
+# built-in check of the staged changes. Bypass (only for a false alarm): git commit --no-verify
+set -u
+if command -v gitleaks >/dev/null 2>&1; then
+  exec gitleaks protect --staged --redact --config .gitleaks.toml
+fi
+bad=0
+names="$(git diff --cached --name-only --diff-filter=AM)"
+hits="$(printf '%s\n' "$names" | grep -iE '(^|/)\.env($|\.)|\.pem$|\.key$|\.p12$|\.pfx$|(^|/)id_(rsa|ed25519|ecdsa)|client_secret|\.db$|\.sqlite3?$' | grep -vE '\.example$' || true)"
+if [ -n "$hits" ]; then
+  echo "pre-commit: these look like secrets or user data:"; printf '    %s\n' $hits; bad=1
+fi
+re='(sk|rk)_live_[0-9A-Za-z]{16,}|whsec_[0-9A-Za-z]{20,}|GOCSPX-[0-9A-Za-z_-]{20,}|-----BEGIN ([A-Z]+ )?PRIVATE KEY-----|AKIA[0-9A-Z]{16}|gh[pousr]_[0-9A-Za-z]{30,}|github_pat_[0-9A-Za-z_]{40,}|xox[baprs]-[0-9A-Za-z-]{10,}'
+if git diff --cached -U0 --diff-filter=AM | grep -E '^\+' | grep -qE "$re"; then
+  echo "pre-commit: a staged line looks like a key or token (not shown). Remove it — and rotate it if it was real."
+  bad=1
+fi
+if [ "$bad" = 1 ]; then
+  echo "pre-commit: commit refused. (A false alarm? git commit --no-verify)"
+  exit 1
+fi
+exit 0

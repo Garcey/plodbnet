@@ -20,10 +20,10 @@ from plo5bp.ocr.types import Card
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_slot0_ten_of_hearts():
-    frame = REPO_ROOT / "screenrecords" / "frames" / "debug_1777231338393.png"
-    if not frame.exists():
-        pytest.skip(f"missing fixture {frame}")
+def test_slot0_ten_of_hearts(frame_finder):
+    frame = frame_finder("debug_1777231338393.png")
+    if frame is None:
+        pytest.skip("missing fixture debug_1777231338393.png")
     img = cv2.imread(str(frame))
     assert img is not None
     fs = extract_frame_state(img, num_seats=6)

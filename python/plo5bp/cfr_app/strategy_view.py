@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 from pathlib import Path
 from typing import Any, Sequence
 
+from plo5bp.gto.jsonio import sanitize_json
 from plo5bp.gto.preflop_class import (
     NUM_PREFLOP_CLASSES,
     cards_to_combo,
@@ -144,6 +146,19 @@ def weighted_strategy(rows: Sequence[dict[str, Any]]) -> tuple[list[str], list[f
     if total <= 0.0:
         return order, [0.0] * len(order)
     return order, [sums[a] / total for a in order]
+
+
+def weighted_value(rows: Sequence[dict[str, Any]], key: str) -> float | None:
+    """(TOOL-035) Reach-weighted mean of a per-hand number (``ev_bb`` /
+    ``equity``) over the rows that have it — the weights of every other
+    aggregate (:func:`row_weights`). None when no row has the number."""
+    total = acc = 0.0
+    for r, w in zip(rows, row_weights(rows)):
+        v = r.get(key)
+        if w > 0.0 and isinstance(v, (int, float)) and math.isfinite(v):
+            total += w
+            acc += w * float(v)
+    return acc / total if total > 0.0 else None
 
 
 def parse_infoset_id(iid: str) -> dict[str, Any]:
@@ -317,6 +332,11 @@ def infoset_row(raw: dict[str, Any], *, root_board_len: int | None = None) -> di
 
     vm = raw.get("visit_mass")
     meta["visit_mass"] = float(vm) if isinstance(vm, (int, float)) and math.isfinite(vm) else None
+    # (TOOL-035) per-hand EV (bb) and showdown equity from the solver's final
+    # best-response pass, when the report has them.
+    for key in ("ev_bb", "equity"):
+        v = raw.get(key)
+        meta[key] = float(v) if isinstance(v, (int, float)) and math.isfinite(v) else None
     meta["street"] = int(raw["street"]) if isinstance(raw.get("street"), int) else None
     meta["board"] = board
     meta["runout"] = runout_key(board, root_board_len)
@@ -353,7 +373,7 @@ def load_report(
         source = str(source) if source else "<memory>"
     else:
         p = Path(path)
-        data = json.loads(p.read_text(encoding="utf-8"))
+        data = read_strategy_json(p)
         source = str(p)
 
     # Chart node format (pushfold hands)
@@ -408,6 +428,8 @@ def load_report(
         "config": data.get("config") or {},
         "iterations_run": data.get("iterations_run"),
         "exploitability_bb": data.get("exploitability_bb"),
+        # (TOOL-021) what KIND of number that is (exact / proxy / estimate …)
+        "expl_kind": expl_kind_of(data.get("notes")),
         "notes": list(data.get("notes") or []),
         "num_infosets": len(rows),
         "num_nodes": len(nodes),
@@ -423,7 +445,9 @@ def load_report(
         "navigable": bool(line_nav.get("navigable")),
     }
     return {
-        "summary": summary,
+        # (TOOL-052) root / config / notes / chart meta come straight from the
+        # file; one NaN in them must not 500 the view (strict JSON responses).
+        "summary": sanitize_json(summary),
         "rows": rows,
         "nodes": nodes,
         "matrix": matrix,
@@ -439,7 +463,12 @@ def _view_from_chart(data: dict[str, Any], *, source: str) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     for h in hands:
         actions = list(h.get("actions") or [])
-        probs = [float(x) for x in (h.get("probs") or [])]
+        # (TOOL-052) the same NaN guard as solve reports: json.loads accepts a
+        # bare NaN, and one used to reach the JSON response and 500 the view.
+        probs = [_finite(x) for x in (h.get("probs") or [])]
+        if len(probs) < len(actions):
+            probs += [0.0] * (len(actions) - len(probs))
+        probs = probs[: len(actions)]
         label = str(h.get("hand") or "")
         cid = h.get("class_id")
         if cid is None and label:
@@ -467,9 +496,9 @@ def _view_from_chart(data: dict[str, Any], *, source: str) -> dict[str, Any]:
         }
         # inject allin/fold convenience if present
         if "allin" in h:
-            row["allin"] = float(h["allin"])
+            row["allin"] = _finite(h["allin"])
         if "fold" in h:
-            row["fold"] = float(h["fold"])
+            row["fold"] = _finite(h["fold"])
         rows.append(row)
 
     matrix = build_preflop_matrix(rows)
@@ -532,7 +561,9 @@ def _view_from_chart(data: dict[str, Any], *, source: str) -> dict[str, Any]:
         },
     }
     return {
-        "summary": summary,
+        # (TOOL-052) root / config / notes / chart meta come straight from the
+        # file; one NaN in them must not 500 the view (strict JSON responses).
+        "summary": sanitize_json(summary),
         "rows": rows,
         "nodes": nodes,
         "matrix": matrix,
@@ -546,9 +577,10 @@ def _view_from_chart(data: dict[str, Any], *, source: str) -> dict[str, Any]:
 def quality_summary(rows: Sequence[dict[str, Any]], data: dict[str, Any]) -> dict[str, Any]:
     """Aggregate quality metrics available from strategy dumps (probs + report fields).
 
-    Native dumps are frequency-only (no per-hand CFV in export). We surface:
-    exploitability, mean entropy, fold/call/raise/allin mass, pure-strategy
-    fraction, and top aggressive hands — enough to judge solve quality before training.
+    We surface: exploitability, mean entropy, fold/call/raise/allin mass,
+    pure-strategy fraction, and top aggressive hands — enough to judge solve
+    quality before training — plus how many rows carry per-hand EV / equity
+    (TOOL-035: exact HU postflop solves export them from the final pass).
     """
     from plo5bp.cfr_app.tree_model import aggregate_node
 
@@ -559,9 +591,19 @@ def quality_summary(rows: Sequence[dict[str, Any]], data: dict[str, Any]) -> dic
         if pp >= 0.99:
             pure += 1
     n = max(1, len(rows))
+    ev_rows = sum(1 for r in rows if r.get("ev_bb") is not None)
+    ev_note = (
+        f"Per-hand EV (bb) and equity on {ev_rows} of {len(rows)} rows: the solver's final "
+        "best-response pass under the average strategies (EV = expected share of the final "
+        "pot minus the chips the hand still puts in from that node)."
+        if ev_rows
+        else "No per-hand EV in this report (preflop / multiway / bucketed solves, reports "
+        "made before EV export, or a final pass that did not finish)."
+    )
     # weight proxy: each hand equal mass (class/combo uniform prior)
     return {
         "exploitability_bb": data.get("exploitability_bb"),
+        "expl_kind": expl_kind_of(data.get("notes")),
         "iterations_run": data.get("iterations_run"),
         "num_infosets": len(rows),
         "mean_entropy": agg.get("entropy"),
@@ -573,8 +615,9 @@ def quality_summary(rows: Sequence[dict[str, Any]], data: dict[str, Any]) -> dic
         "agg_ge_50pct": agg.get("agg_ge_50pct"),
         "fold_ge_50pct": agg.get("fold_ge_50pct"),
         "mean_mix": agg.get("mean_mix"),
+        "ev_rows": ev_rows,
         "notes": [
-            "Strategy JSON is frequency-only; CFV/EV not in native dump.",
+            ev_note,
             "Hand weights = uniform prior over infoset private views.",
             "Exploitability from solver report when present.",
         ],
@@ -776,6 +819,8 @@ def build_class_matrix_from_combos(rows: Sequence[dict[str, Any]]) -> dict[str, 
         actions, probs = weighted_strategy(class_rows)
         strat = _normalize_probs(actions, probs)
         mix = _mix_buckets(strat)
+        ev = weighted_value(class_rows, "ev_bb")
+        eq = weighted_value(class_rows, "equity")
         cells[ri][ci] = {
             "class_id": cid,
             "label": preflop_class_label(cid),
@@ -791,6 +836,9 @@ def build_class_matrix_from_combos(rows: Sequence[dict[str, Any]]) -> dict[str, 
             "primary_prob": max(mix["fold"], mix["call"], mix["agg"]),
             "n_combos": len(class_rows),
             "weighted": True,
+            # (TOOL-035) the class's reach-weighted EV (bb) / equity at this node
+            "ev_bb": round(ev, 4) if ev is not None else None,
+            "equity": round(eq, 4) if eq is not None else None,
         }
         placed += 1
 
@@ -1058,61 +1106,205 @@ def hand_matcher(query: str):
     ).lower()
 
 
+# (TOOL-055) Not strategies: batch / campaign metadata and job sidecars.
+_NON_STRATEGY_NAMES = frozenset(
+    {"status.json", "overnight_grid.json", "manifest.json", "plan.json",
+     "certificate.json", "index.json"}
+)
+_NON_STRATEGY_SUFFIXES = (".job.json", "_split.json", ".error.json", ".result.json")
+_SKIP_DIRS = frozenset({"markers"})
+
+KIND_INTERRUPTED = "interrupted"  # a dead solve's last live snapshot (TOOL-031)
+KIND_REJECTED = "rejected"  # over the teacher cap (batch wrapper)
+KIND_UNVERIFIED = "unverified"  # exploitability not a final estimate
+
+
+def is_strategy_candidate(name: str) -> bool:
+    n = name.lower()
+    return (
+        n.endswith(".json")
+        and n not in _NON_STRATEGY_NAMES
+        and not n.endswith(_NON_STRATEGY_SUFFIXES)
+        and not n.endswith(".tmp")
+    )
+
+
+def library_kind_hint(path: Path | str) -> str | None:
+    """What a file IS from its name / folder alone (None = peek to find out)."""
+    p = Path(path)
+    if p.name.lower().endswith(".progress.json"):
+        return KIND_INTERRUPTED
+    parent = p.parent.name.lower()
+    if parent == "rejected":
+        return KIND_REJECTED
+    if parent == "unverified":
+        return KIND_UNVERIFIED
+    return None
+
+
+def expl_kind_of(notes: Sequence[Any] | None) -> str | None:
+    """The ``expl_kind=<kind>`` token of a report's notes (TOOL-021)."""
+    for n in notes or []:
+        for tok in str(n).split():
+            if tok.startswith("expl_kind="):
+                return tok[len("expl_kind="):].strip(",;") or None
+    return None
+
+
+def _job_sidecar_for(p: Path) -> Path | None:
+    """The root/config sidecar of a progress snapshot, if one was written."""
+    stem = p.name[: -len(".progress.json")]
+    for cand in (p.with_name(f"{stem}.job.json"), p.parent.parent / "markers" / f"{stem}.job.json"):
+        if cand.is_file():
+            return cand
+    return None
+
+
+def _root_from_dumps(infosets: Sequence[Any]) -> dict[str, Any]:
+    """Street + board of a snapshot with no sidecar, from its infoset dumps (the
+    root street is the earliest one any infoset is on)."""
+    best: tuple[int, list[int]] | None = None
+    for iset in infosets[:5000]:
+        if not isinstance(iset, dict) or not isinstance(iset.get("street"), int):
+            continue
+        st, board = int(iset["street"]), iset.get("board")
+        if isinstance(board, list) and (best is None or st < best[0]):
+            best = (st, [int(c) for c in board])
+    if best is None:
+        return {}
+    return {"street": best[0], "board": best[1]}
+
+
+def read_strategy_json(path: Path | str) -> dict[str, Any]:
+    """Parse a strategy file into a viewable report dict.
+
+    - a batch ``rejected/`` wrapper is unwrapped to its report (status
+      ``rejected``, the reason prepended to the notes);
+    - a ``.progress.json`` snapshot of a solve that never finished (TOOL-031) is
+      dressed as a report: status ``interrupted``, root / config from the job's
+      sidecar when there is one;
+    - anything else is returned as parsed.
+    """
+    p = Path(path)
+    data = json.loads(p.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("strategy file must be a JSON object")
+    if data.get("status") == "rejected" and isinstance(data.get("report"), dict):
+        inner = dict(data["report"])
+        why = data.get("reason") or "over the teacher cap"
+        inner["notes"] = [f"rejected: {why}"] + list(inner.get("notes") or [])
+        inner["status"] = KIND_REJECTED
+        return inner
+    if p.name.lower().endswith(".progress.json") and "strategy" in data:
+        root, config, notes = {}, {}, []
+        side = _job_sidecar_for(p)
+        if side is not None:
+            try:
+                meta = json.loads(side.read_text(encoding="utf-8"))
+                root = meta.get("root") or {}
+                config = meta.get("config") or {}
+                notes = [str(meta.get("label"))] if meta.get("label") else []
+            except (OSError, ValueError):
+                pass
+        if not root:
+            root = _root_from_dumps((data.get("strategy") or {}).get("infosets") or [])
+        kind = data.get("expl_kind")
+        return {
+            "status": KIND_INTERRUPTED,
+            "root": root,
+            "config": config,
+            "iterations_run": data.get("iterations_run"),
+            "exploitability_bb": data.get("exploitability_bb"),
+            "notes": notes
+            + ["interrupted: the solve stopped before it finished; this is its last live snapshot"]
+            + ([f"expl_kind={kind}"] if kind else []),
+            "strategy": data.get("strategy") or {},
+        }
+    return data
+
+
+def _scan_json(root: Path, out: list[tuple[float, int, Path]]) -> None:
+    """Recursive scandir: one stat per file (DirEntry caches it on Windows)."""
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        return
+    for e in entries:
+        try:
+            if e.is_dir(follow_symlinks=False):
+                if e.name.lower() not in _SKIP_DIRS:
+                    _scan_json(Path(e.path), out)
+            elif is_strategy_candidate(e.name):
+                st = e.stat()
+                out.append((st.st_mtime, st.st_size, Path(e.path)))
+        except OSError:
+            continue  # vanished mid-scan (a live solve rewrites its files)
+
+
 def list_strategy_library(
     roots: Sequence[Path | str] | None = None,
     *,
     max_files: int = 500,
+    exclude: Sequence[Path | str] = (),
 ) -> list[dict[str, Any]]:
-    """Scan known CFR data dirs for loadable JSON strategy files."""
+    """Strategy files under the CFR data folder, newest first.
+
+    (TOOL-055) ONE recursive pass over the data root (it used to scan seven
+    sub-folders AND the whole root again, stat'ing every file twice), skipping
+    batch metadata, job sidecars and ``markers/``. Interrupted solves' last
+    snapshots (``*.progress.json``) are listed with ``kind_hint`` =
+    ``interrupted`` (TOOL-031) — pass the LIVE job's progress file in
+    ``exclude``; ``rejected/`` / ``unverified/`` batch reports carry their hint.
+    """
     if roots is None:
-        # (review 2026-09-20 J4) env-overridable defaults — see cfr_app/paths.py
+        # (review 2026-09-20 J4) env-overridable — see cfr_app/paths.py
         from plo5bp.cfr_app.paths import library_roots
 
         roots = library_roots()
-    seen: set[str] = set()
-    items: list[dict[str, Any]] = []
+    skip = {str(Path(x).resolve()) for x in exclude}
+    stamped: list[tuple[float, int, Path]] = []
     for root in roots:
         r = Path(root)
-        if not r.exists():
-            continue
-        # (review 2026-09-20 E12) stat() once per file, tolerating files that
-        # vanish mid-scan: a live solve rewrites/deletes its progress + tmp files
-        # under app_jobs, and an unguarded stat() in the sort key 500'd /api/library.
-        stamped: list[tuple[float, int, Path]] = []
-        for p in r.rglob("*.json") if r.is_dir() else [r]:
+        if r.is_dir():
+            _scan_json(r, stamped)
+        elif r.is_file() and is_strategy_candidate(r.name):
             try:
-                st = p.stat()
+                st = r.stat()
+                stamped.append((st.st_mtime, st.st_size, r))
             except OSError:
-                continue
-            stamped.append((st.st_mtime, st.st_size, p))
-        stamped.sort(key=lambda x: x[0], reverse=True)
-        for mtime, size, p in stamped:
-            if not p.is_file():
-                continue
-            key = str(p.resolve())
-            if key in seen:
-                continue
-            # skip grid/status/index noise optionally — still include INDEX as meta
-            name = p.name.lower()
-            if name in ("status.json", "overnight_grid.json", "manifest.json", "plan.json", "certificate.json"):
-                continue
-            # (review 2026-09-20 E12) live-solve snapshots are not strategies.
-            if name.endswith(".progress.json"):
-                continue
-            seen.add(key)
-            items.append(
-                {
-                    "path": str(p),
-                    "name": p.name,
-                    "rel": _rel_to_repo(p),
-                    "size": size,
-                    "size_kb": round(size / 1024.0, 1),
-                    "mtime": mtime,
-                    "dir": str(p.parent),
-                }
-            )
-            if len(items) >= max_files:
-                return items
+                pass
+    stamped.sort(key=lambda x: x[0], reverse=True)
+    # A snapshot whose job DID finish (its report sits beside it — builds before
+    # the E12 clean-up left them) is not an interrupted solve: not listed.
+    present = {str(p).lower() for _m, _s, p in stamped}
+
+    def _finished_snapshot(p: Path) -> bool:
+        name = p.name.lower()
+        if not name.endswith(".progress.json"):
+            return False
+        return str(p.with_name(p.name[: -len(".progress.json")] + ".json")).lower() in present
+
+    seen: set[str] = set()
+    items: list[dict[str, Any]] = []
+    for mtime, size, p in stamped:
+        key = str(p.resolve())
+        if key in seen or key in skip or _finished_snapshot(p):
+            continue
+        seen.add(key)
+        items.append(
+            {
+                "path": str(p),
+                "name": p.name,
+                "rel": _rel_to_repo(p),
+                "size": size,
+                "size_kb": round(size / 1024.0, 1),
+                "mtime": mtime,
+                "dir": str(p.parent),
+                "kind_hint": library_kind_hint(p),
+            }
+        )
+        if len(items) >= max_files:
+            break
     return items
 
 
@@ -1133,9 +1325,9 @@ def summarize_report_light(
     """
     p = Path(path)
     if data is None:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        data = read_strategy_json(p)
     if "hands" in data and "strategy" not in data:
-        return {
+        return sanitize_json({
             "path": str(p),
             "kind": "chart",
             "status": "ok",
@@ -1146,14 +1338,19 @@ def summarize_report_light(
             "iterations_run": None,
             "exploitability_bb": None,
             "description": data.get("description"),
-        }
+        })
     root = data.get("root") or {}
     strat = data.get("strategy") or {}
-    infos = strat.get("infosets") or []
-    return {
+    infos = strat.get("infosets") or data.get("infosets") or []
+    status = data.get("status")
+    kind = status if status in (KIND_INTERRUPTED, KIND_REJECTED) else (
+        library_kind_hint(p) or "solve_report"
+    )
+    return sanitize_json({
         "path": str(p),
-        "kind": "solve_report",
-        "status": data.get("status"),
+        "kind": kind,
+        "status": status,
+        "expl_kind": expl_kind_of(data.get("notes")),
         "root_id": root.get("root_id"),
         "num_infosets": len(infos),
         "street": root.get("street"),
@@ -1161,4 +1358,4 @@ def summarize_report_light(
         "iterations_run": data.get("iterations_run"),
         "exploitability_bb": data.get("exploitability_bb"),
         "notes": (data.get("notes") or [])[:5],
-    }
+    })

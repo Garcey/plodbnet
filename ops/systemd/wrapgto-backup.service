@@ -1,0 +1,11 @@
+# /etc/systemd/system/wrapgto-backup.service — nightly backup (ops/bin/wrapgto-backup)
+[Unit]
+Description=WrapGTO backup (local snapshot + encrypted off-site copy)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wrapgto-backup
+Nice=10
+IOSchedulingClass=idle

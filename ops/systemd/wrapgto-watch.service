@@ -1,0 +1,7 @@
+# /etc/systemd/system/wrapgto-watch.service — health, disk and backup checks + alerts
+[Unit]
+Description=WrapGTO health watch
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wrapgto-watch

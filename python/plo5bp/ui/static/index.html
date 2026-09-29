@@ -2,52 +2,78 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>WrapGTO — AI PLO Training</title>
-    <meta name="description" content="WrapGTO — AI-powered PLO training. Drill double-board PLO5 bomb pots against a self-play AI with EV-graded post-hand review." />
+    <meta name="description" content="Train double-board PLO bomb pots against a neural network: every decision graded, the EV each one cost, a study tool for the hands you played — and private home games with friends." />
+    <meta name="theme-color" content="#070b11" />
+    <link rel="canonical" href="https://wrapgto.com/" />
+    <link rel="manifest" href="/static/brand/manifest.webmanifest" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="WrapGTO" />
+    <meta property="og:url" content="https://wrapgto.com/" />
+    <meta property="og:title" content="WrapGTO — AI training for double-board PLO bomb pots" />
+    <meta property="og:description" content="Drill bomb pots against a neural network, get every decision graded, study your hands — and run private home games with friends." />
+    <meta property="og:image" content="https://wrapgto.com/static/brand/social-avatar-dark-1024.png" />
+    <meta property="og:image:width" content="1024" />
+    <meta property="og:image:height" content="1024" />
+    <meta property="og:image:alt" content="The WrapGTO logo" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="WrapGTO — AI training for double-board PLO bomb pots" />
+    <meta name="twitter:description" content="Drill bomb pots against a neural network, get every decision graded, study your hands — and run private home games with friends." />
+    <meta name="twitter:image" content="https://wrapgto.com/static/brand/social-avatar-dark-1024.png" />
     <link rel="icon" type="image/svg+xml" href="/static/brand/wrap-app-icon-dark.svg" />
     <link rel="icon" type="image/png" sizes="48x48" href="/static/brand/favicon-48.png" />
     <link rel="icon" type="image/png" sizes="32x32" href="/static/brand/favicon-32.png" />
     <link rel="icon" type="image/png" sizes="16x16" href="/static/brand/favicon-16.png" />
     <link rel="apple-touch-icon" sizes="180x180" href="/static/brand/apple-touch-icon.png" />
     <meta name="apple-mobile-web-app-title" content="WrapGTO" />
+    <!-- WGFONTS:START (replaced by the self-hosted fonts once static/fonts/ has them) -->
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400..700&family=Geist+Mono:wght@400..700&display=swap" rel="stylesheet" />
+    <!-- WGFONTS:END -->
     <link rel="stylesheet" href="/static/style.css" />
   </head>
   <body>
     <!-- WGAPP:START (public build: stripped server-side for signed-out visitors) -->
     <header id="top-bar">
-      <div class="brand">
+      <a class="brand" href="/" aria-label="WrapGTO">
         <svg class="brand-logo" viewBox="0 0 96 96" aria-hidden="true">
           <path d="M28 12 H68 Q84 12 84 28 V68 Q84 84 68 84 H28 Q12 84 12 68 V44 Q12 30 26 30 H44 Q56 30 56 42 V46 Q56 56 46 56"
                 fill="none" stroke="currentColor" stroke-width="11"
                 stroke-linecap="round" stroke-linejoin="round"/>
         </svg>
         <span class="brand-name">Wrap<span class="brand-gto">GTO</span></span>
-      </div>
-      <div id="mode-tabs">
-        <button id="tab-study" class="mode-tab active" type="button">Study</button>
-        <button id="tab-trainer" class="mode-tab" type="button">Trainer</button>
-        <button id="tab-ranges" class="mode-tab" type="button" hidden>Ranges</button>
-      </div>
-      <div class="top-bar-item">
-        <label for="format-select">Format</label>
-        <select id="format-select"></select>
-      </div>
+      </a>
+      <nav id="mode-tabs" aria-label="Mode">
+        <button id="tab-study" class="mode-tab" type="button" aria-pressed="false">Study</button>
+        <button id="tab-trainer" class="mode-tab" type="button" aria-pressed="false">Trainer</button>
+        <!-- WGLIVE:START (Ranges is local-only: stripped from the public build) -->
+        <button id="tab-ranges" class="mode-tab" type="button" aria-pressed="false" hidden>Ranges</button>
+        <!-- WGLIVE:END -->
+      </nav>
       <div class="top-bar-item top-bar-spacer"></div>
-      <div class="top-bar-item">
-        <label for="unit-toggle">Units</label>
-        <button id="unit-toggle" type="button">bb</button>
+      <div class="top-bar-item" id="format-wrap">
+        <label for="format-select" class="tb-label">Format</label>
+        <select id="format-select"></select>
+        <span id="format-static" class="format-static" hidden></span>
       </div>
-      <div class="top-bar-item" id="account-chip" style="display:none"></div>
+      <div class="top-bar-item unit-ctl">
+        <span class="tb-label" id="unit-label">Show</span>
+        <div class="seg" id="unit-seg" role="group" aria-labelledby="unit-label">
+          <button type="button" data-unit="bb" aria-pressed="true" title="Show amounts in big blinds">bb</button>
+          <button type="button" data-unit="$" aria-pressed="false" title="Show amounts in dollars">$</button>
+        </div>
+        <button id="rate-btn" class="rate-btn" type="button" hidden
+                aria-haspopup="dialog" title="Dollar value of one big blind"></button>
+      </div>
+      <div class="top-bar-item" id="account-chip" hidden></div>
     </header>
 
     <main>
-      <!-- NLH range grid (Ranges tab) — local build only; ranges.js gates
-           the tab on format + PLO5BP_PUBLIC, and the /ranges routes are
-           stripped server-side on the public build. -->
+      <!-- WGLIVE:START
+           NLH range grid (Ranges tab) — local build only: the public build
+           strips this markup (FE-025), its /ranges routes and ranges.js. -->
       <section id="rg-view">
         <div id="rg-topbar">
           <label>Seats
@@ -57,7 +83,7 @@
             </select>
           </label>
           <label>Stack (bb)
-            <input id="rg-stack" type="number" min="2" max="1000" step="5" value="100" />
+            <input id="rg-stack" type="number" min="2" max="1000" step="5" value="100" inputmode="decimal" />
           </label>
           <button id="rg-reset" type="button">Reset</button>
           <span id="rg-model" class="muted"></span>
@@ -72,34 +98,35 @@
             <div id="rg-hover"></div>
           </div>
         </div>
-        <div id="rg-card-modal" class="modal-backdrop" hidden>
+        <dialog id="rg-card-modal" class="dlg" aria-labelledby="rg-card-title">
           <div class="modal rg-card-picker">
             <h3 id="rg-card-title">Pick cards</h3>
-            <div id="rg-card-grid"></div>
+            <div id="rg-card-grid" role="group" aria-label="Cards"></div>
             <div class="modal-buttons">
               <button id="rg-card-cancel" type="button">Cancel</button>
               <button id="rg-card-ok" class="primary" type="button" disabled>Confirm</button>
             </div>
           </div>
-        </div>
+        </dialog>
       </section>
+      <!-- WGLIVE:END -->
       <section id="table-area">
         <div id="workbar">
       <div class="top-bar-item study-only">
-        <label>Seats</label>
-        <div class="seat-ctl">
-          <button id="seats-dec" type="button" aria-label="Fewer seats">−</button>
-          <span id="seats-count">6</span>
-          <button id="seats-inc" type="button" aria-label="More seats">+</button>
+        <span class="tb-label" id="seats-label">Players</span>
+        <div class="seat-ctl" role="group" aria-labelledby="seats-label">
+          <button id="seats-dec" type="button" aria-label="One player fewer">−</button>
+          <span id="seats-count" aria-live="polite">6</span>
+          <button id="seats-inc" type="button" aria-label="One player more">+</button>
         </div>
       </div>
       <div class="top-bar-item study-only">
-        <label for="dpb-input">$ / bb</label>
-        <input id="dpb-input" type="number" step="0.01" min="0.01" value="20.00" />
+        <label for="hero-pos-select" class="tb-label">Your seat</label>
+        <select id="hero-pos-select" title="Your position at the table (the D button moves with it)"></select>
       </div>
       <div class="top-bar-item study-only">
-        <label for="ante-input">Ante</label>
-        <input id="ante-input" type="number" step="0.01" min="0" value="3.00" />
+        <label for="ante-input" class="tb-label" id="ante-label">Ante (bb)</label>
+        <input id="ante-input" type="number" step="0.5" min="0" inputmode="decimal" value="3" />
       </div>
       <!-- WGLIVE:START -->
       <div class="top-bar-item ocr-group study-only">
@@ -109,13 +136,13 @@
         <span id="clubgg-controls">
           <div class="ocr-window-picker">
             <button id="ocr-window-button" type="button" aria-haspopup="listbox"
-                    aria-expanded="false" title="Pick the window to screen-read">— pick window —</button>
+                    aria-expanded="false" title="Pick the ClubGG table window to screen-read. ClubGG needs the 4-colour deck (suits are read by colour) and the table window at its usual shape.">— pick window —</button>
           </div>
           <button id="ocr-toggle" type="button" aria-pressed="false">Off</button>
-          <button id="ocr-simple-toggle" type="button" aria-pressed="true"
-                  title="Skip OCR action inference; manual action entry only">Simple: On</button>
+          <button id="ocr-simple-toggle" type="button" aria-pressed="false"
+                  title="Automatic action tracking. Off: live capture follows the cards, button and stacks, and you enter every action yourself. On: actions are read from the table too.">Track actions: Off</button>
           <button id="ocr-save-frame" type="button"
-                  title="Save the current OCR frame to screenrecords/frames/">Save frame</button>
+                  title="Save the current frame to screenrecords/frames/ (local debug capture). Shift-click: keep it as a test fixture in tests/ocr/fixtures/frames/.">Save frame</button>
           <span id="ocr-status" class="muted"></span>
         </span>
         <span id="pokernow-controls" style="display:none">
@@ -127,16 +154,34 @@
       <!-- WGLIVE:END -->
       <div class="top-bar-item top-bar-spacer"></div>
       <div class="top-bar-item trainer-only">
+        <button id="trainer-help-btn" class="icon-btn" type="button" aria-label="Help and keyboard shortcuts" title="Help and keyboard shortcuts (?)">?</button>
         <button id="trainer-settings-btn" type="button" title="Trainer settings">Settings</button>
-        <button id="trainer-repeat-btn" type="button" title="Re-deal the same hand (excluded from stats)">Repeat</button>
-        <button id="trainer-new-hand-btn" type="button">New Hand</button>
+        <button id="trainer-repeat-btn" type="button" title="Deal the same hand again (not counted in your stats)">Repeat</button>
+        <button id="trainer-new-hand-btn" type="button" title="Deal a new hand (N)">New hand</button>
       </div>
       <div class="top-bar-item study-only">
-        <button id="new-hand-btn" type="button">New Hand</button>
+        <button id="enter-cards-top" class="enter-cards-top" type="button" data-open-picker>Enter cards</button>
+        <button id="study-help-btn" class="icon-btn" type="button" aria-label="How Study works" aria-expanded="false" aria-controls="study-guide" title="How Study works">?</button>
+        <button id="share-spot-btn" type="button" title="Copy a link to this spot">Share</button>
+        <button id="new-hand-btn" type="button" title="Clear the cards and actions">New hand</button>
       </div>
         </div>
+        <div id="study-guide" class="study-only guide" hidden>
+          <div class="guide-head">
+            <strong>How Study works</strong>
+            <button id="study-guide-close" type="button" class="guide-close" aria-label="Hide the guide">&#10005;</button>
+          </div>
+          <ol class="guide-steps">
+            <li><b>Set the table.</b> Choose <em>Your seat</em> and the number of players above; click any stack to change it, or use a seat&rsquo;s <span class="kbd-inline">&#8943;</span> menu.</li>
+            <li><b>Enter the cards.</b> Click cards in the grid &mdash; or type a rank then a suit, like <kbd>A</kbd><kbd>s</kbd>. They fill your hand, then the flops, turns and rivers, in order.</li>
+            <li><b>Enter every action in order</b> &mdash; each player&rsquo;s Fold, Check/Call or Bet, yours included. Undo or click a history line to go back.</li>
+            <li><b>Read the network&rsquo;s answer</b> in Recommendation on your turns: its top action, how often it takes each action, and the sizes it likes.</li>
+          </ol>
+        </div>
         <div id="table-wrap">
-          <svg id="table-svg" viewBox="0 0 800 560" xmlns="http://www.w3.org/2000/svg">
+          <p id="table-summary" class="sr-only"></p>
+          <svg id="table-svg" viewBox="0 0 800 560" xmlns="http://www.w3.org/2000/svg" role="group" aria-label="Poker table">
+            <title>Poker table</title>
             <defs>
               <radialGradient id="felt-gradient" cx="50%" cy="36%" r="70%">
                 <stop offset="0%" stop-color="#2c6e5c" />
@@ -181,21 +226,17 @@
               </filter>
             </defs>
 
-            <ellipse cx="400" cy="260" rx="352" ry="202" class="table-rim" filter="url(#table-shadow)" />
-            <ellipse cx="400" cy="260" rx="340" ry="190" class="table-edge" />
-            <ellipse cx="400" cy="260" rx="300" ry="153" class="table-line" />
-            <ellipse cx="400" cy="222" rx="266" ry="116" class="table-glow" />
+            <ellipse id="felt-rim" cx="400" cy="260" rx="352" ry="202" class="table-rim" filter="url(#table-shadow)" />
+            <ellipse id="felt-edge" cx="400" cy="260" rx="340" ry="190" class="table-edge" />
+            <ellipse id="felt-line" cx="400" cy="260" rx="300" ry="153" class="table-line" />
+            <ellipse id="felt-glow" cx="400" cy="222" rx="266" ry="116" class="table-glow" />
 
             <g id="board-a" transform="translate(280 207)"></g>
             <g id="board-b" transform="translate(280 285)"></g>
 
-            <g id="pot-badge">
-              <rect x="320" y="154" width="160" height="32" rx="16" class="pot-badge-rect" />
-              <text id="pot-label" x="400" y="175" text-anchor="middle" class="pot-label">Total Pot 0bb</text>
-            </g>
-            <g id="pot-settled-badge">
-              <rect x="345" y="360" width="110" height="22" rx="11" class="pot-settled-rect" />
-              <text id="pot-settled-label" x="400" y="375" text-anchor="middle" class="pot-settled-label">Pot 0bb</text>
+            <g id="pot-badge" transform="translate(400 170)" hidden>
+              <rect x="-80" y="-16" width="160" height="32" rx="16" class="pot-badge-rect" />
+              <text id="pot-label" x="0" y="5" text-anchor="middle" class="pot-label"></text>
             </g>
 
             <g id="seats"></g>
@@ -215,7 +256,7 @@
               </foreignObject>
             </g>
             <!-- WGLIVE:END -->
-            <g id="dealer-button"><circle r="14" class="dealer-circle" /><text class="dealer-text" text-anchor="middle" dy="5">D</text></g>
+            <g id="dealer-button"><title>Dealer button — drag it to another seat, or choose Your seat above</title><circle r="14" class="dealer-circle" /><circle r="24" class="dealer-hit" /><text class="dealer-text" text-anchor="middle" dy="5">D</text></g>
             <g id="insert-icon" hidden>
               <circle r="14" class="insert-icon-bg" />
               <text class="insert-icon-plus" text-anchor="middle" dy="6">+</text>
@@ -232,20 +273,21 @@
 
         <div id="review-panel" class="panel" hidden>
           <div class="review-left">
-            <svg class="score-ring" viewBox="0 0 64 64" width="64" height="64">
+            <svg class="score-ring" viewBox="0 0 64 64" width="64" height="64" aria-hidden="true">
               <circle class="ring-bg" cx="32" cy="32" r="26" />
               <circle id="review-ring-fill" class="ring-fill" cx="32" cy="32" r="26" />
               <text id="review-score-num" x="32" y="37" text-anchor="middle">—</text>
             </svg>
-            <span class="review-score-caption">GTO score</span>
+            <span class="review-score-caption">Accuracy
+              <button type="button" class="help-q" data-help="grading" aria-label="How moves are graded">?</button></span>
           </div>
           <div class="review-mid">
             <div class="review-step-row">
-              <button id="review-first" type="button" aria-label="First node" title="Jump to first decision">«</button>
-              <button id="review-prev" type="button" aria-label="Previous node">‹</button>
-              <span id="review-step-label"></span>
-              <button id="review-next" type="button" aria-label="Next node">›</button>
-              <button id="review-last" type="button" aria-label="Last node" title="Jump to last decision">»</button>
+              <button id="review-first" type="button" aria-label="First action" title="First action (Home)">«</button>
+              <button id="review-prev" type="button" aria-label="Previous action" title="Previous action (←)">‹</button>
+              <span id="review-step-label" aria-live="polite"></span>
+              <button id="review-next" type="button" aria-label="Next action" title="Next action (→)">›</button>
+              <button id="review-last" type="button" aria-label="Last action" title="Last action (End)">»</button>
             </div>
             <div id="review-chips"></div>
             <div id="review-whatif-bar" hidden>
@@ -255,106 +297,112 @@
           </div>
           <div id="review-detail"></div>
           <div class="review-actions">
-            <button id="review-repeat-hand" type="button">Repeat Hand</button>
-            <button id="review-next-hand" class="primary" type="button">Next Hand</button>
+            <button id="review-next-hand" class="primary" type="button" title="Deal a new hand (N)">Next hand</button>
+            <button id="review-repeat-hand" type="button" title="Deal the same hand again (not counted in your stats)">Repeat hand</button>
+            <button id="review-open-study" type="button" title="Open this spot in Study to explore other lines">Open in Study</button>
           </div>
         </div>
 
         <div class="panels">
           <div id="action-panel" class="panel">
-            <h3>Actions</h3>
+            <h3 id="action-title">Actions</h3>
+            <div id="last-verdict" class="last-verdict" hidden></div>
             <div id="gate-buttons"></div>
             <div id="raise-section" hidden>
               <div class="raise-bounds muted" id="raise-bounds-label"></div>
               <div class="raise-input-row">
-                <input id="raise-input" type="number" step="0.01" />
+                <input id="raise-input" type="number" step="0.01" inputmode="decimal" aria-label="Bet size" aria-describedby="raise-bounds-label" />
                 <span id="raise-unit" class="raise-unit">bb</span>
-                <button id="raise-submit" class="primary">Raise</button>
+                <button id="raise-submit" class="primary" type="button">Raise</button>
               </div>
               <div id="raise-shortcuts" class="raise-shortcuts"></div>
             </div>
             <div id="terminal-pane" hidden>
               <div id="terminal-message"></div>
             </div>
+          </div>
+          <div id="history-panel" class="panel">
             <div class="panel-head-row">
               <h3>History</h3>
-              <button id="undo-btn" disabled title="Take back the last action">Undo</button>
+              <button id="undo-btn" class="study-only" type="button" disabled title="Take back the last action (Backspace in the action list)">Undo</button>
             </div>
             <div id="history"></div>
           </div>
-
         </div>
       </section>
 
       <div id="side-rail">
         <div id="info-panel" class="panel">
-          <h3>Recommendation</h3>
-          <div id="recommendation">
-            <p class="muted">Place hero's 5 hole cards to see network output.</p>
+          <div class="panel-head-row panel-head-top">
+            <h3>Recommendation</h3>
+            <button type="button" class="help-q" data-help="reading" aria-label="How to read the recommendation">?</button>
+          </div>
+          <div id="recommendation" aria-live="polite">
+            <p class="muted">Loading the table…</p>
           </div>
         </div>
-      <aside id="card-grid-panel">
+      <aside id="card-grid-panel" aria-label="Card picker">
         <div class="card-grid-header">
           <span>Cards</span>
-          <span id="slot-hint" class="muted">Click a slot to place cards</span>
+          <span id="slot-hint" class="muted"></span>
           <span class="kbd-hint muted" title="Type a rank then a suit, e.g. A then S for the ace of spades. Backspace clears the last card.">or type <kbd>A</kbd><kbd>s</kbd></span>
         </div>
         <div id="card-grid"></div>
       </aside>
 
-      <aside id="trainer-stats-panel">
+      <aside id="trainer-stats-panel" aria-label="Your stats">
         <div class="card-grid-header"><span>Stats</span></div>
         <div id="stats-session" class="stats-block"></div>
         <div id="stats-lifetime" class="stats-block"></div>
+        <div id="recent-hands" class="stats-block recent-hands" hidden></div>
       </aside>
       </div>
     </main>
-    <!-- WGAPP:END -->
 
-    <div id="trainer-settings-modal" class="modal-backdrop" hidden>
-      <div class="modal">
-        <h3>Trainer Settings</h3>
+    <dialog id="trainer-settings-modal" class="dlg" aria-labelledby="ts-title">
+      <form class="modal" method="dialog" id="ts-form" novalidate>
+        <h3 id="ts-title">Trainer settings</h3>
         <div class="ts-row">
-          <label>Seats</label>
+          <label for="ts-seats-mode">Players</label>
           <select id="ts-seats-mode">
             <option value="random">Random range</option>
             <option value="fixed">Fixed</option>
           </select>
           <span class="ts-sub" id="ts-seats-fixed-wrap">
-            <input id="ts-seats-fixed" type="number" min="2" max="6" step="1" />
+            <input id="ts-seats-fixed" type="number" min="2" max="6" step="1" inputmode="numeric" aria-label="Number of players" />
           </span>
           <span class="ts-sub" id="ts-seats-range-wrap">
-            <input id="ts-seats-min" type="number" min="2" max="6" step="1" /> –
-            <input id="ts-seats-max" type="number" min="2" max="6" step="1" />
+            <input id="ts-seats-min" type="number" min="2" max="6" step="1" inputmode="numeric" aria-label="Fewest players" /> –
+            <input id="ts-seats-max" type="number" min="2" max="6" step="1" inputmode="numeric" aria-label="Most players" />
           </span>
         </div>
         <div class="ts-row">
-          <label>Stacks (bb)</label>
+          <label for="ts-stacks-mode">Stacks (bb)</label>
           <select id="ts-stacks-mode">
-            <option value="fixed">Fixed</option>
+            <option value="fixed">Same for everyone</option>
             <option value="random">Random range</option>
             <option value="per_seat">Per seat</option>
           </select>
           <span class="ts-sub" id="ts-stack-fixed-wrap">
-            <input id="ts-stack-bb" type="number" min="1" max="1000" step="0.5" />
+            <input id="ts-stack-bb" type="number" min="1" max="1000" step="0.5" inputmode="decimal" aria-label="Stack in big blinds" />
           </span>
           <span class="ts-sub" id="ts-stack-range-wrap">
-            <input id="ts-stack-min-bb" type="number" min="1" max="1000" step="0.5" /> –
-            <input id="ts-stack-max-bb" type="number" min="1" max="1000" step="0.5" />
+            <input id="ts-stack-min-bb" type="number" min="1" max="1000" step="0.5" inputmode="decimal" aria-label="Smallest stack in big blinds" /> –
+            <input id="ts-stack-max-bb" type="number" min="1" max="1000" step="0.5" inputmode="decimal" aria-label="Largest stack in big blinds" />
           </span>
         </div>
         <div class="ts-row" id="ts-per-seat-wrap">
-          <label>Per-seat ranges</label>
-          <div id="ts-per-seat"></div>
+          <span class="ts-label">Per seat</span>
+          <div id="ts-per-seat" role="group" aria-label="Stack range per seat, counted from you"></div>
         </div>
         <div class="ts-row">
-          <label>Hero position</label>
+          <label for="ts-hero-mode">Your seat</label>
           <select id="ts-hero-mode">
-            <option value="random">Random seat</option>
-            <option value="kth">Fixed (k-th to act)</option>
+            <option value="random">Random</option>
+            <option value="kth">Fixed turn to act</option>
           </select>
           <span class="ts-sub" id="ts-hero-kth-wrap">
-            <select id="ts-hero-kth">
+            <select id="ts-hero-kth" aria-label="Your turn to act">
               <option value="1">1st to act</option>
               <option value="2">2nd to act</option>
               <option value="3">3rd to act</option>
@@ -365,84 +413,207 @@
           </span>
         </div>
         <div class="ts-row">
-          <label>Ante (bb)</label>
-          <input id="ts-ante-bb" type="number" min="0" max="100" step="0.5" />
+          <label for="ts-spot">Spot to drill</label>
+          <select id="ts-spot">
+            <option value="any">Any spot</option>
+            <option value="first">You act first</option>
+            <option value="checked_to">Checked to you</option>
+            <option value="facing_bet">Facing a bet</option>
+            <option value="multiway">3+ players still in</option>
+          </select>
+          <span class="ts-help muted">Deals until your first decision is this kind of spot.</span>
         </div>
         <div class="ts-row">
-          <label>EV rollouts</label>
-          <input id="ts-mc-rollouts" type="number" min="0" max="256" step="1"
-                 title="Monte-Carlo rollouts per EV-loss estimate; 0 disables EV loss" />
+          <label for="ts-ante-bb">Ante (bb)</label>
+          <input id="ts-ante-bb" type="number" min="0" max="100" step="0.5" inputmode="decimal" />
         </div>
         <div class="ts-row">
-          <label>$ per 1bb</label>
-          <input id="ts-dollars-bb" type="number" min="0.01" max="100000" step="0.5"
-                 title="Dollar value of one big blind when the display unit is $" />
+          <label for="ts-mc-rollouts">EV-loss samples</label>
+          <input id="ts-mc-rollouts" type="number" min="0" max="256" step="1" inputmode="numeric"
+                 title="How many simulated run-outs estimate the EV cost of a move that differs from the network's; 0 turns EV loss off" />
+          <span class="ts-help muted">More = steadier EV-loss numbers, slower grading. 0 turns it off.</span>
         </div>
         <div class="ts-row">
-          <label>Opponent speed</label>
+          <label for="ts-anim-ms">Pause between opponent actions</label>
           <span class="ts-sub ts-speed">
             <input id="ts-anim-ms-range" type="range" min="0" max="4000" step="100"
-                   title="Pause between opponent actions (0 = instant, higher = slower)" />
-            <input id="ts-anim-ms" type="number" min="0" max="8000" step="100"
-                   title="Pause between opponent actions in milliseconds (0 = instant)" />
+                   aria-label="Pause between opponent actions" />
+            <input id="ts-anim-ms" type="number" min="0" max="8000" step="100" inputmode="numeric" />
             <span class="ts-unit">ms</span>
           </span>
         </div>
         <div class="ts-row">
-          <label>Fast-forward after fold</label>
+          <label for="ts-ff-fold">Skip ahead after I fold</label>
           <input id="ts-ff-fold" type="checkbox"
-                 title="When you fold, skip straight to the result instead of watching the opponents finish the hand" />
+                 title="When you fold, go straight to the result instead of watching the opponents finish the hand" />
         </div>
-        <p class="muted">Playback settings apply immediately; the rest from the next hand.</p>
+        <p id="ts-error" class="ts-error" role="alert" hidden></p>
+        <p class="muted">Playback settings apply right away; the rest from the next hand.</p>
         <div class="modal-buttons">
           <button id="ts-cancel" type="button">Cancel</button>
-          <button id="ts-save" class="primary" type="button">Save</button>
+          <button id="ts-save" class="primary" type="submit" value="save">Save</button>
         </div>
-      </div>
-    </div>
+      </form>
+    </dialog>
 
-    <div id="toast-container"></div>
+    <dialog id="confirm-dlg" class="dlg dlg-sm" aria-labelledby="confirm-title" aria-describedby="confirm-body">
+      <form class="modal" method="dialog">
+        <h3 id="confirm-title"></h3>
+        <p id="confirm-body" class="dlg-body"></p>
+        <div class="modal-buttons">
+          <button type="submit" value="cancel" class="btn-secondary" id="confirm-cancel">Cancel</button>
+          <button type="submit" value="ok" class="primary" id="confirm-ok">OK</button>
+        </div>
+      </form>
+    </dialog>
 
-    <!-- Public build: landing page (shown when PLO5BP_PUBLIC and no session) -->
-    <div id="login-overlay" style="display:none">
+    <dialog id="help-dlg" class="dlg" aria-labelledby="help-title">
+      <form class="modal" method="dialog">
+        <h3 id="help-title"></h3>
+        <div id="help-body" class="dlg-body help-body"></div>
+        <div class="modal-buttons">
+          <button type="submit" value="close" class="primary">Got it</button>
+        </div>
+      </form>
+    </dialog>
+    <!-- WGAPP:END -->
+
+    <div id="toast-container" aria-live="polite"></div>
+
+    <!-- Landing page for signed-out visitors (public build). It is visible as
+         served — no script needed (ACC-016) — and scrolls with the page
+         (MOB-012). On a signed-in page (the app chrome above is present) CSS
+         hides it: `#top-bar ~ #login-overlay`. -->
+    <div id="login-overlay" class="landing-page">
       <div class="landing">
         <header class="l-top">
-          <div class="gate-brand">
+          <a class="gate-brand" href="/" aria-label="WrapGTO home">
             <svg class="brand-logo" viewBox="0 0 96 96" aria-hidden="true">
               <path d="M28 12 H68 Q84 12 84 28 V68 Q84 84 68 84 H28 Q12 84 12 68 V44 Q12 30 26 30 H44 Q56 30 56 42 V46 Q56 56 46 56"
                     fill="none" stroke="currentColor" stroke-width="11"
                     stroke-linecap="round" stroke-linejoin="round"/>
             </svg>
             <span>Wrap<span class="brand-gto">GTO</span></span>
-          </div>
-          <button type="button" class="landing-signin l-top-cta">Sign in</button>
+          </a>
+          <nav class="l-nav" aria-label="Page">
+            <a href="#features">Features</a>
+            <a href="#home-games">Home games</a>
+            <a class="l-top-cta" href="/auth/login">Sign in</a>
+          </nav>
         </header>
 
-        <aside class="l-announce" role="status" aria-label="Free while in development">
-          <p class="l-kicker">Free for now</p>
-          <h2 class="l-announce-title">The models are still in development &mdash; so the whole site is free.</h2>
-          <p class="l-announce-body">The neural networks behind WrapGTO get stronger with every training run, but they are <b>not yet at the level I&rsquo;d be comfortable charging for</b>. Until they are, everything is open to the public at no cost: unlimited trainer hands, full Study mode, every format. Sign in and use it.</p>
-          <p class="l-announce-body"><b>How to read the output right now:</b> the network&rsquo;s <b>preferred action</b> (the highest-ranked line) is the main signal. The mixing frequencies are still soft, so secondary sizes and lines can show more weight than they should. That improves as training continues, and new weights are promoted to the site regularly.</p>
-        </aside>
-
+        <div class="l-main" role="main">
         <section class="l-hero">
-          <p class="l-kicker">AI-powered PLO training</p>
-          <h1>Train double-board PLO5 bomb pots against a neural network.</h1>
-          <p class="l-sub">A self-play model with over <b>800 million hands</b> — more
-            than eight billion decisions — and counting, wrapped in a GTO-style
-            trainer: drill random spots against the network, get every decision graded,
-            and review the EV of every line you didn't take. More formats are on the way.</p>
-          <p id="login-error" class="l-login-error" role="alert" hidden></p>
-          <button id="google-signin-btn" type="button" class="gate-google">
-            <svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
-            Sign in with Google
-          </button>
-          <p class="l-note"><b class="l-price">Free for everyone</b> while the models are in development
-            &middot; no card, no trial, no daily limit</p>
-          <div id="dev-login-row" style="display:none">
-            <input id="dev-login-email" type="email" placeholder="dev login email" />
-            <button id="dev-login-btn" type="button">Dev sign-in</button>
+          <div class="l-hero-copy">
+            <p class="l-kicker">AI-powered PLO training</p>
+            <h1>Train double-board PLO bomb pots against a neural network.</h1>
+            <p class="l-sub">A model trained on billions of self-play decisions, in a GTO-style
+              trainer. Drill random spots and get every decision graded, see what each one
+              cost you in EV, study the hands you played &mdash; and run private home games
+              with your friends.</p>
+            <p id="login-error" class="l-login-error" role="alert" hidden></p>
+            <a class="gate-google" href="/auth/login">
+              <svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
+              Sign in with Google
+            </a>
+            <!-- WGFREE:START (free period: PLO5BP_FREE_FOR_ALL on) -->
+            <p class="l-ribbon"><b>Free while the models are in development</b> &middot; no card, no daily limit &middot; <a href="#free">why free?</a></p>
+            <!-- WGFREE:END -->
+            <!-- WGPAID:START (paywall on) -->
+            <p class="l-ribbon"><b>{{FREE_HANDS}} free trainer hands a day</b> &middot; everything for {{PRICE}} a month &middot; <a href="#pricing">pricing</a></p>
+            <!-- WGPAID:END -->
+            <div id="dev-login-row" hidden>
+              <input id="dev-login-email" type="email" placeholder="dev login email" aria-label="Dev login email" />
+              <button id="dev-login-btn" type="button">Dev sign-in</button>
+            </div>
           </div>
+
+          <figure class="l-shot" aria-labelledby="l-shot-cap">
+            <div class="shot" role="img" aria-label="The Trainer: a double-board bomb pot on the table, a graded move (Best move, 96%) and the network's recommendation — bet 12 big blinds, with its frequencies and preferred sizes.">
+              <div class="shot-bar"><i></i><i></i><i></i><span>wrapgto.com &middot; Trainer</span></div>
+              <div class="shot-body">
+                <div class="shot-table">
+                  <div class="shot-felt"></div>
+                  <span class="shot-seat" style="--x:50%;--y:9%">UTG<b>34bb</b></span>
+                  <span class="shot-seat" style="--x:13%;--y:30%">BB<b>41bb</b></span>
+                  <span class="shot-seat" style="--x:87%;--y:30%">HJ<b>37bb</b></span>
+                  <span class="shot-seat folded" style="--x:13%;--y:72%">SB<b>29bb</b></span>
+                  <span class="shot-seat folded" style="--x:87%;--y:72%">CO<b>44bb</b></span>
+                  <span class="shot-seat hero" style="--x:50%;--y:90%">BTN &middot; you<b>37bb</b></span>
+                  <span class="shot-pot">Pot 18bb</span>
+                  <div class="shot-board" style="--y:31%">
+                    <span class="c su-s">K<i>&#9824;</i></span><span class="c su-h">9<i>&#9829;</i></span><span class="c su-d">4<i>&#9830;</i></span><span class="c su-c">2<i>&#9827;</i></span><span class="c empty"></span>
+                  </div>
+                  <div class="shot-board" style="--y:46%">
+                    <span class="c su-d">Q<i>&#9830;</i></span><span class="c su-s">8<i>&#9824;</i></span><span class="c su-c">7<i>&#9827;</i></span><span class="c su-h">J<i>&#9829;</i></span><span class="c empty"></span>
+                  </div>
+                  <div class="shot-board shot-hero" style="--y:63%">
+                    <span class="c su-h">A<i>&#9829;</i></span><span class="c su-d">K<i>&#9830;</i></span><span class="c su-c">Q<i>&#9827;</i></span><span class="c su-s">9<i>&#9824;</i></span><span class="c su-h">8<i>&#9829;</i></span>
+                  </div>
+                </div>
+                <div class="shot-panel">
+                  <div class="shot-h">Recommendation</div>
+                  <div class="shot-rec"><b>Bet 12bb</b><span>EV +6.2bb</span></div>
+                  <div class="shot-dist">
+                    <span>Fold</span><i style="--w:0%"></i><em>0%</em>
+                    <span>Check</span><i class="k" style="--w:22%"></i><em>22%</em>
+                    <span>Bet</span><i class="b" style="--w:78%"></i><em>78%</em>
+                  </div>
+                  <svg class="shot-curve" viewBox="0 0 200 62" aria-hidden="true">
+                    <defs><linearGradient id="shotgrad" x1="0" x2="1"><stop offset="0" stop-color="#5FE5D9"/><stop offset="1" stop-color="#18D2C3"/></linearGradient></defs>
+                    <line x1="8" y1="48" x2="192" y2="48" stroke="rgba(255,255,255,0.12)"/>
+                    <path d="M8 44 C30 40 44 30 62 20 C78 11 92 9 104 16 C120 26 140 38 160 42 C172 44 184 45 192 45 L192 48 L8 48 Z" fill="url(#shotgrad)" fill-opacity="0.16"/>
+                    <path d="M8 44 C30 40 44 30 62 20 C78 11 92 9 104 16 C120 26 140 38 160 42 C172 44 184 45 192 45" fill="none" stroke="url(#shotgrad)" stroke-width="2.2" stroke-linecap="round"/>
+                    <circle cx="86" cy="11" r="4" fill="#fff"/>
+                    <text x="8" y="59" fill="#8794a6" font-size="8">min</text><text x="86" y="59" fill="#8794a6" font-size="8" text-anchor="middle">66%</text><text x="192" y="59" fill="#8794a6" font-size="8" text-anchor="end">pot</text>
+                  </svg>
+                  <div class="shot-verdict">
+                    <span class="lbl">Your move</span>
+                    <b><span class="mk">&#10003;&#10003;</span> Best move &middot; 96%</b>
+                    <span class="sub">Bet 12bb &middot; EV loss shown at hand end</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <figcaption id="l-shot-cap">Every decision graded against the network &mdash; with its
+              preferred action, how often it takes each line, and the sizes it likes.</figcaption>
+          </figure>
+        </section>
+
+        <section class="l-section" id="features">
+          <p class="l-kicker">What you get</p>
+          <h2>A trainer, a study tool and a review, built for one format.</h2>
+          <div class="l-cards">
+            <div class="l-card">
+              <h3>Trainer</h3>
+              <p>Random bomb pots dealt instantly, any stack depth, two- to six-handed. Play them
+                against the network and every move is graded &mdash; Best move, Correct,
+                Inaccuracy, Wrong, Blunder.</p>
+            </div>
+            <div class="l-card">
+              <h3>Review</h3>
+              <p>After each hand, step through every decision &mdash; yours and theirs &mdash; see
+                what each of yours cost in EV, and swap a card to see how the answer changes.</p>
+            </div>
+            <div class="l-card">
+              <h3>Study</h3>
+              <p>Enter a hand you played: seats, stacks, cards and actions. The network answers at
+                every decision, with the bet sizes it prefers. Share any spot with a link.</p>
+            </div>
+          </div>
+        </section>
+
+        <section class="l-section l-games" id="home-games">
+          <p class="l-kicker">Home games</p>
+          <h2>Play with your friends &mdash; on the same tables.</h2>
+          <p class="l-body">Start a private club, send your friends an invite link, and deal
+            double-board PLO5, PLO6 or PLO67 bomb pots on any phone or computer.</p>
+          <ul class="l-feature-list">
+            <li><b>Private clubs.</b> Only members see your tables, hand histories and numbers.</li>
+            <li><b>A ledger, not a cashier.</b> WrapGTO keeps score of who's up and who owes whom; no money ever moves through the site.</li>
+            <li><b>A shuffle you can check.</b> Every player's device helps cut the deck, and anyone can verify a deal afterwards.</li>
+            <li><b>Every hand kept.</b> A hand replayer, club stats, and the same move-by-move grades as the trainer.</li>
+          </ul>
         </section>
 
         <section class="l-section">
@@ -452,111 +623,160 @@
             <div class="l-card">
               <h3>Any stack depth</h3>
               <p>Real games don't come in preset configurations. The model trains across
-                two- to six-handed pots with stacks from short to 300bb deep — and reads
+                two- to six-handed pots with stacks from short to 300bb deep &mdash; and reads
                 the exact stacks in front of it, not the nearest template.</p>
             </div>
             <div class="l-card">
               <h3>Any bet size</h3>
               <p>No fixed bet menu. The network converges on its own preferred size for
-                each spot — a continuous choice from min-bet to pot — and grades your
+                each spot &mdash; a continuous choice from min-bet to pot &mdash; and grades your
                 sizing against that judgment, not a coarse grid.</p>
             </div>
             <div class="l-card">
               <h3>Every multiway spot</h3>
               <p>Bomb pots are multiway by nature, which is exactly where game trees
-                explode. The network doesn't enumerate the tree — it just plays the spot
+                explode. The network doesn't enumerate the tree &mdash; it plays the spot
                 in front of it, however many players are in.</p>
             </div>
           </div>
         </section>
 
         <section class="l-section">
-          <p class="l-kicker">What it is — and isn't</p>
+          <p class="l-kicker">What it is &mdash; and isn't</p>
           <h2>Not a true solver. Honestly better than pretending.</h2>
           <p class="l-body">WrapGTO does not compute a Nash equilibrium. The model
-            <em>approximates</em> GTO play, learned through self-play — that's a real
-            limitation, and we'd rather state it than market around it.</p>
+            <em>approximates</em> GTO play, learned through self-play &mdash; that's a real
+            limitation, and I'd rather state it than market around it.</p>
           <p class="l-body">The alternative doesn't exist: a true CFR solver for
-            double-board PLO5 bomb pots would require crushing abstractions —
+            double-board PLO5 bomb pots would require crushing abstractions &mdash;
             pre-configured seat and stack layouts, a handful of allowed bet sizes, and
-            heavy card bucketing — before the tree fits in any computer. What you'd gain
+            heavy card bucketing &mdash; before the tree fits in any computer. What you'd gain
             in theoretical purity, you'd lose in relevance to the hand you actually played.</p>
-          <div class="l-stat">
-            <div class="l-stat-num">&mdash;<span class="l-stat-unit">bb/100</span></div>
-            <div class="l-stat-cap">Measured exploitability</div>
-            <p class="l-stat-note">We train a best-response adversary against the live
-              model and publish how much it can extract. The current probe hasn't
-              finished; the number will appear here when it does — whatever it says.</p>
-          </div>
+          <p class="l-body">I'm also building a best-response probe that measures how much a
+            perfect adversary could win against the live model. The number will be published
+            here when it's done &mdash; whatever it says.</p>
         </section>
 
-        <section class="l-section">
-          <p class="l-kicker">Why this exists</p>
-          <h2>A study tool first. A business barely.</h2>
-          <p class="l-body">WrapGTO started as a personal project: a professional player
-            who wanted to study double-board bomb pots and found that nothing for the format
-            existed — no solver, no trainer, no library. So I built the model, the engine,
-            and this site to study against myself.</p>
-          <p class="l-body">Right now it costs nothing. The models aren't strong enough yet
-            for me to feel right about selling them, so the site stays free while they train.
-            When that changes it will be priced to cover GPU time, not to turn a profit &mdash;
-            each new format is weeks of training at around $50 a day, funded out of my own
-            poker winnings &mdash; and anyone using it today will hear about it well in advance.
-            I'd be running it either way.</p>
+        <!-- WGFREE:START -->
+        <section class="l-section l-pricing" id="free">
+          <p class="l-kicker">Why it's free</p>
+          <h2>The models are still in development, so the whole site is free.</h2>
+          <p class="l-body">The networks behind WrapGTO get stronger with every training run, but
+            they aren't yet at the level I'd be comfortable charging for. Until they are, everything
+            is open: unlimited trainer hands, full Study, home games. New weights reach the site
+            regularly as training goes on.</p>
+          <p class="l-body">If paid plans ever arrive, anyone using the site will hear about it well
+            in advance &mdash; priced to cover GPU time, not to turn a profit.</p>
+          <a class="gate-primary l-cta" href="/auth/login">Sign in and start</a>
+          <p class="l-fine">A Google sign-in keeps your hands and stats yours. Nothing else is asked for.</p>
         </section>
-
-        <section class="l-section l-pricing">
+        <!-- WGFREE:END -->
+        <!-- WGPAID:START -->
+        <section class="l-section l-pricing" id="pricing">
           <p class="l-kicker">Pricing</p>
           <div class="l-price-card">
-            <div class="l-badge">While the models are in development</div>
-            <div class="l-price-row"><span class="l-price-big">Free</span><span class="l-price-per">for now</span></div>
-            <p class="l-price-note">No subscription, no card, no limits. If that ever changes,
-              you'll know long before it does.</p>
+            <div class="l-price-row"><span class="l-price-big">{{PRICE}}</span><span class="l-price-per">a month</span></div>
+            <p class="l-price-note">Start free: {{FREE_HANDS}} trainer hands a day, no card needed.</p>
             <ul class="l-list">
               <li>Unlimited trainer hands, graded move by move</li>
               <li>Full Study mode &mdash; set up any spot, replay any line</li>
               <li>EV-loss review on every decision</li>
               <li>New formats and stronger weights as they ship</li>
             </ul>
-            <button type="button" class="gate-primary landing-signin">Sign in and start</button>
-            <p class="l-fine">A Google sign-in keeps your hands and stats yours. Nothing else is asked for.</p>
+            <a class="gate-primary l-cta" href="/auth/login">Sign in and start</a>
+            <p class="l-fine">Cancel anytime. A Google sign-in keeps your hands and stats yours.</p>
           </div>
         </section>
+        <!-- WGPAID:END -->
+
+        <section class="l-section">
+          <p class="l-kicker">Why this exists</p>
+          <h2>A study tool first. A business barely.</h2>
+          <p class="l-body">WrapGTO started as a personal project: I'm a professional player who
+            wanted to study double-board bomb pots and found that nothing for the format existed
+            &mdash; no solver, no trainer, no library. So I built the model, the engine, and this
+            site to study against myself. Each new format is weeks of training at around $50 a
+            day, funded out of my own poker winnings. I'd be running it either way.</p>
+        </section>
+        </div>
 
         <footer class="l-foot">
-          Study tool only — no real-time play assistance. &copy; 2026 WrapGTO
-          &nbsp;·&nbsp; <a href="/terms" style="color:var(--muted)">Terms</a>
-          &nbsp;·&nbsp; <a href="/privacy" style="color:var(--muted)">Privacy</a>
+          <span>Study tool only &mdash; no real-time play assistance. &copy; 2026 WrapGTO</span>
+          <nav aria-label="Legal and contact">
+            <a href="/terms">Terms</a>
+            <a href="/privacy">Privacy</a>
+            <a href="mailto:support@wrapgto.com">Contact</a>
+          </nav>
         </footer>
       </div>
     </div>
 
-    <!-- Mobile card picker: the #card-grid node is re-parented in here while
+    <!-- WGAPP:START (in-app dialogs; a signed-out visitor never needs them) -->
+    <!-- Phone card picker: the #card-grid node is re-parented in here while
          a slot is selected on a small screen (study entry + trainer what-if). -->
-    <div id="card-picker-modal" style="display:none">
-      <div class="picker-backdrop"></div>
+    <dialog id="card-picker-modal" class="dlg sheet" aria-labelledby="picker-title">
       <div class="picker-sheet">
         <div class="picker-head">
-          <span id="picker-title">Place card</span>
-          <button id="picker-clear-btn" type="button" style="display:none">Clear slot</button>
-          <button id="picker-close-btn" type="button" aria-label="Close">&#10005;</button>
+          <span id="picker-title">Place a card</span>
+          <button id="picker-clear-btn" type="button" hidden>Clear card</button>
+          <button id="picker-close-btn" type="button" aria-label="Close the card picker">&#10005;</button>
         </div>
         <div id="picker-grid-host"></div>
       </div>
-    </div>
+    </dialog>
 
-    <!-- Public build: paywall modal (free limit / study gating) -->
-    <div id="paywall-modal" class="gate-overlay" style="display:none">
-      <div class="gate-card">
-        <h2 id="paywall-title">Daily free limit reached</h2>
+    <!-- Public build: paywall (dormant while the site is free) -->
+    <dialog id="paywall-modal" class="dlg dlg-sm" aria-labelledby="paywall-title" aria-describedby="paywall-msg">
+      <div class="modal gate-card">
+        <h3 id="paywall-title">Daily free limit reached</h3>
         <p id="paywall-msg" class="gate-tag"></p>
-        <button id="paywall-subscribe-btn" type="button" class="gate-primary">Subscribe — $10 / month</button>
-        <p class="gate-fine">Early-user rate: 80% off the standard $50/mo, locked in for life.</p>
+        <button id="paywall-subscribe-btn" type="button" class="gate-primary">Subscribe</button>
+        <p id="paywall-fine" class="gate-fine">Early-user price, kept for as long as your subscription stays active. Cancel anytime.</p>
         <button id="paywall-close-btn" type="button" class="gate-secondary">Not now</button>
       </div>
-    </div>
+    </dialog>
 
+    <!-- Delete account (srv ACC-009 routes; the menu item appears when /me offers it) -->
+    <dialog id="delete-dlg" class="dlg dlg-sm" aria-labelledby="delete-title" aria-describedby="delete-body">
+      <form class="modal" method="dialog" id="delete-form" novalidate>
+        <h3 id="delete-title">Delete your account?</h3>
+        <p id="delete-body" class="dlg-body">Your email, name, picture, trainer stats and chat are removed and
+          you're signed out everywhere. Hands you played in home games stay in your friends' histories and
+          ledgers, under "Deleted player", so their numbers still add up. This can't be undone.</p>
+        <p id="delete-export-line" class="dlg-body" hidden>Want a copy first?
+          <a id="delete-export" href="/account/export" download>Download your data</a>.</p>
+        <label class="dlg-field" for="delete-confirm">Type your email address to confirm</label>
+        <input id="delete-confirm" type="email" autocomplete="off" spellcheck="false" />
+        <p id="delete-error" class="ts-error" role="alert" hidden></p>
+        <div class="modal-buttons">
+          <button type="button" class="btn-secondary" id="delete-cancel">Cancel</button>
+          <button type="submit" class="primary danger" id="delete-go">Delete my account</button>
+        </div>
+      </form>
+    </dialog>
+
+    <!-- Session ended while the page was open (ACC-026) -->
+    <dialog id="session-dlg" class="dlg dlg-sm" aria-labelledby="session-title">
+      <div class="modal">
+        <h3 id="session-title">You've been signed out</h3>
+        <p class="dlg-body">Your session ended. Sign in again to pick up where you left off.</p>
+        <div class="modal-buttons">
+          <a class="primary btn-link" id="session-signin" href="/auth/login">Sign in again</a>
+        </div>
+      </div>
+    </dialog>
+
+    <!-- The client: plain scripts that share one global scope, in this order
+         (each file's header says what it holds; FE-019). -->
+    <script src="/static/app.core.js"></script>
+    <script src="/static/app.table.js"></script>
+    <script src="/static/app.play.js"></script>
+    <script src="/static/app.study.js"></script>
+    <script src="/static/app.trainer.js"></script>
+    <script src="/static/app.topbar.js"></script>
     <script src="/static/app.js"></script>
     <script src="/static/ranges.js"></script>
+    <!-- WGAPP:END -->
+    <script src="/static/landing.js" defer></script>
   </body>
 </html>

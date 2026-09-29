@@ -72,3 +72,20 @@ def test_userscript_keeps_privileged_transport_and_loopback_target():
     )
     for forbidden in ("fetch(", "new WebSocket", "XMLHttpRequest(", ".click(", "dispatchEvent("):
         assert forbidden not in code, forbidden
+
+
+def test_userscript_version_is_consistent_and_self_updating():
+    """TOOL-016: the header @version, the `collector` it sends and the
+    server's minimum agree, and Tampermonkey updates it from the local
+    server."""
+    import re
+
+    src = USERSCRIPT.read_text(encoding="utf-8")
+    header = re.search(r"// @version\s+(\S+)", src).group(1)
+    sent = re.search(r"const COLLECTOR_VERSION = '([^']+)';", src).group(1)
+    assert header == sent
+    url = "http://127.0.0.1:8765/pokernow/pokernow.user.js"
+    assert f"// @updateURL    {url}" in src and f"// @downloadURL  {url}" in src
+    from plo5bp.ui.live.pokernow import REQUIRED_COLLECTOR
+
+    assert tuple(int(x) for x in sent.split(".")) >= REQUIRED_COLLECTOR

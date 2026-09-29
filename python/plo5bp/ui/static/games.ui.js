@@ -1,19 +1,36 @@
 "use strict";
-// Home games — UI chrome: toasts, dialogs, menus, the lobby, the side rail
-// (chat / hand log / ledger / history) and the host's "Manage table" drawer.
+// Home games — UI shell: the building blocks every window uses (toasts, dialogs,
+// menus, segmented pickers), the side rail (chat / hand log / ledger / history),
+// preferences, the profile picture, the top bar and the render entry point.
+// The windows live in feature modules that load after this file and add their
+// functions to HG.ui (they call each other through HG.ui at call time, so their
+// load order doesn't matter):
+//   games.lobby.js    the lobby, clubs, hosting a table, the club's numbers
+//   games.history.js  the hand replayer, Open in Study, the lifetime hand database
+//   games.seat.js     sitting down, chips, automatic chips, requests, the player card, leaving
+//   games.manage.js   the host's Manage drawer and the Table info card
 // The action dock lives in games.play.js; the felt in games.table.js.
 (function () {
   const HG = (globalThis.HG = globalThis.HG || {});
   const $ = (id) => document.getElementById(id);
   const C = () => HG.core;
-  const esc = (x) => C().esc(x);
-  const icon = (id, cls) => `<svg class="ico ${cls || ""}"><use href="#${id}"/></svg>`;
+  // Markup (FE-003): html`` escapes every value it is given; put() puts markup in as
+  // markup and anything else as text (games.js; this file loads before it, hence the
+  // call-time wrappers). Styling lives in games.css — a value the CSS needs rides in
+  // data-vars (FE-011: the page allows no inline style).
+  const html = (strings, ...values) => C().html(strings, ...values);
+  const put = (el, content) => C().put(el, content);
+  const icon = (id, cls) => html`<svg class="ico ${cls || ""}"><use href="#${id}"/></svg>`;
+  const UI = (HG.ui = HG.ui || {});
+  UI.onInit = UI.onInit || [];  // (each feature module's own wiring, run by init)
   const U = (HG.uiState = {
     eventSeen: null, chatSig: "", logSig: "", ledgerSig: "", handsFor: null, hands: null, handsLoading: false,
     unread: 0, drawer: null, drawerTab: "game", modals: [], menu: null, lobbySig: "", railTab: "chat",
   });
 
-  function h(tag, attrs, html) {
+  // An element with its attributes (on* = a listener) and its content: markup (html``),
+  // a node, or text — a plain string is always text (put).
+  function h(tag, attrs, content) {
     const e = document.createElement(tag);
     for (const [k, v] of Object.entries(attrs || {})) {
       if (k === "class") e.className = v;
@@ -21,30 +38,53 @@
       else if (v === true) e.setAttribute(k, "");
       else if (v !== false && v != null) e.setAttribute(k, v);
     }
-    if (html != null) e.innerHTML = html;
+    if (attrs && attrs["data-vars"]) C().applyVars(e);
+    if (content != null) put(e, content);
     return e;
+  }
+  // markup added at the end of `el` (new chat lines), its data-vars applied like put's
+  function append(el, markup) {
+    const box = put(document.createElement("div"), markup);
+    while (box.firstChild) el.appendChild(box.firstChild);
   }
   // `url` = the person's profile picture (2026-09-26); the initials stay under it
   // and show again if the picture can't load (the error listener in init drops it).
+  // The hue is a CSS variable (data-vars: the page allows no inline style).
   function avatar(name, key, cls, url) {
     const A = HG.avatar;
-    const img = url ? `<img src="${esc(url)}" alt="" loading="lazy" decoding="async"/>` : "";
-    return `<span class="av ${cls || ""}" style="--h:${A.hueOf(key != null ? key : name)}">${esc(A.initials(name))}${img}</span>`;
+    const img = url ? html`<img src="${url}" alt="" loading="lazy" decoding="async"/>` : "";
+    return html`<span class="av ${cls || ""}" data-vars="h:${A.hueOf(key != null ? key : name)}">${A.initials(name)}${img}</span>`;
   }
-  function moneyInput(id, cents, attrs) {
-    return `<div class="money"><input class="input" id="${id}" inputmode="decimal" autocomplete="off" value="${(cents / 100).toFixed(2)}" ${attrs || ""}/></div>`;
+  // `label` names the box for a screen reader (optional)
+  function moneyInput(id, cents, label) {
+    return html`<div class="money"><input class="input" id="${id}" inputmode="decimal" autocomplete="off" value="${(cents / 100).toFixed(2)}"${label ? html` aria-label="${label}"` : ""}/></div>`;
   }
+  const CONN_GRACE_MS = 2500;  // (renderConn: how long a lost connection may last before the bar shows)
   const d2 = (c) => C().dollars(c);
-  const d0 = (c) => (c % 100 ? d2(c) : d2(c).replace(/\.00$/, ""));  // "$100", "$12.50": preset buttons are narrow
+  const d0 = (c) => C().dollars(c, true);  // "$100", "$12.50": preset buttons are narrow
   // The games a table can deal (2026-09-26: PLO6 next to PLO5; 2026-09-27: PLO67). The
-  // server says which one a table deals (s.variant / s.game); this is the lobby's copy for
-  // the create dialog, the tags and the club's per-game numbers. Seat limits: one deck
-  // (7 x 6 + 10 = 52; PLO67 reserves seven cards a player + 10 + 3 face-up burns = 48 at 5).
+  // SERVER's list is the source (FE-004): the lobby data and every table view carry it
+  // (setGames) — labels, seats, graded, and whether this server can deal it at all (PLO67
+  // needs its engine). This copy only covers the moment before the first answer, and an
+  // older server. Seat limits: one deck (7 x 6 + 10 = 52; PLO67 reserves seven cards a
+  // player + 10 + 3 face-up burns = 48 at 5).
+  const WORDS = ["no", "one", "two", "three", "four", "five", "six", "seven"];
   const GAMES = {
-    plo5: { label: "PLO5", name: "PLO5 double-board bomb pot", hole: 5, word: "five", maxSeats: 8, seats: [2, 4, 6, 8], graded: true },
-    plo6: { label: "PLO6", name: "PLO6 double-board bomb pot", hole: 6, word: "six", maxSeats: 7, seats: [2, 4, 6, 7], graded: false },
-    plo67: { label: "PLO67", name: "PLO67 double-board bomb pot", hole: 7, dealt: 4, burns: 3, word: "four", maxSeats: 5, seats: [2, 3, 4, 5], graded: false },
+    plo5: { label: "PLO5", name: "PLO5 double-board bomb pot", hole: 5, dealt: 5, burns: 0, word: "five", maxSeats: 8, graded: true, available: true },
+    plo6: { label: "PLO6", name: "PLO6 double-board bomb pot", hole: 6, dealt: 6, burns: 0, word: "six", maxSeats: 7, graded: false, available: true },
+    plo67: { label: "PLO67", name: "PLO67 double-board bomb pot", hole: 7, dealt: 4, burns: 3, word: "four", maxSeats: 5, graded: false, available: true },
   };
+  function setGames(list) {
+    for (const g of Array.isArray(list) ? list : [list]) {
+      if (!g || !g.code) continue;
+      const cur = GAMES[g.code] || {};
+      GAMES[g.code] = {
+        label: g.label || cur.label || g.code, name: g.name || cur.name || g.code, hole: g.hole, dealt: g.dealt, burns: g.burns || 0,
+        word: WORDS[g.dealt] || String(g.dealt), maxSeats: g.max_seats, graded: !!g.graded,
+        available: g.available != null ? !!g.available : cur.available !== false,
+      };
+    }
+  }
   const gameOf = (v) => GAMES[v] || GAMES.plo5;
   const gameNote = (v) => {
     const G = gameOf(v), cards = G.word[0].toUpperCase() + G.word.slice(1);
@@ -52,99 +92,152 @@
     return `${deal}, up to ${G.maxSeats} players · ${G.graded ? "every decision graded by the network" : `not graded yet (there is no ${G.label} network)`}`;
   };
   // PLO67 in one paragraph (the table's info card and the Game guide)
-  const BURN_RULES = "The three burn cards are dealt <b>face up</b>: one before the flops, one before the turns, one before the rivers. " +
-    "Every <b>red</b> burn (diamond or heart) deals everyone still in the hand — all-in players too — one more hole card: " +
-    "4-5 cards on the flop, 4-6 on the turn, up to 7 on the river.";
+  const burnRules = () => html`The three burn cards are dealt <b>face up</b>: one before the flops, one before the turns, one before the rivers.
+    Every <b>red</b> burn (diamond or heart) deals everyone still in the hand — all-in players too — one more hole card:
+    4-5 cards on the flop, 4-6 on the turn, up to 7 on the river.`;
+  // The choices for a table's settings — ONE list for "Host a table" and Manage (they
+  // used to offer different ones: no 10 s clock or 5 seats when hosting).
+  const OPTIONS = {
+    clock: [[0, "Off"], [10, "10s"], [15, "15s"], [20, "20s"], [30, "30s"], [45, "45s"], [60, "60s"]],
+    bank: [[0, "Off"], [15, "15s"], [30, "30s"], [60, "60s"], [120, "2 min"]],
+    deal: [[0, "Manual"], [2, "2s"], [3, "3s"], [5, "5s"], [8, "8s"], [12, "12s"]],
+    pause: [[0.5, "0.5s"], [1, "1s"], [1.5, "1.5s"], [2.5, "2.5s"], [4, "4s"]],
+    seats: (max) => Array.from({ length: Math.max(1, max - 1) }, (_, i) => [i + 2, String(i + 2)]),
+  };
+  const secsLabel = (v) => (Number(v) ? `${v}s` : "Off");
+  // "Sat 27 Sep, 21:40" in the viewer's own time zone (the server's dates are UTC, so a
+  // late game read "tomorrow" as a bare "2026-09-27"; HGH-004). The year only when it isn't this one.
+  function fmtWhen(iso, withTime) {
+    const t = Date.parse(iso);
+    if (!Number.isFinite(t)) return String(iso || "").slice(0, 10);
+    const d = new Date(t);
+    const date = d.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short", year: d.getFullYear() === new Date().getFullYear() ? undefined : "numeric" });
+    return withTime === false ? date : `${date}, ${d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}`;
+  }
 
   // ------------------------------------------------------------------ toasts
+  // Errors stay 7 s (a buy-in rule takes a moment to read) and are announced at once
+  // (role=alert; the root is a polite live region for the rest); any toast goes away
+  // when tapped. A phone at the table shows one at a time: they sit over the far seats.
   function toast(msg, kind, ms) {
     const root = $("toast-root");
     if (!root) return;
     // the same line again while it is still up is noise (stacked copies hid the table)
     if ([...root.children].some((x) => x.textContent === String(msg) && !x.classList.contains("out"))) return;
-    const t = h("div", { class: "toast " + (kind || "") }, esc(msg));
+    const err = kind === "err";
+    const t = h("div", { class: "toast " + (kind || ""), role: err ? "alert" : null, title: "Tap to dismiss" }, String(msg));
+    const bye = () => {
+      if (t.classList.contains("out")) return;
+      t.classList.add("out");
+      t.addEventListener("animationend", () => t.remove());  // (its fade-out; the timer covers no animation)
+      setTimeout(() => t.remove(), 400);
+    };
+    t.addEventListener("click", bye);
     root.appendChild(t);
-    while (root.children.length > 4) root.firstChild.remove();
-    setTimeout(() => { t.classList.add("out"); setTimeout(() => t.remove(), 260); }, ms || 3400);
+    const max = !C().G.gameId || globalThis.innerWidth > 760 ? 3 : 1;
+    while (root.children.length > max) root.firstChild.remove();
+    setTimeout(bye, ms || (err ? 7000 : 3400));
   }
-
-  // --------------------------------------- join requests (club owner / admins)
-  // Someone asked to join the club (from a table link, or the invite link of an
-  // ask-first club). A small card, never a modal — it must not get in the way of
-  // a hand.
-  function renderJoinReqs(list) {
-    let el = $("joinreq");
-    if (!list || !list.length) {
-      if (el && !el.hidden) { el.hidden = true; el.dataset.sig = ""; }
-      document.body.classList.remove("has-joinreq");
-      return;
+  // A page-wide notice over everything (no network at start-up, signed out): title, a
+  // line, one button. `null` takes it away.
+  function pageNotice(o) {
+    let el = $("pagenote");
+    if (!o) { if (el) el.remove(); return; }
+    if (!el) { el = h("div", { id: "pagenote", role: "alertdialog", "aria-modal": "true", "aria-labelledby": "pn-title" }); document.body.appendChild(el); }
+    put(el, html`<div class="pn-card"><span class="pn-ico">${icon(o.icon || "i-info")}</span><h2 id="pn-title">${o.title}</h2><p>${o.text}</p></div>`);
+    if (o.button) {
+      const b = h("button", { class: "btn gold", type: "button", onclick: o.onClick }, o.button);
+      el.firstChild.appendChild(b);
+      setTimeout(() => b.focus({ preventScroll: true }), 30);
     }
-    if (!el) {
-      el = h("div", { id: "joinreq", class: "joinreq", role: "status" });
-      document.body.appendChild(el);
-      el.addEventListener("click", async (e) => {
-        const b = e.target.closest("button[data-j]");
-        const r = U.joinReq;
-        if (!b || b.disabled || !r) return;
-        el.querySelectorAll("button").forEach((x) => { x.disabled = true; });
-        const allow = b.dataset.j === "yes";
-        try {
-          await C().j(`/games/api/clubs/${encodeURIComponent(r.club_id)}/requests/decide`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ user_id: r.user_id, allow }) });
-          toast(allow ? `${r.name || "They"} joined ${r.club_name || "the club"}` : "Request declined", allow ? "ok" : "");
-        } catch (err) { toast(err.message, "err"); }
-        el.dataset.sig = "";  // the next state (or lobby poll) brings the rest
-        el.hidden = true;
-        document.body.classList.remove("has-joinreq");
-        if (C().G.gameId) C().refreshNow().catch(() => {}); else C().loadLobby().catch(() => {});
-      });
-    }
-    const r = list[0];
-    U.joinReq = r;
-    const sig = list.map((x) => `${x.club_id}:${x.user_id}`).join(",");
-    if (el.dataset.sig !== sig) {
-      el.dataset.sig = sig;
-      el.innerHTML = `<div class="jr-txt"><b>${esc(r.name || "Someone")}</b> wants to join ${esc(r.club_name || "the club")}<small>${esc(r.email)}${list.length > 1 ? ` · +${list.length - 1} more` : ""}</small></div>` +
-        `<div class="jr-btns"><button class="btn sm ghost" type="button" data-j="no">Not now</button><button class="btn sm gold" type="button" data-j="yes">Let in</button></div>`;
-    }
-    el.hidden = false;
-    document.body.classList.add("has-joinreq");
+  }
+  function bootProblem(msg, retry) {
+    if (msg == null) { if ($("pagenote") && $("pagenote").dataset.k === "boot") pageNotice(null); return; }
+    pageNotice({ icon: "i-bolt", title: "Can't reach WrapGTO", text: `${msg}. Trying again by itself…`, button: "Try now", onClick: () => retry && retry() });
+    $("pagenote").dataset.k = "boot";
+  }
+  function signedOut() {
+    pageNotice({ icon: "i-user", title: "You've been signed out", text: "Your sign-in ended (signed out in another tab, or it expired). Sign in again to pick up where you were.", button: "Sign in again", onClick: () => location.reload() });
+    $("pagenote").dataset.k = "signin";
+  }
+  // the lobby's first load failed: its "Loading…" says why (the 5 s poll retries)
+  function lobbyOffline(on) {
+    const lb = $("lobby");
+    if (lb) lb.classList.toggle("offline", !!on);
   }
 
   // ------------------------------------------------------------------ modals
+  // Dialogs (A11Y-004): named by their title (aria-labelledby); focus moves in — to the
+  // first box, or with `autofocus: false` (no phone keyboard popping up) to the dialog
+  // itself — Tab stays inside (trapFocus), and focus goes back to what opened it. A
+  // dialog that fills in later (a slow load) opens at once with "Loading…" and gets its
+  // content through setBody / setButtons / setTitle (HGH-002). `then(fn)` runs fn once
+  // the dialog has finished closing — the next dialog opens from there (FE-007: this
+  // used to be copies of the CSS timings in setTimeouts).
   function openModal(opts) {
     const root = $("modal-root");
-    const layer = h("div", { class: "layer", style: "position:absolute;inset:0" });
+    const layer = h("div", { class: "layer" });
     const scrim = h("div", { class: "scrim" });
     const wrap = h("div", { class: "modal-wrap" });
-    const modal = h("div", { class: "modal" + (opts.wide ? " wide" : ""), role: "dialog", "aria-modal": "true" });
-    const head = h("div", { class: "m-head" }, `<h3>${esc(opts.title || "")}</h3>`);
+    U.modalSeq = (U.modalSeq || 0) + 1;
+    const tid = "mt-" + U.modalSeq;
+    const modal = h("div", { class: "modal" + (opts.wide ? " wide" : ""), role: "dialog", "aria-modal": "true", "aria-labelledby": tid, tabindex: "-1" });
+    const head = h("div", { class: "m-head" }, h("h3", { id: tid }));
     const x = h("button", { class: "icon-btn", type: "button", "aria-label": "Close" }, icon("i-x"));
     head.appendChild(x);
     modal.appendChild(head);
-    if (opts.sub) modal.appendChild(h("div", { class: "m-sub" }, esc(opts.sub)));
+    const sub = h("div", { class: "m-sub" });
+    modal.appendChild(sub);
     const body = h("div", { class: "m-body" });
-    if (typeof opts.body === "string") body.innerHTML = opts.body; else if (opts.body) body.appendChild(opts.body);
     modal.appendChild(body);
     const foot = h("div", { class: "m-foot" });
+    modal.appendChild(foot);
+    const opener = document.activeElement;
+    const after = [];
+    let closed = false, gone = false;
+    const finish = () => {
+      if (gone) return;
+      gone = true;
+      layer.remove();
+      after.splice(0).forEach((f) => f());
+    };
     const close = (val) => {
+      if (closed) return;
+      closed = true;
       layer.classList.remove("open");
       U.modals = U.modals.filter((m) => m !== api);
-      setTimeout(() => layer.remove(), 240);
+      afterTransition(modal, finish, 400);  // (gone when its fade-out ends)
       if (opts.onClose) opts.onClose(val);
+      if (!U.modals.length && !U.drawer && opener && opener.isConnected && opener.focus) opener.focus({ preventScroll: true });
     };
-    const api = { close, body, modal, foot };
-    (opts.buttons || []).forEach((b) => {
-      const btn = h("button", { class: "btn " + (b.cls || ""), type: "button" }, esc(b.label));
-      btn.addEventListener("click", async () => {
-        if (!b.onClick) return close(b.value);
-        btn.disabled = true;
-        try { const keep = await b.onClick(api); if (keep !== false) close(b.value); }
-        catch (e) { if (e && e.status !== 409) { /* post() already toasted */ } }
-        finally { btn.disabled = false; }
+    const setTitle = (title, subText) => {
+      head.firstChild.textContent = title || "";
+      if (subText !== undefined) { sub.textContent = subText || ""; sub.hidden = !subText; }
+    };
+    const setBody = (b) => put(body, b);  // (markup, a node, or a line of text)
+    const setButtons = (list) => {
+      foot.innerHTML = "";
+      (list || []).forEach((b) => {
+        const btn = h("button", { class: "btn " + (b.cls || ""), type: "button" }, b.label);
+        btn.addEventListener("click", async () => {
+          if (!b.onClick) return close(b.value);
+          btn.disabled = true;
+          try { const keep = await b.onClick(api); if (keep !== false) close(b.value); }
+          catch (e) { if (e && e.status !== 409) { /* post() already toasted */ } }
+          finally { btn.disabled = false; }
+        });
+        foot.appendChild(btn);
       });
-      foot.appendChild(btn);
-    });
-    if (foot.children.length) modal.appendChild(foot);
+      foot.hidden = !foot.children.length;
+    };
+    const api = {
+      close, body, modal, foot, setBody, setButtons, setTitle,
+      get closed() { return closed; },
+      then(fn) { if (gone) fn(); else after.push(fn); return api; },
+    };
+    setTitle(opts.title, opts.sub || "");
+    setBody(opts.body);
+    setButtons(opts.buttons);
     wrap.appendChild(modal);
     layer.appendChild(scrim);
     layer.appendChild(wrap);
@@ -153,9 +246,43 @@
     scrim.addEventListener("click", () => close(null));
     requestAnimationFrame(() => layer.classList.add("open"));
     U.modals.push(api);
-    const first = body.querySelector("input,select,button");
-    if (first && opts.autofocus !== false) setTimeout(() => first.focus({ preventScroll: true }), 60);
+    setTimeout(() => {
+      if (closed) return;
+      const first = opts.autofocus !== false && body.querySelector("input:not([type=hidden]):not([disabled]),select,textarea");
+      (first || modal).focus({ preventScroll: true });
+    }, 60);
     return api;
+  }
+  // Run `fn` once `el`'s own CSS transition has ended — a timer covers one that never
+  // runs (reduced motion, a background tab). The chained dialogs, the drawer and the rail
+  // used to copy the CSS durations into setTimeouts (FE-007).
+  function afterTransition(el, fn, fallback) {
+    let done = false, t = 0;
+    const end = (e) => {
+      if ((e && e.target !== el) || done) return;
+      done = true;
+      el.removeEventListener("transitionend", end);
+      clearTimeout(t);
+      fn();
+    };
+    el.addEventListener("transitionend", end);
+    t = setTimeout(end, fallback || 450);
+  }
+  // "Loading…" for a dialog whose content is on its way (openModal's setBody)
+  const loading = () => html`<div class="m-loading" role="status"><span class="spin"></span>Loading…</div>`;
+  // Tab / Shift+Tab stay inside the top dialog (or the Manage drawer): the page behind
+  // it can't be reached until it closes.
+  function trapFocus(e) {
+    if (e.key !== "Tab") return;
+    const box = U.modals.length ? U.modals[U.modals.length - 1].modal : U.drawer ? U.drawer.dr : null;
+    if (!box) return;
+    const list = [...box.querySelectorAll("a[href],button:not([disabled]),input:not([disabled]):not([type=hidden]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex='-1'])")]
+      .filter((el) => !el.closest("[hidden]"));
+    if (!list.length) { e.preventDefault(); box.focus(); return; }
+    const first = list[0], last = list[list.length - 1], a = document.activeElement;
+    if (!box.contains(a)) { e.preventDefault(); first.focus(); }
+    else if (e.shiftKey && (a === first || a === box)) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && a === last) { e.preventDefault(); first.focus(); }
   }
   function confirmDialog(o) {
     return new Promise((resolve) => {
@@ -168,24 +295,46 @@
     });
   }
   function closeTop() {
-    if (U.menu) { closeMenu(); return true; }
+    if (U.menu) { closeMenu(true); return true; }
     if (U.modals.length) { U.modals[U.modals.length - 1].close(null); return true; }
-    if (U.drawer) { closeDrawer(); return true; }
+    if (U.drawer && UI.closeDrawer) { UI.closeDrawer(); return true; }
     return false;
+  }
+  // close the top dialog, then run `fn` once it is gone (the next dialog in a chain)
+  function closeTopThen(fn) {
+    const top = U.modals[U.modals.length - 1];
+    if (!top) { fn(); return; }
+    top.then(fn);
+    top.close(null);
   }
 
   // ------------------------------------------------------------------- menus
+  // Menus (the seat menu, ≡, the club switcher, React) work from the keyboard (A11Y-013):
+  // role=menu with menuitems, focus on the first item, ↑ ↓ Home End move, Tab or Escape
+  // (games.play.js closeTop) close it, focus goes back to the button that opened it — and
+  // the table's hotkeys are paused while it is open (games.play.js).
   function openMenu(anchor, items) {
     closeMenu();
-    const m = h("div", { class: "menu" });
+    const m = h("div", { class: "menu", role: "menu" });
     items.forEach((it) => {
-      if (it === "-") return m.appendChild(h("hr"));
-      if (it.header) return m.appendChild(h("div", { class: "mh" }, esc(it.header)));
-      const b = h("button", { type: "button", class: it.danger ? "danger" : "" }, (it.icon ? icon(it.icon) : "") + `<span>${esc(it.label)}</span>`);
+      if (it === "-") return m.appendChild(h("hr", { role: "separator" }));
+      if (it.header) return m.appendChild(h("div", { class: "mh", role: "presentation" }, it.header));
+      const b = h("button", { type: "button", role: "menuitem", tabindex: "-1", class: it.danger ? "danger" : "" }, html`${it.icon ? icon(it.icon) : ""}<span>${it.label}</span>`);
       b.disabled = !!it.disabled;
       if (it.hint) b.title = it.hint;
-      b.addEventListener("click", () => { closeMenu(); it.onClick(); });
+      b.addEventListener("click", () => { closeMenu(true); it.onClick(); });
       m.appendChild(b);
+    });
+    m.addEventListener("keydown", (e) => {
+      const list = [...m.querySelectorAll("button[role=menuitem]:not([disabled])")];
+      if (!list.length) return;
+      const i = list.indexOf(document.activeElement);
+      const go = (k) => { e.preventDefault(); e.stopPropagation(); list[(k + list.length) % list.length].focus(); };
+      if (e.key === "ArrowDown") go(i + 1);
+      else if (e.key === "ArrowUp") go(i < 0 ? list.length - 1 : i - 1);
+      else if (e.key === "Home") go(0);
+      else if (e.key === "End") go(list.length - 1);
+      else if (e.key === "Tab") closeMenu(true);
     });
     document.body.appendChild(m);
     const r = anchor.getBoundingClientRect();
@@ -196,477 +345,44 @@
     m.style.left = left + "px";
     m.style.top = top + "px";
     U.menu = m;
+    U.menuAnchor = anchor;
+    anchor.setAttribute("aria-expanded", "true");
+    const first = m.querySelector("button[role=menuitem]:not([disabled])");
+    if (first) first.focus({ preventScroll: true });
     setTimeout(() => document.addEventListener("pointerdown", onDocDown, true), 0);
   }
   function onDocDown(e) { if (U.menu && !U.menu.contains(e.target)) closeMenu(); }
-  function closeMenu() {
+  // `refocus`: the menu was used from inside (an item, Escape, Tab) — focus goes back to its button
+  function closeMenu(refocus) {
+    const a = U.menuAnchor;
     if (U.menu) { U.menu.remove(); U.menu = null; }
+    U.menuAnchor = null;
+    if (a) { a.setAttribute("aria-expanded", "false"); if (refocus && a.isConnected && a.focus) a.focus({ preventScroll: true }); }
     document.removeEventListener("pointerdown", onDocDown, true);
   }
 
-  // ------------------------------------------------------------------- lobby
-  const STAKES = [  // (lobby copy only — the create dialog takes a big blind and an ante)
-  ];
-
-  function miniFelt(t) {
-    const n = t.num_seats, by = {};
-    (t.players || []).forEach((p) => (by[p.seat] = p));
-    let out = "";
-    for (let i = 0; i < n; i++) {
-      const th = Math.PI / 2 + (i * 2 * Math.PI) / n;
-      const x = 50 + 46 * Math.cos(th), y = 50 + 40 * Math.sin(th);
-      const p = by[i];
-      out += p
-        ? `<span class="av ${p.is_me ? "me" : ""}" style="left:${x}%;top:${y}%;--h:${HG.avatar.hueOf(p.name)}" title="${esc(p.name)}">${esc(HG.avatar.initials(p.name))}</span>`
-        : `<span class="slot" style="left:${x}%;top:${y}%"></span>`;
+  // ------------------------------------------------------ segmented pickers
+  // ONE builder for every segmented picker (create, Manage, Preferences, …; FE-002).
+  // `cur` compares as text (numbers and codes alike); `keep(v)` labels the current value
+  // when it isn't one of the options (a value set elsewhere), so it still shows as chosen.
+  // The chosen button says so to screen readers (aria-pressed; A11Y-009). A label is text
+  // or markup; `cls` adds classes to the picker ("wide", "as-modes").
+  function segHtml(id, opts, cur, keep, cls) {
+    const list = opts.slice();
+    if (keep && cur != null && !list.some(([v]) => String(v) === String(cur))) {
+      list.push([cur, keep(cur)]);
+      list.sort((a, b) => Number(a[0]) - Number(b[0]));
     }
-    return `<div class="tcard-felt">${out}<div class="mid"><small>Ante</small>${d2(t.ante_cents)}</div></div>`;
-  }
-  function tableCard(t) {
-    const full = t.seated >= t.num_seats;
-    const cta = t.is_seated ? "Return to table" : full ? "Watch" : "Join table";
-    const card = h("div", { class: "tcard" });
-    // (your seat at a table of ANOTHER club: say which club it is in)
-    const other = t.club_id && t.club_id !== C().G.clubId ? ` · ${esc(t.club_name || "another club")}` : "";
-    card.innerHTML =
-      `<div class="tcard-top"><div style="min-width:0;flex:1"><div class="tcard-name">${esc(t.name)}</div>` +
-      `<div class="tcard-host">Hosted by ${esc(t.host_name)}${t.is_host ? " (you)" : ""}${other}</div></div>` +
-      `<span class="pill ${t.running ? "live" : "paused"}">${t.running ? "Live" : "Paused"}</span></div>` +
-      miniFelt(t) +
-      `<div class="tcard-meta"><span class="pill game">${gameOf(t.variant).label}</span><span class="pill gold num">${d2(t.bb_cents)} bb</span>` +
-      `<span class="pill">${icon("i-users", "sm")}${t.seated}/${t.num_seats}</span>` +
-      (t.hand_no ? `<span class="pill num">Hand #${t.hand_no}</span>` : "") +
-      (t.listed ? "" : `<span class="pill">${icon("i-lock", "sm")}Link only</span>`) + "</div>";
-    const row = h("div", { class: "tcard-cta" });
-    const go = h("button", { class: "btn " + (t.is_seated ? "primary" : ""), type: "button" }, esc(cta));
-    go.addEventListener("click", () => C().openTable(t.id, true).catch((e) => toast(e.message, "err")));
-    const copy = h("button", { class: "btn", type: "button", title: "Copy invite link" }, icon("i-link", "sm"));
-    copy.addEventListener("click", () => copyInvite(t.id));
-    row.appendChild(go); row.appendChild(copy);
-    card.appendChild(row);
-    return card;
-  }
-  function renderLobby(data) {
-    const tables = data.tables || [];
-    const clubs = data.clubs || [];
-    U.lobbyData = data;
-    setMyAvatar(data.my_avatar);
-    renderJoinReqs(data.join_requests);
-    // a request to join was answered while this page was open: straight into the club
-    // (and back to the table the request came from)
-    const pend = U.pendingClub;
-    if (pend && clubs.some((c) => c.id === pend.id)) {
-      U.pendingClub = null;
-      toast(`You're in ${pend.name}!`, "ok", 5000);
-      HG.sound && HG.sound.play("sit");
-      if (pend.table) { C().openTable(pend.table, true).catch(() => {}); return; }
-      if (C().G.clubId !== pend.id) { switchClub(pend.id); return; }
-    }
-    const sig = JSON.stringify(data);
-    if (sig === U.lobbySig) return;
-    U.lobbySig = sig;
-    $("lobby").classList.remove("loading");  // (until the first answer the page does not guess: no half-empty lobby)
-    renderClubBar(data);
-    const panel = U.clubPanel, shown = clubs.find((c) => c.id === data.club);
-    if (panel && shown && panel.cid === shown.id) {
-      const psig = `${shown.members}:${shown.requests}`;
-      if (psig !== panel.sig) { panel.sig = psig; panel.refresh(); }
-    }
-    const none = !clubs.length;
-    $("lb-welcome").hidden = !none;
-    $("lb-hero").querySelector(".lb-actions").hidden = none;  // (hosting needs a club: the welcome offers one)
-    $("lb-open").closest(".lb-sec").hidden = none;
-    const mine = tables.filter((t) => t.is_host || t.is_seated);
-    const open = tables.filter((t) => !(t.is_host || t.is_seated));
-    $("lb-mine-sec").hidden = !mine.length;
-    const mineEl = $("lb-mine"), openEl = $("lb-open");
-    mineEl.innerHTML = ""; openEl.innerHTML = "";
-    mine.forEach((t) => mineEl.appendChild(tableCard(t)));
-    open.forEach((t) => openEl.appendChild(tableCard(t)));
-    $("lb-open-count").textContent = open.length ? `${open.length} running` : "";
-    if (!open.length) {
-      const empty = h("div", { class: "lb-empty", style: "grid-column:1/-1" },
-        mine.length ? "<b>No other tables right now</b>When someone in the club hosts one, it shows up here." : "<b>No tables yet</b>Host one — everyone in the club sees it here, or send them its link.");
-      openEl.appendChild(empty);
-    }
-    const sess = data.sessions || [];
-    $("lb-sess-sec").hidden = !sess.length;
-    $("lb-sessions").innerHTML = sess.map((x) =>
-      `<div class="sess" data-id="${esc(x.id)}" role="button" tabindex="0" title="Open this session: final ledger and every hand"><div><b>${esc(x.name)}</b><br><small>${gameOf(x.variant).label} · ${d2(x.bb_cents)} bb · ante ${d2(x.ante_cents)}</small></div>` +
-      `<small class="opt">${x.hands} hand${x.hands === 1 ? "" : "s"}</small><small class="opt">in for ${d2(x.buyin_cents)}</small>` +
-      `<b class="num ${x.net_cents >= 0 ? "pos" : "neg"}">${x.net_cents >= 0 ? "+" : ""}${d2(x.net_cents)}</b></div>`).join("");
-    wireSessions();
-    loadClub(false); // (rides the lobby poll, at most every 30 s)
-  }
-  function wireSessions() {
-    document.querySelectorAll("#lb-sessions .sess[data-id]").forEach((row) => row.addEventListener("click", () => C().openTable(row.dataset.id, true).catch((e) => toast(e.message, "err"))));
-  }
-  async function copyInvite(id) {
-    const url = `${location.origin}/games/t/${id}`;
-    try { await navigator.clipboard.writeText(url); toast("Invite link copied", "ok"); }
-    catch (_) {
-      // (listeners, not an onfocus="" attribute: the page's security policy blocks inline
-      // handlers. Click too: the mouse-up after a click-to-focus clears a focus-time selection.)
-      const pick = (e) => e.target.select();
-      const box = h("input", { class: "input", readonly: true, value: url, onfocus: pick, onclick: pick });
-      openModal({ title: "Invite link", sub: "Copy this link and send it to your friends.", body: box, buttons: [{ label: "Done", cls: "primary" }] });
-    }
-  }
-
-  // ------------------------------------------------------------------- clubs
-  // The lobby shows ONE club: its tables, its players, its numbers. A club's
-  // owner (and admins) invite people with its link and let in whoever asks.
-  const ROLE_WORD = { owner: "you run it", admin: "you're an admin", member: "member" };
-  function clubBadge(name, cls) {
-    const A = HG.avatar;
-    return `<span class="club-badge ${cls || ""}" style="--h:${A.hueOf("club:" + name)}">${esc(A.initials(name))}</span>`;
-  }
-  function inviteUrl(code) { return `${location.origin}/games/join/${code}`; }
-  async function copyText(text, okMsg, title) {
-    try { await navigator.clipboard.writeText(text); toast(okMsg, "ok"); }
-    catch (_) {
-      const pick = (e) => e.target.select();
-      const box = h("input", { class: "input", readonly: true, value: text, onfocus: pick, onclick: pick });
-      openModal({ title, sub: "Copy this link and send it to your friends.", body: box, buttons: [{ label: "Done", cls: "primary" }] });
-    }
-  }
-  function currentClub() {
-    const d = U.lobbyData || {};
-    return (d.clubs || []).find((c) => c.id === C().G.clubId) || null;
-  }
-  function renderClubBar(data) {
-    const club = (data.clubs || []).find((c) => c.id === data.club) || null;
-    const bar = $("lb-clubbar");
-    bar.hidden = !club;
-    if (!club) return;
-    const A = HG.avatar, badge = $("club-badge");
-    badge.textContent = A.initials(club.name);
-    badge.style.setProperty("--h", A.hueOf("club:" + club.name));
-    $("club-name").textContent = club.name;
-    $("club-kicker").textContent = data.clubs.length > 1 ? `Club · 1 of ${data.clubs.length}` : "Club";
-    $("club-meta").textContent = `${club.members} member${club.members === 1 ? "" : "s"} · ${ROLE_WORD[club.role] || club.role}`;
-    const manage = club.role === "owner" || club.role === "admin";
-    $("club-invite").hidden = !manage;
-    const req = $("club-req");
-    req.hidden = !club.requests; req.textContent = String(club.requests || 0);
-  }
-  function switchClub(id) {
-    C().setClub(id);
-    U.lobbySig = ""; U.clubAt = 0; U.club = null;
-    C().loadLobby().catch((e) => toast(e.message, "err"));
-    loadClub(true);
-  }
-  function openClubMenu(anchor) {
-    const clubs = (U.lobbyData && U.lobbyData.clubs) || [];
-    const cur = C().G.clubId;
-    openMenu(anchor, [{ header: "Your clubs" }]
-      .concat(clubs.map((c) => ({
-        icon: c.id === cur ? "i-check" : "i-users",
-        label: c.name + (c.requests ? ` · ${c.requests} waiting` : ""),
-        hint: `${c.members} member${c.members === 1 ? "" : "s"} · ${ROLE_WORD[c.role] || c.role}`,
-        onClick: () => { if (c.id !== cur) switchClub(c.id); },
-      })))
-      .concat(["-", { icon: "i-plus", label: "Start a new club", onClick: openCreateClub },
-        { icon: "i-link", label: "Join a club with a link", onClick: openJoinClub }]));
-  }
-  async function createClub(name) {
-    try {
-      const club = await C().j("/games/api/clubs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
-      switchClub(club.id);
-      toast(`${club.name} is ready — send your friends its invite link`, "ok", 5000);
-      return true;
-    } catch (e) { toast(e.message, "err"); return false; }
-  }
-  function openCreateClub() {
-    const body = h("div", { style: "display:flex;flex-direction:column;gap:14px" },
-      `<label class="field"><span>Club name</span><input type="text" class="input" id="cc-name" maxlength="40" placeholder="Friday night"/></label>` +
-      `<p class="muted" style="margin:0;font-size:12.5px">You run it: invite people with the club's link and decide who's in. Its tables, leaderboard and everyone's numbers stay inside the club.</p>`);
-    openModal({
-      title: "Start a club", body,
-      buttons: [{ label: "Cancel", cls: "ghost" }, {
-        label: "Create club", cls: "gold",
-        onClick: async () => {
-          const name = body.querySelector("#cc-name").value.trim();
-          if (!name) { toast("Give the club a name", "err"); return false; }
-          return createClub(name);
-        },
-      }],
-    });
-  }
-  function openJoinClub() {
-    const body = h("div", { style: "display:flex;flex-direction:column;gap:12px" },
-      `<label class="field"><span>Invite link</span><input type="text" class="input" id="jc-link" placeholder="Paste the invite link" autocomplete="off"/><small>A table link works too: you can ask its club to let you in.</small></label>`);
-    openModal({
-      title: "Join a club", body,
-      buttons: [{ label: "Cancel", cls: "ghost" }, { label: "Continue", cls: "gold", onClick: () => { joinByLink(body.querySelector("#jc-link").value); } }],
-    });
-  }
-  // a pasted link: a club invite, a table link (joins or asks its club) or a bare code
-  async function joinByLink(raw) {
-    const s = String(raw || "").trim();
-    let m = s.match(/\/games\/join\/([A-Za-z0-9_-]+)/);
-    if (m) return openInvite(m[1]);
-    m = s.match(/\/games\/t\/([A-Za-z0-9_-]+)/) || s.match(/^([A-Za-z0-9_-]{4,})$/);
-    if (!m) return toast("Paste a table link or a club's invite link", "err");
-    try { await C().openTable(m[1], true); }
-    catch (err) {
-      if (err.status === 403 && err.detail && err.detail.error === "club") return openClubGate(err.detail, m[1]);
-      if (err.status === 404 && !/\/games\/t\//.test(s)) return openInvite(m[1], true);  // (a bare code: a club's?)
-      toast(err.status === 404 ? "No table or club with that link" : err.message, "err");
-    }
-  }
-  // someone else's club: its invite link (join now, or ask when the club asks first)
-  async function openInvite(code, quiet404) {
-    let info;
-    try { info = await C().j(`/games/api/invites/${encodeURIComponent(code)}`); }
-    catch (e) { return toast(e.status === 404 ? (quiet404 ? "No table or club with that link" : "That invite link is no longer valid — ask for a new one") : e.message, "err", 5000); }
-    if (info.member) { if (C().G.clubId !== info.club.id) switchClub(info.club.id); return toast(`You're in ${info.club.name}`, "ok"); }
-    const c = info.club, body = h("div", { class: "invite-box" });
-    const paint = () => {
-      body.innerHTML = `<div class="inv-head">${clubBadge(c.name, "lg")}<div><b>${esc(c.name)}</b><small>${c.members} member${c.members === 1 ? "" : "s"} · run by ${esc(c.owner_name)}</small></div></div>` +
-        (info.request === "pending" ? `<p class="inv-note">Your request is in. ${esc(c.owner_name)} or a club admin lets you in — you'll be taken into the club as soon as they do.</p>`
-          : info.request === "declined" && info.retry_in > 0 ? `<p class="inv-note">The club didn't let you in this time. You can ask again in a minute.</p>`
-            : `<p>Join to see the club's tables, sit down with its members and show up on its leaderboard. The club's numbers stay inside the club.</p>`);
-    };
-    paint();
-    const waiting = info.request === "pending" || (info.request === "declined" && info.retry_in > 0);
-    const buttons = [{ label: waiting ? "Close" : "Not now", cls: "ghost" }];
-    if (!waiting) buttons.push({
-      label: info.approve ? "Ask to join" : "Join club", cls: "gold",
-      onClick: async () => {
-        try {
-          const out = await C().j(`/games/api/invites/${encodeURIComponent(code)}/join`, { method: "POST" });
-          if (out.member) { switchClub(out.club.id); toast(`Welcome to ${out.club.name}!`, "ok", 5000); HG.sound && HG.sound.play("sit"); return true; }
-          info = out; paint();
-          U.pendingClub = { id: c.id, name: c.name, table: null };
-          toast("Request sent", "ok");
-          return true;
-        } catch (e) { toast(e.message, "err"); return false; }
-      },
-    });
-    openModal({ title: "Club invite", body, buttons, autofocus: false });
-    if (info.request === "pending") U.pendingClub = { id: c.id, name: c.name, table: null };
-  }
-  // a table of a club I am not in (a table link): ask to join the club
-  function openClubGate(d, tableId) {
-    const c = d.club, body = h("div", { class: "invite-box" });
-    let st = d.request;
-    const retry = d.retry_in || 0;
-    const paint = () => {
-      body.innerHTML = `<div class="inv-head">${clubBadge(c.name, "lg")}<div><b>${esc(c.name)}</b><small>This table belongs to the club</small></div></div>` +
-        (st === "pending" ? `<p class="inv-note">Your request is in — the club's owner or an admin lets you in. The table opens by itself as soon as they do (keep this page open).</p>`
-          : st === "declined" && retry > 0 ? `<p class="inv-note">The club didn't let you in this time. You can ask again in a minute.</p>`
-            : `<p>Only the club's members can sit at its tables or watch them. Ask to join, and the club's owner or an admin lets you in.</p>`);
-    };
-    paint();
-    if (st === "pending") U.pendingClub = { id: c.id, name: c.name, table: tableId || null };
-    const waiting = st === "pending" || (st === "declined" && retry > 0);
-    const buttons = [{ label: waiting ? "Close" : "Not now", cls: "ghost" }];
-    if (!waiting) buttons.push({
-      label: "Ask to join", cls: "gold",
-      onClick: async () => {
-        try {
-          const out = await C().j(`/games/api/clubs/${encodeURIComponent(c.id)}/request`, { method: "POST" });
-          if (out.member) { if (tableId) await C().openTable(tableId, true); return true; }
-          st = out.request; paint();
-          U.pendingClub = { id: c.id, name: c.name, table: tableId || null };
-          toast("Request sent — you'll be let in by the club", "ok", 5000);
-          return true;
-        } catch (e) { toast(e.message, "err"); return false; }
-      },
-    });
-    openModal({ title: "Members only", body, buttons, autofocus: false });
-  }
-  // the club's members, invite link and settings (owner / admins manage, members look)
-  async function openClubSettings() {
-    const cid = C().G.clubId;
-    if (!cid) return;
-    let v;
-    try { v = await C().j(`/games/api/clubs/${encodeURIComponent(cid)}`); } catch (e) { return toast(e.message, "err"); }
-    const body = h("div", { class: "club-set" });
-    const post = async (path, payload) => {
-      try {
-        const out = await C().j(`/games/api/clubs/${encodeURIComponent(cid)}/${path}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload || {}) });
-        if (out && out.members) v = out;
-        U.lobbySig = ""; C().loadLobby().catch(() => {});
-        return true;
-      } catch (e) { toast(e.message, "err", 5000); return false; }
-    };
-    const refresh = async () => { try { v = await C().j(`/games/api/clubs/${encodeURIComponent(cid)}`); } catch (_) { /* keep */ } paint(); };
-    const canAct = (m) => !m.is_me && (v.role === "owner" || (v.role === "admin" && m.role === "member"));
-    const paint = () => {
-      const owner = v.role === "owner", manage = owner || v.role === "admin";
-      body.innerHTML =
-        (owner ? `<div class="grp"><label class="field"><span>Club name</span><span class="row-inline"><input class="input" id="cs-name" maxlength="40" value="${esc(v.name)}"/><button class="btn sm" id="cs-save" type="button">Save</button></span></label></div>` : "") +
-        (manage ? `<div class="grp"><h4>Invite link</h4><span class="row-inline"><input class="input" id="cs-link" readonly value="${esc(inviteUrl(v.invite_code))}"/><button class="btn sm gold" id="cs-copy" type="button">${icon("i-copy", "sm")}Copy</button></span>` +
-          `<small class="muted">Anyone with this link can ${v.approve_joins ? "ask to join" : "join the club"}. <button class="linkish" id="cs-reset" type="button">Make a new link</button> — the old one stops working.</small>` +
-          (owner ? `<div class="setrow"><div><b>Ask me first</b><small>New people ask to join; you or an admin let them in</small></div><label class="switch"><input type="checkbox" id="cs-approve" ${v.approve_joins ? "checked" : ""}/><i></i></label></div>` : "") + `</div>` : "") +
-        ((v.requests || []).length ? `<div class="grp"><h4>Waiting to join · ${v.requests.length}</h4>${v.requests.map((q) =>
-          `<div class="mem"><span class="mem-who">${avatar(q.name, q.name, "sm", q.avatar)}<span><b>${esc(q.name)}</b><small>${esc(q.email)}</small></span></span>` +
-          `<span class="mem-act"><button class="btn sm ghost" type="button" data-deny="${q.user_id}">Not now</button><button class="btn sm gold" type="button" data-allow="${q.user_id}">Let in</button></span></div>`).join("")}</div>` : "") +
-        `<div class="grp"><h4>Members · ${v.members.length}</h4>${v.members.map((m) =>
-          `<div class="mem"><span class="mem-who">${avatar(m.name, m.name, "sm", m.avatar)}<span><b>${esc(m.name)}${m.is_me ? " <i>you</i>" : ""}</b><small>${m.role === "owner" ? "Runs the club" : m.role === "admin" ? "Admin: lets people in" : "Member"}</small></span></span>` +
-          `<span class="mem-act"><span class="pill role-${m.role}">${m.role}</span>${canAct(m) ? `<button class="icon-btn" type="button" data-mem="${m.user_id}" aria-label="Manage ${esc(m.name)}">${icon("i-menu")}</button>` : ""}</span></div>`).join("")}</div>` +
-        (owner ? `<p class="muted" style="font-size:12px;margin:0">You run this club. To step down, hand it to another member (the ☰ next to their name).</p>`
-          : `<button class="btn sm danger" id="cs-leave" type="button">${icon("i-door", "sm")}Leave club</button>`);
-      const q = (id) => body.querySelector("#" + id);
-      if (q("cs-save")) q("cs-save").addEventListener("click", async () => { const name = q("cs-name").value.trim(); if (!name) return toast("Give the club a name", "err"); if (await post("settings", { name })) { toast("Renamed", "ok"); paint(); } });
-      if (q("cs-copy")) q("cs-copy").addEventListener("click", () => copyText(inviteUrl(v.invite_code), "Invite link copied", "Invite link"));
-      if (q("cs-link")) { const pick = (e) => e.target.select(); q("cs-link").addEventListener("focus", pick); q("cs-link").addEventListener("click", pick); }
-      if (q("cs-reset")) q("cs-reset").addEventListener("click", async () => {
-        const ok = await confirmDialog({ title: "Make a new invite link?", text: "The current link stops working — anyone who has it but hasn't joined yet will need the new one.", okLabel: "New link" });
-        if (ok && await post("invite")) { toast("New invite link ready", "ok"); paint(); }
-      });
-      if (q("cs-approve")) q("cs-approve").addEventListener("change", async (e) => { if (await post("settings", { approve_joins: e.target.checked })) { toast(e.target.checked ? "New people ask first now" : "The link lets people straight in", "ok"); paint(); } else e.target.checked = !e.target.checked; });
-      body.querySelectorAll("[data-allow],[data-deny]").forEach((b) => b.addEventListener("click", async () => {
-        const allow = !!b.dataset.allow, uid = Number(b.dataset.allow || b.dataset.deny);
-        b.disabled = true;
-        if (await post("requests/decide", { user_id: uid, allow })) { toast(allow ? "Welcome aboard — they're in" : "Request declined", allow ? "ok" : ""); await refresh(); }
-        else b.disabled = false;
-      }));
-      body.querySelectorAll("[data-mem]").forEach((b) => b.addEventListener("click", () => {
-        const m = v.members.find((x) => String(x.user_id) === b.dataset.mem);
-        if (!m) return;
-        const items = [{ header: m.name }];
-        if (v.role === "owner") {
-          items.push(m.role === "admin"
-            ? { icon: "i-user", label: "Make a member", onClick: async () => { if (await post("members", { user_id: m.user_id, role: "member" })) paint(); } }
-            : { icon: "i-shield", label: "Make an admin", hint: "Admins let people in and remove members", onClick: async () => { if (await post("members", { user_id: m.user_id, role: "admin" })) paint(); } });
-          items.push({ icon: "i-crown", label: "Hand the club over", onClick: async () => {
-            const ok = await confirmDialog({ title: `Hand ${v.name} to ${m.name}?`, text: `${m.name} runs the club from now on; you stay on as an admin.`, okLabel: "Hand over" });
-            if (ok && await post("members", { user_id: m.user_id, role: "owner" })) { toast(`${m.name} runs ${v.name} now`, "ok"); paint(); }
-          } });
-          items.push("-");
-        }
-        items.push({ icon: "i-door", label: "Remove from the club", danger: true, onClick: async () => {
-          const ok = await confirmDialog({ title: `Remove ${m.name}?`, text: "They lose the club's tables and numbers. Their hands stay in the club's history.", okLabel: "Remove", danger: true });
-          if (ok && await post("members", { user_id: m.user_id, remove: true })) { toast(`${m.name} is out of the club`, ""); paint(); }
-        } });
-        openMenu(b, items);
-      }));
-      if (q("cs-leave")) q("cs-leave").addEventListener("click", async () => {
-        const ok = await confirmDialog({ title: `Leave ${v.name}?`, text: "Its tables and numbers disappear from your lobby. You can come back with an invite link.", okLabel: "Leave club", danger: true });
-        if (!ok) return;
-        try {
-          await C().j(`/games/api/clubs/${encodeURIComponent(cid)}/leave`, { method: "POST" });
-          api.close(null);
-          toast(`You left ${v.name}`, "");
-          C().setClub(null); U.lobbySig = ""; C().loadLobby().catch(() => {});
-        } catch (e) { toast(e.message, "err", 5000); }
-      });
-    };
-    const api = openModal({
-      title: v.name, sub: `${v.members.length} member${v.members.length === 1 ? "" : "s"} · ${ROLE_WORD[v.role] || v.role}`, body, wide: true, autofocus: false,
-      buttons: [{ label: "Done", cls: "primary" }],
-      onClose: () => { if (U.clubPanel && U.clubPanel.api === api) U.clubPanel = null; },
-    });
-    paint();
-    // (someone joins or asks while it is open: the lobby poll notices and it repaints)
-    const summary = currentClub();
-    U.clubPanel = { api, cid, sig: summary ? `${summary.members}:${summary.requests}` : "", refresh };
-  }
-
-  async function openCreate(fresh) {
-    const me = C().G.me || {};
-    const clubs = (U.lobbyData && U.lobbyData.clubs) || [];
-    const cur = clubs.find((c) => c.id === C().G.clubId) || clubs[0];
-    if (!cur) return openCreateClub();  // (a table lives in a club)
-    // The settings of the last table you hosted (2026-09-26); amounts come in big blinds.
-    let prefs = null;
-    if (!fresh) { try { prefs = (await C().j("/games/api/host_prefs")).prefs || null; } catch (_) { prefs = null; } }
-    const P = prefs || {};
-    const num = (v, dflt) => (Number.isFinite(Number(v)) && v !== null && v !== undefined ? Number(v) : dflt);
-    const bb0 = num(P.bb_cents, 0) > 0 ? num(P.bb_cents, 100) : 100;
-    const anteBB0 = num(P.ante_bb, 0) > 0 ? num(P.ante_bb, 3) : 3;
-    const buyinBB0 = num(P.buyin_bb, 0) > 0 ? num(P.buyin_bb, 40) : 40;
-    const segHtml = (id, opts, cur2, fmt) => {
-      const list = opts.slice();
-      if (!list.some(([v]) => v === cur2)) list.push([cur2, fmt(cur2)]);  // a value set in Manage
-      list.sort((a, b) => a[0] - b[0]);
-      return `<div class="seg" id="${id}">${list.map(([v, l]) => `<button type="button" data-v="${v}" class="${v === cur2 ? "on" : ""}">${l}</button>`).join("")}</div>`;
-    };
-    const secs = (v) => (v ? `${v}s` : "Off");
-    // the game (PLO5 / PLO6): fixed for the table's life; the seat choices follow it
-    const game0 = GAMES[P.variant] ? P.variant : "plo5";
-    const seatsFor = (g, want) => { const G = gameOf(g); return segHtml("c-seats", G.seats.map((n) => [n, String(n)]), Math.min(G.maxSeats, num(want, G.maxSeats)), String); };
-    const body = h("div", { style: "display:flex;flex-direction:column;gap:16px" });
-    body.innerHTML =
-      (prefs ? `<div class="setrow"><div><b>Your settings from last time</b><small>Stakes, seats, clock and buy-ins — and Manage's too: automatic chips, grades, rabbit</small></div><button type="button" class="btn sm" id="c-reset">Use defaults</button></div>` : "") +
-      (clubs.length > 1 ? `<label class="field"><span>Club</span><select class="input" id="c-club">${clubs.map((c) => `<option value="${esc(c.id)}" ${c.id === cur.id ? "selected" : ""}>${esc(c.name)}</option>`).join("")}</select><small>Only this club's members can see and join the table</small></label>` : "") +
-      `<label class="field"><span>Table name</span><input type="text" id="c-name" maxlength="60" value="${esc((me.name || "My").split(" ")[0])}'s game"/></label>` +
-      `<div class="field"><span>Game</span><div class="seg" id="c-game">${Object.entries(GAMES).map(([k, G]) => `<button type="button" data-v="${k}" class="${k === game0 ? "on" : ""}">${G.label}</button>`).join("")}</div><small id="c-game-note">${gameNote(game0)}</small></div>` +
-      `<div class="row3" style="grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto;align-items:start">` +
-      `<label class="field"><span>Big blind</span>${moneyInput("c-bb", bb0)}<small>The chip unit and the minimum bet</small></label>` +
-      `<label class="field"><span>Ante, in big blinds</span><div class="money unit-bb"><input class="input" id="c-ante-bb" inputmode="decimal" autocomplete="off" value="${anteBB0}"/></div><small id="c-ante-eq">= $3.00 per player, every hand</small></label>` +
-      `<div class="field" id="c-seats-f"><span>Seats</span>${seatsFor(game0, P.num_seats)}</div></div>` +
-      `<label class="field"><span>Your buy-in</span>${moneyInput("c-buyin", Math.round(bb0 * buyinBB0))}<small>Nobody posts blinds — every hand is a bomb pot: everyone antes and the action starts on the flop.</small></label>` +
-      `<details class="adv"><summary>More options</summary><div>` +
-      `<div class="row2"><label class="field"><span>Min buy-in</span>${moneyInput("c-min", Math.round(bb0 * num(P.min_buyin_bb, 0)))}<small>0 = no minimum</small></label><label class="field"><span>Max buy-in</span>${moneyInput("c-max", Math.round(bb0 * num(P.max_buyin_bb, 0)))}<small>0 = no maximum</small></label></div>` +
-      `<div class="field"><span>Decision time</span>${segHtml("c-clock", [[0, "Off"], [15, "15s"], [20, "20s"], [30, "30s"], [45, "45s"], [60, "60s"]], num(P.decision_secs, 30), secs)}</div>` +
-      `<div class="field"><span>Time bank</span>${segHtml("c-bank", [[0, "Off"], [30, "30s"], [60, "60s"], [120, "2 min"]], num(P.time_bank_secs, 30), secs)}</div>` +
-      `<div class="field"><span>Next hand</span>${segHtml("c-deal", [[0, "Manual"], [3, "3s"], [5, "5s"], [8, "8s"], [12, "12s"]], num(P.deal_delay_secs, 5), (v) => (v ? `${v}s` : "Manual"))}</div>` +
-      `<div class="setrow"><div><b>I approve every buy-in</b><small>Sit-downs and top-ups wait for your OK — you can trust regulars so they never wait</small></div><label class="switch"><input type="checkbox" id="c-approve" ${P.approve_buyins ? "checked" : ""}/><i></i></label></div>` +
-      `<div class="setrow"><div><b>Players may take chips off the table</b><small>Ratholing allowed: anyone can pocket part of their stack between hands</small></div><label class="switch"><input type="checkbox" id="c-rathole" ${P.allow_rathole ? "checked" : ""}/><i></i></label></div>` +
-      `<div class="setrow"><div><b>Show it in the club lobby</b><small>Off = only club members with the link can find it</small></div><label class="switch"><input type="checkbox" id="c-listed" ${P.listed === false ? "" : "checked"}/><i></i></label></div>` +
-      `</div></details>`;
-    segWire(body);
-    const q = (id) => body.querySelector("#" + id);
-    const gameVal = () => { const on = body.querySelector("#c-game button.on"); return on ? on.dataset.v : "plo5"; };
-    q("c-game").addEventListener("pick", (e) => {
-      const f = q("c-seats-f"), want = segVal(body, "c-seats");
-      f.innerHTML = `<span>Seats</span>${seatsFor(e.detail, want)}`;
-      segWire(f);
-      q("c-game-note").textContent = gameNote(e.detail);
-    });
-    const reset = q("c-reset");
-    if (reset) reset.addEventListener("click", () => { closeTop(); setTimeout(() => openCreate(true), 260); });
-    const bbCents = () => Math.max(1, C().toCents(q("c-bb").value) || 0);
-    const anteBB = () => Math.max(0, Number(String(q("c-ante-bb").value).replace(",", ".")) || 0);
-    const anteCents = () => Math.round(bbCents() * anteBB());
-    let buyinTouched = false;
-    const sync = () => {
-      q("c-ante-eq").textContent = `= ${d2(anteCents())} per player, every hand`;
-      if (!buyinTouched) q("c-buyin").value = ((bbCents() * buyinBB0) / 100).toFixed(2);  // your usual buy-in in bb (40 bb by default)
-    };
-    q("c-bb").addEventListener("input", sync);
-    q("c-ante-bb").addEventListener("input", sync);
-    q("c-buyin").addEventListener("input", () => { buyinTouched = true; });
-    sync();
-    openModal({
-      title: "Host a table", sub: `In ${cur.name}: its members see the table in the lobby. You can change almost everything later from Manage table.`, body,
-      buttons: [
-        { label: "Cancel", cls: "ghost" },
-        {
-          label: "Create table", cls: "gold",
-          onClick: async () => {
-            const bb = bbCents();
-            if (anteBB() <= 0) { toast("The ante must be at least a fraction of a big blind", "err"); return false; }
-            const payload = {
-              name: q("c-name").value.trim() || "Home game", variant: gameVal(),
-              bb_cents: bb, sb_cents: Math.max(1, Math.round(bb / 2)),
-              ante_cents: anteCents(), default_buyin_cents: C().toCents(q("c-buyin").value),
-              min_buyin_cents: C().toCents(q("c-min").value) || 0, max_buyin_cents: C().toCents(q("c-max").value) || 0,
-              num_seats: segVal(body, "c-seats"), decision_secs: segVal(body, "c-clock"),
-              time_bank_secs: segVal(body, "c-bank"), deal_delay_secs: segVal(body, "c-deal"), listed: q("c-listed").checked,
-              approve_buyins: q("c-approve").checked, allow_rathole: q("c-rathole").checked,
-              club_id: clubs.length > 1 ? q("c-club").value : cur.id,
-              remembered: !!prefs,  // also bring Manage's settings from last time
-            };
-            try {
-              const s = await C().j("/games/api/tables", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-              await C().openTable(s.id, true);
-              HG.sound && HG.sound.play("sit");
-            } catch (e) { toast(e.message, "err"); return false; }
-          },
-        },
-      ],
-    });
+    return html`<div class="seg${cls ? " " + cls : ""}" id="${id}" role="group">${list.map(([v, l]) => {
+      const on = String(v) === String(cur);
+      return html`<button type="button" data-v="${v}" class="${on ? "on" : ""}" aria-pressed="${on}">${l}</button>`;
+    })}</div>`;
   }
   function segWire(root) {
     root.querySelectorAll(".seg").forEach((seg) => seg.addEventListener("click", (e) => {
       const b = e.target.closest("button[data-v]");
       if (!b || b.disabled) return;
-      seg.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
+      seg.querySelectorAll("button").forEach((x) => { x.classList.toggle("on", x === b); x.setAttribute("aria-pressed", String(x === b)); });
       seg.dispatchEvent(new CustomEvent("pick", { detail: b.dataset.v }));
     }));
   }
@@ -674,206 +390,17 @@
     const on = root.querySelector(`#${id} button.on`);
     return on ? Number(on.dataset.v) : null;
   }
+  // "Saved" beside a setting that saves on its own (Manage; games.css .saved)
+  function savedFlash(node) {
+    const row = node && node.closest(".field, .setrow");
+    if (!row) return;
+    row.classList.remove("saved");
+    void row.offsetWidth;
+    row.classList.add("saved");
+    clearTimeout(row._savedT);
+    row._savedT = setTimeout(() => row.classList.remove("saved"), 1600);
+  }
 
-  // ------------------------------------------------------- seat money dialogs
-  function buyinLimits(s, stackCents) {
-    const st = s.stakes, set = s.settings || {};
-    const floor = Math.max(st.bb_cents, st.ante_cents + st.bb_cents);
-    const lo = stackCents > 0 ? st.bb_cents : Math.max(floor, set.min_buyin_cents || 0);
-    let hi = set.max_buyin_cents ? set.max_buyin_cents - stackCents : Math.max(st.default_buyin_cents * 5, lo * 4);
-    hi = Math.max(lo, hi);
-    return { lo, hi, capped: !!set.max_buyin_cents };
-  }
-  function moneyDialog(o) {
-    const { lo, hi } = o;
-    let cents = Math.max(lo, Math.min(hi, o.start));
-    const body = h("div", { style: "display:flex;flex-direction:column;gap:14px" });
-    body.innerHTML =
-      `<div class="bigmoney"><span id="md-big"></span><small id="md-antes"></small></div>` +
-      `<input type="range" id="md-range" min="${lo}" max="${hi}" step="${Math.max(1, Math.round(o.step || 100))}" value="${cents}"/>` +
-      `<div class="sz-row"><div class="sz-presets" id="md-presets"></div><div class="sz-amt">${moneyInput("md-input", cents)}</div></div>` +
-      `<small class="muted">${esc(o.hint || "")}</small>`;
-    if (o.footer) body.appendChild(o.footer);
-    const big = body.querySelector("#md-big"), antes = body.querySelector("#md-antes"), range = body.querySelector("#md-range"), input = body.querySelector("#md-input");
-    const presets = body.querySelector("#md-presets");
-    const sync = (from) => {
-      cents = Math.max(lo, Math.min(hi, cents));
-      big.textContent = d2(cents);
-      antes.textContent = o.ante ? `${Math.floor(cents / o.ante)} antes` : "";
-      if (from !== "range") range.value = String(cents);
-      if (from !== "input") input.value = (cents / 100).toFixed(2);
-      range.style.setProperty("--fill", (hi > lo ? ((cents - lo) / (hi - lo)) * 100 : 100) + "%");
-    };
-    const seen = new Set();  // two presets on the same amount read as a bug: keep the first
-    (o.presets || []).filter((p) => p.cents >= lo && p.cents <= hi && !seen.has(p.cents) && seen.add(p.cents)).slice(0, 4).forEach((p) => {
-      const b = h("button", { type: "button" }, esc(p.label));
-      b.addEventListener("click", () => { cents = p.cents; sync(); });
-      presets.appendChild(b);
-    });
-    range.addEventListener("input", () => { cents = Number(range.value); sync("range"); });
-    input.addEventListener("input", () => { const c = C().toCents(input.value); if (c != null) { cents = c; big.textContent = d2(Math.max(lo, Math.min(hi, c))); } });
-    input.addEventListener("change", () => sync());
-    input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); sync(); go(); } });
-    sync();
-    let api = null;
-    const go = async () => { sync(); try { await o.onOk(cents); if (api) api.close(true); } catch (_) { /* toasted */ } };
-    api = openModal({ title: o.title, sub: o.sub, body, buttons: [{ label: "Cancel", cls: "ghost" }, { label: o.okLabel, cls: "primary", onClick: async () => { sync(); await o.onOk(cents); } }] });
-  }
-  function openSit(seat) {
-    const s = C().G.state;
-    if (!s) return;
-    if (s.my_seat != null) return toast("You're already seated", "err");
-    const lim = buyinLimits(s, 0), dflt = s.stakes.default_buyin_cents;
-    moneyDialog({
-      title: `Take seat ${seat + 1}`, sub: `${s.name} · ${d2(s.stakes.bb_cents)} bb · ante ${d2(s.stakes.ante_cents)}`,
-      lo: lim.lo, hi: lim.hi, start: dflt, ante: s.stakes.ante_cents, step: s.stakes.bb_cents, okLabel: s.needs_approval ? "Request seat" : "Sit down",
-      hint: (s.needs_approval ? "The host approves buy-ins here — your seat is held while they decide. " : "") + (lim.capped ? `Buy-in ${d2(lim.lo)} – ${d2(lim.hi)}. ` : "") + "Real money is settled between you — the ledger just keeps score.",
-      presets: [{ label: "Min", cents: lim.lo }, { label: d0(dflt), cents: dflt }, { label: d0(dflt * 2), cents: dflt * 2 }, { label: "Max", cents: lim.hi }],
-      onOk: async (cents) => {
-        const out = await C().tablePost("sit", { seat, buyin_cents: cents });
-        if (out && out.my_request) toast("Request sent — waiting for the host", "ok");
-        else HG.sound && HG.sound.play("sit");
-      },
-    });
-  }
-  function openTopUp(mode) {
-    const s = C().G.state;
-    if (!s || s.my_seat == null) return;
-    const me = s.seats[s.my_seat];
-    // Table stakes: chips asked for while you hold cards land when the hand ends.
-    const holding = me.in_hand && (s.phase === "in_hand" || (s.runout && s.runout.blocking));
-    const canRemove = !!(s.settings && s.settings.allow_rathole);
-    if (mode === "remove" && canRemove) return openRemoveChips(s, me, holding);
-    if (!mode && canRemove) {
-      // the host allows ratholing: ask which way the chips go
-      const floor = s.stakes.ante_cents + s.stakes.bb_cents;
-      const canTake = me.stack_cents - floor >= s.stakes.bb_cents;
-      const seg = h("div", { class: "seg", style: "width:100%" });
-      seg.innerHTML = `<button type="button" data-v="add" class="on">Add chips</button><button type="button" data-v="remove" ${canTake ? "" : "disabled"}>Take chips off</button>`;
-      let pick = "add";
-      seg.addEventListener("click", (e) => { const b = e.target.closest("button[data-v]"); if (!b || b.disabled) return; pick = b.dataset.v; seg.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b)); });
-      const body = h("div", { style: "display:flex;flex-direction:column;gap:14px" });
-      body.appendChild(seg);
-      const auto = autoChipsRow(s, me);
-      if (auto) body.appendChild(auto);
-      return openModal({ title: "Chips", sub: `Your stack is ${d2(me.stack_cents)}. This table lets players take chips off between hands.`, body, autofocus: false,
-        buttons: [{ label: "Cancel", cls: "ghost" }, { label: "Continue", cls: "primary", onClick: () => { setTimeout(() => openTopUp(pick === "remove" ? "remove" : "add"), 260); } }] });
-    }
-    const lim = buyinLimits(s, me.stack_cents);
-    if (lim.capped && lim.hi < s.stakes.bb_cents) return toast(`You're at the table maximum (${d2(s.settings.max_buyin_cents)})`);
-    const dflt = Math.max(lim.lo, Math.min(lim.hi, s.stakes.default_buyin_cents - me.stack_cents > 0 ? s.stakes.default_buyin_cents - me.stack_cents : s.stakes.default_buyin_cents));
-    moneyDialog({
-      title: "Add chips", sub: `Your stack is ${d2(me.stack_cents)}.` + (holding ? " They are added when this hand ends." : ""), lo: lim.lo, hi: lim.hi, start: dflt,
-      ante: s.stakes.ante_cents, step: s.stakes.bb_cents, okLabel: s.needs_approval ? "Request chips" : "Add chips",
-      hint: (s.needs_approval ? "The host approves buy-ins here. " : "") + (lim.capped ? `You can top up to ${d2(s.settings.max_buyin_cents)} in total.` : ""),
-      footer: autoChipsRow(s, me),
-      // "To $100" tops the stack up to a buy-in; "+$100" adds one on top
-      presets: [
-        ...(me.stack_cents > 0 && s.stakes.default_buyin_cents > me.stack_cents
-          ? [{ label: `To ${d0(s.stakes.default_buyin_cents)}`, cents: s.stakes.default_buyin_cents - me.stack_cents }] : []),
-        { label: `+${d0(s.stakes.default_buyin_cents)}`, cents: s.stakes.default_buyin_cents },
-        { label: `+${d0(s.stakes.default_buyin_cents * 2)}`, cents: s.stakes.default_buyin_cents * 2 },
-        { label: "Max", cents: lim.hi },
-      ],
-      onOk: async (cents) => {
-        const out = await C().tablePost("rebuy", { amount_cents: cents, queue: true });
-        if (out && out.my_request) toast("Request sent — waiting for the host", "ok");
-        else if (holding) toast(`${d2(cents)} lands when this hand ends`, "ok");
-        else HG.sound && HG.sound.play("chips");
-      },
-    });
-  }
-  function openRemoveChips(s, me, holding) {
-    const floor = s.stakes.ante_cents + s.stakes.bb_cents;  // what stays: an ante and a bet
-    const hi = me.stack_cents - floor, lo = s.stakes.bb_cents;
-    if (hi < lo) return toast(`Nothing to take off — you keep at least ${d2(floor)} to stay seated. Leave the table to cash out.`, "err");
-    moneyDialog({
-      title: "Take chips off the table", sub: `Your stack is ${d2(me.stack_cents)}.` + (holding ? " They come off when this hand ends." : ""), lo, hi, start: Math.min(hi, Math.max(lo, Math.round(hi / 2 / s.stakes.bb_cents) * s.stakes.bb_cents)),
-      ante: s.stakes.ante_cents, step: s.stakes.bb_cents, okLabel: "Take off",
-      hint: `They go back to your ledger as if you had cashed them out. You keep at least ${d2(floor)} on the table.`,
-      presets: [
-        { label: "Half", cents: Math.round(hi / 2) },
-        ...(me.stack_cents - s.stakes.default_buyin_cents >= lo
-          ? [{ label: `Keep ${d0(s.stakes.default_buyin_cents)}`, cents: me.stack_cents - s.stakes.default_buyin_cents }] : []),
-        { label: "Max", cents: hi },
-      ],
-      onOk: async (cents) => {
-        await C().tablePost("remove_chips", { amount_cents: cents, queue: holding });
-        toast(holding ? `${d2(cents)} comes off when this hand ends` : `${d2(cents)} taken off the table`, "ok");
-        HG.sound && HG.sound.play("chips");
-      },
-    });
-  }
-  // What automatic chips do for this player here, for the places people look
-  // (2026-09-26): the choice used to live only behind the top bar's person icon,
-  // so a table set to "Players choose" looked like it had no such option.
-  function autoChipsNow(s, me) {
-    const top = s.auto_topup.mode, set = s.auto_stack.mode;
-    const setOn = set !== "off" && me.auto_stack_cents > 0;
-    const topOn = !setOn && top !== "off" && me.topup_target_cents > 0;
-    let text = setOn ? `Your stack resets to ${d2(me.auto_stack_cents)} before every hand.`
-      : topOn ? `Topped back up to ${d2(me.topup_target_cents)} when you drop below ${d2(me.topup_below_cents || me.topup_target_cents)}.`
-      : top === "player" || set === "player" ? "Off. This table lets you choose." : "Off for you.";
-    if ((setOn && set === "host") || (topOn && top === "host")) text += " Set by the host.";
-    if ((setOn || topOn) && s.needs_approval) text += " Runs once the host trusts you.";
-    return { any: top !== "off" || set !== "off", choose: top === "player" || set === "player", text };
-  }
-  function autoChipsRow(s, me) {
-    const a = autoChipsNow(s, me);
-    if (!a.any) return null;
-    const row = h("div", { class: "setrow" }, `<div><b>Automatic chips</b><small>${esc(a.text)}</small></div>`);
-    row.appendChild(h("button", {
-      type: "button", class: "btn sm",
-      onclick: () => { closeTop(); setTimeout(openAutoChips, 260); },
-    }, a.choose ? "Change" : "Details"));
-    const box = h("div", { class: "grp" });
-    box.appendChild(row);
-    return box;
-  }
-  function openAutoChips() {
-    const s = C().G.state;
-    if (!s || !Number.isInteger(s.my_seat)) return;
-    const me = s.seats[s.my_seat];
-    const topMode = s.auto_topup.mode, setMode = s.auto_stack.mode;
-    const kinds = [["off", "Off"]];
-    if (topMode === "player") kinds.push(["topup", "Auto top-up"]);
-    if (setMode === "player") kinds.push(["set", "Set stack"]);
-    const cur = setMode !== "off" && me.auto_stack_cents > 0 ? "set" : topMode !== "off" && me.topup_target_cents > 0 ? "topup" : "off";
-    const hostLines = [];
-    if (topMode === "host") hostLines.push(me.topup_target_cents ? `The host tops you up to ${d2(me.topup_target_cents)} whenever you drop below ${d2(me.topup_below_cents || me.topup_target_cents)}.` : "The host controls auto top-up (off for you).");
-    if (setMode === "host") hostLines.push(me.auto_stack_cents ? `The host resets your stack to ${d2(me.auto_stack_cents)} before every hand.` : "The host controls set-stack (off for you).");
-    const body = h("div", { style: "display:flex;flex-direction:column;gap:14px" });
-    body.innerHTML =
-      (hostLines.length ? `<div class="grp"><h4>Set by the host</h4><p style="margin:0">${hostLines.map(esc).join("<br>")}</p></div>` : "") +
-      (kinds.length > 1
-        ? `<div class="field"><span>Automatic chips</span><div class="seg" id="ac-kind">${kinds.map(([k, l]) => `<button type="button" data-v="${k}" class="${(kinds.some((x) => x[0] === cur) ? cur : "off") === k ? "on" : ""}">${l}</button>`).join("")}</div></div>` +
-          `<div id="ac-top" hidden><div class="row2"><label class="field"><span>Top up to</span>${moneyInput("ac-top-target", me.topup_target_cents || s.stakes.default_buyin_cents)}</label>` +
-          `<label class="field"><span>When below</span>${moneyInput("ac-top-below", me.topup_below_cents || me.topup_target_cents || s.stakes.default_buyin_cents)}</label></div>` +
-          `<small class="muted">Before each hand, if your stack has dropped below the second amount it is topped back up to the first. It never takes chips off the table.</small></div>` +
-          `<div id="ac-set" hidden><label class="field"><span>Stack every hand</span>${moneyInput("ac-set-target", me.auto_stack_cents || s.stakes.default_buyin_cents)}</label>` +
-          `<small class="muted">Before EVERY hand your stack is reset to this amount — short stacks are topped up and anything above it goes back to your ledger. This table allows it.</small></div>`
-        : (hostLines.length ? "" : `<p class="muted" style="margin:0">The host hasn't enabled automatic chips at this table.</p>`)) +
-      (s.needs_approval ? `<small class="muted">The host approves buy-ins here: automatic chips only run once the host trusts you.</small>` : "");
-    const showKind = (k) => { const a = body.querySelector("#ac-top"), b = body.querySelector("#ac-set"); if (a) a.hidden = k !== "topup"; if (b) b.hidden = k !== "set"; };
-    segWire(body);
-    const segEl = body.querySelector("#ac-kind");
-    if (segEl) { segEl.addEventListener("pick", (e) => showKind(e.detail)); showKind(kinds.some((x) => x[0] === cur) ? cur : "off"); }
-    openModal({
-      title: "Automatic chips", body, autofocus: false,
-      buttons: kinds.length > 1 ? [{ label: "Cancel", cls: "ghost" }, {
-        label: "Save", cls: "primary",
-        onClick: async () => {
-          const on = body.querySelector("#ac-kind button.on");
-          const kind = on ? on.dataset.v : "off";
-          const payload = { kind };
-          if (kind === "topup") { payload.target_cents = C().toCents(body.querySelector("#ac-top-target").value) || 0; payload.below_cents = C().toCents(body.querySelector("#ac-top-below").value) || 0; }
-          if (kind === "set") payload.target_cents = C().toCents(body.querySelector("#ac-set-target").value) || 0;
-          await C().tablePost("auto_chips_self", payload);
-          toast(kind === "off" ? "Automatic chips off" : kind === "topup" ? `Topping up to ${d2(payload.target_cents)}` : `Stack resets to ${d2(payload.target_cents)} every hand`, "ok");
-        },
-      }] : [{ label: "Done", cls: "primary" }],
-    });
-  }
   // --------------------------------------------------------- profile picture
   // (2026-09-26) The browser crops the middle square of the photo and re-encodes
   // it at 256 px (small, and free of the photo's metadata) before it is sent.
@@ -905,8 +432,8 @@
   }
   function renderMe() {
     const me = C().G.me || {};
-    const nm = me.name || me.email || "";
-    $("userchip").innerHTML = `${avatar(nm, nm, "sm", me.avatar)}<span>${esc(nm)}</span>`;
+    const nm = myName();
+    put($("userchip"), html`${avatar(nm, nm, "sm", me.avatar)}<span>${nm}</span>`);
   }
   function setMyAvatar(url) {  // the lobby and the table views carry it (my_avatar)
     const me = C().G.me || {};
@@ -923,16 +450,25 @@
       toast(out.avatar ? "Picture saved" : "Picture removed", "ok");
     } catch (e) { toast(e.message, "err"); return false; }
   }
-  function openAvatar() {
-    const me = C().G.me || {};
-    const nm = me.name || me.email || "?";
+  // Your picture AND the name the tables show (FEAT-008: friends were stuck with their
+  // full Google name, cut off on the seat plate — or an email's first half).
+  function openAvatar(opts) {
+    const me = (C().G.me = C().G.me || {});  // (one object: setMyName fills in the name's state)
+    const nm = myName();
     let picked = null;
     const body = h("div", { class: "avup" });
+    const typed = () => { const b = body.querySelector("#avup-name"); return b ? b.value.trim() : null; };
+    let touched = false;  // (the box keeps what was typed; until then it follows the name's state)
     const paint = () => {
-      body.innerHTML = `<div class="avup-pic">${avatar(nm, nm, "xl", picked || me.avatar)}</div>` +
-        `<div class="avup-side"><label class="btn" for="avup-file">${icon("i-user", "sm")}Choose a photo</label>` +
-        `<input type="file" id="avup-file" accept="image/*" hidden/>` +
-        `<small class="muted">We use a square from the middle of it. Everyone in your clubs sees it at the table and on the club page.</small></div>`;
+      const st = me.name_state || {};
+      const value = touched ? typed() : st.chosen || (opts && opts.focusName && st.account_name) || "";
+      put(body, html`<div class="avup-pic">${avatar(nm, nm, "xl", picked || me.avatar)}</div>
+        <div class="avup-side"><label class="btn" for="avup-file">${icon("i-user", "sm")}Choose a photo</label>
+        <input type="file" id="avup-file" accept="image/*" hidden/>
+        <small class="muted">We use a square from the middle of it. Everyone in your clubs sees it at the table and on the club page.</small></div>
+        <label class="field avup-name"><span>Name at the table</span><input class="input" id="avup-name" maxlength="20" autocomplete="nickname" placeholder="${st.account_name || "e.g. Sam"}" value="${value || ""}"/>
+        <small class="muted">What your seat, the chat and the club show — short names fit the seat best. Empty = ${st.account_name ? `your account's name (${st.account_name})` : "\u201cPlayer\u201d and a number"}. A club can also give you a nickname of its own.</small></label>`);
+      body.querySelector("#avup-name").addEventListener("input", () => { touched = true; });
       body.querySelector("#avup-file").addEventListener("change", async (e) => {
         const f = e.target.files && e.target.files[0];
         if (!f) return;
@@ -940,40 +476,98 @@
       });
     };
     paint();
+    const saveName = async () => {
+      const v = typed();
+      const cur = (me.name_state && me.name_state.chosen) || "";
+      if (v == null || v === cur) return true;
+      try {
+        const st = await C().j("/games/api/me/name", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: v }) });
+        setMyName(st);
+        toast(v ? `The tables call you ${st.name}` : "Name reset", "ok");
+        return true;
+      } catch (e) { toast(e.message, "err"); return false; }
+    };
     const buttons = [];
-    if (me.avatar) buttons.push({ label: "Remove", cls: "ghost", onClick: () => saveAvatar(null) });
+    if (me.avatar) buttons.push({ label: "Remove photo", cls: "ghost", onClick: () => saveAvatar(null) });
     buttons.push({ label: "Cancel", cls: "ghost" }, {
       label: "Save", cls: "gold",
-      onClick: () => { if (!picked) { toast("Choose a photo first", "err"); return false; } return saveAvatar(picked); },
+      onClick: async () => {
+        if (!(await saveName())) return false;
+        return picked ? saveAvatar(picked) : true;
+      },
     });
-    openModal({ title: "Your picture", body, buttons, autofocus: false });
+    const api = openModal({ title: (opts && opts.title) || "Your picture and name", sub: opts && opts.sub, body, buttons, autofocus: !!(opts && opts.focusName) });
+    if (opts && opts.focusName) setTimeout(() => { const b = body.querySelector("#avup-name"); if (b) b.focus({ preventScroll: true }); }, 80);
+    // (opened from a table link, before any lobby: the name's state comes from here)
+    if (!me.name_state) C().j("/games/api/me/name").then((st) => { setMyName(st); if (!api.closed) paint(); }).catch(() => {});
+  }
+  // FEAT-008: the name the tables show for you — the lobby and table views carry it
+  function myName() {
+    const me = C().G.me || {};
+    return (me.name_state && me.name_state.name) || me.name || me.email || "?";
+  }
+  function setMyName(st) {
+    if (!st || typeof st !== "object") return;
+    const me = (C().G.me = C().G.me || {});
+    const was = JSON.stringify(me.name_state || null);
+    me.name_state = st;
+    if (JSON.stringify(st) !== was) renderMe();
+  }
+  // No name of your own yet ("Player 12", or your email's first half): asked once per
+  // visit, the first time you open a table, with the picture dialog focused on the name.
+  // (asked at most once a week in this browser: a Save with the name that is there already
+  // settles it for good; a dismissal only for the week)
+  const ASK_NAME_KEY = "hg.askname.v1";
+  function askForName(s) {
+    if (!s || !s.my_name_default || U.askedName) return;
+    U.askedName = true;
+    try {
+      const last = Number(localStorage.getItem(ASK_NAME_KEY) || 0);
+      if (Date.now() - last < 7 * 86400e3) return;
+      localStorage.setItem(ASK_NAME_KEY, String(Date.now()));
+    } catch (_) { /* private mode: once per visit */ }
+    setTimeout(() => openAvatar({ title: "What should the table call you?", sub: "Your seat and the chat show this name. You can change it any time from your picture.", focusName: true }), 400);
   }
 
   // ------------------------------------------------------------ preferences
   function openPrefs() {
     const p = C().G.prefs;
-    const seg = (id, opts, cur) => `<div class="seg" id="${id}">${opts.map(([v, l]) => `<button type="button" data-v="${v}" class="${String(v) === String(cur) ? "on" : ""}">${l}</button>`).join("")}</div>`;
-    const sw = (id, on) => `<label class="switch"><input type="checkbox" id="${id}" ${on ? "checked" : ""}/><i></i></label>`;
-    const body = h("div", { style: "display:flex;flex-direction:column;gap:14px" });
-    body.innerHTML =
-      `<div class="grp"><h4>Sound</h4><div class="setrow"><div><b>Table sounds</b><small>Cards, chips, your-turn chime</small></div>${sw("p-sound", p.sound)}</div>` +
-      `<label class="field"><span>Volume</span><input type="range" id="p-vol" min="0" max="100" value="${Math.round(p.volume * 100)}" style="--fill:${Math.round(p.volume * 100)}%"/></label>` +
-      `<div class="setrow"><div><b>Desktop notification on my turn</b><small>Only when this tab is in the background</small></div>${sw("p-notify", p.notify)}</div></div>` +
-      `<div class="grp"><h4>Table</h4><div class="field"><span>Felt</span>${seg("p-felt", [["emerald", "Emerald"], ["royal", "Royal"], ["crimson", "Crimson"], ["violet", "Violet"], ["graphite", "Graphite"]], p.felt)}</div>` +
-      `<div class="row2"><div class="field"><span>Cards</span>${seg("p-cards", [["bold", "Bold"], ["classic", "Classic"]], p.cards)}</div><div class="field"><span>Deck</span>${seg("p-deck", [["4c", "4-colour"], ["2c", "2-colour"]], p.deck)}</div></div>` +
-      `<div class="row2"><div class="field"><span>Card backs</span>${seg("p-back", [["blue", "Blue"], ["red", "Red"], ["green", "Green"], ["black", "Black"]], p.back)}</div><div class="field"><span>Amounts</span>${seg("p-unit", [["dollars", "$"], ["bb", "BB"]], p.unit)}</div></div>` +
-      `<div class="field"><span>Animations</span>${seg("p-anim", [["full", "Full"], ["off", "Off"]], p.anim)}</div>` +
-      `<div class="setrow"><div><b>Chat bubbles over seats</b></div>${sw("p-bubbles", p.bubbles !== false)}</div></div>` +
-      `<div class="grp"><h4>Playing</h4><div class="setrow"><div><b>Keyboard shortcuts</b><small>F fold · C check/call · R bet/raise · 1–5 sizes · ↑↓ adjust</small></div>${sw("p-hot", p.hotkeys)}</div>` +
-      `<div class="setrow"><div><b>Confirm all-in</b><small>Ask before putting your whole stack in</small></div>${sw("p-allin", p.confirmAllIn)}</div></div>`;
+    const seg = segHtml;
+    const sw = (id, on) => html`<label class="switch"><input type="checkbox" id="${id}" ${on ? "checked" : ""}/><i></i></label>`;
+    const row = (id, on, title, hint) => html`<div class="setrow"><div><b>${title}</b>${hint ? html`<small>${hint}</small>` : ""}</div>${sw(id, on)}</div>`;
+    const vol = Math.round(p.volume * 100);
+    const body = h("div", { class: "stack-14" });
+    // Sounds come in three kinds (FEAT-011): someone who only wants the your-turn chime
+    // used to have to mute everything. The top bar's speaker still mutes them all.
+    put(body, html`<div class="grp"><h4>Sound</h4>${p.sound ? "" : html`<p class="flush">All sounds are muted — the speaker button in the top bar turns them back on.</p>`}
+      ${row("p-snd-turn", p.sndTurn !== false, "Your turn", "The chime, your clock's last seconds, and a buy-in or join request waiting for you")}
+      ${row("p-snd-chat", p.sndChat !== false, "Chat", "A soft ping for a new message while the chat is closed")}
+      ${row("p-snd-table", p.sndTable !== false, "Table", "Cards, chips, bets and wins")}
+      <label class="field"><span>Volume</span><input type="range" id="p-vol" min="0" max="100" value="${vol}" data-vars="fill:${vol}%"/></label>
+      ${canVibrate() ? row("p-vibrate", p.vibrate !== false, "Vibrate on my turn") : ""}
+      ${row("p-notify", p.notify, "Notification on my turn", "When this tab is in the background — tap it to come back to the table")}</div>
+      <div class="grp"><h4>Table</h4><div class="field"><span>Felt</span>${seg("p-felt", [["emerald", "Emerald"], ["royal", "Royal"], ["crimson", "Crimson"], ["violet", "Violet"], ["graphite", "Graphite"]], p.felt)}</div>
+      <div class="row2"><div class="field"><span>Cards</span>${seg("p-cards", [["bold", "Bold"], ["classic", "Classic"]], p.cards)}</div><div class="field"><span>Deck</span>${seg("p-deck", [["4c", "4-colour"], ["2c", "2-colour"]], p.deck)}</div></div>
+      <div class="row2"><div class="field"><span>Card backs</span>${seg("p-back", [["blue", "Blue"], ["red", "Red"], ["green", "Green"], ["black", "Black"]], p.back)}</div><div class="field"><span>Amounts</span>${seg("p-unit", [["dollars", "$"], ["bb", "BB"]], p.unit)}</div></div>
+      <div class="field"><span>Animations</span>${seg("p-anim", [["auto", "Auto"], ["full", "Full"], ["off", "Off"]], p.anim)}<small>Auto follows your device's Reduce Motion setting.</small></div>
+      ${row("p-bubbles", p.bubbles !== false, "Chat bubbles over seats")}</div>
+      <div class="grp"><h4>Playing</h4>${row("p-hot", p.hotkeys, "Keyboard shortcuts", "F fold · C check/call · R or B bet/raise · 1–6 sizes · arrows adjust · Esc cancels a pre-action · ? lists them all")}
+      ${row("p-allin", p.confirmAllIn, "Confirm all-in", "Ask before putting your whole stack in (a call too)")}</div>
+      <div class="grp"><h4>Private notes &amp; tags</h4><div class="setrow"><div><b>Back up or bring back</b><small>Your notes on players stay in this browser. Save them to a file before clearing it or changing phone.</small></div>
+      <span class="row-inline"><button type="button" class="btn sm" id="p-notes-out">Save</button><label class="btn sm" for="p-notes-in">Restore</label><input type="file" id="p-notes-in" accept="application/json,.json" hidden/></span></div></div>`);
+    // (FEAT-014 above: the notes live in this browser only — a file keeps them safe, and still private)
     segWire(body);
     const save = (patch) => { C().savePrefs(patch); const s = C().G.state; if (s) HG.ui.render(s, s, { unitChanged: true }); renderSound(); };
     [["p-felt", "felt"], ["p-cards", "cards"], ["p-deck", "deck"], ["p-back", "back"], ["p-unit", "unit"], ["p-anim", "anim"]].forEach(([id, key]) =>
       body.querySelector("#" + id).addEventListener("pick", (e) => save({ [key]: e.detail })));
-    [["p-sound", "sound"], ["p-bubbles", "bubbles"], ["p-hot", "hotkeys"], ["p-allin", "confirmAllIn"]].forEach(([id, key]) =>
-      body.querySelector("#" + id).addEventListener("change", (e) => save({ [key]: e.target.checked })));
+    [["p-snd-turn", "sndTurn"], ["p-snd-chat", "sndChat"], ["p-snd-table", "sndTable"], ["p-vibrate", "vibrate"], ["p-bubbles", "bubbles"], ["p-hot", "hotkeys"], ["p-allin", "confirmAllIn"]].forEach(([id, key]) => {
+      const box = body.querySelector("#" + id);
+      if (box) box.addEventListener("change", (e) => save({ [key]: e.target.checked }));
+    });
     body.querySelector("#p-vol").addEventListener("input", (e) => { e.target.style.setProperty("--fill", e.target.value + "%"); save({ volume: Number(e.target.value) / 100 }); });
     body.querySelector("#p-vol").addEventListener("change", () => HG.sound && HG.sound.play("chip"));
+    body.querySelector("#p-notes-out").addEventListener("click", () => UI.exportNotes && UI.exportNotes());
+    body.querySelector("#p-notes-in").addEventListener("change", (e) => { const f = e.target.files && e.target.files[0]; if (f && UI.importNotes) UI.importNotes(f); e.target.value = ""; });
     body.querySelector("#p-notify").addEventListener("change", async (e) => {
       if (e.target.checked && globalThis.Notification && Notification.permission !== "granted") {
         const r = await Notification.requestPermission().catch(() => "denied");
@@ -986,7 +580,9 @@
   function renderSound() {
     const b = $("tb-sound"), on = !!C().G.prefs.sound;
     b.classList.toggle("on", on);
-    b.innerHTML = icon(on ? "i-vol" : "i-mute");
+    put(b, icon(on ? "i-vol" : "i-mute"));
+    b.title = on ? "Mute sounds" : "Turn sounds on";
+    b.setAttribute("aria-label", b.title);
   }
 
   // -------------------------------------------------------------------- rail
@@ -996,10 +592,10 @@
     C().savePrefs({ rail: open, railTab: U.railTab });
     $("rail").classList.toggle("closed", !open);
     $("tb-rail").classList.toggle("on", open);
-    document.querySelectorAll("#rail-tabs button").forEach((b) => b.classList.toggle("on", b.dataset.tab === U.railTab));
+    document.querySelectorAll("#rail-tabs button").forEach((b) => { b.classList.toggle("on", b.dataset.tab === U.railTab); b.setAttribute("aria-selected", String(b.dataset.tab === U.railTab)); });
     for (const k of ["chat", "log", "ledger", "hands"]) $("panel-" + k).hidden = k !== U.railTab;
     if (open && U.railTab === "chat") { U.unread = 0; renderUnread(); const sc = $("chat-log").parentNode; sc.scrollTop = sc.scrollHeight; }
-    if (p.rail !== open) setTimeout(() => HG.table.layout(), 300);
+    if (p.rail !== open) afterTransition($("rail"), () => HG.table.layout());  // (the felt re-fits once the rail has moved)
     const s = C().G.state;
     if (s && open) renderRail(s, true);
   }
@@ -1007,9 +603,20 @@
   // someone reading the chat never saw the buttons and the clock folded them: close
   // it (a half-typed message stays in its box). A dialog or the Manage drawer may hold
   // unsaved edits, so those stay open and a toast says it instead.
-  function onMyTurn() {
+  // A phone buzzes too (FEAT-011; Preferences › Vibrate on my turn — Android: iPhones have
+  // no vibration for web pages).
+  const canVibrate = () => !!(globalThis.navigator && navigator.vibrate && globalThis.matchMedia && matchMedia("(pointer: coarse)").matches);
+  function onMyTurn(s) {
+    if (C().G.prefs.vibrate !== false && canVibrate()) { try { navigator.vibrate([90, 70, 90]); } catch (_) { /* not allowed yet */ } }
     if (C().G.prefs.rail && getComputedStyle($("rail")).position === "absolute") setRail(false);
     if (U.drawer || document.querySelector("#modal-root .modal")) toast("It's your turn", "gold", 4000);
+    // screen readers hear it too (the chime and the tab title were all there was)
+    const live = $("sr-live");
+    if (live && s) {
+      const owe = s.to_call_cents || 0;
+      live.textContent = "";
+      setTimeout(() => { live.textContent = owe > 0 ? `Your turn — ${C().fmtAmt(owe, s)} to call` : "Your turn — check or bet"; }, 60);
+    }
   }
   function renderUnread() {
     const n = U.unread;
@@ -1029,18 +636,33 @@
       const firstPaint = U.chatSig === "";
       const prevLast = Number(U.chatSig.split(":")[0] || 0);
       U.chatSig = sig;
+      // mine = by user id (two members can share a name — HGT-027); an older server sends names only
       const myName = (s.seats[s.my_seat] || {}).name;
+      const isMine = (m) => (m.user_id != null ? m.user_id === s.my_user_id : m.name === myName);
       const items = chat.map((m) => ({ t: timeOf(m.created_at), chat: m })).concat(events.map((e) => ({ t: e.ts * 1000, ev: e })));
       items.sort((a, b) => a.t - b.t);
       const log = $("chat-log"), sc = log.parentNode;
       const stick = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 40;
-      log.innerHTML = items.length ? items.map((it) => it.chat
-        ? `<div class="msg ${it.chat.name === myName ? "me" : ""}">${avatar(it.chat.name, it.chat.name, "sm", it.chat.avatar)}<div class="body"><div class="who">${esc(it.chat.name)}<time>${it.t ? hhmm(it.t) : ""}</time></div><div class="txt">${esc(it.chat.text)}</div></div></div>`
-        : `<div class="msg sys ${it.ev.kind === "win" ? "win" : ""}">${esc(it.ev.text)}</div>`).join("")
-        : `<div class="muted" style="text-align:center;padding:28px 10px">Say hi — the dealer posts joins, rebuys and results here too.</div>`;
+      const line = (it) => (it.chat
+        ? html`<div class="msg ${isMine(it.chat) ? "me" : ""}">${avatar(it.chat.name, it.chat.name, "sm", it.chat.avatar)}<div class="body"><div class="who">${it.chat.name}<time>${it.t ? hhmm(it.t) : ""}</time></div><div class="txt">${it.chat.text}</div></div></div>`
+        : html`<div class="msg sys ${it.ev.kind === "win" ? "win" : ""}">${it.ev.text}</div>`);
+      // New lines are ADDED (FE-008: the whole chat used to be redrawn for every line);
+      // lines the server's window dropped at the top are removed. Anything else redraws.
+      const keys = items.map((it) => (it.chat ? "c" + it.chat.id : "e" + it.ev.id));
+      const old = U.chatKeys || [];
+      const from = keys.length ? old.indexOf(keys[0]) : -1;
+      const kept = from < 0 ? [] : old.slice(from);
+      if (!force && items.length && kept.length && kept.length <= keys.length && kept.every((k, i) => k === keys[i]) && log.childElementCount === old.length) {
+        for (let i = 0; i < from; i++) log.firstElementChild.remove();
+        if (keys.length > kept.length) append(log, html`${items.slice(kept.length).map(line)}`);
+      } else {
+        put(log, items.length ? html`${items.map(line)}`
+          : html`<div class="muted empty-note">Say hi — the dealer posts joins, rebuys and results here too.</div>`);
+      }
+      U.chatKeys = items.length ? keys : [];
       if (stick || firstPaint) sc.scrollTop = sc.scrollHeight;
       if (!firstPaint) {
-        const fresh = chat.filter((m) => m.id > prevLast && m.name !== myName).length;
+        const fresh = chat.filter((m) => m.id > prevLast && !isMine(m)).length;
         if (fresh && !(open && U.railTab === "chat")) { U.unread += fresh; HG.sound && HG.sound.play("msg"); }
       }
       renderUnread();
@@ -1058,15 +680,16 @@
     U.logSig = sig;
     const names = {}, pics = {};
     s.seats.forEach((x) => { if (!x.empty) { names[x.seat] = x.name; pics[x.seat] = x.avatar; } });
-    let html = "", street = null;
+    const rows = [];
+    let street = null;
     hist.forEach((x) => {
-      if (x.street !== street) { street = x.street; html += `<div class="log-street">${esc(street)}</div>`; }
-      const k = x.action === 0 ? "fold" : x.action === 1 ? (x.chips > 0 ? "call" : "check") : x.action === 7 ? "allin" : "raise";
+      if (x.street !== street) { street = x.street; rows.push(html`<div class="log-street">${street}</div>`); }
+      const k = C().actionKind(x);
       const lb = k === "fold" ? "Fold" : k === "check" ? "Check" : k === "call" ? "Call " + C().fmtAmt(x.cents, s) : (k === "allin" ? "All-in " : "Raise to ") + C().fmtAmt(x.to_cents, s);
-      html += `<div class="log-row k-${k}">${avatar(names[x.seat] || "?", names[x.seat], "sm", pics[x.seat])}<span class="nm">${esc(names[x.seat] || "Seat " + (x.seat + 1))}</span><span class="lb">${lb}</span></div>`;
+      rows.push(html`<div class="log-row k-${k}">${avatar(names[x.seat] || "?", names[x.seat], "sm", pics[x.seat])}<span class="nm">${names[x.seat] || "Seat " + (x.seat + 1)}</span><span class="lb">${lb}</span></div>`);
     });
-    $("log-body").innerHTML = (s.hand_no ? `<div class="muted num" style="margin-bottom:10px">Hand #${s.hand_no} · ante ${d2(s.stakes.ante_cents)}</div>` : "") +
-      (html || `<div class="muted" style="text-align:center;padding:28px 10px">${s.phase === "in_hand" ? "No action yet — everyone anted." : "The action of the current hand shows up here."}</div>`);
+    put($("log-body"), html`${s.hand_no ? html`<div class="muted num log-head">Hand #${s.hand_no} · ante ${d2(s.stakes.ante_cents)}</div>` : ""}${rows.length ? rows
+      : html`<div class="muted empty-note">${s.phase === "in_hand" ? "No action yet — everyone anted." : "The action of the current hand shows up here."}</div>`}`);
     const sc = $("log-body"); sc.scrollTop = sc.scrollHeight;
   }
 
@@ -1084,43 +707,80 @@
     }
     return out;
   }
+  // Who pays whom (FEAT-001): the server's fewest payments (`settle_up`, your own lines
+  // marked); an older server only sent the ledger, settled here greedily.
+  function payments(s) {
+    if (Array.isArray(s.settle_up)) return s.settle_up.map((p) => ({ from: p.from_name, to: p.to_name, cents: p.cents, you: p.you }));
+    return settleUp(s.ledger || []);
+  }
+  const payLine = (p) => p.you === "pay" ? html`<b class="you">You</b> pay ${p.to}` : p.you === "get" ? html`${p.from} pays <b class="you">you</b>` : html`${p.from} pays ${p.to}`;
   function renderLedger(s, force) {
     const led = s.ledger || [];
-    const sig = JSON.stringify(led) + C().G.prefs.unit + (U.hands ? U.hands.statsSig : "");
+    const sig = JSON.stringify(led) + JSON.stringify(s.settle_up || null) + C().G.prefs.unit + (U.hands ? U.hands.statsSig : "");
     if (sig === U.ledgerSig && !force) return;
     U.ledgerSig = sig;
+    // your own row opens your receipt (FEAT-002); the host's, anyone's
+    const tappable = (r) => r.user_id === s.my_user_id || s.is_host;
     const rows = led.map((r) =>
-      `<tr class="${r.user_id === s.my_user_id ? "me" : ""} ${r.seated ? "" : "gone"}"><td title="${esc(r.name)}">${esc(r.name)}</td><td>${d2(r.buyin_cents)}</td><td>${r.seated ? d2(r.stack_cents) : d2(r.leftover_cents)}</td><td class="${r.net_cents > 0 ? "pos" : r.net_cents < 0 ? "neg" : ""}">${r.net_cents > 0 ? "+" : ""}${d2(r.net_cents)}</td></tr>`).join("");
-    const pays = settleUp(led);
+      html`<tr class="${r.user_id === s.my_user_id ? "me" : ""} ${r.seated ? "" : "gone"} ${tappable(r) ? "tap" : ""}"${tappable(r) ? html` data-uid="${Number(r.user_id)}" tabindex="0" role="button" aria-label="${r.name}: every buy-in and cash-out"` : ""}><td title="${r.name}">${r.name}</td><td>${d2(r.buyin_cents)}</td><td>${r.seated ? d2(r.stack_cents) : d2(r.leftover_cents)}</td><td class="${r.net_cents > 0 ? "pos" : r.net_cents < 0 ? "neg" : ""}">${r.net_cents > 0 ? "+" : ""}${d2(r.net_cents)}</td></tr>`);
+    const pays = payments(s);
     const stats = (U.hands && U.hands.stats) || [];
-    $("ledger-body").innerHTML =
-      `<table class="ledger"><thead><tr><th>Player</th><th>Buy-in</th><th>Stack</th><th>Net</th></tr></thead><tbody>${rows}</tbody></table>` +
-      `<div class="muted" style="font-size:11.5px;margin-top:8px">Stacks settle at the end of each hand. Players who left show what they cashed out.</div>` +
-      `<div class="rsec"><h4>Settle up</h4>${pays.length ? pays.map((p) => `<div class="settle-row"><span>${esc(p.from)} pays ${esc(p.to)}</span><b>${d2(p.cents)}</b></div>`).join("") : '<div class="muted">Everyone is even.</div>'}` +
-      (pays.length ? `<button class="btn sm block" id="settle-copy" style="margin-top:10px">${icon("i-copy", "sm")}Copy summary</button>` : "") + `</div>` +
-      (stats.length ? `<div class="rsec"><h4>Session stats</h4><table class="ledger"><thead><tr><th>Player</th><th>Hands</th><th>Won</th><th>Best</th><th title="Average score of their decisions against the network (0-100)">Acc.</th></tr></thead><tbody>` +
-        stats.map((r) => `<tr class="${r.is_me ? "me" : ""}"><td>${esc(r.name)}</td><td>${r.hands}</td><td>${r.wins}</td><td>${d2(r.biggest_win_cents)}</td><td>${r.accuracy == null ? "–" : Math.round(r.accuracy) + "%"}</td></tr>`).join("") + `</tbody></table>` +
-        `<div class="muted" style="font-size:11.5px;margin-top:6px">${gameOf(s.variant).graded ? "Accuracy = how closely each decision matched the network, graded in the background after every hand." : `${gameOf(s.variant).label} decisions are not graded — there is no ${gameOf(s.variant).label} network yet.`}</div></div>` : "") +
-      (((U.hands && U.hands.h2h) || []).length ? `<div class="rsec"><h4>Head to head — this table</h4>` + U.hands.h2h.map((x) => `<div class="settle-row"><span>${esc(x.to)} is up on ${esc(x.from)}</span><b>${d2(x.cents)}</b></div>`).join("") + `</div>` : "") +
-      `<button class="btn sm block" id="ledger-myhands" style="margin-top:14px">${icon("i-chart", "sm")}My hands &amp; lifetime stats</button>`;
+    const h2h = (U.hands && U.hands.h2h) || [];
+    const G = gameOf(s.variant);
+    put($("ledger-body"), html`<table class="ledger"><thead><tr><th>Player</th><th>Buy-in</th><th>Stack</th><th>Net</th></tr></thead><tbody>${rows}</tbody></table>
+      <div class="muted fine-print">Stacks settle at the end of each hand. Players who left show what they cashed out. ${UI.openReceipt ? (s.is_host ? "Tap a row for every buy-in and cash-out." : "Tap your row for every buy-in and cash-out.") : ""}</div>
+      <div class="rsec"><h4>Settle up</h4>${pays.length ? html`<div class="muted fine-print lead">The fewest payments that square everyone${s.status === "open" ? " if the game ended now" : ""}.</div>${pays.map((p) => html`<div class="settle-row ${p.you ? "mine" : ""}"><span>${payLine(p)}</span><b>${d2(p.cents)}</b></div>`)}` : html`<div class="muted">Everyone is even.</div>`}
+      ${pays.length ? html`<button class="btn sm block gap-top" id="settle-copy">${icon("i-copy", "sm")}Copy summary</button>` : ""}</div>
+      ${stats.length ? html`<div class="rsec"><h4>Session stats</h4><table class="ledger"><thead><tr><th>Player</th><th>Hands</th><th title="Hands won">Hands won</th><th title="Biggest pot won">Best</th><th title="Average score of their decisions against the network (0-100)">Acc.</th></tr></thead><tbody>${stats.map((r) =>
+        html`<tr class="${r.is_me ? "me" : ""}"><td>${r.name}</td><td>${r.hands}</td><td>${r.wins}</td><td>${d2(r.biggest_win_cents)}</td><td>${r.accuracy == null ? "–" : Math.round(r.accuracy) + "%"}</td></tr>`)}</tbody></table>
+        <div class="muted fine-print">${G.graded ? "Accuracy = how closely each decision matched the network, graded in the background after every hand." : `${G.label} decisions are not graded — there is no ${G.label} network yet.`}</div></div>` : ""}
+      ${h2h.length ? html`<div class="rsec"><h4>Head to head — this table</h4>${h2h.map((x) => html`<div class="settle-row"><span>${x.to} is up on ${x.from}</span><b>${d2(x.cents)}</b></div>`)}</div>` : ""}
+      <button type="button" class="btn sm block gap-top" id="ledger-myhands">${icon("i-chart", "sm")}My hands &amp; stats</button>`);
     const mh = $("ledger-myhands");
-    if (mh) mh.addEventListener("click", () => openMyHands(""));
+    if (mh) mh.addEventListener("click", () => UI.openMyHands(""));
+    $("ledger-body").querySelectorAll("tr.tap[data-uid]").forEach((tr) => {
+      const open = () => UI.openReceipt && UI.openReceipt(Number(tr.dataset.uid));
+      tr.addEventListener("click", open);
+      tr.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } });
+    });
     const cp = $("settle-copy");
     if (cp) cp.addEventListener("click", async () => {
       const text = `${s.name} — settle up\n` + led.map((r) => `${r.name}: ${r.net_cents >= 0 ? "+" : ""}${d2(r.net_cents)}`).join("\n") + "\n\n" + pays.map((p) => `${p.from} pays ${p.to} ${d2(p.cents)}`).join("\n");
       try { await navigator.clipboard.writeText(text); toast("Summary copied", "ok"); } catch (_) { toast("Couldn't copy", "err"); }
     });
-    if (!U.hands && !U.handsLoading && s.is_member) loadHands(s);
+    if (!U.hands && !U.handsLoading && canBrowse(s)) loadHands(s);
   }
 
-  async function loadHands(s) {
+  // Who may browse a table's hands: every member of its club (SEC-008 — the server says
+  // so with `can_browse_hands`; an older server let only the table's own players).
+  const canBrowse = (s) => !!(s && (s.can_browse_hands != null ? s.can_browse_hands : s.is_member));
+
+  // The table's hands, newest first, 40 at a time. `older` asks for the page before the
+  // oldest one shown (HGH-001: the History tab used to stop at the last 40); a refresh
+  // after a new hand keeps the older pages already loaded.
+  async function loadHands(s, older) {
     if (U.handsLoading) return;
     U.handsLoading = true;
+    const have = U.hands && U.hands.table === s.id ? U.hands : null;
     try {
-      const data = await C().j(`/games/api/tables/${s.id}/hands?limit=40`);
-      data.statsSig = JSON.stringify([data.stats || [], data.h2h || []]);
-      U.hands = data; U.handsFor = `${s.id}:${s.last_hand_no}`;
-    } catch (_) { U.hands = { hands: [], stats: [], statsSig: "", denied: true }; U.handsFor = `${s.id}:${s.last_hand_no}`; }
+      const before = older && have && have.hands.length ? have.hands[have.hands.length - 1].hand_no : null;
+      const data = await C().j(`/games/api/tables/${s.id}/hands?limit=40` + (before ? `&before=${before}` : ""));
+      if (before) {
+        have.hands = have.hands.concat(data.hands || []);
+        have.more = !!data.more;
+      } else {
+        data.table = s.id;
+        data.statsSig = JSON.stringify([data.stats || [], data.h2h || []]);
+        if (have && (data.hands || []).length) {
+          const newest = data.hands[data.hands.length - 1].hand_no;
+          const kept = have.hands.filter((x) => x.hand_no < newest);
+          if (kept.length) { data.hands = data.hands.concat(kept); data.more = have.more; }
+        }
+        U.hands = data; U.handsFor = `${s.id}:${s.last_hand_no}`;
+      }
+    } catch (_) {
+      if (!older) { U.hands = { hands: [], stats: [], statsSig: "", denied: true, table: s.id }; U.handsFor = `${s.id}:${s.last_hand_no}`; }
+    }
     U.handsLoading = false;
     const cur = C().G.state;
     if (cur && cur.id === s.id) renderRail(cur, true);
@@ -1128,7 +788,7 @@
   function miniCards(list, extra) {
     // (a PLO67 hand holds up to seven: its row of mini cards tucks together to fit — games.css .many)
     const many = (list || []).length > 5 ? " many" : "";
-    return `<span class="mini-cards ${extra || ""}${many}" data-cards="${(list || []).join(",")}"></span>`;
+    return html`<span class="mini-cards ${extra || ""}${many}" data-cards="${(list || []).join(",")}"></span>`;
   }
   function fillMiniCards(root) {
     root.querySelectorAll(".mini-cards[data-cards]").forEach((m) => {
@@ -1139,950 +799,87 @@
   function renderHands(s, force) {
     const key = `${s.id}:${s.last_hand_no}`;
     const body = $("hands-body");
-    if (!s.is_member) { body.innerHTML = `<div class="muted" style="text-align:center;padding:28px 10px">Hand history is for players at this table. Take a seat to see it.</div>`; return; }
-    if (U.handsFor !== key && !U.handsLoading) { loadHands(s); if (!U.hands) body.innerHTML = `<div class="muted" style="text-align:center;padding:28px 10px">Loading hands…</div>`; return; }
+    if (!canBrowse(s)) { put(body, html`<div class="muted empty-note">Hand history is for the players of this table's club.</div>`); return; }
+    if (U.handsFor !== key && !U.handsLoading) { loadHands(s); if (!U.hands) put(body, html`<div class="muted empty-note">Loading hands…</div>`); return; }
     if (!U.hands || (!force && body.dataset.k === key + C().G.prefs.unit)) return;
     body.dataset.k = key + C().G.prefs.unit;
     const list = U.hands.hands || [];
-    body.innerHTML = list.length ? "" : `<div class="muted" style="text-align:center;padding:28px 10px">No finished hands yet. Every hand you play is saved here — your cards, the boards and who won.</div>`;
+    put(body, list.length ? "" : html`<div class="muted empty-note">No finished hands yet. Every hand played here is saved — the cards you may see, the boards and who won.</div>`);
     list.forEach((x) => {
       const net = x.my_delta_cents;
-      const row = h("button", { class: "hand-row", type: "button" },
-        // (your hand framed in gold, then board 1 — they used to read as one row of cards)
-        `<span class="no">#${x.hand_no}</span><span style="display:flex;align-items:center;min-width:0">${x.my_hole ? miniCards(x.my_hole, "mine") : ""}${miniCards(x.board_a, x.my_hole ? "gap board" : "board")}</span>` +
-        `<span class="net ${net > 0 ? "pos" : net < 0 ? "neg" : "muted"}">${net == null ? "—" : (net > 0 ? "+" : "") + d2(net)}</span>` +
-        `<span></span><span class="who">${esc((x.winners || []).map((w) => w.name).join(", ") || "Split pot")} · pot ${d2(x.pot_cents)}</span><span class="muted num" style="font-size:11px">${x.my_accuracy == null ? (x.showdown ? "Showdown" : "") : Math.round(x.my_accuracy) + "%"}</span>`);
-      row.addEventListener("click", () => openHand(s.id, x.hand_no));
+      const row = h("button", { class: "hand-row", type: "button", "aria-label": `Hand ${x.hand_no}` },
+        // your hand framed in gold, then BOTH boards stacked (HGH-005: board 1 alone could
+        // show the board you lost while your money came from board 2)
+        html`<span class="no">#${Number(x.hand_no)}</span><span class="hr-cards">${x.my_hole ? miniCards(x.my_hole, "mine") : ""}<span class="boards2${x.my_hole ? " gap board" : ""}">${miniCards(x.board_a)}${miniCards(x.board_b)}</span></span>
+        <span class="net ${net > 0 ? "pos" : net < 0 ? "neg" : "muted"}">${net == null ? "—" : (net > 0 ? "+" : "") + d2(net)}</span>
+        <span></span><span class="who">${(x.winners || []).map((w) => w.name).join(", ") || "Split pot"} · pot ${d2(x.pot_cents)}</span><span class="muted num small">${x.my_accuracy == null ? (x.showdown ? "Showdown" : "") : Math.round(x.my_accuracy) + "%"}</span>`);
+      row.addEventListener("click", () => UI.openHand(s.id, x.hand_no));
       body.appendChild(row);
     });
     fillMiniCards(body);
-    const all = h("button", { class: "btn sm block", type: "button", style: "margin-top:10px" }, icon("i-chart", "sm") + "All my hands (every table)");
-    all.addEventListener("click", () => openMyHands(""));
+    if (U.hands.more) {
+      const older = h("button", { class: "btn sm block gap-top", type: "button" }, U.handsLoading ? "Loading…" : "Load older hands");
+      older.addEventListener("click", () => { older.disabled = true; older.textContent = "Loading…"; loadHands(s, true); });
+      body.appendChild(older);
+    }
+    const all = h("button", { class: "btn sm block gap-top", type: "button" }, html`${icon("i-chart", "sm")}My hands &amp; stats`);
+    all.addEventListener("click", () => UI.openMyHands(""));
     body.appendChild(all);
-  }
-  // ------------------------------------------------------------ hand replayer
-  // A CLICK-THROUGH, not a video: the hand opens on the flop with the first
-  // player to act; forward plays one action, back takes one away. Every player
-  // decision carries the network's verdict (same marks as the Trainer), and any
-  // position can be sent to the Study tab as a spot.
-  const MARKS = { best: "✓✓", correct: "✓", inaccuracy: "~", wrong: "✗", blunder: "✗✗" };
-  const MARK_LABEL = { best: "Best move", correct: "Correct", inaccuracy: "Inaccuracy", wrong: "Wrong move", blunder: "Blunder" };
-  const kindOfAction = (x) => (x.action === 0 ? "fold" : x.action === 1 ? (x.chips > 0 ? "call" : "check") : x.action === 7 ? "allin" : "raise");
-  function gradeChip(g, small) {
-    if (!g) return "";
-    return `<span class="grade g-${g.cat}${small ? " sm" : ""}" title="${MARK_LABEL[g.cat] || g.cat} · ${Math.round(g.score)}/100 vs the network">${MARKS[g.cat] || "?"}${small ? "" : ` <em>${MARK_LABEL[g.cat] || g.cat}</em> <b>${Math.round(g.score)}</b>`}</span>`;
-  }
-
-  function replayState(rec, k) {
-    const seats = {};
-    rec.seats.forEach((x) => { seats[x.seat] = { stack: x.start_cents - rec.ante_cents, bet: 0, folded: false }; });
-    let pot = rec.ante_cents * rec.seats.length, street = "flop";
-    const clearBets = () => Object.values(seats).forEach((p) => { p.bet = 0; });
-    for (let i = 0; i < k; i++) {
-      const a = rec.actions[i];
-      if (String(a.street).toLowerCase() !== street) { street = String(a.street).toLowerCase(); clearBets(); }
-      const p = seats[a.seat];
-      if (!p) continue;
-      if (a.action === 0) p.folded = true;
-      else { p.stack -= a.cents; p.bet += a.cents; pot += a.cents; }
+    // FEAT-003: the whole session's hands as a file — only the cards you could see
+    if (list.length) {
+      const base = `/games/api/tables/${encodeURIComponent(s.id)}/hands/export?format=`;
+      body.appendChild(h("div", { class: "dl-row" },
+        html`<span class="muted">Download the session</span><a class="btn sm ghost" href="${base}txt" download>Text</a><a class="btn sm ghost" href="${base}json" download>JSON</a>`));
     }
-    const next = rec.actions[k] || null;
-    if (next && String(next.street).toLowerCase() !== street) { street = String(next.street).toLowerCase(); clearBets(); }
-    const over = !next;
-    if (over) clearBets();
-    const boardN = over ? Math.max(3, (rec.board_a || []).length) : street === "river" ? 5 : street === "turn" ? 4 : 3;
-    return { seats, pot, street, next, over, boardN, last: k > 0 ? rec.actions[k - 1] : null };
-  }
-  // PLO67: a seat's cards on the street being replayed (0 flop, 1 turn, 2 river): the
-  // first `counts[i]` of its cards in the order they came, shown high to low — or that
-  // many face down for a hand the viewer may not see. Other games: the stored hand.
-  function replayHole(x, rec, boardN) {
-    const i = Math.max(0, Math.min(2, boardN - 3));
-    const counts = x.counts || null, n = counts ? counts[i] : (x.hole ? x.hole.length : rec.hole_count || 5);
-    if (x.hole_seq && x.hole_seq.length) return x.hole_seq.slice(0, n).sort((a, b) => b - a);
-    if (x.hole && x.hole.length && x.hole[0] >= 0 && !counts) return x.hole;
-    return Array(n).fill("x");
-  }
-
-  // "turn · burn 7♦, everyone in gets a card" — PLO67's face-up burn of a street (else "")
-  const cardName = (c) => "23456789TJQKA"[Math.floor(c / 4)].replace("T", "10") + "♣♦♥♠"[c % 4];
-  function burnNote(rec, street) {
-    const j = { flop: 0, turn: 1, river: 2 }[String(street).toLowerCase()];
-    const b = j == null ? null : (rec.burns || [])[j];
-    if (b == null) return "";
-    const red = b % 4 === 1 || b % 4 === 2;
-    return ` <span class="burn-note ${red ? "red" : ""}">· burn ${cardName(b)}${red ? " — everyone in gets a card" : ""}</span>`;
-  }
-  async function openHand(gid, no) {
-    let rec;
-    try { rec = await C().j(`/games/api/tables/${gid}/hands/${no}`); } catch (e) { return toast(e.message, "err"); }
-    const N = (rec.actions || []).length;
-    const gradeAt = {};
-    (rec.grades || []).forEach((g) => { gradeAt[g.i] = g; });
-    const names = {};
-    rec.seats.forEach((x) => (names[x.seat] = x.is_me ? "You" : x.name));
-    const hero = (rec.seats.find((x) => x.is_me) || rec.seats[0] || {}).seat || 0;
-    const order = rec.seats.map((x) => x.seat);
-    const n = rec.num_seats || 8;
-    let k = 0;
-    const body = h("div", { class: "rp" });
-    body.innerHTML =
-      `<div class="rp-main"><div class="rp-felt" id="rp-felt"></div>` +
-      `<div class="rp-banner" id="rp-banner"></div>` +
-      `<div class="rp-ctl"><button class="btn sm" id="rp-first" title="Start of the hand (Home)">⏮</button><button class="btn" id="rp-prev" title="Back one action (←)">◀</button>` +
-      `<span class="rp-step num" id="rp-step"></span><button class="btn primary" id="rp-next" title="Play the next action (→)">▶</button><button class="btn sm" id="rp-last" title="End of the hand (End)">⏭</button>` +
-      `<span class="spacer"></span>${rec.fair && HG.fair ? `<button class="btn sm" id="rp-fair" title="Re-check this hand's sealed deck, its cut and every card you can see">${icon("i-shield", "sm")}<span>Check shuffle</span></button>` : ""}` +
-      (studyable(rec) ? `<button class="btn gold sm" id="rp-study" title="Send this exact spot to the Study tab">${icon("i-chart", "sm")}Open in Study</button>` : "") + `</div></div>` +
-      `<div class="rp-side"><div class="rsec" style="margin-top:0"><h4>Action</h4><div id="rp-list" class="rp-list"></div></div><div id="rp-result"></div></div>`;
-    const q = (id) => body.querySelector("#" + id);
-
-    function paint() {
-      const st = replayState(rec, k);
-      // seats around the felt, hero at the bottom
-      let html = "";
-      rec.seats.forEach((x) => {
-        const rel = (x.seat - hero + n) % n;
-        const th = Math.PI / 2 + (rel * 2 * Math.PI) / n;
-        const px = 50 + 44 * Math.cos(th), py = 50 + 40 * Math.sin(th);
-        const p = st.seats[x.seat];
-        const acting = st.next && st.next.seat === x.seat;
-        const known = x.hole && x.hole.length && x.hole[0] >= 0;
-        const cards = p.folded && !known ? "" : `<span class="mini-cards" data-cards="${replayHole(x, rec, st.boardN).join(",")}"></span>`;
-        const res = st.over ? `<b class="num ${x.delta_cents > 0 ? "pos" : x.delta_cents < 0 ? "neg" : "muted"}">${x.delta_cents > 0 ? "+" : ""}${d2(x.delta_cents)}</b>` : "";
-        html += `<div class="rp-seat ${p.folded ? "folded" : ""} ${acting ? "acting" : ""}" style="left:${px}%;top:${py}%">${cards}` +
-          `<div class="rp-plate">${avatar(x.name, x.name, "sm", x.avatar)}<div><b>${esc(names[x.seat])}${x.seat === rec.button ? ' <i class="rp-d">D</i>' : ""}</b><span class="num">${d2(Math.max(0, p.stack))}</span></div></div>` +
-          (p.bet > 0 ? `<span class="rp-bet num">${d2(p.bet)}</span>` : "") + res + `</div>`;
-      });
-      // PLO67: the burns turned up by this street (a red one dealt everyone still in a card)
-      const burns = (rec.burns || []).slice(0, Math.max(0, st.boardN - 2));
-      html += `<div class="rp-center"><span class="rp-pot num">Pot ${d2(st.pot)}</span>` +
-        `<span class="mini-cards" data-cards="${(rec.board_a || []).slice(0, st.boardN).join(",")}"></span>` +
-        `<span class="mini-cards" data-cards="${(rec.board_b || []).slice(0, st.boardN).join(",")}"></span>` +
-        (burns.length ? `<span class="rp-burns" title="Burn cards, face up: a red one deals everyone still in the hand another card"><small>Burns</small><span class="mini-cards" data-cards="${burns.join(",")}"></span></span>` : "") + `</div>`;
-      const felt = q("rp-felt");
-      felt.innerHTML = html;
-      fillMiniCards(felt);
-      // banner: the action just played (with its verdict) and who is up
-      const last = st.last, g = last ? gradeAt[k - 1] : null;
-      q("rp-banner").innerHTML =
-        (last ? `<span class="rp-act k-${kindOfAction(last)}"><b>${esc(names[last.seat] || "?")}</b> ${esc(last.label)}${last.auto ? ' <small class="muted">(clock)</small>' : ""}</span>${gradeChip(g)}` : `<span class="muted">Flop dealt — everyone anted ${d2(rec.ante_cents)}.</span>`) +
-        `<span class="spacer"></span>` +
-        (st.next ? `<span class="muted">${esc(String(st.street).toUpperCase())} · <b style="color:var(--tx)">${esc(names[st.next.seat] || "?")}</b> to act</span>` : `<span class="pill gold">Hand over</span>`);
-      q("rp-step").textContent = `${k} / ${N}`;
-      q("rp-prev").disabled = q("rp-first").disabled = k === 0;
-      q("rp-next").disabled = q("rp-last").disabled = k === N;
-      body.querySelectorAll("#rp-list .log-row").forEach((r) => r.classList.toggle("on", Number(r.dataset.i) === k - 1));
-      const cur = body.querySelector("#rp-list .log-row.on");
-      if (cur) cur.scrollIntoView({ block: "nearest" });
-      q("rp-result").hidden = !st.over;
-    }
-    function go(to) { k = Math.max(0, Math.min(N, to)); paint(); }
-
-    // action list (click = jump to just after that action)
-    let list = "", street = null;
-    (rec.actions || []).forEach((a2, i) => {
-      if (a2.street !== street) { street = a2.street; list += `<div class="log-street">${esc(street)}${burnNote(rec, street)}</div>`; }
-      list += `<button type="button" class="log-row k-${kindOfAction(a2)}" data-i="${i}"><span class="nm">${esc(names[a2.seat] || "?")}</span><span class="lb">${esc(a2.label)}</span>${gradeChip(gradeAt[i], true)}</button>`;
-    });
-    // PLO67: a street run out with nobody to act still turned its burn up (and dealt the cards)
-    const seenStreets = new Set((rec.actions || []).map((x) => String(x.street).toLowerCase()));
-    ["flop", "turn", "river"].slice(0, (rec.burns || []).length).forEach((st) => {
-      if (!seenStreets.has(st)) list += `<div class="log-street">${st}${burnNote(rec, st)}</div>`;
-    });
-    q("rp-list").innerHTML = list || `<div class="muted">No betting — everyone was all-in from the ante.</div>`;
-    q("rp-list").addEventListener("click", (e) => { const r = e.target.closest(".log-row"); if (r) go(Number(r.dataset.i) + 1); });
-    const awards = (rec.awards || []).map((w) => {
-      const who = w.winners.map((x) => names[x] || "?").join(" & ");
-      const lab = w.winners.length === 1 && w.labels && w.labels[String(w.winners[0])] ? ` with ${w.labels[String(w.winners[0])]}` : "";
-      return `<div class="settle-row"><span>${w.uncontested ? "Uncontested" : "Board " + (w.board === "b" ? 2 : 1)} · ${esc(who)}${esc(lab)}</span><b>${d2(w.cents)}</b></div>`;
-    }).join("");
-    const flows = (rec.flows || []).map((f) => `<div class="settle-row"><span>${esc(names[f.from] || "?")} → ${esc(names[f.to] || "?")}</span><b>${d2(f.cents)}</b></div>`).join("");
-    q("rp-result").innerHTML = (awards ? `<div class="rsec"><h4>Pots</h4>${awards}</div>` : "") + (flows ? `<div class="rsec"><h4>Who paid whom</h4>${flows}</div>` : "");
-    q("rp-first").addEventListener("click", () => go(0));
-    q("rp-prev").addEventListener("click", () => go(k - 1));
-    q("rp-next").addEventListener("click", () => go(k + 1));
-    q("rp-last").addEventListener("click", () => go(N));
-    if (q("rp-study")) q("rp-study").addEventListener("click", () => openInStudy(rec, k));
-    const fairBtn = q("rp-fair");
-    if (fairBtn) fairBtn.addEventListener("click", async () => {
-      fairBtn.disabled = true;
-      try {
-        const r = await HG.fair.checkPast(gid, no);
-        fairBtn.classList.add("ok");
-        fairBtn.lastElementChild.textContent = r.contributors ? `Verified · cut by ${r.contributors} device${r.contributors === 1 ? "" : "s"}${r.mine ? " (yours too)" : ""}` : "Sealed · nobody's device cut it";
-        toast(`Sealed deck, cut and ${r.cards} card${r.cards === 1 ? "" : "s"} check out`, "ok");
-      } catch (e) {
-        fairBtn.classList.add("bad");
-        fairBtn.lastElementChild.textContent = "CHECK FAILED";
-        toast("This hand's shuffle does not check out: " + e.message, "err", 9000);
-      }
-      fairBtn.disabled = false;
-    });
-    const onKey = (e) => {
-      if (U.modals[U.modals.length - 1] !== api) return;
-      if (e.key === "ArrowRight") { e.preventDefault(); go(k + 1); }
-      else if (e.key === "ArrowLeft") { e.preventDefault(); go(k - 1); }
-      else if (e.key === "Home") { e.preventDefault(); go(0); }
-      else if (e.key === "End") { e.preventDefault(); go(N); }
-    };
-    document.addEventListener("keydown", onKey);
-    const graded = (rec.grades || []).length;
-    const api = openModal({
-      title: `Hand #${rec.hand_no}${rec.table_name ? " · " + rec.table_name : ""}`,
-      sub: `${gameOf(rec.variant).label} · Pot ${d2(rec.pot_cents)} · ante ${d2(rec.ante_cents)} · ${rec.showdown ? "showdown" : "won without showdown"}` +
-        (!gameOf(rec.variant).graded ? ` · ${gameOf(rec.variant).label} isn't graded yet` : rec.grades == null ? " · accuracy is still being worked out" : graded ? "" : " · no graded decisions") + " · use ← → to step",
-      body, wide: true, autofocus: false, buttons: [{ label: "Close", cls: "primary" }],
-      onClose: () => document.removeEventListener("keydown", onKey),
-    });
-    api.modal.classList.add("xwide");
-    paint();
-  }
-
-  // The Study tab works on the signed-in user's own server-side session, so a
-  // spot is "copied" by driving Study's normal API: reset, stakes, seats + stacks
-  // (hero = seat 0, clockwise), cards dealt so far, then the actions up to here.
-  // (Study deals PLO5 — five hole cards; a hand of another game has no spot to copy there)
-  function studyable(rec) { return (rec.variant || "plo5") === "plo5"; }
-  async function openInStudy(rec, k) {
-    if (!studyable(rec)) return toast(`Study works with PLO5 hands — this was ${gameOf(rec.variant).label}`, "err");
-    const dealt = rec.seats.map((x) => x.seat);
-    if (dealt.length > 6) return toast(`Study handles up to 6 players — this hand had ${dealt.length}`, "err");
-    const N = rec.actions.length;
-    const known = (seat) => { const x = rec.seats.find((y) => y.seat === seat); return x && x.hole && x.hole[0] >= 0 ? x : null; };
-    const actor = (rec.actions[Math.min(k, N - 1)] || {}).seat;
-    const me = rec.seats.find((x) => x.is_me);
-    const heroSeat = actor != null && known(actor) ? actor : me && known(me.seat) ? me.seat : (rec.seats.find((x) => known(x.seat)) || { seat: actor != null ? actor : dealt[0] }).seat;
-    const n = rec.num_seats || 8;
-    const order = dealt.slice().sort((x, y) => ((x - heroSeat + n) % n) - ((y - heroSeat + n) % n));
-    const st = replayState(rec, k);
-    const heroRec = known(heroSeat);
-    const pad = (arr, len) => { const out = arr.slice(0, len); while (out.length < len) out.push(null); return out; };
-    const cards = {
-      hero_hole: heroRec ? heroRec.hole.slice(0, 5) : [null, null, null, null, null],
-      flop_a: pad(rec.board_a || [], 3), flop_b: pad(rec.board_b || [], 3),
-      turn: st.boardN >= 4 ? [(rec.board_a || [])[3] ?? null, (rec.board_b || [])[3] ?? null] : [null, null],
-      river: st.boardN >= 5 ? [(rec.board_a || [])[4] ?? null, (rec.board_b || [])[4] ?? null] : [null, null],
-    };
-    const post = (url, b) => C().j(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b || {}) });
-    const btn = document.getElementById("rp-study");
-    if (btn) btn.disabled = true;
-    // Study opens in a NEW TAB so the replayer keeps its place. The tab has to be
-    // opened right here, inside the click — after the awaits below a browser
-    // treats window.open as a pop-up and blocks it.
-    let tab = null;
-    try {
-      tab = globalThis.open("", "_blank");
-      if (tab) {
-        tab.document.title = "Opening in Study…";
-        tab.document.body.style.cssText = "margin:0;height:100vh;display:grid;place-items:center;background:#070b11;color:#8794a6;font:14px system-ui,sans-serif";
-        tab.document.body.textContent = "Copying the spot into Study…";
-      }
-    } catch (_) { /* a blocked or cross-origin handle: fall through to the link below */ }
-    try {
-      await post("/format", { format: "plo5_double_bomb" }).catch(() => null);
-      await post("/reset");
-      // (hands recorded before 2026-09-23 carry cents only)
-      const bbChips = rec.bb_chips || 10000;
-      const toChips = (cents) => Math.round((cents * bbChips) / (rec.bb_cents || 100));
-      await post("/config", { bb_chips: bbChips, ante_chips: rec.ante_chips != null ? rec.ante_chips : toChips(rec.ante_cents), dollars_per_bb: rec.bb_cents / 100 });
-      await post("/seats", {
-        num_seats: order.length, button_seat: Math.max(0, order.indexOf(rec.button)),
-        starting_stacks: order.map((seat) => { const x = rec.seats.find((y) => y.seat === seat); return x.start_chips != null ? x.start_chips : toChips(x.start_cents); }), stacks_are_starting: true,
-      });
-      await post("/cards", cards);
-      for (let i = 0; i < k; i++) {
-        const a2 = rec.actions[i];
-        const gate = a2.action === 0 ? "fold" : a2.action === 1 ? "check_call" : "raise";
-        await post("/action", gate === "raise" ? { gate, chips: a2.chips } : { gate });
-      }
-      if (btn) btn.disabled = false;
-      if (tab && !tab.closed) { try { tab.opener = null; } catch (_) { /* fine */ } tab.location.replace("/?mode=study"); toast("Opened in Study (new tab)", "ok"); }
-      else {
-        // pop-ups blocked: the spot IS loaded — a plain link click is always allowed
-        openModal({ title: "Spot copied to Study", sub: "Your browser blocked the new tab. The spot is loaded — open Study with this link.", body: `<a class="btn gold block" href="/?mode=study" target="_blank" rel="noopener">Open Study in a new tab</a>`, buttons: [{ label: "Done", cls: "primary" }] });
-      }
-    } catch (e) {
-      if (btn) btn.disabled = false;
-      if (tab && !tab.closed) tab.close();
-      toast(e.status === 402 ? "Study needs a subscription on this account" : "Couldn't copy the spot: " + e.message, "err");
-    }
-  }
-
-  // --------------------------------------------------- lifetime hand database
-  // `player` = {user_id, name} opens somebody else's database (the club is private:
-  // everyone may browse everyone — cards still follow the table's reveal rule).
-  // `variant` = one game's numbers (PLO5 / PLO6 are different games: the club section
-  // opens this on the game it shows); a switch changes it once more than one was played.
-  async function openMyHands(gameId, player, clubId, variant) {
-    const other = player && !player.is_me ? player : null;
-    const base = other ? `/games/api/players/${other.user_id}` : "/games/api/my";
-    // (one club's numbers — the club's lobby, or the club of the table it was opened from)
-    const club = clubId || C().G.clubId;
-    const clubName = (currentClub() && currentClub().id === club && currentClub().name) || "";
-    const F = { sort: "time", dir: "desc", game: gameId || "", variant: variant || "", offset: 0, rows: [], total: 0 };
-    const qs = () => [club ? `club=${encodeURIComponent(club)}` : "", F.variant ? `variant=${encodeURIComponent(F.variant)}` : ""].filter(Boolean).join("&");
-    let stats;
-    const loadStats = async () => { stats = await C().j(base + "/stats" + (qs() ? "?" + qs() : "")); };
-    try { await loadStats(); } catch (e) { return toast(e.message, "err"); }
-    const acc = (v) => (v == null ? "–" : Math.round(v) + "%");
-    const played = () => (stats.games || []).filter((g) => g.hands > 0);
-    const body = h("div", { class: "db" });
-    body.innerHTML =
-      `<div id="db-head"></div>` +
-      `<div class="db-bar"><select class="input" id="db-game"></select>` +
-      `<div class="seg" id="db-sort">${[["time", "Date"], ["pot", "Pot size"], ["net", "Profit / loss"], ["accuracy", "Accuracy"]].map(([v, l]) => `<button type="button" data-v="${v}" class="${v === "time" ? "on" : ""}">${l}</button>`).join("")}</div>` +
-      `<button class="btn sm" id="db-dir" title="Reverse the order">↓ High to low</button></div>` +
-      `<div id="db-list"></div><button class="btn block" id="db-more" hidden>Load more</button>`;
-    const q = (id) => body.querySelector("#" + id);
-    segWire(body);  // (the sort: wired once — the game switch is wired with each paint of the head)
-    const paintHead = () => {
-      const games = played().map((g) => g.code);
-      if (F.variant && !games.includes(F.variant)) games.push(F.variant);
-      const ungraded = !!F.variant && !gameOf(F.variant).graded;
-      const sw = games.length > 1
-        ? `<div class="seg db-games" id="db-v">${[["", "All games"]].concat(games.map((c) => [c, gameOf(c).label])).map(([v, l]) => `<button type="button" data-v="${v}" class="${v === F.variant ? "on" : ""}">${l}</button>`).join("")}</div>` : "";
-      q("db-head").innerHTML = sw +
-        `<div class="pcard-stats"><div><b>${stats.hands}</b><small>${F.variant ? gameOf(F.variant).label + " hands" : "Hands"}</small></div><div><b class="${stats.net_cents > 0 ? "pos" : stats.net_cents < 0 ? "neg" : ""}">${stats.net_cents > 0 ? "+" : ""}${d2(stats.net_cents)}</b><small>${F.variant ? "Net" : "Lifetime net"}</small></div>` +
-        (ungraded ? `<div><b>–</b><small>Not graded (no ${gameOf(F.variant).label} network)</small></div>` : `<div><b>${acc(stats.accuracy)}</b><small>Accuracy (${stats.graded} decisions)</small></div>`) +
-        `<div><b>${stats.hands ? Math.round((100 * stats.wins) / stats.hands) + "%" : "–"}</b><small>Hands won</small></div></div>` +
-        ((stats.versus || []).length ? `<div class="rsec"><h4>Head to head${F.variant ? " · " + gameOf(F.variant).label : ""}${clubName ? " — " + esc(clubName) : ""}</h4><div class="vs">${stats.versus.map((v) => `<span class="vs-chip"><span>${esc(v.name)}</span><b class="num ${v.net_cents > 0 ? "pos" : v.net_cents < 0 ? "neg" : ""}">${v.net_cents > 0 ? "+" : ""}${d2(v.net_cents)}</b></span>`).join("")}</div></div>` : "");
-      const sess = stats.sessions || [], tag = !F.variant && played().length > 1;
-      q("db-game").innerHTML = `<option value="">All sessions (${sess.length})</option>` + sess.map((x) => `<option value="${esc(x.id)}" ${x.id === F.game ? "selected" : ""}>${esc(x.name)}${tag ? " · " + gameOf(x.variant).label : ""} · ${x.hands} hands · ${x.net_cents >= 0 ? "+" : ""}${d2(x.net_cents)}${x.accuracy == null ? "" : " · " + acc(x.accuracy)}</option>`).join("");
-      if (!sw) return;
-      segWire(q("db-head"));
-      q("db-v").addEventListener("pick", async (e) => {
-        F.variant = e.detail; F.game = "";
-        try { await loadStats(); } catch (err) { toast(err.message, "err"); return; }
-        paintHead();
-        load(true);
-      });
-    };
-    const draw = () => {
-      const host = q("db-list");
-      host.innerHTML = F.rows.length ? "" : `<div class="muted" style="text-align:center;padding:26px">${other ? "No hands here yet." : "No hands yet. Every hand you play at this club's tables lands here."}</div>`;
-      const tag = !F.variant && played().length > 1;  // (every game in one list: say which each hand was)
-      F.rows.forEach((x) => {
-        const net = x.net_cents;
-        const row = h("button", { class: "hand-row db-row", type: "button" },
-          `<span class="no">#${x.hand_no}</span><span style="display:flex;align-items:center;min-width:0">${x.my_hole ? miniCards(x.my_hole) : ""}${miniCards(x.board_a, "gap")}${miniCards(x.board_b, "gap")}</span>` +
-          `<span class="net ${net > 0 ? "pos" : net < 0 ? "neg" : "muted"}">${net > 0 ? "+" : ""}${d2(net)}</span>` +
-          `<span></span><span class="who">${esc(x.table_name)}${tag ? " · " + gameOf(x.variant).label : ""} · ${esc(String(x.ended_at || "").slice(0, 10))} · pot ${d2(x.pot_cents)}${x.showdown ? " · showdown" : ""}</span><span class="muted num" style="font-size:11.5px">${x.accuracy == null ? "" : acc(x.accuracy)}</span>`);
-        row.addEventListener("click", () => openHand(x.game_id, x.hand_no));
-        host.appendChild(row);
-      });
-      fillMiniCards(host);
-      q("db-more").hidden = F.rows.length >= F.total;
-      q("db-dir").textContent = F.dir === "desc" ? "↓ High to low" : "↑ Low to high";
-    };
-    const load = async (reset) => {
-      if (reset) { F.offset = 0; F.rows = []; }
-      try {
-        const d = await C().j(`${base}/hands?sort=${F.sort}&dir=${F.dir}&limit=40&offset=${F.offset}` + (F.game ? `&game=${encodeURIComponent(F.game)}` : "") + (qs() ? "&" + qs() : ""));
-        F.rows = F.rows.concat(d.hands); F.total = d.total; F.offset += d.limit;
-      } catch (e) { toast(e.message, "err"); }
-      draw();
-    };
-    paintHead();
-    q("db-sort").addEventListener("pick", (e) => { F.sort = e.detail; load(true); });
-    q("db-dir").addEventListener("click", () => { F.dir = F.dir === "desc" ? "asc" : "desc"; load(true); });
-    q("db-game").addEventListener("change", (e) => { F.game = e.target.value; load(true); });
-    q("db-more").addEventListener("click", () => load(false));
-    const api = openModal({
-      title: (other ? `${other.name} — hands & stats` : "My hands & stats") + (clubName ? ` · ${clubName}` : ""),
-      sub: other ? `Every hand they played${clubName ? " in " + clubName : ""}. You see the cards you saw at the table: your own, and hands that were shown.` : `Every hand you played${clubName ? " in " + clubName : ""}, with the network's accuracy rating (PLO5).`,
-      body, wide: true, autofocus: false, buttons: [{ label: "Close", cls: "primary" }],
-    });
-    api.modal.classList.add("xwide");
-    load(true);
-  }
-
-  // ------------------------------------------------------------ the club: everyone
-  const MIN_RANKED = 20; // graded decisions before an accuracy counts for the podium
-  const accTxt = (v) => (v == null ? "–" : Math.round(v) + "%");
-  const signed = (c) => (c > 0 ? "+" : c < 0 ? "−" : "") + d2(Math.abs(c));
-  const tone = (c) => (c > 0 ? "pos" : c < 0 ? "neg" : "");
-
-  // PLO5 and PLO6 are different games: the club's numbers are shown one game at a time
-  // (2026-09-26). The server picks the club's most-played game; a switch picks another,
-  // remembered per club in this browser.
-  const CLUB_GAME_KEY = "hg.clubgame.v1";
-  function clubGames() { try { return JSON.parse(localStorage.getItem(CLUB_GAME_KEY) || "{}") || {}; } catch (_) { return {}; } }
-  function clubGameFor(cid) { const v = clubGames()[cid]; return GAMES[v] ? v : ""; }
-  function setClubGame(cid, v) {
-    const all = clubGames();
-    all[cid] = v;
-    try { localStorage.setItem(CLUB_GAME_KEY, JSON.stringify(all)); } catch (_) { /* private mode: this visit only */ }
-  }
-  async function loadClub(force) {
-    const cid = C().G.clubId;
-    if (!cid) { renderClub({ players: [] }); return; }  // (no club (yet): no numbers to show)
-    // (the 30 s throttle is per club: a switch, or the first load after the club is known, always fetches)
-    if (!force && U.clubAt && U.clubFor === cid && Date.now() - U.clubAt < 30000) return;
-    U.clubAt = Date.now(); U.clubFor = cid;
-    const v = clubGameFor(cid);
-    try {
-      const data = await C().j(`/games/api/community?club=${encodeURIComponent(cid)}` + (v ? `&variant=${encodeURIComponent(v)}` : ""));
-      if (C().G.clubId === cid) renderClub(data);  // (a switch in the meantime: the newer answer wins)
-    } catch (_) { /* the lobby works without it */ }
-  }
-  function renderClub(data) {
-    U.club = data;
-    const players = data.players || [];
-    const G = gameOf(data.variant), played = (data.games || []).filter((g) => g.hands > 0);
-    $("lb-club-sec").hidden = !players.length && !played.length;
-    if ($("lb-club-sec").hidden) return;
-    // the game switch: once the club has played more than one game
-    const codes = played.map((g) => g.code);
-    if (data.variant && !codes.includes(data.variant)) codes.push(data.variant);
-    const sw = $("lb-game");
-    sw.hidden = codes.length < 2;
-    sw.innerHTML = codes.map((c) => {
-      const n = ((data.games || []).find((g) => g.code === c) || { hands: 0 }).hands;
-      return `<button type="button" data-v="${c}" class="${c === data.variant ? "on" : ""}" title="${n} hand${n === 1 ? "" : "s"} played">${gameOf(c).label}</button>`;
-    }).join("");
-    $("lb-club-sub").textContent = `${G.label} · ${players.length} player${players.length === 1 ? "" : "s"} · ${G.graded ? "accuracy is the network's rating of every decision" : `${G.label} isn't graded yet (there is no ${G.label} network)`}`;
-    if (!players.length) {
-      $("lb-podium").hidden = true;
-      $("lb-players").innerHTML = `<div class="lb-empty" style="grid-column:1/-1"><b>No ${G.label} hands yet</b>The club's ${G.label} numbers show up here after its first ${G.label} hand.</div>`;
-      return;
-    }
-    // podium: accuracy, among players with enough graded decisions to mean something
-    // (a game the network doesn't grade has no podium)
-    const rated = G.graded ? players.filter((p) => p.accuracy != null) : [];
-    const ranked = rated.filter((p) => p.graded >= MIN_RANKED).sort((a, b) => b.accuracy - a.accuracy || b.graded - a.graded);
-    const early = rated.filter((p) => p.graded < MIN_RANKED).sort((a, b) => b.accuracy - a.accuracy || b.graded - a.graded);
-    const top = ranked.concat(early).slice(0, 3);
-    const pod = $("lb-podium");
-    pod.hidden = !top.length;
-    const step = (p, place) => !p ? `<div class="pod-col p${place} empty"><div class="pod-step"><b>${place}</b></div></div>` :
-      `<button type="button" class="pod-col p${place}" data-uid="${p.user_id}" title="Open ${esc(p.name)}'s hands">` +
-      `${place === 1 ? `<span class="pod-crown">${icon("i-crown")}</span>` : ""}${avatar(p.name, p.name, "lg", p.avatar)}` +
-      `<span class="pod-name">${esc(p.name)}${p.is_me ? " <i>you</i>" : ""}</span>` +
-      `<span class="pod-acc num">${accTxt(p.accuracy)}</span>` +
-      `<span class="pod-sub">${p.graded} decision${p.graded === 1 ? "" : "s"}${p.graded < MIN_RANKED ? " · provisional" : ""}</span>` +
-      `<span class="pod-step"><b>${place}</b></span></button>`;
-    pod.innerHTML = step(top[1], 2) + step(top[0], 1) + step(top[2], 3);
-    // one card per player, biggest winner first (an ungraded game's meter: hands won)
-    $("lb-players").innerHTML = players.map((p) => {
-      const won = p.hands ? Math.round((100 * p.wins) / p.hands) : 0;
-      const pct = !G.graded ? won : p.accuracy == null ? 0 : Math.max(0, Math.min(100, p.accuracy));
-      return `<button type="button" class="plcard ${p.is_me ? "me" : ""}" data-uid="${p.user_id}">` +
-        `<span class="plcard-top">${avatar(p.name, p.name, "", p.avatar)}<span class="plcard-name"><b>${esc(p.name)}</b><small>${p.hands} hand${p.hands === 1 ? "" : "s"} · ${p.sessions} session${p.sessions === 1 ? "" : "s"}</small></span>` +
-        `<b class="num plcard-net ${tone(p.net_cents)}">${signed(p.net_cents)}</b></span>` +
-        `<span class="plcard-acc"><span class="plcard-meter"><i style="width:${pct}%"></i></span><b class="num">${G.graded ? accTxt(p.accuracy) : won + "%"}</b></span>` +
-        (G.graded
-          ? `<span class="plcard-foot"><span>Accuracy${p.graded ? ` · ${p.graded} decisions` : " · not rated yet"}</span><span>Won ${won}% · best ${d2(p.best_cents)}</span></span></button>`
-          : `<span class="plcard-foot"><span>Hands won · not graded</span><span>best ${d2(p.best_cents)}</span></span></button>`);
-    }).join("");
-    document.querySelectorAll("#lb-podium [data-uid], #lb-players [data-uid]").forEach((b) => b.addEventListener("click", () => {
-      const p = players.find((x) => String(x.user_id) === b.dataset.uid);
-      if (p) openMyHands("", { user_id: p.user_id, name: p.name, is_me: p.is_me }, null, data.variant);
-    }));
-  }
-
-  // who is up on whom: row = the player, column = the opponent, cell = what the
-  // row player has won from (+) or lost to (−) that opponent, all sessions
-  function openMatrix() {
-    const data = U.club;
-    if (!data || !(data.players || []).length) return toast("No hands played yet", "");
-    const ps = data.players.filter((p) => (data.pairs || []).some((x) => x.from === p.user_id || x.to === p.user_id));
-    if (ps.length < 2) return toast(`No money has changed hands at ${gameOf(data.variant).label} yet`, "");
-    const net = {};
-    (data.pairs || []).forEach((x) => { net[x.to + ":" + x.from] = x.cents; net[x.from + ":" + x.to] = -x.cents; });
-    const peak = Math.max(1, ...Object.values(net).map(Math.abs));
-    const cell = (v) => {
-      if (!v) return `<td class="mx-zero">·</td>`;
-      const a = 0.1 + 0.34 * Math.min(1, Math.abs(v) / peak);
-      return `<td class="num ${tone(v)}" style="background:rgba(${v > 0 ? "53,200,120" : "242,86,106"},${a.toFixed(2)})">${signed(v)}</td>`;
-    };
-    const body = h("div", { class: "mx-wrap" });
-    body.innerHTML = `<table class="mx"><thead><tr><th class="mx-corner">won from →</th>${ps.map((p) => `<th title="${esc(p.name)}">${avatar(p.name, p.name, "sm", p.avatar)}<span>${esc(p.name)}</span></th>`).join("")}<th class="mx-total">Total</th></tr></thead><tbody>` +
-      ps.map((r) => {
-        const total = ps.reduce((acc, c) => acc + (net[r.user_id + ":" + c.user_id] || 0), 0);
-        return `<tr><th data-uid="${r.user_id}" title="Open ${esc(r.name)}'s hands">${avatar(r.name, r.name, "sm", r.avatar)}<span>${esc(r.name)}${r.is_me ? " (you)" : ""}</span></th>` +
-          ps.map((c) => (c.user_id === r.user_id ? `<td class="mx-self"></td>` : cell(net[r.user_id + ":" + c.user_id] || 0))).join("") +
-          `<td class="num mx-total ${tone(total)}">${signed(total)}</td></tr>`;
-      }).join("") + `</tbody></table>` +
-      `<p class="muted" style="font-size:12px;margin:12px 0 0">Read across: a green cell is what that player has won from the player in the column. Every pot is traced layer by layer — side pots, split boards and quartered pots each go to who really paid for them.</p>`;
-    body.querySelectorAll("th[data-uid]").forEach((th) => th.addEventListener("click", () => {
-      const p = ps.find((x) => String(x.user_id) === th.dataset.uid);
-      if (p) openMyHands("", { user_id: p.user_id, name: p.name, is_me: p.is_me }, null, data.variant);
-    }));
-    const G = gameOf(data.variant);
-    const api = openModal({ title: `Head to head · ${G.label}`, sub: `Who has won what from whom at ${G.label}, across every recorded session.`, body, wide: true, autofocus: false, buttons: [{ label: "Close", cls: "primary" }] });
-    api.modal.classList.add("xwide");
-  }
-
-  // every session on record; the site admin can take test tables out of the stats
-  function openSessions() {
-    const body = h("div", { class: "db" });
-    const paint = () => {
-      const data = U.club || {}, rows = data.sessions || [];
-      body.innerHTML = (data.is_admin ? `<p class="muted" style="font-size:12.5px;margin:0 0 12px">Excluding a session takes it out of everyone's stats, hand lists and head-to-head. Nothing is deleted — you can restore it here any time. An open table is closed first.</p>` : "") +
-        (rows.length ? rows.map((x) =>
-          `<div class="sess ${x.excluded ? "excluded" : ""}" data-id="${esc(x.id)}"><div><b>${esc(x.name)}</b>${x.open ? ` <span class="pill live">Open</span>` : ""}${x.excluded ? ` <span class="pill">Excluded</span>` : ""}<br>` +
-          `<small>${esc(String(x.created_at || "").slice(0, 10))} · ${gameOf(x.variant).label} · ${d2(x.bb_cents)} bb · ante ${d2(x.ante_cents)}</small></div>` +
-          `<small class="opt">${x.hands} hand${x.hands === 1 ? "" : "s"}</small><small class="opt">${x.players} player${x.players === 1 ? "" : "s"}</small>` +
-          `<span class="sess-act"><button class="btn sm" data-open="${esc(x.id)}" type="button">Open</button>` +
-          (data.is_admin ? `<button class="btn sm ${x.excluded ? "" : "danger"}" data-ex="${esc(x.id)}" data-on="${x.excluded ? "0" : "1"}" type="button">${x.excluded ? "Restore" : "Exclude"}</button>` : "") + `</span></div>`).join("")
-          : `<div class="muted" style="text-align:center;padding:26px">No sessions yet.</div>`);
-      body.querySelectorAll("[data-open]").forEach((b) => b.addEventListener("click", () => { api.close(null); C().openTable(b.dataset.open, true).catch((e) => toast(e.message, "err")); }));
-      body.querySelectorAll("[data-ex]").forEach((b) => b.addEventListener("click", async () => {
-        const on = b.dataset.on === "1", row = rows.find((x) => x.id === b.dataset.ex);
-        if (on) {
-          const ok = await confirmDialog({ title: `Exclude “${row.name}”?`, text: `Its ${row.hands} hand${row.hands === 1 ? "" : "s"} stop counting toward anyone's profit, accuracy and head-to-head${row.open ? ", and the table is closed (everyone is cashed out)" : ""}. You can restore it later.`, okLabel: "Exclude from stats", danger: true });
-          if (!ok) return;
-        }
-        b.disabled = true;
-        try {
-          await C().j(`/games/api/tables/${encodeURIComponent(b.dataset.ex)}/exclude`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ on }) });
-          toast(on ? "Session excluded from the stats" : "Session restored", "ok");
-          await loadClub(true); U.lobbySig = ""; C().loadLobby().catch(() => {});
-          paint();
-        } catch (e) { b.disabled = false; toast(e.message, "err"); }
-      }));
-    };
-    const api = openModal({ title: "All sessions", sub: "Every table on record, newest first.", body, wide: true, autofocus: false, buttons: [{ label: "Close", cls: "primary" }] });
-    paint();
-  }
-
-  // --------------------------------------------------------- manage drawer
-  function openDrawer(tab) {
-    const s = C().G.state;
-    if (!s) return;
-    if (tab) U.drawerTab = tab;
-    if (U.drawer) { paintDrawer(s, true); return; }
-    const root = $("drawer-root");
-    const layer = h("div", { style: "position:absolute;inset:0" });
-    const scrim = h("div", { class: "scrim" });
-    const dr = h("aside", { class: "drawer", role: "dialog", "aria-label": "Manage table" });
-    layer.appendChild(scrim); layer.appendChild(dr);
-    root.appendChild(layer);
-    scrim.addEventListener("click", closeDrawer);
-    U.drawer = { layer, dr, sig: "" };
-    paintDrawer(s, true);
-    requestAnimationFrame(() => layer.classList.add("open"));
-  }
-  function closeDrawer() {
-    const d = U.drawer;
-    if (!d) return;
-    U.drawer = null;
-    d.layer.classList.remove("open");
-    setTimeout(() => d.layer.remove(), 300);
-  }
-  const segHtml = (id, opts, cur) => `<div class="seg" id="${id}">${opts.map(([v, l]) => `<button type="button" data-v="${v}" class="${Number(v) === Number(cur) ? "on" : ""}">${l}</button>`).join("")}</div>`;
-
-  function paintDrawer(s, force) {
-    const d = U.drawer;
-    if (!d) return;
-    if (!s.is_host) { closeDrawer(); return; }
-    // Forms are only rebuilt when the drawer opens / the tab changes / a save
-    // lands — never under the host's cursor. The Players tab follows the table.
-    const sig = U.drawerTab === "players"
-      ? JSON.stringify(s.seats.map((x) => [x.user_id, x.name, x.stack_cents, x.sitting_out, x.pending_remove, x.auto_stack_cents, x.trusted, x.present])) + s.phase + s.auto_stack.mode
-      : U.drawerTab === "chips" ? JSON.stringify([s.requests, s.settings.approve_buyins, s.auto_stack, s.auto_topup])
-      : U.drawerTab === "table" ? `${s.running}:${s.phase}:${s.actor}:${s.can_deal}:${s.runout.blocking}` : "form";
-    if (!force && sig === d.sig) return;
-    d.sig = sig;
-    const set = s.settings, st = s.stakes;
-    const nReq = (s.requests || []).length;
-    const tabs = [["game", "Game"], ["chips", "Chips" + (nReq ? ` (${nReq})` : "")], ["pace", "Pace"], ["players", "Players"], ["table", "Table"]];
-    let html = `<div class="dr-head"><h3>${icon("i-crown")}Manage table</h3><button class="icon-btn" id="dr-x" aria-label="Close">${icon("i-x")}</button></div>` +
-      `<div class="dr-tabs">${tabs.map(([k, l]) => `<button data-t="${k}" class="${k === U.drawerTab ? "on" : ""}">${l}</button>`).join("")}</div><div class="dr-body">`;
-    if (U.drawerTab === "game") {
-      const maxSeats = (s.game && s.game.max_seats) || gameOf(s.variant).maxSeats;
-      html += `<div class="grp"><h4>Table</h4><label class="field"><span>Name</span><input type="text" id="m-name" maxlength="60" value="${esc(s.name)}"/></label>` +
-        `<div class="field"><span>Game</span><input type="text" class="input" disabled value="${esc(gameOf(s.variant).name)}"/><small>Fixed once a table is created — host another table for the other game</small></div>` +
-        `<div class="row2"><label class="field"><span>Ante</span>${moneyInput("m-ante", st.ante_cents)}<small>Applies from the next hand</small></label>` +
-        `<div class="field"><span>Big blind (chip unit)</span><input type="text" class="input num" disabled value="${d2(st.bb_cents)}"/><small>Fixed once a table is created</small></div></div>` +
-        `<div class="field"><span>Seats</span>${segHtml("m-seats", Array.from({ length: maxSeats - 1 }, (_, i) => [i + 2, String(i + 2)]), s.num_seats)}<small>Between hands only — the higher seats must be empty to shrink${maxSeats < 8 ? ` · ${gameOf(s.variant).label} seats up to ${maxSeats} (one deck)` : ""}</small></div></div>` +
-        `<div class="grp"><h4>Buy-ins</h4><div class="row3"><label class="field"><span>Minimum</span>${moneyInput("m-min", set.min_buyin_cents)}</label><label class="field"><span>Default</span>${moneyInput("m-dflt", st.default_buyin_cents)}</label><label class="field"><span>Maximum</span>${moneyInput("m-max", set.max_buyin_cents)}</label></div><p>0 = no limit. The maximum also caps top-ups.</p></div>` +
-        `<div class="grp"><h4>Privacy &amp; extras</h4><div class="setrow"><div><b>List in the lobby</b><small>Off = link only</small></div><label class="switch"><input type="checkbox" id="m-listed" ${set.listed ? "checked" : ""}/><i></i></label></div>` +
-        `<div class="setrow"><div><b>Accuracy marks on shown hands</b><small>Everyone sees the network's marks on their own decisions, and on hands tabled at showdown — never on a mucked hand. Off = only their own</small></div><label class="switch"><input type="checkbox" id="m-grades" ${set.show_grades ? "checked" : ""}/><i></i></label></div>` +
-        `<div class="setrow"><div><b>Rabbit hunting</b><small>Let players peek at the undealt streets after a fold-out</small></div><label class="switch"><input type="checkbox" id="m-rabbit" ${set.allow_rabbit ? "checked" : ""}/><i></i></label></div>` +
-        `<div class="setrow"><div><b>Players may take chips off the table</b><small>Ratholing allowed: anyone can pocket part of their stack between hands (a player always keeps an ante + 1 bb)</small></div><label class="switch"><input type="checkbox" id="m-rathole" ${set.allow_rathole ? "checked" : ""}/><i></i></label></div></div>`;
-    } else if (U.drawerTab === "chips") {
-      const modeSeg = (id, cur) => `<div class="seg as-modes" id="${id}">${[["off", "Off"], ["host", "Host sets"], ["player", "Players choose"]].map(([v, l]) => `<button type="button" data-v="${v}" class="${cur === v ? "on" : ""}">${l}</button>`).join("")}</div>`;
-      html += `<div class="grp"><h4>Buy-in approval</h4><div class="setrow"><div><b>I approve every buy-in</b><small>Sit-downs and top-ups wait for your OK. Players you trust never wait.</small></div><label class="switch"><input type="checkbox" id="m-approve" ${set.approve_buyins ? "checked" : ""}/><i></i></label></div>` +
-        (nReq ? (s.requests || []).map((r) =>
-          `<div class="prow req" data-req="${r.id}">${avatar(r.name, r.name, "", r.avatar)}<div class="who"><b>${esc(r.name)}</b><small>${r.kind === "sit" ? `wants seat ${r.seat + 1} with ${d2(r.amount_cents)}` : `wants to add ${d2(r.amount_cents)}`}</small></div>` +
-          `<div class="acts"><button class="btn sm primary" data-ok="${r.id}">Approve</button><button class="btn sm gold" data-okt="${r.id}" title="Approve, and never ask again for this player">+ Trust</button><button class="btn sm" data-edit="${r.id}" title="Change the amount, then approve">Edit</button><button class="icon-btn" data-no="${r.id}" title="Decline" style="color:#ff9aa6">${icon("i-x")}</button></div></div>`).join("")
-          : (set.approve_buyins ? `<p>No one is waiting. Trust regulars from the Players tab so the game never stops for them.</p>` : "")) + `</div>` +
-        `<div class="grp"><h4>Auto top-up</h4><p>When a stack drops below a threshold it is topped back up before the next hand. Winnings stay on the table — no ratholing.</p>${modeSeg("m-top", s.auto_topup.mode)}` +
-        (s.auto_topup.mode === "player" ? `<small class="muted">Each player picks their own: they tap their seat (or Add chips) › Automatic chips.</small>` : "") +
-        (s.auto_topup.mode === "host" ? `<div class="row2"><label class="field"><span>Top up to</span>${moneyInput("m-top-target", s.auto_topup.all_target_cents || st.default_buyin_cents)}</label><label class="field"><span>When below</span>${moneyInput("m-top-below", s.auto_topup.all_below_cents || s.auto_topup.all_target_cents || st.default_buyin_cents)}</label></div><button class="btn sm" id="m-top-apply">Apply to everyone</button><small class="muted">Per-player amounts: tap a player's seat.</small>` : "") + `</div>` +
-        `<div class="grp"><h4>Set stack every hand</h4><p>Every stack is reset to one amount before EVERY deal — short stacks top up, big stacks bank the difference. For high-action games where ratholing is fine.</p>${modeSeg("m-auto", s.auto_stack.mode)}` +
-        (s.auto_stack.mode === "player" ? `<small class="muted">Each player picks their own: they tap their seat (or Add chips) › Automatic chips.</small>` : "") +
-        (s.auto_stack.mode === "host" ? `<div class="sz-row"><label class="field" style="flex:1"><span>Stack for everyone</span>${moneyInput("m-auto-all", s.auto_stack.all_cents || st.default_buyin_cents)}</label><button class="btn sm" id="m-auto-apply" style="align-self:flex-end;height:40px">Apply</button></div><small class="muted">Per-player amounts: tap a player's seat. Set-stack wins when a player has both.</small>` : "") + `</div>` +
-        (set.approve_buyins ? `<small class="muted">While you approve buy-ins, automatic chips only run for you and the players you trust.</small>` : "");
-    } else if (U.drawerTab === "pace") {
-      html += `<div class="grp"><h4>Shot clock</h4><div class="field"><span>Decision time</span>${segHtml("m-clock", [[0, "Off"], [10, "10s"], [15, "15s"], [20, "20s"], [30, "30s"], [45, "45s"], [60, "60s"]], s.decision_secs)}<small>When it runs out the player checks if that is free, otherwise folds.</small></div>` +
-        `<div class="field"><span>Time bank per player</span>${segHtml("m-bank", [[0, "Off"], [15, "15s"], [30, "30s"], [60, "60s"], [120, "2 min"]], set.time_bank_secs)}<small>Burned automatically after the base clock; a couple of seconds come back every hand.</small></div></div>` +
-        `<div class="grp"><h4>Dealing</h4><div class="field"><span>Next hand after</span>${segHtml("m-deal", [[0, "Manual"], [2, "2s"], [3, "3s"], [5, "5s"], [8, "8s"], [12, "12s"]], set.deal_delay_secs)}<small>The server deals — the game keeps running even if you switch tabs.</small></div>` +
-        `<div class="field"><span>All-in runout, per street</span>${segHtml("m-pause", [[0.5, "0.5s"], [1, "1s"], [1.5, "1.5s"], [2.5, "2.5s"], [4, "4s"]], s.street_pause_secs)}</div></div>` +
-        ``;
-    } else if (U.drawerTab === "players") {
-      const seated = s.seats.filter((x) => !x.empty);
-      html += `<div class="grp"><h4>${seated.length} seated</h4>` + seated.map((x) =>
-        `<div class="prow" data-uid="${x.user_id}">${avatar(x.name, x.name, "", x.avatar)}<div class="who"><b>${esc(x.name)}${x.is_host ? ' <span class="pill host" style="height:18px;font-size:10px">Host</span>' : ""}</b><small>${d2(x.stack_cents)}${x.sitting_out ? " · sitting out" : ""}${x.pending_remove ? " · leaving" : ""}</small></div>` +
-        `<div class="acts">` +
-        (x.user_id !== s.my_user_id ? `<button class="btn sm ${x.trusted ? "gold" : ""}" data-trust="${x.user_id}" data-on="${x.trusted ? 0 : 1}" title="${x.trusted ? "Trusted: buys in without asking. Click to stop trusting." : "Trust: let them buy in and top up without your approval"}">${icon("i-check", "sm")}${x.trusted ? "Trusted" : "Trust"}</button>` : "") +
-        (x.pending_remove ? "" : `<button class="btn sm" data-away="${x.user_id}" data-on="${x.sitting_out ? 0 : 1}">${x.sitting_out ? (x.user_id === s.my_user_id ? "I'm back" : "Sit in") : "Sit out"}</button>`) +
-        (x.user_id !== s.my_user_id && !x.pending_remove ? `<button class="icon-btn" data-host="${x.user_id}" title="Make host">${icon("i-swap")}</button><button class="icon-btn" data-kick="${x.user_id}" title="Remove from table" style="color:#ff9aa6">${icon("i-x")}</button>` : "") +
-        `</div></div>`).join("") + `</div>` +
-        ((s.spectators || []).length ? `<div class="grp"><h4>${s.spectators.length} watching</h4><p style="margin:0">${s.spectators.map(esc).join(", ")}</p></div>` : "") +
-        `<small class="muted">Tap a player's seat for their card: trust, per-player automatic chips, notes.</small>`;
-    } else {
-      const busy = s.phase === "in_hand" || s.runout.blocking;
-      const actor = s.actor != null ? s.seats[s.actor] : null;
-      html += `<div class="grp"><h4>Game</h4><div class="setrow"><div><b>${s.running ? (busy ? "Game is running" : "Game is running") : "Game is paused"}</b><small>${s.running ? "Pausing lets the current hand finish first." : s.eligible_count < 2 ? "Needs two players with more than the ante." : "Everyone is waiting on you."}</small></div>` +
-        `<button class="btn ${s.running ? "" : "primary"}" id="m-run" ${!s.running && s.eligible_count < 2 ? "disabled" : ""}>${icon(s.running ? "i-pause" : "i-play", "sm")}${s.running ? (busy ? "Pause after hand" : "Pause") : "Start game"}</button></div>` +
-        `<div class="setrow"><div><b>Deal now</b><small>Skip the wait between hands</small></div><button class="btn" id="m-deal" ${s.can_deal ? "" : "disabled"}>${icon("i-bolt", "sm")}Deal</button></div></div>` +
-        `<div class="grp danger"><h4>Careful</h4><div class="setrow"><div><b>Fold the player on the clock</b><small>${actor && s.phase === "in_hand" ? esc(actor.name) + " is up. Checks instead when checking is free." : "Nobody is on the clock."}</small></div><button class="btn danger" id="m-hostfold" ${actor && s.phase === "in_hand" ? "" : "disabled"}>Fold</button></div>` +
-        `<div class="setrow"><div><b>Close the table</b><small>Cashes everyone out and ends the session${busy ? " — after this hand" : ""}.</small></div><button class="btn danger" id="m-close" ${busy ? "disabled" : ""}>Close table</button></div></div>`;
-    }
-    html += `</div>`;
-    if (U.drawerTab === "game") html += `<div class="dr-foot"><button class="btn ghost" id="m-cancel">Cancel</button><button class="btn primary" id="m-save">Save changes</button></div>`;
-    d.dr.innerHTML = html;
-    wireDrawer(s, d.dr);
-  }
-
-  function wireDrawer(s, root) {
-    const q = (id) => root.querySelector("#" + id);
-    const gid = s.id;
-    const saveSet = async (patch, okMsg) => { try { await C().tablePost("settings", patch); if (okMsg) toast(okMsg, "ok"); } catch (_) { const cur = C().G.state; if (cur) paintDrawer(cur, true); } };
-    q("dr-x").addEventListener("click", closeDrawer);
-    root.querySelectorAll(".dr-tabs button").forEach((b) => b.addEventListener("click", () => { U.drawerTab = b.dataset.t; paintDrawer(C().G.state, true); }));
-    segWire(root);
-    if (U.drawerTab === "game") {
-      q("m-cancel").addEventListener("click", closeDrawer);
-      q("m-save").addEventListener("click", async () => {
-        const patch = {
-          name: q("m-name").value, ante_cents: C().toCents(q("m-ante").value),
-          min_buyin_cents: C().toCents(q("m-min").value) || 0, default_buyin_cents: C().toCents(q("m-dflt").value),
-          max_buyin_cents: C().toCents(q("m-max").value) || 0, listed: q("m-listed").checked, allow_rabbit: q("m-rabbit").checked,
-          show_grades: q("m-grades").checked, allow_rathole: q("m-rathole").checked,
-        };
-        const seats = segVal(root, "m-seats");
-        if (seats !== s.num_seats) patch.num_seats = seats;
-        try { await C().tablePost("settings", patch); toast("Table updated", "ok"); closeDrawer(); } catch (_) { /* toasted */ }
-      });
-    } else if (U.drawerTab === "chips") {
-      q("m-approve").addEventListener("change", (e) => saveSet({ approve_buyins: e.target.checked }));
-      const resolve = (id, action, trust) => C().tablePost("request", { id: Number(id), action, trust: !!trust }).catch(() => {});
-      root.querySelectorAll("[data-ok]").forEach((b) => b.addEventListener("click", () => resolve(b.dataset.ok, "approve", false)));
-      root.querySelectorAll("[data-okt]").forEach((b) => b.addEventListener("click", () => resolve(b.dataset.okt, "approve", true)));
-      root.querySelectorAll("[data-no]").forEach((b) => b.addEventListener("click", () => resolve(b.dataset.no, "deny", false)));
-      root.querySelectorAll("[data-edit]").forEach((b) => b.addEventListener("click", () => { const r = (s.requests || []).find((x) => String(x.id) === b.dataset.edit); if (r) openRequestDialog(r); }));
-      q("m-top").addEventListener("pick", async (e) => { try { await C().tablePost("auto_topup", { mode: e.detail }); } catch (_) { /* toasted */ } paintDrawer(C().G.state, true); });
-      q("m-auto").addEventListener("pick", async (e) => { try { await C().tablePost("auto_stack", { mode: e.detail }); } catch (_) { /* toasted */ } paintDrawer(C().G.state, true); });
-      const ta = q("m-top-apply");
-      if (ta) ta.addEventListener("click", async () => { try { await C().tablePost("auto_topup", { all_target_cents: C().toCents(q("m-top-target").value) || 0, all_below_cents: C().toCents(q("m-top-below").value) || 0 }); toast("Auto top-up set for everyone", "ok"); } catch (_) { /* toasted */ } });
-      const ap = q("m-auto-apply");
-      if (ap) ap.addEventListener("click", async () => { try { await C().tablePost("auto_stack", { all_cents: C().toCents(q("m-auto-all").value) || 0 }); toast("Everyone resets to that stack each hand", "ok"); } catch (_) { /* toasted */ } });
-    } else if (U.drawerTab === "pace") {
-      q("m-clock").addEventListener("pick", (e) => saveSet({ decision_secs: Number(e.detail) }));
-      q("m-bank").addEventListener("pick", (e) => saveSet({ time_bank_secs: Number(e.detail) }));
-      q("m-deal").addEventListener("pick", (e) => saveSet({ deal_delay_secs: Number(e.detail) }));
-      q("m-pause").addEventListener("pick", (e) => C().tablePost("street_pause", { secs: Number(e.detail) }).catch(() => {}));
-    } else if (U.drawerTab === "players") {
-      root.querySelectorAll("[data-trust]").forEach((b) => b.addEventListener("click", () => C().tablePost("trust", { user_id: Number(b.dataset.trust), on: b.dataset.on === "1" }).catch(() => {})));
-      root.querySelectorAll("[data-away]").forEach((b) => b.addEventListener("click", () => {
-        const uid = Number(b.dataset.away), on = b.dataset.on === "1";
-        (uid === s.my_user_id ? C().tablePost("sit_out", { on }) : C().tablePost("sit_out_player", { user_id: uid, on })).catch(() => {});
-      }));
-      root.querySelectorAll("[data-kick]").forEach((b) => b.addEventListener("click", async () => {
-        const who = s.seats.find((x) => x.user_id === Number(b.dataset.kick));
-        const ok = await confirmDialog({ title: `Remove ${who ? who.name : "player"}?`, text: "They are cashed out at the end of the current hand and their seat opens up. They can sit back down later.", okLabel: "Remove", danger: true });
-        if (ok) C().tablePost("kick", { user_id: Number(b.dataset.kick) }).catch(() => {});
-      }));
-      root.querySelectorAll("[data-host]").forEach((b) => b.addEventListener("click", async () => {
-        const who = s.seats.find((x) => x.user_id === Number(b.dataset.host));
-        const ok = await confirmDialog({ title: `Make ${who ? who.name : "them"} the host?`, text: "They get the Manage button; you keep your seat.", okLabel: "Hand over" });
-        if (ok) C().tablePost("transfer_host", { user_id: Number(b.dataset.host) }).then(() => closeDrawer()).catch(() => {});
-      }));
-    } else {
-      q("m-run").addEventListener("click", () => C().tablePost("run", { running: !s.running }).catch(() => {}));
-      q("m-deal").addEventListener("click", () => C().deal(C().G.state));
-      q("m-hostfold").addEventListener("click", async () => {
-        const cur = C().G.state, a = cur && cur.actor != null ? cur.seats[cur.actor] : null;
-        if (!a) return;
-        const ok = await confirmDialog({ title: `Fold ${a.name}?`, text: a.user_id === cur.my_user_id ? "That's you — this folds your own hand." : "Use this when someone is away and the table is waiting. It can't be undone.", okLabel: "Fold them", danger: true });
-        if (ok) C().tablePost("host_fold").catch(() => {});
-      });
-      q("m-close").addEventListener("click", async () => {
-        const cur = C().G.state;
-        const lines = (cur.ledger || []).map((r) => `<div class="settle-row"><span>${esc(r.name)}</span><b class="${r.net_cents >= 0 ? "pos" : "neg"}">${r.net_cents >= 0 ? "+" : ""}${d2(r.net_cents)}</b></div>`).join("");
-        const ok = await confirmDialog({ title: "Close this table?", text: "Everyone is cashed out and the session ends. The final ledger stays available from the lobby.", body: `<div>${lines}</div>`, okLabel: "Close table", danger: true });
-        if (ok) { try { await C().tablePost("close"); closeDrawer(); } catch (_) { /* toasted */ } }
-      });
-    }
-    void gid;
-  }
-
-  function openInfo() {
-    const s = C().G.state;
-    if (!s) return;
-    const set = s.settings, st = s.stakes;
-    const row = (k, v) => `<div class="settle-row"><span class="muted">${k}</span><b style="color:var(--tx)">${v}</b></div>`;
-    openModal({
-      title: s.name, sub: gameOf(s.variant).name, autofocus: false,
-      body: `<div>${row("Big blind (chip unit)", d2(st.bb_cents))}${row("Ante", `${d2(st.ante_cents)} (${(st.ante_cents / st.bb_cents).toFixed(st.ante_cents % st.bb_cents ? 1 : 0)} bb)`)}` +
-        row("Buy-in", set.min_buyin_cents || set.max_buyin_cents ? `${set.min_buyin_cents ? d2(set.min_buyin_cents) : "any"} – ${set.max_buyin_cents ? d2(set.max_buyin_cents) : "any"}` : "No limits") +
-        row("Seats", s.num_seats) + row("Decision time", s.decision_secs ? s.decision_secs + "s" : "No clock") + row("Time bank", set.time_bank_secs ? set.time_bank_secs + "s per player" : "Off") +
-        row("Next hand", set.deal_delay_secs ? `dealt automatically after ${set.deal_delay_secs}s` : "dealt manually") + row("Rabbit hunt", set.allow_rabbit ? "Allowed" : "Off") + row("Lobby", set.listed ? "Listed" : "Link only") + `</div>` +
-        `<div class="grp"><h4>How a hand works</h4><p style="margin:0;color:var(--tx-2);font-size:13px;line-height:1.5">Everyone dealt in posts the ante — no blinds. You get ${gameOf(s.variant).word} cards and the hand starts on the flop with <b>two boards</b>. ${gameOf(s.variant).burns ? BURN_RULES + " " : ""}Betting is pot-limit. At showdown each board awards half the pot to the best hand using exactly two hole cards and three board cards.${gameOf(s.variant).graded ? "" : ` ${gameOf(s.variant).label} decisions are not graded — there is no ${gameOf(s.variant).label} network yet.`}</p></div>`,
-      buttons: [{ label: "Copy invite link", cls: "", onClick: () => { copyInvite(s.id); return false; } }, { label: "Done", cls: "primary" }],
-    });
-  }
-
-  // ------------------------------------------------------------ player card
-  // Notes + colour tags are PRIVATE: they live in this browser only.
-  const TAGS = { none: "transparent", red: "#f2566a", amber: "#f5a742", green: "#35c878", blue: "#5b95ff", violet: "#a67bf0" };
-  function notesAll() { try { return JSON.parse(localStorage.getItem("hg.notes.v1") || "{}"); } catch (_) { return {}; } }
-  function noteFor(uid) { return notesAll()[String(uid)] || { tag: "none", text: "" }; }
-  function saveNote(uid, patch) {
-    const all = notesAll();
-    all[String(uid)] = Object.assign({ tag: "none", text: "" }, all[String(uid)], patch);
-    if (all[String(uid)].tag === "none" && !all[String(uid)].text) delete all[String(uid)];
-    try { localStorage.setItem("hg.notes.v1", JSON.stringify(all)); } catch (_) { /* private mode */ }
-    const s = C().G.state;
-    if (s) HG.table.render(s, s);
-  }
-  // The host taps a reserved seat (or a seated player's "$" badge) and gets
-  // the request right there: approve as asked, approve a DIFFERENT amount
-  // ("asked $150 — seated with $80"), approve + trust, or decline.
-  function openRequest(seatIdx) {
-    const s = C().G.state;
-    if (!s || !s.is_host) return;
-    const seat = s.seats[seatIdx];
-    const r = (s.requests || []).find((q) => (q.kind === "sit" ? q.seat === seatIdx : seat && !seat.empty && q.user_id === seat.user_id));
-    if (!r) return toast("Nothing is waiting for you at that seat", "");
-    openRequestDialog(r);
-  }
-  function openRequestDialog(r) {
-    const s = C().G.state;
-    const st = s.stakes, set = s.settings || {};
-    const stackNow = r.kind === "rebuy" ? ((s.seats.find((x) => !x.empty && x.user_id === r.user_id) || {}).stack_cents || 0) : 0;
-    const lo = r.kind === "sit" ? Math.max(st.bb_cents, set.min_buyin_cents || 0) : st.bb_cents;
-    const hi = set.max_buyin_cents ? Math.max(lo, set.max_buyin_cents - stackNow) : Math.max(r.amount_cents * 2, lo * 4, st.default_buyin_cents * 5);
-    let cents = Math.max(lo, Math.min(hi, r.amount_cents));
-    const body = h("div", { style: "display:flex;flex-direction:column;gap:14px" });
-    body.innerHTML =
-      `<div class="req-head">${avatar(r.name, r.name, "", r.avatar)}<div><b>${esc(r.name)}</b><small>${r.kind === "sit" ? `wants seat ${r.seat + 1} with ${d2(r.amount_cents)}` : `wants to add ${d2(r.amount_cents)} (stack ${d2(stackNow)})`}</small></div></div>` +
-      `<div class="bigmoney"><span id="rq-big">${d2(cents)}</span><small id="rq-note"></small></div>` +
-      `<input type="range" id="rq-range" min="${lo}" max="${hi}" step="${Math.max(1, st.bb_cents)}" value="${cents}"/>` +
-      `<div class="sz-row"><div class="sz-presets" id="rq-presets"></div><div class="sz-amt">${moneyInput("rq-input", cents)}</div></div>` +
-      `<small class="muted">Change the amount if you like — they are told what you approved.${set.max_buyin_cents ? ` Table maximum ${d2(set.max_buyin_cents)}.` : ""}</small>`;
-    const q = (id) => body.querySelector("#" + id);
-    const sync = (from) => {
-      cents = Math.max(lo, Math.min(hi, cents));
-      q("rq-big").textContent = d2(cents);
-      q("rq-note").textContent = cents === r.amount_cents ? "as asked" : `asked ${d2(r.amount_cents)}`;
-      if (from !== "range") q("rq-range").value = String(cents);
-      if (from !== "input") q("rq-input").value = (cents / 100).toFixed(2);
-      q("rq-range").style.setProperty("--fill", (hi > lo ? ((cents - lo) / (hi - lo)) * 100 : 100) + "%");
-    };
-    [{ label: "As asked", cents: r.amount_cents }, { label: d2(st.default_buyin_cents), cents: st.default_buyin_cents }, { label: "Half", cents: Math.round(r.amount_cents / 2) }, { label: "Max", cents: hi }]
-      .filter((p, i, arr) => p.cents >= lo && p.cents <= hi && arr.findIndex((x) => x.cents === p.cents) === i)
-      .forEach((p) => { const b = h("button", { type: "button" }, esc(p.label)); b.addEventListener("click", () => { cents = p.cents; sync(); }); q("rq-presets").appendChild(b); });
-    q("rq-range").addEventListener("input", () => { cents = Number(q("rq-range").value); sync("range"); });
-    q("rq-input").addEventListener("input", () => { const c = C().toCents(q("rq-input").value); if (c != null) { cents = c; q("rq-big").textContent = d2(Math.max(lo, Math.min(hi, c))); } });
-    q("rq-input").addEventListener("change", () => sync());
-    sync();
-    const resolve = async (action, trust) => {
-      sync();
-      const body2 = { id: r.id, action, trust: !!trust };
-      if (action === "approve" && cents !== r.amount_cents) body2.amount_cents = cents;
-      await C().tablePost("request", body2);
-      if (action === "approve") { toast(`${r.name} ${r.kind === "sit" ? "is seated" : "topped up"} with ${d2(cents)}${trust ? " — trusted from now on" : ""}`, "ok"); HG.sound && HG.sound.play("sit"); }
-    };
-    openModal({
-      title: r.kind === "sit" ? "Buy-in request" : "Top-up request", body, autofocus: false,
-      buttons: [
-        { label: "Decline", cls: "ghost", onClick: () => resolve("deny", false) },
-        { label: "Approve & trust", cls: "gold", onClick: () => resolve("approve", true) },
-        { label: "Approve", cls: "primary", onClick: () => resolve("approve", false) },
-      ],
-    });
-  }
-
-  function openPlayer(seatIdx) {
-    const s = C().G.state;
-    const x = s && s.seats[seatIdx];
-    if (!x || x.empty) return;
-    if (s.is_host && x.request) return openRequestDialog(Object.assign({ user_id: x.user_id, name: x.name, avatar: x.avatar, seat: seatIdx }, x.request));
-    const mine = x.user_id === s.my_user_id;
-    const row = (s.ledger || []).find((r) => r.user_id === x.user_id) || {};
-    const st = ((U.hands && U.hands.stats) || []).find((r) => r.name === x.name) || {};
-    const note = noteFor(x.user_id);
-    const body = h("div", { style: "display:flex;flex-direction:column;gap:16px" });
-    body.innerHTML =
-      `<div class="pcard-head">${avatar(x.name, x.name, "", x.avatar)}<div><b>${esc(x.name)}${mine ? " (you)" : ""}</b><span class="muted">Seat ${seatIdx + 1}${x.is_host ? " · host" : ""}${x.sitting_out ? " · sitting out" : ""}</span></div></div>` +
-      `<div class="pcard-stats"><div><b>${d2(x.stack_cents)}</b><small>Stack</small></div><div><b class="${row.net_cents > 0 ? "pos" : row.net_cents < 0 ? "neg" : ""}">${row.net_cents > 0 ? "+" : ""}${d2(row.net_cents || 0)}</b><small>Net</small></div>` +
-      `<div><b>${st.hands != null ? st.hands : "–"}</b><small>Hands</small></div><div><b>${st.wins != null ? st.wins : "–"}</b><small>Won</small></div></div>` +
-      (mine ? "" : `<div class="field"><span>Colour tag</span><div class="tagrow">${Object.entries(TAGS).map(([k, col]) => `<button type="button" data-tag="${k}" class="${note.tag === k ? "on" : ""}" style="--tc:${k === "none" ? "rgba(255,255,255,.12)" : col}" title="${k}"></button>`).join("")}</div></div>` +
-        `<label class="field"><span>Private note</span><textarea class="input" id="pc-note" maxlength="500" placeholder="Only you can see this — it stays in this browser.">${esc(note.text)}</textarea></label>`);
-    // your own automatic chips (the host's own fields sit in the Host box below)
-    if (mine && s.status === "open" && seatIdx === s.my_seat && !(s.is_host && !autoChipsNow(s, x).choose)) {
-      const auto = autoChipsRow(s, x);
-      if (auto) body.appendChild(auto);
-    }
-    if (s.is_host && s.status === "open") {
-      const hostBox = h("div", { class: "grp" });
-      hostBox.innerHTML = `<h4>Host</h4>` +
-        (mine ? "" : `<div class="setrow"><div><b>Trusted</b><small>Buys in, tops up and auto-tops-up without your approval</small></div><label class="switch"><input type="checkbox" id="pc-trust" ${x.trusted ? "checked" : ""}/><i></i></label></div>`) +
-        (s.auto_topup.mode === "host" ? `<div class="row2"><label class="field"><span>Top up to</span>${moneyInput("pc-top-target", x.topup_target_cents || 0)}</label><label class="field"><span>When below</span>${moneyInput("pc-top-below", x.topup_below_cents || 0)}</label></div>` : "") +
-        (s.auto_stack.mode === "host" ? `<label class="field"><span>My stack each hand (host)</span>${moneyInput("pc-set", x.auto_stack_cents || 0)}<small>0 = off for this player</small></label>` : "") +
-        (s.auto_topup.mode === "host" || s.auto_stack.mode === "host" ? `<button class="btn sm" id="pc-save">Save automatic chips</button>` : "");
-      if (hostBox.children.length > 1) body.appendChild(hostBox);
-      const tr = hostBox.querySelector("#pc-trust");
-      if (tr) tr.addEventListener("change", (e) => C().tablePost("trust", { user_id: x.user_id, on: e.target.checked }).then(() => toast(e.target.checked ? `${x.name} is trusted` : `${x.name} needs approval again`, "ok")).catch(() => { e.target.checked = !e.target.checked; }));
-      const sv = hostBox.querySelector("#pc-save");
-      if (sv) sv.addEventListener("click", async () => {
-        try {
-          if (s.auto_topup.mode === "host") await C().tablePost("auto_topup", { players: [{ user_id: x.user_id, target_cents: C().toCents(hostBox.querySelector("#pc-top-target").value) || 0, below_cents: C().toCents(hostBox.querySelector("#pc-top-below").value) || 0 }] });
-          if (s.auto_stack.mode === "host") await C().tablePost("auto_stack", { players: [{ user_id: x.user_id, cents: C().toCents(hostBox.querySelector("#pc-set").value) || 0 }] });
-          toast("Saved", "ok");
-        } catch (_) { /* toasted */ }
-      });
-    }
-    const buttons = [];
-    if (s.is_host && !mine && s.status === "open" && !x.pending_remove) {
-      buttons.push({ label: x.sitting_out ? "Sit them in" : "Sit them out", cls: "", onClick: () => C().tablePost("sit_out_player", { user_id: x.user_id, on: !x.sitting_out }) });
-      buttons.push({ label: "Remove", cls: "danger", onClick: async () => {
-        const ok = await confirmDialog({ title: `Remove ${x.name}?`, text: "They are cashed out at the end of the current hand and their seat opens up.", okLabel: "Remove", danger: true });
-        if (!ok) return false;
-        await C().tablePost("kick", { user_id: x.user_id });
-      } });
-    }
-    buttons.push({ label: "Done", cls: "primary" });
-    if (!mine) {
-      body.querySelector(".tagrow").addEventListener("click", (e) => {
-        const b = e.target.closest("button[data-tag]");
-        if (!b) return;
-        body.querySelectorAll(".tagrow button").forEach((k) => k.classList.toggle("on", k === b));
-        saveNote(x.user_id, { tag: b.dataset.tag });
-      });
-      body.querySelector("#pc-note").addEventListener("change", (e) => saveNote(x.user_id, { text: e.target.value.trim() }));
-    }
-    openModal({ title: "Player", body, buttons, autofocus: false });
-    if (!U.hands && s.is_member) loadHands(s);
-  }
-
-  function openLeave() {
-    const s = C().G.state;
-    if (!s || !Number.isInteger(s.my_seat)) return;
-    const me = s.seats[s.my_seat];
-    if (me.leaving) return C().tablePost("stay").catch(() => {});
-    const busy = me.in_hand && (s.phase === "in_hand" || (s.runout && s.runout.blocking));
-    if (!busy) {
-      confirmDialog({ title: "Leave your seat?", text: `You cash out ${d2(me.stack_cents)} and your seat opens up.`, okLabel: "Leave seat", danger: true })
-        .then((ok) => { if (ok) C().tablePost("leave").catch(() => {}); });
-      return;
-    }
-    openModal({
-      title: "Leave your seat?", sub: "You're in a hand. Play it out and leave when it ends — or leave right now (you are checked or folded for the rest of it).",
-      body: "", autofocus: false,
-      buttons: [
-        { label: "Cancel", cls: "ghost" },
-        { label: "Leave now (fold)", cls: "danger", onClick: () => C().tablePost("leave", { now: true }) },
-        { label: "Leave after this hand", cls: "primary", onClick: () => C().tablePost("leave").then(() => toast("You leave when this hand ends", "ok")) },
-      ],
-    });
-  }
-
-  function seatMenu(anchor) {
-    const s = C().G.state;
-    if (!s) return;
-    const seated = Number.isInteger(s.my_seat);
-    const me = seated ? s.seats[s.my_seat] : null;
-    const busy = s.phase === "in_hand" || s.runout.blocking;
-    const items = [{ header: seated ? `${me.name} · ${d2(me.stack_cents)}` : "Not seated" }];
-    if (seated && s.status === "open") {
-      items.push({ icon: "i-pluscircle", label: s.needs_approval ? "Request chips" : (s.settings && s.settings.allow_rathole) ? "Add or take off chips" : "Add chips", onClick: () => openTopUp() });
-      if (s.auto_stack.mode !== "off" || s.auto_topup.mode !== "off") items.push({ icon: "i-wallet", label: "Automatic chips…", onClick: openAutoChips });
-      if (me.sitting_out) items.push({ icon: "i-play", label: "I'm back", onClick: () => C().tablePost("sit_out", { on: false }).catch(() => {}) });
-      else {
-        items.push({ icon: "i-coffee", label: me.sit_out_next ? "Cancel sit-out" : "Sit out next hand", onClick: () => C().tablePost("sit_out", me.sit_out_next ? { on: false } : { on: true, next_hand: true }).catch(() => {}) });
-        items.push({ icon: "i-clock", label: "Step away now", hint: "You are checked or folded until you come back", onClick: () => C().tablePost("sit_out", { on: true }).catch(() => {}) });
-      }
-      items.push("-");
-      if (me.leaving) items.push({ icon: "i-play", label: "Stay — cancel leaving", onClick: () => C().tablePost("stay").catch(() => {}) });
-      else items.push({
-        icon: "i-door", label: me.pending_remove ? "Leaving after this hand" : "Leave seat", danger: true, disabled: !!me.pending_remove,
-        onClick: openLeave,
-      });
-    } else if (s.status === "open") items.push({ icon: "i-user", label: "Pick an open seat on the table", disabled: true, onClick: () => {} });
-    items.push({ icon: "i-back", label: "Back to lobby", onClick: () => C().showLobby(false) });
-    openMenu(anchor, items);
   }
 
   // -------------------------------------------------------------------- init
+  // The page chrome: the top bar, the rail, chat. Each feature module wires its own
+  // part of the page from its entry in UI.onInit (games.lobby.js: the lobby).
   function init() {
     renderMe();
+    document.addEventListener("keydown", trapFocus);
     $("userchip").addEventListener("click", openAvatar);
     // a profile picture that can't load leaves the initials under it
     document.addEventListener("error", (e) => {
       const t = e.target;
       if (t && t.tagName === "IMG" && t.parentElement && t.parentElement.classList.contains("av")) t.remove();
     }, true);
-    $("c-open").addEventListener("click", () => openCreate());
-    $("lb-myhands").addEventListener("click", () => openMyHands(""));
-    $("lb-h2h").addEventListener("click", openMatrix);
-    $("lb-game").addEventListener("click", (e) => {
-      const b = e.target.closest("button[data-v]"), cid = C().G.clubId;
-      if (!b || !cid || b.classList.contains("on")) return;
-      setClubGame(cid, b.dataset.v);
-      $("lb-game").querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
-      loadClub(true);
-    });
-    $("lb-allsess").addEventListener("click", openSessions);
-    const takeLink = (id) => { const box = $(id), v = box.value; box.value = ""; box.blur(); return v; };
-    $("join-form").addEventListener("submit", (e) => { e.preventDefault(); joinByLink(takeLink("join-input")); });
-    $("club-switch").addEventListener("click", (e) => openClubMenu(e.currentTarget));
-    $("club-settings").addEventListener("click", openClubSettings);
-    $("club-invite").addEventListener("click", async () => {
-      const cid = C().G.clubId;
-      try {
-        const v = await C().j(`/games/api/clubs/${encodeURIComponent(cid)}`);
-        if (v.invite_code) copyText(inviteUrl(v.invite_code), `Invite link to ${v.name} copied`, "Club invite link");
-      } catch (err) { toast(err.message, "err"); }
-    });
-    $("wel-create").addEventListener("submit", (e) => {
-      e.preventDefault();
-      const name = $("wel-name").value.trim();
-      if (!name) { toast("Give the club a name", "err"); $("wel-name").focus(); return; }
-      createClub(name);
-    });
-    $("wel-join").addEventListener("submit", (e) => { e.preventDefault(); joinByLink(takeLink("wel-link")); });
     $("brand-link").addEventListener("click", (e) => { e.preventDefault(); C().showLobby(false); });
     $("tb-back").addEventListener("click", () => C().showLobby(false));
-    $("tb-invite").addEventListener("click", () => copyInvite(C().G.gameId));
-    $("tb-manage").addEventListener("click", () => openDrawer(((C().G.state || {}).requests || []).length ? "chips" : null));
+    $("tb-invite").addEventListener("click", () => UI.copyInvite(C().G.gameId));
+    $("tb-manage").addEventListener("click", () => UI.openDrawer(((C().G.state || {}).requests || []).length ? "chips" : null));
     $("tb-run").addEventListener("click", () => { const s = C().G.state; if (s) C().tablePost("run", { running: !s.running }).catch(() => {}); });
     $("rabbit-btn").addEventListener("click", () => C().tablePost("rabbit").catch(() => {}));
     $("tb-watch").addEventListener("click", (e) => {
       const s = C().G.state, names = (s && s.spectators) || [];
       openMenu(e.currentTarget, [{ header: `${names.length} watching` }].concat(names.map((n) => ({ icon: "i-eye", label: n, disabled: true, onClick: () => {} }))));
     });
-    $("tb-info").addEventListener("click", openInfo);
+    $("tb-info").addEventListener("click", () => UI.openInfo());
     $("tb-prefs").addEventListener("click", openPrefs);
-    $("tb-seat").addEventListener("click", (e) => seatMenu(e.currentTarget));
+    $("tb-seat").addEventListener("click", (e) => UI.seatMenu(e.currentTarget));
     $("tb-more").addEventListener("click", (e) => {
       const s = C().G.state, on = !!C().G.prefs.sound, anchor = e.currentTarget;
       // (a phone has no React button: the dock's right side is hidden there)
       const react = () => setTimeout(() => openMenu(anchor, [{ header: "React" }].concat(Object.entries(HG.table.EMOTES).map(([k, g]) => ({
-        label: `${g}  ${k.toUpperCase()}`, onClick: () => C().tablePost("react", { emote: k }).catch(() => {}),
+        label: `${g}  ${(HG.table.EMOTE_NAMES || {})[k] || k}`, onClick: () => C().tablePost("react", { emote: k }).catch(() => {}),
       })))), 0);
+      // A phone's top bar keeps room for the table's name (HGT-003): the seat menu and the
+      // shuffle's shield live here instead (games.css hides their buttons ≤ 560 px).
+      const phone = !!(globalThis.matchMedia && matchMedia("(max-width: 560px)").matches);
+      const fair = $("tb-fair");
+      const seat = phone && s && UI.seatItems ? UI.seatItems(s) : [];
       openMenu(anchor, [
+        ...seat, ...(seat.length ? ["-"] : []),
         { header: s ? s.name : "Table" },
-        { icon: "i-link", label: "Copy invite link", disabled: !s || s.status !== "open", onClick: () => copyInvite(C().G.gameId) },
-        { icon: "i-info", label: "Table info", onClick: openInfo },
-        { icon: "i-clock", label: "Last hand", disabled: !s || !s.last_hand_no || !s.is_member, onClick: () => openHand(s.id, C().G.state.last_hand_no) },
+        { icon: "i-link", label: "Copy invite link", disabled: !s || s.status !== "open", onClick: () => UI.copyInvite(C().G.gameId) },
+        { icon: "i-info", label: "Table info", onClick: () => UI.openInfo() },
+        { icon: "i-clock", label: "Last hand", disabled: !s || !s.last_hand_no || !canBrowse(s), onClick: () => UI.openHand(s.id, C().G.state.last_hand_no) },
         { icon: "i-smile", label: "React", disabled: !s || !Number.isInteger(s.my_seat), onClick: react },
+        ...(phone && fair && !fair.hidden && HG.fair ? [{ icon: "i-shield", label: `Shuffle: ${fair.lastElementChild.textContent}`, onClick: () => HG.fair.openPanel() }] : []),
         "-",
-        { icon: on ? "i-vol" : "i-mute", label: on ? "Sound on" : "Sound off", onClick: () => { C().savePrefs({ sound: !on }); renderSound(); } },
+        // (an action, not a status: "Sound on" read like either)
+        { icon: on ? "i-mute" : "i-vol", label: on ? "Mute sounds" : "Turn sounds on", onClick: () => { C().savePrefs({ sound: !on }); renderSound(); } },
         { icon: "i-sliders", label: "Preferences", onClick: openPrefs },
         { icon: "i-user", label: "Your picture…", onClick: openAvatar },
       ]);
@@ -2098,7 +895,7 @@
       try { await C().tablePost("chat", { text }); } catch (_) { input.value = text; }
     });
     const tray = $("emote-tray");
-    tray.innerHTML = Object.entries(HG.table.EMOTES).map(([k, g]) => `<button type="button" data-e="${k}" title="${k}">${g}</button>`).join("");
+    put(tray, html`${Object.entries(HG.table.EMOTES).map(([k, g]) => { const nm = (HG.table.EMOTE_NAMES || {})[k] || k; return html`<button type="button" data-e="${k}" title="${nm}" aria-label="${nm}">${g}</button>`; })}`);
     tray.addEventListener("click", (e) => { const b = e.target.closest("button[data-e]"); if (b) { C().tablePost("react", { emote: b.dataset.e }).catch(() => {}); tray.hidden = true; } });
     $("emote-btn").addEventListener("click", () => { tray.hidden = !tray.hidden; });
     U.railTab = C().G.prefs.railTab || "chat";
@@ -2106,12 +903,39 @@
     if (narrow) C().G.prefs.rail = false;
     setRail(!!C().G.prefs.rail, U.railTab);
     renderSound();
+    UI.onInit.forEach((f) => f());
     if (HG.play) HG.play.init();
   }
 
-  function showLobby() { $("lobby").hidden = false; $("table-view").hidden = true; document.body.classList.add("in-lobby"); closeDrawer(); U.lobbySig = ""; loadClub(true); }
+  // A new version of the client is live (games.js offerUpdate; OPS-039). At a table the
+  // dock's status strip offers the refresh between hands (games.play.js); the lobby has
+  // this card. "Later" hides it until the page next comes back to the lobby.
+  function showUpdate() {
+    let card = $("updcard");
+    const inLobby = !C().G.gameId;
+    if (!card) {
+      if (!inLobby) return;
+      card = h("div", { id: "updcard", class: "joinreq updcard", role: "status" },
+        html`<div class="jr-txt"><b>A new version is ready</b><small>Refresh to get it — it only takes a second.</small></div>`);
+      const btns = h("div", { class: "jr-btns" });
+      btns.appendChild(h("button", { class: "btn sm ghost", type: "button", onclick: () => { U.updLater = true; card.hidden = true; } }, "Later"));
+      btns.appendChild(h("button", { class: "btn sm gold", type: "button", onclick: () => C().reloadForUpdate() }, "Refresh"));
+      card.appendChild(btns);
+      document.body.appendChild(card);
+    }
+    card.hidden = !inLobby || !!U.updLater;
+  }
+
+  function showLobby() {
+    $("lobby").hidden = false; $("table-view").hidden = true; document.body.classList.add("in-lobby");
+    U.updLater = false;
+    if (UI.closeDrawer) UI.closeDrawer();
+    U.lobbySig = "";
+    if (UI.loadClub) UI.loadClub(true);
+  }
   function showTable() {
     $("lobby").hidden = true; $("table-view").hidden = false;
+    if ($("updcard")) $("updcard").hidden = true;  // (the table offers it in the dock)
     document.body.classList.remove("in-lobby");
     U.eventSeen = null; U.chatSig = ""; U.logSig = ""; U.ledgerSig = ""; U.hands = null; U.handsFor = null; U.unread = 0;
     $("hands-body").dataset.k = "";
@@ -2119,18 +943,25 @@
   function renderConn() {
     const c = $("conn"), st = C().G.conn;
     c.className = "conn " + (st === "ok" ? "" : st);
-    c.lastChild.textContent = st === "ok" ? "Live" : st === "slow" ? "Slow" : "Reconnecting…";
+    // ("Connected", not "Live": the game's own Live / Paused pill sits next to it)
+    c.lastChild.textContent = st === "ok" ? "Connected" : st === "slow" ? "Slow connection" : "Reconnecting…";
     // A lost connection must be SEEN — on a phone the top bar has no room for the
-    // indicator above, and the frozen table looked perfectly normal.
+    // indicator above, and the frozen table looked perfectly normal. But the live feed
+    // reconnects by itself: a blip under CONN_GRACE_MS raises no bar and no "Back online".
     let bar = $("connbar");
     if (!bar) {
-      bar = h("div", { id: "connbar", role: "status", "aria-live": "polite" }, `<i></i><span><b>Connection lost</b> — reconnecting…</span>`);
+      bar = h("div", { id: "connbar", role: "status", "aria-live": "polite" }, html`<i></i><span><b>Connection lost</b> — reconnecting…</span>`);
       bar.hidden = true;
       document.body.appendChild(bar);
     }
-    bar.hidden = st !== "off";
-    if (U.connWas === "off" && st === "ok") toast("Back online", "ok");
-    U.connWas = st;
+    clearTimeout(U.connTimer);
+    if (st === "off") {
+      if (bar.hidden) U.connTimer = setTimeout(() => { if (C().G.conn === "off") { bar.hidden = false; U.connShown = true; } }, CONN_GRACE_MS);
+    } else {
+      bar.hidden = true;
+      if (U.connShown && st === "ok") toast("Back online", "ok");
+      U.connShown = false;
+    }
   }
 
   function renderTop(s) {
@@ -2146,7 +977,8 @@
     $("tb-hostpill").hidden = !s.is_host;
     $("tb-manage").hidden = !(s.is_host && s.status === "open");
     const run = $("tb-run");
-    run.hidden = !(s.is_host && s.status === "open");
+    // (not when the felt or the dock already offers "Start game": one Start — HGT-004)
+    run.hidden = !(s.is_host && s.status === "open") || !!(HG.play && HG.play.startOnFelt && HG.play.startOnFelt(s));
     if (!run.hidden) {
       const busy = s.phase === "in_hand" || (s.runout && s.runout.blocking);
       const label = s.running ? (busy ? "Pause after hand" : "Pause") : "Start game";
@@ -2155,9 +987,10 @@
         run.dataset.k = k;
         run.className = "btn sm " + (s.running ? "" : "start");
         // (a phone gets the short label: the long one squeezed the status pill off the bar)
-        run.innerHTML = icon(s.running ? "i-pause" : "i-play", "sm") + `<span class="lbl-l">${label}</span><span class="lbl-s">${s.running ? "Pause" : "Start"}</span>`;
+        put(run, html`${icon(s.running ? "i-pause" : "i-play", "sm")}<span class="lbl-l">${label}</span><span class="lbl-s">${s.running ? "Pause" : "Start"}</span>`);
         run.disabled = !s.running && s.eligible_count < 2;
         run.title = s.running ? "Pause the game (the current hand finishes first)" : s.eligible_count < 2 ? "Needs two players with more than the ante" : "Start dealing";
+        run.setAttribute("aria-label", s.running ? (busy ? "Pause after this hand" : "Pause the game") : "Start the game");  // (a phone shows it as its icon)
       }
     }
     const nReq = s.is_host ? (s.requests || []).length : 0;
@@ -2173,13 +1006,23 @@
     // the server restarted (new epoch): its event ids start again at 1 — show them
     if (prev && prev.id === s.id && prev.epoch && s.epoch && prev.epoch !== s.epoch) U.eventSeen = 0;
     if (U.eventSeen != null && prev && prev.id === s.id) {
+      // Pop-ups are for what concerns YOU (2026-09-28): joins, rebuys, auto top-ups, leaves
+      // and the host's settings used to be toasted too — on a phone they sat over the far
+      // seats most hands. They are all in the chat (the dealer's lines).
       evs.filter((e) => e.id > U.eventSeen).slice(-3).forEach((e) => {
         if (e.kind === "timeout" && e.seat === s.my_seat) { toast("You ran out of time — " + (e.text.includes("folded") ? "your hand was folded" : "you were checked"), "err", 5000); return; }
-        if (e.kind === "request") { if (s.is_host && /asks to/.test(e.text)) { toast(e.text + " — open Manage › Chips", "gold", 6000); HG.sound && HG.sound.play("msg"); } return; }
-        if (e.kind === "joinreq") { if ((s.join_requests || []).length) HG.sound && HG.sound.play("msg"); return; }  // the card says it
-        if (e.kind === "fair") { toast(e.text, "gold", 6000); return; } // a redone shuffle is always said out loud
-        if (["join", "leave", "rebuy", "host", "settings", "run"].includes(e.kind)) toast(e.text, e.kind === "join" ? "ok" : "");
-        if (e.kind === "join") HG.sound && HG.sound.play("sit");
+        // (a request waiting for YOU sounds like your turn — its "ask" is in that group of sounds, FEAT-011)
+        if (e.kind === "request") { if (s.is_host && /asks to/.test(e.text)) { toast(e.text + " — tap their seat to answer", "gold", 6000); HG.sound && HG.sound.play("ask"); } return; }
+        if (e.kind === "joinreq") { if ((s.join_requests || []).length) HG.sound && HG.sound.play("ask"); return; }  // the card says it
+        if (e.kind === "fair") {  // a redone shuffle is always said out loud — and explained to the one it names
+          if (Number.isInteger(s.my_seat) && (e.seats || []).includes(s.my_seat)) toast("Your device didn't confirm the shuffle in time, so it was redone. Keep this page open and in front between hands.", "err", 9000);
+          else toast(e.text, "gold", 6000);
+          return;
+        }
+        if (e.kind === "join") { HG.sound && HG.sound.play("sit"); return; }
+        if (e.kind === "host") { if (s.is_host && prev && !prev.is_host) toast("You're the host now — Manage is in the top bar", "gold", 5000); return; }
+        // the game stopping on its own (an error, a hand cut short) is news; start / pause show in the top bar
+        if (e.kind === "run" && !/^Game (started|paused|pauses after)/.test(e.text)) toast(e.text, "", 6000);
       });
     }
     U.eventSeen = last;
@@ -2187,20 +1030,36 @@
   }
 
   function render(s, prev, opts) {
+    if (s.game) setGames(s.game);  // (the server's word on this table's game)
     setMyAvatar(s.my_avatar);
-    renderJoinReqs(s.join_requests);
+    askForName(s);  // (FEAT-008: no name of your own yet — asked once)
+    if (UI.renderJoinReqs) UI.renderJoinReqs(s.join_requests);
     renderTop(s);
     HG.table.render(s, prev, opts);
     if (HG.play) HG.play.render(s, prev, opts);
     handleEvents(s, prev);
     renderRail(s, !!(opts && opts.unitChanged));
-    if (U.drawer) paintDrawer(s, false);
+    if (U.drawer && UI.paintDrawer) UI.paintDrawer(s, false);
+    if (UI.pendingMove) UI.pendingMove(s);  // (a change of seats asked for during the hand — FEAT-013)
+    // A first look at a game's table: how a hand works (FEAT-009; games.manage.js). A
+    // moment later, so a hand opened by a link (the replayer) comes first and wins.
+    if (!prev || prev.id !== s.id) {
+      clearTimeout(U.guideTimer);
+      U.guideTimer = setTimeout(() => { const cur = C().G.state; if (cur && cur.id === s.id && UI.maybeGuide) UI.maybeGuide(cur); }, 900);
+    }
   }
 
-  HG.ui = {
-    init, render, renderLobby, showLobby, showTable, renderConn, toast, openModal, confirmDialog, openMenu, closeTop,
-    openSit, openTopUp, openAutoChips, openPlayer, openRequest, openLeave, openMyHands, noteFor, TAGS, openDrawer, openInfo, openPrefs, openHand, copyInvite, setRail, onMyTurn, renderDock: (s) => HG.play && HG.play.render(s, s),
-    openInvite, openClubGate, openClubSettings, openAvatar, setMyAvatar,
-    onClock: (left, tm) => HG.play && HG.play.onClock(left, tm),
+  // Shared building blocks for the feature modules (games.lobby.js, games.history.js,
+  // games.seat.js, games.manage.js): each takes what it needs from HG.uikit at load.
+  HG.uikit = {
+    $, C, html, put, append, icon, U, h, avatar, moneyInput, d2, d0, GAMES, gameOf, gameNote, setGames, burnRules, OPTIONS, secsLabel, fmtWhen,
+    toast, openModal, confirmDialog, closeTop, closeTopThen, afterTransition, loading, openMenu, closeMenu, segHtml, segWire, segVal, savedFlash,
+    setMyAvatar, setMyName, miniCards, fillMiniCards, loadHands, canBrowse,
   };
+  Object.assign(UI, {
+    init, render, showLobby, showTable, renderConn, toast, openModal, confirmDialog, openMenu, closeTop,
+    openPrefs, setRail, onMyTurn, openAvatar, setMyAvatar, setMyName, showUpdate, bootProblem, signedOut, lobbyOffline,
+    renderDock: (s) => HG.play && HG.play.render(s, s),
+    onClock: (left, tm) => HG.play && HG.play.onClock(left, tm),
+  });
 })();

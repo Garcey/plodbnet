@@ -12,6 +12,8 @@ import pytest
 
 from plo5bp.config import GameConfig
 from plo5bp.ui import server
+from plo5bp.ui.live import pokernow as pn_live, tracking  # noqa: E402
+from plo5bp.ui.live.state import live_state  # noqa: E402
 
 
 def _configure_session(bb_chips: int = 2, ante_chips: int = 12, dpb: float = 1.0) -> None:
@@ -27,10 +29,10 @@ def _configure_session(bb_chips: int = 2, ante_chips: int = 12, dpb: float = 1.0
     s.button_seat = 0
     s.hero_seat = 0
     s.dollars_per_bb = dpb
-    s.last_hero_hole = None
+    live_state.last_hero_hole = None
     server._new_session_defaults()
-    server.pokernow_runner._reconstructor = None
-    server._set_active_reconstructor(None)
+    pn_live.pokernow_runner._reconstructor = None
+    tracking._set_active_reconstructor(None)
     server._rebuild_env()
 
 
@@ -82,7 +84,7 @@ def _river_payload():
 
 def test_bootstrap_from_full_board_frame():
     _configure_session()
-    server.pokernow_runner.handle_payload(_river_payload())
+    pn_live.pokernow_runner.handle_payload(_river_payload())
 
     s = server.session
     assert s.num_seats == 2
@@ -97,7 +99,7 @@ def test_bootstrap_from_full_board_frame():
     assert all(c is not None for c in s.flop_a)
     assert all(c is not None for c in s.river_cards)
     assert s.env is not None
-    assert server.pokernow_runner.last_error is None
+    assert pn_live.pokernow_runner.last_error is None
 
 
 def test_seat_count_reconfigures_from_default_six():
@@ -105,17 +107,17 @@ def test_seat_count_reconfigures_from_default_six():
     server.session.game_config = GameConfig(num_seats=6, starting_stack=400, ante=12, bb=2)
     server.session.dollars_per_bb = 1.0
     server._new_session_defaults()
-    server.pokernow_runner._reconstructor = None
+    pn_live.pokernow_runner._reconstructor = None
 
-    server.pokernow_runner.handle_payload(_river_payload())
+    pn_live.pokernow_runner.handle_payload(_river_payload())
     # Two in-hand seats → engine reconfigured down to 2.
     assert server.session.num_seats == 2
-    assert server.pokernow_runner._reconstructor.num_seats == 2
+    assert pn_live.pokernow_runner._reconstructor.num_seats == 2
 
 
 def test_flop_bet_infers_raise_action():
     _configure_session()
-    r = server.pokernow_runner
+    r = pn_live.pokernow_runner
     # Frame A: flop dealt, no bets, hero to act → fires hand-start, baseline.
     r.handle_payload(_flop_payload(hero_bet=None, hero_actor=True))
     assert server.session.hand_in_hand_mask == frozenset({0, 1})
@@ -145,7 +147,7 @@ def test_new_hand_fires_at_flop_without_action_or_button_move():
     from plo5bp.ocr.types import Card
 
     _configure_session()
-    r = server.pokernow_runner
+    r = pn_live.pokernow_runner
     r.handle_payload(_flop_payload(hero_actor=True))
     assert server.session.hand_in_hand_mask == frozenset({0, 1})
 
@@ -181,7 +183,7 @@ def test_street_advances_at_reveal_even_if_check_frames_were_dropped():
     turn (card + recommendation) shows at deal time, not at the first action.
     """
     _configure_session()
-    r = server.pokernow_runner
+    r = pn_live.pokernow_runner
     hero = ["As", "Ks", "Qh", "Jd", "Tc"]
 
     def frame(b1, b2):
@@ -219,7 +221,7 @@ def test_closing_call_reconciled_at_reveal_when_signal_lost():
     still close the prior street by filling the call.
     """
     _configure_session()
-    r = server.pokernow_runner
+    r = pn_live.pokernow_runner
     hero = ["Ah", "Kh", "Qh", "Jh", "9h"]
 
     def frame(b1, b2, hero_bet=None, hero_actor=True, villain_actor=False,
@@ -274,13 +276,13 @@ def test_overbet_beyond_effective_stack_is_clamped_not_dropped():
     s.button_seat = 0
     s.hero_seat = 0
     s.dollars_per_bb = 1.0
-    s.last_hero_hole = None
+    live_state.last_hero_hole = None
     server._new_session_defaults()
-    server.pokernow_runner._reconstructor = None
-    server._set_active_reconstructor(None)
+    pn_live.pokernow_runner._reconstructor = None
+    tracking._set_active_reconstructor(None)
     server._rebuild_env()
 
-    r = server.pokernow_runner
+    r = pn_live.pokernow_runner
     hero = ["As", "Ks", "Qh", "Jd", "Tc"]
     b1, b2 = ["2c", "3c", "4d"], ["5s", "6s", "7d"]
 
@@ -316,7 +318,7 @@ def test_overbet_beyond_effective_stack_is_clamped_not_dropped():
 
 def test_game_lock_ignores_foreign_game():
     """Frames from a second open PokerNow tab (different gameId) are ignored."""
-    r = server.PokerNowRunner()
+    r = pn_live.PokerNowRunner()
     assert r.accept_game("gameA") is True
     assert r.active_game_id == "gameA"
     assert r.accept_game("gameA") is True          # same game, fine
@@ -327,7 +329,7 @@ def test_game_lock_ignores_foreign_game():
 
 def test_game_lock_switches_after_active_goes_quiet():
     """A new game may take over once the locked one is silent past the window."""
-    r = server.PokerNowRunner()
+    r = pn_live.PokerNowRunner()
     assert r.accept_game("gameA") is True
     # Simulate gameA going quiet longer than the switch window.
     r._active_game_at -= r._GAME_SWITCH_STALE + 1.0
@@ -349,6 +351,6 @@ def _restore_session():
     server.session.button_seat = 0
     server.session.game_config = GameConfig(starting_stack=400000)
     server.session.dollars_per_bb = 2.0
-    server.pokernow_runner._reconstructor = None
-    server._set_active_reconstructor(None)
+    pn_live.pokernow_runner._reconstructor = None
+    tracking._set_active_reconstructor(None)
     server._rebuild_env()

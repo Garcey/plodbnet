@@ -134,3 +134,13 @@ def test_trailing_separator_never_inflates_the_amount():
         want = _parse_chip_text(clean)
         for junk in (".", ",", "..", ".,", " ."):
             assert _parse_chip_text(clean + junk) == want, (clean, junk)
+
+
+def test_cli_pretty_can_be_turned_off():
+    """TOOL-045: `--pretty` was store_true with default True — a no-op."""
+    from plo5bp.ocr.cli import build_parser
+
+    p = build_parser()
+    assert p.parse_args(["f.png"]).pretty is True
+    assert p.parse_args(["f.png", "--no-pretty"]).pretty is False
+    assert p.parse_args(["f.png", "--pretty"]).pretty is True

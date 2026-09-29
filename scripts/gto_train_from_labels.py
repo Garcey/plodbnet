@@ -1,6 +1,11 @@
 #!/usr/bin/env python
 """Train PolicyNet from native rust_cfr LabelRecord JSONL (+ optional bootstrap mix).
 
+Secondary entry point: for a new teacher run use scripts/train_policy_from_cfr.py
+(docs/ops/GTO_PIPELINE.md), which also keeps the planned holdout out of training.
+Use this one to retrain from label files you already have, to warm-start (--load),
+or to mix in bootstrap rows (a bootstrap mix is never badge-eligible).
+
   .venv/Scripts/python scripts/gto_train_from_labels.py \\
       --labels data/gto_nlh/pushfold_4h_labels.jsonl \\
       --epochs 10 --out checkpoints/gto_policy.pt

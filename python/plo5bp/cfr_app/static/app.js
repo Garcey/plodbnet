@@ -55,20 +55,94 @@
     return window.CFR_TOKEN ? { "X-CFR-Token": window.CFR_TOKEN } : {};
   }
 
+  // (TOOL-053) Readable names for the fields a 422 can point at.
+  const FIELD_LABELS = {
+    street: "Street", pot_bb: "Pot (bb)", effective_stack_bb: "Stack (bb)", stack_bb: "Stack (bb)",
+    num_seats: "Seats", board: "Board", bb_chips: "BB", sb_chips: "SB", ante_chips: "Ante",
+    raise_sizes_pm: "Raise sizes", stacks_bb: "Multiway stacks", range_oop: "OOP range",
+    range_ip: "IP range", max_iterations: "Max iterations", thread_num: "Deals per iteration",
+    target_exploitability_bb: "Target expl", time_budget_secs: "Time budget", seed: "Seed",
+    poll_every: "Progress every", expl_check_secs: "Check expl every",
+  };
+
+  // FastAPI's validation errors are a list of {loc, msg}: "Pot (bb): Input should
+  // be a valid number" instead of a raw JSON blob.
+  function formatDetail(detail) {
+    if (Array.isArray(detail)) {
+      return detail
+        .map((d) => {
+          const loc = (d && d.loc) || [];
+          const key = loc.length ? String(loc[loc.length - 1]) : "";
+          const name = FIELD_LABELS[key] || key.replace(/_/g, " ");
+          return (name ? name + ": " : "") + ((d && d.msg) || "invalid");
+        })
+        .join(" · ");
+    }
+    if (detail && typeof detail === "object") return JSON.stringify(detail);
+    return String(detail);
+  }
+
+  function errorText(e) {
+    return String((e && e.message) || e || "error");
+  }
+
   async function api(path, opts = {}) {
-    const res = await fetch(path, {
-      ...opts,
-      headers: { "Content-Type": "application/json", ...authHeaders(), ...(opts.headers || {}) },
-    });
+    let res;
+    try {
+      res = await fetch(path, {
+        ...opts,
+        headers: { "Content-Type": "application/json", ...authHeaders(), ...(opts.headers || {}) },
+      });
+    } catch (e) {
+      const err = new Error("The solver's local server is not responding");
+      err.offline = true;
+      throw err;
+    }
     let body = null;
     const ct = res.headers.get("content-type") || "";
     if (ct.includes("application/json")) body = await res.json();
     else body = await res.text();
     if (!res.ok) {
       const detail = (body && body.detail) || body || res.statusText;
-      throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+      const err = new Error(formatDetail(detail));
+      err.status = res.status;
+      throw err;
     }
     return body;
+  }
+
+  // (TOOL-053) Client-side number checks, so an emptied box says which box —
+  // it used to be sent as null and come back as a pydantic error blob.
+  class FieldError extends Error {
+    constructor(sel, msg) {
+      super(msg);
+      this.sel = sel;
+    }
+  }
+
+  function readNumber(sel, { int = false, min = null, label = "" } = {}) {
+    const el = $(sel);
+    const raw = el ? String(el.value).trim() : "";
+    const v = int ? parseInt(raw, 10) : parseFloat(raw);
+    const name = label || (el && el.dataset && el.dataset.label) || sel;
+    if (raw === "" || !Number.isFinite(v)) throw new FieldError(sel, `${name} needs a number`);
+    if (min != null && v < min) throw new FieldError(sel, `${name} must be at least ${min}`);
+    return v;
+  }
+
+  function clearInvalid() {
+    $$(".invalid").forEach((x) => x.classList.remove("invalid"));
+  }
+
+  function reportError(e) {
+    if (e instanceof FieldError) {
+      const el = $(e.sel);
+      if (el) {
+        el.classList.add("invalid");
+        if (el.focus) el.focus();
+      }
+    }
+    toast(errorText(e), "error");
   }
 
   function escapeHtml(s) {
@@ -87,6 +161,44 @@
   function cardIsRed(c) {
     const s = SUITS[c % 4];
     return s === "d" || s === "h";
+  }
+
+  // ---------- exploitability: every number says what KIND it is (TOOL-021) ----------
+  const EXPL_KINDS = {
+    exact_infoset: ["exact", "Exact best response over every hand combo — a real certificate for this tree"],
+    hero_enum: ["exact", "Exact best response with every hero hand enumerated"],
+    infoset_br: ["best response", "Infoset best response (older solver build)"],
+    sampled_runout_br: ["sampled", "Best response against a sample of runouts — an upper-biased estimate"],
+    mc_poll: ["estimate", "In-solve estimate from a sample; the final number replaces it"],
+    mc_br_proxy: ["proxy", "Perfect-information best-response PROXY (preflop / multiway) — not a Nash certificate, and it does not shrink with more iterations"],
+    none: ["n/a", "Could not be computed in the time allowed"],
+  };
+
+  function explKindOf(obj) {
+    if (!obj) return null;
+    if (obj.expl_kind) return obj.expl_kind;
+    for (const n of obj.notes || []) {
+      const m = /(?:^|\s)expl_kind=([a-z_]+)/.exec(String(n));
+      if (m) return m[1];
+    }
+    return null;
+  }
+
+  function explLabel(kind) {
+    const k = EXPL_KINDS[kind];
+    return k ? k[0] : kind || "";
+  }
+
+  function explTitle(kind) {
+    const k = EXPL_KINDS[kind];
+    return k ? k[1] : kind ? `expl_kind=${kind}` : "";
+  }
+
+  // "3.1234 bb · proxy" (digits = decimals).
+  function explText(value, kind, digits = 4) {
+    if (value == null || !Number.isFinite(Number(value))) return "—";
+    const lab = explLabel(kind);
+    return Number(value).toFixed(digits) + " bb" + (lab ? " · " + lab : "");
   }
 
   // ---------- tabs ----------
@@ -116,6 +228,7 @@
 
   function renderBoardSlots() {
     ensureBoardLen();
+    hideValidateResult(); // (TOOL-032) the board changed: Validate's answer is stale
     // Board cards block combos, so what a range text means depends on the board
     // (incl. "no board" preflop). Debounced: a burst of clicks = one request.
     scheduleRangeRefresh("oop");
@@ -201,18 +314,114 @@
     renderBoardSlots();
   }
 
-  function onStreetChange() {
+  // ---------- algorithm (TOOL-008 / TOOL-017) ----------
+  // Where each algorithm applies and what the "threads" number means for it. The
+  // server sends the same catalog in /api/meta (algorithm_info); this copy keeps
+  // the form usable before meta arrives.
+  const ALGO_FALLBACK = [
+    { id: "dcfr_vector", label: "Full-range DCFR", streets: [2, 3], hu_only: true },
+    { id: "dcfr", label: "Sampled DCFR", streets: [1, 2, 3], hu_only: false },
+    { id: "mccfr_es", label: "External-sampling MCCFR", streets: [0, 1, 2, 3], hu_only: false },
+  ];
+
+  function algoCatalog() {
+    const info = state.meta && state.meta.algorithm_info;
+    return Array.isArray(info) && info.length ? info : ALGO_FALLBACK;
+  }
+
+  function rootShape() {
     const street = parseInt($("#f-street").value, 10);
-    if (street === 0) {
-      $("#f-algo").value = "mccfr_es";
-      $("#f-abs").value = "none";
-    } else if (street === 1) {
-      $("#f-algo").value = "dcfr";
-      $("#f-abs").value = "ochs";
-    } else {
-      $("#f-algo").value = "dcfr";
-      $("#f-abs").value = "none";
+    const seats = parseInt($("#f-seats").value, 10);
+    return { street: Number.isFinite(street) ? street : 3, seats: Number.isFinite(seats) ? seats : 2 };
+  }
+
+  function algoApplies(a, street, seats) {
+    return (a.streets || []).includes(street) && !(a.hu_only && seats > 2);
+  }
+
+  // Preflop → MCCFR; heads-up river / turn → full-range DCFR; heads-up flop and
+  // multiway postflop → sampled DCFR (buckets on the flop).
+  function recommendedAlgo(street, seats) {
+    if (street === 0) return "mccfr_es";
+    if (seats <= 2 && (street === 2 || street === 3)) return "dcfr_vector";
+    return "dcfr";
+  }
+
+  const ALGO_HINTS = {
+    dcfr_vector: "Every hand and every runout, each iteration — the fastest and exact for heads-up river / turn.",
+    dcfr: "One sampled deal per pass. Needed for flops (hand buckets) and multiway postflop.",
+    mccfr_es: "Samples chance and opponents; for preflop and multiway roots.",
+  };
+
+  // Disable what the root cannot use, move off an invalid pick, and say what the
+  // "threads" number means for the chosen algorithm.
+  function syncAlgorithm({ pickRecommended = false } = {}) {
+    const sel = $("#f-algo");
+    if (!sel) return;
+    const { street, seats } = rootShape();
+    const catalog = algoCatalog();
+    const byId = {};
+    catalog.forEach((a) => (byId[a.id] = a));
+    const opts = sel.options ? Array.from(sel.options) : [];
+    opts.forEach((o) => {
+      const a = byId[o.value];
+      const ok = !a || algoApplies(a, street, seats);
+      o.disabled = !ok;
+      o.title = ok ? a && a.for ? `For: ${a.for}` : "" : `Not for this root${a && a.for ? " — for: " + a.for : ""}`;
+    });
+    const cur = byId[sel.value];
+    if (pickRecommended || (cur && !algoApplies(cur, street, seats))) {
+      sel.value = recommendedAlgo(street, seats);
     }
+    const algo = sel.value;
+    const hint = $("#f-algo-hint");
+    if (hint) hint.textContent = ALGO_HINTS[algo] || "";
+    // Card abstraction follows: flops are bucketed, the full-range solver is exact.
+    const abs = $("#f-abs");
+    if (abs) {
+      if (algo === "dcfr_vector" || street === 0 || street >= 2) abs.value = "none";
+      else if (street === 1 && seats <= 2) abs.value = "ochs";
+    }
+    const threads = $("#c-threads");
+    const label = $("#c-threads-label");
+    const thint = $("#c-threads-hint");
+    // Until the user types a number, the box holds each algorithm's natural
+    // default: real threads for full-range DCFR (same result for any count),
+    // one deal per iteration for sampled DCFR.
+    if (threads && !(threads.dataset && threads.dataset.userSet)) {
+      threads.value = String(algo === "dcfr_vector" ? defaultThreads() : 1);
+    }
+    if (threads) {
+      if (algo === "mccfr_es") {
+        threads.disabled = true;
+        if (label) label.textContent = "Threads";
+        if (thint) thint.textContent = "Not used: MCCFR samples one deal per iteration.";
+      } else if (algo === "dcfr") {
+        threads.disabled = false;
+        if (label) label.textContent = "Deals per iteration";
+        if (thint) thint.textContent = "Sampled one after another each iteration — not in parallel. 1 is usual.";
+      } else {
+        threads.disabled = false;
+        if (label) label.textContent = "Threads";
+        if (thint)
+          thint.textContent =
+            street === 2 ? "Turn roots solve their rivers in parallel." : "River roots use one thread (one board).";
+      }
+    }
+  }
+
+  function defaultThreads() {
+    const n = typeof navigator !== "undefined" && navigator.hardwareConcurrency ? navigator.hardwareConcurrency : 4;
+    return Math.max(1, Math.min(8, n));
+  }
+
+  function threadsLabel() {
+    const label = $("#c-threads-label");
+    return (label && label.textContent) || "Threads";
+  }
+
+  function onStreetChange() {
+    syncAlgorithm({ pickRecommended: true });
     updateStackMin();
     renderBoardSlots();
   }
@@ -354,6 +563,7 @@
       if (!p.raise_sizes_pm.length) $("#f-size-preset").value = "custom";
     }
     if (p.algorithm) $("#f-algo").value = p.algorithm;
+    syncAlgorithm({ pickRecommended: !p.algorithm });
     if (p.card_abstraction) $("#f-abs").value = p.card_abstraction;
     if (p.allin_atom != null) $("#f-allin").checked = !!p.allin_atom;
     if (p.ante_chips != null) $("#f-ante").value = String(p.ante_chips);
@@ -363,6 +573,12 @@
     updateStackMin(); // street / bb / ante were set programmatically (no change event)
     state.board = (p.board || []).slice();
     renderBoardSlots();
+    // A preset that names ranges sets them; one that does not leaves the boxes.
+    if (p.range_oop != null || p.range_ip != null) {
+      if (p.range_oop != null) $("#f-range-oop").value = p.range_oop;
+      if (p.range_ip != null) $("#f-range-ip").value = p.range_ip;
+      syncRangeFromTextareas();
+    }
     $$(".preset-btn").forEach((b) => b.classList.toggle("active", b.dataset.id === p.id));
   }
 
@@ -391,19 +607,19 @@
 
   function collectRoot() {
     const stacksRaw = $("#f-stacks").value.trim();
-    const stacks_bb = stacksRaw
-      ? stacksRaw.split(/[,\s]+/).filter(Boolean).map(Number)
-      : [];
+    const stacks_bb = stacksRaw ? stacksRaw.split(/[,\s]+/).filter(Boolean).map(Number) : [];
+    const badStack = stacksRaw ? stacksRaw.split(/[,\s]+/).filter(Boolean).find((x) => !Number.isFinite(Number(x))) : null;
+    if (badStack != null) throw new FieldError("#f-stacks", `Multiway stacks: "${badStack}" is not a number`);
     const board = state.board.filter((c) => c != null).map(Number);
     return {
       street: parseInt($("#f-street").value, 10),
-      pot_bb: parseFloat($("#f-pot").value),
-      effective_stack_bb: parseFloat($("#f-stack").value),
+      pot_bb: readNumber("#f-pot", { label: "Pot (bb)" }),
+      effective_stack_bb: readNumber("#f-stack", { label: "Stack (bb)" }),
       board,
-      num_seats: parseInt($("#f-seats").value, 10),
-      bb_chips: parseInt($("#f-bb").value, 10),
-      sb_chips: parseInt($("#f-sb").value, 10),
-      ante_chips: parseInt($("#f-ante").value, 10),
+      num_seats: readNumber("#f-seats", { int: true, min: 2, label: "Seats" }),
+      bb_chips: readNumber("#f-bb", { int: true, min: 1, label: "BB" }),
+      sb_chips: readNumber("#f-sb", { int: true, min: 0, label: "SB" }),
+      ante_chips: readNumber("#f-ante", { int: true, min: 0, label: "Ante" }),
       raise_sizes_pm: parseSizes(),
       size_preset: $("#f-size-preset").value,
       allin_atom: $("#f-allin").checked,
@@ -416,6 +632,7 @@
   }
 
   async function previewTree() {
+    clearInvalid();
     try {
       const tree = await api("/api/tree/preview", {
         method: "POST",
@@ -426,7 +643,7 @@
       el.textContent = formatTreeText(tree.tree, 0);
       toast(`Tree: ${tree.num_nodes_built} nodes · ${tree.street_name}`, "ok");
     } catch (e) {
-      toast(String(e.message || e), "error");
+      reportError(e);
     }
   }
 
@@ -457,13 +674,22 @@
     let poll = parseInt(($("#c-poll") && $("#c-poll").value) || "50", 10);
     if (!Number.isFinite(poll) || poll < 1) poll = 50;
     if (iters === 0) poll = Math.min(poll, 100);
+    const optional = (sel) => {
+      const raw = String($(sel).value).trim();
+      return raw === "" ? 0 : readNumber(sel, { min: 0 });
+    };
+    const threadsBox = $("#c-threads");
     return {
       max_iterations: iters,
       unlimited: iters === 0,
-      thread_num: parseInt($("#c-threads").value, 10),
-      target_exploitability_bb: parseFloat($("#c-expl").value) || 0,
-      time_budget_secs: parseFloat($("#c-time").value) || 0,
-      seed: parseInt($("#c-seed").value, 10),
+      // (TOOL-017) unused by MCCFR: the box is disabled and 1 is sent
+      thread_num:
+        threadsBox && threadsBox.disabled ? 1 : readNumber("#c-threads", { int: true, min: 1, label: threadsLabel() }),
+      target_exploitability_bb: optional("#c-expl"),
+      time_budget_secs: optional("#c-time"),
+      // (TOOL-030) a live exploitability number while the solve runs
+      expl_check_secs: optional("#c-expl-check"),
+      seed: String($("#c-seed").value).trim() === "" ? 0 : readNumber("#c-seed", { int: true, label: "Seed" }),
       use_isomorphism: $("#c-iso").checked,
       algorithm: $("#f-algo").value,
       card_abstraction: $("#f-abs").value,
@@ -485,11 +711,116 @@
     if (btnStop) btnStop.disabled = !live;
   }
 
+  // ---------- validate (TOOL-032) ----------
+  function fmtMb(mb) {
+    if (!Number.isFinite(mb)) return "?";
+    if (mb >= 1024) return (mb / 1024).toFixed(mb >= 10240 ? 0 : 1) + " GB";
+    if (mb >= 10) return Math.round(mb) + " MB";
+    return mb.toFixed(1) + " MB";
+  }
+
+  function fmtCount(n) {
+    if (!Number.isFinite(n)) return "?";
+    if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+    if (n >= 1e4) return Math.round(n / 1e3) + "k";
+    return String(n);
+  }
+
+  function hideValidateResult() {
+    const box = $("#validate-result");
+    if (box) box.classList.add("hidden");
+  }
+
+  // What the root means (ranges) and what solving it will need (memory against
+  // this machine's budget, infosets, tree size) — or why the solver would refuse.
+  function renderValidateResult(r, est, root) {
+    const box = $("#validate-result");
+    if (!box) return;
+    box.classList.remove("hidden", "warn", "bad");
+    if (!r || !r.ok) {
+      box.classList.add("bad");
+      box.innerHTML =
+        `<div class="vr-head">Root not valid</div>` +
+        `<div class="vr-msg">${escapeHtml((r && r.error) || "invalid")}</div>`;
+      return;
+    }
+    const rg = r.ranges || {};
+    const rangeText = (x) => (!x ? "—" : x.full ? "100%" : `${x.combos} combos`);
+    const rows = [
+      ["OOP range", rangeText(rg.oop)],
+      ["IP range", rangeText(rg.ip)],
+    ];
+    let head = "Root OK";
+    let msg = "";
+    let meter = "";
+    if (est && est.ok) {
+      const a = algoCatalog().find((x) => x.id === est.algorithm);
+      rows.push(["Algorithm", (a && a.label) || est.algorithm]);
+      const frac = est.budget_mb > 0 ? est.est_mb / est.budget_mb : 0;
+      rows.push(["Memory", `≈ ${fmtMb(est.est_mb)} of ${fmtMb(est.budget_mb)}`]);
+      const pct = Math.min(100, Math.max(1, frac * 100)).toFixed(1);
+      meter = `<div class="mem-meter" title="Estimated memory against this machine's budget"><span style="width:${pct}%"></span></div>`;
+      rows.push(["Infosets", "≈ " + fmtCount(est.est_infosets)]);
+      const oneRunout = root && root.street > 0 && root.street < 3;
+      rows.push([oneRunout ? "Decision nodes (one runout)" : "Decision nodes", fmtCount(est.public_nodes)]);
+      if (est.refuse_reason) {
+        box.classList.add("bad");
+        head = "Root OK — but the solver would refuse it";
+        msg = est.refuse_reason;
+      } else if (frac > 0.5) {
+        box.classList.add("warn");
+        msg = "More than half of this machine's solver memory budget — other programs may slow down.";
+      }
+    } else if (est && est.error) {
+      msg = "No memory estimate: " + est.error;
+    }
+    const rowHtml = rows
+      .map(([k, v]) => {
+        const line = `<div class="vr-row"><span>${escapeHtml(k)}</span><b>${escapeHtml(v)}</b></div>`;
+        return k === "Memory" ? line + meter : line;
+      })
+      .join("");
+    box.innerHTML =
+      `<div class="vr-head">${escapeHtml(head)}</div>` + rowHtml + (msg ? `<div class="vr-msg">${escapeHtml(msg)}</div>` : "");
+  }
+
+  async function validateAll() {
+    clearInvalid();
+    let root;
+    let config;
+    try {
+      root = collectRoot();
+      config = collectConfig();
+    } catch (e) {
+      reportError(e);
+      return;
+    }
+    try {
+      const r = await api("/api/validate_root", { method: "POST", body: JSON.stringify(root) });
+      let est = null;
+      if (r.ok) {
+        try {
+          est = await api("/api/estimate", { method: "POST", body: JSON.stringify({ root, config, save: false }) });
+        } catch (e) {
+          est = { ok: false, error: errorText(e) };
+        }
+      }
+      renderValidateResult(r, est, root);
+      if (!r.ok) toast(r.error || "invalid", "error");
+      else if (est && est.ok && est.refuse_reason) toast("The solver would refuse this root — see Validate", "error");
+      else toast("Root OK" + (r.root && r.root.root_id ? ": " + r.root.root_id : ""), "ok");
+    } catch (e) {
+      reportError(e);
+    }
+  }
+
   // ---------- solve ----------
   async function startSolve() {
-    const root = collectRoot();
-    const config = collectConfig();
+    clearInvalid();
     try {
+      const root = collectRoot();
+      const config = collectConfig();
       const job = await api("/api/solve", {
         method: "POST",
         body: JSON.stringify({ root, config, save: true }),
@@ -497,11 +828,11 @@
       state.currentJobId = job.job_id;
       setTransportButtons("running");
       updateJobBadges(job);
-      const lim = config.unlimited || config.max_iterations === 0 ? "∞" : config.max_iterations;
+      const lim = job.config && Number(job.config.max_iterations) === 0 ? "∞" : (job.config || {}).max_iterations;
       toast(`Solve started (${lim} iters)`, "ok");
       startPolling();
     } catch (e) {
-      toast(String(e.message || e), "error");
+      reportError(e);
     }
   }
 
@@ -519,7 +850,7 @@
       // stopped within ~10 s — say so, instead of implying an instant stop.
       toast("Stop requested — saving at the next iteration; force-stopped after ~10 s if stuck", "ok");
     } catch (e) {
-      toast(String(e.message || e), "error");
+      reportError(e);
     }
   }
 
@@ -530,7 +861,7 @@
       updateJobBadges(j);
       toast("Paused", "ok");
     } catch (e) {
-      toast(String(e.message || e), "error");
+      reportError(e);
     }
   }
 
@@ -542,7 +873,7 @@
       toast("Resumed", "ok");
       startPolling();
     } catch (e) {
-      toast(String(e.message || e), "error");
+      reportError(e);
     }
   }
 
@@ -558,7 +889,7 @@
       toast("Kuhn solve started — result stays on this tab", "ok");
       startPolling();
     } catch (e) {
-      toast(String(e.message || e), "error");
+      reportError(e);
     }
   }
 
@@ -595,6 +926,7 @@
   async function pollJobsOnce() {
     try {
       const data = await api("/api/jobs");
+      noteServerUp();
       const active = data.active;
       if (!active) return;
       if (!state.currentJobId) state.currentJobId = active.job_id;
@@ -646,8 +978,10 @@
           stopLiveView();
         }
       }
-    } catch (_) {
-      /* ignore transient */
+    } catch (e) {
+      // (TOOL-053) a transient error is ignored, but a server that stopped
+      // answering is said out loud instead of showing "running" forever.
+      if (e && e.offline) noteServerDown();
     }
   }
 
@@ -659,10 +993,9 @@
     const unlimited =
       prog.unlimited || (prog.config && Number(prog.config.max_iterations) === 0);
     $("#st-iters").textContent = unlimited ? `${iters} / ∞` : String(iters);
-    $("#st-expl").textContent =
-      prog.exploitability_bb != null
-        ? Number(prog.exploitability_bb).toFixed(4) + " bb"
-        : "—";
+    const stExpl = $("#st-expl");
+    stExpl.textContent = explText(prog.exploitability_bb, explKindOf(prog));
+    stExpl.title = explTitle(explKindOf(prog));
     $("#st-ninfo").textContent =
       prog.num_infosets != null ? String(prog.num_infosets) : "—";
     const notes = []
@@ -710,10 +1043,9 @@
     updateJobBadges(job);
     const rep = job.report || {};
     $("#st-iters").textContent = rep.iterations_run != null ? rep.iterations_run : "—";
-    $("#st-expl").textContent =
-      rep.exploitability_bb != null
-        ? Number(rep.exploitability_bb).toFixed(4) + " bb"
-        : "—";
+    const kind = explKindOf(rep) || explKindOf(job);
+    $("#st-expl").textContent = explText(rep.exploitability_bb, kind);
+    $("#st-expl").title = explTitle(kind);
     const strat = rep.strategy || {};
     const n =
       strat.num_infosets != null
@@ -739,7 +1071,7 @@
         firstOpen: true,
       });
     } catch (e) {
-      if (!opts.live) toast(String(e.message || e), "error");
+      if (!opts.live) reportError(e);
     }
     if (wantLive) startLiveView();
   }
@@ -937,7 +1269,7 @@
       state.viewData = data;
       renderView(data, { keepDetail: true });
     } catch (e) {
-      if (!isStaleView(ticket)) toast(String(e.message || e), "error");
+      if (!isStaleView(ticket)) reportError(e);
     }
   }
 
@@ -986,7 +1318,7 @@
       sum.board_str || null,
       sum.num_infosets != null ? `${sum.num_infosets} infosets` : null,
       sum.iterations_run != null ? `${sum.iterations_run} iters` : null,
-      sum.exploitability_bb != null ? `expl ${Number(sum.exploitability_bb).toFixed(3)} bb` : null,
+      sum.exploitability_bb != null ? "expl " + explText(sum.exploitability_bb, explKindOf(sum), 3) : null,
       data.matrix && data.matrix.aggregated_from_combos ? "class avg" : null,
     ]
       .filter(Boolean)
@@ -994,15 +1326,19 @@
     const chipsEl = $("#view-meta-chips");
     if (chipsEl) {
       chipsEl.textContent = chips || "loaded";
+      chipsEl.title = explTitle(explKindOf(sum));
       chipsEl.classList.remove("muted");
     }
 
     const lines = [
       `status: ${sum.status}`,
-      `street: ${streetLab || sum.street}  board: ${sum.board_str || "—"}`,
+      `street: ${streetLab || "—"}  board: ${sum.board_str || "—"}`,
       `infosets: ${sum.num_infosets}  nodes: ${sum.num_nodes}`,
       sum.iterations_run != null ? `iters: ${sum.iterations_run}` : null,
-      sum.exploitability_bb != null ? `expl: ${Number(sum.exploitability_bb).toFixed(4)} bb` : null,
+      sum.exploitability_bb != null
+        ? `expl: ${explText(sum.exploitability_bb, explKindOf(sum))}` +
+          (explKindOf(sum) ? `\n  (${explTitle(explKindOf(sum))})` : "")
+        : null,
       sum.range_oop ? `range_oop: ${sum.range_oop}` : null,
       sum.range_ip ? `range_ip: ${sum.range_ip}` : null,
     ].filter(Boolean);
@@ -1014,7 +1350,6 @@
     state.chartPack = data.chart_pack || null;
     renderRunoutPicker(data.runout);
     renderLineNav(data);
-    renderLineTree(data.solution_tree);
     state.loadedPath = sum.source || (state.viewSource && state.viewSource.path) || null;
     const exp = $("#btn-export");
     if (exp) exp.disabled = !state.loadedPath || state.loadedPath === "<memory>";
@@ -1216,8 +1551,8 @@
       btn.type = "button";
       const pct = Math.round((a.freq || 0) * 1000) / 10;
       btn.className = "line-act " + (a.css || "") + (a.terminal ? " terminal" : "");
-      btn.disabled = !a.has_next && !a.terminal ? false : false;
-      if (!a.has_next && !a.terminal && !navigable) btn.disabled = true;
+      // Only an action with no next node, no terminal and no line keys is dead.
+      btn.disabled = !a.has_next && !a.terminal && !navigable;
       btn.innerHTML = `
         <span class="la-name">${escapeHtml(a.short || a.action)}</span>
         <span class="la-freq">${pct}%</span>
@@ -1278,7 +1613,7 @@
           });
           await loadFileView(pack.file);
         } catch (e) {
-          toast(String(e.message || e), "error");
+          reportError(e);
         }
         return;
       }
@@ -1303,24 +1638,21 @@
       return;
     }
     if (act.chart_file) {
-      const nav = state.lineNav;
-      const onlyOne = nav && nav.by_path && Object.keys(nav.by_path).length <= 1;
-      if (onlyOne || act.chart_file) {
-        state.selectedHandMix = null;
-        state.selectedClassId = null;
-        state.selectedNodePath = act.next_path;
-        if (act.next_seat != null) state.selectedSeat = act.next_seat;
-        try {
-          await api("/api/library/load", {
-            method: "POST",
-            body: JSON.stringify({ path: act.chart_file }),
-          });
-          await loadFileView(act.chart_file);
-        } catch (e) {
-          toast(String(e.message || e), "error");
-        }
-        return;
+      // A chart pack keeps one node per file: the next node is another file.
+      state.selectedHandMix = null;
+      state.selectedClassId = null;
+      state.selectedNodePath = act.next_path;
+      if (act.next_seat != null) state.selectedSeat = act.next_seat;
+      try {
+        await api("/api/library/load", {
+          method: "POST",
+          body: JSON.stringify({ path: act.chart_file }),
+        });
+        await loadFileView(act.chart_file);
+      } catch (e) {
+        toast(errorText(e), "error");
       }
+      return;
     }
     if (act.has_next && act.next_path) {
       const node = ((state.viewData && state.viewData.nodes) || []).find(
@@ -1351,7 +1683,7 @@
     }
     el.classList.remove("muted");
     el.textContent = [
-      q.exploitability_bb != null ? `expl: ${Number(q.exploitability_bb).toFixed(4)} bb` : null,
+      q.exploitability_bb != null ? `expl: ${explText(q.exploitability_bb, q.expl_kind)}` : null,
       q.iterations_run != null ? `iters: ${q.iterations_run}` : null,
       `infosets: ${q.num_infosets}`,
       `H(π) mean: ${q.mean_entropy}`,
@@ -1376,13 +1708,6 @@
       .join("");
     el.innerHTML = `<strong>${escapeHtml(n.label || "P" + n.seat)} · ${escapeHtml(prettyPath(n.path))}</strong> · ${agg.num_hands} hands
       <div class="mix-row">${chips}</div>`;
-  }
-
-  function renderLineTree(st) {
-    const el = $("#line-tree");
-    if (!el) return;
-    el.innerHTML = "";
-    if (!st || !st.forest) return;
   }
 
   function setViewMode(mode) {
@@ -1451,6 +1776,7 @@
           el.title = [
             cell.label,
             `F ${Math.round(f * 100)}%  C ${Math.round(c * 100)}%  R ${Math.round(a * 100)}%`,
+            evText(cell), // (TOOL-035)
             cell.n_combos ? `${cell.n_combos} combos averaged` : "",
           ]
             .filter(Boolean)
@@ -1467,6 +1793,9 @@
               strategy: cell.strategy,
               private: cell.class_id,
               private_kind: "class",
+              ev_bb: cell.ev_bb,
+              equity: cell.equity,
+              n_combos: cell.n_combos,
             });
             renderLineNav(state.viewData || {});
           });
@@ -1493,6 +1822,8 @@
         <td class="muted">${escapeHtml(String(r.primary_action || ""))} ${
           r.primary_prob != null ? (r.primary_prob * 100).toFixed(0) + "%" : ""
         }</td>
+        <td class="num">${Number.isFinite(r.ev_bb) ? escapeHtml(fmtEv(r.ev_bb)) : '<span class="muted">—</span>'}</td>
+        <td class="num">${Number.isFinite(r.equity) ? (r.equity * 100).toFixed(1) + "%" : '<span class="muted">—</span>'}</td>
       `;
       tr.addEventListener("click", () => {
         $$("#hand-table tbody tr.selected").forEach((x) => x.classList.remove("selected"));
@@ -1528,6 +1859,23 @@
     );
   }
 
+  // (TOOL-035) "+1.23 bb" — the hand's EV at the node under the solved strategies.
+  function fmtEv(ev) {
+    return (ev > 0 ? "+" : ev < 0 ? "−" : "") + Math.abs(ev).toFixed(2) + " bb";
+  }
+
+  // One line for tooltips / the detail panel: "EV +1.23 bb · equity 64.2%".
+  function evText(x) {
+    if (!x || !Number.isFinite(x.ev_bb)) return "";
+    const eq = Number.isFinite(x.equity) ? ` · equity ${(x.equity * 100).toFixed(1)}%` : "";
+    return `EV ${fmtEv(x.ev_bb)}${eq}`;
+  }
+
+  const EV_TITLE =
+    "Expected value at this node under the solved strategies: the hand's expected share of the " +
+    "final pot minus the chips it still puts in from here. Equity = chance of winning at " +
+    "showdown against the range that reaches the node (ties count half).";
+
   function showHandDetail(r) {
     const el = $("#hand-detail");
     const strat = r.strategy || [];
@@ -1535,6 +1883,11 @@
     html += `<div class="muted" style="font-family:var(--mono);font-size:0.75rem;margin-bottom:0.6rem">P${
       r.seat ?? "?"
     } · ${escapeHtml(prettyPath(r.path))}</div>`;
+    const ev = evText(r);
+    if (ev) {
+      const avg = r.private_kind === "class" && r.n_combos > 1 ? ` <span class="muted">(${r.n_combos} combos, reach-weighted)</span>` : "";
+      html += `<div class="ev-line" title="${escapeHtml(EV_TITLE)}">${escapeHtml(ev)}${avg}</div>`;
+    }
     if (!strat.length) {
       html += '<div class="muted">No action mix.</div>';
     } else {
@@ -1583,7 +1936,7 @@
       switchTab("viewer");
       toast(`Loaded ${body.kind || "solution"} · ${body.num_infosets || "?"} infosets`, "ok");
     } catch (e) {
-      toast(String(e.message || e), "error");
+      reportError(e);
     }
   }
 
@@ -1629,6 +1982,16 @@
     return STREET_NAME[s] || String(s);
   }
 
+  // Library "Kind" column: label, tooltip, style (TOOL-055 / TOOL-031).
+  const LIB_KINDS = {
+    solve_report: ["Solve", "A finished solve report", ""],
+    chart: ["Chart", "One node of a push/fold chart pack", ""],
+    interrupted: ["Interrupted", "The solve stopped before it finished (app closed or killed) — this is its last live snapshot", "kind-warn"],
+    rejected: ["Rejected", "A teacher-batch root over the exploitability cap", "kind-bad"],
+    unverified: ["Unverified", "A teacher-batch root whose exploitability is not a final estimate", "kind-warn"],
+    large: ["Large", "Too large to peek at while listing — opens normally", ""],
+  };
+
   function renderLibrary(filter) {
     const tbody = $("#lib-table tbody");
     tbody.innerHTML = "";
@@ -1640,13 +2003,13 @@
     });
     items.forEach((it) => {
       const tr = document.createElement("tr");
-      const expl =
-        it.exploitability_bb != null ? Number(it.exploitability_bb).toFixed(3) : "—";
+      const expl = it.exploitability_bb != null ? explText(it.exploitability_bb, it.expl_kind, 3) : "—";
+      const kind = LIB_KINDS[it.kind] || [it.kind || "—", "", ""];
       tr.innerHTML = `
         <td><strong>${escapeHtml(it.name)}</strong><div class="muted" style="font-size:0.7rem">${escapeHtml(it.rel || "")}</div></td>
-        <td class="muted">${escapeHtml(it.kind || "—")}</td>
+        <td><span class="kind-tag ${kind[2]}" title="${escapeHtml(kind[1])}">${escapeHtml(kind[0])}</span></td>
         <td>${escapeHtml(streetLabel(it.street))}</td>
-        <td class="muted">${expl}</td>
+        <td class="muted" title="${escapeHtml(explTitle(it.expl_kind))}">${escapeHtml(expl)}</td>
         <td class="muted">${it.num_infosets != null ? it.num_infosets : "—"}</td>
         <td class="muted">${it.size_kb} KB</td>
         <td><button type="button" class="btn btn-ghost btn-sm">Open</button></td>
@@ -1660,7 +2023,7 @@
           await loadFileView(it.path);
           switchTab("viewer");
         } catch (e) {
-          toast(String(e.message || e), "error");
+          reportError(e);
         }
       };
       tr.querySelector("button").addEventListener("click", (e) => {
@@ -1672,13 +2035,91 @@
     });
   }
 
+  // (TOOL-054) Compare-with choices: every openable solution but the one shown.
+  async function refreshCompareOptions() {
+    const sel = $("#cmp-path");
+    if (!sel || state.cmpLoading) return;
+    state.cmpLoading = true;
+    try {
+      if (!state.libItems || !state.libItems.length || Date.now() - (state.libFetchedAt || 0) > 15000) {
+        const data = await api("/api/library");
+        state.libItems = data.items || [];
+        state.libFetchedAt = Date.now();
+      }
+    } catch (_) {
+      /* keep what we have */
+    } finally {
+      state.cmpLoading = false;
+    }
+    const cur = sel.value;
+    const here = state.loadedPath;
+    const opts = (state.libItems || []).filter((it) => it.path !== here && it.kind !== "chart");
+    sel.innerHTML = "";
+    const first = document.createElement("option");
+    first.value = "";
+    first.textContent = opts.length ? "Choose a solution…" : "No other solutions in the Library";
+    sel.appendChild(first);
+    opts.forEach((it) => {
+      const o = document.createElement("option");
+      o.value = it.path;
+      const street = it.street != null ? streetLabel(it.street) : "";
+      o.textContent = [it.name, street, it.board_str].filter(Boolean).join(" · ");
+      sel.appendChild(o);
+    });
+    if (cur && opts.some((it) => it.path === cur)) sel.value = cur;
+  }
+
   async function loadLibrary() {
     try {
       const data = await api("/api/library");
       state.libItems = data.items || [];
+      state.libFetchedAt = Date.now();
       renderLibrary($("#lib-filter") ? $("#lib-filter").value : "");
     } catch (e) {
-      toast(String(e.message || e), "error");
+      reportError(e);
+    }
+  }
+
+  // ---------- connection watch (TOOL-053) ----------
+  // Consecutive failed requests before the banner shows (~3 s while a solve
+  // polls every 800 ms; ~10 s from the idle heartbeat).
+  const OFFLINE_AFTER = 3;
+
+  function noteServerUp() {
+    if (state.offline) {
+      state.offline = false;
+      const b = $("#conn-banner");
+      if (b) b.classList.add("hidden");
+      toast("Reconnected to the solver", "ok");
+    }
+    state.connFailures = 0;
+  }
+
+  function noteServerDown() {
+    state.connFailures = (state.connFailures || 0) + 1;
+    if (state.connFailures < OFFLINE_AFTER || state.offline) return;
+    state.offline = true;
+    const b = $("#conn-banner");
+    if (b) {
+      b.textContent =
+        "The solver's local server stopped responding — close and reopen the CFR Solver app. " +
+        "Finished solves are saved; an interrupted one is listed in the Library.";
+      b.classList.remove("hidden");
+    }
+    const jb = $("#job-badge");
+    if (jb) {
+      jb.textContent = "offline";
+      jb.className = "badge badge-bad";
+    }
+  }
+
+  async function heartbeat() {
+    if (document.hidden) return;
+    try {
+      await api("/api/health");
+      noteServerUp();
+    } catch (e) {
+      if (e && e.offline) noteServerDown();
     }
   }
 
@@ -1687,6 +2128,16 @@
     initTabs();
     wireUpload();
     $("#f-street").addEventListener("change", onStreetChange);
+    // (TOOL-032) Validate's answer is about the root as it WAS: any edit hides it.
+    const builder = $("#panel-builder");
+    if (builder) ["input", "change"].forEach((ev) => builder.addEventListener(ev, hideValidateResult));
+    // (TOOL-008 / TOOL-017) the algorithm menu follows the root's shape
+    $("#f-algo").addEventListener("change", () => syncAlgorithm());
+    $("#f-seats").addEventListener("change", () => syncAlgorithm({ pickRecommended: true }));
+    // A number the user typed stays, whatever the algorithm (TOOL-017).
+    $("#c-threads").addEventListener("input", () => {
+      $("#c-threads").dataset.userSet = "1";
+    });
     $("#btn-clear-board").addEventListener("click", () => {
       state.board = [];
       renderBoardSlots();
@@ -1703,22 +2154,7 @@
     $("#f-sizes").addEventListener("input", () => {
       $("#f-size-preset").value = "custom";
     });
-    $("#btn-validate").addEventListener("click", async () => {
-      try {
-        const r = await api("/api/validate_root", {
-          method: "POST",
-          body: JSON.stringify(collectRoot()),
-        });
-        if (r.ok) {
-          // Say what the range text MEANS, not just that it parsed (E11).
-          const rg = r.ranges || {};
-          const bit = (n, x) => (x ? ` · ${n} ${x.full ? "100%" : x.combos + " combos"}` : "");
-          toast("Root OK: " + (r.root.root_id || "valid") + bit("OOP", rg.oop) + bit("IP", rg.ip), "ok");
-        } else toast(r.error || "invalid", "error");
-      } catch (e) {
-        toast(String(e.message || e), "error");
-      }
-    });
+    $("#btn-validate").addEventListener("click", validateAll);
     $("#btn-solve").addEventListener("click", startSolve);
     $("#btn-stop").addEventListener("click", stopSolve);
     $("#btn-pause").addEventListener("click", pauseSolve);
@@ -1737,7 +2173,21 @@
         }
       });
     }
-    $("#btn-kuhn").addEventListener("click", startKuhn);
+    // The Diagnostics menu closes like any menu: outside click or Escape.
+    document.addEventListener("click", (e) => {
+      const menu = $("#diag-menu");
+      if (menu && menu.open && menu.contains && !menu.contains(e.target)) menu.open = false;
+    });
+    document.addEventListener("keydown", (e) => {
+      const menu = $("#diag-menu");
+      if (e.key === "Escape" && menu && menu.open) menu.open = false;
+    });
+    $("#btn-kuhn").addEventListener("click", () => {
+      const menu = $("#diag-menu");
+      if (menu) menu.open = false;
+      switchTab("builder"); // the self-test reports in the Solve tab's status
+      startKuhn();
+    });
     $("#btn-view-job").addEventListener("click", () => openCurrentJob({ live: true }));
     $("#btn-filter").addEventListener("click", () => {
       state.pageOffset = 0;
@@ -1797,17 +2247,27 @@
         });
         toast("Exported → " + r.rel, "ok");
       } catch (e) {
-        toast(String(e.message || e), "error");
+        reportError(e);
       }
     });
+    const cmpSel = $("#cmp-path");
+    if (cmpSel) {
+      // Filled from the Library when opened (TOOL-054; it was a typed path).
+      cmpSel.addEventListener("focus", () => refreshCompareOptions());
+      cmpSel.addEventListener("mousedown", () => refreshCompareOptions());
+    }
     $("#btn-compare").addEventListener("click", async () => {
-      const pathB = $("#cmp-path").value.trim();
+      const pathB = String($("#cmp-path").value || "").trim();
       const pathA =
         state.loadedPath && state.loadedPath !== "<memory>"
           ? state.loadedPath
           : state.viewSource && state.viewSource.path;
-      if (!pathA || !pathB) {
-        toast("Need current file + path B", "error");
+      if (!pathA) {
+        toast("Open a saved solution first — the comparison needs a file on each side", "error");
+        return;
+      }
+      if (!pathB) {
+        toast("Choose a solution to compare with", "error");
         return;
       }
       try {
@@ -1825,7 +2285,7 @@
             .map((x) => `  ${x.hand}: L1=${x.l1}  ${x.a_primary} vs ${x.b_primary}`),
         ].join("\n");
       } catch (e) {
-        toast(String(e.message || e), "error");
+        reportError(e);
       }
     });
 
@@ -1833,6 +2293,8 @@
 
     try {
       const health = await api("/api/health");
+      const ver = $("#app-version");
+      if (ver && health.version) ver.textContent = "CFR Solver " + health.version;
       const rb = $("#rust-badge");
       if (health.rust_cfr) {
         rb.textContent = "CFR ready";
@@ -1853,12 +2315,17 @@
         list.appendChild(b);
       });
       if (state.meta.presets && state.meta.presets[2]) applyPreset(state.meta.presets[2]);
-      else renderBoardSlots();
+      else {
+        syncAlgorithm();
+        renderBoardSlots();
+      }
     } catch (e) {
       toast("Failed to load meta: " + e.message, "error");
+      syncAlgorithm();
       renderBoardSlots();
     }
     await reattachActiveJob();
+    state.heartbeatTimer = setInterval(heartbeat, 4000);
   }
 
   // (review 2026-09-20 JS races) The solve lives in the server, not the page. A

@@ -12,8 +12,12 @@ infoset ids:
 
 - ``unused_uniform`` — untouched node (``visit_mass==0``) or, on legacy
   dumps without visit mass, exact 1/n average strategy (the 0.5/0.5 default).
-- ``low_visit`` — ``visit_mass`` present and below ``min_visit_mass``
-  (teacher default 1.0 = one DCFR visit). Library default is 0 (off).
+- ``low_visit`` — fewer real visits than the floor (teacher default 1). New
+  dumps carry ``visits`` = how many times the average strategy was
+  accumulated, and the floor counts those (TOOL-028). ``visit_mass`` (sum of
+  the reach-weighted, DCFR-decayed strategy sums — its scale depends on the
+  iteration count and the depth, so often-but-early visited nodes fell under
+  1.0) is used only for legacy dumps without ``visits``. Library default 0 (off).
 - ``illegal_fold`` — FOLD in the menu or fold mass > 0 when ``to_call==0``.
 - ``inconsistent_public`` — pot<=0, to_call<0, to_call>hero stack, or a
   v2 row missing ``to_call_chips``.
@@ -74,6 +78,7 @@ from plo5bp.gto.preflop_class import (
     representative_hole,
 )
 from plo5bp.gto.roots import CLUBGG_NLH_ROOT
+from plo5bp.gto.jsonio import atomic_write_text
 from plo5bp.gto.teacher import (
     TEACHER_HOLDOUT_FRAC,
     TEACHER_MAX_EXPL_BB,
@@ -333,8 +338,14 @@ def reject_reason(
     iso_id: int | None = None,
     raw_combo: int | None = None,
     min_visit_mass: float = 0.0,
+    visits: int | None = None,
 ) -> str | None:
-    """Return a REJECT_* reason or None if the row may be exported."""
+    """Return a REJECT_* reason or None if the row may be exported.
+
+    The low-visit floor ``min_visit_mass`` means "at least that many visits":
+    it counts ``visits`` when the dump has them (TOOL-028) and falls back to the
+    legacy ``visit_mass`` comparison otherwise.
+    """
     if iso_id is not None and raw_combo is None:
         return REJECT_ISO_WITHOUT_RAW
     if v2_missing_to_call:
@@ -345,12 +356,12 @@ def reject_reason(
         return REJECT_INCONSISTENT_PUBLIC
     if is_unused_uniform(probs, visit_mass=visit_mass):
         return REJECT_UNUSED_UNIFORM
-    if (
-        visit_mass is not None
-        and float(min_visit_mass) > 0.0
-        and float(visit_mass) < float(min_visit_mass)
-    ):
-        return REJECT_LOW_VISIT
+    if float(min_visit_mass) > 0.0:
+        if visits is not None:
+            if int(visits) < math.ceil(float(min_visit_mass)):
+                return REJECT_LOW_VISIT
+        elif visit_mass is not None and float(visit_mass) < float(min_visit_mass):
+            return REJECT_LOW_VISIT
     acts_u = [str(a).upper() for a in actions]
     fold_in_menu = "FOLD" in acts_u
     fold_mass = sum(
@@ -784,6 +795,11 @@ def strategy_to_labels(
                 visit_mass = float(visit_mass)
             except (TypeError, ValueError):
                 visit_mass = None
+        visits = iset.get("visits")
+        try:
+            visits = None if visits is None else int(visits)
+        except (TypeError, ValueError):
+            visits = None
         hero_stack = int(chip_est.get("hero_stack") or _hero_stack(row_stacks, seat, stack_chips))
         why = reject_reason(
             actions=actions,
@@ -798,6 +814,7 @@ def strategy_to_labels(
             iso_id=iso_id,
             raw_combo=raw_combo,
             min_visit_mass=min_visit_mass,
+            visits=visits,
         )
         if why is not None:
             if stats is not None:
@@ -869,6 +886,7 @@ def strategy_to_labels(
             "mc_br_proxy": is_mc_proxy,
             "hero_stack_est": chip_est.get("hero_stack"),
             "visit_mass": visit_mass,
+            "visits": visits,
             "bb_chips": bb,
             "root_pot_chips": int(pot_chips_root),
             "root_stacks_chips": list(stacks_chips),
@@ -979,12 +997,9 @@ def _is_solve_report(rep: Any) -> bool:
     return True
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
-    """Write via a sibling temp file + ``os.replace`` (review 2026-09-20 F10)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+# Sibling temp file + ``os.replace`` (review 2026-09-20 F10) — the shared helper
+# (TOOL-048).
+_atomic_write_text = atomic_write_text
 
 
 def _load_report(path: Path) -> dict[str, Any] | None:

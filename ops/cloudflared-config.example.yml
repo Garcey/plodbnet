@@ -1,0 +1,16 @@
+# /etc/cloudflared/config.yml — the Cloudflare tunnel that is wrapgto.com's only way
+# in (the server has no open web ports). Created once with:
+#   cloudflared tunnel login && cloudflared tunnel create wrapgto
+#   cloudflared tunnel route dns wrapgto wrapgto.com && cloudflared tunnel route dns wrapgto www.wrapgto.com
+#   cloudflared service install      (runs it as cloudflared.service)
+# Run exactly ONE connector for this tunnel: a second machine running it (e.g. a
+# laptop) would receive a share of the live traffic.
+tunnel: <TUNNEL-UUID>
+credentials-file: /etc/cloudflared/<TUNNEL-UUID>.json
+
+ingress:
+  - hostname: wrapgto.com
+    service: http://127.0.0.1:8770
+  - hostname: www.wrapgto.com
+    service: http://127.0.0.1:8770
+  - service: http_status:404

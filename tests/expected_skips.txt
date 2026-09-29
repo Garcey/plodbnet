@@ -1,0 +1,38 @@
+# Skips the suite EXPECTS on some machines (TEST-031). Every skipped test is listed
+# at the end of every run, grouped by reason; a reason that matches none of these
+# patterns is flagged as UNEXPECTED — and fails the run with --strict-skips,
+# PLO5BP_STRICT_SKIPS=1, or on CI.
+#
+# Format: <category> | <Python regex, searched case-insensitively in the skip reason>
+# Add a line only for a skip that is legitimate on SOME machine, and say why.
+
+# Optional extras / packages a machine may not have (the pixel-OCR half needs
+# `pip install -e ".[ocr]"`; this desktop has none of it).
+optional package | could not import '(cv2|pytesseract|stripe|fastapi|torch|mss|pygetwindow|windows_capture|PIL|webview|httpx)'
+optional package | No module named '(cv2|pytesseract|stripe|mss|pygetwindow|windows_capture|PIL|webview|httpx)'
+
+# Tools outside Python.
+tool | node is not installed
+tool | no bash|needs (git|a GNU bash|git and bash|git and a GNU bash)|needs Windows PowerShell
+tool | no GPU here|needs a CUDA learner|CUDA (is )?not available
+
+# An engine built before a feature (a rebuild fixes it; CI builds fresh and turns
+# these into failures — tests/conftest.py).
+engine build | extension not built|(Rust|native) CFR not built|no rust cfr|no compiled engine
+engine build | rebuild|engine build has no|engine without|not in this (engine build|binary)
+engine build | engine was built before SOURCE_HASH|engine is older than its sources|verified shuffle is off
+engine build | could not import 'plo5bp\._engine'|engine cannot deal
+
+# Files that exist only on some machines: labeled ClubGG frames / recordings (the
+# owner's capture step, TEST-027), OCR rank templates, git-ignored data/cfr solves.
+data not on disk | fixture|frame|recordings|rank templates|golden frames
+data not on disk | ^missing$|chart missing|missing chart|strategy fixture missing|missing fixtures
+data not on disk | cannot export HEAD|reference run failed
+
+# Randomized tests that skip when the dealt hand never reaches the spot they check.
+scenario not dealt | hand ended|hero never acted|never reached|no hero decision|no villain decision
+scenario not dealt | no raise available|no alternate legal gate|^terminal$|never left a hand|no finished hand
+scenario not dealt | hand terminal at deal|hand ended instantly
+
+# Features not built yet (a skip that must go away when they are).
+not built yet | homegame has no model provider hook yet

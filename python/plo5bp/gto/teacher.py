@@ -8,18 +8,28 @@ Defaults (documented, configurable at the CLI / function args):
 - **Exploitability provenance** (review 2026-09-20 D8/F6) — the cap is only
   meaningful on a number produced by a FINAL estimator. A report is
   exploitability-VERIFIED only when its notes carry ``expl_kind=<kind>`` with
-  ``kind`` in :data:`VERIFIED_EXPL_KINDS` and NO ``early_stop=`` /
-  ``promoted_from_progress`` marker. Everything else — the Monte-Carlo poll
-  estimate (``expl_kind=mc_poll``), target-based early stops (their number IS
-  the poll), time-budget / stop-file exits, multiway ``mc_br_proxy`` numbers,
-  promoted progress snapshots — is UNVERIFIED: batches neither accept nor
-  reject on it and teacher export skips it by default. See
-  :func:`expl_provenance`.
-- ``TEACHER_MIN_VISIT_MASS = 1.0`` — drop infosets whose dump ``visit_mass``
-  is present and ``< 1.0``. ``visit_mass`` is ``sum(strategy_sum)``: one
-  DCFR visit accumulates ~1.0. This is *beyond* the existing
-  ``unused_uniform`` gate (mass<=0 or legacy exact 1/n). Legacy rows
-  without ``visit_mass`` are not dropped by this floor.
+  ``kind`` in :data:`VERIFIED_EXPL_KINDS` and no ``promoted_from_progress``
+  marker. An ``early_stop=`` marker is fine when the solver re-computed its
+  final estimator on the way out: since the D8b fix every exit path does, so a
+  target / time-budget / memory stop labelled ``exact_infoset`` or
+  ``hero_enum`` (:data:`FINAL_ON_EARLY_STOP_KINDS`) is as trustworthy as a full
+  run — the number certifies the exported strategy (TOOL-001: the best
+  converging roots used to land in ``unverified/``). Still UNVERIFIED: the
+  Monte-Carlo poll (``expl_kind=mc_poll``), a legacy ``infoset_br`` early stop
+  (the pre-D8b binary wrote that token on the poll number), a ``stop_file``
+  exit (the operator interrupted the solve; a batch re-solves it on resume),
+  multiway ``mc_br_proxy`` numbers and promoted progress snapshots — batches
+  neither accept nor reject on those and teacher export skips them by default.
+  See :func:`expl_provenance`.
+- ``TEACHER_MIN_VISIT_MASS = 1.0`` — drop infosets visited fewer than once.
+  Dumps now carry ``visits`` (how many times the average strategy was
+  accumulated) and the floor counts THOSE (TOOL-028). The old test compared
+  ``visit_mass`` (``sum(strategy_sum)``) with 1.0, but that sum is reach-
+  weighted and multiplied by DCFR's ``(t/(t+1))^2`` every iteration, so its
+  scale depended on the iteration count and the depth: nodes visited often
+  but early fell under 1.0 and were dropped. Only legacy dumps without
+  ``visits`` still use the mass comparison. This is *beyond* the
+  ``unused_uniform`` gate (mass<=0 or legacy exact 1/n).
 - ``TEACHER_HOLDOUT_FRAC = 0.15`` — 15% of roots (in the 10–20% band) go
   to holdout. Assignment is SHA-256 of ``f"{split_seed}\\0{root_id}"``
   (deterministic, disjoint, independent of ``PYTHONHASHSEED``). With
@@ -57,6 +67,11 @@ SPLIT_HOLDOUT = "holdout"
 VERIFIED_EXPL_KINDS: frozenset[str] = frozenset(
     {"exact_infoset", "hero_enum", "infoset_br"}
 )
+# Kinds the current solver computes on EVERY exit path (D8b), so an early stop
+# carrying one of them reports the final estimator, not the poll (TOOL-001).
+FINAL_ON_EARLY_STOP_KINDS: frozenset[str] = frozenset({"exact_infoset", "hero_enum"})
+# Early stops that mean "interrupted", whatever the number: a batch re-solves them.
+INTERRUPTED_EARLY_STOPS: frozenset[str] = frozenset({"stop_file"})
 EXPL_UNVERIFIED_PREFIX = "expl_unverified"
 
 
@@ -112,9 +127,11 @@ def _note_token(notes: Iterable[Any], key: str) -> str | None:
 def expl_provenance(rep: Mapping[str, Any] | Any) -> ExplProvenance:
     """Classify a SolveReport (dict or dataclass) as verified / unverified.
 
-    Verified == ``status == "ok"``, a final estimator kind in the notes, and
-    no early-stop / promoted-from-progress marker. Anything else must not be
-    judged against the teacher cap.
+    Verified == ``status == "ok"``, a final estimator kind in the notes, no
+    promoted-from-progress marker, and either no early stop or an early stop
+    whose number the solver re-computed with a final estimator
+    (:data:`FINAL_ON_EARLY_STOP_KINDS`; never a ``stop_file`` interruption).
+    Anything else must not be judged against the teacher cap.
     """
     if isinstance(rep, Mapping):
         status = rep.get("status")
@@ -133,7 +150,9 @@ def expl_provenance(rep: Mapping[str, Any] | Any) -> ExplProvenance:
         return ExplProvenance(kind, False, f"status={status}", early)
     if promoted:
         return ExplProvenance(kind, False, "promoted_from_progress", early)
-    if early is not None:
+    if early is not None and (
+        early in INTERRUPTED_EARLY_STOPS or kind not in FINAL_ON_EARLY_STOP_KINDS
+    ):
         return ExplProvenance(kind, False, f"early_stop={early}", early)
     # Pre-token binary: a target-based early stop returned the poll estimate
     # with an "... early stop iter N" note and no expl_kind at all.
@@ -143,7 +162,7 @@ def expl_provenance(rep: Mapping[str, Any] | Any) -> ExplProvenance:
         return ExplProvenance(None, False, "expl_kind_missing", early)
     if kind not in VERIFIED_EXPL_KINDS:
         return ExplProvenance(kind, False, f"expl_kind={kind}", early)
-    return ExplProvenance(kind, True, "", None)
+    return ExplProvenance(kind, True, "", early)
 
 
 def holdout_assignment(

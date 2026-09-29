@@ -21,7 +21,6 @@ sampling NOISE. With delta_X = theta_X - theta_base:
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import os
 import sys
@@ -30,14 +29,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-REPO = Path(__file__).resolve().parents[1]
-
-
-def _sharp():
-    spec = importlib.util.spec_from_file_location("_sharp", REPO / "scripts" / "policy_sharpness.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+from plo5bp.evaluation import load_actor
+from plo5bp.evaluation.sharpness import check_readable, ensure_states
 
 
 def param_deltas(base: dict, a: dict, b: dict, key: str):
@@ -75,6 +68,8 @@ def main() -> None:
     ap.add_argument("b")
     ap.add_argument("--states", default="runs/snr_states.npz")
     ap.add_argument("--rows", type=int, default=60000)
+    ap.add_argument("--states-rev", type=int, default=None,
+                    help="the obs revision of a states cache written before 2026-09-28")
     ap.add_argument("--out", default="runs/update_snr.jsonl")
     args = ap.parse_args()
 
@@ -92,17 +87,16 @@ def main() -> None:
         rec[key] = {"cos": cos, "norm_a": na, "norm_b": nb, "snr2": snr2,
                     "per_tensor": {r[0]: r[1] for r in rows}}
 
-    sharp = _sharp()
-    base_actor, obs_mode, _ = sharp._load_actor(args.base)
-    st = Path(args.states)
-    if st.exists():
-        z = np.load(st)
-        obs, masks = z["obs"], z["masks"]
-    else:
-        obs, masks, sizing, tiers = sharp.build_states(base_actor, args.rows, obs_mode)
-        st.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(st, obs=obs, masks=masks, sizing=sizing, tiers=tiers)
-    lp = [gate_logp(sharp._load_actor(p)[0], obs, masks) for p in (args.base, args.a, args.b)]
+    # The base's self-play states, cached with their obs revision / layout
+    # (every checkpoint must be able to read them: plo5bp.evaluation.sharpness).
+    (obs, masks, _sizing, _tiers), info = ensure_states(
+        args.states, args.base, args.rows, args.states_rev
+    )
+    lp = []
+    for p in (args.base, args.a, args.b):
+        actor, meta = load_actor(p, check_rev=False)
+        adapt = check_readable(info, meta, actor)
+        lp.append(gate_logp(actor, adapt(obs), masks))
     legal = masks.astype(bool)
     p0, pa, pb = (np.exp(x) for x in lp)
 

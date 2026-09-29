@@ -9,6 +9,13 @@ inside the pixel helpers that need it, never at module top, so the pure
 string parser (`_parse_chip_text`) and its tests run without the `[ocr]`
 extras. `import cv2` inside a function is a `sys.modules` dict hit after the
 first call -- negligible next to a Tesseract invocation.
+
+(TOOL-033) Amounts are read by the in-process digit-template reader
+(`digits.py`) first, whenever harvested templates exist
+(`templates/digits.npz`, built by `python -m plo5bp.ocr.tools.harvest_digits`);
+it answers only when every glyph matches confidently, and Tesseract reads the
+rest — and everything, while there are no templates. `PLO5BP_OCR_DIGITS=0`
+turns the template reader off. `reader_stats()` counts who read what.
 """
 
 from __future__ import annotations
@@ -16,6 +23,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import threading
 
 import numpy as np
 
@@ -118,15 +126,67 @@ def _parse_chip_text(raw: str) -> int | None:
     return int(dollars or "0") * 100 + int((cents + "00")[:2])
 
 
-def _ocr_chip_token(prep: np.ndarray) -> int | None:
-    """Run tesseract on a preprocessed binary image and parse to chips.
+_UNSET = object()
+_DIGIT_READER: object = _UNSET
+_DIGIT_LOCK = threading.Lock()
+_STATS = {"template": 0, "tesseract": 0, "unread": 0}
 
-    Returns None on empty input, missing tesseract, or unparseable output.
-    Shared parse path: both stack/pot crops and seat-commit crops land
-    here after their respective preprocessors.
+
+def _digit_reader():
+    """(TOOL-033) The digit-template reader, or None — no complete template
+    file yet, or ``PLO5BP_OCR_DIGITS=0``. Loaded once (the OCR pool calls this
+    from several threads)."""
+    global _DIGIT_READER
+    if _DIGIT_READER is _UNSET:
+        with _DIGIT_LOCK:
+            if _DIGIT_READER is _UNSET:
+                reader = None
+                if os.environ.get("PLO5BP_OCR_DIGITS", "1").strip() != "0":
+                    try:
+                        from plo5bp.ocr.digits import DigitReader
+
+                        reader = DigitReader.load()
+                    except Exception:  # a damaged template file must not break OCR
+                        reader = None
+                _DIGIT_READER = reader
+    return _DIGIT_READER
+
+
+def _count(key: str) -> None:
+    with _DIGIT_LOCK:
+        _STATS[key] += 1
+
+
+def reader_stats() -> dict[str, int]:
+    """(TOOL-033) How many amounts each reader answered since start-up:
+    ``template`` (in-process, exact), ``tesseract`` (fallback), ``unread``."""
+    with _DIGIT_LOCK:
+        return dict(_STATS)
+
+
+def _ocr_chip_token(prep: np.ndarray) -> int | None:
+    """Read a preprocessed binary image (black text on white) to chips.
+
+    The digit-template reader answers first when templates exist; Tesseract
+    reads what it is unsure of (TOOL-033). Returns None on empty input,
+    missing tesseract, or unparseable output. Shared parse path: both stack/pot
+    crops and seat-commit crops land here after their respective preprocessors.
     """
     if prep.size == 0:
         return None
+    reader = _digit_reader()
+    if reader is not None:
+        text = reader.read_text(np.asarray(prep) < 128)
+        value = _parse_chip_text(text) if text is not None else None
+        if value is not None:
+            _count("template")
+            return value
+    value = _tesseract_chip_token(prep)
+    _count("tesseract" if value is not None else "unread")
+    return value
+
+
+def _tesseract_chip_token(prep: np.ndarray) -> int | None:
     try:
         tesseract = _get_tesseract()
     except RuntimeError:
@@ -174,13 +234,25 @@ def read_chip_amount(bgr: np.ndarray) -> int | None:
     """
     if bgr.size == 0:
         return None
+    return _ocr_chip_token(prep_chip_crop(bgr))
+
+
+def prep_chip_crop(bgr: np.ndarray) -> np.ndarray:
+    """A stack / pot crop as the readers see it: tightened to the cyan digits,
+    then `_preprocess_chip_crop` (the digit harvester uses this too, so the
+    templates are cut from exactly what gets read)."""
     bbox = _cyan_text_bbox(bgr)
     if bbox is not None:
         x0, y0, x1, y1 = bbox
         tight = bgr[y0:y1, x0:x1]
         if tight.size > 0:
             bgr = tight
-    return _ocr_chip_token(_preprocess_chip_crop(bgr))
+    return _preprocess_chip_crop(bgr)
+
+
+def prep_commit_crop(bgr: np.ndarray) -> np.ndarray:
+    """A seat-commit badge as its first read sees it (see `read_seat_commit`)."""
+    return _preprocess_seat_commit_crop(bgr)
 
 
 def _preprocess_seat_commit_crop(bgr: np.ndarray) -> np.ndarray:
@@ -245,21 +317,3 @@ def read_pot_amount(bgr: np.ndarray) -> int | None:
         return None
     return read_chip_amount(bgr)
 
-
-def read_button_marker(bgr: np.ndarray) -> bool:
-    """Return True if the crop looks like the gold 'D' dealer-button chip.
-
-    The button is a small gold/amber disc (high R+G, low B) with a bright 'D'
-    glyph. We detect it via a color mask on gold pixels.
-    """
-    if bgr.size == 0:
-        return False
-    import cv2
-
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    # Gold/amber hue range in OpenCV HSV (H=0..179).
-    lower = np.array([15, 120, 120], dtype=np.uint8)
-    upper = np.array([35, 255, 255], dtype=np.uint8)
-    mask = cv2.inRange(hsv, lower, upper)
-    frac = float(mask.sum()) / (mask.size * 255.0)
-    return frac > 0.08

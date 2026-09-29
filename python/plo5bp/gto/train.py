@@ -10,7 +10,9 @@ Review 2026-09-20:
 
 - **D1** — teacher anchor mass on a grid-ILLEGAL anchor is an error
   (:class:`IllegalTeacherMassError`, naming the root), never silently
-  renormalized away.
+  renormalized away. Every row is checked BEFORE the first optimizer step
+  (:func:`check_teacher_mass`, TOOL-049) — it used to raise only when the bad
+  row's batch came up, after steps had already been taken.
 - **F11** — rows without a value target (``value_mask=False``; every CFR
   export) are masked out of the value loss instead of being trained toward 0.
 - **D4 / F6** — the checkpoint meta records what was ACTUALLY trained on,
@@ -58,6 +60,10 @@ class TrainConfig:
 
 @dataclass
 class TrainResult:
+    """``final_*`` are means over the LAST EPOCH (row-weighted; the anchor KL is
+    weighted by teacher raise mass, as in the loss) — the last minibatch alone
+    was noisy (TOOL-049). ``epochs`` holds the same means for every epoch."""
+
     steps: int
     final_loss: float
     final_gate_kl: float
@@ -65,6 +71,7 @@ class TrainResult:
     ckpt_path: str
     n_train: int
     seconds: float
+    epochs: list[dict[str, float]] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -75,7 +82,64 @@ class TrainResult:
             "ckpt_path": self.ckpt_path,
             "n_train": self.n_train,
             "seconds": self.seconds,
+            "epochs": list(self.epochs or []),
         }
+
+
+class _EpochMeans:
+    """Row-weighted running means of the logged losses for one epoch."""
+
+    def __init__(self) -> None:
+        self.n = 0.0
+        self.loss = self.gate_kl = self.value = 0.0
+        self.anchor_w = self.anchor_kl = 0.0
+
+    def add(self, n: int, loss: float, gate_kl: float, value: float,
+            anchor_kl: float, anchor_w: float) -> None:
+        self.n += n
+        self.loss += n * loss
+        self.gate_kl += n * gate_kl
+        self.value += n * value
+        self.anchor_kl += anchor_w * anchor_kl
+        self.anchor_w += anchor_w
+
+    def means(self) -> dict[str, float]:
+        n = max(self.n, 1.0)
+        return {
+            "loss": self.loss / n,
+            "gate_kl": self.gate_kl / n,
+            "anchor_kl": self.anchor_kl / self.anchor_w if self.anchor_w > 0 else 0.0,
+            "value": self.value / n,
+        }
+
+
+def check_teacher_mass(ds: PolicyDataset, *, chunk: int = 8192) -> None:
+    """Raise :class:`IllegalTeacherMassError` if ANY row parks anchor mass on a
+    grid-illegal anchor while raising is on (review D1; TOOL-049: the whole
+    dataset is checked before training, not batch by batch mid-training)."""
+    import numpy as np
+
+    rows = ds.rows
+    for start in range(0, len(rows), chunk):
+        part = rows[start : start + chunk]
+        sizing = torch.from_numpy(np.stack([np.asarray(r.sizing) for r in part]))
+        a_tgt = torch.from_numpy(np.stack([np.asarray(r.anchor_probs) for r in part]))
+        g_tgt = torch.from_numpy(np.stack([np.asarray(r.gate_probs) for r in part]))
+        gm = torch.from_numpy(np.stack([np.asarray(r.gate_mask) for r in part]))
+        legal = anchor_grid_torch(sizing, NLH_ANCHOR_SPEC).legal
+        w = g_tgt[:, 2].clamp(0.0, 1.0) * gm[:, 2].float()
+        illegal_mass = (a_tgt.clamp_min(0.0) * (~legal).float()).sum(dim=-1)
+        bad = (illegal_mass > ILLEGAL_MASS_TOL) & (w > 0)
+        if bool(bad.any()):
+            j = int(torch.nonzero(bad)[0].item())
+            row = part[j]
+            raise IllegalTeacherMassError(
+                f"root {row.prov.root_id or '?'!r}: "
+                f"{float(illegal_mass[j]):.6g} of anchor target mass on "
+                f"grid-illegal anchors (sizing={row.sizing.tolist()}, "
+                f"target={[round(float(x), 6) for x in row.anchor_probs]}) "
+                f"— re-export the labels (review 2026-09-20 D1)"
+            )
 
 
 def _soft_kl(
@@ -236,9 +300,9 @@ def train_policy_net(
         stale = obs_rev_mismatch(init_meta)
         if stale is not None:
             print(f"[gto-train] WARNING warm-start {stale}", flush=True)
-    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
-
     ds = PolicyDataset(rows)
+    check_teacher_mass(ds)  # every row, before any optimizer step (TOOL-049)
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     loader = DataLoader(
         ds,
         batch_size=min(cfg.batch_size, len(ds)),
@@ -248,10 +312,12 @@ def train_policy_net(
 
     steps = 0
     last_loss = last_gkl = last_akl = 0.0
+    history: list[dict[str, float]] = []
     t0 = time.perf_counter()
     model.train()
 
     for epoch in range(cfg.epochs):
+        ep = _EpochMeans()
         for batch in loader:
             obs = batch["obs"].to(device)
             gm = batch["gate_mask"].to(device)
@@ -274,19 +340,8 @@ def train_policy_net(
             # (review 2026-09-20 D1) Masking + renormalizing used to ERASE
             # teacher mass parked on a grid-illegal anchor (the ALL-IN atom
             # whenever a fraction anchor already clamps to the stack: ~40% of
-            # the jam mass at SPR 2). Refuse instead, naming the root.
-            illegal_mass = (a_tgt.clamp_min(0.0) * (~legal).float()).sum(dim=-1)
-            bad = (illegal_mass > ILLEGAL_MASS_TOL) & (w > 0)
-            if bool(bad.any()):
-                j = int(torch.nonzero(bad)[0].item())
-                row = ds.rows[int(batch["idx"][j])]
-                raise IllegalTeacherMassError(
-                    f"root {row.prov.root_id or '?'!r}: "
-                    f"{float(illegal_mass[j]):.6g} of anchor target mass on "
-                    f"grid-illegal anchors (sizing={row.sizing.tolist()}, "
-                    f"target={[round(float(x), 6) for x in row.anchor_probs]}) "
-                    f"— re-export the labels (review 2026-09-20 D1)"
-                )
+            # the jam mass at SPR 2). check_teacher_mass refused such rows
+            # before training started, so every target here is legal.
             # per-row KL for the p_raise weighting
             a_logits_m = anchor_logits.masked_fill(~legal, -1e9)
             a_t = a_tgt * legal.float()
@@ -315,15 +370,24 @@ def train_policy_net(
             opt.step()
 
             steps += 1
-            last_loss = float(loss.item())
-            last_gkl = float(gate_kl.item())
-            last_akl = float(anchor_kl.item())
+            b_loss, b_gkl = float(loss.item()), float(gate_kl.item())
+            b_akl, b_v = float(anchor_kl.item()), float(v_loss.item())
+            ep.add(int(obs.shape[0]), b_loss, b_gkl, b_v, b_akl, float(w.sum().item()))
             if steps % cfg.log_every == 0:
                 print(
                     f"[gto-train] ep={epoch} step={steps} "
-                    f"loss={last_loss:.4f} gKL={last_gkl:.4f} "
-                    f"aKL={last_akl:.4f} v={float(v_loss.item()):.4f}"
+                    f"loss={b_loss:.4f} gKL={b_gkl:.4f} "
+                    f"aKL={b_akl:.4f} v={b_v:.4f}"
                 )
+        means = ep.means()
+        history.append({"epoch": float(epoch), **means})
+        last_loss, last_gkl, last_akl = means["loss"], means["gate_kl"], means["anchor_kl"]
+        if cfg.epochs <= 50 or epoch == cfg.epochs - 1 or epoch % 10 == 0:
+            print(
+                f"[gto-train] epoch {epoch} means: loss={last_loss:.4f} "
+                f"gKL={last_gkl:.4f} aKL={last_akl:.4f} v={means['value']:.4f}",
+                flush=True,
+            )
 
     out_path = Path(out_path)
     save_meta = {
@@ -332,9 +396,11 @@ def train_policy_net(
         "epochs": cfg.epochs,
         "hidden_dim": cfg.hidden_dim,
         "num_layers": cfg.num_layers,
+        # Last-epoch means (TOOL-049), not the last minibatch.
         "final_loss": last_loss,
         "final_gate_kl": last_gkl,
         "final_anchor_kl": last_akl,
+        "epoch_means": history,
     }
     if meta:
         save_meta.update(meta)
@@ -364,4 +430,5 @@ def train_policy_net(
         ckpt_path=str(out_path),
         n_train=len(rows),
         seconds=elapsed,
+        epochs=history,
     )

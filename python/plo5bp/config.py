@@ -162,6 +162,26 @@ class TrainingConfig:
     num_envs: int = 32
     ppo_epochs: int = 4
     batch_size: int = 256
+    # PPO minibatches per epoch counted on the rows actually COLLECTED
+    # (2026-09-28, ML-044): > 0 = each minibatch is ceil(rows / this), so an
+    # epoch is exactly this many optimizer steps. 0 = `batch_size` (train.py
+    # derives it from the rollout_length TARGET; the drain adds ~8-9% more
+    # rows, so vSix6 takes ~17 steps per epoch, not 16, and the count moves
+    # with the policy's hand lengths). Not bit-exact: switch at a stem
+    # boundary (--minibatches-from-rows).
+    num_minibatches: int = 0
+    # Common random numbers (2026-09-28, ML-004; --crn-streams): each purpose
+    # draws from its own stream keyed by (seed, update[, sub-rollout]) --
+    # the update's table configs, its PPO shuffles, and per (env, hand) the
+    # deals / buttons / opponent assignments (rollout._CrnDeals) -- so two
+    # runs that differ only in a recipe knob see the same tables and hands.
+    # False = the one shared stream (every stem so far). Not bit-exact with it.
+    crn_streams: bool = False
+    # Pool ANCHORS (--pool-anchors, 2026-09-28, ML-033): besides the FIFO of
+    # `opponent_pool_size` recent snapshots, the numbered checkpoints nearest
+    # these many updates back join the pool (selfplay.refresh_pool_anchors).
+    # () = the FIFO alone (every stem so far).
+    pool_anchor_ages: tuple = ()
     entropy_coef: float = 0.1
     value_clip: float = 0.2
     hidden_dim: int = 128
@@ -214,23 +234,10 @@ class TrainingConfig:
     pool_mix_prob: float = 0.5
     pool_opp_seats: int = 2
 
-    # Pot-fraction aggression bonus (bb units). When > 0, each
-    # GATE_RAISE step (covering both normal raises and short shoves
-    # encoded at u=1) gets an additional
-    # `c * min(1.0, aggressive_chips / pre_step_pot)` added to the
-    # forward-EV per-step reward. Default 0.0 disables the bonus.
-    aggression_bonus_c: float = 0.0
-
-    # Retroactive aggression bonus (bb units). When > 0, at end-of-hand
-    # each learner-seat trajectory receives a flat bonus on qualifying
-    # steps based on hero's pot share:
-    #   share > 50%  → bonus on GATE_RAISE steps only
-    #   share == 50% → bonus on GATE_RAISE + GATE_CHECK_CALL(chips > 0)
-    #   share < 50%  → no bonus
-    # Folds and pure checks never get bonus. Independent of
-    # `aggression_bonus_c`; both can be set but typical use is one or
-    # the other.
-    retroactive_bonus_c: float = 0.0
+    # (The per-step and retroactive aggression bonuses -- aggression_bonus_c,
+    # retroactive_bonus_c -- were retired 2026-09-28, ML-030: every stem since
+    # vTwo ran them at 0. Their qualification still counts winning aggression
+    # steps for the F/T/R telemetry, rollout._winning_aggression_steps.)
 
     # Auxiliary Q(s, a) regression coefficient for the critic's dueling
     # head (v5 stems; head exists zero-init regardless so the VRPO
@@ -308,6 +315,10 @@ class TrainingConfig:
     # per-group split clip; 0 = off, no running state (kl_hard-rollback-safe).
     adam_b2: float = 0.999
     agc_clip: float = 0.0
+    # AdamW's decoupled weight decay, on every tensor. 0.01 is AdamW's own
+    # default -- what every stem to date trained with (implicitly until
+    # 2026-09-28, ML-051). Changing it is a stem-boundary decision.
+    weight_decay: float = 0.01
 
     # v6 probability-dependent PPO clip (Over-mixing §6; a generalization of
     # DAPO "Clip-Higher"). When True, the GATE's clip band widens for RARE gate
@@ -345,8 +356,8 @@ class TrainingConfig:
     value_support: float = 1500.0
     value_hlgauss_sigma: float = 0.75
 
-    # v2 (anchor head + centralized critic) hyperparameters. Ignored on
-    # v1 runs — the critic is only built when train.py constructs one.
+    # Centralized critic hyperparameters (the critic is only built when
+    # train.py constructs one).
     critic_hidden_dim: int = 1536
     critic_num_blocks: int = 2
     # Critic redesign (2026-09-26 regression diagnosis; network.CentralCritic):
@@ -369,6 +380,16 @@ class TrainingConfig:
     # 1 / (minibatch return variance + 1) -- see PPOTrainer._q_norm. For new
     # critics; False = the pre-2026-09-26 raw bb^2 losses.
     critic_q_norm: bool = False
+    # With critic_q_norm AND micro-batching: take the return variance of the
+    # WHOLE minibatch once (like the fold-supervision denominator) instead of
+    # each chunk's own (2026-09-28, ML-011). Only then is a micro-batched step
+    # the same gradient as the unchunked one. False = per chunk (vSix6's
+    # recipe to date); unchunked minibatches are identical either way.
+    critic_q_norm_minibatch: bool = False
+    # torch.compile the critic's TRAINING forwards (train_outputs, q_values)
+    # on CUDA, like evaluate()/forward already are (ML-013). Not bit-exact vs
+    # eager kernels -> a relaunch decision. No effect on CPU / without Triton.
+    compile_critic_train: bool = False
     # Weight on the actor's own value head ("display head" for the UI)
     # when a CentralCritic owns the GAE values. Plain regression, no
     # clipping; small so it stays subordinate to the policy loss.
@@ -412,12 +433,13 @@ class TrainingConfig:
     # rollback (soft early-stop still applies).
     kl_hard: float = 10.0
 
-    # Sizing-entropy scale (v2 only): multiplies the anchor+beta
-    # (sizing-head) entropy bonus relative to the gate. 1.0 = off (gate and
-    # sizing heads share entropy_coef). >1 gives the sizing heads a stronger
-    # entropy bonus to resist the anchor/beta over-sharpening that drives v2
-    # saturation collapse, WITHOUT loosening the gate. Live-tunable via
-    # runs/anneal_control.json {"sizing_entropy_scale": X}.
+    # Sizing-entropy scale (every anchor head, v2..v5): multiplies the
+    # anchor+beta (sizing-head) entropy bonus relative to the gate. 1.0 = the
+    # sizing heads share entropy_coef with the gate; < 1 lets raise sizes
+    # differentiate (vMin3 0.1, vSix6 0.3); > 1 resists the anchor/beta
+    # over-sharpening that drove the v2 saturation collapse, WITHOUT
+    # loosening the gate. Live-tunable via the control file
+    # {"sizing_entropy_scale": X}.
     sizing_entropy_scale: float = 1.0
 
     # Clamp normalized advantages to ±this many σ before the PPO loss.

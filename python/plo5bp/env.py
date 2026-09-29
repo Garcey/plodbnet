@@ -41,6 +41,22 @@ from plo5bp.encoding import (
     encode_observation,
 )
 from plo5bp.encoding_nlh import OBS_DIM_NLH, encode_observation_nlh
+from plo5bp import encoding as _encoding  # module handle: OBS_SEMANTICS_REV is read late
+from plo5bp.engine_abi import functions as _engine_functions
+from plo5bp.engine_abi import require as _engine_require
+
+# The per-step bookkeeping reads total_commit through its own getter (PERF-027).
+_engine_require("GameState.total_commit")
+
+# The engine's one-row observation encode (ML-008): what training encodes with,
+# bit-identical to the scalar numpy encoders (tests/python/engine/test_serial_encode.py).
+# An engine built before ML-008 has none: engine_abi refuses it at import.
+(_engine_encode_state,) = _engine_functions("encode_game_state")
+# Variants whose hands keep their size -- the engine encoder's layouts. NLH
+# (numpy-only features) and PLO67 (hands grow on red burns) keep numpy.
+_ENGINE_ENCODED_VARIANTS = frozenset(
+    {"plo4_double_bomb", "plo5_double_bomb", "plo6_double_bomb"}
+)
 
 
 def _engine_obs_rev_kwargs(engine_cls) -> dict[str, int]:
@@ -48,12 +64,9 @@ def _engine_obs_rev_kwargs(engine_cls) -> dict[str, int]:
     Python encoders read at import (review 2026-09-20): both sides parse
     `PLO5BP_OBS_REV`, but the engine reads it at construction, so an env var
     changed after import would otherwise let the fused Rust encoder and the
-    numpy encoders disagree silently. A binary built before the switch has no
-    `obs_rev` argument and only implements rev 1 (encoding.py warns at
-    import) — pass nothing so it keeps constructing."""
-    if hasattr(engine_cls, "obs_semantics_rev"):
-        return {"obs_rev": int(OBS_SEMANTICS_REV)}
-    return {}
+    numpy encoders disagree silently. (An engine built before the switch has
+    no `obs_rev` argument; encoding.py refuses it at import -- engine_abi.)"""
+    return {"obs_rev": int(OBS_SEMANTICS_REV)}
 
 
 @dataclass
@@ -124,6 +137,9 @@ class BombPotEnv:
         else:
             self._obs_dim = OBS_DIM
             self._encode = encode_observation
+        # The engine encodes the PLO layouts (ML-008); `_encode` (numpy) stays
+        # for NLH / PLO67 and as the tests' oracle.
+        self._engine_encode = self.config.variant in _ENGINE_ENCODED_VARIANTS
         self._last_obs_vec = np.zeros(self._obs_dim, dtype=np.float32)
         self._last_mask = np.zeros(NUM_ACTIONS, dtype=bool)
         self._ev_runout_samples = int(ev_runout_samples)
@@ -241,14 +257,9 @@ class BombPotEnv:
         return self._rs.study_terminal()
 
     def _read_total_commit(self) -> np.ndarray:
-        # Bookkeeping read (twice per step): skip the 1024-sample opp-outcome
-        # MC that `observation_dict()` runs by default — only `_pack_obs`
-        # needs those features (review 2026-09-20 C8). Same dict, the
-        # outcome slots are just zeros.
-        return np.asarray(
-            self._rs.observation_dict(skip_outcome_mc=True)["total_commit"],
-            dtype=np.int64,
-        )
+        # Bookkeeping read (twice per step): the engine's getter, not a whole
+        # observation dict (PERF-027) — the same numbers as its total_commit.
+        return np.asarray(self._rs.total_commit(), dtype=np.int64)
 
     def _finalize_step(
         self, pre_total_commit: np.ndarray
@@ -263,9 +274,9 @@ class BombPotEnv:
             obs_vec = np.zeros(self._obs_dim, dtype=np.float32)
             mask = np.zeros(NUM_ACTIONS, dtype=bool)
             gate_mask = np.zeros(GATE_ACTIONS, dtype=bool)
-            # Terminal: no actor, so the outcome slots are zeros with or
+            # Terminal: no actor, so the feature slots are zeros with or
             # without the flag (same keys, same values) — it just keeps the
-            # no-MC intent explicit, like `_read_total_commit`.
+            # nothing-to-compute intent explicit.
             raw = dict(self._rs.observation_dict(skip_outcome_mc=True))
             info = StepInfo(
                 legal_mask=mask,
@@ -363,12 +374,41 @@ class BombPotEnv:
         accessor — never feed into observations mid-hand."""
         return [[int(c) for c in hole] for hole in self._rs.all_hole_cards()]
 
+    # --- read-only accessors for the home games (HGB-023) ----------------------
+    # homegame.py used to reach through the private ``_rs`` handle for these, so
+    # an env change broke the tables at runtime instead of at import. Exact
+    # pass-throughs: nothing is computed here.
+
+    def observation_dict(self) -> dict:
+        """The engine's raw state as a plain dict (the opp-outcome Monte Carlo
+        skipped — it only feeds network observations)."""
+        return dict(self._rs.observation_dict(skip_outcome_mc=True))
+
+    def payouts(self) -> list[int]:
+        """Exact per-seat chip deltas of the finished hand vs its start (won −
+        committed; they sum to zero). Zeros while the hand is live."""
+        return [int(x) for x in self._rs.payouts()]
+
+    def all_burns(self) -> list[int]:
+        """PLO67: all three burn cards of the hand — a reveal accessor, like
+        ``all_hole_cards`` (the table shows them street by street). [] for the
+        variants that burn nothing."""
+        return [int(c) for c in self._rs.all_burns()]
+
+    def hole_count_on(self, seat: int, street: int) -> int:
+        """PLO67: the hole cards ``seat`` held on ``street`` (1 flop, 2 turn,
+        3 river) — its extras are a prefix of the red burns."""
+        return int(self._rs.hole_count_on(int(seat), int(street)))
+
     def legal_action_mask(self) -> np.ndarray:
         return np.asarray(self._rs.legal_action_mask(), dtype=bool)
 
     def _pack_obs(self) -> tuple[np.ndarray, StepInfo]:
-        skip_mc = getattr(self, "_obs_mode", "full") == "minimal"
-        raw = dict(self._rs.observation_dict(skip_outcome_mc=skip_mc))
+        # The full layout's raw dict carries the opp-outcome MC (the ONE run
+        # per decision: the engine encode below reuses it); the minimal layout
+        # has no MC dims.
+        minimal = getattr(self, "_obs_mode", "full") == "minimal"
+        raw = dict(self._rs.observation_dict(skip_outcome_mc=minimal))
         mask = np.asarray(self._rs.legal_action_mask(), dtype=bool)
         min_raise = int(raw.get("min_raise", 0))
         max_raise = int(raw.get("max_raise", 0))
@@ -379,7 +419,12 @@ class BombPotEnv:
             # Board B is empty for single-board variants; the engine
             # returns 0 before evaluating, so no variant branch needed.
             raw["hero_category_b"] = int(self._rs.hero_category(actor, 1))
-        vec = self._encode(raw, self.config)
+        if self._engine_encode and isinstance(self._rs, _RustGameState):
+            vec = self._engine_obs(raw, minimal)
+        else:
+            # NLH / PLO67, or a stand-in for the engine state (a test's
+            # forwarding proxy): the numpy encoder, the engine's oracle.
+            vec = self._encode(raw, self.config)
         self._last_obs_vec = vec
         self._last_mask = mask
         n = self.config.num_seats
@@ -402,3 +447,20 @@ class BombPotEnv:
             total_commit=total_commit,
         )
         return vec, info
+
+    def _engine_obs(self, raw: dict[str, Any], minimal: bool) -> np.ndarray:
+        """The engine's encode of the current node (ML-008), at the revision
+        the Python side reads NOW (as the numpy encoders did — tests re-pin
+        it). The full layout reuses the opp-outcome block `raw` already holds
+        instead of running the MC a second time."""
+        rev = int(_encoding.OBS_SEMANTICS_REV)
+        if minimal:
+            vec = _engine_encode_state(self._rs, "minimal", opp_outcome_mc=0, obs_rev=rev)
+        else:
+            outcome = (
+                list(raw["opp_outcome_fractions"])
+                + list(raw["per_board_outcome"])
+                + list(raw["share_bounds"])
+            )
+            vec = _engine_encode_state(self._rs, "full", outcome=outcome, obs_rev=rev)
+        return np.asarray(vec, dtype=np.float32)

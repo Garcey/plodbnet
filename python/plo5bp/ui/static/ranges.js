@@ -33,10 +33,10 @@ const RG_GATE_LABEL = { fold: "Fold", check_call: "Call", raise: "Raise" };
 
 // Server strings (checkpoint file name, labels) go through innerHTML below:
 // escape them. The checkpoint name comes from a file path / env var.
+// (app.js's escapeHTML — one copy of the helper, FE-021; this file loads
+// after app.js.)
 function rgEsc(v) {
-  return String(v ?? "").replace(/[&<>"']/g, (ch) => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-  }[ch]));
+  return escapeHTML(v);
 }
 
 function rgClone(v) { return JSON.parse(JSON.stringify(v)); }
@@ -153,7 +153,16 @@ function rgBuildGrid() {
       cell.className = "rg-cell";
       cell.id = `rg-cell-${name}`;
       cell.innerHTML = `<span class="rg-cell-name">${name}</span>`;
+      // The combo breakdown opens on hover, and on click / Enter too, so
+      // touch and keyboard reach it (FE-023).
+      cell.tabIndex = 0;
+      cell.setAttribute("role", "button");
+      cell.setAttribute("aria-label", `${name}: show combos`);
       cell.addEventListener("mouseenter", () => rgRenderHover(name));
+      cell.addEventListener("click", () => rgRenderHover(name));
+      cell.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); rgRenderHover(name); }
+      });
       grid.appendChild(cell);
     }
   }
@@ -255,7 +264,7 @@ function rgChip(label, cls, onClick) {
 function rgCardsLabel(cards) {
   return cards
     .map((idx) => {
-      const r = "23456789TJQKA"[idx >> 2];
+      const r = RANK_STRINGS[idx >> 2];
       const s = "cdhs"[idx & 3];
       return `<span class="rg-card suit-${s}">${r}${RG_SUIT_GLYPH[s]}</span>`;
     })
@@ -368,7 +377,8 @@ function rgRenderActions() {
     const custom = document.createElement("div");
     custom.className = "rg-action-row rg-custom";
     custom.innerHTML =
-      `<input id="rg-custom-bb" type="number" step="0.1"` +
+      `<input id="rg-custom-bb" type="number" step="0.1" inputmode="decimal"` +
+      ` aria-label="${verb} amount in big blinds"` +
       ` min="${minTo}" max="${maxTo}"` +
       ` placeholder="${minTo}–${maxTo}bb" />` +
       `<button id="rg-custom-go" type="button" class="rg-chip gate-raise">${verb}</button>`;
@@ -484,7 +494,7 @@ function rgOpenCardModal(street, need, board) {
       b.type = "button";
       const suit = "cdhs"[s];
       b.className = `rg-pick-card suit-${suit}`;
-      b.innerHTML = `${"23456789TJQKA"[r]}${RG_SUIT_GLYPH[suit]}`;
+      b.innerHTML = `${RANK_STRINGS[r]}${RG_SUIT_GLYPH[suit]}`;
       if (used.has(idx)) b.disabled = true;
       b.addEventListener("click", () => {
         const i = RG.pick.chosen.indexOf(idx);
@@ -498,61 +508,62 @@ function rgOpenCardModal(street, need, board) {
     }
   }
   document.getElementById("rg-card-ok").disabled = true;
-  modal.hidden = false;
+  // A native dialog (A11Y-015): focus moves in and back, Escape closes it.
+  openDialog(modal);
 }
 
 function rgCloseCardModal() {
   RG.pick = null;
-  document.getElementById("rg-card-modal").hidden = true;
+  closeDialog(document.getElementById("rg-card-modal"));
 }
 
 // --- tab / mode wiring --------------------------------------------------------
 
 function rgEnterMode() {
   document.body.classList.add("ranges-mode");
-  document.getElementById("tab-ranges").classList.add("active");
-  document.getElementById("tab-study").classList.remove("active");
-  document.getElementById("tab-trainer").classList.remove("active");
+  for (const [id, on] of [["tab-ranges", true], ["tab-study", false], ["tab-trainer", false]]) {
+    const t = document.getElementById(id);
+    t.classList.toggle("active", on);
+    t.setAttribute("aria-pressed", on ? "true" : "false");
+  }
   if (!RG.data) rgQuery();
 }
 
 function rgLeaveMode() {
   document.body.classList.remove("ranges-mode");
-  document.getElementById("tab-ranges").classList.remove("active");
+  const t = document.getElementById("tab-ranges");
+  t.classList.remove("active");
+  t.setAttribute("aria-pressed", "false");
 }
 
-function rgSyncTabVisibility() {
-  const sel = document.getElementById("format-select");
+// The range grid exists for the no-limit (hold'em) format — read from the
+// /formats payload app.js keeps (`pot_limit`), not a hard-coded format id.
+function rgSyncTabVisibility(formatId) {
   const tab = document.getElementById("tab-ranges");
-  const nlh = !!sel && sel.value === "nlh_single";
-  RG.enabled = nlh && !window.PLO5BP_PUBLIC;
+  const id = formatId || (document.getElementById("format-select") || {}).value;
+  const f = typeof UI !== "undefined" && UI.formats ? UI.formats.find((x) => x.id === id) : null;
+  RG.enabled = !!f && f.pot_limit === false && !isPublicBuild();
   tab.hidden = !RG.enabled;
   if (!RG.enabled && document.body.classList.contains("ranges-mode")) {
-    document.getElementById("tab-trainer").click();
+    // Back to the tab the player came from, not always the Trainer.
+    rgLeaveMode();
+    if (typeof applyModeUI === "function") applyModeUI();
   }
 }
 
 function rgInit() {
-  if (window.PLO5BP_PUBLIC) return; // local-only feature
+  if (isPublicBuild()) return; // local-only feature
   const tab = document.getElementById("tab-ranges");
   if (!tab) return;
   rgBuildGrid();
   tab.addEventListener("click", rgEnterMode);
   document.getElementById("tab-study").addEventListener("click", rgLeaveMode);
   document.getElementById("tab-trainer").addEventListener("click", rgLeaveMode);
-
-  const sel = document.getElementById("format-select");
-  if (sel) {
-    sel.addEventListener("change", () => setTimeout(rgSyncTabVisibility, 50));
-  }
-  // The format dropdown fills asynchronously at app boot.
-  const poll = setInterval(() => {
-    if (sel && sel.options.length) {
-      clearInterval(poll);
-      rgSyncTabVisibility();
-    }
-  }, 300);
-  setTimeout(() => clearInterval(poll), 15000);
+  // app.js announces the formats list and every format switch (FE-023):
+  // no timers guessing when the dropdown has been filled.
+  document.addEventListener("wg:formats", (e) => rgSyncTabVisibility(e.detail && e.detail.active));
+  document.addEventListener("wg:format", (e) => rgSyncTabVisibility(e.detail && e.detail.format));
+  document.getElementById("rg-card-modal").addEventListener("close", () => { RG.pick = null; });
 
   // Table-config changes reset the line. RG.data / RG.good are left alone:
   // if the query fails, rgQuery rolls the whole state (line, node, seats,
@@ -582,9 +593,6 @@ function rgInit() {
     }
   });
   document.getElementById("rg-card-cancel").addEventListener("click", rgCloseCardModal);
-  document.getElementById("rg-card-modal").addEventListener("pointerdown", (e) => {
-    if (e.target === e.currentTarget) rgCloseCardModal();
-  });
 }
 
 rgInit();

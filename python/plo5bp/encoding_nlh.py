@@ -738,7 +738,7 @@ def encode_observation_batch_nlh(
     `nlh_opp_outcome`). `hero_category_a` is the engine's any-combo
     category at the current actor (`hero_cat_b` is ignored — board B does
     not exist). Bit-exact vs `encode_observation_nlh`
-    (tests/python/test_nlh_env_batched.py); all scalar arithmetic runs in
+    (tests/python/engine/test_nlh_env_batched.py); all scalar arithmetic runs in
     f64 with the f32 cast on assignment, mirroring the scalar path.
 
     Terminal envs (actor == -1) produce all-zero rows.

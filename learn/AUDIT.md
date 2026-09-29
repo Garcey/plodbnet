@@ -1,5 +1,10 @@
 # learn/ course audit & repair log
 
+> **Status 2026-09-28:** this audit reflects the code of 2026-07-23. Since then the
+> run, scale, storage and code layout changed — see the "What changed since" box at
+> the top of MASTER.md. A fresh audit against today's code is the next step for
+> this course.
+
 *Repaired 2026-07-23 against live `python/plo5bp` + `scripts/*_guardian.sh`.*
 
 ## Verdict (pre-repair → post-repair)

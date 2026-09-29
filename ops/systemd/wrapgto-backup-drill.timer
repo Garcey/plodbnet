@@ -1,0 +1,10 @@
+# /etc/systemd/system/wrapgto-backup-drill.timer — enable: systemctl enable --now wrapgto-backup-drill.timer
+[Unit]
+Description=Monthly WrapGTO restore drill
+
+[Timer]
+OnCalendar=*-*-01 05:30:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

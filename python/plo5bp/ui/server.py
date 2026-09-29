@@ -11,31 +11,33 @@ Run with: `uvicorn plo5bp.ui.server:app --port 8765`.
 
 from __future__ import annotations
 
-import asyncio
 import dataclasses
-import inspect
+import hashlib
+import json
 import logging
 import math
 import os
 import re
+import sys
 import threading
 import time
+import types
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Mapping
 
 import anyio.to_thread
 import numpy as np
 import torch
 import torch.nn.functional as F
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as _StarletteHTTPException
 from pydantic import BaseModel, Field
 
 from plo5bp.actions import (
-    GATE_ACTIONS,
     GATE_CHECK_CALL,
     GATE_FOLD,
     GATE_NAMES,
@@ -43,55 +45,64 @@ from plo5bp.actions import (
 )
 from plo5bp.config import GameConfig, VARIANT_NLH, VARIANT_PLO5
 
-# UI-only format id: same engine rules as PLO5 double-board bomb pot, but
-# serves the minimal-obs ablation stem (vMin1). Not a GameConfig.variant.
-FORMAT_EXPERIMENTAL = "experimental"
 import plo5bp.encoding as _encoding  # module handle: OBS_SEMANTICS_REV is read late
-from plo5bp.encoding import encode_observation
+from plo5bp.encoding import OBS_DIM_MINIMAL, encode_observation  # noqa: F401 (re-export)
 from plo5bp.env import BombPotEnv
-from plo5bp.encoding import OBS_DIM, OBS_DIM_MINIMAL
-from plo5bp.network import (
-    ActorCritic,
-    ActorCriticV4,
-    ActorCriticV5,
-    CentralCritic,
-    build_actor_from_state_dict,
-    build_critic_from_state_dict,
-    obs_adapter,
-)
-from plo5bp.encoding_nlh import OBS_DIM_NLH
+from plo5bp.network import ActorCritic, CentralCritic
 from plo5bp.sizing import (
-    ANCHOR_COUNT,
-    BRACKET_HALF,
     NLH_ANCHOR_SPEC,
     PLO_ANCHOR_SPEC,
     anchor_grid_np,
     anchor_grid_torch,
     sizing_from_info,
 )
+from plo5bp.ui.common import FORMAT_EXPERIMENTAL  # the admin candidate slot
 
+from plo5bp.ui import middleware as _mw
 from plo5bp.ui.common import (
     AWAITING_NAMES,
-    HISTORY_NAMES as _HISTORY_NAMES,
-    POSITION_BY_SEAT_6,
-    POSITION_BY_SEAT_SHORT,
-    STREET_NAMES,
-    anchor_label as _anchor_label,
     anchor_label_spec as _spec_anchor_label,
+    ActionRequest as _CommonActionRequest,
+    GATE_NAME_TO_IDX as _COMMON_GATE_NAME_TO_IDX,
+    GATE_SLUGS as _COMMON_GATE_SLUGS,
+    anchors_payload as _common_anchors_payload,
+    default_game_config as _common_default_game_config,
+    engine_variant as _common_engine_variant,
+    table_state as _common_table_state,
+    validate_card_list as _common_validate_card_list,
     effective_button as _effective_button,
+    env_flag as _env_flag,
+    format_defaults as _common_format_defaults,
+    model_slots as _model_slots,
     position_name as _common_position_name,
 )
 
 logger = logging.getLogger("plo5bp.ui")
 
-# Public build flag. When truthy, the live-capture subsystems (ClubGG OCR
-# and PokerNow DOM ingest) are NOT exposed: their routes are unmounted below
-# and the frontend hides the live controls. Trainer + Study are fully
-# functional without them — every study route rebuilds from user input via
-# _rebuild_env, with no dependency on a live feed.
-PLO5BP_PUBLIC = os.environ.get("PLO5BP_PUBLIC", "").strip().lower() in (
-    "1", "true", "yes", "on",
-)
+
+def _configure_logging() -> None:
+    """(OPS-023) Make the app's own log lines reach the journal.
+
+    uvicorn configures only its own loggers, so `plo5bp.*` INFO lines ("loaded
+    checkpoint …", "evicted runtime …", "PUBLIC service installed …") were
+    dropped and WARNINGs printed bare. When nothing else has configured
+    logging (no root handler — pytest, a --log-config and embedding apps all
+    install one), the `plo5bp` logger gets a timestamped handler at
+    ``PLO5BP_LOG_LEVEL`` (default INFO). Runs before the models load, so the
+    lines naming the served checkpoints are kept."""
+    pkg = logging.getLogger("plo5bp")
+    if logging.getLogger().handlers or pkg.handlers:
+        return
+    level = os.environ.get("PLO5BP_LOG_LEVEL", "INFO").strip().upper() or "INFO"
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    pkg.addHandler(handler)
+    pkg.setLevel(level if level in logging.getLevelNamesMapping() else "INFO")
+
+
+_configure_logging()
 
 TERMINAL_NAMES = {0: "fold_out", 1: "run_out", 2: "showdown"}
 TERMINAL_MESSAGES = {
@@ -103,409 +114,358 @@ TERMINAL_MESSAGES = {
 STATIC_DIR = Path(__file__).parent / "static"
 
 
-# --- Model loader -----------------------------------------------------------
+# --- Serving models ---------------------------------------------------------
+# Loading (one read per checkpoint, safe unpickling), the obs-rev bookkeeping,
+# verification and live swaps live in `plo5bp.ui.models`. An app's served
+# models are its site's `formats` (see `Site`); this module keeps the
+# historical names — `MODEL`, `FORMATS`, `_load_model`, … — that the routes,
+# the trainer, the home-games grader, the deploy check and the tests use.
 
-def _resolve_device() -> str:
-    """Pick the inference device. PLO5BP_DEVICE=cuda promotes when
-    available; otherwise log and fall back to CPU."""
-    requested = os.environ.get("PLO5BP_DEVICE", "cpu").strip().lower() or "cpu"
-    if requested == "cuda":
-        if torch.cuda.is_available():
-            return "cuda"
-        logger.warning("PLO5BP_DEVICE=cuda but cuda unavailable — falling back to cpu")
-    return "cpu"
+from plo5bp.ui import models as _models  # noqa: E402
 
+_resolve_device = _models.resolve_device
+_random_init_model = _models.random_init_model
+_OBS_REV_INFO = _models.OBS_REV_INFO
+_process_obs_rev = _models.process_obs_rev
+_note_checkpoint_obs_rev = _models.note_checkpoint_obs_rev
+_obs_rev_entry = _models.obs_rev_entry
+_critic_value_kwargs = _models.critic_value_kwargs
+_CRITIC_VALUE_KWARGS = _models.CRITIC_VALUE_KWARGS
 
-#: Per-format checkpoint resolution. The PLO5 arm keeps the historical
-#: env var + stub path; NLH gets its own pair so `cp checkpoints/nlh1_X.pt
-#: checkpoints/nlh_stub.pt` is the NLH promote flow. Experimental resolves
-#: the newest `checkpoints/vMin1_*.pt` (or stem `vMin1.pt`) unless
-#: PLO5BP_CHECKPOINT_EXPERIMENTAL overrides.
-_FORMAT_CKPTS = {
-    VARIANT_PLO5: ("PLO5BP_CHECKPOINT", "checkpoints/stub.pt"),
-    VARIANT_NLH: ("PLO5BP_CHECKPOINT_NLH", "checkpoints/nlh_stub.pt"),
-    FORMAT_EXPERIMENTAL: ("PLO5BP_CHECKPOINT_EXPERIMENTAL", ""),
-}
+#: The formats a site serves, in dropdown order: PLO5, NLH and the admin
+#: candidate slot.
+_SERVED_FORMATS = (VARIANT_PLO5, VARIANT_NLH, FORMAT_EXPERIMENTAL)
 
 
-def _latest_vmin1_ckpt(ckpt_dir: Path | None = None) -> Path | None:
-    """Newest numbered vMin1 snapshot, else the stem file, else None."""
-    d = ckpt_dir if ckpt_dir is not None else Path("checkpoints")
-    numbered = sorted(
-        d.glob("vMin1_*.pt"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    if numbered:
-        return numbered[0]
-    stem = d / "vMin1.pt"
-    return stem if stem.exists() else None
-
-
-def _format_ckpt_path(variant: str) -> Path:
-    env_key, default = _FORMAT_CKPTS[variant]
-    override = os.environ.get(env_key, "").strip()
-    if override:
-        return Path(override)
-    if variant == FORMAT_EXPERIMENTAL:
-        latest = _latest_vmin1_ckpt()
-        if latest is not None:
-            return latest
-        # Missing file → _load_model falls back to random-init placeholder.
-        return Path("checkpoints/vMin1.pt")
-    return Path(default)
-
-
-def _random_init_model(variant: str) -> ActorCritic:
-    """Placeholder actor when no checkpoint exists for the format. The
-    PLO fallback keeps the historical v1 128×2 shape; NLH needs a
-    correctly-shaped v4 (995-dim obs, 12-anchor ladder) so the format is
-    still explorable before the first promote — flagged un-loaded so the
-    UI can badge the recommendations as untrained. Experimental mirrors
-    the vMin1 ablation (796-d minimal obs, mixture head)."""
-    if variant == VARIANT_NLH:
-        return ActorCriticV4(
-            hidden_dim=128,
-            obs_dim=OBS_DIM_NLH,
-            num_layers=2,
-            anchor_spec=NLH_ANCHOR_SPEC,
-        )
-    if variant == FORMAT_EXPERIMENTAL:
-        return ActorCriticV5(
-            hidden_dim=128,
-            obs_dim=OBS_DIM_MINIMAL,
-            num_layers=2,
-            anchor_spec=PLO_ANCHOR_SPEC,
-        )
-    return ActorCritic(hidden_dim=128, num_layers=2)
-
-
-# --- Observation-semantics revision ------------------------------------------
-# (review 2026-09-20) The observation feature fixes from this review change
-# VALUES, not the layout: same width, different numbers in the corrected
-# dims. `plo5bp.encoding.OBS_SEMANTICS_REV` (env `PLO5BP_OBS_REV`; 2 = the
-# corrected features, 1 = the exact pre-review values) says which semantics
-# this PROCESS encodes; train.py stamps `obs_rev` into new checkpoints, and a
-# checkpoint without the key was trained on rev 1. A model served on the
-# other revision gets inputs it never saw, silently — so a mismatch is
-# reported loudly and surfaced per format, but never refused: the operator
-# picks the revision, the UI keeps serving.
-
-#: variant -> {"obs_rev": int, "obs_rev_mismatch": bool} for the checkpoint
-#: `_load_model` last loaded for that format.
-_OBS_REV_INFO: dict[str, dict[str, Any]] = {}
-#: (checkpoint path, checkpoint rev, process rev) already warned about.
-_OBS_REV_WARNED: set[tuple[str, int, int]] = set()
-
-
-def _process_obs_rev() -> int:
-    """The obs-semantics revision this process encodes. Read late (and with a
-    default) so it works before the encoder-side switch lands."""
-    return int(getattr(_encoding, "OBS_SEMANTICS_REV", 2))
-
-
-def _note_checkpoint_obs_rev(
-    variant: str, ckpt: Any, ckpt_path: Path, loaded: bool
-) -> None:
-    process_rev = _process_obs_rev()
-    if not loaded:
-        # A random-init placeholder was trained on nothing: never a mismatch.
-        _OBS_REV_INFO[variant] = {
-            "obs_rev": process_rev, "obs_rev_mismatch": False,
-        }
-        return
-    raw = ckpt.get("obs_rev", 1) if isinstance(ckpt, dict) else 1
-    try:
-        ckpt_rev = int(raw)
-    except (TypeError, ValueError):
-        ckpt_rev = 1
-    mismatch = ckpt_rev != process_rev
-    _OBS_REV_INFO[variant] = {"obs_rev": ckpt_rev, "obs_rev_mismatch": mismatch}
-    key = (str(ckpt_path), ckpt_rev, process_rev)
-    if mismatch and key not in _OBS_REV_WARNED:
-        _OBS_REV_WARNED.add(key)
-        logger.warning(
-            "OBS-REV MISMATCH: checkpoint %s (%s) was trained on observation "
-            "semantics rev %d, but this process encodes rev %d — the model is "
-            "being fed feature values it never saw. Still serving it; set "
-            "PLO5BP_OBS_REV=%d and restart to serve it exactly as trained.",
-            ckpt_path, variant, ckpt_rev, process_rev, ckpt_rev,
-        )
-
-
-def _obs_rev_entry(variant: str) -> dict[str, Any]:
-    """The `FORMATS` fields describing the checkpoint just loaded for
-    ``variant`` (call right after `_load_model`)."""
-    return dict(
-        _OBS_REV_INFO.get(
-            variant,
-            {"obs_rev": _process_obs_rev(), "obs_rev_mismatch": False},
-        )
-    )
+def _format_ckpt_path(variant: str) -> Path | None:
+    """The checkpoint a format serves: PLO5 `$PLO5BP_CHECKPOINT` /
+    checkpoints/stub.pt, NLH `$PLO5BP_CHECKPOINT_NLH` / checkpoints/
+    nlh_stub.pt, the admin candidate slot `$PLO5BP_CHECKPOINT_CANDIDATE`
+    (None when unset)."""
+    return _models.format_ckpt_path(variant)
 
 
 def _load_model(variant: str = VARIANT_PLO5) -> tuple[ActorCritic, bool]:
     """Load the format's promoted checkpoint. Returns (model, loaded) —
     loaded=False means a random-init placeholder is being served."""
-    device = _resolve_device()
-    ckpt_path = _format_ckpt_path(variant)
-    if not ckpt_path.exists():
-        logger.warning(
-            "checkpoint %s not found — using random-init model (%s)",
-            ckpt_path, variant,
-        )
-        _note_checkpoint_obs_rev(variant, None, ckpt_path, loaded=False)
-        return _random_init_model(variant).to(device).eval(), False
-    try:
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    except Exception as e:
-        logger.warning("failed to load %s (%s) — using random init", ckpt_path, e)
-        _note_checkpoint_obs_rev(variant, None, ckpt_path, loaded=False)
-        return _random_init_model(variant).to(device).eval(), False
-    if isinstance(ckpt, dict) and "model" in ckpt:
-        state_dict = ckpt["model"]
-        cfg_block = ckpt.get("config", {}) or {}
-        hidden_dim = int(cfg_block.get("hidden_dim", 128))
-        num_layers = int(cfg_block.get("num_layers", 2))
-        # Optional EMA serving (PLO5BP_SERVE_EMA=1): serve the slow
-        # EMA-of-past-iterates actor (`model_ema`, persisted by training
-        # when the kl-anchor magnet is on) instead of the last iterate.
-        # The EMA is a smoother, less-exploitable policy — exactly what a
-        # study tool should show. Falls through to the last iterate when
-        # the flag is off, the key is absent, or it's None (magnet-off
-        # runs). Same architecture, so it's a drop-in for the actor; the
-        # critic (review "true EV") is never EMA'd.
-        if os.environ.get("PLO5BP_SERVE_EMA") == "1":
-            ema = ckpt.get("model_ema")
-            if ema:
-                state_dict = ema
-                logger.info("serving EMA actor (PLO5BP_SERVE_EMA=1) for %s", variant)
-            else:
-                logger.info(
-                    "PLO5BP_SERVE_EMA=1 but %s has no model_ema — serving last "
-                    "iterate", ckpt_path,
-                )
-    else:
-        state_dict = ckpt
-        hidden_dim = 128
-        num_layers = 2
-    # Dual path: v2 anchor-head checkpoints carry 'anchor_head.weight',
-    # v1 Beta-head ones 'raise_head.weight'; the trained obs width (959
-    # v1-era vs 991/995 current) and anchor spec are sniffed from the
-    # state dict. The bundled critic state (ckpt['critic']) is loaded
-    # separately by _load_critic() for the trainer review's all-cards
-    # "true EV".
-    try:
-        model = build_actor_from_state_dict(state_dict, hidden_dim, num_layers)
-        loaded = True
-    except Exception as e:
-        logger.warning(
-            "checkpoint %s is incompatible with current network (%s) — "
-            "using random init", ckpt_path, e,
-        )
-        model = _random_init_model(variant)
-        loaded = False
-    model.to(device)
-    model.eval()
-    for p in model.parameters():
-        p.requires_grad_(False)
-    logger.info(
-        "loaded checkpoint %s (%s, hidden_dim=%d, num_layers=%d, device=%s)",
-        ckpt_path, type(model).__name__, hidden_dim, num_layers, device,
-    )
-    _note_checkpoint_obs_rev(variant, ckpt, ckpt_path, loaded)
-    return model, loaded
-
-
-#: Distributional-critic readout hyperparameters that are NOT sniffable from
-#: the state dict (no parameters — pure forward-path semantics) but change
-#: the served V: a critic trained at a non-default symlog support decodes to
-#: the wrong "true EV" when rebuilt at the default.
-_CRITIC_VALUE_KWARGS = ("value_support", "value_hlgauss_sigma")
-
-
-def _critic_value_kwargs(ckpt: Any) -> dict[str, float]:
-    """Keyword args for ``build_critic_from_state_dict`` taken from the
-    checkpoint's ``config`` block.
-
-    (review 2026-09-20) The builder is gaining optional ``value_support`` /
-    ``value_hlgauss_sigma`` kwargs; pass the run's stamped values when the
-    checkpoint carries them, but only the ones the installed builder
-    actually accepts — signature-guarded so this works before and after
-    that change lands.
-    """
-    cfg_block = ckpt.get("config") if isinstance(ckpt, dict) else None
-    if not isinstance(cfg_block, dict):
-        return {}
-    try:
-        accepted = inspect.signature(build_critic_from_state_dict).parameters
-    except (TypeError, ValueError):
-        return {}
-    out: dict[str, float] = {}
-    for key in _CRITIC_VALUE_KWARGS:
-        value = cfg_block.get(key)
-        if key in accepted and value is not None:
-            out[key] = float(value)
-    return out
+    return _models.load_model(variant, _format_ckpt_path(variant))
 
 
 def _load_critic(device: torch.device, variant: str = VARIANT_PLO5) -> CentralCritic | None:
-    """Load the centralized critic bundled in the format's checkpoint
-    (v2+ only; ckpt['critic'] + head_version>=2). Returns None for v1 /
-    random-init / missing critic, in which case the trainer review shows
-    only the actor's own (blind) value estimate."""
+    """The centralized critic bundled in the format's checkpoint (v2+), or
+    None — then the trainer review shows only the actor's blind value."""
     ckpt_path = _format_ckpt_path(variant)
-    if not ckpt_path.exists():
+    if ckpt_path is None or not ckpt_path.exists():
         return None
     try:
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    except Exception as e:
+        ckpt = _models.read_checkpoint(ckpt_path)
+    except Exception as e:  # noqa: BLE001
         logger.warning("failed to load critic from %s (%s)", ckpt_path, e)
         return None
-    if not (
-        isinstance(ckpt, dict)
-        and int(ckpt.get("head_version", 1)) >= 2
-        and "critic" in ckpt
-    ):
-        return None
-    try:
-        # Dims (obs width, hidden, residual depth) are sniffed from the
-        # state dict — NLH critics are 995-wide, PLO 991, and constructing
-        # at the PLO default used to shape-fail every NLH load.
-        critic = build_critic_from_state_dict(
-            ckpt["critic"], **_critic_value_kwargs(ckpt)
+    return _models.critic_from_checkpoint(ckpt, device, variant, ckpt_path)
+
+
+# --- The site: one app and everything it serves from (BE-007) ----------------
+# `create_app()` builds the FastAPI app from the environment together with a
+# `Site` that holds what the app serves from: its settings, its models, the
+# NLH teacher, the trainer router, the study sessions, the format gate, the
+# static files and — in the public build — the service layer's database and
+# the home games. Importing this module builds one (uvicorn's
+# `plo5bp.ui.server:app`, the deploy's pre-flight); a test builds more — another
+# configuration, a fresh database — without re-importing any module.
+#
+# The process has ONE current site: the last one built, or the one `use_site`
+# picked. The study routes serve from it and the module's historical names
+# read it — `app`, `FORMATS`, `MODEL`, `MODEL_LOADED`, `GTO_HOST`,
+# `trainer_router`, `PLO5BP_PUBLIC` … (`_SITE_NAMES`) — like `homegame.CTX` for
+# the home games. Production builds exactly one.
+
+
+@dataclasses.dataclass(frozen=True)
+class SiteSettings:
+    """What `create_app` reads from the environment — once, when it builds the
+    app (`from_env`). The layers read their own settings the same way when an
+    app installs them (`public.install`, `homegame.install`); the trainer and
+    the checkpoint loader read PLO5BP_PUBLIC when they run, so `public` must
+    agree with the environment (`create_app` checks)."""
+
+    #: PLO5BP_PUBLIC — the public build: sign-in, per-user state, the service
+    #: layer and the home games. The live-capture subsystems (ClubGG OCR and
+    #: PokerNow ingest, `plo5bp.ui.live`), /ranges and the API docs are never
+    #: imported or mounted, and the frontend hides the live controls; Trainer +
+    #: Study are fully functional without them (every study route rebuilds from
+    #: user input via _rebuild_env, with no dependency on a live feed).
+    public: bool = False
+    #: PLO5BP_GTO_CHECKPOINT — the NLH teacher Study and the Trainer share.
+    gto_checkpoint: str | None = None
+    #: PLO5BP_BASE_URL without its trailing slash ("": the request's own
+    #: address) — the sitemap's links, and HSTS when the public build is https.
+    base_url: str = ""
+    #: PLO5BP_TORCH_THREADS — CPU threads per forward (None: the build decides).
+    torch_threads: int | None = None
+
+    @classmethod
+    def from_env(cls, environ: Mapping[str, str] | None = None) -> "SiteSettings":
+        env = os.environ if environ is None else environ
+        threads = env.get("PLO5BP_TORCH_THREADS", "").strip()
+        return cls(
+            public=_env_flag("PLO5BP_PUBLIC", environ=env),
+            gto_checkpoint=env.get("PLO5BP_GTO_CHECKPOINT", "").strip() or None,
+            base_url=env.get("PLO5BP_BASE_URL", "").strip().rstrip("/"),
+            torch_threads=max(1, int(threads)) if threads else None,
         )
-    except Exception as e:
-        logger.warning(
-            "checkpoint %s critic incompatible (%s) — true-EV disabled",
-            ckpt_path, e,
+
+
+class Site:
+    """Everything one app serves from. `create_app` builds it; it is the app's
+    ``app.state.site`` and, while it is the current site, what the module's
+    names read."""
+
+    def __init__(self, settings: SiteSettings) -> None:
+        self.settings = settings
+        self.app: FastAPI | None = None
+        #: Per-format serving registry (`models.FormatEntry` dicts). `label` is
+        #: what the UI dropdown shows; `loaded=False` means a random-init
+        #: placeholder answers (no checkpoint promoted) and the client badges
+        #: recommendations as untrained. Each checkpoint is read ONCE for its
+        #: actor and critic (PERF-023). Promote without a restart from /admin
+        #: (System → Promote) after copying the new file next to the served one
+        #: as `<name>.new` (`model_admin`, a `models.ModelAdmin` over this dict).
+        self.formats: dict[str, dict[str, Any]] = {}
+        #: Where the models run (the PLO5 model's device at startup).
+        self.device = torch.device("cpu")
+        self.model_admin: _models.ModelAdmin | None = None
+        #: The optional NLH GTO PolicyNet (Phase 2a): Study recommendations and
+        #: the Trainer share this one host.
+        self.gto_host: Any = None
+        self.trainer_router: Any = None
+        #: The study session. Locally there is exactly one (module-global
+        #: semantics, live capture included). In the public build
+        #: `plo5bp.ui.public` installs a resolver that returns the signed-in
+        #: user's own Session — every `session.x` read/write lands on the
+        #: per-user object — and this one is never served (SEC-011).
+        self.default_session = Session()
+        self.session_resolver: Callable[[], Session | None] | None = None
+        #: The public build's per-request trainer resolver (the trainer module
+        #: holds the current site's).
+        self.trainer_resolver: Callable[[], Any] | None = None
+        #: Optional per-request format gate, installed by the public build:
+        #: callable(format_id) -> True when the CURRENT user may not select the
+        #: format (rendered greyed-out "coming soon!" in the dropdown; POST
+        #: /format returns 403). None (the local build) = everything unlocked.
+        self.format_gate: Callable[[str], bool] | None = None
+        self.static: SiteStaticFiles | None = None
+        self.pages: _PageRenderer | None = None
+        #: GET /health's worker checks (`middleware.register_health_check`).
+        self.health_checks: dict[str, Any] = {}
+        #: Public build: the service layer's database and per-user registry, and
+        #: the home-games context (`homegame.HomeGames`).
+        self.db: Any = None
+        self.registry: Any = None
+        self.homegames: Any = None
+        self.started_at = time.time()
+        self.closed = False
+
+    @property
+    def public(self) -> bool:
+        return self.settings.public
+
+    def set_session_resolver(self, fn: Callable[[], Session | None] | None) -> None:
+        self.session_resolver = fn
+
+    def set_trainer_resolver(self, fn: Callable[[], Any] | None) -> None:
+        self.trainer_resolver = fn
+        if _SITE is self:
+            _trainer.set_session_resolver(fn)
+
+    def set_format_gate(self, fn: Callable[[str], bool] | None) -> None:
+        self.format_gate = fn
+
+    def close(self) -> None:
+        """Stop what this site runs in the background — the home games' clock,
+        grader and live streams — and close its database. (Tests; a stopping
+        server runs the app's shutdown hooks instead.) Idempotent."""
+        if self.closed:
+            return
+        self.closed = True
+        if self.homegames is not None:
+            hg = sys.modules.get("plo5bp.ui.homegame")
+            if hg is not None:
+                previous = hg.use_context(self.homegames)
+                try:
+                    hg.shutdown()
+                finally:
+                    hg.use_context(previous)
+        if self.db is not None:
+            self.db.close()
+
+
+#: The current site (see above). Set by `create_app` / `use_site`.
+_SITE: Site | None = None
+#: The site the public layer (`plo5bp.ui.public`, whose state is its module's)
+#: currently serves: one at a time.
+_PUBLIC_SITE: Site | None = None
+
+
+def current_site() -> Site:
+    """The site the study routes and the module's names serve from."""
+    if _SITE is None:
+        raise RuntimeError("no app has been built yet (plo5bp.ui.server.create_app)")
+    return _SITE
+
+
+def use_site(site: Site | FastAPI) -> Site | None:
+    """Make `site` (or an app's) the current one; returns the one it replaces.
+
+    The trainer's per-request session resolver, the /health worker checks and —
+    for a public site — the home-games context follow it. A public site can be
+    current only while the public layer still serves it (the layer's state is
+    its module's: a later public `create_app` retired this one)."""
+    if not isinstance(site, Site):
+        site = site.state.site
+    if site.closed:
+        raise RuntimeError("that app was closed (Site.close)")
+    if site.public and site is not _PUBLIC_SITE:
+        raise RuntimeError(
+            "this public app was retired by a later create_app(): its service layer "
+            "now serves the newer app — build a new one"
         )
-        return None
-    if variant == VARIANT_NLH:
-        serve_obs_dim = OBS_DIM_NLH
-    elif variant == FORMAT_EXPERIMENTAL:
-        serve_obs_dim = OBS_DIM_MINIMAL
-    else:
-        serve_obs_dim = OBS_DIM
-    if critic.obs_dim != serve_obs_dim:
-        logger.warning(
-            "checkpoint %s critic obs width %d != %s serve width %d — "
-            "true-EV disabled",
-            ckpt_path, critic.obs_dim, variant, serve_obs_dim,
-        )
-        return None
-    critic.to(device).eval()
-    for p in critic.parameters():
-        p.requires_grad_(False)
-    logger.info(
-        "loaded centralized critic (obs_dim=%d, hidden_dim=%d, device=%s)",
-        critic.obs_dim, critic.value_head.in_features, device,
-    )
-    return critic
+    return _activate(site)
 
 
-MODEL, MODEL_LOADED = _load_model(VARIANT_PLO5)
-MODEL_DEVICE = next(MODEL.parameters()).device
-MODEL_CRITIC = _load_critic(MODEL_DEVICE, VARIANT_PLO5)
-# v1-era checkpoints (trained at OBS_DIM 959) get the exact downgrade
-# projection; current-width models get identity.
-OBS_ADAPT = obs_adapter(MODEL)
+def _activate(site: Site) -> Site | None:
+    global _SITE
+    old, _SITE = _SITE, site
+    _trainer.set_session_resolver(site.trainer_resolver)
+    _mw.use_health_checks(site.health_checks)
+    if site.homegames is not None:
+        sys.modules["plo5bp.ui.homegame"].use_context(site.homegames)
+    return old
 
-NLH_MODEL, NLH_MODEL_LOADED = _load_model(VARIANT_NLH)
-NLH_CRITIC = _load_critic(MODEL_DEVICE, VARIANT_NLH)
 
-#: Per-format serving registry. `label` is what the UI dropdown shows;
-#: `loaded=False` means the format serves a random-init placeholder (no
-#: checkpoint promoted yet) and the client badges recommendations as
-#: untrained. Promote flows: PLO5 `cp checkpoints/<run>.pt
-#: checkpoints/stub.pt`; NLH `cp checkpoints/nlh<N>_<u>.pt
-#: checkpoints/nlh_stub.pt` — restart to pick up.
-EXP_MODEL, EXP_MODEL_LOADED = _load_model(FORMAT_EXPERIMENTAL)
-EXP_CRITIC = _load_critic(MODEL_DEVICE, FORMAT_EXPERIMENTAL)
+def _plo5_entry(site: Site) -> dict[str, Any]:
+    return site.formats[VARIANT_PLO5]
 
-FORMATS: dict[str, dict[str, Any]] = {
-    VARIANT_PLO5: {
-        "label": "PLO5 Double Board Bomb Pot",
-        "model": MODEL,
-        "critic": MODEL_CRITIC,
-        "adapter": OBS_ADAPT,
-        "loaded": MODEL_LOADED,
-        "engine_variant": VARIANT_PLO5,
-        # obs_rev / obs_rev_mismatch — see "Observation-semantics revision".
-        **_obs_rev_entry(VARIANT_PLO5),
-    },
-    VARIANT_NLH: {
-        "label": "NLH 5/10 ($5 ante)",
-        "model": NLH_MODEL,
-        "critic": NLH_CRITIC,
-        "adapter": obs_adapter(NLH_MODEL),
-        "loaded": NLH_MODEL_LOADED,
-        "engine_variant": VARIANT_NLH,
-        **_obs_rev_entry(VARIANT_NLH),
-    },
-    FORMAT_EXPERIMENTAL: {
-        "label": "experimental",
-        "model": EXP_MODEL,
-        "critic": EXP_CRITIC,
-        "adapter": obs_adapter(EXP_MODEL),
-        "loaded": EXP_MODEL_LOADED,
-        # Same table rules as PLO5; only the policy/obs differ.
-        "engine_variant": VARIANT_PLO5,
-        "_ckpt_path": str(_format_ckpt_path(FORMAT_EXPERIMENTAL)),
-        **_obs_rev_entry(FORMAT_EXPERIMENTAL),
-    },
+
+#: The module's historical names, read from the CURRENT site (`_ServerModule`).
+_SITE_NAMES: dict[str, Callable[[Site], Any]] = {
+    # uvicorn's `plo5bp.ui.server:app`: the app built at import (the current site's).
+    "app": lambda s: s.app,
+    "FORMATS": lambda s: s.formats,
+    "MODEL": lambda s: _plo5_entry(s)["model"],
+    "MODEL_LOADED": lambda s: bool(_plo5_entry(s)["loaded"]),
+    "MODEL_CRITIC": lambda s: _plo5_entry(s)["critic"],
+    # v1-era checkpoints (trained at OBS_DIM 959) get the exact downgrade
+    # projection; current-width models get identity.
+    "OBS_ADAPT": lambda s: _plo5_entry(s)["adapter"],
+    "NLH_MODEL": lambda s: s.formats[VARIANT_NLH]["model"],
+    "NLH_MODEL_LOADED": lambda s: bool(s.formats[VARIANT_NLH]["loaded"]),
+    "NLH_CRITIC": lambda s: s.formats[VARIANT_NLH]["critic"],
+    "EXP_MODEL": lambda s: s.formats[FORMAT_EXPERIMENTAL]["model"],
+    "EXP_MODEL_LOADED": lambda s: bool(s.formats[FORMAT_EXPERIMENTAL]["loaded"]),
+    "EXP_CRITIC": lambda s: s.formats[FORMAT_EXPERIMENTAL]["critic"],
+    "MODEL_DEVICE": lambda s: s.device,
+    #: Admin reload / promote / rollback (OPS-027) — see `models.ModelAdmin`.
+    "MODEL_ADMIN": lambda s: s.model_admin,
+    "GTO_HOST": lambda s: s.gto_host,
+    "_GTO_CKPT": lambda s: s.settings.gto_checkpoint,
+    "trainer_router": lambda s: s.trainer_router,
+    "PLO5BP_PUBLIC": lambda s: s.settings.public,
+    "_DEFAULT_SESSION": lambda s: s.default_session,
+    "_SESSION_RESOLVER": lambda s: s.session_resolver,
+    "_FORMAT_GATE": lambda s: s.format_gate,
+    "_STATIC_MOUNT": lambda s: s.static,
+    "_PAGES": lambda s: s.pages,
+    "_STARTED_AT": lambda s: s.started_at,
+}
+#: The names that may be assigned (a test's monkeypatch): they write the site.
+_SITE_SETTABLE = {
+    "GTO_HOST": "gto_host",
+    "_SESSION_RESOLVER": "session_resolver",
+    "_FORMAT_GATE": "format_gate",
 }
 
 
+class _ServerModule(types.ModuleType):
+    """``server.MODEL``, ``server.app``, ``server.GTO_HOST`` … read (and the
+    settable ones write) the CURRENT site's (BE-007)."""
+
+    def __getattr__(self, name: str) -> Any:
+        get = _SITE_NAMES.get(name)
+        if get is None:
+            raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+        site = self.__dict__.get("_SITE")
+        if site is None:
+            raise AttributeError(f"{__name__}.{name}: no app has been built yet (create_app)")
+        return get(site)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        attr = _SITE_SETTABLE.get(name)
+        if attr is not None:
+            setattr(current_site(), attr, value)
+        elif name in _SITE_NAMES:
+            raise AttributeError(
+                f"{__name__}.{name} is the current site's (read-only here) — see Site"
+            )
+        else:
+            super().__setattr__(name, value)
+
+    def __dir__(self) -> list[str]:
+        return sorted(set(super().__dir__()) | set(_SITE_NAMES))
+
+
+def _on_model_swap(fmt: str, entry: dict[str, Any]) -> None:
+    """`entry` now serves `fmt` on the current site. The model names (`MODEL`,
+    `MODEL_CRITIC`, `NLH_MODEL` …) are read from `FORMATS` whenever they are
+    used, so nothing else needs refreshing: trainer sessions re-bind at their
+    next hand (the entry's `version`), the home-games grader at its next job."""
+    current_site().formats[fmt] = entry
+
+
 def _maybe_reload_experimental() -> None:
-    """If a newer vMin1 snapshot appeared on disk since boot (or last
-    switch), hot-swap the experimental format's model/critic/adapter.
-    No-op when PLO5BP_CHECKPOINT_EXPERIMENTAL pins a path, or when the
-    resolved path is unchanged / unloadable."""
-    if os.environ.get("PLO5BP_CHECKPOINT_EXPERIMENTAL", "").strip():
-        return
-    entry = FORMATS.get(FORMAT_EXPERIMENTAL)
-    if entry is None:
-        return
+    """The candidate slot follows its file: when the configured candidate
+    checkpoint changed on disk since it was loaded (a new file dropped in
+    place), load it and swap it in. No-op when the slot is unset, the file
+    is unchanged, or the new file does not load (the old one keeps serving)."""
     path = _format_ckpt_path(FORMAT_EXPERIMENTAL)
-    if not path.exists():
+    if path is None:
         return
-    prev = entry.get("_ckpt_path")
-    if prev is not None and Path(prev) == path and entry.get("loaded"):
+    try:
+        st = path.stat()
+    except OSError:
         return
-    model, loaded = _load_model(FORMAT_EXPERIMENTAL)
-    critic = _load_critic(MODEL_DEVICE, FORMAT_EXPERIMENTAL)
-    entry["model"] = model
-    entry["critic"] = critic
-    entry["adapter"] = obs_adapter(model)
-    entry["loaded"] = loaded
-    entry["_ckpt_path"] = str(path)
-    entry.update(_obs_rev_entry(FORMAT_EXPERIMENTAL))
-    logger.info("experimental format now serving %s (loaded=%s)", path, loaded)
+    entry = current_site().formats.get(FORMAT_EXPERIMENTAL) or {}
+    if (
+        entry.get("loaded")
+        and entry.get("_ckpt_path") == str(path)
+        and entry.get("mtime") == float(st.st_mtime)
+        and entry.get("size") == int(st.st_size)
+    ):
+        return
+    new = _models.build_entry(FORMAT_EXPERIMENTAL, path)
+    if not new["loaded"]:
+        logger.warning("candidate checkpoint %s does not load — keeping the previous one", path)
+        return
+    _on_model_swap(FORMAT_EXPERIMENTAL, new)
+    logger.info("candidate format now serving %s", path)
 
 
 def _fmt() -> dict[str, Any]:
     """The active format's serving entry (model/critic/adapter/loaded)."""
-    return FORMATS[session.variant]
-
-
-#: Optional per-request format gate, installed by the public build:
-#: callable(format_id) -> True when the CURRENT user may not select the
-#: format (rendered greyed-out "coming soon!" in the dropdown; POST
-#: /format returns 403). None (the local build) = everything unlocked.
-_FORMAT_GATE: Any = None
+    return current_site().formats[session.variant]
 
 
 def set_format_gate(fn: Any) -> None:
-    global _FORMAT_GATE
-    _FORMAT_GATE = fn
+    """Install the current site's per-request format gate (`Site.format_gate`)."""
+    current_site().set_format_gate(fn)
 
 
 def _format_locked(fmt_id: str) -> bool:
-    if _FORMAT_GATE is None:
+    gate = current_site().format_gate
+    if gate is None:
         return False
     try:
-        return bool(_FORMAT_GATE(fmt_id))
+        return bool(gate(fmt_id))
     except Exception:
         logger.exception("format gate failed")
         # Fail closed for non-default formats; never lock the default.
@@ -569,88 +529,19 @@ class Session:
     # live sitting-out set without needing per-frame detection.
     folded_this_hand: frozenset[int] = frozenset()
 
-    # Directly-observed values from the most recent OCR frame. These
-    # are refreshed every tick by `_mirror_observable_state` regardless
-    # of hand-boundary detection, so stacks/pot stay live across
-    # rewinds and missed hand transitions.
-    observed_stacks: tuple[int | None, ...] = ()
-    observed_pot: int | None = None
-
-    # Hero's hole cards snapshot at the most recent hand-start trigger.
-    # Used to detect a new hand when hero hole re-appears with
-    # different cards (rewind-proof fallback).
-    last_hero_hole: tuple[int, ...] | None = None
-
-    # Stability gate state: we only commit a new button/participant
-    # snapshot after the same value has held for two consecutive ticks,
-    # so a single mid-animation frame can't cascade into a bogus
-    # hand-start.
-    _pending_button: int | None = None
-    _pending_sitting_out: frozenset[int] | None = None
-    _pending_stable_ticks: int = 0
-    # Button-ONLY stability counter, decoupled from the (button, sitting_out)
-    # snapshot above. The button is a strong, discrete new-hand signal that
-    # never moves mid-hand, so the button-change trigger debounces on this
-    # short counter — sitting_out flicker (folds/banners during the deal)
-    # no longer resets it. See `_mirror_observable_state`.
-    _last_observed_button: int | None = None
-    _button_stable_ticks: int = 0
-    # Frame captured the tick a new pending snapshot first appeared —
-    # used as the pre-commit baseline for stack-seeding and reconstructor
-    # rebaselining when the 2-tick stability gate finally commits. Without
-    # this, the 2nd stable tick (post-bet) would clobber the pre-bet
-    # baseline, making the stack-delta fallback unable to see the action.
-    _pending_anchor_fs: Any = None
-
-    # Mid-hand `_begin_new_hand` lock. Counts ticks since the last
-    # hand-start fired; once past `_LOCK_AFTER_TICKS` the snapshot
-    # debouncer requires `_STABILITY_TICKS_REQUIRED_LOCKED` stable
-    # ticks (instead of the bootstrap 2) before button_changed /
-    # first_commit can re-fire, and `hero_hole_rotated` runs through
-    # its own debouncer instead of firing on a single disjoint frame.
-    # Suppresses false hand-restarts from chip-settle / banner OCR
-    # flickers without delaying real new-hand detection (which
-    # persists for many seconds in practice).
-    _ticks_since_hand_start: int = 0
-    _pending_hero_hole_rotation: tuple[int, ...] | None = None
-    _pending_hero_hole_rotation_ticks: int = 0
-
-    # Mid-hand mask-expansion debouncer. If a non-hero seat reads
-    # `folded=False` for two consecutive ticks while NOT in the locked
-    # `hand_in_hand_mask` (and not already in `folded_this_hand`), we
-    # treat that as "anchor frame missed this participant" and expand
-    # the mask. Late rebuyers stay safe because they read folded=True
-    # (no cards / banner / commit / timer-bar). Real folds stay safe
-    # because the FOLD event puts them in `folded_this_hand`, which
-    # the candidate filter excludes.
-    _pending_mask_additions: frozenset[int] = frozenset()
-    _pending_mask_additions_ticks: int = 0
-
-    # StreetReveal fold-reconcile debounce (OCR path only). Seats that read
-    # visually folded on the reveal tick but have no FOLD yet; they are only
-    # reconciled if they STILL read folded on the following tick, so a
-    # one-frame card-back miss on the reveal frame can't retire a live seat.
-    # `_pending_reveal_target` carries the reveal's target street to that
-    # follow-up tick (None = no follow-up pending). (review 2026-09-20 F11)
-    _pending_reveal_folds: frozenset[int] = frozenset()
-    _pending_reveal_target: int | None = None
-
     # (log index, recorded seat, engine actor) triples already warned about
     # by the replay seat-attribution check, so a persistent mismatch logs
     # once per hand instead of once per tick. (review 2026-09-20 F15)
     _replay_mismatch_warned: frozenset[tuple[int, int, int]] = frozenset()
 
+    # (FEAT-025) Admins: show the candidate model's answer next to the live
+    # one (`POST /study/compare`).
+    compare_candidate: bool = False
+
     # Snapshots captured at first-time street reveal during replay.
     # Compared against current card spec to flag "modified since reveal".
     snapshot_at_turn: dict[str, list[int | None]] | None = None
     snapshot_at_river: dict[str, list[int | None]] | None = None
-
-    # When True, OcrRunner._tick still mirrors cards + runs the
-    # debounced hand-start machine, but skips action inference
-    # entirely. The user enters all actions via the manual /action
-    # endpoint. Workaround for unreliable action detection in the
-    # reconstructor (silent CHECKs, banner timing).
-    simple_ocr_mode: bool = True
 
     # Per-slot OCR write lock. Once a card slot has been filled (by
     # OCR or by the user via /cards), the lock for that slot latches
@@ -658,14 +549,18 @@ class Session:
     # the user override OCR misreads without the next tick clobbering
     # their edit. Reset to all-False by `_new_session_defaults`.
     _card_slot_locked: dict[str, list[bool]]
-    # Per-slot stability debounce for the AUTO mirror path: (card_idx, count)
-    # of consecutive identical OCR reads, or None. A slot only commits+locks
-    # after `_CARD_STABLE_TICKS` identical reads, so a transient mid-reveal
-    # misread (dark flipping card -> spurious spade) never latches. Manual
-    # rescan bypasses this. Reset by `_new_session_defaults`.
-    _card_slot_pending: dict[str, list[tuple[int, int] | None]]
+
+    # Live-capture tracker state (`plo5bp.ui.live.state.LiveState`: the OCR /
+    # PokerNow debounce counters, pending card reads, observed stacks). The
+    # local build's live capture creates it on first use; the public build
+    # never does.
+    live: Any = None
 
     def __init__(self) -> None:
+        # (BE-002) Serializes this session's Study requests (see
+        # `_study_route`): two quick clicks or two tabs used to interleave
+        # validate-then-append and lose or double actions.
+        self.lock = threading.RLock()
         # Per-instance mutable state. These MUST be created here, not as
         # class-level defaults: in the multi-user public build every signed-in
         # user gets their own Session(), and a shared class-level list/dict
@@ -674,7 +569,7 @@ class Session:
         # (None / int / str / tuple / frozenset) stay as class attributes
         # above — reassignment can't leak. Sizes match the PLO5 default
         # variant; _new_session_defaults re-sizes per variant on reset.
-        self.game_config = GameConfig(starting_stack=400000)
+        self.game_config = _common_default_game_config(VARIANT_PLO5)
         self.hero_hole = [None] * 5
         self.flop_a = [None] * 3
         self.flop_b = [None] * 3
@@ -688,36 +583,34 @@ class Session:
             "turn_cards": [False, False],
             "river_cards": [False, False],
         }
-        self._card_slot_pending = {
-            "hero_hole": [None] * 5,
-            "flop_a": [None] * 3,
-            "flop_b": [None] * 3,
-            "turn_cards": [None, None],
-            "river_cards": [None, None],
-        }
 
 
-# The study session. Locally there is exactly one (module-global semantics,
-# OCR runner included). In the public build, `plo5bp.ui.public` installs a
-# resolver that returns the signed-in user's own Session — every existing
-# `session.x` read/write below transparently lands on the per-user object.
-# The resolver returning None (or nothing installed) falls back to the
-# default single session, which keeps the local build byte-identical.
-_DEFAULT_SESSION = Session()
-_SESSION_RESOLVER: Any = None
+# The study session (the current site's, see `Site.default_session`). Locally
+# there is exactly one (module-global semantics, live capture included). In the
+# public build, `plo5bp.ui.public` installs a resolver that returns the
+# signed-in user's own Session — every existing `session.x` read/write below
+# transparently lands on the per-user object. The resolver returning None (or
+# nothing installed) falls back to the default single session, which keeps the
+# local build byte-identical.
 
 
 def set_session_resolver(fn) -> None:
-    global _SESSION_RESOLVER
-    _SESSION_RESOLVER = fn
+    current_site().set_session_resolver(fn)
 
 
 def _current_session() -> Session:
-    if _SESSION_RESOLVER is not None:
-        s = _SESSION_RESOLVER()
+    site = current_site()
+    if site.session_resolver is not None:
+        s = site.session_resolver()
         if s is not None:
             return s
-    return _DEFAULT_SESSION
+        if site.public:
+            # (SEC-011) Mirror the trainer: the default session is ONE object
+            # shared by every caller, so in the public build a request (or a
+            # background task) with no signed-in user must never read or
+            # drive it — it fails closed instead.
+            raise HTTPException(status_code=401, detail="sign in required")
+    return site.default_session
 
 
 class _SessionProxy:
@@ -735,10 +628,31 @@ class _SessionProxy:
 
 session: Any = _SessionProxy()
 
-# Consecutive identical auto-OCR reads required before a card slot commits and
-# locks. ~600ms at 200ms poll / 300ms at 100ms. Raise if misreads still slip
-# through; lower if the commit feels sluggish.
-_CARD_STABLE_TICKS = 3
+
+# --- Local-build extension hooks ---------------------------------------------
+# The live-capture package (`plo5bp.ui.live`, local build only) keeps its own
+# per-session state (`Session.live`) and plugs into the study core here. The
+# public build registers nothing, so these are no-ops there.
+
+#: fn(kind) callbacks. kind "hand": `_new_session_defaults` just restored the
+#: per-hand defaults (a new hand, /reset, /format); "user": a user-level reset
+#: (/reset, /format) that must also forget what was learned across hands.
+_SESSION_RESET_HOOKS: list[Any] = []
+#: fn() -> dict callbacks whose keys are merged into `_state_dict()`.
+_STATE_EXTRAS_HOOKS: list[Any] = []
+
+
+def _run_session_reset_hooks(kind: str) -> None:
+    # (each hook once, even if a second local app registered it again)
+    for hook in dict.fromkeys(_SESSION_RESET_HOOKS):
+        hook(kind)
+
+
+def _state_extras() -> dict[str, Any]:
+    extras: dict[str, Any] = {}
+    for hook in dict.fromkeys(_STATE_EXTRAS_HOOKS):
+        extras.update(hook())
+    return extras
 
 
 #: Per-format card-slot shapes. PLO5 double-board: 5-card hole, two
@@ -763,96 +677,28 @@ _CARD_SPEC_BY_VARIANT: dict[str, tuple[tuple[str, int], ...]] = {
 
 
 def _engine_variant(fmt_id: str | None = None) -> str:
-    """Map a UI format id to the engine GameConfig.variant string."""
+    """Map a UI format id to the engine GameConfig.variant string (the
+    registry's `engine_variant`, else the shared `common.engine_variant`)."""
     fid = session.variant if fmt_id is None else fmt_id
-    entry = FORMATS.get(fid)
+    entry = current_site().formats.get(fid)
     if entry is not None:
         return str(entry.get("engine_variant", fid))
-    return fid
+    return _common_engine_variant(fid)
 
 
 def _card_spec_attrs() -> tuple[tuple[str, int], ...]:
     return _CARD_SPEC_BY_VARIANT[_engine_variant()]
 
 
-def _blank_card_pending() -> dict[str, list[tuple[int, int] | None]]:
-    """Fresh per-slot debounce state (all slots empty)."""
-    return {attr: [None] * n for attr, n in _card_spec_attrs()}
-
-
 def _lock_filled_card_slots() -> None:
-    """Latch the OCR-skip lock on any slot currently holding a card."""
+    """Latch the live-capture skip lock on any slot currently holding a card
+    (a user edit via /cards wins over later live reads)."""
     for attr, _ in _card_spec_attrs():
         spec = getattr(session, attr)
         locks = session._card_slot_locked[attr]
         for i, c in enumerate(spec):
             if c is not None:
                 locks[i] = True
-
-
-def _card_held_by_other_slot(attr: str, idx: int, card: int) -> bool:
-    """True when ``card`` already sits in a spec slot other than (attr, idx)."""
-    for other_attr, _ in _card_spec_attrs():
-        for j, c in enumerate(getattr(session, other_attr)):
-            if c is not None and int(c) == int(card) and (other_attr, j) != (attr, idx):
-                return True
-    return False
-
-
-def _ocr_apply_card_slot(
-    attr: str,
-    idx: int,
-    ocr_card_idx: int | None,
-    debounce: bool = False,
-    reject_duplicates: bool | None = None,
-) -> None:
-    """Write an OCR-detected card into the spec slot if it isn't locked.
-
-    With ``debounce=True`` (the automatic mirror path) the read must repeat
-    identically for ``_CARD_STABLE_TICKS`` consecutive ticks before it commits
-    and locks — so a transient mid-reveal misread can't latch. ``debounce=False``
-    (manual rescan, explicit edits) commits immediately, as before.
-
-    ``reject_duplicates`` refuses to commit a card that another slot already
-    holds: a stable misread that duplicated a card used to lock, after which
-    ``_pad_all`` 400'd every tick and the session was wedged until a manual
-    edit. The slot stays empty + unlocked so a later correct read (or the
-    user) can still fill it. Default (None) = on for the debounced automatic
-    mirror, off for immediate commits; the PokerNow mirror opts in, manual
-    rescan stays off on purpose — its duplicate path is the pinned
-    400 + rollback. (review 2026-09-20 H7)
-    """
-    if reject_duplicates is None:
-        reject_duplicates = debounce
-    if session._card_slot_locked[attr][idx]:
-        return
-    if not debounce:
-        if ocr_card_idx is None:
-            return
-        if reject_duplicates and _card_held_by_other_slot(attr, idx, ocr_card_idx):
-            return
-        getattr(session, attr)[idx] = ocr_card_idx
-        session._card_slot_locked[attr][idx] = True
-        return
-
-    pending = session._card_slot_pending[attr]
-    if ocr_card_idx is None:
-        # No confident read this tick — break the run.
-        pending[idx] = None
-        return
-    prev = pending[idx]
-    count = prev[1] + 1 if (prev is not None and prev[0] == ocr_card_idx) else 1
-    pending[idx] = (ocr_card_idx, count)
-    if count >= _CARD_STABLE_TICKS:
-        pending[idx] = None
-        if reject_duplicates and _card_held_by_other_slot(attr, idx, ocr_card_idx):
-            logger.info(
-                "ocr: %s[%d] read card %d, already held by another slot — "
-                "not committing", attr, idx, ocr_card_idx,
-            )
-            return
-        getattr(session, attr)[idx] = ocr_card_idx
-        session._card_slot_locked[attr][idx] = True
 
 
 def _new_session_defaults() -> None:
@@ -871,20 +717,11 @@ def _new_session_defaults() -> None:
     session.sitting_out_seats = frozenset()
     session.hand_in_hand_mask = frozenset()
     session.folded_this_hand = frozenset()
-    session._pending_mask_additions = frozenset()
-    session._pending_mask_additions_ticks = 0
-    session._ticks_since_hand_start = 0
-    session._pending_hero_hole_rotation = None
-    session._pending_hero_hole_rotation_ticks = 0
-    session._last_observed_button = None
-    session._button_stable_ticks = 0
-    session._pending_reveal_folds = frozenset()
-    session._pending_reveal_target = None
     session._replay_mismatch_warned = frozenset()
     session._card_slot_locked = {
         attr: [False] * n for attr, n in _card_spec_attrs()
     }
-    session._card_slot_pending = _blank_card_pending()
+    _run_session_reset_hooks("hand")
 
 
 def _clear_hand_state_keep_cards() -> None:
@@ -895,44 +732,6 @@ def _clear_hand_state_keep_cards() -> None:
     session.last_obs = None
     session.last_info = None
     session._replay_mismatch_warned = frozenset()
-
-
-def _reset_live_tracking() -> None:
-    """Forget everything the live hand-start machine has accumulated.
-
-    `_new_session_defaults` deliberately keeps the cross-hand debounce state
-    (`_pending_*`, `last_hero_hole`, observed stacks/pot) because
-    `_begin_new_hand` calls it mid-stream. A user-level reset is different:
-    after `/reset`, `/format`, an OCR (re)start or a live-source switch the
-    old `_pending_anchor_fs` is a frame from a hand that no longer exists,
-    and the still-"stable" tick counter let the very next tick fire
-    `_begin_new_hand` with that stale anchor — seeding stacks and the
-    reconstructor baseline from minutes-old reads. Clearing the counters
-    makes the next hand-start debounce from scratch on fresh frames.
-    (review 2026-09-20 F10)
-    """
-    session._pending_button = None
-    session._pending_sitting_out = None
-    session._pending_stable_ticks = 0
-    session._pending_anchor_fs = None
-    session.last_hero_hole = None
-    session.observed_stacks = ()
-    session.observed_pot = None
-    session.sitting_out_seats = frozenset()
-    session.hand_in_hand_mask = frozenset()
-    session.folded_this_hand = frozenset()
-    session._pending_mask_additions = frozenset()
-    session._pending_mask_additions_ticks = 0
-    session._ticks_since_hand_start = 0
-    session._pending_hero_hole_rotation = None
-    session._pending_hero_hole_rotation_ticks = 0
-    session._last_observed_button = None
-    session._button_stable_ticks = 0
-    session._pending_reveal_folds = frozenset()
-    session._pending_reveal_target = None
-    # The mask decides who the engine deals in, so the env built with it is
-    # stale now. Callers rebuild right away or let the next reader do it.
-    session.env = None
 
 
 def _current_total_commit(num_seats: int, ante: int) -> list[int]:
@@ -962,14 +761,17 @@ def _current_engine_seat_array(key: str) -> list[int] | None:
         # session whose current state can't rebuild falls through.
         try:
             _rebuild_env()
-        except Exception:
-            pass
+        except Exception:  # noqa: BLE001 — callers fall back, but say why (OPS-028)
+            logger.warning(
+                "could not rebuild the study env to read %r — callers fall back to"
+                " ante-only commits", key, exc_info=True,
+            )
     if session.env is not None:
         try:
             raw = session.env._rs.observation_dict(skip_outcome_mc=True)
             return [int(x) for x in (raw.get(key) or [])]
-        except Exception:
-            pass
+        except Exception:  # noqa: BLE001 (OPS-028)
+            logger.warning("reading %r from the study engine failed", key, exc_info=True)
     return None
 
 
@@ -1227,7 +1029,8 @@ def _build_env(spec: _EnvSpec) -> _EnvBuild:
             actor = env.current_actor()
             if actor is None or int(actor) not in structurally_sitting:
                 return
-            raw = dict(env._rs.observation_dict())
+            # Only bet_to_call is read: skip the opp-outcome Monte Carlo.
+            raw = env._rs.observation_dict(skip_outcome_mc=True)
             bet_to_call = int(raw.get("bet_to_call") or 0)
             gate = int(GATE_FOLD) if bet_to_call > 0 else int(GATE_CHECK_CALL)
             env.step_hybrid(gate, 0)
@@ -1274,8 +1077,8 @@ def _build_env(spec: _EnvSpec) -> _EnvBuild:
                 mx = int(env._rs.max_raise_chips())
                 if 0 < mx < chips:
                     chips = mx
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001 (OPS-028) — replay continues unclamped
+                logger.warning("max_raise_chips failed replaying %s", entry, exc_info=True)
         try:
             env.step_hybrid(gate, chips)
             kept.append(entry)
@@ -1412,17 +1215,21 @@ def _refresh_obs() -> None:
 
 # --- Request models ---------------------------------------------------------
 
-class ActionRequest(BaseModel):
-    gate: str = Field(..., pattern=r"^(fold|check_call|raise)$")
-    chips: int | None = Field(default=None, ge=0)
+#: One action — shared with the Trainer API (BE-010).
+ActionRequest = _CommonActionRequest
 
 
 class CardsRequest(BaseModel):
-    hero_hole: list[int | None] = Field(default_factory=lambda: [None] * 5)
-    flop_a: list[int | None] = Field(default_factory=lambda: [None] * 3)
-    flop_b: list[int | None] = Field(default_factory=lambda: [None] * 3)
-    turn: list[int | None] = Field(default_factory=lambda: [None, None])
-    river: list[int | None] = Field(default_factory=lambda: [None, None])
+    """The card spec. An omitted field KEEPS the session's cards for it
+    (BE-014): the old PLO5-shaped defaults cleared them and made a partial
+    NLH request fail with "must be length 2, got 5". Lists are bounded so a
+    huge array is refused before any work."""
+
+    hero_hole: list[int | None] | None = Field(default=None, max_length=8)
+    flop_a: list[int | None] | None = Field(default=None, max_length=3)
+    flop_b: list[int | None] | None = Field(default=None, max_length=3)
+    turn: list[int | None] | None = Field(default=None, max_length=2)
+    river: list[int | None] | None = Field(default=None, max_length=2)
 
 
 #: Upper bound for any chip quantity a request may set (per-seat stack, the
@@ -1456,215 +1263,18 @@ class ConfigRequest(BaseModel):
 
 
 class FormatRequest(BaseModel):
-    format: str = Field(..., pattern=r"^(plo5_double_bomb|nlh_single|experimental)$")
+    # Validated against the live `FORMATS` registry in the handler (BE-011):
+    # a new format needs no second list of ids here.
+    format: str = Field(..., min_length=1, max_length=64)
 
 
 # --- Helpers ----------------------------------------------------------------
 
-_GATE_NAME_TO_IDX = {
-    "fold": GATE_FOLD,
-    "check_call": GATE_CHECK_CALL,
-    "raise": GATE_RAISE,
-}
+_GATE_NAME_TO_IDX = _COMMON_GATE_NAME_TO_IDX
 
 
 def _chips_to_bb(chips: int | float) -> float:
     return float(chips) / float(session.game_config.bb)
-
-
-def _ocr_cents_to_engine_chips(cents: int) -> int:
-    """Convert an OCR-cent amount (ClubGG dollar display × 100) to engine chips.
-
-    OCR reads ClubGG stack text in cents (100 = $1). The engine carries
-    chip counts where `cfg.bb` chips = 1 big blind = `dollars_per_bb`
-    dollars. At the defaults (bb=10000, $20/bb) that works out to 5
-    engine-chips per cent. Doing the mixed-unit arithmetic that used to
-    live in ``_reset_for_new_hand`` (raw_cents + cfg.ante_chips) is a
-    bug; always run cents through this helper first.
-    """
-    scale = _chips_per_cent()
-    if scale is None:
-        return int(cents)
-    # Same single multiply + round as `ocr.events.cents_to_engine_chips`, on
-    # the same `chips_per_cent` the EngineView carries, so a stack seeded here
-    # and a bet converted by the reconstructor can never round differently
-    # (the old `cents * bb / (100 * dpb)` op order could be 1 chip off at
-    # non-integer scales).
-    return int(round(int(cents) * scale))
-
-
-def _chips_per_cent() -> float | None:
-    """Engine chips per OCR cent (None when $/bb is unusable)."""
-    dpb = float(session.dollars_per_bb)
-    if dpb <= 0:
-        return None
-    return float(session.game_config.bb) / (100.0 * dpb)
-
-
-def _seat_action_to_log_entry(ev: Any) -> dict[str, int]:
-    """Translate a ``SeatAction`` OCR event into an ``action_log`` entry.
-
-    ``SeatAction.chips`` is already a raise-by delta in engine-chips
-    (the reconstructor converts OCR cents at its boundary); no unit
-    fixup needed here. ``seat`` records who the walk attributed the
-    action to (diagnostic only — see the replay loop in `_build_env`).
-    """
-    return {
-        "gate": int(_GATE_NAME_TO_IDX[ev.gate]),
-        "chips": int(ev.chips),
-        "seat": int(ev.seat),
-    }
-
-
-def _reconcile_missed_folds_on_street_reveal(fs: Any, exact: bool = False) -> bool:
-    """Append FOLD entries for in-hand seats the walk missed (Fix K).
-
-    Triggered when a ``StreetReveal`` fires (and, on the OCR path, once more
-    on the following tick — see below). The guard is that
-    ``StreetReveal`` already requires both board_a and board_b to
-    show 4+ cards (see ocr.events), which rules out the bomb-pot
-    intro animation flicker.
-
-    Attribution by count, not by seat: ``step_hybrid`` applies
-    actions to the engine's own ``current_actor``, so appending N
-    bare FOLD entries retires the next N actors. That's fine because
-    the walk already handled any non-fold actions ahead of the
-    missed folds — if a call had sat between them, the engine
-    would have advanced past those seats before the missed folds
-    reached the front of the queue.
-
-    (review 2026-09-20 F11) ``exact=False`` (ClubGG OCR): ``folded`` is a
-    noisy pixel read, and this used to trust the single reveal frame — one
-    missed card-back on exactly that frame retired a live seat for the rest
-    of the hand. A seat is now reconciled only when it reads folded on TWO
-    consecutive ticks: the first sighting is parked in
-    ``_pending_reveal_folds`` and confirmed (or dropped) by the caller's
-    follow-up call on the next tick. ``exact=True`` (PokerNow: the DOM
-    ``fold`` class is authoritative) reconciles immediately — it must,
-    because the forced CHECK_CALL fill that runs right after treats every
-    unreconciled seat as a caller.
-
-    Returns True when FOLD entries were appended.
-    """
-    in_hand = session.hand_in_hand_mask
-    if not in_hand:
-        session._pending_reveal_folds = frozenset()
-        return False
-    fs_by_seat = {s.seat: s for s in fs.seats}
-    visually_folded = frozenset(
-        seat
-        for seat in in_hand
-        if fs_by_seat.get(seat) is not None and fs_by_seat[seat].folded
-    )
-    missing = visually_folded - session.folded_this_hand
-    if not exact:
-        confirmed = missing & session._pending_reveal_folds
-        session._pending_reveal_folds = frozenset(missing - confirmed)
-        missing = confirmed
-    if not missing:
-        return False
-    for _ in missing:
-        session.action_log.append({"gate": int(GATE_FOLD), "chips": 0})
-    session.folded_this_hand = frozenset(
-        session.folded_this_hand | missing
-    )
-    all_seats = frozenset(range(session.num_seats))
-    session.sitting_out_seats = (
-        (all_seats - session.hand_in_hand_mask) | session.folded_this_hand
-    )
-    logger.warning(
-        "ocr: StreetReveal fold reconcile — added %d FOLD entries "
-        "for seats %s (walk missed these folds)",
-        len(missing),
-        sorted(missing),
-    )
-    return True
-
-
-def _reconcile_missed_checks_on_street_reveal(
-    target_street: int, force: bool = False
-) -> None:
-    """Append CHECK_CALL entries when the walk missed a pure-check round.
-
-    Loop-fills: appends one CHECK_CALL, rebuilds the engine, rechecks
-    ``view.street`` — until the engine has advanced to ``target_street``.
-    The engine's own street-advance logic decides when each fill is
-    enough, so this is correct whether the walk emitted 0, 1, or N
-    CHECKs for the current street before the reconciler ran. The old
-    ``len(active) * streets_to_fill`` formula assumed the engine was at
-    the start of the current street, but step 5 of the walk ladder
-    (events.py ``_infer_seat_actions``) routinely emits a CHECK for the
-    first actor on a quiet street — leaving the engine partially
-    advanced and the formula over-counting by exactly that emission.
-
-    Safety (``force=False``, the OCR default): only fills when
-    ``bet_to_call == 0`` and no seat has committed chips on the current
-    street; positive evidence means a real bet was missed and we leave
-    the engine stuck rather than silently mis-attribute.
-
-    ``force=True`` (PokerNow): fill CHECK_CALL even when facing a bet.
-    A PokerNow street reveal is authoritative proof the prior street's
-    betting closed (PokerNow won't deal the next card otherwise), and the
-    closing call's signal is unrecoverable — PokerNow sweeps the chips to
-    the pot and deals the next card in the same instant the closing caller
-    acts, so their committed amount is gone and their stack delta already
-    landed in a (likely coalesced-away) earlier frame. Folds are
-    reconciled first (``_reconcile_missed_folds_on_street_reveal`` reads
-    the DOM fold flags), so every remaining in-hand seat that hasn't
-    matched the bet must have CALLED — GATE_CHECK_CALL calls the engine's
-    current ``bet_to_call`` for the right amount. A loop-count guard caps
-    runaway in case the engine refuses to advance.
-    """
-    _rebuild_env()
-    if session.env is None:
-        return
-    view = _engine_view_from_session()
-    if os.environ.get("PLO5BP_OCR_DEBUG_TIMER"):
-        logger.warning(
-            "ocr.reconcile.checks: target=%d force=%s view.street=%d "
-            "view.bet_to_call=%d committed=%s",
-            target_street, force, int(view.street), int(view.bet_to_call),
-            tuple(int(c) for c in view.committed_this_street),
-        )
-    if view.street >= target_street:
-        return
-    if not force and (
-        view.bet_to_call > 0 or any(int(c) > 0 for c in view.committed_this_street)
-    ):
-        logger.warning(
-            "ocr: StreetReveal check reconcile — skipping; "
-            "bet_to_call=%d committed=%s (real bets must have been missed)",
-            int(view.bet_to_call),
-            tuple(int(c) for c in view.committed_this_street),
-        )
-        return
-    if not session.hand_in_hand_mask:
-        return
-    if not (session.hand_in_hand_mask - session.folded_this_hand):
-        return
-
-    cfg = session.game_config
-    start_street = int(view.street)
-    safety_limit = cfg.num_seats * (target_street - start_street) + cfg.num_seats
-    appended = 0
-    while view.street < target_street and appended < safety_limit:
-        session.action_log.append({"gate": int(GATE_CHECK_CALL), "chips": 0})
-        appended += 1
-        _rebuild_env()
-        view = _engine_view_from_session()
-
-    if view.street < target_street:
-        logger.warning(
-            "ocr: StreetReveal check reconcile — safety limit hit at "
-            "appended=%d (start_street=%d target=%d view.street=%d)",
-            appended, start_street, target_street, int(view.street),
-        )
-    else:
-        logger.warning(
-            "ocr: StreetReveal check reconcile — appended %d CHECK_CALL "
-            "entries (street %d → %d)",
-            appended, start_street, int(view.street),
-        )
 
 
 def _position_name(seat: int) -> str:
@@ -1690,20 +1300,6 @@ def _position_name(seat: int) -> str:
     )
 
 
-def _history_entries(obs: dict[str, Any]) -> list[dict[str, Any]]:
-    entries: list[dict[str, Any]] = []
-    for seat, action_idx, chips, street_idx in obs.get("history", []):
-        entries.append({
-            "seat": int(seat),
-            "position": _position_name(int(seat)),
-            "action": _HISTORY_NAMES[int(action_idx)],
-            "chips": int(chips),
-            "chips_bb": round(_chips_to_bb(int(chips)), 4),
-            "street": STREET_NAMES.get(int(street_idx), str(street_idx)),
-        })
-    return entries
-
-
 def _hero_info_complete() -> bool:
     return all(c is not None for c in session.hero_hole)
 
@@ -1721,7 +1317,8 @@ def _hero_blocking_reason() -> str | None:
     env = session.env
     if env is None:
         return None
-    raw = env._rs.observation_dict()
+    # Public fields only: skip the opponent Monte-Carlo (PERF-021).
+    raw = env._rs.observation_dict(skip_outcome_mc=True)
     street = int(raw["street"])
     if street >= 1:
         if not all(c is not None for c in session.flop_a):
@@ -1823,25 +1420,9 @@ def _anchors_payload(
     the strategy host — so the client never reconstructs rows (pot fractions,
     labels, the ALL-IN atom) from raw arrays.
     """
-    top = spec.count - 1
-    return [
-        {
-            "k": int(k),
-            # Pot fraction of the anchor; None for the ALL-IN atom (its
-            # chips are max_raise, not a pot fraction).
-            "frac": (
-                None
-                if (spec.allin_atom and k == top)
-                else spec.fracs_pm[k] / 1000.0
-            ),
-            "label": _spec_anchor_label(spec, int(k)),
-            "prob": round(float(anchor_probs[k]), 4),
-            "chips": int(anchor_chips[k]),
-            "chips_bb": round(_chips_to_bb(int(anchor_chips[k])), 4),
-        }
-        for k in range(spec.count)
-        if bool(anchor_legal[k])
-    ]
+    return _common_anchors_payload(
+        spec, anchor_probs, anchor_chips, anchor_legal, int(session.game_config.bb)
+    )
 
 
 def _dealt_in_seat_count() -> int:
@@ -1894,11 +1475,7 @@ def _recommendation_from_nodedist(nd, info, spec: Any = None) -> dict[str, Any]:
     gate = int(d["rec_gate"])
     chips = int(d["rec_chips"]) if gate == GATE_RAISE else None
     chips_bb = round(_chips_to_bb(chips), 4) if chips is not None else None
-    gate_slug = (
-        "fold" if gate == GATE_FOLD else
-        "check_call" if gate == GATE_CHECK_CALL else
-        "raise"
-    )
+    gate_slug = _COMMON_GATE_SLUGS[gate]
     out: dict[str, Any] = {
         "gate": gate_slug,
         "gate_name": GATE_NAMES[gate],
@@ -1955,6 +1532,7 @@ def _compute_recommendation() -> dict[str, Any] | None:
     if obs_np is None:
         return None
     fmt = _fmt()
+    gto_host = current_site().gto_host
     # NLH + GTO host: serve PolicyNet (Mode 0) instead of PPO placeholder —
     # but only on nodes inside the checkpoint's recorded training coverage
     # (see `_gto_host_covers_node`). Anything else falls back to the format's
@@ -1963,16 +1541,16 @@ def _compute_recommendation() -> dict[str, Any] | None:
     # still badged as one) and `gto_unsupported` tells it why.
     if (
         _engine_variant() == VARIANT_NLH
-        and GTO_HOST is not None
+        and gto_host is not None
         and info is not None
     ):
-        if _gto_host_covers_node(GTO_HOST, info):
-            nd = GTO_HOST.node_distribution(obs_np, info)
+        if _gto_host_covers_node(gto_host, info):
+            nd = gto_host.node_distribution(obs_np, info)
             return _recommendation_from_nodedist(
                 nd,
                 info,
                 spec=getattr(
-                    getattr(GTO_HOST, "model", None), "anchor_spec", NLH_ANCHOR_SPEC
+                    getattr(gto_host, "model", None), "anchor_spec", NLH_ANCHOR_SPEC
                 ),
             )
         rec = _format_model_recommendation(fmt, obs_np, info)
@@ -1982,19 +1560,51 @@ def _compute_recommendation() -> dict[str, Any] | None:
     return _format_model_recommendation(fmt, obs_np, info)
 
 
+def _candidate_available() -> bool:
+    """The admin candidate slot is loaded and this user may use it."""
+    entry = current_site().formats.get(FORMAT_EXPERIMENTAL) or {}
+    return bool(entry.get("loaded")) and bool(entry.get("available", True)) and not \
+        _format_locked(FORMAT_EXPERIMENTAL)
+
+
+def _candidate_recommendation() -> dict[str, Any] | None:
+    """(FEAT-025) The candidate checkpoint's answer to the SAME Study spot, so
+    an admin can judge a new model on real spots before promoting it. PLO5
+    spots only (the candidate slot plays PLO5); None whenever the live
+    recommendation would be None."""
+    if not _candidate_available() or _engine_variant() != VARIANT_PLO5:
+        return None
+    if session.variant == FORMAT_EXPERIMENTAL:
+        return None  # already serving the candidate
+    env = session.env
+    if env is None or env.current_actor() != session.hero_seat:
+        return None
+    if _hero_blocking_reason() is not None or session.last_info is None:
+        return None
+    obs_np = _network_obs()
+    if obs_np is None:
+        return None
+    entry = current_site().formats[FORMAT_EXPERIMENTAL]
+    rec = _format_model_recommendation(entry, obs_np, session.last_info)
+    rec["label"] = entry.get("label")
+    rec["checkpoint"] = entry.get("checkpoint")
+    return rec
+
+
 def _format_model_recommendation(
     fmt: dict[str, Any], obs_np: np.ndarray, info: Any
 ) -> dict[str, Any]:
     """Recommendation from the active format's own (PPO) model."""
     model = fmt["model"]
-    obs_t = torch.from_numpy(fmt["adapter"](obs_np)).unsqueeze(0).to(MODEL_DEVICE)
-    gm_t = torch.from_numpy(info.gate_mask).unsqueeze(0).to(MODEL_DEVICE)
+    device = current_site().device
+    obs_t = torch.from_numpy(fmt["adapter"](obs_np)).unsqueeze(0).to(device)
+    gm_t = torch.from_numpy(info.gate_mask).unsqueeze(0).to(device)
     if getattr(model, "head_version", 1) >= 2:
         return _recommendation_v2(model, obs_t, gm_t, info)
     raise_max = int(info.max_raise_chips)
     raise_min = min(int(info.min_raise_chips), raise_max)
     bounds_t = torch.tensor(
-        [[raise_min, raise_max]], dtype=torch.long, device=MODEL_DEVICE
+        [[raise_min, raise_max]], dtype=torch.long, device=device
     )
     with torch.no_grad():
         gate_logits, raise_params, value = model(obs_t, gm_t)
@@ -2016,11 +1626,7 @@ def _format_model_recommendation(
     if chips_out is not None and raise_min == 0 and raise_max > 0:
         chips_out = raise_max
     chips_bb = round(_chips_to_bb(chips_out), 4) if chips_out is not None else None
-    gate_slug = (
-        "fold" if gate == GATE_FOLD else
-        "check_call" if gate == GATE_CHECK_CALL else
-        "raise"
-    )
+    gate_slug = _COMMON_GATE_SLUGS[gate]
     return {
         "gate": gate_slug,
         "gate_name": GATE_NAMES[gate],
@@ -2043,11 +1649,15 @@ def _recommendation_v2(
     chips — the client never recomputes sizing math."""
     spec = getattr(model, "anchor_spec", PLO_ANCHOR_SPEC)
     sizing = sizing_from_info(info)
-    sizing_t = torch.from_numpy(sizing[None, :]).to(MODEL_DEVICE)
-    with torch.no_grad():
+    sizing_t = torch.from_numpy(sizing[None, :]).to(current_site().device)
+    with torch.inference_mode():
         gate_logits, anchor_head_out, refine, value = model(obs_t, gm_t)
         gate_probs = F.softmax(gate_logits, dim=-1).squeeze(0).tolist()
-        _act_out = model.act(obs_t, gm_t, sizing_t, deterministic=True)
+        # (PERF-016) `act` = forward + `_act_from_heads`: reuse these heads
+        # instead of a second forward (bit-identical; deterministic).
+        _act_out = model._act_from_heads(
+            gate_logits, anchor_head_out, refine, value, sizing_t, deterministic=True,
+        )
         gate = int(_act_out.gate.item())
         chips = int(_act_out.chips.item())
         rec_anchor = int(_act_out.anchor.item())
@@ -2076,11 +1686,7 @@ def _recommendation_v2(
 
     chips_out = chips if gate == GATE_RAISE else None
     chips_bb = round(_chips_to_bb(chips_out), 4) if chips_out is not None else None
-    gate_slug = (
-        "fold" if gate == GATE_FOLD else
-        "check_call" if gate == GATE_CHECK_CALL else
-        "raise"
-    )
+    gate_slug = _COMMON_GATE_SLUGS[gate]
     # v5 mixture heads: expose the per-component (mu, s, w) so the client
     # can annotate the multi-modal menu. The `anchors` histogram already
     # renders the mixture marginal — this block is purely additive.
@@ -2110,26 +1716,6 @@ def _recommendation_v2(
         "mixture": mixture_block,
         "model_loaded": bool(_fmt()["loaded"]),
     }
-
-
-def _legal_block(info: Any, actor: int) -> dict[str, bool]:
-    gm = info.gate_mask
-    legal = {
-        "fold": bool(gm[GATE_FOLD]),
-        "check_call": bool(gm[GATE_CHECK_CALL]),
-        "raise": bool(gm[GATE_RAISE]),
-    }
-    # Hero actions blocked until hero hole + cards through current street are entered.
-    if actor == session.hero_seat and _hero_blocking_reason() is not None:
-        legal = {k: False for k in legal}
-    return legal
-
-
-def _to_call_chips(obs: dict[str, Any], actor: int) -> int:
-    current_commit = int(obs["street_commit"][actor])
-    stack = int(obs["stacks"][actor])
-    bet_to_call = int(obs["bet_to_call"])
-    return min(max(0, bet_to_call - current_commit), stack)
 
 
 def _modified_cards() -> list[dict[str, Any]]:
@@ -2176,10 +1762,8 @@ def _state_dict() -> dict[str, Any]:
         _rebuild_env()
         env = session.env
     assert env is not None
-    raw = dict(env._rs.observation_dict())
-
-    actor_raw = raw.get("actor")
-    actor = int(actor_raw) if actor_raw is not None else None
+    # The table projection reads public fields only — no opponent MC (PERF-021).
+    raw = dict(env._rs.observation_dict(skip_outcome_mc=True))
 
     awaiting_idx = raw.get("awaiting_next_street")
     study_term_idx = raw.get("study_terminal")
@@ -2191,66 +1775,37 @@ def _state_dict() -> dict[str, Any]:
 
     cfg = session.game_config
     mask = session.hand_in_hand_mask
-    seats: list[dict[str, Any]] = []
     hero_hole_shown = [c for c in session.hero_hole if c is not None] \
         if any(c is not None for c in session.hero_hole) else None
-    for seat in range(cfg.num_seats):
-        hole = hero_hole_shown if seat == session.hero_seat else None
-        seats.append({
-            "seat": seat,
-            "position": _position_name(seat),
-            "stack_chips": int(raw["stacks"][seat]),
-            "stack_bb": round(_chips_to_bb(int(raw["stacks"][seat])), 4),
-            "committed_this_street_bb": round(
-                _chips_to_bb(int(raw["street_commit"][seat])), 4
-            ),
-            "committed_total_bb": round(
-                _chips_to_bb(int(raw["total_commit"][seat])), 4
-            ),
-            "committed_this_street_chips": int(raw["street_commit"][seat]),
-            "folded": bool(raw["folded"][seat]),
-            # Mid-hand folds stay visible (they were dealt into this hand
-            # — rendering them as `folded` rather than hiding them matches
-            # the real table). Seats never dealt in are hidden as before.
-            "participant": (not mask) or (seat in mask),
-            "all_in": bool(raw["all_in"][seat]),
-            "is_actor": actor is not None and seat == actor,
-            "is_hero": seat == session.hero_seat,
-            "hole": hole,
-        })
-
-    if actor is not None and session.last_info is not None:
-        info = session.last_info
-        legal = _legal_block(info, actor)
-        max_chips = int(info.max_raise_chips)
-        min_chips = min(int(info.min_raise_chips), max_chips)
-        # Short-shove: only legal raise is the all-in shove. Collapse the
-        # slider to a single point so the UI can render an All-in button.
-        if legal["raise"] and min_chips == 0 and max_chips > 0:
-            min_chips = max_chips
-        raise_bounds = {
-            "min_chips": min_chips,
-            "max_chips": max_chips,
-            "min_bb": round(_chips_to_bb(min_chips), 4),
-            "max_bb": round(_chips_to_bb(max_chips), 4),
-        }
-        to_call = _to_call_chips(raw, actor)
-    else:
-        legal = {k: False for k in ("fold", "check_call", "raise")}
-        raise_bounds = {"min_chips": 0, "max_chips": 0, "min_bb": 0.0, "max_bb": 0.0}
-        to_call = 0
+    # The table half (seats, pot, buttons, raise window, history, chip scale)
+    # is the one the Trainer shows too: `common.table_state` (BE-008).
+    state = _common_table_state(
+        raw,
+        cfg,
+        button_seat=session.button_seat,
+        hero_seat=session.hero_seat,
+        info=session.last_info,
+        dollars_per_bb=session.dollars_per_bb,
+        position_of=_position_name,
+        hole_of=lambda seat: hero_hole_shown if seat == session.hero_seat else None,
+        # Mid-hand folds stay visible (they were dealt into this hand —
+        # rendering them as `folded` rather than hiding them matches the real
+        # table). Seats never dealt in are hidden as before.
+        participant_of=lambda seat: (not mask) or (seat in mask),
+        # Hero's buttons stay off until hero's hole + the cards through the
+        # current street are entered.
+        blocked_for=lambda actor: (
+            actor == session.hero_seat and _hero_blocking_reason() is not None
+        ),
+    )
 
     recommendation = _compute_recommendation()
+    candidate = _candidate_recommendation() if session.compare_candidate else None
 
-    return {
+    state.update({
         "format": session.variant,
         "format_label": _fmt()["label"],
         "format_model_loaded": bool(_fmt()["loaded"]),
-        "num_seats": cfg.num_seats,
-        "button_seat": session.button_seat,
-        "hero_seat": session.hero_seat,
-        "actor": actor,
-        "seats": seats,
         "card_spec": {
             "hero_hole": list(session.hero_hole),
             "flop_a": list(session.flop_a),
@@ -2261,79 +1816,34 @@ def _state_dict() -> dict[str, Any]:
         "hero_info_complete": _hero_info_complete(),
         "hero_blocking_reason": _hero_blocking_reason(),
         "modified_cards": _modified_cards(),
-        "pot_chips": int(raw["pot"]),
-        "pot_bb": round(_chips_to_bb(int(raw["pot"])), 4),
-        # Settled pot = the pot gathered from completed streets (pot minus
-        # this street's live commits, which still sit in front of seats).
-        # "Total Pot" = pot_chips; "Pot" = settled_pot_chips.
-        "settled_pot_chips": int(raw["pot"]) - sum(int(x) for x in raw["street_commit"]),
-        "settled_pot_bb": round(
-            _chips_to_bb(int(raw["pot"]) - sum(int(x) for x in raw["street_commit"])), 4
-        ),
-        "bet_to_call_chips": int(raw["bet_to_call"]),
-        "bet_to_call_bb": round(_chips_to_bb(int(raw["bet_to_call"])), 4),
-        "to_call_chips": int(to_call),
-        "to_call_bb": round(_chips_to_bb(int(to_call)), 4),
-        "street": STREET_NAMES.get(int(raw["street"]), "flop"),
-        "history": _history_entries(raw),
-        "legal": legal,
-        "raise_bounds": raise_bounds,
         "terminal": terminal,
         "terminal_message": terminal_message,
         "awaiting_next_street": awaiting,
         "recommendation": recommendation,
+        # (FEAT-025) The admin candidate model on the same spot; only present
+        # while comparing (additive keys).
+        **({"compare_candidate": True, "candidate_recommendation": candidate}
+           if session.compare_candidate else {}),
         "can_undo": len(session.action_log) > 0,
-        "chip_scale": {
-            "bb_chips": int(cfg.bb),
-            "ante_chips": int(cfg.ante),
-            "dollars_per_bb": float(session.dollars_per_bb),
-        },
-        "starting_stacks_chips": [int(s) for s in cfg.resolved_stacks],
-        "starting_stacks_bb": [
-            round(_chips_to_bb(int(s)), 4) for s in cfg.resolved_stacks
-        ],
-        # Live-capture toggle state; omitted in the public build so the JSON
-        # payload carries no trace of the live subsystems.
-        **({} if PLO5BP_PUBLIC else {"simple_ocr_mode": bool(session.simple_ocr_mode)}),
-    }
+        # Keys of local-build extensions (live capture: "simple_ocr_mode").
+        # The public build registers none, so its payload carries no trace of
+        # the live subsystems.
+        **_state_extras(),
+    })
+    return state
 
 
 # --- Validation helpers -----------------------------------------------------
 
 def _validate_card_list(xs: list[int | None], length: int, name: str) -> list[int | None]:
-    if len(xs) != length:
-        raise HTTPException(
-            status_code=400,
-            detail=f"{name} must be length {length}, got {len(xs)}",
-        )
-    out: list[int | None] = []
-    for x in xs:
-        if x is None:
-            out.append(None)
-        else:
-            xi = int(x)
-            if not (0 <= xi < 52):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"{name}: card {xi} out of range [0,51]",
-                )
-            out.append(xi)
-    return out
+    """`common.validate_card_list` (the one copy, BE-010) as an HTTP 400."""
+    try:
+        return _common_validate_card_list(xs, length, name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
-# --- FastAPI app ------------------------------------------------------------
-
-# (review 2026-09-20 F1) The public build ships no interactive docs / schema:
-# `/openapi.json` listed every route — the hidden home-games API and the
-# admin API included — to any signed-in free user.
-app = FastAPI(
-    title="PLO5 Bomb-Pot Study Tool",
-    **(
-        {"docs_url": None, "redoc_url": None, "openapi_url": None}
-        if PLO5BP_PUBLIC
-        else {}
-    ),
-)
+# --- Error handlers (every app: `create_app`) ----------------------------------
 
 
 def _json_safe(value: Any) -> Any:
@@ -2347,64 +1857,152 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
-@app.exception_handler(RequestValidationError)
 async def _request_validation_error(request: Request, exc: RequestValidationError):
     """FastAPI's stock 422, minus one crash: it echoes the offending input,
     and a body like `{"dollars_per_bb": Infinity}` (which `json.loads`
     accepts) made the 422 itself unserializable ⇒ 500. (review 2026-09-20 H7)
-    """
+    Same shape as every other error (BE-026): ``detail`` (FastAPI's list of
+    field errors, which clients already read) + ``code``."""
     return JSONResponse(
         status_code=422,
-        content={"detail": _json_safe(jsonable_encoder(exc.errors()))},
+        content=_mw.error_body(422, _json_safe(jsonable_encoder(exc.errors()))),
     )
 
 
-# Trainer mode rides on the same app/model under /trainer/*. Import here
-# (not at top) so trainer.py never needs to import server.py back.
-from plo5bp.ui.trainer import create_trainer_router  # noqa: E402
+async def _http_error(request: Request, exc: _StarletteHTTPException):
+    """Every HTTP error in ONE shape (BE-026): ``{"detail", "code"}`` for API
+    clients — ``detail`` passes through untouched (a string, or the club
+    gate's dict) — and, for a browser navigation, a small branded page with
+    a way back instead of a line of JSON (ACC-014 / ACC-028). 5xx carry an
+    ``error_id`` that is also in the log line (OPS-024)."""
+    status = int(exc.status_code)
+    headers = dict(getattr(exc, "headers", None) or {})
+    if status < 200 or status in (204, 304):
+        return Response(status_code=status, headers=headers)
+    error_id = None
+    if status >= 500:
+        error_id = _mw.new_error_id()
+        _note_error(request, status, error_id, str(exc.detail))
+    if status >= 400 and _mw.wants_html(request.headers, request.method):
+        message = exc.detail if isinstance(exc.detail, str) and status not in (404, 405) else None
+        return HTMLResponse(
+            _mw.error_page(status, message, error_id=error_id, sign_in=status == 401),
+            status_code=status,
+            headers={**headers, "Cache-Control": "no-store"},
+        )
+    extra = {"error_id": error_id} if error_id else {}
+    return JSONResponse(
+        _mw.error_body(status, exc.detail, **extra), status_code=status, headers=headers
+    )
 
 
-# Optional NLH GTO PolicyNet (Phase 2a). When set, Study recommendations
-# and Trainer (via create_trainer_router) share the same PolicyNetHost.
-# Env: PLO5BP_GTO_CHECKPOINT=checkpoints/gto_policy.pt
+async def _unhandled_error(request: Request, exc: Exception):
+    """A crash: logged with an id, the user and the request, kept for the
+    admin System panel, and answered with that id (OPS-024)."""
+    error_id = _mw.new_error_id()
+    logger.error(
+        "unhandled error %s on %s %s (user %s)",
+        error_id, request.method, request.url.path, _mw.request_user(request.scope),
+        exc_info=exc,
+    )
+    _note_error(request, 500, error_id, f"{type(exc).__name__}: {exc}", log=False)
+    if _mw.wants_html(request.headers, request.method):
+        return HTMLResponse(
+            _mw.error_page(500, error_id=error_id), status_code=500,
+            headers={"Cache-Control": "no-store"},
+        )
+    return JSONResponse(
+        _mw.error_body(500, "Something went wrong on our side.", error_id=error_id),
+        status_code=500,
+    )
+
+
+def _note_error(request: Request, status: int, error_id: str, what: str, *, log: bool = True) -> None:
+    uid = _mw.request_user(request.scope)
+    if log:
+        logger.warning(
+            "error %s: %s %s -> %s (user %s): %s",
+            error_id, request.method, request.url.path, status, uid, what,
+        )
+    _mw.METRICS.record_error({
+        "id": error_id,
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "method": request.method,
+        "path": request.url.path,
+        "status": status,
+        "user": uid,
+        "error": what[:300],
+    })
+
+
+# Trainer mode rides on the same app/models under /trainer/* (each app gets
+# its own router: `create_app`). trainer.py never imports server.py back.
+from plo5bp.ui import trainer as _trainer  # noqa: E402
+
+# Optional NLH GTO PolicyNet (Phase 2a, PLO5BP_GTO_CHECKPOINT): Study
+# recommendations and the Trainer share one PolicyNetHost (`Site.gto_host`).
 from plo5bp.gto.policy_host import try_load_gto_host  # noqa: E402
 
-_GTO_CKPT = os.environ.get("PLO5BP_GTO_CHECKPOINT", "").strip() or None
-GTO_HOST = try_load_gto_host(_GTO_CKPT, device=MODEL_DEVICE) if _GTO_CKPT else None
-if GTO_HOST is not None:
-    logger.info("GTO PolicyNet loaded from %s (Study+Trainer T1)", _GTO_CKPT)
-else:
-    logger.info(
-        "No PLO5BP_GTO_CHECKPOINT — NLH Study uses PPO/random placeholder"
-    )
 
-trainer_router = create_trainer_router(
-    MODEL, MODEL_DEVICE, critic=MODEL_CRITIC, formats=FORMATS,
-    gto_checkpoint=_GTO_CKPT,
-)
-
-app.include_router(trainer_router)
-
-# NLH range grid (/ranges/*) — LOCAL BUILD ONLY for now: the public build
-# strips these routes below (same mechanism as /ocr, /pokernow) until the
-# feature is validated and deliberately shipped.
-from plo5bp.ui.ranges import create_ranges_router  # noqa: E402
-
-app.include_router(
-    create_ranges_router(
-        FORMATS,
-        MODEL_DEVICE,
-        nlh_ckpt_name=_format_ckpt_path(VARIANT_NLH).name,
-        gto_model=(GTO_HOST.model if GTO_HOST is not None else None),
-        # The HOST (not just its model) carries coverage + obs-form metadata:
-        # Ranges serves the teacher only where `supports()` says yes and on
-        # its canonical obs, else the PPO NLH model (review 2026-09-20 D3).
-        gto_host=GTO_HOST,
-    )
-)
+# --- The Study API ----------------------------------------------------------------
+# (BE-009) The Study routes live on ONE router, mounted twice by `create_app`:
+# under /study/* — like /trainer/*, /games/api/*, /admin/api/* — so the public
+# build gates them by PREFIX (a new Study route can't be left open by a
+# forgotten list entry; the client calls /study/*, site 2026-09-28), and at the
+# site root, the aliases a page still running the previous script calls.
+study_router = APIRouter()
+#: The site's other routes on this module: the format list and the candidate
+#: comparison (root / one spelling only) and /health.
+site_router = APIRouter()
 
 
-@app.get("/state")
+def _mount_flat(
+    app: FastAPI, router: APIRouter, prefix: str = "", *, include_in_schema: bool = True
+) -> None:
+    """Add each of `router`'s routes to `app` as a top-level route of its own —
+    the same `APIRoute` a decorator on the app makes. (`include_router` would
+    wrap the router in ONE opaque route, which the live-capture lock and the
+    route checks cannot see into: they look for the study routes one by one.)"""
+    for route in router.routes:
+        app.add_api_route(
+            prefix + route.path, route.endpoint, methods=sorted(route.methods),
+            include_in_schema=include_in_schema,
+        )
+
+
+#: How long a Study request waits for its session's lock before a polite 429.
+_STUDY_LOCK_TIMEOUT_S = float(os.environ.get("PLO5BP_SESSION_LOCK_TIMEOUT_S", "20"))
+
+
+def _study_route(fn: Any) -> Any:
+    """(BE-002) Run a Study handler under ITS session's lock, like every
+    trainer route: handlers validate against the current action log and
+    append later, so two requests of one user (two tabs, a double click)
+    could interleave — a second action slipping in unvalidated, an /undo
+    dropping an action appended in between. A request that can't get the
+    lock in time answers 429 instead of parking a worker thread (the public
+    build already queues one user's requests before they reach a thread)."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        lock = session.lock
+        if not lock.acquire(timeout=_STUDY_LOCK_TIMEOUT_S):
+            raise HTTPException(
+                status_code=429,
+                detail="Still working on your previous change — try again in a moment.",
+                headers={"Retry-After": "1"},
+            )
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            lock.release()
+
+    return wrapper
+
+
+@study_router.get("/state")
+@_study_route
 def state() -> dict[str, Any]:
     if session.env is None:
         _rebuild_env()
@@ -2486,19 +2084,24 @@ def _splice_starting_stacks(
     return tuple(out + [out[-1]] * (new_n - old_n))
 
 
-@app.post("/cards")
+@study_router.post("/cards")
+@_study_route
 def cards(req: CardsRequest) -> dict[str, Any]:
     lens = dict(_card_spec_attrs())
+    given = {
+        "hero_hole": (req.hero_hole, "hero_hole"),
+        "flop_a": (req.flop_a, "flop_a"),
+        "flop_b": (req.flop_b, "flop_b"),
+        "turn_cards": (req.turn, "turn"),
+        "river_cards": (req.river, "river"),
+    }
+    # An omitted field keeps the session's cards (BE-014).
     candidate = {
-        "hero_hole": _validate_card_list(
-            req.hero_hole, lens["hero_hole"], "hero_hole"
-        ),
-        "flop_a": _validate_card_list(req.flop_a, lens["flop_a"], "flop_a"),
-        "flop_b": _validate_card_list(req.flop_b, lens["flop_b"], "flop_b"),
-        "turn_cards": _validate_card_list(req.turn, lens["turn_cards"], "turn"),
-        "river_cards": _validate_card_list(
-            req.river, lens["river_cards"], "river"
-        ),
+        attr: _validate_card_list(
+            value if value is not None else list(getattr(session, attr)),
+            lens[attr], name,
+        )
+        for attr, (value, name) in given.items()
     }
     # Validate-then-commit (review 2026-09-20 H7): a duplicate used to 400
     # AFTER the bad spec was stored and its slots locked, so every later
@@ -2511,7 +2114,8 @@ def cards(req: CardsRequest) -> dict[str, Any]:
     return {"state": _state_dict()}
 
 
-@app.post("/seats")
+@study_router.post("/seats")
+@_study_route
 def seats(req: SeatsRequest) -> dict[str, Any]:
     cfg = session.game_config
     new_num_seats = req.num_seats if req.num_seats is not None else session.num_seats
@@ -2593,7 +2197,8 @@ def seats(req: SeatsRequest) -> dict[str, Any]:
     return {"state": _state_dict()}
 
 
-@app.post("/action")
+@study_router.post("/action")
+@_study_route
 def action(req: ActionRequest) -> dict[str, Any]:
     if session.env is None:
         _rebuild_env()
@@ -2656,7 +2261,8 @@ def action(req: ActionRequest) -> dict[str, Any]:
     return {"state": _state_dict()}
 
 
-@app.post("/undo")
+@study_router.post("/undo")
+@_study_route
 def undo() -> dict[str, Any]:
     if not session.action_log:
         raise HTTPException(status_code=400, detail="nothing to undo")
@@ -2669,78 +2275,82 @@ def undo() -> dict[str, Any]:
     return {"state": _state_dict()}
 
 
-@app.post("/reset")
+@study_router.post("/reset")
+@_study_route
 def reset() -> dict[str, Any]:
     _new_session_defaults()
     # Also drop the live hand-start debounce state, or the next OCR tick
     # re-seeds the "new" hand from a stale anchor. (review 2026-09-20 F10)
-    _reset_live_tracking()
+    _run_session_reset_hooks("user")
     _rebuild_env()
     return {"state": _state_dict()}
 
 
-@app.get("/formats")
+@site_router.get("/formats")
 def formats() -> dict[str, Any]:
     """Formats the server can serve, for the UI dropdown. `model_loaded`
     False = a random-init placeholder answers (no checkpoint promoted).
     `locked` True = greyed out "coming soon!" for this user (public
-    build gates non-default formats to admins while they train)."""
-    return {
-        "formats": [
-            {
-                "id": vid,
-                "label": f["label"],
-                "model_loaded": bool(f["loaded"]),
-                # True = the served checkpoint was trained on a different
-                # observation-semantics revision than this process encodes
-                # (see `_note_checkpoint_obs_rev`). Additive key.
-                "obs_rev_mismatch": bool(f.get("obs_rev_mismatch", False)),
-                "locked": _format_locked(vid),
-                # Betting cap class: pot-limit formats cap raises at pot
-                # (the client's b100 preset is "pot" and nothing larger
-                # exists); no-limit formats allow overbets + all-in.
-                "pot_limit": _engine_variant(vid) != VARIANT_NLH,
-            }
-            for vid, f in FORMATS.items()
-        ],
-        "active": session.variant,
-    }
+    build gates non-default formats to admins while they train). The
+    admin candidate slot is listed only when a candidate is configured,
+    and never to a user the gate locks out (it is not "coming soon")."""
+    out = []
+    for vid, f in list(current_site().formats.items()):
+        if not f.get("available", True):
+            continue
+        locked = _format_locked(vid)
+        if locked and f.get("admin_only"):
+            continue
+        out.append({
+            "id": vid,
+            "label": f["label"],
+            "model_loaded": bool(f["loaded"]),
+            # True = the served checkpoint was trained on a different
+            # observation-semantics revision than this process encodes
+            # (see `models.note_checkpoint_obs_rev`). Additive key.
+            "obs_rev_mismatch": bool(f.get("obs_rev_mismatch", False)),
+            "locked": locked,
+            # Betting cap class: pot-limit formats cap raises at pot
+            # (the client's b100 preset is "pot" and nothing larger
+            # exists); no-limit formats allow overbets + all-in.
+            "pot_limit": _engine_variant(vid) != VARIANT_NLH,
+        })
+    return {"formats": out, "active": session.variant}
 
 
-@app.post("/format")
+@study_router.post("/format")
+@_study_route
 def set_format(req: FormatRequest) -> dict[str, Any]:
     """Switch the study session's game format. Resets per-hand state and
-    swaps the game config to the format default (PLO5: 6-max 200bb bomb
-    pot; NLH: 6-max 100bb 5/10 with a $5/player ante). The trainer's
-    format follows via its own setter so both tabs stay on one game."""
+    swaps the game config to the format default (`common.FORMAT_DEFAULTS`:
+    PLO5 6-max 20bb with a 3bb ante; NLH 6-max 100bb 5/10 with a $5/player
+    ante — the Trainer starts from the same table). The trainer's format
+    follows via its own setter so both tabs stay on one game."""
+    formats = current_site().formats
+    if req.format not in formats:
+        raise HTTPException(status_code=400, detail=f"unknown format {req.format!r}")
     if _format_locked(req.format):
         raise HTTPException(
             status_code=403,
             detail="This format isn't available on your account yet — coming soon!",
         )
     if req.format != session.variant:
-        if req.format not in FORMATS:
-            raise HTTPException(status_code=400, detail=f"unknown format {req.format!r}")
-        session.variant = req.format
         if req.format == FORMAT_EXPERIMENTAL:
             _maybe_reload_experimental()
-        eng = _engine_variant(req.format)
-        if eng == VARIANT_NLH:
-            session.game_config = GameConfig.nlh_default()
-            session.dollars_per_bb = 10.0
-        else:
-            # PLO5 + experimental: same bomb-pot table defaults.
-            session.game_config = GameConfig(starting_stack=400000)
-            session.dollars_per_bb = 2.0
+        if not formats[req.format].get("available", True):
+            raise HTTPException(status_code=400, detail="no candidate model is configured")
+        session.variant = req.format
+        session.game_config = _common_default_game_config(req.format)
+        session.dollars_per_bb = float(_common_format_defaults(req.format)["dollars_per_bb"])
         session.num_seats = session.game_config.num_seats
         session.button_seat = 0
         session.hero_seat = 0
         _new_session_defaults()
         # A format switch is a hard reset for the live hand-start machine
         # too (stale anchor / mask from the previous game). (review F10)
-        _reset_live_tracking()
+        _run_session_reset_hooks("user")
         try:
-            trainer_router.set_format(req.format)
+            current_site().trainer_router.set_format(req.format)
         except Exception:
             logger.exception("trainer format sync failed")
         _rebuild_env()
@@ -2749,7 +2359,8 @@ def set_format(req: FormatRequest) -> dict[str, Any]:
     return {"state": _state_dict()}
 
 
-@app.post("/config")
+@study_router.post("/config")
+@_study_route
 def config(req: ConfigRequest) -> dict[str, Any]:
     cfg = session.game_config
     bb = int(req.bb_chips) if req.bb_chips is not None else cfg.bb
@@ -2812,1789 +2423,202 @@ def config(req: ConfigRequest) -> dict[str, Any]:
     return {"state": _state_dict()}
 
 
-# Initialize env at module load so /state works on first request.
-_rebuild_env()
+# --- Whole-spot load + rewind (site FEAT-016/026, FEAT-017, FEAT-020) ----------
+# A Study spot is fully defined by the table (seats, button, stacks, ante),
+# the cards and the action log. Share links and the Trainer's "Open in Study"
+# load one in ONE validated call (validate-then-commit, like every handler
+# above: a bad spot leaves the session exactly as it was); clicking a history
+# row rewinds the log in one call instead of N x /undo.
 
 
-# --- OCR runner -------------------------------------------------------------
-
-class OcrStartRequest(BaseModel):
-    window_match: str = Field(..., min_length=1)
-    poll_ms: int = Field(default=200, ge=50, le=5000)
+class SpotAction(BaseModel):
+    gate: str = Field(..., pattern=r"^(fold|check_call|raise)$")
+    chips: int | None = Field(default=None, ge=0, le=_MAX_CHIPS)
 
 
-class OcrSimpleRequest(BaseModel):
-    enabled: bool
+class SpotRequest(BaseModel):
+    # The spot's format must be the session's (switch with /format first — a
+    # format switch resets both tabs, so the client asks the user).
+    format: str | None = Field(
+        default=None, pattern=r"^(plo5_double_bomb|nlh_single|experimental)$"
+    )
+    num_seats: int = Field(..., ge=2, le=6)
+    button_seat: int = Field(..., ge=0, le=5)
+    # ENGINE starting stacks (before antes/blinds), hero first, clockwise.
+    starting_stacks: list[int] = Field(..., min_length=2, max_length=6)
+    ante_chips: int | None = Field(default=None, ge=0, le=_MAX_CHIPS)
+    bb_chips: int | None = Field(default=None, ge=1, le=_MAX_CHIPS)
+    hero_hole: list[int | None] | None = None
+    flop_a: list[int | None] | None = None
+    flop_b: list[int | None] | None = None
+    turn: list[int | None] | None = None
+    river: list[int | None] | None = None
+    actions: list[SpotAction] = Field(default_factory=list, max_length=400)
 
 
-class OcrRescanRequest(BaseModel):
-    target: Literal["hole", "board"]
+class RewindRequest(BaseModel):
+    # Keep this many entries of the action log (0 = back to the deal).
+    length: int = Field(..., ge=0)
 
 
-_RESCAN_GROUPS: dict[str, tuple[str, ...]] = {
-    "hole": ("hero_hole",),
-    "board": ("flop_a", "flop_b", "turn_cards", "river_cards"),
-}
-
-
-class OcrRunner:
-    """WGC-fed OCR session that mutates `session` once per polling tick.
-
-    Frame *acquisition* happens on a free-threaded
-    Windows.Graphics.Capture session against the picked window's HWND.
-    The WGC callback runs on the binding's worker thread and publishes
-    the latest BGR ndarray into ``self.latest_frame`` under
-    ``self._frame_lock``. An asyncio task (``_loop``) wakes every
-    ``poll_ms`` and runs ``_tick`` on a worker thread (extract +
-    reconstruct + ``_rebuild_env`` is CPU-bound and the engine is not
-    asyncio-aware).
-
-    Why WGC and not Chrome's getDisplayMedia: ClubGG sets
-    ``SetWindowDisplayAffinity`` on its tables. Chrome's per-window
-    capture goes through GDI BitBlt / DXGI Desktop Duplication and
-    respects WDA, so the captured frame shows whatever is behind the
-    table. WGC reads from the DWM compositor surface and bypasses WDA
-    in the same way OBS's "Windows 10 (1903 and up)" source does.
-    """
-
-    def __init__(self) -> None:
-        self.running: bool = False
-        self.poll_ms: int = 200
-        self.window_match: str | None = None
-        self.window_title: str | None = None
-        self.candidates: list[str] = []
-        # HWND of the captured window, persisted so `_loop` can poll its
-        # liveness each tick. None when not running.
-        self._hwnd: int | None = None
-        # Why the runner last stopped: None for manual/never, "window_closed"
-        # when it auto-stopped because the captured window was destroyed. The
-        # frontend uses this to reset the picker only on auto-off.
-        self.stopped_reason: str | None = None
-        self.last_error: str | None = None
-        self.last_tick_at: float | None = None
-        self.frames_seen: int = 0
-        self.events_applied: int = 0
-        # Most recent BGR frame published by the WGC callback. Read by
-        # `_tick` under `_frame_lock`.
-        self.latest_frame: Any = None
-        self._frame_lock: threading.Lock = threading.Lock()
-        # Serializes the background `_tick` (run via `asyncio.to_thread`)
-        # against handlers that mutate the same session state (cards,
-        # locks, `session.env`). Acquire in the event loop before
-        # dispatching the threadpool work.
-        self._tick_lock: asyncio.Lock = asyncio.Lock()
-        self._capture_control: Any = None
-        self._reconstructor: Any = None
-        self.task: asyncio.Task | None = None
-        # Per-crop OCR read cache (stack/commit/pot). Lets `_tick` skip the
-        # Tesseract subprocess for any chip ROI whose pixels are unchanged
-        # since the last tick — most ticks then do ~0 reads. Cleared on start().
-        self._ocr_read_cache: dict = {}
-
-    def status(self) -> dict[str, Any]:
-        return {
-            "running": self.running,
-            "poll_ms": self.poll_ms,
-            "window_match": self.window_match,
-            "window_title": self.window_title,
-            "candidates": list(self.candidates),
-            "last_tick_at": self.last_tick_at,
-            "last_error": self.last_error,
-            "stopped_reason": self.stopped_reason,
-            "frames_seen": self.frames_seen,
-            "events_applied": self.events_applied,
-        }
-
-    async def start(self, window_match: str, poll_ms: int) -> None:
-        from plo5bp.ocr import live as ocr_live
-        from plo5bp.ocr.events import EventReconstructor
-
-        if self.running:
-            return
-
-        self.window_match = window_match
-        self.poll_ms = int(poll_ms)
-        self.last_error = None
-        self.stopped_reason = None
-        self.frames_seen = 0
-        self.events_applied = 0
-        self.candidates = []
-        self.window_title = None
-        self._hwnd = None
-        self.latest_frame = None
-        self._ocr_read_cache = {}
-
-        try:
-            wm = await asyncio.to_thread(ocr_live.find_window, window_match)
-        except ocr_live.NoWindowError as e:
-            try:
-                self.candidates = await asyncio.to_thread(ocr_live.list_window_titles)
-            except Exception:
-                self.candidates = []
-            self.last_error = str(e)
-            raise HTTPException(status_code=400, detail=str(e)) from e
-        except ocr_live.MultipleWindowsError as e:
-            self.candidates = list(e.candidates)
-            self.last_error = str(e)
-            raise HTTPException(status_code=400, detail=str(e)) from e
-
-        self.window_title = wm.title
-        self._hwnd = int(wm.hwnd)
-
-        def _on_frame(bgr: Any) -> None:
-            with self._frame_lock:
-                self.latest_frame = bgr
-
-        try:
-            self._capture_control = await asyncio.to_thread(
-                ocr_live.start_wgc_capture, int(wm.hwnd), _on_frame
-            )
-        except Exception as e:
-            self.last_error = f"WGC start failed: {type(e).__name__}: {e}"
-            logger.exception("WGC start failed for hwnd=%s", wm.hwnd)
-            raise HTTPException(status_code=500, detail=self.last_error) from e
-
-        # ClubGG always renders 6 physical seat positions; the ROI table is
-        # tied to those absolute screen coords. Empty seats are handled by
-        # the multi-signal in-hand detector. Force the session to 6 seats
-        # so OCR output shape matches the engine state regardless of how
-        # many seats were configured for non-OCR study.
-        if session.num_seats != 6:
-            # `replace` carries variant/sb (and any future field) — the
-            # hand-written copy dropped them. (review 2026-09-20 I10)
-            session.game_config = dataclasses.replace(
-                session.game_config, num_seats=6, starting_stacks=None
-            )
-            session.num_seats = 6
-            if session.button_seat >= 6:
-                session.button_seat = 0
-            session.hero_seat = 0
-            _clear_hand_state_keep_cards()
-            _rebuild_env()
-
-        # A capture (re)start is a fresh live session: drop the previous
-        # source's mask / debounce state so its stale anchor can't seed the
-        # first hand. (review 2026-09-20 F10)
-        _note_live_source("ocr")
-        _reset_live_tracking()
-
-        self._reconstructor = EventReconstructor(num_seats=session.num_seats)
-        _set_active_reconstructor(self._reconstructor)
-        self.running = True
-        self.task = asyncio.create_task(self._loop())
-
-    async def _release_capture(self) -> None:
-        """Stop the WGC capture session if one is live (idempotent).
-
-        Shared by the manual `stop()` path and the auto-off
-        `_handle_window_closed()` path; the `cc is None` guard makes a second
-        call a no-op if a manual Off races a window close.
-        """
-        cc = self._capture_control
-        self._capture_control = None
-        if cc is not None:
-            try:
-                await asyncio.to_thread(cc.stop)
-            except Exception as e:
-                logger.warning("WGC stop raised: %s", e)
-
-    async def stop(self) -> None:
-        was_running = self.running
-        self.running = False
-        self.stopped_reason = None  # manual stop
-        task = self.task
-        self.task = None
-        if task is not None:
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
-
-        await self._release_capture()
-        self._hwnd = None
-        if was_running:
-            self.window_match = None
-            self.window_title = None
-        self._retire_reconstructor()
-
-    def _retire_reconstructor(self) -> None:
-        """Unregister this runner's reconstructor as the live one.
-
-        (review 2026-09-20 I9) It used to stay registered after OCR stopped,
-        so a PokerNow session that followed had `_begin_new_hand` rebaseline
-        the dead ClubGG reconstructor instead of its own — PokerNow's stayed
-        on the pre-flop ante frame and emitted a phantom ante RAISE/CALL
-        every hand.
-        """
-        if _LIVE_RECONSTRUCTOR is self._reconstructor:
-            _set_active_reconstructor(None)
-        self._reconstructor = None
-        # Only give up the source if it is ours: a stray /ocr/stop while
-        # PokerNow is driving must not make its next frame look like a
-        # source switch (which resets the live hand).
-        if _LIVE_SOURCE == "ocr":
-            _note_live_source(None)
-
-    async def _handle_window_closed(self) -> None:
-        """Auto-stop path: the captured window was destroyed.
-
-        Runs *inside* `_loop`, so it must NOT cancel its own task — it tears
-        down the capture and lets `_loop` return normally. The frontend reads
-        `stopped_reason == "window_closed"` (via `status()`) to reset the
-        picker only on this path, not on a manual Off.
-        """
-        self.running = False
-        self.stopped_reason = "window_closed"
-        self.task = None
-        await self._release_capture()
-        self._hwnd = None
-        self.window_match = None
-        self.window_title = None
-        self._retire_reconstructor()
-
-    async def _loop(self) -> None:
-        from plo5bp.ocr import live as ocr_live
-
-        try:
-            while self.running:
-                await asyncio.sleep(self.poll_ms / 1000.0)
-                if not self.running:
-                    return
-                # Auto-stop if the captured window has been destroyed. Both
-                # signals are sub-microsecond, so run them directly on the
-                # asyncio side (no to_thread) before any per-tick work.
-                # IsWindow is authoritative (stays True on minimize); the
-                # WGC is_finished() is a defensive secondary signal.
-                cc = self._capture_control
-                cc_finished = False
-                if cc is not None:
-                    try:
-                        cc_finished = bool(cc.is_finished())
-                    except Exception:
-                        cc_finished = False
-                if cc_finished or not ocr_live.is_window_alive(self._hwnd):
-                    await self._handle_window_closed()
-                    return
-                try:
-                    async with self._tick_lock:
-                        await asyncio.to_thread(self._tick)
-                except BaseException as e:
-                    # PyO3 panics inherit from BaseException; surface
-                    # them via last_error rather than killing the loop.
-                    self.last_error = f"{type(e).__name__}: {e}"
-                    logger.exception("ocr tick failed")
-        except asyncio.CancelledError:
-            pass
-
-    def _tick(self) -> None:
-        from plo5bp.ocr.events import (
-            HeroHoleRevealed,
-            OcrWarning,
-            SeatAction,
-            StreetReveal,
+@study_router.post("/spot")
+@_study_route
+def load_spot(req: SpotRequest) -> dict[str, Any]:
+    if req.format is not None and req.format != session.variant:
+        raise HTTPException(
+            status_code=409,
+            detail="This spot is for another format — switch format first.",
         )
-        from plo5bp.ocr.extract import extract_frame_state
-
-        with self._frame_lock:
-            img = self.latest_frame
-        # WGC may not have delivered the first frame yet on the very
-        # first tick after start; skip silently and try again next poll.
-        if img is None:
-            return
-        # Live capture only understands the PLO5 double-board table. If the
-        # user flips the study format while the runner is up, idle instead of
-        # mirroring a 5-card/2-board frame into an NLH-shaped card spec
-        # (IndexError every tick). (review 2026-09-20 I10)
-        if not _live_capture_allowed():
-            self.last_error = _LIVE_FORMAT_ERROR
-            return
-        # `stop()` clears the reconstructor; a tick already running on its
-        # worker thread must not trip over that.
-        reconstructor = self._reconstructor
-        if reconstructor is None:
-            return
-
-        fs = extract_frame_state(
-            img, num_seats=session.num_seats, cache=self._ocr_read_cache
-        )
-        self.frames_seen += 1
-
-        # Mirror directly-observable card / button state from the frame
-        # before the reconstructor runs — event callbacks can assume
-        # the session card spec already reflects the latest reveal.
-        _mirror_observable_state(fs)
-
-        if not session.simple_ocr_mode:
-            # `_begin_new_hand` invalidates the env, so on a hand-start tick
-            # this view is rebuilt from the NEW hand (button, mask, stacks)
-            # rather than describing the previous one. (review I5)
-            try:
-                engine_view = _engine_view_from_session()
-            except HTTPException as e:
-                self.last_error = f"rebuild failed: {e.detail}"
-                logger.warning("ocr rebuild failed: %s", e.detail)
-                self.last_tick_at = time.time()
-                return
-            events = reconstructor.step(fs, engine_view)
-
-            for ev in events:
-                if isinstance(ev, HeroHoleRevealed):
-                    # Already mirrored via _mirror_observable_state.
-                    self.events_applied += 1
-                elif isinstance(ev, StreetReveal):
-                    # Already mirrored.
-                    self.events_applied += 1
-                elif isinstance(ev, SeatAction):
-                    session.action_log.append(_seat_action_to_log_entry(ev))
-                    if ev.gate == "fold":
-                        # Sticky participant mask: once the reconstructor
-                        # confirms a fold, retire that seat for the rest of
-                        # the hand. Subsequent per-frame misses (banner /
-                        # occlusion) can't un-fold them, and the UI's
-                        # sitting_out display stays accurate.
-                        session.folded_this_hand = frozenset(
-                            session.folded_this_hand | {int(ev.seat)}
-                        )
-                        if session.hand_in_hand_mask:
-                            all_seats = frozenset(range(session.num_seats))
-                            session.sitting_out_seats = (
-                                (all_seats - session.hand_in_hand_mask)
-                                | session.folded_this_hand
-                            )
-                    self.events_applied += 1
-                elif isinstance(ev, OcrWarning):
-                    logger.warning("ocr: %s", ev.message)
-
-            street_reveals = [ev for ev in events if isinstance(ev, StreetReveal)]
-            # Fold reconcile needs the seat to read folded on TWO consecutive
-            # ticks (review 2026-09-20 F11): the reveal tick parks first
-            # sightings, the very next tick confirms them and only then runs
-            # the check fill that was blocked behind the missing fold.
-            followup_target = session._pending_reveal_target
-            session._pending_reveal_target = None
-            if street_reveals:
-                target_street = max(
-                    2 if ev.street == "turn" else 3 for ev in street_reveals
-                )
-                _reconcile_missed_folds_on_street_reveal(fs)
-                _reconcile_missed_checks_on_street_reveal(target_street)
-                if session._pending_reveal_folds:
-                    session._pending_reveal_target = target_street
-            elif followup_target is not None:
-                if _reconcile_missed_folds_on_street_reveal(fs):
-                    _reconcile_missed_checks_on_street_reveal(followup_target)
-                session._pending_reveal_folds = frozenset()
-
-        try:
-            _rebuild_env()
-            self.last_error = None
-        except HTTPException as e:
-            self.last_error = f"rebuild failed: {e.detail}"
-            logger.warning("ocr rebuild failed: %s", e.detail)
-        except Exception as e:
-            self.last_error = f"rebuild failed: {type(e).__name__}: {e}"
-            logger.exception("ocr rebuild failed")
-
-        self.last_tick_at = time.time()
-
-
-def _card_idx(c: Any) -> int | None:
-    """FrameState Card → engine card index (rank * 4 + suit)."""
-    if c is None:
-        return None
-    return int(c.rank) * 4 + int(c.suit)
-
-
-_STABILITY_TICKS_REQUIRED = 2
-
-# Mid-hand lock thresholds. After `_LOCK_AFTER_TICKS` ticks since
-# the last `_begin_new_hand`, the snapshot debouncer (and the
-# hero-hole rotation gate) require `_STABILITY_TICKS_REQUIRED_LOCKED`
-# stable ticks before triggering another hand-start. Real new
-# hands persist for many seconds and trivially clear this bar; a
-# 1-2-tick chip-settle / banner OCR flicker doesn't.
-_LOCK_AFTER_TICKS = 3
-_STABILITY_TICKS_REQUIRED_LOCKED = 6
-# Consecutive identical button reads required to trust a mid-hand button MOVE
-# as a new-hand trigger. Decoupled from the 6-tick snapshot above: a button
-# move persists all hand, so 3 reads reject a 1-2 frame glitch while keeping
-# new-hand latency low and immune to sitting_out churn.
-_BUTTON_STABLE_TICKS_LOCKED = 3
-
-# Minimum plausible stack_chips read (cents) for an in-hand seat's
-# anchor OCR. Live ClubGG frames captured during the chip-settle
-# animation occasionally OCR the stack label as 0 or a tiny number
-# because the blue bet-banner or chip oval covers the digits.
-# `_begin_new_hand` refuses to seed from such reads — it keeps the
-# existing seeded value instead — and `_mirror_observable_state`
-# refuses to commit an anchor where any in-hand seat looks glitched,
-# extending the debounce by one tick until a clean frame lands.
-_MIN_PLAUSIBLE_STACK_CENTS = 100  # $1 — every in-hand seat has at least this
-
-
-def _anchor_fs_stacks_plausible(fs: Any) -> bool:
-    """Return True iff every non-folded seat has a plausible stack read.
-
-    A glitched anchor is one where a bet-banner or chip-settle
-    animation is covering a seat's stack label at capture time, so
-    the OCR text read comes back as None or a near-zero value. Using
-    such an anchor to seed ``cfg.starting_stacks`` causes the engine
-    to wipe the seat's stack to zero after ante posting, which then
-    renders in the UI as a phantom pre-bet "all-in".
-    """
-    for s in fs.seats:
-        if s.folded:
-            continue
-        if s.stack_chips is None or int(s.stack_chips) < _MIN_PLAUSIBLE_STACK_CENTS:
-            return False
-    return True
-
-
-def _mirror_observable_state(fs: Any) -> None:
-    """Sync every directly-observed field from a FrameState into `session`.
-
-    Cards, button, participant mask, and observed stack/pot numbers are
-    all overwritten on every tick. The debounced button + participant
-    commit is gated by a 2-tick stability check so one glitched frame
-    can't trigger a false hand-start. When the debounced state advances
-    (new button, new participant mask, or a hero-hole reshuffle), we
-    call :func:`_begin_new_hand` to re-seed `cfg.starting_stacks` from
-    the current OCR numbers and rebaseline the reconstructor.
-    """
-    # PLO5-only (review 2026-09-20 I10): a 5-card / two-board frame does not
-    # fit any other format's card spec. Entry points refuse earlier; this
-    # keeps a stray call a no-op instead of an IndexError.
-    if not _live_capture_allowed():
-        return
-    for i, c in enumerate(fs.hero_hole):
-        _ocr_apply_card_slot("hero_hole", i, _card_idx(c), debounce=True)
-    for i, c in enumerate(fs.board_a[:3]):
-        _ocr_apply_card_slot("flop_a", i, _card_idx(c), debounce=True)
-    for i, c in enumerate(fs.board_b[:3]):
-        _ocr_apply_card_slot("flop_b", i, _card_idx(c), debounce=True)
-    _ocr_apply_card_slot("turn_cards", 0, _card_idx(fs.board_a[3]), debounce=True)
-    _ocr_apply_card_slot("turn_cards", 1, _card_idx(fs.board_b[3]), debounce=True)
-    _ocr_apply_card_slot("river_cards", 0, _card_idx(fs.board_a[4]), debounce=True)
-    _ocr_apply_card_slot("river_cards", 1, _card_idx(fs.board_b[4]), debounce=True)
-
-    session.observed_stacks = tuple(s.stack_chips for s in fs.seats)
-    session.observed_pot = fs.pot_total_chips
-
-    # Tick the mid-hand lock counter. Only counts while a hand is
-    # active (mask non-empty); during bootstrap (empty mask) we
-    # stay in the fast 2-tick path so initial hand-start isn't
-    # delayed.
-    if session.hand_in_hand_mask:
-        session._ticks_since_hand_start += 1
-    is_locked = (
-        bool(session.hand_in_hand_mask)
-        and session._ticks_since_hand_start >= _LOCK_AFTER_TICKS
-    )
-    threshold = (
-        _STABILITY_TICKS_REQUIRED_LOCKED if is_locked
-        else _STABILITY_TICKS_REQUIRED
-    )
-
-    observed_sitting_out = frozenset(
-        i for i, s in enumerate(fs.seats) if i != session.hero_seat and s.folded
-    )
-    observed_button = (
-        int(fs.button_seat) if fs.button_seat is not None else session.button_seat
-    )
-
-    # Button-ONLY stability, decoupled from the (button, sitting_out) snapshot
-    # below. The button never moves mid-hand, so a stable button MOVE is a
-    # strong new-hand signal that must not wait on sitting_out churn.
-    if observed_button == session._last_observed_button:
-        session._button_stable_ticks += 1
-    else:
-        session._last_observed_button = observed_button
-        session._button_stable_ticks = 1
-
-    hero_hole_indices: tuple[int, ...] | None = None
-    if all(c is not None for c in fs.hero_hole):
-        hero_hole_indices = tuple(int(_card_idx(c)) for c in fs.hero_hole)
-
-    # (review 2026-09-20 I1) Adopt hero's first full read of the hand as the
-    # rotation baseline. Hands usually start (button move) while hero's cards
-    # are still hidden, so `_begin_new_hand` has nothing to record and the
-    # baseline is None; without adopting here it stayed on the PREVIOUS
-    # hand's cards, and the anti-collusion reveal then looked like a
-    # permanent "hole rotated" signal waiting for one bad frame to fire.
-    if (
-        hero_hole_indices is not None
-        and session.last_hero_hole is None
-        and session.hand_in_hand_mask
-    ):
-        session.last_hero_hole = hero_hole_indices
-
-    # Debounce the button + participant snapshot over 2 consecutive
-    # ticks so a glitched frame can't trigger a false hand-start. The
-    # anchor frame captures the first tick of a new snapshot and is
-    # used downstream for stack seeding / reconstructor rebaseline.
-    snapshot = (observed_button, observed_sitting_out)
-    if (
-        snapshot == (session._pending_button, session._pending_sitting_out)
-    ):
-        session._pending_stable_ticks += 1
-        # Opportunistic anchor upgrade: if the stored anchor has
-        # glitched stack reads but this tick's fs is clean, swap in
-        # the cleaner anchor. Keeps the debounce counter intact so
-        # we don't reset progress just because the original anchor
-        # was captured during the chip-settle animation.
-        if (
-            session._pending_anchor_fs is not None
-            and not _anchor_fs_stacks_plausible(session._pending_anchor_fs)
-            and _anchor_fs_stacks_plausible(fs)
-        ):
-            session._pending_anchor_fs = fs
-    else:
-        session._pending_button = observed_button
-        session._pending_sitting_out = observed_sitting_out
-        session._pending_stable_ticks = 1
-        session._pending_anchor_fs = fs
-
-    committed_ready = session._pending_stable_ticks >= threshold
-    # Delay the commit one more tick if the anchor looks glitched.
-    # The opportunistic upgrade above will replace it as soon as a
-    # clean tick lands.
-    if (
-        committed_ready
-        and session._pending_anchor_fs is not None
-        and not _anchor_fs_stacks_plausible(session._pending_anchor_fs)
-    ):
-        logger.warning(
-            "hand-start delayed: anchor_fs has glitched stack reads"
-        )
-        committed_ready = False
-    # A button MOVE (off its prior seat), confirmed by a short run of identical
-    # reads, fires a new hand — gated on the button alone, not the 6-tick
-    # snapshot, so sitting_out flicker during the deal no longer delays it.
-    # Still require the seeding anchor to have plausible stacks (the same guard
-    # `committed_ready` applies for `first_commit`).
-    button_threshold = (
-        _BUTTON_STABLE_TICKS_LOCKED if is_locked else _STABILITY_TICKS_REQUIRED
-    )
-    button_changed = (
-        observed_button != int(session.button_seat)
-        and session._button_stable_ticks >= button_threshold
-        and _anchor_fs_stacks_plausible(session._pending_anchor_fs or fs)
-    )
-
-    # Rewind-proof fallback: hero hole re-appears with cards that differ
-    # from the snapshot we recorded last hand-start. Pre-lock (bootstrap
-    # or first few ticks of a hand) we trust the read on a single tick,
-    # since hero_hole OCR uses static per-card ROIs and is normally
-    # stable. Once locked we require the same rotated indices to persist
-    # for `threshold` consecutive ticks — a one-frame OCR glitch during
-    # a banner / chip-settle animation must not wipe the hand.
-    hero_hole_rotated_now = (
-        hero_hole_indices is not None
-        and session.last_hero_hole is not None
-        and session.last_hero_hole != hero_hole_indices
-        and set(session.last_hero_hole).isdisjoint(hero_hole_indices)
-    )
-    if not is_locked:
-        hero_hole_rotated = hero_hole_rotated_now
-        session._pending_hero_hole_rotation = None
-        session._pending_hero_hole_rotation_ticks = 0
-    else:
-        if hero_hole_rotated_now and (
-            hero_hole_indices == session._pending_hero_hole_rotation
-        ):
-            session._pending_hero_hole_rotation_ticks += 1
-        elif hero_hole_rotated_now:
-            session._pending_hero_hole_rotation = hero_hole_indices
-            session._pending_hero_hole_rotation_ticks = 1
-        else:
-            session._pending_hero_hole_rotation = None
-            session._pending_hero_hole_rotation_ticks = 0
-        hero_hole_rotated = (
-            session._pending_hero_hole_rotation_ticks >= threshold
-        )
-
-    # First-time commit: when no hand has been committed yet (empty
-    # in-hand mask) and the debounce is ready, seed the hand. This is
-    # how we bootstrap when OCR starts mid-hand — there's no button
-    # change to trigger on since session.button_seat was at its default.
-    # (review 2026-09-20 F10) ...but only when the anchor actually has
-    # someone in the hand. Between hands every seat reads folded, the commit
-    # produced an EMPTY mask, and an empty mask re-armed `first_commit` —
-    # `_begin_new_hand` re-fired on every tick until cards were dealt.
-    anchor_for_commit = session._pending_anchor_fs or fs
-    first_commit = (
-        committed_ready
-        and not session.hand_in_hand_mask
-        and any(not s.folded for s in anchor_for_commit.seats)
-    )
-
-    # Hand-start triggers: real hand-boundary events (button rotation,
-    # hero-hole rotation) plus the very first commit after OCR start.
-    # A mid-hand change in `observed_sitting_out` (a fold, or a banner
-    # flicker) is NOT a hand-start — the reconstructor emits FOLD
-    # events for real folds, and the `hand_in_hand_mask` / banner
-    # signals defend against OCR flicker.
-    trigger_fired = button_changed or hero_hole_rotated or first_commit
-
-    # OCR-confirm guard: a real hand boundary always moves the button
-    # to a different seat. If OCR still reads the button on the seat
-    # we recorded at the last hand-start, the trigger source is
-    # spurious (seen with ClubGG anti-collusion's mid-hand hero-hole
-    # reveal tripping `hero_hole_rotated` against a stale baseline).
-    # `first_commit` is exempt — bootstrap from an empty mask predates
-    # any meaningful `session.button_seat`. We only check that the
-    # button has moved off its prior seat, not that it landed on the
-    # next clockwise seat: with <6 active players the button can skip.
-    # (review 2026-09-20 I1) The move must be POSITIVELY read on this frame:
-    # an unreadable button (None) confirms nothing. It used to skip the
-    # guard, so with `hero_hole_rotated` latched, ONE occluded-button frame
-    # restarted a live hand (log wiped, locks cleared, stacks re-seeded).
-    # `button_changed` can't be true on such a frame, so only the hero-hole
-    # trigger is affected.
-    if trigger_fired and not first_commit:
-        if (
-            fs.button_seat is None
-            or int(fs.button_seat) == int(session.button_seat)
-        ):
-            trigger_fired = False
-            # A confirmed hole rotation while the button is positively read
-            # on its hand-start seat means the BASELINE was stale (recorded
-            # from the previous hand's still-visible cards), not that a hand
-            # began. Adopt the cards so the rotation can't stay latched —
-            # latched, it bypassed the button debounce: a single misread
-            # button frame would have fired it.
-            if hero_hole_rotated and fs.button_seat is not None:
-                session.last_hero_hole = hero_hole_indices
-                session._pending_hero_hole_rotation = None
-                session._pending_hero_hole_rotation_ticks = 0
-
-    if os.environ.get("PLO5BP_OCR_DEBUG_HANDSTART"):
-        logger.info(
-            "ocr.handstart: raw_btn=%s obs_btn=%s sess_btn=%s btn_ticks=%d "
-            "locked=%s snap_ticks=%d | btn_chg=%s hole_rot=%s first=%s -> %s",
-            fs.button_seat, observed_button, session.button_seat,
-            session._button_stable_ticks, is_locked,
-            session._pending_stable_ticks,
-            button_changed, hero_hole_rotated, first_commit,
-            "FIRED" if trigger_fired else "-",
-        )
-
-    if trigger_fired:
-        anchor_fs = session._pending_anchor_fs or fs
-        _begin_new_hand(
-            anchor_fs,
-            button_seat=observed_button,
-            hero_hole_indices=hero_hole_indices,
-        )
-        session._pending_anchor_fs = None
-
-    # Mid-hand mask expansion. Backstop for the case where the anchor
-    # frame fired before a participant's cards-back rendered — that
-    # seat reads `folded=True` at anchor (so they're missing from
-    # `hand_in_hand_mask`) but `folded=False` continuously thereafter.
-    # We add them after a 2-tick stability window so single-frame OCR
-    # flickers can't trigger a false addition. Strictly additive: the
-    # mask never shrinks here. Late-rebuy players are safe because
-    # they read `folded=True` (no cards/banner/commit/timer-bar);
-    # already-folded players are excluded via `folded_this_hand`.
-    # (review 2026-09-20 I8) Hero is a candidate like everyone else. Hero
-    # was excluded here, so an anchor frame that landed before hero's card
-    # backs rendered locked hero out for the whole hand: `_rebuild_env`
-    # dropped the mask (six antes) and hero got no recommendation. Hero's
-    # `folded` comes from the same multi-signal rule as the other seats.
-    if session.hand_in_hand_mask:
-        candidate_additions = frozenset(
-            i for i, s in enumerate(fs.seats)
-            if (not s.folded
-                and i not in session.hand_in_hand_mask
-                and i not in session.folded_this_hand)
-        )
-        if candidate_additions and candidate_additions == session._pending_mask_additions:
-            session._pending_mask_additions_ticks += 1
-        else:
-            session._pending_mask_additions = candidate_additions
-            session._pending_mask_additions_ticks = 1 if candidate_additions else 0
-        if session._pending_mask_additions_ticks >= _STABILITY_TICKS_REQUIRED:
-            session.hand_in_hand_mask = frozenset(
-                session.hand_in_hand_mask | candidate_additions
-            )
-            session._pending_mask_additions = frozenset()
-            session._pending_mask_additions_ticks = 0
-            # The mask decides who the engine deals in; the env built with
-            # the old mask must not feed this tick's EngineView. (review I5)
-            session.env = None
-
-    # Refresh the live sitting-out set every tick from the sticky mask
-    # plus any folds the reconstructor has emitted. This makes a
-    # banner-flicker or a transient `has_cards_back` miss invisible to
-    # downstream consumers: once a seat is in the anchor mask it stays
-    # in the hand until the reconstructor says otherwise. Before any
-    # commit, leave `sitting_out_seats` as-is (default frozenset()) so
-    # the stability gate alone decides when to trust OCR participants.
-    if session.hand_in_hand_mask:
-        all_seats = frozenset(range(session.num_seats))
-        session.sitting_out_seats = (
-            (all_seats - session.hand_in_hand_mask) | session.folded_this_hand
-        )
-
-
-def _pre_street_frame(fs: Any) -> Any:
-    """``fs`` as it stood before the current street's bets: every visible
-    commit moved back behind (stack + commit), nothing committed.
-
-    The walk only accepts a commit a matching stack drop (or bet banner)
-    corroborates, measured against the reconstructor's baseline. Rebaselining
-    on this frame lets it re-derive, from an EXACT source's per-seat commits,
-    bets that were already on the table when the baseline had to be reset.
-    """
-    return dataclasses.replace(
-        fs,
-        seats=tuple(
-            dataclasses.replace(
-                s,
-                stack_chips=(
-                    None
-                    if s.stack_chips is None
-                    else int(s.stack_chips) + int(s.committed_chips or 0)
-                ),
-                committed_chips=None,
-            )
-            for s in fs.seats
-        ),
-    )
-
-
-def _begin_new_hand(
-    fs: Any,
-    *,
-    button_seat: int,
-    hero_hole_indices: tuple[int, ...] | None,
-    exact_commits: bool = False,
-) -> None:
-    """Seed session state for a newly-observed hand.
-
-    Pulls ``cfg.starting_stacks`` from the anchor frame's OCR-cent reads
-    (converted to engine chips + ante), locks the hand-start participant
-    mask from the anchor frame (seats whose `folded=False` at hand-start
-    are the ones dealt into this hand), rebaselines the reconstructor so
-    diff-based action inference starts from a clean slate, and records
-    the hero-hole snapshot so a future rewind can distinguish "same hand
-    again" from "new hand".
-
-    ``exact_commits`` (PokerNow): the frame's per-seat ``committed_chips``
-    are authoritative, so a hand-start that lands mid-street accounts for
-    the chips already in front of each seat (see the seeding loop).
-    """
-    _new_session_defaults()
-    session.button_seat = int(button_seat)
-
-    # Lock the participant mask from the anchor frame. Once a seat is
-    # in this mask it stays in the hand until the reconstructor emits a
-    # FOLD event (tracked in `folded_this_hand`). Banner flickers and
-    # transient `has_cards_back` misses can't remove them.
-    n = session.num_seats
-    in_hand_mask = frozenset(
-        i for i in range(n) if i < len(fs.seats) and not fs.seats[i].folded
-    )
-    session.hand_in_hand_mask = in_hand_mask
-    session.folded_this_hand = frozenset()
-    all_seats = frozenset(range(n))
-    session.sitting_out_seats = all_seats - in_hand_mask
-
+    if req.button_seat >= req.num_seats:
+        raise HTTPException(status_code=400, detail="button_seat must be a seat at the table")
     cfg = session.game_config
-    existing = list(cfg.resolved_stacks)
-    merged = list(existing)
-    for i in range(n):
-        cents = fs.seats[i].stack_chips if i < len(fs.seats) else None
-        # A glitched anchor OCR read — stack label covered by the blue
-        # bet-banner or chip-settle animation — occasionally returns 0
-        # or an absurdly small cent value. Seeding merged[i] from such a
-        # read can make the engine's ante posting wipe the stack to 0
-        # and flip the seat to all-in at hand-start, before any action
-        # events have been applied. Skip the read and keep the prior
-        # seeded value when it looks implausibly small. `None` already
-        # falls through via the untouched branch below.
-        if cents is not None and int(cents) < _MIN_PLAUSIBLE_STACK_CENTS:
-            continue
-        if cents is None:
-            continue
-        # (review 2026-09-20 I9) starting = behind + this street's visible
-        # commit + ante. When the anchor lands mid-street (source attached
-        # mid-hand, hand-start signal arriving after a bet) the chips already
-        # in front of the seat are NOT in its stack read; seeding
-        # `behind + ante` alone meant the walk re-derived that bet as an
-        # action and deducted it a second time. Exact sources only: a pixel
-        # `committed_chips` read is too noisy to fold into a stack.
-        committed_cents = fs.seats[i].committed_chips if exact_commits else None
-        committed = (
-            _ocr_cents_to_engine_chips(int(committed_cents))
-            if committed_cents is not None and int(committed_cents) > 0
-            else 0
-        )
-        merged[i] = (
-            _ocr_cents_to_engine_chips(int(cents)) + committed + int(cfg.ante)
-        )
-    if tuple(merged) != tuple(existing):
-        # `replace` keeps variant/sb (review 2026-09-20 I10).
-        session.game_config = dataclasses.replace(
-            cfg, starting_stacks=tuple(merged)
-        )
-
-    # (review 2026-09-20 I1) Unconditional: when hero's cards aren't readable
-    # at hand start (the usual case — dealt face-down until hero's turn) the
-    # baseline must become None, NOT stay on the previous hand's cards.
-    # `_mirror_observable_state` adopts the first full read of this hand.
-    session.last_hero_hole = hero_hole_indices
-
-    # Rebaseline whichever live source is currently driving the session
-    # (ClubGG OCR or PokerNow ingest). Both runners register their
-    # reconstructor as the active one when they start. With exact commits
-    # the baseline is the frame as it stood BEFORE this street's bets, so
-    # the walk re-derives them (matching the stacks seeded above).
-    recon = _active_reconstructor()
-    if recon is not None:
-        recon.rebaseline(_pre_street_frame(fs) if exact_commits else fs)
-
-    # (review 2026-09-20 I5) The env still describes the PREVIOUS hand. Both
-    # runners build their EngineView right after this returns; invalidate so
-    # it is rebuilt from the new button / mask / stacks (every reader of
-    # `session.env` rebuilds on None).
-    session.env = None
-
-
-def _engine_view_from_session(exact_folds: bool = False) -> Any:
-    """Build an EngineView snapshot from the current session env.
-
-    ``exact_folds`` is set by the PokerNow path (the DOM exposes an exact
-    ``fold`` class) so the walk never *infers* a fold from a swept closing
-    call. Imported lazily so server import doesn't pull in ocr deps when the
-    OCR extras aren't installed.
-    """
-    from plo5bp.ocr.events import EngineView
-
-    env = session.env
-    if env is None:
-        _rebuild_env()
-        env = session.env
-    assert env is not None
-    raw = dict(env._rs.observation_dict())
-    n = session.num_seats
-    hero_seat = int(session.hero_seat)
-    actor_raw = raw.get("actor")
-    actor = int(actor_raw) if actor_raw is not None else None
-    cfg = session.game_config
-    # One definition of the scale, shared with `_ocr_cents_to_engine_chips`.
-    chips_per_cent = _chips_per_cent() or 1.0
-    # Noise floor: 1 bb in cents. Any stack-delta smaller than this must
-    # be OCR jitter — no legal bet is under 1 bb.
-    min_bet_cents = int(round(float(cfg.bb) / chips_per_cent)) if chips_per_cent > 0 else 0
-    return EngineView(
-        num_seats=n,
-        current_actor=actor,
-        street=int(raw.get("street", 0)),
-        awaiting_next_street=raw.get("awaiting_next_street"),
-        button_seat=int(session.button_seat),
-        committed_this_street=tuple(int(x) for x in raw["street_commit"][:n]),
-        stacks=tuple(int(x) for x in raw["stacks"][:n]),
-        folded=tuple(bool(x) for x in raw["folded"][:n]),
-        all_in=tuple(bool(x) for x in raw["all_in"][:n]),
-        bet_to_call=int(raw.get("bet_to_call", 0)),
-        chips_per_cent=chips_per_cent,
-        min_bet_cents=min_bet_cents,
-        # `sitting_out` tells the walk which seats the ENGINE retires on its
-        # own (`_auto_fold_sitting_out`). Hero is never auto-acted (review
-        # 2026-09-20 I8), so hero is never reported here even while outside
-        # the mask — otherwise the walk would skip a seat the engine is
-        # waiting on and attribute the next action to the wrong player. A
-        # hero who really folded is covered by the engine's `folded` flag.
-        sitting_out=tuple(
-            i in session.sitting_out_seats and i != hero_seat for i in range(n)
-        ),
-        exact_folds=exact_folds,
+    stacks = _request_stacks(req.starting_stacks, req.num_seats)
+    bb = int(req.bb_chips) if req.bb_chips is not None else int(cfg.bb)
+    ante = int(req.ante_chips) if req.ante_chips is not None else int(cfg.ante)
+    new_cfg = _make_config(
+        cfg,
+        num_seats=req.num_seats,
+        starting_stack=stacks[0],
+        starting_stacks=stacks,
+        bb=bb,
+        ante=ante,
+        # NLH keeps sb = bb/2 (same rule as /config).
+        sb=bb // 2 if cfg.variant == VARIANT_NLH else cfg.sb,
     )
-
-
-ocr_runner = OcrRunner()
-
-
-# --- Active live-source reconstructor ---------------------------------------
-# Both live sources (ClubGG WGC OCR and PokerNow DOM ingest) feed the same
-# session through an EventReconstructor. `_begin_new_hand` rebaselines
-# whichever one is currently driving; each runner registers its reconstructor
-# here when it starts so the shared hand-start path stays source-agnostic.
-_LIVE_RECONSTRUCTOR: Any = None
-
-
-def _active_reconstructor() -> Any:
-    # Prefer an explicitly-registered source reconstructor; fall back to the
-    # OCR runner's own (the historical default, and what tests that wire
-    # `ocr_runner._reconstructor` directly rely on).
-    if _LIVE_RECONSTRUCTOR is not None:
-        return _LIVE_RECONSTRUCTOR
-    return ocr_runner._reconstructor
-
-
-def _set_active_reconstructor(recon: Any) -> None:
-    global _LIVE_RECONSTRUCTOR
-    _LIVE_RECONSTRUCTOR = recon
-
-
-#: Which live source last drove the session: "ocr", "pokernow" or None.
-_LIVE_SOURCE: str | None = None
-
-
-def _note_live_source(name: str | None) -> None:
-    """Record the driving live source; a SWITCH to another source resets the
-    hand-start machine so the previous source's mask / anchor / hero-hole
-    baseline can't leak into the new one's first hand. (review 2026-09-20 F10)
-    """
-    global _LIVE_SOURCE
-    if name == _LIVE_SOURCE:
-        return
-    _LIVE_SOURCE = name
-    if name is not None:
-        _reset_live_tracking()
-
-
-# --- Live capture is PLO5-only ----------------------------------------------
-# (review 2026-09-20 I10) Both live sources read a 5-card-hole, double-board
-# bomb-pot table and mirror it into the session's card spec. Under the NLH
-# study format the spec is 2-card / single-board and the game config carries
-# blinds: one PokerNow POST used to replace that config with a PLO one while
-# `session.variant` stayed NLH, bricking the study session (every rebuild
-# 400'd, /reset included) until a format flip. Live entry points therefore
-# refuse — before touching any state — unless the engine variant is PLO5.
-
-_LIVE_FORMAT_ERROR = (
-    "live capture needs the PLO5 double-board format — switch the format "
-    "back to PLO5 to use ClubGG OCR / PokerNow"
-)
-
-#: Engine seat ceiling (`GameConfig` validates 2..8; PLO5 double-board can't
-#: even deal a 9th seat: 9*5 + 10 board cards > 52). PokerNow tables seat 10.
-_MAX_ENGINE_SEATS = 8
-
-
-def _live_capture_allowed() -> bool:
-    return _engine_variant() == VARIANT_PLO5
-
-
-def _require_live_capture_format() -> None:
-    if not _live_capture_allowed():
-        raise HTTPException(status_code=409, detail=_LIVE_FORMAT_ERROR)
-
-
-# --- PokerNow DOM ingest ----------------------------------------------------
-
-def _count_prefix(cards: tuple[Any, ...]) -> int:
-    """Length of the leading run of non-None cards (board fill level)."""
-    n = 0
-    for c in cards:
-        if c is None:
-            break
-        n += 1
-    return n
-
-
-def _pokernow_set_seat_count(n: int) -> bool:
-    """Reconfigure the session for an ``n``-seat PokerNow table.
-
-    PokerNow tables vary in size hand-to-hand; unlike ClubGG (fixed 6),
-    the engine seat count must track the players actually dealt in. Hero
-    stays engine seat 0 (the mapper rotates the table so hero is first).
-
-    Returns False — leaving the session untouched — when the engine can't
-    represent the table: PokerNow seats up to 10, the engine 2..8
-    (`GameConfig` rejects the rest; a 9-handed PLO5 double board doesn't
-    even fit the deck). The caller surfaces that as a status message
-    instead of crashing the ingest loop. (review 2026-09-20 B8 contract)
-    """
-    if not (2 <= int(n) <= _MAX_ENGINE_SEATS):
-        return False
-    try:
-        # `replace` keeps variant/sb (review 2026-09-20 I10).
-        new_cfg = dataclasses.replace(
-            session.game_config, num_seats=int(n), starting_stacks=None
+    lens = dict(_card_spec_attrs())
+    given = {
+        "hero_hole": req.hero_hole, "flop_a": req.flop_a, "flop_b": req.flop_b,
+        "turn_cards": req.turn, "river_cards": req.river,
+    }
+    cards = {
+        attr: _validate_card_list(
+            value if value is not None else [None] * lens[attr], lens[attr], attr
         )
-    except ValueError as e:
-        logger.warning("pokernow: %d-seat table rejected by GameConfig: %s", n, e)
-        return False
-    session.game_config = new_cfg
-    session.num_seats = int(n)
-    session.hero_seat = 0
-    if session.button_seat >= n:
-        session.button_seat = 0
-    _clear_hand_state_keep_cards()
-    session.hand_in_hand_mask = frozenset()
-    session.folded_this_hand = frozenset()
-    session.sitting_out_seats = frozenset()
-    session.last_hero_hole = None
-    # (review 2026-09-20 I5/F14) The env still has the OLD seat count. The
-    # very next thing the runner does is build an EngineView from it:
-    # `num_seats` from the session, per-seat arrays from the stale env ⇒
-    # IndexError on every frame, i.e. /pokernow/ingest 500'd forever after a
-    # player sat down or left. Invalidate; readers rebuild on None.
-    session.env = None
-    return True
-
-
-def _commits_are_lingering_antes(fs: Any) -> bool:
-    """True when every live seat shows a commit of exactly one ante.
-
-    PokerNow renders the bomb-pot ante as a per-seat bet before the flop and
-    normally clears it by the first flop frame. Should a frame still show
-    them, they must not be mistaken for flop bets (the engine posts antes
-    itself): the hand-start then seeds and rebaselines exactly as it always
-    did. A real all-seats-matched bet of precisely one ante is swept to the
-    pot the instant it closes, so misreading one costs at worst the old
-    behaviour.
-    """
-    ante = int(session.game_config.ante)
-    live = [s for s in fs.seats if not s.folded]
-    if ante <= 0 or not live:
-        return False
-    return all(
-        s.committed_chips is not None
-        and _ocr_cents_to_engine_chips(int(s.committed_chips)) == ante
-        for s in live
-    )
-
-
-def _pokernow_mirror_cards(fs: Any) -> None:
-    """Mirror hero hole + both boards from a PokerNow FrameState.
-
-    PokerNow card reads are exact (DOM text), so we commit immediately
-    (``debounce=False``) — no multi-tick stability gate is needed. The
-    per-slot lock still lets the user override a slot via ``/cards``.
-    Villain cards stay hidden (PokerNow only reveals them at showdown),
-    so only hero + community cards are mirrored, exactly like the OCR path.
-    """
-    # reject_duplicates: DOM reads are exact, but a slot the user overrode via
-    # /cards can collide with one — never lock a duplicate (review H7).
-    def put(attr: str, idx: int, card: Any) -> None:
-        _ocr_apply_card_slot(
-            attr, idx, _card_idx(card), debounce=False, reject_duplicates=True
-        )
-
-    for i, c in enumerate(fs.hero_hole):
-        put("hero_hole", i, c)
-    for i, c in enumerate(fs.board_a[:3]):
-        put("flop_a", i, c)
-    for i, c in enumerate(fs.board_b[:3]):
-        put("flop_b", i, c)
-    put("turn_cards", 0, fs.board_a[3])
-    put("turn_cards", 1, fs.board_b[3])
-    put("river_cards", 0, fs.board_a[4])
-    put("river_cards", 1, fs.board_b[4])
-
-
-class PokerNowRunner:
-    """Receives normalized DOM snapshots from the PokerNow userscript and
-    drives the same session pipeline the OCR runner uses.
-
-    Unlike ``OcrRunner`` there is no capture loop — the browser-side
-    Tampermonkey collector pushes a ``pokernow.v1`` payload over the
-    ``/pokernow/ingest`` websocket on every table change, and each payload
-    is processed by ``handle_payload`` (run on a worker thread because
-    ``_rebuild_env`` is synchronous CPU work).
-
-    Because PokerNow data is exact, the reconstructor's OCR-disambiguation
-    fallbacks never fire; the per-seat committed amount and explicit actor
-    come straight from the DOM. The one PokerNow-specific wrinkle vs ClubGG
-    is hand-start: bomb pots post antes (which PokerNow renders as a per-seat
-    bet) before the flop, so we wait until the flop is on the felt to fire
-    ``_begin_new_hand`` — that captures post-ante stacks and a clean
-    zero-commit baseline, matching what ClubGG's debouncer lands on.
-    """
-
-    # A POST-based collector looks "connected" while snapshots keep arriving;
-    # the userscript heartbeats every ~2s so an idle table stays green.
-    _STALE_SECONDS = 6.0
-    # Seconds the locked game can be silent before another game may take over.
-    # Longer than the heartbeat so a brief gap mid-hand never hands the session
-    # to a second open tab; short enough that intentionally switching tables
-    # recovers within a few seconds.
-    _GAME_SWITCH_STALE = 8.0
-
-    def __init__(self) -> None:
-        self._ws_connected: bool = False
-        self.frames_seen: int = 0
-        self.events_applied: int = 0
-        self.last_error: str | None = None
-        self.last_tick_at: float | None = None
-        self.last_post_at: float | None = None
-        self.bomb_pot: bool = False
-        self.variant: str | None = None
-        self.table_seats: int = 0
-        self._reconstructor: Any = None
-        self._last_payload_key: str | None = None
-        # Game-lock: the bridge processes frames from exactly ONE PokerNow game
-        # at a time. A second open tab (another table) posts a different
-        # `gameId`; those frames are ignored so they can't interleave into the
-        # live hand. Switches only after the locked game goes quiet.
-        self.active_game_id: str | None = None
-        self._active_game_at: float | None = None
-        self.ignored_frames: int = 0
-        self._tick_lock: asyncio.Lock = asyncio.Lock()
-
-    def accept_game(self, game_id: Any) -> bool:
-        """Return True if a frame from ``game_id`` should be processed.
-
-        Untagged frames (older userscript) are always accepted. A tagged
-        frame is accepted when it matches the locked game, no game is locked
-        yet, or the locked game has been silent past ``_GAME_SWITCH_STALE``.
-        """
-        if game_id is None:
-            return True
-        now = time.time()
-        if (
-            self.active_game_id is None
-            or game_id == self.active_game_id
-            or self._active_game_at is None
-            or (now - self._active_game_at) > self._GAME_SWITCH_STALE
-        ):
-            if game_id != self.active_game_id:
-                logger.info("pokernow: locking onto game %s", game_id)
-                # New game takes over: drop the prior hand's state cleanly.
-                self._reconstructor = None
-            self.active_game_id = game_id
-            self._active_game_at = now
-            return True
-        self.ignored_frames += 1
-        return False
-
-    @property
-    def connected(self) -> bool:
-        if self._ws_connected:
-            return True
-        return (
-            self.last_post_at is not None
-            and (time.time() - self.last_post_at) < self._STALE_SECONDS
-        )
-
-    def status(self) -> dict[str, Any]:
-        return {
-            "connected": self.connected,
-            "frames_seen": self.frames_seen,
-            "events_applied": self.events_applied,
-            "last_error": self.last_error,
-            "last_tick_at": self.last_tick_at,
-            "bomb_pot": self.bomb_pot,
-            "variant": self.variant,
-            "table_seats": self.table_seats,
-            "active_game_id": self.active_game_id,
-            "ignored_frames": self.ignored_frames,
+        for attr, value in given.items()
+    }
+    log = [
+        {
+            "gate": int(_GATE_NAME_TO_IDX[a.gate]),
+            "chips": int(a.chips or 0) if a.gate == "raise" else 0,
         }
-
-    def note_post(self) -> None:
-        """Record that a snapshot/heartbeat arrived (HTTP POST path)."""
-        self.last_post_at = time.time()
-
-    def on_connect(self) -> None:
-        self._ws_connected = True
-        self.frames_seen = 0
-        self.events_applied = 0
-        self.last_error = None
-        self._reconstructor = None
-        self._last_payload_key = None
-
-    def on_disconnect(self) -> None:
-        self._ws_connected = False
-
-    def is_duplicate(self, payload: dict) -> bool:
-        """Cheap server-side dedupe so heartbeats don't re-run the pipeline.
-
-        The userscript already dedupes by content, but heartbeats resend the
-        last snapshot to keep the connection fresh; skip reprocessing those.
-        """
-        import json as _json
-
-        try:
-            key = _json.dumps(payload, sort_keys=True, default=str)
-        except Exception:
-            return False
-        if key == self._last_payload_key:
-            return True
-        self._last_payload_key = key
-        return False
-
-    def _apply_button_correction(self, fs: Any) -> None:
-        """Move the button of the CURRENT hand (cards, mask, stacks, locks and
-        the hero-hole baseline all stay) and rebuild under it.
-
-        The acting order hangs off the button, so actions the walk recorded
-        under the stale button may now replay onto the wrong seats. Each
-        entry carries the seat it was recorded for: when the replay under the
-        corrected button contradicts those stamps (or the engine rejects an
-        entry) the log is provably mis-ordered and is dropped, and the walk —
-        run on this same frame — re-derives the street from PokerNow's exact
-        per-seat commits. For that the reconstructor is rebaselined on the
-        frame as it stood BEFORE the street's bets (stack + commit behind,
-        nothing committed): the walk only accepts a commit that a matching
-        stack drop corroborates. A log that still replays consistently is
-        kept as is.
-        """
-        session.button_seat = int(fs.button_seat)
-        session.env = None
-        if not session.action_log:
-            return
-        try:
-            build = _build_env(_session_env_spec())
-        except HTTPException:
-            return
-        if not (build.seat_mismatches or build.dropped_entries):
-            return
-        logger.warning(
-            "pokernow: button corrected to seat %d mid-hand; re-deriving %d "
-            "action(s) recorded under the stale acting order",
-            session.button_seat, len(session.action_log),
+        for a in req.actions
+    ]
+    build = _build_env(
+        _session_env_spec(
+            cfg=new_cfg,
+            num_seats=req.num_seats,
+            button_seat=req.button_seat,
+            hero_seat=0,
+            hand_in_hand_mask=frozenset(),
+            action_log=log,
+            **cards,
         )
-        session.action_log = []
-        session.folded_this_hand = frozenset()
-        session._replay_mismatch_warned = frozenset()
-        if self._reconstructor is not None:
-            self._reconstructor.rebaseline(_pre_street_frame(fs))
-
-    def _skip_frame(self, reason: str) -> None:
-        """Ignore a frame the session can't represent, without mutating it.
-        The reason shows up in /pokernow/status; logged once per change."""
-        if self.last_error != reason:
-            logger.warning("pokernow: %s", reason)
-        self.last_error = reason
-        self.last_tick_at = time.time()
-
-    def handle_payload(self, payload: dict) -> None:
-        # PLO5-only (review 2026-09-20 I10) — checked before anything is
-        # imported or touched. The HTTP/WS endpoints 409 first; this covers
-        # direct callers and a format flip while frames are in flight.
-        if not _live_capture_allowed():
-            self._skip_frame(_LIVE_FORMAT_ERROR)
-            return
-
-        from plo5bp.ocr.events import (
-            OcrWarning,
-            SeatAction,
-            StreetReveal,
+    )
+    if build.dropped_entries:
+        bad = next(
+            (i for i, e in enumerate(log)
+             if i >= len(build.kept_log) or build.kept_log[i] is not e),
+            len(log) - 1,
         )
-        from plo5bp.ocr.events import EventReconstructor
-        from plo5bp.ocr.pokernow import map_payload
-
-        try:
-            pf = map_payload(payload)
-        except ValueError as e:
-            # A malformed snapshot (the mapper raises a ValueError subclass)
-            # is the sender's error, not ours: 400, session untouched.
-            self._skip_frame(str(e))
-            raise HTTPException(status_code=400, detail=str(e)) from e
-        fs = pf.frame
-        n = pf.num_seats
-        # Between hands PokerNow can briefly show <2 in-hand seats; skip
-        # those frames rather than collapsing the engine seat count.
-        if n < 2:
-            return
-
-        self.frames_seen += 1
-        self.bomb_pot = pf.bomb_pot
-        self.variant = pf.variant
-        self.table_seats = n
-
-        # PokerNow seats up to 10; the engine tops out at 8. Keep the
-        # previous config and say so rather than crash-looping the ingest.
-        if n > _MAX_ENGINE_SEATS:
-            self._skip_frame(
-                f"PokerNow hand has {n} players; the engine supports at most "
-                f"{_MAX_ENGINE_SEATS} — frame ignored"
-            )
-            return
-
-        # First PokerNow frame after ClubGG OCR (or ever): reset the shared
-        # hand-start machine so nothing from the other source leaks in.
-        _note_live_source("pokernow")
-
-        _pn_reconf = n != session.num_seats
-        _pn_raw_seats = [
-            (
-                s.get("seat"),
-                s.get("stackDollars"),
-                s.get("betDollars") if s.get("betDollars") is not None else s.get("betText"),
-                "fold" if s.get("folded") else ("allin" if s.get("allIn") else ""),
-                len(s.get("cards") or []),
-            )
-            for s in (payload.get("seats") or [])
-        ]
-
-        # Track the table size; reconfigure + rebuild the reconstructor
-        # when it changes (player joined/left between hands).
-        if n != session.num_seats:
-            if not _pokernow_set_seat_count(n):
-                self._skip_frame(
-                    f"PokerNow hand has {n} players; the engine can't "
-                    "represent that table — frame ignored"
-                )
-                return
-            self._reconstructor = None
-        if self._reconstructor is None or self._reconstructor.num_seats != session.num_seats:
-            self._reconstructor = EventReconstructor(num_seats=session.num_seats)
-        # (review 2026-09-20 I9) Register on EVERY payload, not only when a
-        # new reconstructor is created: after a ClubGG session at the same
-        # seat count nothing re-registered PokerNow's, so `_begin_new_hand`
-        # kept rebaselining the dead OCR reconstructor.
-        _set_active_reconstructor(self._reconstructor)
-
-        _pokernow_mirror_cards(fs)
-        session.observed_stacks = tuple(s.stack_chips for s in fs.seats)
-        session.observed_pot = fs.pot_total_chips
-
-        flop_present = (
-            _count_prefix(fs.board_a) >= 3 and _count_prefix(fs.board_b) >= 3
-        )
-        hero_indices: tuple[int, ...] | None = None
-        if all(c is not None for c in fs.hero_hole):
-            hero_indices = tuple(int(_card_idx(c)) for c in fs.hero_hole)
-
-        button_changed = (
-            fs.button_seat is not None
-            and int(fs.button_seat) != int(session.button_seat)
-        )
-        # Hero's hole cards are the most reliable new-hand signal: dealt at
-        # hand start, visible throughout, exact, and re-dealt every hand.
-        # Compare as a SET (order-insensitive — PokerNow may re-sort hero's
-        # cards mid-hand) and fire on ANY change. We deliberately do NOT
-        # require the new hand to be card-disjoint from the last (that's a
-        # ClubGG OCR-noise guard; consecutive PokerNow deals often share a
-        # card, which would suppress the trigger). The dealer-button DOM can
-        # lag the flop deal, so `button_changed` is only a secondary signal.
-        hero_changed = hero_indices is not None and (
-            session.last_hero_hole is None
-            or set(hero_indices) != set(session.last_hero_hole)
-        )
-        first_commit = not session.hand_in_hand_mask
-        # (review 2026-09-20 I9) A button change while hero still holds the
-        # SAME cards is not a new hand — it is the lagging dealer-button DOM
-        # catching up after the hand already started (on the hero-card
-        # signal) under the previous button. Treating it as a hand-start
-        # wiped the live hand mid-street and re-seeded stacks from a frame
-        # with chips already in front of the seats. It is a correction to
-        # the current hand instead. (Hero cards unreadable ⇒ the button is
-        # the only new-hand signal left, so that case still starts a hand.)
-        button_correction = (
-            button_changed
-            and not first_commit
-            and not hero_changed
-            and hero_indices is not None
-        )
-        new_hand = (
-            first_commit
-            or hero_changed
-            or (button_changed and not button_correction)
-        )
-
-        # Defer the hand-start to the flop so the anchor frame carries
-        # post-ante stacks + cleared street commits (see class docstring).
-        # No stack-plausibility gate here (unlike the OCR path): PokerNow
-        # reads are exact, and `_begin_new_hand` already skips per-seat
-        # None/short stacks — gating the whole hand-start on it would wrongly
-        # block a hand where a villain ante'd all-in (stack renders empty).
-        if new_hand and flop_present:
-            btn = (
-                int(fs.button_seat)
-                if fs.button_seat is not None
-                else int(session.button_seat)
-            )
-            _begin_new_hand(
-                fs,
-                button_seat=btn,
-                hero_hole_indices=hero_indices,
-                # Commits on the anchor are real flop bets (the hand-start
-                # signal arrived mid-street) — unless they are just the ante
-                # bets still on display, which the engine posts itself.
-                exact_commits=not _commits_are_lingering_antes(fs),
-            )
-            # _begin_new_hand wiped the card spec via _new_session_defaults;
-            # re-mirror this frame so the flop/hero cards survive the reset.
-            _pokernow_mirror_cards(fs)
-        elif button_correction:
-            self._apply_button_correction(fs)
-
-        _pn_dbg = os.environ.get("PLO5BP_PN_DEBUG")
-        _street_before = None
-        if _pn_dbg and session.env is not None:
-            try:
-                _street_before = int(dict(session.env._rs.observation_dict()).get("street", -1))
-            except Exception:
-                _street_before = -2
-
-        # Action inference runs only once flop betting is live (the engine
-        # posts antes itself; PokerNow's pre-flop ante bets are not actions).
-        events: list = []
-        street_reveals: list = []
-        if flop_present and session.hand_in_hand_mask:
-            # The hand-start / seat-count paths above invalidated the env, so
-            # this view is rebuilt from the CURRENT hand. A state that can't
-            # rebuild (e.g. a user card override colliding with the DOM) is
-            # reported, never raised: an exception here used to 500 every
-            # ingest POST from then on. (review 2026-09-20 I5/F14)
-            try:
-                engine_view = _engine_view_from_session(exact_folds=True)
-            except HTTPException as e:
-                self._skip_frame(f"rebuild failed: {e.detail}")
-                return
-            events = self._reconstructor.step(fs, engine_view)
-            for ev in events:
-                if isinstance(ev, SeatAction):
-                    session.action_log.append(_seat_action_to_log_entry(ev))
-                    if ev.gate == "fold":
-                        session.folded_this_hand = frozenset(
-                            session.folded_this_hand | {int(ev.seat)}
-                        )
-                        if session.hand_in_hand_mask:
-                            all_seats = frozenset(range(session.num_seats))
-                            session.sitting_out_seats = (
-                                (all_seats - session.hand_in_hand_mask)
-                                | session.folded_this_hand
-                            )
-                    self.events_applied += 1
-                elif isinstance(ev, StreetReveal):
-                    self.events_applied += 1
-                elif isinstance(ev, OcrWarning):
-                    logger.warning("pokernow: %s", ev.message)
-
-            street_reveals = [ev for ev in events if isinstance(ev, StreetReveal)]
-            if street_reveals:
-                # exact=True: the DOM fold flag is authoritative — no 2-tick
-                # confirmation (the forced call fill below depends on folds
-                # having been reconciled first).
-                _reconcile_missed_folds_on_street_reveal(fs, exact=True)
-                target_street = max(
-                    2 if ev.street == "turn" else 3 for ev in street_reveals
-                )
-                # force=True: a PokerNow reveal proves the prior street closed,
-                # but the closing call's committed/stack signal is gone (chips
-                # swept to pot + next card dealt in the same instant). Fill the
-                # remaining calls to close the street rather than stalling.
-                _reconcile_missed_checks_on_street_reveal(target_street, force=True)
-
-        try:
-            _rebuild_env()
-            self.last_error = None
-        except HTTPException as e:
-            self.last_error = f"rebuild failed: {e.detail}"
-            logger.warning("pokernow rebuild failed: %s", e.detail)
-        except Exception as e:
-            self.last_error = f"rebuild failed: {type(e).__name__}: {e}"
-            logger.exception("pokernow rebuild failed")
-
-        if _pn_dbg:
-            try:
-                # Read street/actor straight from the engine — do NOT call
-                # _state_dict() here: it runs _compute_recommendation() (a model
-                # forward pass), which on every ingest frame throttles the whole
-                # bridge and forces the userscript to coalesce/drop actions.
-                _raw = (
-                    dict(session.env._rs.observation_dict())
-                    if session.env is not None else {}
-                )
-                _dbg_street = STREET_NAMES.get(int(_raw.get("street", -1)), _raw.get("street"))
-                _dbg_actor = _raw.get("actor")
-                ev_kinds = ",".join(type(e).__name__ for e in events) or "-"
-                _gate_ch = {int(GATE_FOLD): "F", int(GATE_CHECK_CALL): "C", int(GATE_RAISE): "R"}
-                alog_str = "".join(
-                    _gate_ch.get(int(e["gate"]), "?") + str(int(e["chips"]))
-                    for e in session.action_log
-                ) or "-"
-                seats_str = " ".join(
-                    f"{s.seat}:stk={s.stack_chips}bet={s.committed_chips}{'A' if s.is_actor else ''}{'F' if s.folded else ''}"
-                    for s in fs.seats
-                )
-                line = (
-                    f"f{self.frames_seen} b1={_count_prefix(fs.board_a)} "
-                    f"b2={_count_prefix(fs.board_b)} n={n} reconf={_pn_reconf} "
-                    f"mask={sorted(session.hand_in_hand_mask)} "
-                    f"raw={_pn_raw_seats} actorDOM="
-                    f"{[s.seat for s in fs.seats if s.is_actor]} "
-                    f"new_hand={new_hand}(hc={hero_changed},bc={button_changed},fc={first_commit}) "
-                    f"flop_present={flop_present} street_before={_street_before} "
-                    f"events=[{ev_kinds}] reveals={len(street_reveals)} "
-                    f"alog={alog_str} seats=[{seats_str}] -> street={_dbg_street} "
-                    f"actor={_dbg_actor} pot={session.observed_pot} err={self.last_error}\n"
-                )
-                with open(_pn_dbg, "a", encoding="utf-8") as fh:
-                    fh.write(line)
-            except Exception:
-                pass
-
-        self.last_tick_at = time.time()
-
-
-pokernow_runner = PokerNowRunner()
-
-
-@app.websocket("/pokernow/ingest")
-async def pokernow_ingest(ws: WebSocket) -> None:
-    """Receive ``pokernow.v1`` DOM snapshots from the Tampermonkey collector.
-
-    One active collector at a time. Refuses the connection while the ClubGG
-    OCR runner is live so the two sources can't fight over the session.
-    """
-    await ws.accept()
-    if ocr_runner.running:
-        await ws.close(code=1008, reason="ClubGG OCR is active")
-        return
-    if not _live_capture_allowed():
-        await ws.close(code=1008, reason="live capture requires the PLO5 format")
-        return
-    pokernow_runner.on_connect()
-    try:
-        while True:
-            payload = await ws.receive_json()
-            # Game-lock first (before dedup) so the active game's heartbeats
-            # keep the lock fresh even when they dedupe away.
-            if not pokernow_runner.accept_game(payload.get("gameId")):
-                continue
-            pokernow_runner.note_post()
-            if pokernow_runner.is_duplicate(payload):
-                continue
-            try:
-                async with pokernow_runner._tick_lock:
-                    await asyncio.to_thread(pokernow_runner.handle_payload, payload)
-            except HTTPException:
-                # One rejected frame (malformed payload; reason is already in
-                # status().last_error) must not tear the collector's socket down.
-                continue
-    except WebSocketDisconnect:
-        pass
-    except Exception as e:  # noqa: BLE001 — surface, don't crash the socket loop
-        pokernow_runner.last_error = f"{type(e).__name__}: {e}"
-        logger.exception("pokernow ingest error")
-    finally:
-        pokernow_runner.on_disconnect()
-
-
-@app.post("/pokernow/ingest")
-async def pokernow_ingest_http(payload: dict) -> dict[str, Any]:
-    """HTTP ingest for the Tampermonkey collector (``GM_xmlhttpRequest``).
-
-    This is the primary transport: a userscript can't open a page-context
-    websocket to ``127.0.0.1`` from an ``https`` PokerNow tab (Chrome's
-    Private Network Access + mixed-content rules block it), but
-    ``GM_xmlhttpRequest`` runs in the extension's privileged context and
-    POSTs here freely. The websocket endpoint remains for non-userscript
-    clients (e.g. a packaged extension).
-    """
-    if ocr_runner.running:
-        raise HTTPException(status_code=409, detail="ClubGG OCR is active")
-    # PLO5-only; refuse before any session state is touched (review I10).
-    _require_live_capture_format()
-    # Game-lock first (before dedup) so the active game's heartbeats keep the
-    # lock fresh even when they dedupe away. Foreign frames (a second open
-    # PokerNow tab) are ignored so they can't interleave into the live hand.
-    if not pokernow_runner.accept_game(payload.get("gameId")):
-        return {"ok": True, "ignored": "other_game", "status": pokernow_runner.status()}
-    pokernow_runner.note_post()
-    if pokernow_runner.is_duplicate(payload):
-        return {"ok": True, "deduped": True, "status": pokernow_runner.status()}
-    async with pokernow_runner._tick_lock:
-        await asyncio.to_thread(pokernow_runner.handle_payload, payload)
-    return {"ok": True, "status": pokernow_runner.status()}
-
-
-@app.get("/pokernow/status")
-def pokernow_status() -> dict[str, Any]:
-    return pokernow_runner.status()
-
-
-@app.get("/ocr/windows")
-def ocr_windows() -> dict[str, Any]:
-    """List visible top-level window titles for the dropdown.
-
-    The frontend calls this on Refresh and on first focus of the
-    window-match input. Backend matching is deliberately kept simple
-    (substring + exact-match override in ``find_window``); see
-    ``plo5bp.ocr.live`` for the exact semantics.
-    """
-    try:
-        from plo5bp.ocr import live as ocr_live
-    except ImportError as e:
-        raise HTTPException(status_code=500, detail=f"ocr deps missing: {e}") from e
-    try:
-        titles = ocr_live.list_window_titles()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
-    return {"windows": list(titles)}
-
-
-@app.post("/ocr/start")
-async def ocr_start(req: OcrStartRequest) -> dict[str, Any]:
-    # PLO5-only; refuse before `start` reshapes the session (review I10).
-    _require_live_capture_format()
-    await ocr_runner.start(req.window_match, req.poll_ms)
-    return {"ok": True, "status": ocr_runner.status()}
-
-
-@app.post("/ocr/stop")
-async def ocr_stop() -> dict[str, Any]:
-    await ocr_runner.stop()
-    return {"ok": True, "status": ocr_runner.status()}
-
-
-@app.post("/ocr/simple")
-def ocr_simple(req: OcrSimpleRequest) -> dict[str, Any]:
-    session.simple_ocr_mode = bool(req.enabled)
-    return {"state": _state_dict()}
-
-
-@app.post("/ocr/rescan")
-async def ocr_rescan(req: OcrRescanRequest) -> dict[str, Any]:
-    """Re-OCR a single card group from the current frame; preserve hand state.
-
-    Used in simple OCR mode when a card group was misread (capture
-    landed mid-reveal animation). Clears the per-slot lock for the
-    target group, applies a fresh OCR read, re-latches filled slots,
-    and rebuilds the engine. `action_log`, `button_seat`, participant
-    mask, observed stacks/pot all survive untouched.
-    """
-    # PLO5-only (review I10): the rescan groups are PLO5 card-spec slots.
-    _require_live_capture_format()
-    if not ocr_runner.running:
-        raise HTTPException(status_code=400, detail="OCR not running")
-    async with ocr_runner._tick_lock:
-        with ocr_runner._frame_lock:
-            img = ocr_runner.latest_frame
-        if img is None:
-            raise HTTPException(
-                status_code=400,
-                detail="no frame received yet; let one WGC frame land first",
-            )
-
-        from plo5bp.ocr.extract import extract_frame_state
-
-        groups = _RESCAN_GROUPS[req.target]
-        prev_spec = {g: list(getattr(session, g)) for g in groups}
-        prev_locks = {g: list(session._card_slot_locked[g]) for g in groups}
-
-        try:
-            fs = extract_frame_state(img, num_seats=session.num_seats)
-        except Exception as e:
-            raise HTTPException(
-                status_code=400,
-                detail=f"rescan {req.target} failed: extract: {e}",
-            ) from e
-
-        for g in groups:
-            session._card_slot_locked[g] = [False] * len(prev_locks[g])
-            session._card_slot_pending[g] = [None] * len(prev_locks[g])
-
-        if "hero_hole" in groups:
-            for i, c in enumerate(fs.hero_hole):
-                _ocr_apply_card_slot("hero_hole", i, _card_idx(c))
-        if "flop_a" in groups:
-            for i, c in enumerate(fs.board_a[:3]):
-                _ocr_apply_card_slot("flop_a", i, _card_idx(c))
-            for i, c in enumerate(fs.board_b[:3]):
-                _ocr_apply_card_slot("flop_b", i, _card_idx(c))
-            _ocr_apply_card_slot("turn_cards", 0, _card_idx(fs.board_a[3]))
-            _ocr_apply_card_slot("turn_cards", 1, _card_idx(fs.board_b[3]))
-            _ocr_apply_card_slot("river_cards", 0, _card_idx(fs.board_a[4]))
-            _ocr_apply_card_slot("river_cards", 1, _card_idx(fs.board_b[4]))
-
-        _lock_filled_card_slots()
-
-        try:
-            _rebuild_env()
-        except Exception as e:
-            for g in groups:
-                setattr(session, g, prev_spec[g])
-                session._card_slot_locked[g] = prev_locks[g]
-            try:
-                _rebuild_env()
-            except Exception:
-                logger.exception("rescan rollback rebuild also failed")
-            detail = e.detail if isinstance(e, HTTPException) else str(e)
-            raise HTTPException(
-                status_code=400, detail=f"rescan {req.target} failed: {detail}"
-            )
-    return {"state": _state_dict()}
-
-
-@app.get("/ocr/status")
-def ocr_status() -> dict[str, Any]:
-    return ocr_runner.status()
-
-
-@app.post("/ocr/save_frame")
-def ocr_save_frame() -> dict[str, Any]:
-    """Debug: write the most recent WGC frame to disk.
-
-    Source is `OcrRunner.latest_frame`, the BGR ndarray published by
-    the WGC callback on the most recent capture. Returns 400 if WGC
-    hasn't delivered a frame yet.
-    """
-    try:
-        import cv2
-    except ImportError as e:
-        raise HTTPException(status_code=500, detail=f"ocr deps missing: {e}") from e
-
-    with ocr_runner._frame_lock:
-        img = ocr_runner.latest_frame
-    if img is None:
         raise HTTPException(
             status_code=400,
-            detail="no frame received yet; start OCR and let one WGC frame land first",
+            detail=f"Action {bad + 1} of this spot isn't legal at that point.",
         )
+    _new_session_defaults()
+    session.game_config = new_cfg
+    session.num_seats = req.num_seats
+    session.button_seat = req.button_seat
+    session.hero_seat = 0
+    for attr, value in cards.items():
+        setattr(session, attr, value)
+    session.action_log = log
+    _run_session_reset_hooks("user")
+    _lock_filled_card_slots()
+    _commit_env_build(build)
+    return {"state": _state_dict()}
 
-    out_dir = Path(__file__).resolve().parents[3] / "screenrecords" / "frames"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    ts_ms = int(time.time() * 1000)
-    path = out_dir / f"debug_{ts_ms}.png"
-    if not cv2.imwrite(str(path), img):
-        raise HTTPException(status_code=500, detail=f"cv2.imwrite failed for {path}")
-    h, w = img.shape[:2]
+
+_GATE_IDX_TO_NAME = {v: k for k, v in _GATE_NAME_TO_IDX.items()}
+
+
+def _spot_actions(log: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {"gate": _GATE_IDX_TO_NAME[int(e["gate"])], "chips": int(e["chips"])}
+        for e in log
+    ]
+
+
+@study_router.post("/rewind")
+@_study_route
+def rewind(req: RewindRequest) -> dict[str, Any]:
+    """Keep the first `length` actions. `removed` carries what was taken off
+    (gate + chips, /spot's action shape) so the client can offer Redo."""
+    if req.length >= len(session.action_log):
+        return {"state": _state_dict(), "removed": []}
+    remaining = session.action_log[: req.length]
+    removed = _spot_actions(session.action_log[req.length:])
+    build = _build_env(_session_env_spec(action_log=remaining))
+    session.action_log = remaining
+    _commit_env_build(build)
+    return {"state": _state_dict(), "removed": removed}
+
+
+@study_router.get("/spot")
+@_study_route
+def get_spot() -> dict[str, Any]:
+    """The current Study spot in /spot's request shape (for share links)."""
+    cfg = session.game_config
     return {
-        "path": str(path),
-        "frame_size": {"width": int(w), "height": int(h)},
+        "spot": {
+            "format": session.variant,
+            "num_seats": int(session.num_seats),
+            "button_seat": int(session.button_seat),
+            "starting_stacks": [int(x) for x in cfg.resolved_stacks],
+            "ante_chips": int(cfg.ante),
+            "bb_chips": int(cfg.bb),
+            "hero_hole": list(session.hero_hole),
+            "flop_a": list(session.flop_a),
+            "flop_b": list(session.flop_b),
+            "turn": list(session.turn_cards),
+            "river": list(session.river_cards),
+            "actions": _spot_actions(session.action_log),
+        }
     }
 
 
-# --- Public build: unmount live-capture routes ------------------------------
-# In a public deployment the trained model is served but real-time table
-# reading is not. The OCR/PokerNow handlers above stay defined; here we drop
-# their routes so every /ocr/* and /pokernow/* path 404s. Trainer + Study are
-# untouched (they never call these). Stripping post-registration avoids
-# wrapping ~1000 lines of handlers in a conditional.
-def _public_route_kept(route: Any) -> bool:
-    """Drop OCR / PokerNow / Ranges from the public app.
-
-    FastAPI 0.141 wraps ``include_router`` as ``_IncludedRouter`` with
-    ``path is None``; the prefix lives on the inner APIRouter's routes.
-    OCR/PokerNow are still registered directly on ``app`` so ``.path``
-    matches. Ranges is an included router and would leak without the
-    inner-route check.
-    """
-    path = str(getattr(route, "path", "") or "")
-    if path.startswith(("/ocr", "/pokernow", "/ranges")):
-        return False
-    inner = getattr(route, "original_router", None)
-    for sub in getattr(inner, "routes", None) or ():
-        sp = str(getattr(sub, "path", "") or "")
-        if sp.startswith(("/ocr", "/pokernow", "/ranges")):
-            return False
-    return True
+class CompareRequest(BaseModel):
+    on: bool
 
 
-if PLO5BP_PUBLIC:
-    _n_before = len(app.router.routes)
-    app.router.routes[:] = [r for r in app.router.routes if _public_route_kept(r)]
-    logger.info(
-        "PUBLIC build: dropped %d live route(s); /ocr and /pokernow disabled",
-        _n_before - len(app.router.routes),
-    )
+@site_router.post("/study/compare")
+@_study_route
+def study_compare(req: CompareRequest) -> dict[str, Any]:
+    """(FEAT-025) Turn the candidate-model comparison on/off for this
+    Study session (admins; only while a candidate is configured)."""
+    if req.on and not _candidate_available():
+        raise HTTPException(status_code=403, detail="No candidate model is available to compare.")
+    session.compare_candidate = bool(req.on)
+    if session.env is None:
+        _rebuild_env()
+    return {"state": _state_dict()}
 
 
 # --- Static frontend --------------------------------------------------------
+#
+# Caching (FE-015 / PERF-001 / PERF-017 / PERF-020). HTML pages are
+# revalidated on every visit (`no-cache` + an ETag: an unchanged page is a
+# tiny 304), and every asset a page links is linked WITH ITS CONTENT HASH
+# (`/static/app.js?v=3f9c2a…`). Such a URL never changes meaning, so the
+# browser and Cloudflare keep it for a year (`immutable`), and a deploy that
+# changes a file changes its URL — nothing stale is ever shown and nothing
+# unchanged is ever downloaded twice. A request without (or with an outdated)
+# `v` gets `no-cache` + ETag. Rendered pages and served-text hashes are
+# cached by file (mtime, size), so a request re-reads nothing.
 
 
 _NO_CACHE = {"Cache-Control": "no-store, must-revalidate"}
+_REVALIDATE = "no-cache"
+_IMMUTABLE = "public, max-age=31536000, immutable"
 
 
 def _strip_wglive(text: str) -> str:
@@ -4619,6 +2643,71 @@ def _strip_wgapp(text: str) -> str:
     return re.sub(r"[^\n]*WGAPP:START.*?WGAPP:END[^\n]*\n?", "", text, flags=re.S)
 
 
+def _select_pricing_copy(html: str, public: bool | None = None) -> str:
+    """Keep the landing's free-period copy (WGFREE regions) or its paid-plan
+    copy (WGPAID regions) to match `PLO5BP_FREE_FOR_ALL`, and fill the paid
+    copy's {{PRICE}} / {{FREE_HANDS}} from the service settings — so turning
+    the paywall back on can never leave the page promising "free" (site
+    ACC-017). Marker lines are removed either way. The local build has no
+    service layer (and never imports it): free copy, never shown there.
+    `public`: the page's build (default: the current site's)."""
+    free, price_cents, hands = True, 1000, 5
+    if current_site().public if public is None else public:
+        try:
+            from plo5bp.ui import public as _pub
+
+            free = bool(_pub.FREE_FOR_ALL)
+            price_cents = int(_pub.PRICE_CENTS)
+            hands = int(_pub.FREE_HANDS_PER_DAY)
+        except Exception:  # noqa: BLE001 — keep the page up; free copy
+            logger.exception("landing: pricing settings unavailable")
+    drop, keep = ("WGPAID", "WGFREE") if free else ("WGFREE", "WGPAID")
+    html = re.sub(rf"[^\n]*{drop}:START.*?{drop}:END[^\n]*\n?", "", html, flags=re.S)
+    html = re.sub(rf"[^\n]*{keep}:(?:START|END)[^\n]*\n?", "", html)
+    dollars = price_cents / 100
+    price = f"${dollars:,.0f}" if price_cents % 100 == 0 else f"${dollars:,.2f}"
+    return html.replace("{{PRICE}}", price).replace("{{FREE_HANDS}}", str(hands))
+
+
+#: Self-hosted brand fonts (site FE-024 / PERF-002): (family, file in
+#: static/fonts/). While every file is there, pages load the fonts from this
+#: site; until then they keep the Google Fonts links (a render-blocking
+#: stylesheet from another origin, which also tells Google about the visit).
+_FONT_FILES = (("Geist", "Geist-Variable.woff2"), ("Geist Mono", "GeistMono-Variable.woff2"))
+
+
+def _font_versions(versions: "_AssetVersions") -> tuple[str, ...] | None:
+    """Content versions of the self-hosted font files as served — None until
+    every one of them is in static/fonts/."""
+    got = tuple(versions.version(f"fonts/{name}") for _, name in _FONT_FILES)
+    return None if any(v is None for v in got) else got
+
+
+def _font_links(html: str, versions: tuple[str, ...] | None) -> str:
+    """Swap a page's WGFONTS region (the Google Fonts links) for the
+    self-hosted fonts when `versions` (from `_font_versions`) says they are
+    there; otherwise keep the region and drop only its marker lines. The
+    @font-face rules are written inline with content-versioned URLs, so the
+    font request starts as soon as the head is parsed (the main face is also
+    preloaded — the same URL, one download) and is cached for a year like
+    every other versioned asset. A WGFONTNOTE region (the privacy policy's
+    line about Google serving the fonts) is kept only while Google does."""
+    if not versions:
+        return re.sub(r"[^\n]*WGFONT(?:S|NOTE):(?:START|END)[^\n]*\n?", "", html)
+    urls = [f"/static/fonts/{name}?v={v}" for (_, name), v in zip(_FONT_FILES, versions)]
+    faces = "".join(
+        '@font-face{font-family:"' + family + '";src:url("' + url + '") format("woff2");'
+        "font-weight:100 900;font-style:normal;font-display:swap}"
+        for (family, _), url in zip(_FONT_FILES, urls)
+    )
+    block = (
+        '    <link rel="preload" href="' + urls[0] + '" as="font" type="font/woff2" crossorigin />\n'
+        "    <style>" + faces + "</style>\n"
+    )
+    html = re.sub(r"[^\n]*WGFONTNOTE:START.*?WGFONTNOTE:END[^\n]*\n?", "", html, flags=re.S)
+    return re.sub(r"[^\n]*WGFONTS:START.*?WGFONTS:END[^\n]*\n?", lambda _m: block, html, flags=re.S)
+
+
 def _strip_local_only_scripts(html: str) -> str:
     """Drop the <script> tags of assets the public static mount refuses, so
     a public page never requests (and console-404s on) them."""
@@ -4629,154 +2718,306 @@ def _strip_local_only_scripts(html: str) -> str:
     )
 
 
-#: Public-build policy for files under STATIC_DIR, keyed by file name and
-#: enforced on the RESOLVED file (see NoCacheStaticFiles):
-#:   "strip" — served with the WGLIVE regions removed;
-#:   "deny"  — 404 from the static mount. Every one of these has a proper,
-#:             gated home: index.html is `/` (which also applies the
-#:             signed-out WGAPP strip), the home-games assets are
-#:             `/games/static/{name}` + `/games`, admin.html is `/admin`,
-#:             and ranges.js belongs to the local-only /ranges feature.
+#: Public build (SEC-014): the /static mount is an ALLOW-LIST. "strip" = text
+#: served with the WGLIVE regions removed; "serve" = served as is; every file
+#: under a directory of `_PUBLIC_STATIC_DIRS` is served as is. ANY other file —
+#: "deny" below, or not listed at all (a new file, or one left on the server
+#: after it left the repo) — 404s. The "deny" files have their own gated
+#: homes: index.html is `/` (which also applies the signed-out WGAPP strip),
+#: the home-games client (every games.*) `/games/static/{name}` + `/games`,
+#: admin.html / admin.js `/admin`, the legal pages `/terms` + `/privacy`, and
+#: ranges.js belongs to the local-only /ranges feature. The policy is
+#: enforced on the file a request RESOLVES to (see `SiteStaticFiles`).
 _PUBLIC_STATIC_POLICY: dict[str, str] = {
     "app.js": "strip",
+    # The rest of the Study / Trainer client, loaded before app.js (site FE-019).
+    "app.core.js": "strip",
+    "app.table.js": "strip",
+    "app.play.js": "strip",
+    "app.study.js": "strip",
+    "app.trainer.js": "strip",
+    "app.topbar.js": "strip",
     "style.css": "strip",
+    "landing.js": "strip",
     "index.html": "deny",
     "ranges.js": "deny",
-    "games.js": "deny",
-    "games.table.js": "deny",
-    "games.ui.js": "deny",
-    "games.play.js": "deny",
-    "games.sound.js": "deny",
-    "games.fair.js": "deny",
-    "games.css": "deny",
-    "games.html": "deny",
     "admin.html": "deny",
+    "admin.js": "deny",
+    "terms.html": "deny",
+    "privacy.html": "deny",
 }
-_STRIPPED_MEDIA_TYPES = {".js": "text/javascript", ".css": "text/css"}
+# "fonts": the self-hosted Geist files, once the owner adds them (site FE-024).
+_PUBLIC_STATIC_DIRS = ("brand", "fonts")
+_TEXT_MEDIA_TYPES = {
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+}
 
 
-class NoCacheStaticFiles(StaticFiles):
-    """The /static mount: no-store headers, plus the public-build file policy.
+def _static_rel(directory: str, full_path: str) -> str | None:
+    """`full_path`'s location inside `directory` after resolving links, 8.3
+    names and case (normcase), as a forward-slash path; None if outside."""
+    base = os.path.normcase(os.path.realpath(directory))
+    target = os.path.normcase(os.path.realpath(full_path))
+    try:
+        rel = os.path.relpath(target, base)
+    except ValueError:  # another drive (Windows)
+        return None
+    if rel == os.curdir or rel.startswith(os.pardir):
+        return None
+    return rel.replace(os.sep, "/")
+
+
+class _AssetVersions:
+    """Content hash of each static file AS SERVED (stripped in the public
+    build), cached by (mtime, size) — the `?v=` of versioned links."""
+
+    def __init__(self, directory: Path, public: bool) -> None:
+        self.directory = Path(directory)
+        self.public = public
+        self._lock = threading.Lock()
+        self._cache: dict[str, tuple[tuple[int, int], bytes, str]] = {}
+
+    def policy(self, rel: str) -> str | None:
+        """How the mount serves `rel` (normcased, forward slashes): "strip",
+        "serve", or None = 404. The local build serves everything as is."""
+        if not self.public:
+            return "serve"
+        for name, pol in _PUBLIC_STATIC_POLICY.items():
+            if os.path.normcase(name) == rel:
+                return pol if pol in ("strip", "serve") else None
+        top = rel.split("/", 1)[0]
+        if "/" in rel and any(os.path.normcase(d) == top for d in _PUBLIC_STATIC_DIRS):
+            return "serve"
+        return None
+
+    def body(self, rel: str) -> tuple[bytes, str] | None:
+        """(served bytes, version) — None when the file does not exist."""
+        path = self.directory / rel
+        try:
+            st = path.stat()
+        except OSError:
+            return None
+        key = (int(st.st_mtime_ns), int(st.st_size))
+        with self._lock:
+            hit = self._cache.get(rel)
+            if hit is not None and hit[0] == key:
+                return hit[1], hit[2]
+        if self.public and self.policy(rel) == "strip":
+            # Text read with universal newlines (served LF), then stripped.
+            data = _strip_wglive(path.read_text(encoding="utf-8")).encode("utf-8")
+        else:
+            data = path.read_bytes()
+        version = hashlib.sha256(data).hexdigest()[:16]
+        with self._lock:
+            self._cache[rel] = (key, data, version)
+        return data, version
+
+    def version(self, rel: str) -> str | None:
+        got = self.body(os.path.normcase(rel).replace(os.sep, "/"))
+        return got[1] if got is not None else None
+
+
+def _query_param(scope: dict[str, Any], name: str) -> str | None:
+    raw = scope.get("query_string", b"").decode("latin-1")
+    for part in raw.split("&"):
+        k, _, v = part.partition("=")
+        if k == name:
+            return v
+    return None
+
+
+def _not_modified(scope: dict[str, Any], etag: str) -> bool:
+    for k, v in scope.get("headers") or ():
+        if k == b"if-none-match":
+            tags = {t.strip() for t in v.decode("latin-1").split(",")}
+            return etag in tags or "*" in tags
+    return False
+
+
+class SiteStaticFiles(StaticFiles):
+    """The /static mount: content-hash caching + the public allow-list.
 
     (review 2026-09-20 F1) The public build used to shadow the mount with
-    exact-path routes (`/static/app.js`, `/static/style.css`) and rely on the
-    access middleware's exact-path blocklist for the hidden home-games
-    assets. Both compare the RAW url, while the mount normalizes it — so
-    `/static//app.js` served the unstripped OCR/PokerNow client,
-    `/static//games.js` and `/static/games.js/` served the hidden home-games
-    client, and `/static/index.html` the raw WGLIVE/WGAPP markup, all to
-    anonymous visitors. The policy now lives HERE, on the file the request
-    actually resolves to, so no spelling of the path (doubled or trailing
-    slashes, `.` segments, case on a case-insensitive filesystem, 8.3 names,
-    links) can reach a protected file around it.
-    """
+    exact-path routes and rely on the access middleware's exact-path
+    blocklist — both compare the RAW url, while the mount normalizes it — so
+    `/static//app.js` served the unstripped OCR/PokerNow client and
+    `/static//games.js` the hidden home-games client. The policy lives HERE,
+    on the file the request actually resolves to, so no spelling of the path
+    (doubled or trailing slashes, `.` segments, case on a case-insensitive
+    filesystem, 8.3 names, links) can reach a protected file around it — and
+    since 2026-09-28 it is an allow-list (SEC-014)."""
 
     def __init__(self, *args: Any, public: bool = False, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self._public_policy = dict(_PUBLIC_STATIC_POLICY) if public else {}
-        # name -> ((mtime_ns, size), stripped text)
-        self._stripped_cache: dict[str, tuple[tuple[int, int], str]] = {}
-
-    def _policy_for(self, path: str) -> tuple[str | None, str, Any]:
-        """(policy name | None, resolved path, stat) for a mount-relative path."""
-        full_path, stat_result = self.lookup_path(path)
-        if stat_result is None:
-            return None, full_path, None
-        resolved = os.path.normcase(os.path.realpath(full_path))
-        for name in self._public_policy:
-            target = os.path.join(str(self.directory), name)
-            try:
-                target_stat = os.stat(target)
-            except OSError:
-                continue
-            same = os.path.normcase(os.path.realpath(target)) == resolved
-            if not same and stat_result.st_ino and target_stat.st_ino:
-                same = os.path.samestat(stat_result, target_stat)
-            if same:
-                return name, full_path, stat_result
-        return None, full_path, stat_result
-
-    def _stripped(self, name: str, full_path: str, stat_result: Any) -> str:
-        key = (int(stat_result.st_mtime_ns), int(stat_result.st_size))
-        cached = self._stripped_cache.get(name)
-        if cached is None or cached[0] != key:
-            text = Path(full_path).read_text(encoding="utf-8")
-            cached = (key, _strip_wglive(text))
-            self._stripped_cache[name] = cached
-        return cached[1]
+        self.public = public
+        if public:
+            # Every home-games client file (games.*) is served only from its
+            # gated /games/static route (HGB-017) — denied here like any file
+            # not on the allow-list; listed so tests can classify it.
+            for f in Path(str(self.directory)).glob("games.*"):
+                _PUBLIC_STATIC_POLICY.setdefault(f.name, "deny")
+        self.versions = _AssetVersions(Path(str(self.directory)), public)
 
     async def get_response(self, path, scope):
-        if self._public_policy and scope["method"] in ("GET", "HEAD"):
-            try:
-                name, full_path, stat_result = await anyio.to_thread.run_sync(
-                    self._policy_for, path
-                )
-            except (OSError, ValueError):
-                # Unresolvable path (too long, NUL byte…): let the stock
-                # handler produce its usual 404.
-                name = None
-            if name is not None:
-                if self._public_policy[name] == "deny":
-                    raise HTTPException(status_code=404)
-                body = await anyio.to_thread.run_sync(
-                    self._stripped, name, full_path, stat_result
-                )
-                return Response(
-                    body,
-                    media_type=_STRIPPED_MEDIA_TYPES[os.path.splitext(name)[1]],
-                    headers=_NO_CACHE,
-                )
-        resp = await super().get_response(path, scope)
-        resp.headers["Cache-Control"] = "no-store, must-revalidate"
-        return resp
+        if scope["method"] not in ("GET", "HEAD"):
+            return await super().get_response(path, scope)
+        try:
+            full_path, stat_result = await anyio.to_thread.run_sync(self.lookup_path, path)
+        except (OSError, ValueError):
+            # Unresolvable path (too long, NUL byte…): the stock 404.
+            raise HTTPException(status_code=404)
+        if stat_result is None or not os.path.isfile(full_path):
+            raise HTTPException(status_code=404)
+        rel = _static_rel(str(self.directory), full_path)
+        policy = self.versions.policy(rel) if rel is not None else None
+        if policy is None:
+            raise HTTPException(status_code=404)
+        got = await anyio.to_thread.run_sync(self.versions.body, rel)
+        if got is None:
+            raise HTTPException(status_code=404)
+        data, version = got
+        etag = f'"{version}"'
+        cache = _IMMUTABLE if _query_param(scope, "v") == version else _REVALIDATE
+        headers = {"Cache-Control": cache, "ETag": etag}
+        if _not_modified(scope, etag):
+            return Response(status_code=304, headers=headers)
+        ext = os.path.splitext(rel)[1].lower()
+        media = _TEXT_MEDIA_TYPES.get(ext)
+        if media is None:
+            import mimetypes
+
+            media = mimetypes.guess_type(rel)[0] or "application/octet-stream"
+        return Response(data, media_type=media, headers=headers)
 
 
-if STATIC_DIR.exists():
-    app.mount(
-        "/static",
-        NoCacheStaticFiles(directory=STATIC_DIR, public=PLO5BP_PUBLIC),
-        name="static",
-    )
+#: Historical name (tests, docs).
+NoCacheStaticFiles = SiteStaticFiles
+
+_STATIC_REF_RE = re.compile(r'(\b(?:src|href)=")/static/([^"?#]+)(")')
+
+
+class _PageRenderer:
+    """Renders a server-side HTML page once per (file state, variant, asset
+    versions): versioned asset links, and the page's CSP with the hashes of
+    its (server-written) inline scripts."""
+
+    def __init__(self, versions: _AssetVersions) -> None:
+        self.versions = versions
+        self._lock = threading.Lock()
+        self._cache: dict[tuple, Any] = {}
+
+    def render(self, name: str, variant: tuple, transform: Any) -> tuple[str, str, str]:
+        """(html, etag, csp) of static `name` after `transform(html)`."""
+        path = self.versions.directory / name
+        st = path.stat()
+        base_key = (name, int(st.st_mtime_ns), int(st.st_size), variant)
+        with self._lock:
+            src = self._cache.get(("src",) + base_key)
+        if src is None:
+            html = transform(path.read_text(encoding="utf-8"))
+            refs = tuple(sorted({m.group(2) for m in _STATIC_REF_RE.finditer(html)}))
+            src = (html, refs)
+            with self._lock:
+                self._cache[("src",) + base_key] = src
+        html, refs = src
+        versions = tuple(self.versions.version(r) for r in refs)
+        key = base_key + versions
+        with self._lock:
+            hit = self._cache.get(key)
+        if hit is not None:
+            return hit
+        vmap = dict(zip(refs, versions))
+
+        def link(m: "re.Match[str]") -> str:
+            v = vmap.get(m.group(2))
+            suffix = f"?v={v}" if v else ""
+            return f"{m.group(1)}/static/{m.group(2)}{suffix}{m.group(3)}"
+
+        out = _STATIC_REF_RE.sub(link, html)
+        etag = 'W/"' + hashlib.sha256(out.encode("utf-8")).hexdigest()[:20] + '"'
+        csp = _mw.site_csp(_mw.inline_script_hashes(out))
+        result = (out, etag, csp)
+        with self._lock:
+            if len(self._cache) > 64:
+                self._cache.clear()
+            self._cache[key] = result
+        return result
+
+
+def _page_response(request: Request, html: str, etag: str, csp: str, *, private: bool) -> Response:
+    headers = {
+        "Cache-Control": f"{_REVALIDATE}, private" if private else _REVALIDATE,
+        "ETag": etag,
+        "Content-Security-Policy": csp,
+    }
+    if private:
+        headers["Vary"] = "Cookie"
+    if _not_modified(request.scope, etag):
+        return Response(status_code=304, headers=headers)
+    return HTMLResponse(html, headers=headers)
+
+
+def _site_base_url(request: Request, site: Site | None = None) -> str:
+    base = (site or current_site()).settings.base_url
+    return base or str(request.base_url).rstrip("/")
+
+
+def _install_pages(app: FastAPI, site: Site) -> None:
+    """The /static mount and the server-rendered pages of one app: `/`, the
+    legal pages, the icons, robots.txt and the sitemap."""
+    public = site.public
+    site.static = SiteStaticFiles(directory=STATIC_DIR, public=public)
+    app.mount("/static", site.static, name="static")
+    pages = site.pages = _PageRenderer(site.static.versions)
+
+    def _index_transform(signed_in: bool, fonts: tuple[str, ...] | None = None) -> Any:
+        def transform(html: str) -> str:
+            if public:
+                html = _strip_local_only_scripts(_strip_wglive(html))
+                if not signed_in:
+                    html = _strip_wgapp(html)
+            html = _select_pricing_copy(html, public)
+            html = _font_links(html, fonts)
+            # The build mode, known to the client before first paint (the
+            # page's CSP allows exactly this inline script, by its hash).
+            flag = "true" if public else "false"
+            return html.replace(
+                "</head>", f"<script>window.PLO5BP_PUBLIC={flag};</script></head>", 1
+            )
+
+        return transform
 
     @app.get("/")
-    def index(request: Request) -> HTMLResponse:
-        # Inject the build mode so the frontend knows its mode before first
-        # paint; in the public build also strip the WGLIVE markup regions.
-        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
-        if PLO5BP_PUBLIC:
-            html = _strip_local_only_scripts(_strip_wglive(html))
+    def index(request: Request) -> Response:
+        signed_in = True
+        if public:
             # Signed-out visitors get the landing page ONLY — the app chrome
             # is stripped server-side so it can't flash on load or be revealed
             # by deleting the overlay. session.uid is set at login (public.py).
             try:
                 signed_in = bool(request.session.get("uid"))
             except (AssertionError, KeyError):
-                # SessionMiddleware not installed (shouldn't happen in public
-                # build) — fall back to sending the full markup.
+                # SessionMiddleware not installed (shouldn't happen in the
+                # public build) — fall back to sending the full markup.
                 signed_in = True
-            if not signed_in:
-                html = _strip_wgapp(html)
-        flag = "true" if PLO5BP_PUBLIC else "false"
-        html = html.replace(
-            "</head>", f"<script>window.PLO5BP_PUBLIC={flag};</script></head>", 1
+        fonts = _font_versions(pages.versions)
+        html, etag, csp = pages.render(
+            "index.html", (public, signed_in, fonts),
+            _index_transform(signed_in, fonts),
         )
-        return HTMLResponse(
-            html, headers={"Cache-Control": "no-store, must-revalidate"}
-        )
+        return _page_response(request, html, etag, csp, private=public)
 
-    @app.get("/terms")
-    def terms_page() -> FileResponse:
-        return FileResponse(
-            STATIC_DIR / "terms.html",
-            headers={"Cache-Control": "no-store, must-revalidate"},
-        )
+    def _legal_page(name: str) -> Any:
+        def page(request: Request) -> Response:
+            fonts = _font_versions(pages.versions)
+            html, etag, csp = pages.render(name, (fonts,), lambda h: _font_links(h, fonts))
+            return _page_response(request, html, etag, csp, private=False)
 
-    @app.get("/privacy")
-    def privacy_page() -> FileResponse:
-        return FileResponse(
-            STATIC_DIR / "privacy.html",
-            headers={"Cache-Control": "no-store, must-revalidate"},
-        )
+        return page
+
+    app.add_api_route("/terms", _legal_page("terms.html"), methods=["GET"])
+    app.add_api_route("/privacy", _legal_page("privacy.html"), methods=["GET"])
 
     # iPhones use this icon for the home screen, favorites and share sheets,
     # and fetch it from the site ROOT whenever a page doesn't name one. Square
@@ -4791,25 +3032,432 @@ if STATIC_DIR.exists():
             headers={"Cache-Control": "public, max-age=86400"},
         )
 
+    # Browsers, bookmark managers and link unfurlers still ask for the root
+    # favicon (ACC-013): the 48 px brand icon (PNG works in every browser).
+    @app.get("/favicon.ico")
+    def favicon() -> FileResponse:
+        return FileResponse(
+            STATIC_DIR / "brand" / "favicon-48.png",
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=604800"},
+        )
+
+    # Crawl rules + sitemap (ACC-006 / BE-022): the landing and legal pages
+    # are public; the app, its APIs and the private home games are not.
+    _ROBOTS_DISALLOW = (
+        "/games", "/trainer", "/study", "/admin", "/auth", "/billing", "/account",
+        "/state", "/formats", "/me", "/health",
+    )
+
+    @app.get("/robots.txt")
+    def robots(request: Request) -> Response:
+        lines = ["User-agent: *"]
+        lines += [f"Disallow: {p}" for p in _ROBOTS_DISALLOW]
+        lines += ["Allow: /", "", f"Sitemap: {_site_base_url(request, site)}/sitemap.xml", ""]
+        return Response(
+            "\n".join(lines), media_type="text/plain; charset=utf-8",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
+    @app.get("/sitemap.xml")
+    def sitemap(request: Request) -> Response:
+        base = _site_base_url(request, site)
+        rows = []
+        for loc, name, prio in (
+            ("/", "index.html", "1.0"),
+            ("/terms", "terms.html", "0.3"),
+            ("/privacy", "privacy.html", "0.3"),
+        ):
+            try:
+                day = time.strftime("%Y-%m-%d", time.gmtime((STATIC_DIR / name).stat().st_mtime))
+            except OSError:
+                continue
+            rows.append(
+                f"  <url><loc>{base}{loc}</loc><lastmod>{day}</lastmod>"
+                f"<priority>{prio}</priority></url>"
+            )
+        body = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+            + "\n".join(rows) + "\n</urlset>\n"
+        )
+        return Response(
+            body, media_type="application/xml",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
+
+# --- Health (OPS-019) -------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_BUILD_INFO: dict[str, Any] | None = None
+
+
+def _build_info() -> dict[str, Any]:
+    """The deployed code: ``PLO5BP_BUILD_COMMIT``, else ``BUILD_INFO.json`` at
+    the repo root (written by the deploy's pack step: {"commit", "built_at",
+    ...}), else the git checkout. Read once."""
+    global _BUILD_INFO
+    if _BUILD_INFO is not None:
+        return _BUILD_INFO
+    info: dict[str, Any] = {"commit": None, "built_at": None, "source": "unknown"}
+    env_commit = os.environ.get("PLO5BP_BUILD_COMMIT", "").strip()
+    path = _REPO_ROOT / "BUILD_INFO.json"
+    if env_commit:
+        info.update(commit=env_commit, source="env")
+    elif path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                info.update({k: data.get(k) for k in ("commit", "built_at", "dirty", "branch")})
+                info["source"] = "file"
+        except (OSError, ValueError) as e:
+            logger.warning("BUILD_INFO.json unreadable: %s", e)
+    elif (_REPO_ROOT / ".git").exists():
+        import subprocess
+
+        try:
+            out = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=_REPO_ROOT, capture_output=True,
+                text=True, timeout=3,
+            )
+            if out.returncode == 0:
+                info.update(commit=out.stdout.strip(), source="git")
+        except (OSError, subprocess.SubprocessError):
+            pass
+    commit = info.get("commit")
+    info["commit_short"] = str(commit)[:12] if commit else None
+    _BUILD_INFO = info
+    return info
+
+
+def health_report(site: Site | None = None) -> tuple[int, dict[str, Any]]:
+    """(HTTP status, body) of ``GET /health`` for `site` (default: the current).
+
+    The deploy check, the uptime monitor and the admin panel read these
+    names: ``model_loaded`` / ``critic_loaded`` / ``obs_rev_mismatch`` (the
+    PLO5 product format), ``build.commit``, ``threads`` (registered worker
+    checks, e.g. the home-games clock and grader). In the public build a
+    BROKEN model — a random placeholder, or one fed another observation
+    revision — answers 503, so a deploy or a checkpoint swap that breaks it
+    rolls back / pages instead of quietly serving garbage. A missing critic
+    or an unhealthy worker is ``degraded`` (200, ``ok: false``)."""
+    site = site or current_site()
+    plo5 = site.formats[VARIANT_PLO5]
+    model_loaded = bool(plo5.get("loaded"))
+    critic_loaded = bool(plo5.get("critic_loaded", plo5.get("critic") is not None))
+    mismatch = bool(plo5.get("obs_rev_mismatch", False))
+    problems: list[str] = []
+    if not model_loaded:
+        problems.append("PLO5 model not loaded — a random placeholder is serving")
+    if mismatch:
+        problems.append(
+            "PLO5 model trained on obs rev %s, process encodes rev %s"
+            % (plo5.get("obs_rev"), _process_obs_rev())
+        )
+    if not critic_loaded:
+        problems.append("PLO5 critic not loaded — the review's true EV is off")
+    threads: dict[str, Any] = {}
+    for name, check in list(site.health_checks.items()):
+        try:
+            threads[name] = dict(check())
+        except Exception as e:  # noqa: BLE001 — a broken check is itself a finding
+            threads[name] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        if not threads[name].get("ok", True):
+            problems.append(f"{name} unhealthy")
+    broken = not model_loaded or mismatch
+    body = {
+        "ok": not problems,
+        "status": "broken" if broken else ("degraded" if problems else "ok"),
+        "public": site.public,
+        "model_loaded": model_loaded,
+        "critic_loaded": critic_loaded,
+        "obs_rev_mismatch": mismatch,
+        "obs_rev": plo5.get("obs_rev"),
+        "process_obs_rev": _process_obs_rev(),
+        "checkpoint": plo5.get("checkpoint"),
+        "sha256": (plo5.get("sha256") or "")[:16] or None,
+        "build": _build_info(),
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(site.started_at)),
+        "uptime_s": int(time.time() - site.started_at),
+        "formats": {
+            fid: {
+                "model_loaded": bool(f.get("loaded")),
+                "critic_loaded": bool(f.get("critic_loaded", f.get("critic") is not None)),
+                "obs_rev_mismatch": bool(f.get("obs_rev_mismatch", False)),
+                "checkpoint": f.get("checkpoint"),
+            }
+            for fid, f in list(site.formats.items())
+            if f.get("available", True)
+        },
+        "threads": threads,
+        "problems": problems,
+    }
+    return (503 if (site.public and broken) else 200), body
+
+
+#: Any of these means the request crossed a proxy / the Cloudflare tunnel.
+_PROXY_HEADERS = ("x-forwarded-for", "x-forwarded-host", "x-real-ip", "forwarded",
+                  "cf-connecting-ip", "cf-ray", "true-client-ip")
+
+
+def _loopback_request(request: Request) -> bool:
+    """A request made ON the server (the deploy's own check), never one through the
+    tunnel: cloudflared connects from 127.0.0.1 too, so also require no forwarding
+    header and a loopback Host (the tunnel forwards the public hostname)."""
+    import ipaddress
+    from urllib.parse import urlsplit
+
+    def _lo(h: str | None) -> bool:
+        h = (h or "").strip().strip("[]").lower()
+        if h == "localhost":
+            return True
+        try:
+            return ipaddress.ip_address(h).is_loopback
+        except ValueError:
+            return False
+
+    if any(h in request.headers for h in _PROXY_HEADERS):
+        return False
+    try:
+        host = urlsplit("//" + request.headers.get("host", "")).hostname
+    except ValueError:
+        return False
+    return _lo(request.client.host if request.client else "") and _lo(host)
+
+
+@site_router.get("/health")
+def health(request: Request) -> Response:
+    status, body = health_report(getattr(request.app.state, "site", None))
+    # (OPS-031) `?deploy=1` from the server itself adds what a restart would
+    # interrupt, from memory (ops/deploytool.py `status`); anyone else gets plain /health.
+    if request.query_params.get("deploy") == "1" and _loopback_request(request):
+        hg = sys.modules.get("plo5bp.ui.homegame")
+        status_fn = getattr(hg, "deploy_status", None) if hg is not None else None
+        body = {**body, "deploy": {"home_games": status_fn() if callable(status_fn) else None}}
+    return JSONResponse(body, status_code=status, headers={"Cache-Control": "no-store"})
+
+
+def _system_info(site: Site | None = None) -> dict[str, Any]:
+    """Server-side facts for the admin System panel (FEAT-024)."""
+    site = site or current_site()
+    status, body = health_report(site)
+    return {
+        "health": {**body, "http_status": status},
+        "formats": [_models.entry_summary(fid, f) for fid, f in list(site.formats.items())],
+        "device": str(site.device),
+        "torch_threads": torch.get_num_threads(),
+        "gto_host": site.gto_host is not None,
+    }
+
+
+def _tune_torch_threads(settings: SiteSettings) -> None:
+    """(PERF-022) CPU threads per forward pass. The public site runs at most
+    `common.model_slots()` model requests at once (the access layer's work
+    gate); giving each ``cores // slots`` threads keeps them from
+    oversubscribing the box (a 2-vCPU server: 2 requests x 1 thread instead
+    of 2 x 2 fighting over 2 cores). ``PLO5BP_TORCH_THREADS`` overrides; the
+    local build keeps torch's own default unless it is set."""
+    if settings.torch_threads is not None:
+        n = settings.torch_threads
+    elif settings.public:
+        n = max(1, (os.cpu_count() or 2) // _model_slots())
+    else:
+        return
+    try:
+        torch.set_num_threads(n)
+        torch.set_num_interop_threads(1)
+    except RuntimeError:  # interop threads can only be set before first use
+        pass
+    logger.info("torch CPU threads per forward: %d", torch.get_num_threads())
+
 
 # --- Public service layer (auth / billing / admin / per-user state) ----------
-# Installed last so its middleware wraps every route above. Local build
-# (flag unset) never imports plo5bp.ui.public.
-if PLO5BP_PUBLIC:
+
+
+def _install_public(app: FastAPI, site: Site) -> None:
+    """The public build's service layer and home games, on `site`'s app.
+
+    Installed last so its middleware wraps every route above. The local build
+    never imports plo5bp.ui.public. The layer's state is its module's, so it
+    serves one app at a time: a site it served before is closed first (its home
+    games stopped, its database closed) — the new app gets its own database,
+    caches and home-games context (`homegame.use_context`)."""
+    global _PUBLIC_SITE
+    from plo5bp.ui import homegame as _homegame
     from plo5bp.ui import public as _public
-    from plo5bp.ui.trainer import (
-        TrainerSession as _TrainerSession,
-        set_session_resolver as _set_trainer_resolver,
-    )
+
+    retired = _PUBLIC_SITE
+    if retired is not None and retired is not site and not retired.closed:
+        logger.warning("a new public app replaces the previous one: closing the old one")
+        retired.close()
+    _PUBLIC_SITE = site
+    site.homegames = _homegame.HomeGames()
+    _homegame.use_context(site.homegames)
+
+    def _plo5() -> dict[str, Any]:
+        return site.formats[VARIANT_PLO5]
 
     _public.install(
         app,
         study_session_factory=Session,
-        set_study_resolver=set_session_resolver,
-        trainer_session_factory=lambda stats_path: _TrainerSession(
-            MODEL, MODEL_DEVICE, critic=MODEL_CRITIC, stats_path=stats_path
+        set_study_resolver=site.set_session_resolver,
+        # The PLO5 model this site serves NOW (a reloaded / promoted one too).
+        trainer_session_factory=lambda stats_path: _trainer.TrainerSession(
+            _plo5()["model"], site.device, critic=_plo5()["critic"],
+            stats_path=stats_path, formats=site.formats,
         ),
-        set_trainer_resolver=_set_trainer_resolver,
+        set_trainer_resolver=site.set_trainer_resolver,
         static_dir=STATIC_DIR,
-        set_format_gate=set_format_gate,
+        set_format_gate=site.set_format_gate,
+        system_info=lambda: _system_info(site),
+        model_admin=site.model_admin,
     )
+    site.db, site.registry = _public.DB, _public._REGISTRY
+    # Home-games grading scores with the PLO5 model this site serves NOW (a
+    # reloaded / promoted checkpoint included). HGB-016: the grader used to
+    # import this whole module to borrow MODEL. (OPS-021) A random
+    # placeholder is never offered: no real model = no grades, the hands stay
+    # "being worked out" instead of carrying permanent garbage marks.
+    _homegame.set_model_provider(lambda: _plo5()["model"] if _plo5().get("loaded") else None)
+
+
+# --- The app factory ----------------------------------------------------------
+
+
+def create_app(settings: SiteSettings | None = None) -> FastAPI:
+    """Build the study / trainer app — and, in the public build, the service
+    layer and the home games — from `settings` (default: the environment, read
+    now), and make its site the current one (see `Site`). The app's state is
+    ``app.state.site``. uvicorn serves the one built at import
+    (``plo5bp.ui.server:app``).
+
+    A test builds an app per configuration without re-importing anything:
+    set the environment, call this, and `use_site` the previous site back (a
+    public app's `Site.close()` stops its home games and closes its database).
+    The layers' own settings (`public.install`, `homegame.install`) are read
+    from the environment as it is at that moment."""
+    settings = settings if settings is not None else SiteSettings.from_env()
+    if settings.public != _env_flag("PLO5BP_PUBLIC"):
+        # The trainer's public guards and the checkpoint loader read the flag
+        # when they run: a site that disagrees with them would serve a mix.
+        raise ValueError(
+            f"SiteSettings(public={settings.public}) disagrees with PLO5BP_PUBLIC in "
+            "the environment — set the environment (the trainer and the checkpoint "
+            "loader read it when they run)"
+        )
+    site = Site(settings)
+    # The served models: actor + critic from ONE read of each checkpoint.
+    site.formats = {fmt: _models.build_entry(fmt, _format_ckpt_path(fmt)) for fmt in _SERVED_FORMATS}
+    site.device = next(site.formats[VARIANT_PLO5]["model"].parameters()).device
+    site.model_admin = _models.ModelAdmin(site.formats)
+    previous = _activate(site)
+    try:
+        return _compose(site)
+    except BaseException:
+        if previous is not None:
+            _activate(previous)
+        raise
+
+
+def _compose(site: Site) -> FastAPI:
+    """The app itself, around `site` (the current site while it is built)."""
+    settings = site.settings
+    # (review 2026-09-20 F1) The public build ships no interactive docs / schema:
+    # `/openapi.json` listed every route — the hidden home-games API and the
+    # admin API included — to any signed-in free user.
+    app = FastAPI(
+        title="PLO5 Bomb-Pot Study Tool",
+        **(
+            {"docs_url": None, "redoc_url": None, "openapi_url": None}
+            if settings.public
+            else {}
+        ),
+    )
+    site.app = app
+    app.state.site = site
+    app.add_exception_handler(RequestValidationError, _request_validation_error)
+    app.add_exception_handler(_StarletteHTTPException, _http_error)
+    app.add_exception_handler(Exception, _unhandled_error)
+
+    if settings.gto_checkpoint:
+        site.gto_host = try_load_gto_host(settings.gto_checkpoint, device=site.device)
+    if site.gto_host is not None:
+        logger.info("GTO PolicyNet loaded from %s (Study+Trainer T1)", settings.gto_checkpoint)
+    else:
+        logger.info(
+            "No PLO5BP_GTO_CHECKPOINT — NLH Study uses PPO/random placeholder"
+        )
+
+    plo5 = site.formats[VARIANT_PLO5]
+    site.trainer_router = _trainer.create_trainer_router(
+        plo5["model"], site.device, critic=plo5["critic"], formats=site.formats,
+        gto_checkpoint=settings.gto_checkpoint,
+        # The ONE loaded teacher, shared (it used to be loaded twice, PERF-023).
+        gto_host=site.gto_host,
+    )
+    app.include_router(site.trainer_router)
+
+    # NLH range grid (/ranges/*) — LOCAL BUILD ONLY for now: the public build
+    # never mounts it (like live capture) until the feature is validated and
+    # deliberately shipped.
+    if not settings.public:
+        from plo5bp.ui.ranges import create_ranges_router
+
+        app.include_router(
+            create_ranges_router(
+                site.formats,
+                site.device,
+                nlh_ckpt_name=_format_ckpt_path(VARIANT_NLH).name,
+                gto_model=(site.gto_host.model if site.gto_host is not None else None),
+                # The HOST (not just its model) carries coverage + obs-form
+                # metadata: Ranges serves the teacher only where `supports()`
+                # says yes and on its canonical obs, else the PPO NLH model
+                # (review 2026-09-20 D3).
+                gto_host=site.gto_host,
+            )
+        )
+
+    _mount_flat(app, study_router)
+    _mount_flat(app, site_router)
+    _mount_flat(app, study_router, prefix="/study", include_in_schema=False)
+
+    if not settings.public:
+        # Build the env now so /state works on the first request — local build
+        # only: the public build has no shared default session (SEC-011).
+        _rebuild_env()
+        # Live capture (local build only): ClubGG OCR + PokerNow ingest live in
+        # `plo5bp.ui.live` (runners, hand-start machine, /ocr/* + /pokernow/*
+        # routes). The public build never imports that package, so none of its
+        # code ships there.
+        from plo5bp.ui.live.routes import install as _install_live_capture
+
+        _install_live_capture(app)
+
+    if STATIC_DIR.exists():
+        _install_pages(app, site)
+
+    site.started_at = time.time()
+    _tune_torch_threads(settings)
+
+    if settings.public:
+        _install_public(app, site)
+
+    # --- Site-wide HTTP layer (outermost) --------------------------------------
+    # Security headers on every response (SEC-001 / SEC-013 / FE-016) and request
+    # timing / error tracking (OPS-024) — see `plo5bp.ui.middleware`. Added LAST so
+    # it wraps everything, the public build's session + access layers included.
+    app.add_middleware(
+        _mw.SiteMiddleware,
+        hsts=settings.public and settings.base_url.lower().startswith("https://"),
+    )
+    return app
+
+
+# The module's historical names (`app`, `MODEL`, `FORMATS` …) read the current site.
+sys.modules[__name__].__class__ = _ServerModule
+
+# uvicorn (`plo5bp.ui.server:app`) and the deploy's pre-flight import this
+# module: build the app from the environment now. `app` names the current
+# site's — this one, in production.
+create_app()

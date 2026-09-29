@@ -1,5 +1,18 @@
 # Anatomy of one training update (this project, step by step)
 
+> **What changed since this was written (July 2026 → 2026-09-28).** The ORDER of
+> events below is still right; the sizes are not. The numbers here are for 49,134
+> environments, a 6.27M-row rollout, dense float32 observations and a GPU-resident
+> batch. Today (vSix6): **1.76M environments, ~164M rows per update**; observations
+> are stored **compact** (0/1 columns as bits, real columns as float16 — about 1 KB a
+> row instead of 4.7 KB), the batch stays in **host RAM** (`--batch-on-host`: each
+> minibatch is gathered into pinned memory and copied over) and PPO runs in
+> **micro-batches** (`--micro-batch-rows`); in-flight hands are finished at the end of
+> the rollout; all opponents act in one batched forward pass; the network is a 1024×3
+> actor with a 1536×2 SiLU critic. The training loop now lives in
+> `python/plo5bp/train/` (`scripts/train.py` is a thin wrapper). CLAUDE.md, "Current
+> state", has the dated details.
+
 Plain-language, chronological walkthrough of **exactly what happens during a
 single PPO update** in this codebase — what runs, in what order, what gets
 stored in CPU RAM vs GPU VRAM, and when each is allocated and freed.

@@ -40,15 +40,6 @@ def uploads_dir() -> Path:
 
 
 def library_roots() -> list[Path]:
-    """Directories the Library tab scans (most specific first)."""
-    root = data_root()
-    return [
-        uploads_dir(),
-        export_dir(),
-        jobs_dir(),
-        root / "overnight" / "strategies",
-        root / "bench",
-        root / "verify" / "batch" / "strategies",
-        root / "pushfold_14_charts",
-        root,
-    ]
+    """Directories the Library tab scans: the data root, once, recursively
+    (TOOL-055 — every folder below used to be scanned a second time)."""
+    return [data_root()]

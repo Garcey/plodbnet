@@ -1,15 +1,18 @@
 """Private PLO5 / PLO6 / PLO67 double-board bomb-pot home games (PokerNow-style).
 
-Installed only from ``public.install`` (public build). Access is the
-admin-granted ``homegame_access`` flag, independent of subscription;
-the HTTP middleware 404s the whole ``/games`` tree for everyone else.
+Installed only from ``public.install`` (public build). Every signed-in user
+has home games; a CLUB is the private circle — a club's tables, members and
+numbers are its members' only (``_table_access``; clubs replaced the old
+admin-granted ``homegame_access`` flag on 2026-09-25, which now only means "a
+member of the MAIN club"). Signed out, the ``/games`` pages are a sign-in page
+and everything else under ``/games`` is the hidden 404.
 
 The game (2026-09-26): a table deals PLO5 (five hole cards, up to 8 seats) or
 PLO6 (six hole cards, up to 7 seats — 7 x 6 + two boards is the whole deck; no
 burn cards online), chosen when the table is created and fixed for its life
 (like the blinds). Everything else is the same game. Only PLO5 decisions are
-graded (there is no PLO6 network yet), and the club's numbers are kept apart
-per game (``homegames.variant``).
+graded (there is no PLO6 / PLO67 network yet), and the club's numbers are kept
+apart per game (``homegames.variant``).
 
 PLO67 (2026-09-27, the owner's friends' game): four hole cards, and the three
 burn cards are dealt FACE UP — one before the flops, one before the turns, one
@@ -82,36 +85,45 @@ Chips in (2026-09-22):
   when the hand is over; without the flag it is refused as before.
 - ``GET …/stream`` pushes the viewer's state over SSE whenever it changes; the
   450 ms poll stays as the client's fallback.
+
+The code (HGB-006, 2026-09-28): this module is the tables and the hand — state,
+dealing, the clock, the verifiable shuffle, money, the view, grading — and the
+entry points (``install``, ``shutdown``, ``set_model_provider``). The process's
+state lives in ONE ``HomeGames`` object (``CTX``; ``use_context`` swaps it; the old
+names ``HUB``, ``_WATCHDOG_THREAD`` … read and write it). The parts that barely
+touch the hand live beside it — ``homegame_schema``, ``homegame_people``,
+``homegame_clubs``, ``homegame_stats``, ``homegame_pages``, ``homegame_routes``
+(see ``SPLIT_MODULES`` near the end): each reaches every home-games name through
+this module when it runs, and everything they define is re-exported here, so
+``homegame.X`` — importing it, calling it, patching it — works for all of it.
 """
 
 from __future__ import annotations
 
-import asyncio
-import base64
-import hashlib
-import html as html_mod
+import functools
+import inspect
 import json
 import queue
 import logging
 import math
 import os
-import re
 import secrets
 import threading
+import sys
 import time
+import types
+import unicodedata
 import zlib
 from collections import deque
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any, Iterator
 
-from fastapi import Body, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
-from starlette.concurrency import run_in_threadpool
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, Response
 
-from plo5bp.actions import FOLD, GATE_CHECK_CALL, GATE_FOLD, GATE_RAISE
+from plo5bp.actions import ALL_IN, CHECK_CALL, FOLD, GATE_CHECK_CALL, GATE_FOLD, GATE_RAISE
 from plo5bp.config import VARIANT_PLO5, VARIANT_PLO6, VARIANT_PLO67, GameConfig
 from plo5bp.env import BombPotEnv, StepInfo
 from plo5bp.ui.common import STREET_NAMES, position_name
@@ -120,7 +132,9 @@ from plo5bp.ui.runout import (
     AWARD_SECS, board_equities, build_awards, display_pots, money_flows, plo67_equities,
 )
 from plo5bp.ui import fairdeal
+from plo5bp.ui import homegame_export
 from plo5bp.ui import public as pub
+from plo5bp.ui.ratelimit import KeyedCounter, RateLimiter
 
 logger = logging.getLogger("plo5bp.ui.homegame")
 
@@ -148,7 +162,13 @@ DEFAULT_GAME = "plo5"
 # it into memory can ALWAYS be persisted.
 MAX_CENTS = 1_000_000_000  # $10M — per amount, and per player's total buy-in
 MAX_NAME_LEN = 60
-MAX_OPEN_TABLES_PER_USER = int(os.environ.get("PLO5BP_HOMEGAME_MAX_TABLES", "5"))
+
+
+def _env_max_tables() -> int:
+    return int(os.environ.get("PLO5BP_HOMEGAME_MAX_TABLES", "5"))
+
+
+MAX_OPEN_TABLES_PER_USER = _env_max_tables()  # (read again by `install` — `_read_env_settings`)
 CHAT_MAX_LEN = 240
 CHAT_RATE_MAX = 6  # messages ...
 CHAT_RATE_WINDOW_S = 10.0  # ... per user per table per window
@@ -187,12 +207,18 @@ REACTIONS = (
     "think", "ship",
 )
 HANDS_PAGE_MAX = 50
+
+
+def _env_grading_on() -> bool:
+    return os.environ.get("PLO5BP_HOMEGAME_GRADING", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
 # Every action of every hand is graded against the network in the background
 # (never on the request path, never during the hand): the same node distribution
 # and the same scorer as the Trainer tab, from the ACTOR's own point of view.
-GRADING_ON = os.environ.get("PLO5BP_HOMEGAME_GRADING", "1").strip().lower() not in (
-    "0", "false", "no", "off",
-)
+GRADING_ON = _env_grading_on()  # (read again by `install` — `_read_env_settings`)
 # The verifiable shuffle (``fairdeal``): the deck is sealed before the players'
 # devices contribute, their numbers re-permute it, and every card a player is
 # shown comes with its proof. Needs the engine's deal-from-an-explicit-deck entry
@@ -214,7 +240,7 @@ except Exception:  # noqa: BLE001
     PLO67_ON = False
 #: PLO67 all-in runout: extra seconds per street shown, so the burn can be
 #: presented (and, if it is red, a card dealt to every hand) before the board
-#: cards come. Not added when the host set the runout pause to 0 (instant).
+#: cards come.
 BURN_SHOW_S = 1.2
 #: Monte-Carlo runouts behind each street's PLO67 all-in equities (Rust, ~10 ms).
 PLO67_EQ_SAMPLES = 3000
@@ -232,6 +258,11 @@ GAMES_ASSETS: dict[str, str] = {
     "games.js": "text/javascript; charset=utf-8",
     "games.table.js": "text/javascript; charset=utf-8",
     "games.ui.js": "text/javascript; charset=utf-8",
+    # (the UI's feature modules, split out of games.ui.js — FE-005)
+    "games.lobby.js": "text/javascript; charset=utf-8",
+    "games.history.js": "text/javascript; charset=utf-8",
+    "games.seat.js": "text/javascript; charset=utf-8",
+    "games.manage.js": "text/javascript; charset=utf-8",
     "games.play.js": "text/javascript; charset=utf-8",
     "games.sound.js": "text/javascript; charset=utf-8",
     "games.fair.js": "text/javascript; charset=utf-8",
@@ -242,247 +273,16 @@ GAMES_ASSETS: dict[str, str] = {
 HUB_CLOSED_EVICT_S = 60.0
 HUB_IDLE_EVICT_S = 30 * 60.0
 HUB_ABANDONED_EVICT_S = 6 * 3600.0  # even mid-hand: the hand is void
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS homegames (
-  id TEXT PRIMARY KEY,
-  host_user_id INTEGER NOT NULL,
-  name TEXT NOT NULL,
-  num_seats INTEGER NOT NULL,
-  sb_cents INTEGER NOT NULL,
-  bb_cents INTEGER NOT NULL,
-  ante_cents INTEGER NOT NULL,
-  default_buyin_cents INTEGER NOT NULL,
-  status TEXT NOT NULL DEFAULT 'open',
-  running INTEGER NOT NULL DEFAULT 0,
-  auto_stack_mode TEXT NOT NULL DEFAULT 'off',
-  auto_stack_all_cents INTEGER NOT NULL DEFAULT 0,
-  decision_secs INTEGER NOT NULL DEFAULT 0,
-  street_pause_ms INTEGER NOT NULL DEFAULT 1500,
-  button INTEGER NOT NULL DEFAULT 0,
-  hand_no INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL,
-  closed_at TEXT,
-  deal_delay_ms INTEGER NOT NULL DEFAULT 5000,
-  time_bank_secs INTEGER NOT NULL DEFAULT 0,
-  min_buyin_cents INTEGER NOT NULL DEFAULT 0,
-  max_buyin_cents INTEGER NOT NULL DEFAULT 0,
-  listed INTEGER NOT NULL DEFAULT 1,
-  allow_rabbit INTEGER NOT NULL DEFAULT 1,
-  approve_buyins INTEGER NOT NULL DEFAULT 0,
-  topup_mode TEXT NOT NULL DEFAULT 'off',
-  topup_target_cents INTEGER NOT NULL DEFAULT 0,
-  topup_below_cents INTEGER NOT NULL DEFAULT 0,
-  show_grades INTEGER NOT NULL DEFAULT 1,
-  excluded INTEGER NOT NULL DEFAULT 0,
-  allow_rathole INTEGER NOT NULL DEFAULT 0,
-  variant TEXT NOT NULL DEFAULT 'plo5'
-);
-CREATE TABLE IF NOT EXISTS homegame_hands (
-  game_id TEXT NOT NULL,
-  hand_no INTEGER NOT NULL,
-  ended_at TEXT NOT NULL,
-  pot_cents INTEGER NOT NULL DEFAULT 0,
-  summary TEXT NOT NULL,
-  PRIMARY KEY (game_id, hand_no)
-);
-CREATE TABLE IF NOT EXISTS homegame_hand_results (
-  game_id TEXT NOT NULL,
-  hand_no INTEGER NOT NULL,
-  user_id INTEGER NOT NULL,
-  delta_cents INTEGER NOT NULL,
-  showdown INTEGER NOT NULL DEFAULT 0,
-  acc_sum REAL NOT NULL DEFAULT 0,
-  acc_n INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (game_id, hand_no, user_id)
-);
-CREATE TABLE IF NOT EXISTS homegame_flows (
-  game_id TEXT NOT NULL,
-  hand_no INTEGER NOT NULL,
-  payer INTEGER NOT NULL,
-  payee INTEGER NOT NULL,
-  chips INTEGER NOT NULL,
-  PRIMARY KEY (game_id, hand_no, payer, payee)
-);
-CREATE TABLE IF NOT EXISTS homegame_fair (
-  game_id TEXT NOT NULL,
-  hand_no INTEGER NOT NULL,
-  data TEXT NOT NULL,
-  PRIMARY KEY (game_id, hand_no)
-);
-CREATE INDEX IF NOT EXISTS homegame_results_user ON homegame_hand_results(user_id);
-CREATE INDEX IF NOT EXISTS homegame_flows_payer ON homegame_flows(payer);
-CREATE INDEX IF NOT EXISTS homegame_flows_payee ON homegame_flows(payee);
-CREATE TABLE IF NOT EXISTS homegame_players (
-  game_id TEXT NOT NULL,
-  user_id INTEGER NOT NULL,
-  seat INTEGER,
-  stack_chips INTEGER NOT NULL DEFAULT 0,
-  sitting_out INTEGER NOT NULL DEFAULT 0,
-  buyin_cents INTEGER NOT NULL DEFAULT 0,
-  leftover_cents INTEGER NOT NULL DEFAULT 0,
-  auto_stack_cents INTEGER NOT NULL DEFAULT 0,
-  trusted INTEGER NOT NULL DEFAULT 0,
-  topup_target_cents INTEGER NOT NULL DEFAULT 0,
-  topup_below_cents INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (game_id, user_id)
-);
-CREATE TABLE IF NOT EXISTS homegame_ledger (
-  id INTEGER PRIMARY KEY,
-  game_id TEXT NOT NULL,
-  user_id INTEGER NOT NULL,
-  kind TEXT NOT NULL,
-  amount_cents INTEGER NOT NULL,
-  created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS homegame_chat (
-  id INTEGER PRIMARY KEY,
-  game_id TEXT NOT NULL,
-  user_id INTEGER NOT NULL,
-  body TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS homegame_clubs (
-  id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  owner_user_id INTEGER NOT NULL,
-  invite_code TEXT NOT NULL UNIQUE,
-  approve_joins INTEGER NOT NULL DEFAULT 0,
-  is_main INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS homegame_club_members (
-  club_id TEXT NOT NULL,
-  user_id INTEGER NOT NULL,
-  role TEXT NOT NULL DEFAULT 'member',
-  joined_at TEXT NOT NULL,
-  PRIMARY KEY (club_id, user_id)
-);
-CREATE INDEX IF NOT EXISTS homegame_club_members_user ON homegame_club_members(user_id);
-CREATE TABLE IF NOT EXISTS homegame_club_requests (
-  club_id TEXT NOT NULL,
-  user_id INTEGER NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending',
-  created_at TEXT NOT NULL,
-  decided_at TEXT,
-  PRIMARY KEY (club_id, user_id)
-);
-CREATE TABLE IF NOT EXISTS homegame_host_prefs (
-  user_id INTEGER PRIMARY KEY,
-  prefs TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS homegame_avatars (
-  user_id INTEGER PRIMARY KEY,
-  mime TEXT NOT NULL,
-  data BLOB NOT NULL,
-  version TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-"""
-
-
-def _ensure_schema() -> None:
-    with pub.DB._lock:
-        pub.DB._conn.executescript(_SCHEMA)
-        cols = {
-            r[1] for r in pub.DB._conn.execute("PRAGMA table_info(homegames)").fetchall()
-        }
-        if "running" not in cols:
-            pub.DB._conn.execute(
-                "ALTER TABLE homegames ADD COLUMN running INTEGER NOT NULL DEFAULT 0"
-            )
-        if "auto_stack_mode" not in cols:
-            pub.DB._conn.execute(
-                "ALTER TABLE homegames ADD COLUMN auto_stack_mode "
-                "TEXT NOT NULL DEFAULT 'off'"
-            )
-        if "auto_stack_all_cents" not in cols:
-            pub.DB._conn.execute(
-                "ALTER TABLE homegames ADD COLUMN auto_stack_all_cents "
-                "INTEGER NOT NULL DEFAULT 0"
-            )
-        if "decision_secs" not in cols:
-            pub.DB._conn.execute(
-                "ALTER TABLE homegames ADD COLUMN decision_secs "
-                "INTEGER NOT NULL DEFAULT 0"
-            )
-        if "street_pause_ms" not in cols:
-            pub.DB._conn.execute(
-                "ALTER TABLE homegames ADD COLUMN street_pause_ms "
-                "INTEGER NOT NULL DEFAULT 1500"
-            )
-        # 2026-09-21. Tables that predate server-side dealing were auto-dealt
-        # by the host's browser, so they migrate to a 5 s delay (not manual).
-        for col, ddl in (
-            ("deal_delay_ms", "INTEGER NOT NULL DEFAULT 5000"),
-            ("time_bank_secs", "INTEGER NOT NULL DEFAULT 0"),
-            ("min_buyin_cents", "INTEGER NOT NULL DEFAULT 0"),
-            ("max_buyin_cents", "INTEGER NOT NULL DEFAULT 0"),
-            ("listed", "INTEGER NOT NULL DEFAULT 1"),
-            ("allow_rabbit", "INTEGER NOT NULL DEFAULT 1"),
-            ("approve_buyins", "INTEGER NOT NULL DEFAULT 0"),
-            ("topup_mode", "TEXT NOT NULL DEFAULT 'off'"),
-            ("topup_target_cents", "INTEGER NOT NULL DEFAULT 0"),
-            ("topup_below_cents", "INTEGER NOT NULL DEFAULT 0"),
-            ("show_grades", "INTEGER NOT NULL DEFAULT 1"),
-            ("excluded", "INTEGER NOT NULL DEFAULT 0"),
-            ("allow_rathole", "INTEGER NOT NULL DEFAULT 0"),
-            # 2026-09-26: PLO6 tables. Every table before it dealt PLO5.
-            ("variant", "TEXT NOT NULL DEFAULT 'plo5'"),
-        ):
-            if col not in cols:
-                pub.DB._conn.execute(f"ALTER TABLE homegames ADD COLUMN {col} {ddl}")
-        pcols = {
-            r[1]
-            for r in pub.DB._conn.execute(
-                "PRAGMA table_info(homegame_players)"
-            ).fetchall()
-        }
-        if "auto_stack_cents" not in pcols:
-            pub.DB._conn.execute(
-                "ALTER TABLE homegame_players ADD COLUMN auto_stack_cents "
-                "INTEGER NOT NULL DEFAULT 0"
-            )
-        rcols = {
-            r[1]
-            for r in pub.DB._conn.execute(
-                "PRAGMA table_info(homegame_hand_results)"
-            ).fetchall()
-        }
-        if "acc_sum" not in rcols:
-            pub.DB._conn.execute(
-                "ALTER TABLE homegame_hand_results ADD COLUMN acc_sum REAL NOT NULL DEFAULT 0"
-            )
-            pub.DB._conn.execute(
-                "ALTER TABLE homegame_hand_results ADD COLUMN acc_n INTEGER NOT NULL DEFAULT 0"
-            )
-        for col in ("trusted", "topup_target_cents", "topup_below_cents"):
-            if col not in pcols:
-                pub.DB._conn.execute(
-                    f"ALTER TABLE homegame_players ADD COLUMN {col} "
-                    "INTEGER NOT NULL DEFAULT 0"
-                )
-        if "club_id" not in cols:  # 2026-09-25: every table belongs to a club
-            pub.DB._conn.execute("ALTER TABLE homegames ADD COLUMN club_id TEXT")
-        pub.DB._conn.execute("CREATE INDEX IF NOT EXISTS homegames_club ON homegames(club_id)")
-        pub.DB._conn.commit()
-    _migrate_clubs()
 
 
 def _make_env(cfg: GameConfig) -> BombPotEnv:
-    """Prod's env.py may predate ``obs_mode``; fall back to the 2-arg ctor."""
-    try:
-        return BombPotEnv(cfg, ev_runout_samples=0, obs_mode="minimal")
-    except TypeError:
-        return BombPotEnv(cfg, ev_runout_samples=0)
+    # (env.py and the engine ship together — scripts/deploy_prod.sh rebuilds the
+    # engine — so no fallback for an older constructor: HGB-012.)
+    return BombPotEnv(cfg, ev_runout_samples=0, obs_mode="minimal")
 
 
 def _obs_dict(env: BombPotEnv) -> dict[str, Any]:
-    fn = env._rs.observation_dict
-    try:
-        return dict(fn(skip_outcome_mc=True))
-    except TypeError:
-        return dict(fn())
+    return env.observation_dict()  # (the env's public accessors, never its engine handle — HGB-023)
 
 
 def _div_half_up(num: int, den: int) -> int:
@@ -511,6 +311,24 @@ def chips_per_cent(bb_cents: int) -> int:
     (e.g. a 3c big blind) and whole-cent chip multiples do not exist."""
     bb = int(bb_cents)
     return BB_CHIPS // bb if bb > 0 and BB_CHIPS % bb == 0 else 0
+
+
+def zero_sum_cents(deltas_chips: list[int], bb_cents: int) -> list[int]:
+    """One hand's results in whole cents that still sum to ZERO (OPS-015): each
+    seat's exact value floored, and the cents that leaves over go to the largest
+    fractions (ties to the lower seat) — every amount is within a cent of exact,
+    and a hand's stored results add up the way its chips do. (Rounding each seat
+    on its own let a split pot's results sum to +-1 cent.)"""
+    bb = int(bb_cents)
+    if bb <= 0 or not deltas_chips:
+        return [0] * len(deltas_chips)
+    scaled = [int(d) * bb for d in deltas_chips]
+    base = [v // BB_CHIPS for v in scaled]
+    rems = [v % BB_CHIPS for v in scaled]
+    extra = sum(rems) // BB_CHIPS  # exact: the chips sum to a whole number of cents
+    for i in sorted(range(len(base)), key=lambda k: (-rems[k], k))[: max(0, extra)]:
+        base[i] += 1
+    return base
 
 
 def apportion_cents(total_cents: int, chips: list[int]) -> list[int]:
@@ -593,111 +411,22 @@ def _norm_auto_mode(v: Any) -> str:
     return s if s in AUTO_STACK_MODES else "off"
 
 
-def _display_name(user: Any) -> str:
-    name = (user["name"] or "").strip()
-    if name:
-        return name
-    email = (user["email"] or "").strip()
-    return email.split("@")[0] if email else f"player-{user['id']}"
+# SEC-007: text people type (table / club names, chat) and names from Google
+# lose Unicode control and format characters — a right-to-left override, a
+# zero-width space, a bidi isolate can make a line pretend to be someone else's —
+# except the ones emoji are built from (zero-width joiner, variation selectors,
+# the tag characters of subdivision flags). Whitespace runs become one space.
+_EMOJI_FORMAT = {"\u200d", "\ufe0e", "\ufe0f"}
 
 
-# --- profile pictures (owner, 2026-09-26) ----------------------------------------
-# The browser crops and re-encodes the photo to a small square (which also drops
-# its EXIF metadata) and uploads it; the server has no image library, so it only
-# accepts a PNG / JPEG / WebP whose header it can read, within size and pixel
-# limits, and serves it back with nosniff + a sandboxing CSP. Stored in SQLite
-# (small, and the nightly DB backup covers it). URLs carry a content version, so
-# a new picture is a new URL and a browser may cache any one of them for good.
-AVATAR_MAX_BYTES = 200_000
-AVATAR_MAX_PX = 1024
-AVATAR_HEADERS = {
-    "Cache-Control": "private, max-age=31536000, immutable",
-    "X-Content-Type-Options": "nosniff",
-    "Content-Security-Policy": "default-src 'none'; sandbox",
-    "Content-Disposition": "inline",
-}
-_AVATAR_MIMES = ("image/png", "image/jpeg", "image/webp")
-_AVATAR_URLS: dict[int, str | None] = {}
-_AVATAR_LOCK = threading.Lock()
-
-
-def _image_info(b: bytes) -> tuple[str, int, int] | None:
-    """(mime, width, height) of a PNG / JPEG / WebP read from its header, or None."""
-    if b.startswith(b"\x89PNG\r\n\x1a\n") and len(b) >= 24 and b[12:16] == b"IHDR":
-        return "image/png", int.from_bytes(b[16:20], "big"), int.from_bytes(b[20:24], "big")
-    if b[:3] == b"\xff\xd8\xff":
-        i = 2
-        while i + 9 < len(b):
-            if b[i] != 0xFF:
-                return None
-            marker = b[i + 1]
-            if marker == 0xFF:  # fill byte
-                i += 1
-                continue
-            if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
-                i += 2
-                continue
-            if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
-                return "image/jpeg", int.from_bytes(b[i + 7:i + 9], "big"), int.from_bytes(b[i + 5:i + 7], "big")
-            i += 2 + int.from_bytes(b[i + 2:i + 4], "big")
-        return None
-    if b[:4] == b"RIFF" and b[8:12] == b"WEBP" and len(b) >= 30:
-        chunk = b[12:16]
-        if chunk == b"VP8 " and b[23:26] == b"\x9d\x01\x2a":
-            return ("image/webp", int.from_bytes(b[26:28], "little") & 0x3FFF,
-                    int.from_bytes(b[28:30], "little") & 0x3FFF)
-        if chunk == b"VP8L" and b[20] == 0x2F:
-            bits = int.from_bytes(b[21:25], "little")
-            return "image/webp", (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
-        if chunk == b"VP8X":
-            return ("image/webp", int.from_bytes(b[24:27], "little") + 1,
-                    int.from_bytes(b[27:30], "little") + 1)
-    return None
-
-
-def _avatar_url(uid: Any) -> str | None:
-    """The user's picture URL (with its content version), or None — cached."""
-    if uid is None:
-        return None
-    uid = int(uid)
-    with _AVATAR_LOCK:
-        if uid in _AVATAR_URLS:
-            return _AVATAR_URLS[uid]
-    row = pub.DB.one("SELECT version FROM homegame_avatars WHERE user_id=?", (uid,))
-    url = f"/games/api/avatars/{uid}?v={row['version']}" if row is not None else None
-    with _AVATAR_LOCK:
-        _AVATAR_URLS[uid] = url
-    return url
-
-
-def _set_avatar(uid: int, data_url: Any) -> str | None:
-    """Store (or with None, remove) the user's picture; returns its new URL."""
-    uid = int(uid)
-    if data_url is None:
-        pub.DB.q("DELETE FROM homegame_avatars WHERE user_id=?", (uid,))
-    else:
-        m = re.fullmatch(r"data:(image/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=\s]+)", str(data_url))
-        if m is None or len(m.group(2)) > AVATAR_MAX_BYTES * 4 // 3 + 16:
-            raise HTTPException(status_code=400, detail="send a PNG, JPEG or WebP picture under 200 KB")
-        try:
-            data = base64.b64decode("".join(m.group(2).split()), validate=True)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail="that picture could not be read") from e
-        info = _image_info(data)
-        if info is None or info[0] != m.group(1) or len(data) > AVATAR_MAX_BYTES:
-            raise HTTPException(status_code=400, detail="that picture could not be read")
-        if not (16 <= info[1] <= AVATAR_MAX_PX and 16 <= info[2] <= AVATAR_MAX_PX):
-            raise HTTPException(status_code=400, detail="pictures must be 16 to 1024 pixels on a side")
-        version = hashlib.sha256(data).hexdigest()[:12]
-        pub.DB.q(
-            "INSERT INTO homegame_avatars(user_id,mime,data,version,updated_at) VALUES(?,?,?,?,?) "
-            "ON CONFLICT(user_id) DO UPDATE SET mime=excluded.mime, data=excluded.data, "
-            "version=excluded.version, updated_at=excluded.updated_at",
-            (uid, info[0], data, version, pub._now()),
-        )
-    with _AVATAR_LOCK:
-        _AVATAR_URLS.pop(uid, None)
-    return _avatar_url(uid)
+def _clean_text(v: Any) -> str:
+    s = "".join(
+        ch for ch in str(v or "")
+        if unicodedata.category(ch) not in ("Cc", "Cf", "Co", "Cs")
+        or ch in _EMOJI_FORMAT or 0xE0020 <= ord(ch) <= 0xE007F
+        or ch.isspace()  # (whitespace controls: collapsed to a space below)
+    )
+    return " ".join(s.split())
 
 
 def _gate_key(gate: int | str) -> int:
@@ -716,8 +445,7 @@ def _gate_key(gate: int | str) -> int:
 @dataclass
 class Seat:
     user_id: int
-    name: str
-    email: str
+    name: str  # display name (never the email: HGB-011 dropped the unused copy)
     stack_chips: int
     sitting_out: bool
     buyin_cents: int
@@ -733,6 +461,69 @@ class Seat:
     queued_topup_cents: int = 0  # asked for mid-hand; lands when the hand ends
     queued_remove_cents: int = 0  # chips to take OFF the table when the hand ends
     leave_after_hand: bool = False  # finish this hand, then leave the seat
+
+
+@dataclass
+class HandState:
+    """Everything that belongs to ONE hand: the engine, who was dealt in, the
+    clock of the decision on, the runout's script, the rabbit, the shuffle it
+    was dealt from (HGB-004). A deal, a resize and a close start from a fresh
+    ``HandState()``, so a field can never be left over from the hand before —
+    ``pots`` used to survive the deal, and a resize kept ``equity_by_len``,
+    ``rabbit_burns`` and ``terminal_*``. ``LiveTable`` exposes every field under
+    its old name (``t.env`` is ``t.hand.env``)."""
+
+    env: BombPotEnv | None = None
+    info: StepInfo | None = None
+    # Actions applied this hand. With hand_no it names a decision: clients
+    # echo both on /act and get 409 when they are stale (G8).
+    action_seq: int = 0
+    # The decision the running shot clock belongs to: (hand_no, action_seq).
+    # The clock restarts only when this changes (review 2026-09-20 G5).
+    turn_started_mono: float | None = None
+    turn_key: tuple[int, int] | None = None
+    # The decision whose base clock has run out and is burning the bank.
+    bank_key: tuple[int, int] | None = None
+    bank_started_mono: float | None = None
+    hand_start_stacks: list[int] = field(default_factory=list)
+    in_hand_mask: list[bool] = field(default_factory=list)
+    # user id DEALT INTO each seat this hand (None = seat not dealt in). Own
+    # cards are shown against this, never against who sits there now (G2).
+    dealt_user_ids: list[int | None] = field(default_factory=list)
+    # Terminal with >= 2 live hands = a real showdown; a fold-out is not (G1).
+    showdown_reveal: bool = False
+    last_deltas: list[int] = field(default_factory=list)
+    # Seats that chose to table their cards after the hand (phase showdown).
+    shown_seats: set[int] = field(default_factory=set)
+    # The all-in runout: streets and awards revealed by the clock.
+    runout_active: bool = False
+    runout_start_len: int = 3
+    runout_started_mono: float | None = None
+    leftover_stacks: list[int] = field(default_factory=list)
+    terminal_pot: int = 0
+    terminal_commit: list[int] = field(default_factory=list)
+    pot_awards: list[dict[str, Any]] = field(default_factory=list)
+    pots: list[dict[str, Any]] = field(default_factory=list)  # named layers, deepest first
+    # (len_a, len_b) -> {seat: {"a": share, "b": share}}, computed ONCE per
+    # all-in hand from the alive seats' holes (review 2026-09-20 G3).
+    equity_by_len: dict[tuple[int, int], dict[int, dict[str, float]]] = field(default_factory=dict)
+    # The rabbit (a fold-out's undealt streets) and, PLO67, all three burns of
+    # the finished hand (the rabbit and an all-in runout reveal them street by street).
+    rabbit_available: bool = False
+    rabbit_shown: bool = False
+    rabbit_played_len: int = 3
+    rabbit_full_a: list[int] = field(default_factory=list)
+    rabbit_full_b: list[int] = field(default_factory=list)
+    rabbit_burns: list[int] = field(default_factory=list)
+    # What the background grader needs to replay the hand: the deal seed (or the
+    # dealt deck) and the exact engine inputs. In MEMORY only — the seed would
+    # reveal every card, so it is never persisted and never served.
+    hand_seed: int = 0
+    hand_actions: list = field(default_factory=list)
+    hand_deck: list = field(default_factory=list)
+    # The verifiable shuffle this hand was dealt from, and its public facts.
+    fair_hand: Any = None
+    fair_hand_meta: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -755,39 +546,18 @@ class LiveTable:
     auto_stack_all_cents: int = 0
     decision_secs: int = 0  # 0 = unlimited
     street_pause_secs: float = 1.5
-    turn_started_mono: float | None = None
-    # The decision the running shot clock belongs to: (hand_no, action_seq).
-    # The clock restarts only when this changes (review 2026-09-20 G5).
-    turn_key: tuple[int, int] | None = None
     # Players leaving / being removed mid-hand: folded-or-checked by the
     # away logic, cashed out once the hand (and its runout) is over.
     pending_kicks: set[int] = field(default_factory=set)
-    runout_active: bool = False
-    runout_start_len: int = 3
-    runout_started_mono: float | None = None
-    leftover_stacks: list[int] = field(default_factory=list)
-    terminal_pot: int = 0
-    terminal_commit: list[int] = field(default_factory=list)
-    pot_awards: list[dict[str, Any]] = field(default_factory=list)
-    pots: list[dict[str, Any]] = field(default_factory=list)  # named layers, deepest first
-    # (len_a, len_b) -> {seat: {"a": share, "b": share}}, computed ONCE per
-    # all-in hand from the alive seats' holes (review 2026-09-20 G3).
-    equity_by_len: dict[tuple[int, int], dict[int, dict[str, float]]] = field(
-        default_factory=dict
-    )
-    env: BombPotEnv | None = None
-    info: StepInfo | None = None
     phase: str = "waiting"  # waiting | in_hand | showdown
-    hand_start_stacks: list[int] = field(default_factory=list)
-    in_hand_mask: list[bool] = field(default_factory=list)
-    # user id DEALT INTO each seat this hand (None = seat not dealt in). Own
-    # cards are shown against this, never against who sits there now (G2).
-    dealt_user_ids: list[int | None] = field(default_factory=list)
-    # Terminal with >= 2 live hands = a real showdown; a fold-out is not (G1).
-    showdown_reveal: bool = False
-    # Actions applied this hand. With hand_no it names a decision: clients
-    # echo both on /act and get 409 when they are stale (G8).
-    action_seq: int = 0
+    # The hand on the table (or the one just finished): HGB-004.
+    hand: HandState = field(default_factory=lambda: HandState())
+    # PERF-004: the table-wide half of the view (``_shared``), built once per state
+    # of the table for every viewer; who among the viewers only has the "Player
+    # <id>" stand-in name; the trust of unseated viewers, per ``rev``.
+    view_cache: Any = None
+    name_defaults: dict = field(default_factory=dict)
+    trust_cache: Any = None
     # Bumped on every state change; `epoch` is unique per in-memory load.
     # Clients drop responses older than the one they already applied (G8).
     rev: int = 0
@@ -796,18 +566,20 @@ class LiveTable:
     # the watchdog retries (review 2026-09-20 G4).
     persist_dirty: bool = False
     persist_retry_mono: float = 0.0
+    # Writes the table still owes the database, committed WITH the stacks by the
+    # next ``_persist_safe`` (OPS-006 / OPS-013): ("hand", bundle) = a finished
+    # hand's record + results + flows + grading job; ("fair", hand_no, data) = a
+    # hand's shuffle transcript.
+    unsaved: list = field(default_factory=list)
+    # Watchdog health (OPS-002): failing ticks in a row, since when, the last
+    # time it was logged, and (backing off) when the table is next ticked.
+    wd_failures: int = 0
+    wd_failing_since: float | None = None
+    wd_logged_mono: float = -1e9
+    wd_next_mono: float = 0.0
     last_access_mono: float = field(default_factory=time.monotonic)
     chat_times: dict[int, deque] = field(default_factory=dict)
-    last_deltas: list[int] = field(default_factory=list)
-    last_holes: list[list[int] | None] = field(default_factory=list)
-    rabbit_available: bool = False
-    rabbit_shown: bool = False
-    rabbit_played_len: int = 3
-    rabbit_full_a: list[int] = field(default_factory=list)
-    rabbit_full_b: list[int] = field(default_factory=list)
-    # PLO67: all three burns of the finished hand (the rabbit and an all-in
-    # runout reveal them street by street, like the boards)
-    rabbit_burns: list[int] = field(default_factory=list)
+    chat_cache: list | None = None  # the newest chat lines (None = read them again)
     # --- 2026-09-21 -------------------------------------------------------
     deal_delay_secs: float = 0.0  # 0 = manual dealing
     time_bank_secs: int = 0  # per-seat reserve; 0 = off
@@ -817,11 +589,10 @@ class LiveTable:
     allow_rabbit: bool = True
     # When the server will deal the next hand (monotonic), or None.
     next_deal_mono: float | None = None
-    # The decision whose base clock has run out and is burning the bank.
-    bank_key: tuple[int, int] | None = None
-    bank_started_mono: float | None = None
-    # Seats that chose to table their cards after the hand (phase showdown).
-    shown_seats: set[int] = field(default_factory=set)
+    # FEAT-005: why the server's last automatic deal failed, and the table's ``rev``
+    # right after it — it is not retried until something at the table changes.
+    deal_error: str | None = None
+    deal_error_rev: int = -1
     events: deque = field(default_factory=lambda: deque(maxlen=EVENT_FEED_MAX))
     event_seq: int = 0
     reactions: deque = field(default_factory=lambda: deque(maxlen=40))
@@ -845,25 +616,16 @@ class LiveTable:
     # Players may take chips OFF the table between hands ("ratholing"). Off by
     # default: the usual table-stakes rule is that winnings stay in play.
     allow_rathole: bool = False
-    # What the background grader needs to replay the hand being played: the
-    # deal seed and the exact engine inputs. In MEMORY only — the seed would
-    # reveal every card, so it is never persisted and never served.
-    hand_seed: int = 0
-    hand_actions: list = field(default_factory=list)
-    # Verifiable shuffle. ``hand_deck`` = the 52 cards as dealt (memory only, like
-    # the seed it replaces); ``fair_next`` = the sealed deck of the UPCOMING hand
-    # and where its confirmation stands; ``fair_hand`` = the hand on the table.
-    hand_deck: list = field(default_factory=list)
+    # Verifiable shuffle: ``fair_next`` = the sealed deck of the UPCOMING hand and
+    # where its confirmation stands (the hand on the table's is ``hand.fair_hand``).
     fair_next: Any = None
-    fair_hand: Any = None
-    fair_hand_meta: dict = field(default_factory=dict)
     fair_capable: set = field(default_factory=set)       # user ids whose browser takes part
     fair_strikes: dict = field(default_factory=dict)     # user id -> missed reveals in a row
     fair_penalty_until: dict = field(default_factory=dict)  # user id -> hand_no
-    fair_void_counts: dict = field(default_factory=dict)  # name -> voided shuffles this session
-    # People without home-games access who asked to join from this table's link
-    # (``homegame_join_requests``; admins see them). Re-read at most every
-    # JOIN_REFRESH_S so an /admin grant clears them too.
+    fair_void_counts: dict = field(default_factory=dict)  # user id -> voided shuffles this session
+    # Requests to join this table's CLUB (``homegame_club_requests``) that its
+    # owner / an admin sitting here may decide. Re-read at most every
+    # JOIN_REFRESH_S so a decision made elsewhere clears them too.
     join_reqs: list = field(default_factory=list)
     join_checked_mono: float = 0.0
     club_info: dict[str, Any] | None = None
@@ -904,6 +666,17 @@ class LiveTable:
         return self.seats[i] if i is not None else None
 
 
+def _hand_attr(name: str) -> property:
+    return property(lambda t: getattr(t.hand, name), lambda t, v: setattr(t.hand, name, v),
+                    doc=f"``hand.{name}`` (HGB-004)")
+
+
+#: Every per-hand field under its old name on the table (``t.env`` = ``t.hand.env``).
+HAND_FIELDS: tuple[str, ...] = tuple(f.name for f in fields(HandState))
+for _f in HAND_FIELDS:
+    setattr(LiveTable, _f, _hand_attr(_f))
+
+
 @dataclass
 class FairPending:
     """The shuffle of the upcoming hand: a sealed deck and its confirmation."""
@@ -921,17 +694,85 @@ class FairPending:
     voids: list = field(default_factory=list)         # earlier attempts of this hand
 
 
+# --- locks (HGB-018) -------------------------------------------------------------
+#
+# Every lock the home games take, OUTERMOST first. Code holding one may take a later
+# one, never an earlier one:
+#
+#   1. ``Hub._loading[game_id]`` — one loader per table (``Hub.get``); held while the
+#      table is read from the database, so it may take 2 and 4, never 3.
+#   2. ``Hub._lock`` — the dict of loaded tables. Held only to read or change that
+#      dict (and a few lock-free reads of table fields): NOTHING is taken under it.
+#   3. ``LiveTable.lock`` — ONE table at a time. Code that visits several tables (the
+#      clock, a new profile picture, a club's join requests, shutdown) takes their
+#      locks one after another, never nested. A table's lock may be held while the
+#      database is used (4), never the other way round: no table lock is taken
+#      inside ``pub.DB.transaction()``.
+#   4. ``pub.DB``'s lock — innermost (every statement, every transaction).
+#
+#   Leaf locks, held for a few lines and never while taking another: ``CTX.avatar_lock``,
+#   ``CTX.grade_lock``.
+#
+# A function named ``*_locked`` expects its table's lock to be held by the caller
+# (so do ``_view``, ``_mutation``, ``_persist_safe`` and ``_cash_out_seat``). In the
+# test session (``LOCK_CHECKS``) every one of them checks it (``_assert_lock_held``):
+# a bare call — which in production would race the clock thread — fails the test.
+
+#: On in the test session (pytest sets PYTEST_CURRENT_TEST while it runs a test,
+#: which is when the fixtures import this module); PLO5BP_HOMEGAME_LOCK_CHECKS=1/0
+#: forces it. Off in production: the checks cost a call per locked function.
+LOCK_CHECKS = os.environ.get(
+    "PLO5BP_HOMEGAME_LOCK_CHECKS", "1" if "PYTEST_CURRENT_TEST" in os.environ else "0"
+).strip() == "1"
+
+
+def _assert_lock_held(t: "LiveTable") -> None:
+    """(LOCK_CHECKS only) the calling thread must hold ``t.lock``."""
+    if LOCK_CHECKS:
+        owned = getattr(t.lock, "_is_owned", None)
+        if owned is not None and not owned():
+            raise AssertionError(f"homegame: table {t.game_id}'s lock is not held by this thread")
+
+
 class Hub:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._tables: dict[str, LiveTable] = {}
+        # game id -> the hand number an abandoned table was evicted in the middle
+        # of, so the reload can say why that hand vanished (OPS-012)
+        self._abandoned: dict[str, int] = {}
+        self._loading: dict[str, threading.Lock] = {}  # game id -> its loader's lock
+
+    def pop_abandoned(self, game_id: str) -> int | None:
+        with self._lock:
+            return self._abandoned.pop(game_id, None)
 
     def get(self, game_id: str) -> LiveTable:
         with self._lock:
             t = self._tables.get(game_id)
+            if t is not None:
+                t.last_access_mono = time.monotonic()
+                return t
+            loading = self._loading.setdefault(game_id, threading.Lock())
+        # Loaded OUTSIDE the hub lock (PERF-006: a load — several queries, maybe
+        # a club created — used to stall every other table's requests, the
+        # watchdog and the stats pages). One loader per table: a second request
+        # waits for the first and gets the same copy, never a copy of its own.
+        with loading:
+            with self._lock:
+                t = self._tables.get(game_id)
             if t is None:
-                t = _load_table(game_id)
-                self._tables[game_id] = t
+                try:
+                    t = _load_table(game_id)
+                except BaseException:
+                    with self._lock:
+                        if self._loading.get(game_id) is loading:
+                            del self._loading[game_id]
+                    raise
+                with self._lock:  # stored and the loader retired in one step
+                    t = self._tables.setdefault(game_id, t)
+                    if self._loading.get(game_id) is loading:
+                        del self._loading[game_id]
             t.last_access_mono = time.monotonic()
             return t
 
@@ -950,9 +791,10 @@ class Hub:
 
     def evict_idle(self, now: float | None = None) -> list[str]:
         """Forget tables nobody is looking at (review 2026-09-20 G13 — the
-        hub used to grow forever). Clients poll every ~0.5 s, so "idle"
-        means no browser has the table open. Everything that matters is in
-        the DB; the next request reloads it (paused, between hands)."""
+        hub used to grow forever). Every request AND every live-stream push
+        resolves its table through ``get`` (OPS-001), so "idle" means no
+        browser has the table open. Everything that matters is in the DB; the
+        next request reloads it (paused, between hands)."""
         now = time.monotonic() if now is None else now
         gone: list[str] = []
         with self._lock:
@@ -971,62 +813,447 @@ class Hub:
                         logger.warning(
                             "evicting abandoned table %s mid-hand (hand void)", gid
                         )
+                        if len(self._abandoned) >= 1000:
+                            self._abandoned.pop(next(iter(self._abandoned)))
+                        self._abandoned[gid] = int(t.hand_no)
                     del self._tables[gid]
                     gone.append(gid)
         return gone
 
 
-HUB = Hub()
-
-_WATCHDOG_STOP = threading.Event()
-_WATCHDOG_STARTED = False
-_WATCHDOG_THREAD: threading.Thread | None = None
+#: Live streams one user may hold open at once (each is a connection and a loop
+#: that builds their view): more tables than anyone watches, fewer than a flood (SEC-009).
+MAX_STREAMS_PER_USER = 6
 _EVICT_EVERY_S = 30.0
+WATCHDOG_SLOW_TICK_S = 1.0     # a pass slower than this is logged (at most once a minute)
+WATCHDOG_STALE_S = 10.0        # no pass for this long = the clock is stuck (health says so)
 
 
-def _watchdog_loop() -> None:
+class HomeGames:
+    """Everything the home games hold in this process's memory, in ONE object
+    (HGB-006; the app factory's context — BE-007): the loaded tables (``hub``),
+    the three workers — clock, grader, live streams — with their stop flags,
+    threads and health, the grading queue, the model the grader scores with,
+    the open-stream counts and the caches (pictures, names, club roles, the
+    ledger check).
+
+    The module keeps ONE current context, ``CTX``; ``use_context(HomeGames())``
+    swaps all of it at once, so a test or an app factory can start from a clean
+    slate without re-importing the module. The module's older names (``CTX.hub``,
+    ``CTX.watchdog_thread``, ``CTX.grade_q`` …) still read — and write — the current
+    context's (``_LEGACY_STATE``). What is not here is not per-context: the
+    settings (module constants, read from the environment at import), the
+    request budgets (``API_RATE`` …) and the per-process OS lock on the database
+    (``_PROCESS_LOCKS``)."""
+
+    def __init__(self) -> None:
+        self.hub = Hub()
+        # Three workers, one stop flag each (OPS-008: one flag used to stop the
+        # clock, the grader AND every live stream together).
+        self.watchdog_stop = threading.Event()  # the clock thread
+        self.grader_stop = threading.Event()    # the grading thread
+        self.streams_stop = threading.Event()   # every live stream (SSE)
+        self.watchdog_started = False
+        self.watchdog_thread: threading.Thread | None = None
+        # Health (OPS-011): when the clock last finished a pass, and how long it took.
+        self.watchdog_last_tick = 0.0
+        self.watchdog_last_tick_s = 0.0
+        self.watchdog_slow_logged = -1e9
+        # The PLO5 model the grader scores with (HGB-016: server.py provides it).
+        self.model_provider: Any = None
+        # The grading queue (OPS-016): bounded; its jobs' (game_id, hand_no).
+        self.grade_q: "queue.Queue[dict | None]" = queue.Queue()
+        self.grade_thread: threading.Thread | None = None
+        self.grade_lock = threading.Lock()
+        self.grade_queued: set = set()
+        self.streams = KeyedCounter(MAX_STREAMS_PER_USER)  # open live streams per user (SEC-009)
+        # Caches: picture URLs; chosen names and club nicknames (one lock); club roles
+        # (dropped by any write to the clubs' tables); the last ledger check.
+        self.avatar_urls: dict[int, str | None] = {}
+        self.avatar_lock = threading.Lock()
+        self.names_lock = threading.Lock()
+        self.chosen_names: dict[int, str | None] = {}   # user id -> their name at the tables (None: none)
+        self.club_nicks: dict[str, dict[int, str]] = {}  # club id -> {user id: nickname}
+        self.role_cache: dict[tuple[str, int], str | None] = {}
+        self.role_lock = threading.Lock()
+        self.role_gen = [0]
+        self.ledger_check: dict[str, Any] = {"at": -1e9, "out": None}
+
+
+#: The current context (see HomeGames).
+CTX = HomeGames()
+
+#: The module's older names for the context's state (read AND written through the
+#: module — see the end of the module): CTX.hub is CTX.hub, and so on.
+_LEGACY_STATE = {
+    "HUB": "hub", "_WATCHDOG_STOP": "watchdog_stop", "_GRADER_STOP": "grader_stop",
+    "_STREAMS_STOP": "streams_stop", "_WATCHDOG_STARTED": "watchdog_started",
+    "_WATCHDOG_THREAD": "watchdog_thread", "_WATCHDOG_LAST_TICK": "watchdog_last_tick",
+    "_WATCHDOG_LAST_TICK_S": "watchdog_last_tick_s", "_WATCHDOG_SLOW_LOGGED": "watchdog_slow_logged",
+    "_MODEL_PROVIDER": "model_provider", "_GRADE_Q": "grade_q", "_GRADE_THREAD": "grade_thread",
+    "_GRADE_LOCK": "grade_lock", "_GRADE_QUEUED": "grade_queued", "STREAMS": "streams",
+    "_AVATAR_URLS": "avatar_urls", "_AVATAR_LOCK": "avatar_lock", "_NAMES_LOCK": "names_lock",
+    "_CHOSEN_NAMES": "chosen_names", "_CLUB_NICKS": "club_nicks", "_ROLE_CACHE": "role_cache",
+    "_ROLE_LOCK": "role_lock", "_ROLE_GEN": "role_gen", "_LEDGER_CHECK": "ledger_check",
+}
+
+
+def use_context(ctx: HomeGames) -> HomeGames:
+    """Make ``ctx`` the current context; returns the one it replaces (whose
+    workers the caller stops — ``shutdown()`` — before or after, as it needs)."""
+    global CTX
+    old, CTX = CTX, ctx
+    return old
+
+
+# A table whose watchdog steps keep failing (OPS-002): logged at most once per
+# WATCHDOG_LOG_EVERY_S, paused and announced after WATCHDOG_PAUSE_AFTER_S of
+# failing ticks, and from then on ticked only every WATCHDOG_BACKOFF_S until a
+# tick goes through cleanly.
+WATCHDOG_LOG_EVERY_S = 60.0
+WATCHDOG_PAUSE_AFTER_S = 10.0
+WATCHDOG_BACKOFF_S = 2.0
+
+
+def _watchdog_table(t: LiveTable, now: float) -> None:
+    """One watchdog pass over one table. Every step runs on its own: one that
+    raises (a bug, a database error, a shuffle that cannot be finished) is
+    logged and counted but never stops the table's other steps — nor any other
+    table (OPS-002: one try around the whole loop let a single failing table
+    stop the clock of every table after it, four times a second, forever)."""
+    if now < t.wd_next_mono or _watchdog_idle(t):
+        return
+    # PERF-007: a table whose lock is busy (a slow view, an all-in's equities)
+    # is skipped this tick instead of holding up every table after it.
+    if not t.lock.acquire(blocking=False):
+        return
+    errors: list[tuple[str, BaseException]] = []
+    try:
+        for step in (
+            _timeout_tick_locked, _settle_locked, _flush_result_locked,
+            _apply_queued_topups_locked, _expire_requests_locked, _fair_tick_locked,
+            _auto_deal_tick_locked, _retry_persist_locked,
+        ):
+            try:
+                step(t)
+            except Exception as e:  # noqa: BLE001 — never kill the clock thread
+                errors.append((getattr(step, "__name__", "step"), e))
+        _watchdog_account_locked(t, now, errors)
+    finally:
+        t.lock.release()
+
+
+def _watchdog_idle(t: LiveTable) -> bool:
+    """Nothing a watchdog tick could do at this table (conservative: a paused
+    table between hands with no request, leaver, queued chips, owed write or
+    result waiting). PERF-007: most loaded tables are like this most of the time."""
+    return (
+        t.phase != "in_hand" and not t.running and not t.persist_dirty and not t.unsaved
+        and not t.pending_kicks and not t.requests and t.pending_result is None
+        and not (t.fair_next is not None and t.fair_next.pending)
+        and not any(p is not None and (p.leave_after_hand or p.queued_topup_cents or p.queued_remove_cents)
+                    for p in t.seats)
+    )
+
+
+def _watchdog_account_locked(t: LiveTable, now: float, errors: list) -> None:
+    """Failure accounting for one tick of one table (see _watchdog_table)."""
+    if not errors:
+        if t.wd_failing_since is not None:
+            logger.warning("homegame watchdog: table %s is ticking cleanly again", t.game_id)
+        t.wd_failing_since = None
+        t.wd_failures = 0
+        return
+    t.wd_failures += 1
+    if t.wd_failing_since is None:
+        t.wd_failing_since = now
+    if now - t.wd_logged_mono >= WATCHDOG_LOG_EVERY_S:
+        t.wd_logged_mono = now
+        name, err = errors[0]
+        logger.error(
+            "homegame watchdog: table %s, %s failed (%d failing ticks in a row; %s)",
+            t.game_id, name, t.wd_failures,
+            ", ".join(n for n, _ in errors),
+            exc_info=(type(err), err, err.__traceback__),
+        )
+    if now - t.wd_failing_since < WATCHDOG_PAUSE_AFTER_S:
+        return
+    t.wd_next_mono = now + WATCHDOG_BACKOFF_S
+    if t.running and t.status == "open":
+        t.running = False
+        t.next_deal_mono = None
+        t.rev += 1
+        _persist_safe(t)
+        _emit(t, "run", "Something went wrong at this table, so the game is paused"
+                        + (" after this hand" if t.phase == "in_hand" else "")
+                        + ". The host can press Start to carry on.")
+
+
+def _watchdog_loop(ctx: HomeGames | None = None) -> None:
+    ctx = ctx or CTX  # (a swapped context never steals a running clock)
     next_evict = time.monotonic() + _EVICT_EVERY_S
-    while not _WATCHDOG_STOP.wait(0.25):
-        try:
-            with HUB._lock:
-                tables = list(HUB._tables.values())
-            for t in tables:
-                with t.lock:
-                    _timeout_tick_locked(t)
-                    _settle_locked(t)
-                    _flush_result_locked(t)
-                    _apply_queued_topups_locked(t)
-                    _expire_requests_locked(t)
-                    _fair_tick_locked(t)
-                    _auto_deal_tick_locked(t)
-                    _retry_persist_locked(t)
-            if time.monotonic() >= next_evict:
-                next_evict = time.monotonic() + _EVICT_EVERY_S
-                HUB.evict_idle()
-        except Exception:  # noqa: BLE001 — never kill the clock thread
-            logger.exception("homegame shot-clock watchdog")
+    ctx.watchdog_last_tick = time.monotonic()
+    while not ctx.watchdog_stop.wait(0.25):
+        with ctx.hub._lock:
+            tables = list(ctx.hub._tables.values())
+        now = time.monotonic()
+        for t in tables:
+            try:
+                _watchdog_table(t, now)
+            except Exception:  # noqa: BLE001 — the accounting itself failed
+                logger.exception("homegame watchdog (table %s)", t.game_id)
+        if time.monotonic() >= next_evict:
+            next_evict = time.monotonic() + _EVICT_EVERY_S
+            try:
+                for gid in ctx.hub.evict_idle():
+                    logger.info("homegame table %s unloaded (idle)", gid)
+            except Exception:  # noqa: BLE001
+                logger.exception("homegame hub eviction")
+        done = time.monotonic()
+        ctx.watchdog_last_tick, ctx.watchdog_last_tick_s = done, done - now
+        if done - now > WATCHDOG_SLOW_TICK_S and done - ctx.watchdog_slow_logged >= 60.0:
+            ctx.watchdog_slow_logged = done
+            logger.warning("homegame clock: one pass over %d tables took %.1f s", len(tables), done - now)
 
 
 def _start_watchdog() -> None:
-    global _WATCHDOG_STARTED, _WATCHDOG_THREAD
-    if _WATCHDOG_STARTED:
+    if CTX.watchdog_started:
         return
-    _WATCHDOG_STARTED = True
-    _WATCHDOG_STOP.clear()
-    _WATCHDOG_THREAD = threading.Thread(
-        target=_watchdog_loop, name="homegame-clock", daemon=True
+    CTX.watchdog_started = True
+    CTX.watchdog_stop.clear()
+    CTX.streams_stop.clear()
+    CTX.watchdog_thread = threading.Thread(
+        target=_watchdog_loop, args=(CTX,), name="homegame-clock", daemon=True
     )
-    _WATCHDOG_THREAD.start()
+    CTX.watchdog_thread.start()
+
+
+def _ensure_workers() -> None:
+    """Restart a worker that died (OPS-011 B) — cheap enough for every request.
+    A clock thread can only die from a bug outside its per-table guard; without
+    this, every shot clock, auto-deal and eviction would stop silently."""
+    th = CTX.watchdog_thread
+    if CTX.watchdog_started and not CTX.watchdog_stop.is_set() and (th is None or not th.is_alive()):
+        logger.error("homegame clock thread was dead: restarting it")
+        CTX.watchdog_started = False
+        _start_watchdog()
+    g = CTX.grade_thread
+    if g is not None and not g.is_alive() and not CTX.grader_stop.is_set() and GRADING_ON:
+        logger.error("homegame grading thread was dead: restarting it")
+        _start_grader()
+
+
+def health() -> dict[str, Any]:
+    """The workers' health (OPS-011): served to site admins at /games/api/health."""
+    now = time.monotonic()
+    th = CTX.watchdog_thread
+    last = CTX.watchdog_last_tick
+    with CTX.hub._lock:
+        tables = list(CTX.hub._tables.values())
+    return {
+        "clock": {
+            "alive": bool(th is not None and th.is_alive()),
+            "last_tick_age_s": round(now - last, 2) if last else None,
+            "last_tick_s": round(CTX.watchdog_last_tick_s, 3),
+            "stale": bool(last and now - last > WATCHDOG_STALE_S),
+        },
+        "grader": {
+            "on": bool(GRADING_ON),
+            "alive": bool(CTX.grade_thread is not None and CTX.grade_thread.is_alive()),
+            "queued": len(CTX.grade_queued),
+            "saved_jobs": int(pub.DB.one("SELECT COUNT(*) c FROM homegame_grade_jobs")["c"]),
+        },
+        "tables": {
+            "loaded": len(tables),
+            "in_hand": sum(1 for t in tables if t.phase == "in_hand"),
+            "unsaved": sum(1 for t in tables if t.persist_dirty),
+            "failing": sorted(t.game_id for t in tables if t.wd_failing_since is not None),
+        },
+        # OPS-017: does every player's money add up to their ledger rows?
+        "ledger": _ledger_health(),
+    }
+
+
+def deploy_status(tables: list[LiveTable] | None = None) -> dict[str, Any]:
+    """What a restart right now would interrupt, from this process's memory — the
+    production deploy's "is anyone playing?" check (ops/deploytool.py ``status``)
+    reads it through the loopback-only ``GET /health?deploy=1``. Exact, where the
+    database can only guess (``hand_no`` is saved at the deal, and a voided hand is
+    never recorded).
+
+    ``hands_in_progress``: tables whose hand is being played or whose all-in runout
+    is still revealing (``_hand_busy``). ``games_running``: tables the server is
+    dealing to with at least two seated players at the table right now — the next
+    hand is seconds away, and a restart pauses the game until its host presses
+    Start. Table ids and hand numbers only (the deploy reads names from the
+    database). Racy reads of plain attributes, never a table lock: a deploy must not
+    wait on a busy table, and a snapshot a moment old is what it needs. (``tables``:
+    for tests; default = every table this process holds.)"""
+    now = time.monotonic()
+    if tables is None:
+        with CTX.hub._lock:
+            tables = list(CTX.hub._tables.values())
+    busy: list[dict[str, Any]] = []
+    running: list[dict[str, Any]] = []
+    for t in tables:
+        if t.status != "open":
+            continue
+        present = sum(
+            1 for p in list(t.seats)
+            if p is not None and now - t.seen.get(p.user_id, -1e9) <= PRESENCE_WINDOW_S
+        )
+        item = {"id": t.game_id, "hand_no": int(t.hand_no), "present": present}
+        if _hand_busy(t):
+            busy.append(item)
+        elif t.running and present >= 2:
+            running.append(item)
+    return {
+        "hands_in_progress": busy,
+        "games_running": running,
+        "loaded_tables": len(tables),
+        "grader_queue": len(CTX.grade_queued),
+    }
+
+
+#: The ledger check behind the health answers is re-run at most this often (the
+#: site's /health is polled by the uptime monitor; money changes by the hand).
+LEDGER_CHECK_EVERY_S = 300.0
+
+
+def _ledger_health(*, fresh: bool = True) -> dict[str, Any]:
+    now = time.monotonic()
+    if not fresh and CTX.ledger_check["out"] is not None and now - CTX.ledger_check["at"] < LEDGER_CHECK_EVERY_S:
+        return CTX.ledger_check["out"]
+    try:
+        problems = reconcile_ledger()
+        out = {"ok": not problems, "problems": len(problems), "first": problems[:10]}
+    except Exception as e:  # noqa: BLE001 — health must answer
+        out = {"ok": False, "error": str(e)}
+    CTX.ledger_check.update(at=now, out=out)
+    return out
+
+
+def _site_health() -> dict[str, Any]:
+    """The home games' line in the site's GET /health (``middleware.HEALTH_CHECKS``):
+    ok = the clock thread is alive and ticking, the grader (when grading is on) is
+    alive, no loaded table is failing or holding unsaved money, and the ledger adds
+    up (OPS-011 / OPS-017). Not ok makes the site "degraded", never down."""
+    now = time.monotonic()
+    th, last = CTX.watchdog_thread, CTX.watchdog_last_tick
+    clock_ok = bool(th is not None and th.is_alive() and last and now - last <= WATCHDOG_STALE_S)
+    grader_ok = (not GRADING_ON) or bool(CTX.grade_thread is not None and CTX.grade_thread.is_alive())
+    with CTX.hub._lock:
+        tables = list(CTX.hub._tables.values())
+    failing = sorted(t.game_id for t in tables if t.wd_failing_since is not None)
+    unsaved = sum(1 for t in tables if t.persist_dirty)
+    ledger = _ledger_health(fresh=False)
+    return {
+        "ok": clock_ok and grader_ok and not failing and not unsaved and bool(ledger.get("ok")),
+        "clock": clock_ok, "grader": grader_ok, "tables": len(tables), "failing": failing,
+        "unsaved": unsaved, "ledger_ok": bool(ledger.get("ok")), "ledger_problems": ledger.get("problems"),
+    }
+
+
+def _stop_watchdog(timeout: float = 2.0) -> None:
+    CTX.watchdog_stop.set()
+    th = CTX.watchdog_thread
+    if th is not None and th.is_alive() and th is not threading.current_thread():
+        th.join(timeout)
+    CTX.watchdog_started = False
 
 
 def shutdown(timeout: float = 2.0) -> None:
-    """Stop the clock thread (tests purge + reimport this module)."""
-    global _WATCHDOG_STARTED
-    _WATCHDOG_STOP.set()
-    th = _WATCHDOG_THREAD
-    if th is not None and th.is_alive() and th is not threading.current_thread():
-        th.join(timeout)
-    _WATCHDOG_STARTED = False
+    """Stop every worker of the current context — the live streams, the grader,
+    the clock (a test's app closes with it, ``server.Site.close``; production goes
+    through ``_on_app_shutdown``)."""
+    CTX.streams_stop.set()
+    CTX.grader_stop.set()
+    g = CTX.grade_thread
+    if g is not None and g.is_alive() and g is not threading.current_thread():
+        g.join(timeout)
+    CTX.grade_thread = None
+    _stop_watchdog(timeout)
+
+
+#: How long a stopping server gives the grader to finish what it holds (the
+#: rest waits in homegame_grade_jobs for the next start).
+GRADER_DRAIN_S = 3.0
+
+
+def _on_app_shutdown() -> None:
+    """The app's shutdown hook (OPS-008): save every table that still owes the
+    database a write, give the grader a moment, then stop the workers.
+
+    (Streams: the server stops them before this runs. uvicorn waits for open
+    responses first, so run it with ``--timeout-graceful-shutdown`` — without
+    it the live streams hold a stop until the service manager kills it.)"""
+    with CTX.hub._lock:
+        tables = list(CTX.hub._tables.values())
+    for t in tables:
+        try:
+            with t.lock:
+                if t.persist_dirty or t.unsaved:
+                    _persist_safe(t)
+                    if t.persist_dirty:
+                        logger.error("homegame table %s: unsaved at shutdown", t.game_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("homegame shutdown save (table %s)", t.game_id)
+    if GRADING_ON:
+        wait_for_grading(GRADER_DRAIN_S)
+    shutdown()
+    logger.info("homegame workers stopped")
+
+
+# OPS-010: the live tables are held in THIS process's memory, so exactly one
+# process may run the home games on a database — a second uvicorn worker (or a
+# staging copy pointed at the live file) would run its own copy of every table
+# and overwrite the other's stacks. An exclusive lock on a file next to the
+# database, held for the life of the process (the OS drops it when the process
+# ends, however it ends), makes a second one refuse to start, loudly.
+_PROCESS_LOCKS: dict[str, Any] = {}
+
+
+def _take_process_lock() -> None:
+    path = str(getattr(pub.DB, "path", "") or "")
+    if not path or path in _PROCESS_LOCKS:
+        return
+    f = open(path + ".homegames.lock", "a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        f.close()
+        raise RuntimeError(
+            f"another server process already runs the home games on {path} — the live "
+            "tables live in one process's memory, so a second one would overwrite its "
+            "stacks. Run ONE process (no --workers) per database."
+        ) from e
+    _PROCESS_LOCKS[path] = f
+
+
+# The PLO5 model the grader scores with (HGB-016): server.py provides it
+# (``set_model_provider``) — the grader used to import the whole UI server.
+
+
+def set_model_provider(fn: Any) -> None:
+    CTX.model_provider = fn
+
+
+class NoGradingModel(Exception):
+    """No real PLO5 model is being served (OPS-021: a random placeholder never
+    grades): a hand's job waits, saved, until one is."""
+
+
+def _grading_model() -> Any:
+    """The model to grade with, or None (none provided, or only a placeholder)."""
+    return CTX.model_provider() if CTX.model_provider is not None else None
 
 
 def _load_table(game_id: str) -> LiveTable:
@@ -1047,140 +1274,136 @@ def _load_table(game_id: str) -> LiveTable:
             continue
         seats[int(seat)] = Seat(
             user_id=int(p["user_id"]),
-            name=_display_name(user),
-            email=user["email"],
+            name=_display_name(user, row["club_id"]),
             stack_chips=int(p["stack_chips"]),
             sitting_out=bool(p["sitting_out"]),
             buyin_cents=int(p["buyin_cents"]),
             leftover_cents=int(p["leftover_cents"]),
-            auto_stack_cents=int(
-                p["auto_stack_cents"] if "auto_stack_cents" in p.keys() else 0
-            ),
-            time_bank_left=float(_row_int(row, "time_bank_secs", 0)),
-            trusted=bool(_row_int(p, "trusted", 0)),
-            topup_target_cents=_row_int(p, "topup_target_cents", 0),
-            topup_below_cents=_row_int(p, "topup_below_cents", 0),
+            auto_stack_cents=int(p["auto_stack_cents"] or 0),
+            time_bank_left=float(row["time_bank_secs"] or 0),
+            trusted=bool(p["trusted"]),
+            topup_target_cents=int(p["topup_target_cents"] or 0),
+            topup_below_cents=int(p["topup_below_cents"] or 0),
         )
+    # (Every column is there: ``_ensure_schema`` adds what an older database
+    # lacks before anything is loaded — HGB-012.)
+    kw = {c.attr: c.from_db(row[c.col]) for c in META}
     # (review 2026-09-20 G14) A table loaded from the DB has no hand in
     # memory (phase "waiting"), but `running=1` used to survive the restart:
     # the host saw only "Pause", nobody saw a deal button, and the game
     # looked dead. A reload always comes back PAUSED — the host presses
     # Start, which deals. (An interrupted hand is void: stacks were last
     # persisted at the previous hand's end.)
-    was_running = bool(int(row["running"] if "running" in row.keys() else 0))
-    if was_running:
+    if kw["running"]:
         pub.DB.q("UPDATE homegames SET running=0 WHERE id=?", (game_id,))
+    kw.update(running=False, num_seats=n)
     t = LiveTable(
         game_id=row["id"],
-        host_user_id=int(row["host_user_id"]),
-        name=row["name"],
-        num_seats=n,
         sb_cents=int(row["sb_cents"]),
         bb_cents=int(row["bb_cents"]),
-        ante_cents=int(row["ante_cents"]),
-        default_buyin_cents=int(row["default_buyin_cents"]),
-        status=row["status"],
-        button=int(row["button"]),
-        hand_no=int(row["hand_no"]),
         seats=seats,
-        running=False,
-        club_id=(row["club_id"] if "club_id" in row.keys() else None) or _main_club(),
-        auto_stack_mode=_norm_auto_mode(
-            row["auto_stack_mode"] if "auto_stack_mode" in row.keys() else "off"
-        ),
-        auto_stack_all_cents=int(
-            row["auto_stack_all_cents"]
-            if "auto_stack_all_cents" in row.keys()
-            else 0
-        ),
-        decision_secs=int(
-            row["decision_secs"] if "decision_secs" in row.keys() else 0
-        ),
-        street_pause_secs=max(
-            0.3,
-            (
-                int(row["street_pause_ms"] if "street_pause_ms" in row.keys() else 1500)
-                / 1000.0
-            ),
-        ),
+        club_id=row["club_id"] or _main_club(),
         phase="waiting",
-        deal_delay_secs=max(0.0, _row_int(row, "deal_delay_ms", 5000) / 1000.0),
-        time_bank_secs=_row_int(row, "time_bank_secs", 0),
-        min_buyin_cents=_row_int(row, "min_buyin_cents", 0),
-        max_buyin_cents=_row_int(row, "max_buyin_cents", 0),
-        listed=bool(_row_int(row, "listed", 1)),
-        allow_rabbit=bool(_row_int(row, "allow_rabbit", 1)),
-        approve_buyins=bool(_row_int(row, "approve_buyins", 0)),
-        topup_mode=_norm_auto_mode(row["topup_mode"] if "topup_mode" in row.keys() else "off"),
-        topup_all_target_cents=_row_int(row, "topup_target_cents", 0),
-        topup_all_below_cents=_row_int(row, "topup_below_cents", 0),
-        show_grades=bool(_row_int(row, "show_grades", 1)),
-        allow_rathole=bool(_row_int(row, "allow_rathole", 0)),
-        variant=_norm_game(row["variant"] if "variant" in row.keys() else None),
+        variant=_norm_game(row["variant"]),
+        **kw,
     )
-    # A hand dealt (hand_no is saved at the deal) but never recorded was cut short
-    # by a restart. It is void — stacks are saved only when a hand ends, so everyone
-    # has what they had before it — but say so: to the players it just vanished.
+    # A hand dealt (hand_no is saved at the deal) but never recorded was cut short.
+    # It is void — stacks are saved only when a hand ends, so everyone has what they
+    # had before it — but say so: to the players it just vanished. (OPS-012: why —
+    # the hub gave up on a table nobody had looked at for hours, or a restart.)
     if t.status == "open" and t.hand_no > 0:
         last = pub.DB.one("SELECT MAX(hand_no) AS n FROM homegame_hands WHERE game_id=?", (game_id,))
         if last is not None and int(last["n"] or 0) < t.hand_no:
-            _emit(t, "run", f"Hand #{t.hand_no} was cut short (the server restarted) and doesn't count — "
+            why = (
+                "nobody was at the table for hours" if CTX.hub.pop_abandoned(game_id) == t.hand_no
+                else "the server restarted"
+            )
+            _emit(t, "run", f"Hand #{t.hand_no} was cut short ({why}) and doesn't count — "
                             "everyone has the chips they had before it. The host restarts the game.")
     return t
 
 
-def _row_int(row: Any, key: str, default: int) -> int:
-    """A column that older databases may not have yet."""
-    try:
-        v = row[key] if key in row.keys() else default
-    except (IndexError, KeyError):
-        v = default
-    return int(default if v is None else v)
+@dataclass(frozen=True)
+class _MetaCol:
+    """One ``homegames`` column that mirrors a ``LiveTable`` attribute the table
+    can change during its life (settings + a little running state).
+
+    ``META`` is the ONE list of them (HGB-005): it drives the load
+    (``_load_table``), the save (``_persist_meta``), the create
+    (``_create_table``'s INSERT), the all-or-nothing rollback of a failed change
+    (``_SNAPSHOT_FIELDS``) and the additive migration of older databases
+    (``ddl``; ``None`` = a column of the first schema). A new table setting is a
+    column in ``_SCHEMA`` + one line here — and a decision about the host's
+    remembered settings (``_host_prefs_of``; ``test_every_setting_*`` pins it)."""
+
+    attr: str
+    col: str
+    to_db: Any    # attribute value -> column value
+    from_db: Any  # column value -> attribute value
+    ddl: str | None = None
+
+
+def _db_bool(v: Any) -> int:
+    return 1 if v else 0
+
+
+def _db_int(v: Any) -> int:
+    return int(v or 0)
+
+
+def _db_ms(v: Any) -> int:
+    return int(round(float(v or 0.0) * 1000))
+
+
+META: tuple[_MetaCol, ...] = (
+    _MetaCol("host_user_id", "host_user_id", int, int),
+    _MetaCol("status", "status", str, str),
+    # A reload always comes back PAUSED (see _load_table): ``from_db`` is unused.
+    _MetaCol("running", "running", _db_bool, bool, "INTEGER NOT NULL DEFAULT 0"),
+    _MetaCol("auto_stack_mode", "auto_stack_mode", lambda v: _norm_auto_mode(v),
+             lambda v: _norm_auto_mode(v), "TEXT NOT NULL DEFAULT 'off'"),
+    _MetaCol("auto_stack_all_cents", "auto_stack_all_cents", _db_int, int,
+             "INTEGER NOT NULL DEFAULT 0"),
+    _MetaCol("decision_secs", "decision_secs", _db_int, int, "INTEGER NOT NULL DEFAULT 0"),
+    _MetaCol("street_pause_secs", "street_pause_ms", lambda v: _db_ms(v or 1.5),
+             lambda ms: max(MIN_STREET_PAUSE_S, int(ms) / 1000.0), "INTEGER NOT NULL DEFAULT 1500"),
+    _MetaCol("button", "button", int, int),
+    _MetaCol("hand_no", "hand_no", int, int),
+    _MetaCol("name", "name", str, str),
+    _MetaCol("num_seats", "num_seats", int, int),
+    _MetaCol("ante_cents", "ante_cents", int, int),
+    _MetaCol("default_buyin_cents", "default_buyin_cents", int, int),
+    # 2026-09-21. Tables that predate server-side dealing were auto-dealt by the
+    # host's browser, so they migrate to a 5 s delay (not manual).
+    _MetaCol("deal_delay_secs", "deal_delay_ms", _db_ms, lambda ms: max(0.0, int(ms) / 1000.0),
+             "INTEGER NOT NULL DEFAULT 5000"),
+    _MetaCol("time_bank_secs", "time_bank_secs", _db_int, int, "INTEGER NOT NULL DEFAULT 0"),
+    _MetaCol("min_buyin_cents", "min_buyin_cents", _db_int, int, "INTEGER NOT NULL DEFAULT 0"),
+    _MetaCol("max_buyin_cents", "max_buyin_cents", _db_int, int, "INTEGER NOT NULL DEFAULT 0"),
+    _MetaCol("listed", "listed", _db_bool, bool, "INTEGER NOT NULL DEFAULT 1"),
+    _MetaCol("allow_rabbit", "allow_rabbit", _db_bool, bool, "INTEGER NOT NULL DEFAULT 1"),
+    _MetaCol("approve_buyins", "approve_buyins", _db_bool, bool, "INTEGER NOT NULL DEFAULT 0"),
+    _MetaCol("topup_mode", "topup_mode", lambda v: _norm_auto_mode(v),
+             lambda v: _norm_auto_mode(v), "TEXT NOT NULL DEFAULT 'off'"),
+    _MetaCol("topup_all_target_cents", "topup_target_cents", _db_int, int,
+             "INTEGER NOT NULL DEFAULT 0"),
+    _MetaCol("topup_all_below_cents", "topup_below_cents", _db_int, int,
+             "INTEGER NOT NULL DEFAULT 0"),
+    _MetaCol("show_grades", "show_grades", _db_bool, bool, "INTEGER NOT NULL DEFAULT 1"),
+    _MetaCol("allow_rathole", "allow_rathole", _db_bool, bool, "INTEGER NOT NULL DEFAULT 0"),
+)
+
+_PERSIST_META_SQL = (
+    "UPDATE homegames SET " + ", ".join(f"{c.col}=?" for c in META)
+    + ", closed_at=CASE WHEN ?='closed' THEN COALESCE(closed_at, ?) ELSE closed_at END"
+    " WHERE id=?"
+)
 
 
 def _persist_meta(t: LiveTable) -> None:
     pub.DB.q(
-        "UPDATE homegames SET host_user_id=?, status=?, running=?, "
-        "auto_stack_mode=?, auto_stack_all_cents=?, decision_secs=?, "
-        "street_pause_ms=?, "
-        "button=?, hand_no=?, "
-        "name=?, num_seats=?, ante_cents=?, default_buyin_cents=?, "
-        "deal_delay_ms=?, time_bank_secs=?, min_buyin_cents=?, "
-        "max_buyin_cents=?, listed=?, allow_rabbit=?, "
-        "approve_buyins=?, topup_mode=?, topup_target_cents=?, topup_below_cents=?, "
-        "show_grades=?, allow_rathole=?, "
-        "closed_at=CASE WHEN ?= 'closed' THEN COALESCE(closed_at, ?) ELSE closed_at END "
-        "WHERE id=?",
-        (
-            t.host_user_id,
-            t.status,
-            1 if t.running else 0,
-            t.auto_stack_mode,
-            int(t.auto_stack_all_cents or 0),
-            int(t.decision_secs or 0),
-            int(round(float(t.street_pause_secs or 1.5) * 1000)),
-            t.button,
-            t.hand_no,
-            t.name,
-            int(t.num_seats),
-            int(t.ante_cents),
-            int(t.default_buyin_cents),
-            int(round(float(t.deal_delay_secs or 0.0) * 1000)),
-            int(t.time_bank_secs or 0),
-            int(t.min_buyin_cents or 0),
-            int(t.max_buyin_cents or 0),
-            1 if t.listed else 0,
-            1 if t.allow_rabbit else 0,
-            1 if t.approve_buyins else 0,
-            _norm_auto_mode(t.topup_mode),
-            int(t.topup_all_target_cents or 0),
-            int(t.topup_all_below_cents or 0),
-            1 if t.show_grades else 0,
-            1 if t.allow_rathole else 0,
-            t.status,
-            pub._now(),
-            t.game_id,
-        ),
+        _PERSIST_META_SQL,
+        tuple(c.to_db(getattr(t, c.attr)) for c in META) + (t.status, pub._now(), t.game_id),
     )
 
 
@@ -1219,21 +1442,98 @@ def _persist_seats(t: LiveTable) -> None:
                 _persist_player(t, i, p, True)
 
 
+@contextmanager
+def _savepoint(name: str) -> Iterator[None]:
+    """A nested all-or-nothing block INSIDE ``pub.DB.transaction()``: on an
+    exception only its own statements are undone, the transaction goes on."""
+    pub.DB.q(f"SAVEPOINT {name}")
+    try:
+        yield
+    except BaseException:
+        pub.DB.q(f"ROLLBACK TO {name}")
+        pub.DB.q(f"RELEASE {name}")
+        raise
+    pub.DB.q(f"RELEASE {name}")
+
+
 def _persist_safe(t: LiveTable) -> None:
-    """Persist meta + seats on an ENGINE path; never raises.
+    """Persist meta + seats on an ENGINE path — together with every write the
+    table still owes the database (``t.unsaved``) — in ONE transaction; never
+    raises.
 
     (review 2026-09-20 G4) Once the engine has stepped, memory cannot be
     rolled back — the env has no undo — so a failed write must not surface
     as a half-applied action. Memory stays the truth, ``persist_dirty`` is
-    set, and the watchdog retries. (Inputs are capped, so every in-memory
-    value IS persistable; only transient DB errors land here.)"""
+    set, and the watchdog retries — the owed writes with it. (OPS-006: a
+    hand's record and results used to be committed apart from the stacks it
+    moved, so a crash in between left stats and money disagreeing; OPS-013: a
+    shuffle transcript that failed to save was only logged.) Each owed write
+    runs in its own SAVEPOINT: if IT fails, it alone is dropped (logged) — it
+    can never block the stacks. (Inputs are capped, so every in-memory value
+    IS persistable; only transient DB errors land here.)"""
+    _assert_lock_held(t)
+    owed = list(t.unsaved)
+    written: list = []
     try:
-        _persist_seats(t)
+        with pub.DB.transaction():
+            _persist_seats(t)
+            for w in owed:
+                try:
+                    with _savepoint("owed_write"):
+                        _write_owed(t, w)
+                    written.append(w)
+                except Exception:  # noqa: BLE001
+                    logger.exception("homegame: an owed %s write was dropped (table %s)", w[0], t.game_id)
         t.persist_dirty = False
+        del t.unsaved[: len(owed)]  # (callers hold t.lock: nothing else touched the list)
     except Exception:  # noqa: BLE001
         logger.exception("homegame persist failed for %s; will retry", t.game_id)
         t.persist_dirty = True
         t.persist_retry_mono = time.monotonic() + 2.0
+        return
+    for w in written:
+        if w[0] == "hand" and w[1].get("job") is not None:
+            _queue_grading(w[1]["job"])
+
+
+def _write_owed(t: LiveTable, w: tuple) -> None:
+    if w[0] == "fair":
+        _, hand_no, data = w
+        pub.DB.q(
+            "INSERT OR REPLACE INTO homegame_fair(game_id,hand_no,data) VALUES(?,?,?)",
+            (t.game_id, int(hand_no), data),
+        )
+        return
+    b = w[1]
+    rec = b["record"]
+    pub.DB.q(
+        "INSERT OR REPLACE INTO homegame_hands(game_id,hand_no,ended_at,pot_cents,summary)"
+        " VALUES(?,?,?,?,?)",
+        (t.game_id, int(rec["hand_no"]), rec["ended_at"], int(rec["pot_cents"]),
+         json.dumps(rec, separators=(",", ":"))),
+    )
+    for r in b["results"]:
+        pub.DB.q(
+            "INSERT OR REPLACE INTO homegame_hand_results(game_id,hand_no,user_id,delta_cents,"
+            "delta_chips,showdown) VALUES(?,?,?,?,?,?)",
+            (t.game_id, int(rec["hand_no"]), int(r["user_id"]), int(r["delta_cents"]),
+             int(r["delta_chips"]), 1 if r["shown"] else 0),
+        )
+    for payer, payee, chips in b["flows"]:
+        pub.DB.q(
+            "INSERT OR REPLACE INTO homegame_flows(game_id,hand_no,payer,payee,chips)"
+            " VALUES(?,?,?,?,?)",
+            (t.game_id, int(rec["hand_no"]), int(payer), int(payee), int(chips)),
+        )
+    job = b.get("job")
+    if job is not None and job.get("deck"):
+        # (a deck, never a seed: the seed is never persisted. The deck is the
+        # same secret-at-rest as the shuffle transcript in homegame_fair.)
+        pub.DB.q(
+            "INSERT OR REPLACE INTO homegame_grade_jobs(game_id,hand_no,job,created_at,attempts)"
+            " VALUES(?,?,?,?,0)",
+            (t.game_id, int(rec["hand_no"]), json.dumps(job, separators=(",", ":")), pub._now()),
+        )
 
 
 def _retry_persist_locked(t: LiveTable) -> None:
@@ -1241,15 +1541,12 @@ def _retry_persist_locked(t: LiveTable) -> None:
         _persist_safe(t)
 
 
-_SNAPSHOT_FIELDS = (
-    "host_user_id", "status", "running", "auto_stack_mode",
-    "auto_stack_all_cents", "decision_secs", "street_pause_secs", "button",
-    "hand_no", "turn_started_mono", "turn_key", "phase",
-    "name", "num_seats", "ante_cents", "default_buyin_cents", "deal_delay_secs",
-    "time_bank_secs", "min_buyin_cents", "max_buyin_cents", "listed",
-    "allow_rabbit", "approve_buyins", "topup_mode", "topup_all_target_cents",
-    "topup_all_below_cents", "show_grades",
-)
+# What ``_mutation`` rolls back: every saved setting (derived from META, so a new
+# one can never be left out — OPS-003: ``allow_rathole`` was, and a failed save
+# left it switched on in memory), plus the in-memory state a change may touch
+# (a resize drops the finished hand's per-seat arrays — rolled back by
+# reference: they are always replaced, never edited in place).
+_SNAPSHOT_FIELDS = tuple(c.attr for c in META) + ("phase", "next_deal_mono")
 
 
 @contextmanager
@@ -1265,7 +1562,9 @@ def _mutation(t: LiveTable) -> Iterator[None]:
 
     Never step the engine inside it — an env cannot be restored; engine
     paths use ``_persist_safe`` instead."""
+    _assert_lock_held(t)
     snap = {f: getattr(t, f) for f in _SNAPSHOT_FIELDS}
+    hand = replace(t.hand)  # (a copy: a change may set its fields, or replace it — resize)
     seats = [replace(p) if p is not None else None for p in t.seats]
     kicks = set(t.pending_kicks)
     try:
@@ -1274,18 +1573,203 @@ def _mutation(t: LiveTable) -> Iterator[None]:
     except BaseException:
         for f, v in snap.items():
             setattr(t, f, v)
+        t.hand = hand
         t.seats = seats
         t.pending_kicks = kicks
         raise
     t.rev += 1
 
 
+# --- the money ledger (OPS-017) -------------------------------------------------------------
+# ``homegame_ledger`` = every movement of money between a player and a table, with
+# its time and the hand it came after. The player's running totals
+# (``homegame_players.buyin_cents`` / ``leftover_cents``) must equal the sums of
+# these rows — ``reconcile_ledger`` checks it (at start and in /games/api/health).
+#: Money IN — each adds to the player's ``buyin_cents``:
+LEDGER_IN = ("buyin", "rebuy", "topup", "auto_topup", "stack_in")
+#: Money OUT — each adds to ``leftover_cents``:
+LEDGER_OUT = ("cashout", "take_off", "stack_out")
+#: What a receipt calls each kind. Rows from before OPS-017 (``hand_no`` NULL) used
+#: three kinds only: "rebuy" for every chip in after the first buy-in and "cashout"
+#: for every chip out — the same direction as the specific kinds, so the sums hold.
+LEDGER_LABELS = {
+    "buyin": "Bought in",
+    "rebuy": "Sat down again",
+    "topup": "Added chips",
+    "auto_topup": "Auto top-up",
+    "stack_in": "Set stack: topped up",
+    "cashout": "Cashed out",
+    "take_off": "Took chips off the table",
+    "stack_out": "Set stack: extra chips back",
+}
+_LEGACY_LEDGER_LABELS = {"buyin": "Bought in", "rebuy": "Chips in", "cashout": "Chips out"}
+
+
 def _ledger_add(t: LiveTable, uid: int, kind: str, amount_cents: int) -> None:
+    """One money movement (inside the caller's transaction, with the player's new
+    totals). ``hand_no`` = the last hand dealt when it happened (0: before the
+    first) — a mid-hand buy-in by a seat out of the hand names the hand in play."""
+    if kind not in LEDGER_IN and kind not in LEDGER_OUT:
+        raise ValueError(f"unknown ledger kind {kind!r}")
     pub.DB.q(
-        "INSERT INTO homegame_ledger(game_id,user_id,kind,amount_cents,created_at)"
-        " VALUES(?,?,?,?,?)",
-        (t.game_id, uid, kind, int(amount_cents), pub._now()),
+        "INSERT INTO homegame_ledger(game_id,user_id,kind,amount_cents,created_at,hand_no)"
+        " VALUES(?,?,?,?,?,?)",
+        (t.game_id, uid, kind, int(amount_cents), pub._now(), int(t.hand_no)),
     )
+
+
+def reconcile_ledger(game_id: str | None = None) -> list[dict[str, Any]]:
+    """Every place the money does not add up (OPS-017), [] when it all does:
+
+    - a player whose ledger rows do not sum to their running totals (money in =
+      ``buyin_cents``, money out = ``leftover_cents``);
+    - a CLOSED table that still holds chips, or whose money in and out differ
+      (it must be exactly zero-sum once everyone has cashed out);
+    - a row of a kind that is neither money in nor money out.
+    Read-only; ``game_id`` = one table (None = every table)."""
+    ins = ",".join("?" * len(LEDGER_IN))
+    outs = ",".join("?" * len(LEDGER_OUT))
+    where, args = ("WHERE p.game_id=?", [game_id]) if game_id else ("", [])
+    problems: list[dict[str, Any]] = []
+    for r in pub.DB.q(
+        "SELECT p.game_id, p.user_id, p.buyin_cents, p.leftover_cents, "
+        "COALESCE((SELECT SUM(l.amount_cents) FROM homegame_ledger l WHERE l.game_id=p.game_id "
+        f"AND l.user_id=p.user_id AND l.kind IN ({ins})),0) AS lin, "
+        "COALESCE((SELECT SUM(l.amount_cents) FROM homegame_ledger l WHERE l.game_id=p.game_id "
+        f"AND l.user_id=p.user_id AND l.kind IN ({outs})),0) AS lout "
+        f"FROM homegame_players p {where}",
+        tuple(list(LEDGER_IN) + list(LEDGER_OUT) + args),
+    ):
+        if (int(r["lin"]), int(r["lout"])) != (int(r["buyin_cents"]), int(r["leftover_cents"])):
+            problems.append({
+                "table": r["game_id"], "user_id": int(r["user_id"]), "problem": "totals",
+                "buyin_cents": int(r["buyin_cents"]), "ledger_in_cents": int(r["lin"]),
+                "leftover_cents": int(r["leftover_cents"]), "ledger_out_cents": int(r["lout"]),
+            })
+    gwhere, gargs = ("AND g.id=?", [game_id]) if game_id else ("", [])
+    for r in pub.DB.q(
+        "SELECT g.id, COALESCE(SUM(p.buyin_cents),0) b, COALESCE(SUM(p.leftover_cents),0) l, "
+        "COALESCE(SUM(p.stack_chips),0) s FROM homegames g JOIN homegame_players p ON p.game_id=g.id "
+        f"WHERE g.status='closed' {gwhere} GROUP BY g.id HAVING b<>l OR s<>0", tuple(gargs),
+    ):
+        problems.append({"table": r["id"], "problem": "closed table not zero-sum",
+                         "in_cents": int(r["b"]), "out_cents": int(r["l"]), "chips_left": int(r["s"])})
+    kinds = LEDGER_IN + LEDGER_OUT
+    kwhere, kargs = ("AND game_id=?", [game_id]) if game_id else ("", [])
+    for r in pub.DB.q(
+        f"SELECT game_id, kind, COUNT(*) n FROM homegame_ledger WHERE kind NOT IN ({','.join('?' * len(kinds))}) "
+        f"{kwhere} GROUP BY game_id, kind", tuple(list(kinds) + kargs),
+    ):
+        problems.append({"table": r["game_id"], "problem": f"unknown kind {r['kind']!r}", "rows": int(r["n"])})
+    return problems
+
+
+def _check_ledger_at_start() -> None:
+    """Startup reconciliation (OPS-017): loud in the log, never fatal."""
+    try:
+        problems = reconcile_ledger()
+    except Exception:  # noqa: BLE001
+        logger.exception("homegame ledger reconciliation failed to run")
+        return
+    for p in problems[:20]:
+        logger.error("homegame ledger does not add up: %s", p)
+    if problems:
+        logger.error("homegame ledger: %d problem(s) — see /games/api/health", len(problems))
+
+
+# --- settling up (FEAT-001) ----------------------------------------------------------------
+#: Players with money to settle up to which the fewest-payments search is exact
+#: (2^n subsets); a bigger session is settled greedily (still at most n - 1 payments).
+SETTLE_EXACT_MAX = 12
+
+
+@functools.lru_cache(maxsize=512)
+def _settle_plan(nets: tuple[tuple[int, int], ...]) -> tuple[tuple[int, int, int], ...]:
+    """(payer, payee, cents) payments that settle ``nets`` ((key, cents) pairs summing
+    to 0) in the FEWEST payments: the players are split into as many groups that
+    settle among themselves as possible (each group of k needs k - 1 payments, so
+    that is the minimum), then each group pays largest debt to largest credit.
+    Deterministic: the same nets always give the same payments."""
+    items = sorted(((k, c) for k, c in nets if c), key=lambda x: (-abs(x[1]), x[0]))
+    if sum(c for _, c in items) != 0:
+        raise ValueError("nets must sum to zero")
+    groups = _zero_sum_groups(items) if len(items) <= SETTLE_EXACT_MAX else [items]
+    out: list[tuple[int, int, int]] = []
+    for g in groups:
+        debt = [[-c, k] for k, c in g if c < 0]
+        cred = [[c, k] for k, c in g if c > 0]
+        i = j = 0
+        while i < len(debt) and j < len(cred):
+            amt = min(debt[i][0], cred[j][0])
+            out.append((debt[i][1], cred[j][1], amt))
+            debt[i][0] -= amt
+            cred[j][0] -= amt
+            if not debt[i][0]:
+                i += 1
+            if not cred[j][0]:
+                j += 1
+    out.sort(key=lambda x: (-x[2], x[0], x[1]))
+    return tuple(out)
+
+
+def _zero_sum_groups(items: list[tuple[int, int]]) -> list[list[tuple[int, int]]]:
+    """Split ``items`` (summing to 0) into the most groups that each sum to 0:
+    best[m] = max over i in m of best[m - i], +1 when m itself sums to 0 — the
+    best ORDER of the players, cut wherever its running total is back at 0."""
+    n = len(items)
+    vals = [c for _, c in items]
+    size = 1 << n
+    sums = [0] * size
+    best = [0] * size
+    last = [0] * size
+    for m in range(1, size):
+        low = m & -m
+        sums[m] = sums[m ^ low] + vals[low.bit_length() - 1]
+        b, ch, mm = -1, 0, m
+        while mm:
+            bit = mm & -mm
+            mm ^= bit
+            v = best[m ^ bit]
+            if v > b:
+                b, ch = v, bit.bit_length() - 1
+        best[m] = b + (1 if sums[m] == 0 else 0)
+        last[m] = ch
+    order: list[int] = []
+    m = size - 1
+    while m:
+        order.append(last[m])
+        m ^= 1 << last[m]
+    order.reverse()
+    groups: list[list[tuple[int, int]]] = []
+    cur: list[tuple[int, int]] = []
+    run = 0
+    for i in order:
+        cur.append(items[i])
+        run += vals[i]
+        if run == 0:
+            groups.append(cur)
+            cur = []
+    if cur:  # (cannot happen: the whole set sums to 0)
+        groups.append(cur)
+    return groups
+
+
+def settle_up(rows: list[dict[str, Any]], viewer_id: int | None = None) -> list[dict[str, Any]]:
+    """Who pays whom to settle ``rows`` (ledger rows: user_id, name, net_cents —
+    they sum to exactly 0), in the fewest payments. ``you`` = "pay" / "get" on the
+    viewer's own lines. Rows that do not sum to zero (money that cannot exist —
+    ``reconcile_ledger`` is where that is reported) settle nothing: a view never
+    fails over it."""
+    names = {int(r["user_id"]): r["name"] for r in rows}
+    nets = tuple(sorted((int(r["user_id"]), int(r["net_cents"])) for r in rows))
+    if sum(c for _, c in nets) != 0:
+        return []
+    plan = _settle_plan(nets)
+    return [
+        {"from": a, "from_name": names.get(a, "?"), "to": b, "to_name": names.get(b, "?"), "cents": c,
+         "you": "pay" if viewer_id == a else "get" if viewer_id == b else None}
+        for a, b, c in plan
+    ]
 
 
 def _emit(t: LiveTable, kind: str, text: str, **extra: Any) -> None:
@@ -1298,6 +1782,18 @@ def _emit(t: LiveTable, kind: str, text: str, **extra: Any) -> None:
         t.events.append(ev)
     except Exception:  # noqa: BLE001
         logger.exception("homegame event feed")
+
+
+def _user_name(t: LiveTable, uid: Any) -> str:
+    """A user's display name at this table: seated, seen here, or looked up."""
+    uid = int(uid)
+    p = t.player(uid)
+    if p is not None:
+        return p.name
+    if uid in t.names:
+        return t.names[uid]
+    u = pub._user_by_id(uid)
+    return _display_name(u, t.club_id) if u is not None else f"Player {uid}"
 
 
 def _seat_name(t: LiveTable, i: int | None) -> str:
@@ -1352,6 +1848,40 @@ def _validate_topup(t: LiveTable, target: int, below: int) -> tuple[int, int]:
     return target, below
 
 
+def _auto_cap(t: LiveTable, cents: int) -> int:
+    """An automatic-chips target as it applies NOW: never above the table's
+    current maximum buy-in (OPS-004: a target set under a higher maximum kept
+    refilling stacks past a maximum the host had since lowered)."""
+    hi = int(t.max_buyin_cents or 0)
+    return min(int(cents), hi) if hi and cents else int(cents)
+
+
+def _cap_auto_chips_locked(t: LiveTable) -> list[str]:
+    """The maximum buy-in went down: every stored automatic-chips target above
+    it comes down to it (and a top-up threshold with its target), so what the
+    host and the players see is what will happen. Caller is inside
+    ``_mutation`` and persists the seats. Returns the players whose own targets
+    moved (said to the table)."""
+    def capped(target: int, below: int) -> tuple[int, int]:
+        target = _auto_cap(t, target)
+        return target, min(int(below), target)
+
+    t.auto_stack_all_cents = _auto_cap(t, int(t.auto_stack_all_cents or 0))
+    t.topup_all_target_cents, t.topup_all_below_cents = capped(
+        int(t.topup_all_target_cents or 0), int(t.topup_all_below_cents or 0))
+    moved: list[str] = []
+    for p in t.seats:
+        if p is None:
+            continue
+        before = (p.auto_stack_cents, p.topup_target_cents, p.topup_below_cents)
+        p.auto_stack_cents = _auto_cap(t, int(p.auto_stack_cents or 0))
+        p.topup_target_cents, p.topup_below_cents = capped(
+            int(p.topup_target_cents or 0), int(p.topup_below_cents or 0))
+        if (p.auto_stack_cents, p.topup_target_cents, p.topup_below_cents) != before:
+            moved.append(p.name)
+    return moved
+
+
 def _auto_chips_allowed(t: LiveTable, p: Seat) -> bool:
     """An automatic buy-in is still a buy-in: while the host approves buy-ins
     it only runs for the host and the players the host trusts."""
@@ -1365,11 +1895,12 @@ def _auto_target_chips(t: LiveTable, p: Seat) -> int:
     if not _auto_chips_allowed(t, p):
         return chips
     if _norm_auto_mode(t.auto_stack_mode) != "off" and int(p.auto_stack_cents or 0) > 0:
-        return cents_to_chips(int(p.auto_stack_cents), t.bb_cents)
-    if _norm_auto_mode(t.topup_mode) != "off" and int(p.topup_target_cents or 0) > 0:
-        below = int(p.topup_below_cents or 0) or int(p.topup_target_cents)
+        return cents_to_chips(_auto_cap(t, int(p.auto_stack_cents)), t.bb_cents)
+    target = _auto_cap(t, int(p.topup_target_cents or 0))
+    if _norm_auto_mode(t.topup_mode) != "off" and target > 0:
+        below = min(int(p.topup_below_cents or 0), target) or target
         if chips_to_cents(chips, t.bb_cents) < below:
-            return max(chips, cents_to_chips(int(p.topup_target_cents), t.bb_cents))
+            return max(chips, cents_to_chips(target, t.bb_cents))
     return chips
 
 
@@ -1394,23 +1925,23 @@ def _apply_auto_stacks_locked(t: LiveTable) -> None:
         for p in t.seats:
             if p is None or p.sitting_out or not _auto_chips_allowed(t, p):
                 continue
-            target_cents = int(p.auto_stack_cents or 0) if set_on else 0
+            target_cents = _auto_cap(t, int(p.auto_stack_cents or 0)) if set_on else 0
             if target_cents <= 0:
                 # AUTO TOP-UP (2026-09-22): only ever UP, and only once the
                 # stack has dropped below the player's threshold — winnings
                 # stay on the table, so this is not a rathole.
-                tgt = int(p.topup_target_cents or 0) if top_on else 0
+                tgt = _auto_cap(t, int(p.topup_target_cents or 0)) if top_on else 0
                 if tgt <= 0:
                     continue
                 have = chips_to_cents(int(p.stack_chips), t.bb_cents)
-                if have >= (int(p.topup_below_cents or 0) or tgt):
+                if have >= (min(int(p.topup_below_cents or 0), tgt) or tgt):
                     continue
                 add_cents = tgt - have
                 if add_cents <= 0 or p.buyin_cents + add_cents > MAX_CENTS:
                     continue
                 p.buyin_cents += add_cents
                 p.stack_chips += cents_to_chips(add_cents, t.bb_cents)
-                _ledger_add(t, p.user_id, "rebuy", add_cents)
+                _ledger_add(t, p.user_id, "auto_topup", add_cents)
                 _emit(t, "rebuy", f"{p.name} auto topped up {_fmt_cents(add_cents)}")
                 continue
             target_chips = cents_to_chips(target_cents, t.bb_cents)
@@ -1426,12 +1957,12 @@ def _apply_auto_stacks_locked(t: LiveTable) -> None:
                     continue  # total buy-in cap — leave the stack alone
                 p.buyin_cents += delta_cents
                 p.stack_chips += moved
-                _ledger_add(t, p.user_id, "rebuy", delta_cents)
+                _ledger_add(t, p.user_id, "stack_in", delta_cents)
             else:
                 moved = min(moved, int(p.stack_chips))
                 p.leftover_cents += delta_cents
                 p.stack_chips -= moved
-                _ledger_add(t, p.user_id, "cashout", delta_cents)
+                _ledger_add(t, p.user_id, "stack_out", delta_cents)
         _persist_seats(t)
 
 
@@ -1453,10 +1984,7 @@ _AUTO_MODE_LINES = {
 
 def _auto_stack_host_locked(t: LiveTable, uid: int, body: dict) -> None:
     _require_open(t)
-    if uid != t.host_user_id:
-        raise HTTPException(
-            status_code=400, detail="only the host can change auto-stack settings"
-        )
+    _require_host(t, uid, "change auto-stack settings")
     body = body or {}
     old_mode = t.auto_stack_mode
     with _mutation(t):
@@ -1502,10 +2030,7 @@ def _auto_topup_host_locked(t: LiveTable, uid: int, body: dict) -> None:
     """Host side of auto top-up: the mode (off / host / player), the values for
     everyone in host mode, and per-player overrides."""
     _require_open(t)
-    if uid != t.host_user_id:
-        raise HTTPException(
-            status_code=400, detail="only the host can change auto top-up settings"
-        )
+    _require_host(t, uid, "change auto top-up settings")
     body = body or {}
     old_mode = t.topup_mode
     with _mutation(t):
@@ -1584,22 +2109,6 @@ def _auto_chips_self_locked(t: LiveTable, uid: int, body: dict) -> None:
         _persist_player(t, t.seat_of(uid), p, True)
 
 
-def _auto_stack_self_locked(t: LiveTable, uid: int, cents: int) -> None:
-    _require_open(t)
-    if t.auto_stack_mode != "player":
-        raise HTTPException(
-            status_code=400, detail="players cannot set auto-stack in this mode"
-        )
-    if t.player(uid) is None:
-        raise HTTPException(status_code=400, detail="not seated")
-    target = _validate_auto_stack_cents(t, cents)
-    with _mutation(t):
-        p = t.player(uid)
-        assert p is not None
-        p.auto_stack_cents = target
-        _persist_player(t, t.seat_of(uid), p, True)
-
-
 def _next_button(t: LiveTable, mask: list[bool]) -> int:
     n = t.num_seats
     start = t.button
@@ -1625,7 +2134,7 @@ def _split_board(cards: list[int]) -> dict[str, list[int | None]]:
 
 
 def _history_entries(raw: dict[str, Any], bb_cents: int) -> list[dict[str, Any]]:
-    street_commit = [0] * 16
+    street_commit = [0] * TABLE_SEATS
     cur_street: int | None = None
     out: list[dict[str, Any]] = []
     for rec in raw.get("history") or []:
@@ -1634,16 +2143,16 @@ def _history_entries(raw: dict[str, Any], bb_cents: int) -> list[dict[str, Any]]
             # (review 2026-09-20 G9) "Raise to" is a PER-STREET total: the
             # accumulator used to run across streets, so a $5 turn bet after
             # $10 of flop action read "Raise to $15".
-            street_commit = [0] * 16
+            street_commit = [0] * TABLE_SEATS
             cur_street = street
         street_commit[seat] += chips
         if action == FOLD:
             label = "Fold"
-        elif action == 1:  # CHECK_CALL
+        elif action == CHECK_CALL:
             label = "Check" if chips == 0 else f"Call {_fmt_cents(chips_to_cents(chips, bb_cents))}"
         else:
             label = f"Raise to {_fmt_cents(chips_to_cents(street_commit[seat], bb_cents))}"
-            if action == 7:
+            if action == ALL_IN:
                 label = f"All-in {_fmt_cents(chips_to_cents(chips, bb_cents))}"
         out.append({
             "seat": seat,
@@ -1685,7 +2194,7 @@ def _ledger_state(
         live = seated.get(uid)
         entries.append({
             "user_id": uid,
-            "name": live[1].name if live else _display_name(r),
+            "name": live[1].name if live else _display_name(r, t.club_id),
             "seat": live[0] if live else None,
             "buyin": live[1].buyin_cents if live else int(r["buyin_cents"]),
             "leftover": live[1].leftover_cents if live else int(r["leftover_cents"]),
@@ -1723,10 +2232,6 @@ def _ledger_state(
         })
     out.sort(key=lambda x: (not x["seated"], x["seat"] is None, x["seat"] or 0))
     return out, seat_cents
-
-
-def _ledger_rows(t: LiveTable) -> list[dict[str, Any]]:
-    return _ledger_state(t)[0]
 
 
 def _turn_remaining_secs(t: LiveTable) -> float | None:
@@ -1914,15 +2419,21 @@ def _fair_seal(t: LiveTable, hand_no: int, attempt: int) -> Any:
         _fair_hand_id(t, hand_no, attempt), t.num_seats, hole=t.hole_count, burns=t.burns)
 
 
+def _seal_fits(t: LiveTable, sealed: Any) -> bool:
+    """Can this sealed deck be dealt at the table as it is now? Its slot map
+    depends on the seat count, the hole cards per seat and the burns (HGB-024:
+    the check was written out twice)."""
+    return (sealed.num_seats == t.num_seats and sealed.hole == t.hole_count
+            and sealed.burns == t.burns)
+
+
 def _fair_prepare_locked(t: LiveTable) -> None:
     """Seal the deck of the upcoming hand as soon as there is an upcoming hand."""
     if not FAIR_ON or t.status != "open" or t.phase == "in_hand":
         return
     nxt = t.fair_next
     if nxt is not None and nxt.hand_no == t.hand_no + 1:
-        # the slot map depends on the seat count (and on the hole cards per seat)
-        if (nxt.sealed.num_seats != t.num_seats or nxt.sealed.hole != t.hole_count
-                or nxt.sealed.burns != t.burns):
+        if not _seal_fits(t, nxt.sealed):
             _fair_void_locked(t, "the table was resized")
         return
     t.fair_next = FairPending(sealed=_fair_seal(t, t.hand_no + 1, 1), hand_no=t.hand_no + 1)
@@ -2034,19 +2545,21 @@ def _fair_void_locked(t: LiveTable, reason: str, seats: list[int] | None = None)
     nxt = t.fair_next
     if nxt is None:
         return
-    names = [_seat_name(t, i) for i in (seats or [])]
+    # OPS-014: the device that failed to confirm is the USER who committed from
+    # that seat — not whoever sits there now — and the tally is per user.
+    names = [_user_name(t, nxt.commit_users[i]) if i in nxt.commit_users else _seat_name(t, i)
+             for i in (seats or [])]
     for i in seats or []:
         uid = nxt.commit_users.get(i)
         if uid is None:
             continue
+        t.fair_void_counts[int(uid)] = int(t.fair_void_counts.get(int(uid), 0)) + 1
         nxt.barred.add(int(uid))
         n = int(t.fair_strikes.get(int(uid), 0)) + 1
         t.fair_strikes[int(uid)] = n
         if n >= FAIR_STRIKES:
             t.fair_penalty_until[int(uid)] = int(t.hand_no) + 1 + FAIR_PENALTY_HANDS
             t.fair_strikes.pop(int(uid), None)
-    for nm in names:
-        t.fair_void_counts[nm] = int(t.fair_void_counts.get(nm, 0)) + 1
     voids = list(nxt.voids) + [{
         "attempt": nxt.attempt, "seal": nxt.sealed.seal, "reason": reason, "names": names,
     }]
@@ -2056,7 +2569,8 @@ def _fair_void_locked(t: LiveTable, reason: str, seats: list[int] | None = None)
         hand_no=nxt.hand_no, attempt=nxt.attempt + 1, barred=set(nxt.barred), voids=voids,
     )
     _emit(t, "fair", "Shuffle redone — " + (
-        f"{', '.join(names)} didn't confirm in time" if names else reason))
+        f"{', '.join(names)} didn't confirm in time" if names else reason),
+        seats=[int(i) for i in seats or []])  # (the client explains it to the device it names)
     t.rev += 1
     if was_pending and seats:  # the deal is still wanted: a short window to commit to the new seal
         t.fair_next.pending = True
@@ -2075,6 +2589,10 @@ def _fair_complete_locked(t: LiveTable) -> None:
     except HTTPException as e:  # nobody left to deal to, game paused, …
         if t.fair_next is nxt:
             _fair_void_locked(t, f"the hand could not be dealt ({e.detail})")
+    except Exception:  # noqa: BLE001 — a deck that cannot be finished must not stick
+        logger.exception("homegame shuffle could not be dealt (table %s)", t.game_id)
+        if t.fair_next is nxt:
+            _fair_void_locked(t, "the hand could not be dealt")
 
 
 def _fair_tick_locked(t: LiveTable) -> None:
@@ -2132,6 +2650,9 @@ def _fair_view(t: LiveTable, viewer_id: int, visible: list[int]) -> dict[str, An
                 "seat": seat, "committed": bool(mine),
                 "revealed": bool(mine and seat in nxt.reveals),
                 "barred": bool(int(viewer_id) in nxt.barred or _fair_penalized(t, viewer_id)),
+                # hands this device still sits out of the shuffle (it missed confirming
+                # in time: the client says so and why — HGT-012)
+                "benched_hands": max(0, int(t.fair_penalty_until.get(int(viewer_id), 0)) - int(t.hand_no)),
             },
         }
     fh = t.fair_hand
@@ -2146,7 +2667,15 @@ def _fair_view(t: LiveTable, viewer_id: int, visible: list[int]) -> dict[str, An
             "voids": list(meta.get("voids") or []),
             "open": _fair_openings(fh, visible),
         }
-    out["void_counts"] = dict(t.fair_void_counts)
+    # (wire format: display name -> count; two players with one name stay apart)
+    counts: dict[str, int] = {}
+    for uid, n in t.fair_void_counts.items():
+        base = _user_name(t, uid)
+        name, k = base, 2
+        while name in counts:
+            name, k = f"{base} ({k})", k + 1
+        counts[name] = int(n)
+    out["void_counts"] = counts
     return out
 
 
@@ -2168,15 +2697,10 @@ def _fair_transcript(t: LiveTable, viewer_id: int, hand_no: int) -> dict[str, An
         sealed, meta = fairdeal.SealedDeck.from_store(data["sealed"]), dict(data.get("meta") or {})
     visible: list[int] = []
     if live:
-        v = _view(t, viewer_id)
-        for srow in v["seats"]:
-            visible += [c for c in (srow.get("hole") or []) if isinstance(c, int) and c >= 0]
-        for b in ("a", "b"):
-            bd = v["board"][b]
-            visible += [c for c in list(bd["flop"]) + [bd["turn"], bd["river"]] if isinstance(c, int) and c >= 0]
-        visible += [int(c) for c in v.get("burns") or []]
+        visible = _visible_cards(t, viewer_id)  # (HGB-003: it used to build a whole view)
     else:
-        _require_member(t, viewer_id)
+        # (SEC-008: any member of the table's club may browse its hands — and so
+        # verify their shuffle; the openings still follow the reveal rule)
         rec_row = pub.DB.one("SELECT summary FROM homegame_hands WHERE game_id=? AND hand_no=?",
                              (t.game_id, int(hand_no)))
         if rec_row is not None:
@@ -2218,6 +2742,9 @@ def _auto_deal_tick_locked(t: LiveTable) -> None:
     if FAIR_ON and t.fair_next is not None and t.fair_next.pending:
         t.next_deal_mono = None  # this deal is already under way: its shuffle is being confirmed
         return
+    if t.deal_error is not None and t.deal_error_rev == t.rev:
+        t.next_deal_mono = None  # it failed and nothing has changed since: don't loop (FEAT-005)
+        return
     if delay <= 0.0 or not _deal_ready(t, present_only=True):
         t.next_deal_mono = None
         return
@@ -2230,17 +2757,73 @@ def _auto_deal_tick_locked(t: LiveTable) -> None:
     t.next_deal_mono = None
     try:
         _deal_locked(t)
-    except HTTPException:
-        pass  # not dealable after all (e.g. auto-stack could not top up)
+    except HTTPException as e:
+        # Not dealable after all (an automatic top-up that could not happen, say):
+        # the table is told why, and it is tried again once something changes.
+        t.deal_error = str(e.detail)
+        t.rev += 1
+        t.deal_error_rev = t.rev
+
+
+def _names_phrase(names: list[str]) -> str:
+    """"Sam", "Sam and Jo", "Sam, Jo and Al", "Sam, Jo and 3 others"."""
+    if len(names) <= 1:
+        return "".join(names)
+    if len(names) <= 3:
+        return ", ".join(names[:-1]) + " and " + names[-1]
+    return f"{names[0]}, {names[1]} and {len(names) - 2} others"
+
+
+def _deal_blocked_reason(t: LiveTable) -> str | None:
+    """Why the next hand is not coming (FEAT-005: the countdown just disappeared,
+    and nobody knew why) — or None when it is (a countdown or a shuffle under way,
+    a deal button) or the table is not dealing anyway (closed, paused, a hand on)."""
+    if t.status != "open" or not t.running or _hand_busy(t) or t.next_deal_mono is not None:
+        return None
+    if FAIR_ON and t.fair_next is not None and t.fair_next.pending:
+        return None
+    if t.deal_error is not None:
+        return f"The next hand couldn't be dealt: {t.deal_error}."
+    now = time.monotonic()
+    ante = t.ante_chips
+    ready: list[str] = []
+    absent: list[str] = []
+    broke: list[str] = []
+    away: list[str] = []
+    for p in t.seats:
+        if p is None:
+            continue
+        if p.sitting_out or p.sit_out_next or p.leave_after_hand or p.user_id in t.pending_kicks:
+            away.append(p.name)
+        elif _auto_target_chips(t, p) <= ante:
+            broke.append(p.name)
+        elif now - t.seen.get(p.user_id, -1e9) > PRESENCE_WINDOW_S:
+            absent.append(p.name)
+        else:
+            ready.append(p.name)
+    if len(ready) + len(absent) < 2:
+        if broke:
+            return f"{_names_phrase(broke)} {'needs' if len(broke) == 1 else 'need'} chips to play the next hand."
+        if away:
+            return f"Waiting for another player — {_names_phrase(away)} {'is' if len(away) == 1 else 'are'} sitting out."
+        return "Waiting for a second player."
+    if float(t.deal_delay_secs or 0.0) > 0.0 and len(ready) < 2:
+        return f"Waiting for {_names_phrase(absent)} to come back to the table."
+    return None
+
+
+#: The shortest runout pause (the host's setting is 0.3–5 s; there is no
+#: "instant" runout — HGB-014 removed the unreachable branches for one).
+MIN_STREET_PAUSE_S = 0.3
 
 
 def _street_pause(t: LiveTable) -> float:
     """Seconds between the streets of an all-in runout: the host's setting,
-    plus the burn's moment in PLO67 (not when the host wants it instant)."""
+    plus the burn's moment in PLO67. Never below MIN_STREET_PAUSE_S."""
     pause = float(t.street_pause_secs if t.street_pause_secs is not None else 1.5)
-    if pause > 0 and math.isfinite(pause) and t.burns:
-        pause += BURN_SHOW_S
-    return pause
+    if not (math.isfinite(pause) and pause >= MIN_STREET_PAUSE_S):
+        pause = MIN_STREET_PAUSE_S
+    return pause + (BURN_SHOW_S if t.burns else 0.0)
 
 
 def _runout_shown_len(t: LiveTable) -> int:
@@ -2248,8 +2831,6 @@ def _runout_shown_len(t: LiveTable) -> int:
         return 5
     start = max(3, int(t.runout_start_len or 3))
     pause = _street_pause(t)
-    if not (pause > 0) or not math.isfinite(pause):
-        return 5
     started = t.runout_started_mono if t.runout_started_mono is not None else time.monotonic()
     extra = int((time.monotonic() - started) / pause)
     return min(5, start + extra)
@@ -2262,10 +2843,8 @@ def _runout_award_index(t: LiveTable) -> int:
     if _runout_shown_len(t) < 5:
         return -1
     pause = _street_pause(t)
-    if not math.isfinite(pause):
-        pause = 0.0
     start = max(3, int(t.runout_start_len or 3))
-    river_at = (5 - start) * max(pause, 0.0)
+    river_at = (5 - start) * pause
     elapsed = time.monotonic() - (t.runout_started_mono or time.monotonic())
     into = elapsed - river_at
     if into < 0:
@@ -2305,25 +2884,80 @@ def _settle_locked(t: LiveTable) -> None:
             logger.exception("deferred cash-out failed (table %s)", t.game_id)
 
 
-def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
-    t.seen[int(viewer_id)] = time.monotonic()  # presence (server-side dealing)
-    if int(viewer_id) not in t.names:
-        u = pub._user_by_id(int(viewer_id))
-        t.names[int(viewer_id)] = _display_name(u) if u is not None else f"player-{viewer_id}"
-    _timeout_tick_locked(t)
-    _settle_locked(t)
-    _flush_result_locked(t)
+@dataclass
+class _Shared:
+    """The table-wide half of every viewer's view (HGB-003 / PERF-004): the engine's
+    state, the boards, the runout's progress, the ledger, the seats as everybody
+    sees them, the pots and the action history. Built ONCE per state of the table
+    (``_shared_key``) and reused for every viewer until the table changes — each
+    view only adds what is the viewer's own: which cards they may see, their
+    seat, their turn."""
+
+    key: tuple
+    raw: dict[str, Any]
+    actor: int | None
+    all_holes: list[list[int]]
+    folded: list[bool]
+    in_hand: list[bool]
+    dealt: list[int | None]
+    reveal: bool
+    trim_len: int | None
+    ba_src: list[int]
+    bb_src: list[int]
+    burns_shown: list[int]
+    burns_played: int
+    street: str | None
+    runout_live: bool
+    award_idx: int
+    start_stacks: list[int]
+    display_stacks: list[int]
+    ledger: list[dict[str, Any]]
+    seat_cents: dict[int, int]
+    seats: list[dict[str, Any]]      # without the viewer's own fields (see _seat_rows)
+    history: list[dict[str, Any]]
+    live_pots: list[dict[str, Any]]
+    eligible: int
+
+
+def _shared_key(t: LiveTable) -> tuple:
+    """Everything the shared half depends on. ``rev`` moves with every change to the
+    table; the runout reveals itself by the clock, so its progress is in the key
+    too (no rev bump when a street or an award step comes)."""
+    return (
+        t.epoch, t.rev, t.phase, t.hand_no, t.action_seq, t.num_seats,
+        _runout_shown_len(t) if t.runout_active else 0,
+        _runout_award_index(t) if t.runout_active else -2,
+    )
+
+
+def _shared(t: LiveTable) -> _Shared:
+    """The shared half of the view, from the cache when the table has not changed."""
+    key = _shared_key(t)
+    hit = t.view_cache
+    if hit is not None and hit.key == key:
+        return hit
+    sh = _build_shared(t, key)
+    t.view_cache = sh
+    return sh
+
+
+def _build_shared(t: LiveTable, key: tuple) -> _Shared:
+    n = t.num_seats
     raw: dict[str, Any] = {}
     actor = None
-    info = t.info
-    holes: list[list[int] | None] = [None] * t.num_seats
-    # PLO67: a hand the viewer may see, in the order its cards came (the felt
-    # animates the card a red burn dealt — the display order is sorted)
-    seqs: list[list[int] | None] = [None] * t.num_seats
-    in_hand = list(t.in_hand_mask or [])
-    in_hand += [False] * (t.num_seats - len(in_hand))
-    dealt = list(t.dealt_user_ids or [])
-    dealt += [None] * (t.num_seats - len(dealt))
+    all_holes: list[list[int]] = []
+    folded = [True] * n
+    in_hand = list(t.in_hand_mask or []) + [False] * n
+    in_hand = in_hand[:n]
+    dealt = list(t.dealt_user_ids or []) + [None] * n
+    dealt = dealt[:n]
+    if t.env is not None and t.phase in ("in_hand", "showdown"):
+        raw = _obs_dict(t.env)
+        actor_raw = raw.get("actor")
+        actor = int(actor_raw) if actor_raw is not None else None
+        all_holes = [[int(c) for c in h] for h in t.env.all_hole_cards()]
+        folded = [bool(x) for x in raw.get("folded", [])]
+        folded += [True] * (n - len(folded))
     # (review 2026-09-20 G1) Cards are tabled only at a REAL showdown: two or
     # more live hands at terminal. "phase == showdown" alone also covers a
     # fold-out, where the winner's hand used to be shown to the whole table
@@ -2332,58 +2966,57 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
     # PLO67: while an all-in runout is revealing, every hand shows what it held
     # on the street being shown (red burns still to come deal the rest)
     trim_len = max(3, _runout_shown_len(t)) if (t.runout_active and t.burns) else None
-    if t.env is not None and t.phase in ("in_hand", "showdown"):
-        raw = _obs_dict(t.env)
-        actor_raw = raw.get("actor")
-        actor = int(actor_raw) if actor_raw is not None else None
-        all_holes = t.env.all_hole_cards()
-        folded = [bool(x) for x in raw.get("folded", [])]
-        folded += [True] * (t.num_seats - len(folded))
-        for i in range(t.num_seats):
-            if i >= len(all_holes) or not in_hand[i]:
-                # The engine deals EVERY seat, dealt-in or not; a masked-out
-                # seat's hole cards are live-deck information.
-                continue
-            # (review 2026-09-20 G2) "Own" = the user who was DEALT this hand,
-            # not whoever sits in the seat now: a seated-but-not-dealt player
-            # used to see dead hole cards mid-hand, and a newcomer taking the
-            # seat after the hand saw the previous occupant's mucked cards.
-            own = dealt[i] is not None and dealt[i] == viewer_id
-            occupant = t.seats[i].user_id if t.seats[i] is not None else None
-            if occupant is not None and occupant != dealt[i]:
-                # Someone else has taken the seat since: the old hand is
-                # not theirs to show (or to sit behind), face-down included.
-                continue
-            # Tabled voluntarily after the hand ("show cards") — the player's
-            # own choice, so it also covers a fold-out winner and a folded hand.
-            shown = t.phase == "showdown" and i in t.shown_seats
-            cards_i = [int(c) for c in all_holes[i]]
-            if trim_len is not None and trim_len < 5:
-                cards_i = cards_i[: _hole_count_on(t, i, trim_len - 2)]
-            if own or shown or (reveal and not folded[i]):
-                holes[i] = _sorted_hole(cards_i)
-                if t.burns:
-                    seqs[i] = list(cards_i)
-            else:
-                holes[i] = [-1] * len(cards_i)  # facedown
-    elif reveal and t.last_holes:
-        holes = [_sorted_hole(h) if h and h[0] >= 0 else h for h in t.last_holes]
+    ba_src, bb_src, burns_shown, burns_played, street = _boards(t, raw)
 
+    # --- all-in runout: what has been revealed SO FAR -----------------------
+    # (review 2026-09-20 G11) While the streets/awards are still animating,
+    # nothing in the payload may run ahead of them: no final deltas, no
+    # final ledger, no award list, no unrevealed board card.
+    runout_live = bool(t.runout_active and _runout_blocking(t))
+    award_idx = _runout_award_index(t) if t.runout_active else -1
+    start_stacks = (list(t.hand_start_stacks or []) + [0] * n)[:n]
+    display_stacks = [0] * n
+    if runout_live:
+        display_stacks = (list(t.leftover_stacks or []) + [0] * n)[:n]
+        for step in (t.pot_awards or [])[: max(0, award_idx)]:
+            for k, v in (step.get("shares") or {}).items():
+                si = int(k)
+                if 0 <= si < n:
+                    display_stacks[si] += int(v)
+    # Ledger + settled stack cents. During the reveal the ledger stays on the
+    # hand-START stacks (exactly as it does while a hand is being played).
+    ledger, seat_cents = _ledger_state(t, start_stacks if runout_live else None)
+    sh = _Shared(
+        key=key, raw=raw, actor=actor, all_holes=all_holes, folded=folded, in_hand=in_hand,
+        dealt=dealt, reveal=reveal, trim_len=trim_len, ba_src=ba_src, bb_src=bb_src,
+        burns_shown=burns_shown, burns_played=burns_played, street=street,
+        runout_live=runout_live, award_idx=award_idx, start_stacks=start_stacks,
+        display_stacks=display_stacks, ledger=ledger, seat_cents=seat_cents, seats=[],
+        history=_history_entries(raw, t.bb_cents) if raw else [],
+        live_pots=(_live_pots(raw, in_hand, n) if raw and t.phase == "in_hand" and not t.runout_active else []),
+        eligible=sum(_eligible_mask(t, start_stacks if runout_live else None)),
+    )
+    sh.seats = _shared_seat_rows(t, sh)
+    return sh
+
+
+def _boards(t: LiveTable, raw: dict[str, Any]) -> tuple[list[int], list[int], list[int], int, str | None]:
+    """(board A, board B, the PLO67 burns shown, how many of them were played, the
+    street) as the table shows them now: the rabbit's streets only once it is
+    hunted, an all-in runout's street by street."""
     ba_src = list(raw.get("board_a") or t.rabbit_full_a or [])
     bb_src = list(raw.get("board_b") or t.rabbit_full_b or [])
     if t.phase == "showdown" and t.rabbit_full_a:
         ba_src = list(t.rabbit_full_a)
         bb_src = list(t.rabbit_full_b)
         if t.runout_active:
-            n = max(3, _runout_shown_len(t))
-            ba_src, bb_src = ba_src[:n], bb_src[:n]
+            k = max(3, _runout_shown_len(t))
+            ba_src, bb_src = ba_src[:k], bb_src[:k]
         elif not t.rabbit_shown:
-            n = max(3, int(t.rabbit_played_len or 3))
-            ba_src, bb_src = ba_src[:n], bb_src[:n]
+            k = max(3, int(t.rabbit_played_len or 3))
+            ba_src, bb_src = ba_src[:k], bb_src[:k]
     ba_src = [int(c) for c in ba_src]
     bb_src = [int(c) for c in bb_src]
-    ba = _split_board(ba_src)
-    bb = _split_board(bb_src)
     # PLO67's face-up burns: one per street on the board (the rabbit and an
     # all-in runout show them street by street, like the board cards)
     burns_shown: list[int] = []
@@ -2400,43 +3033,69 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
     street = STREET_NAMES.get(int(raw["street"]), "flop") if raw else None
     if t.runout_active:
         street = {3: "flop", 4: "turn", 5: "river"}.get(len(ba_src), street)
+    return ba_src, bb_src, burns_shown, burns_played, street
 
-    viewer_seat = t.seat_of(viewer_id)
-    hero_seat = viewer_seat if viewer_seat is not None else 0
 
-    # --- all-in runout: what has been revealed SO FAR -----------------------
-    # (review 2026-09-20 G11) While the streets/awards are still animating,
-    # nothing in the payload may run ahead of them: no final deltas, no
-    # final ledger, no award list, no unrevealed board card.
-    runout_live = bool(t.runout_active and _runout_blocking(t))
-    award_idx = _runout_award_index(t) if t.runout_active else -1
-    n_awards = len(t.pot_awards or [])
-    start_stacks = list(t.hand_start_stacks or [])
-    start_stacks += [0] * (t.num_seats - len(start_stacks))
-    display_stacks = [0] * t.num_seats
-    if runout_live:
-        base = list(t.leftover_stacks or [])
-        base += [0] * (t.num_seats - len(base))
-        display_stacks = base[: t.num_seats]
-        for step in (t.pot_awards or [])[: max(0, award_idx)]:
-            for k, v in (step.get("shares") or {}).items():
-                si = int(k)
-                if 0 <= si < t.num_seats:
-                    display_stacks[si] += int(v)
+def _visible_holes(t: LiveTable, sh: _Shared, viewer_id: int) -> tuple[list[list[int] | None], list[list[int] | None]]:
+    """(each seat's hole cards as THIS viewer may see them — sorted, or all -1 face
+    down, or None — and, PLO67, the same hands in the order their cards came).
 
-    # Ledger + settled stack cents. During the reveal the ledger stays on the
-    # hand-START stacks (exactly as it does while a hand is being played).
-    ledger, seat_cents = _ledger_state(t, start_stacks if runout_live else None)
-    settled = t.phase != "in_hand" and not runout_live
+    (review 2026-09-20 G2) "Own" = the user who was DEALT this hand, not whoever
+    sits in the seat now: a seated-but-not-dealt player used to see dead hole cards
+    mid-hand, and a newcomer taking the seat after the hand saw the previous
+    occupant's mucked cards. The engine deals EVERY seat, dealt-in or not; a
+    masked-out seat's hole cards are live-deck information and never shown."""
+    n = t.num_seats
+    holes: list[list[int] | None] = [None] * n
+    seqs: list[list[int] | None] = [None] * n
+    for i in range(min(n, len(sh.all_holes))):
+        if not sh.in_hand[i]:
+            continue
+        own = sh.dealt[i] is not None and sh.dealt[i] == viewer_id
+        occupant = t.seats[i].user_id if t.seats[i] is not None else None
+        if occupant is not None and occupant != sh.dealt[i]:
+            # Someone else has taken the seat since: the old hand is not theirs
+            # to show (or to sit behind), face-down included.
+            continue
+        # Tabled voluntarily after the hand ("show cards") — the player's own
+        # choice, so it also covers a fold-out winner and a folded hand.
+        shown = t.phase == "showdown" and i in t.shown_seats
+        cards_i = list(sh.all_holes[i])
+        if sh.trim_len is not None:
+            cards_i = _hand_on(t, i, cards_i, sh.trim_len)
+        if own or shown or (sh.reveal and not sh.folded[i]):
+            holes[i] = _sorted_hole(cards_i)
+            if t.burns:
+                seqs[i] = list(cards_i)
+        else:
+            holes[i] = [-1] * len(cards_i)  # facedown
+    return holes, seqs
 
-    seats_out: list[dict[str, Any]] = []
-    now_seen = time.monotonic()
-    for i in range(t.num_seats):
+
+def _visible_cards(t: LiveTable, viewer_id: int) -> list[int]:
+    """Every card THIS viewer has on their screen right now — the hole cards they may
+    see, both boards, the burns up — the cards whose shuffle proofs they get
+    (``_fair_view``, ``_fair_transcript``: HGB-003, it used to build a whole view)."""
+    sh = _shared(t)
+    holes, _ = _visible_holes(t, sh, viewer_id)
+    return ([int(c) for h in holes if h for c in h if int(c) >= 0]
+            + list(sh.ba_src) + list(sh.bb_src) + list(sh.burns_shown))
+
+
+def _shared_seat_rows(t: LiveTable, sh: _Shared) -> list[dict[str, Any]]:
+    """Every seat as everybody sees it (cards, the viewer's own queued chips, the
+    host's request badge and presence come per viewer in ``_seat_rows``)."""
+    raw, n = sh.raw, t.num_seats
+    settled = t.phase != "in_hand" and not sh.runout_live
+    in_hand_set = {j for j, m in enumerate(sh.in_hand) if m} if any(sh.in_hand) else None
+    eq_map = (t.equity_by_len.get((len(sh.ba_src), len(sh.bb_src))) or {}) if t.runout_active else {}
+    rows: list[dict[str, Any]] = []
+    for i in range(n):
         p = t.seats[i]
-        if p is not None and not in_hand[i]:
+        if p is not None and not sh.in_hand[i]:
             stack_chips = p.stack_chips  # not in this hand (sat / reloaded mid-hand)
-        elif runout_live:
-            stack_chips = display_stacks[i]
+        elif sh.runout_live:
+            stack_chips = sh.display_stacks[i]
         elif t.phase == "showdown" and p is not None:
             stack_chips = p.stack_chips
         elif raw and t.phase == "in_hand":
@@ -2444,18 +3103,14 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
         else:
             stack_chips = p.stack_chips if p else 0
         street_commit = int(raw["street_commit"][i]) if raw else 0
-        hole = holes[i]
-        made = None
-        if hole and hole[0] >= 0:
-            made = [
-                describe_made_hand(hole, ba_src),
-                describe_made_hand(hole, bb_src),
-            ]
-        if settled and p is not None and i in seat_cents:
-            stack_cents = seat_cents[i]  # agrees with the ledger to the cent
+        if settled and p is not None and i in sh.seat_cents:
+            stack_cents = sh.seat_cents[i]  # agrees with the ledger to the cent
         else:
             stack_cents = chips_to_cents(stack_chips, t.bb_cents)
-        seats_out.append({
+        # (review 2026-09-20 G3) equities: computed once per hand in `_capture_rabbit`
+        # from the ALIVE holes — the same numbers for every viewer.
+        eq = eq_map.get(i)
+        rows.append({
             "seat": i,
             "empty": p is None,
             "user_id": p.user_id if p else None,
@@ -2468,39 +3123,26 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
             "committed_this_street_cents": chips_to_cents(street_commit, t.bb_cents),
             "folded": bool(raw["folded"][i]) if raw else False,
             "all_in": bool(raw["all_in"][i]) if raw else False,
-            "in_hand": bool(in_hand[i]),
-            "is_actor": actor is not None and i == actor,
-            "is_hero": viewer_seat is not None and i == viewer_seat,
+            "in_hand": bool(sh.in_hand[i]),
+            "is_actor": sh.actor is not None and i == sh.actor,
+            "is_hero": False,
             "is_host": p is not None and p.user_id == t.host_user_id,
-            "position": position_name(
-                i, t.button, t.num_seats,
-                {j for j, m in enumerate(in_hand) if m} if any(in_hand) else None,
-            ),
-            "hole": hole,
-            "hole_seq": seqs[i],
-            "hand_desc": made,
+            "position": position_name(i, t.button, n, in_hand_set),
+            "hole": None,
+            "hole_seq": None,
+            "hand_desc": None,
             "auto_stack_cents": int(p.auto_stack_cents or 0) if p else 0,
             "pending_remove": bool(p and (p.user_id in t.pending_kicks or p.leave_after_hand)),
             "leaving": bool(p and p.leave_after_hand),
-            "equity_a": None,
-            "equity_b": None,
+            "equity_a": eq["a"] if eq else None,
+            "equity_b": eq["b"] if eq else None,
             "trusted": bool(p.trusted) if p else False,
             "topup_target_cents": int(p.topup_target_cents or 0) if p else 0,
             "topup_below_cents": int(p.topup_below_cents or 0) if p else 0,
-            # your own queued chips only — nobody else needs to see them
-            "queued_topup_cents": (
-                int(p.queued_topup_cents or 0) if p and p.user_id == viewer_id else 0
-            ),
-            "queued_remove_cents": (
-                int(p.queued_remove_cents or 0) if p and p.user_id == viewer_id else 0
-            ),
-            # the host sees who is waiting on them, right on the seat
-            "request": (
-                next(({"id": r["id"], "kind": r["kind"], "amount_cents": r["amount_cents"]}
-                      for r in t.requests if p is not None and r["user_id"] == p.user_id), None)
-                if viewer_id == t.host_user_id else None
-            ),
-            "present": bool(p and now_seen - t.seen.get(p.user_id, -1e9) <= PRESENCE_WINDOW_S),
+            "queued_topup_cents": 0,
+            "queued_remove_cents": 0,
+            "request": None,
+            "present": False,
             "reserved_by": next(
                 (r["name"] for r in t.requests if r["kind"] == "sit" and r["seat"] == i), None
             ) if p is None else None,
@@ -2508,75 +3150,83 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
             "bank_left_secs": round(float(p.time_bank_left or 0.0), 1) if p else 0.0,
             "shown": bool(t.phase == "showdown" and i in t.shown_seats),
         })
+    return rows
 
-    if t.runout_active:
-        # (review 2026-09-20 G3) Computed once per hand in `_capture_rabbit`
-        # from the ALIVE holes — the same numbers for every viewer.
-        eq_map = t.equity_by_len.get((len(ba_src), len(bb_src))) or {}
-        for i, eq in eq_map.items():
-            if 0 <= i < len(seats_out):
-                seats_out[i]["equity_a"] = eq["a"]
-                seats_out[i]["equity_b"] = eq["b"]
 
+def _seat_rows(t: LiveTable, sh: _Shared, viewer_id: int, holes: list, seqs: list,
+               now: float) -> list[dict[str, Any]]:
+    """The seats as THIS viewer sees them: the shared rows plus the cards they may
+    see (and those hands' made-hand labels), which seat is theirs, their own
+    queued chips, the host's request badges, who is here."""
+    viewer_seat = t.seat_of(viewer_id)
+    host = viewer_id == t.host_user_id
+    out = []
+    for i, base in enumerate(sh.seats):
+        row = dict(base)
+        p = t.seats[i]
+        hole = holes[i] if i < len(holes) else None
+        row["hole"] = hole
+        row["hole_seq"] = seqs[i] if i < len(seqs) else None
+        if hole and hole[0] >= 0:
+            row["hand_desc"] = [describe_made_hand(hole, sh.ba_src), describe_made_hand(hole, sh.bb_src)]
+        row["is_hero"] = viewer_seat is not None and i == viewer_seat
+        if p is not None and p.user_id == viewer_id:  # your own queued chips only
+            row["queued_topup_cents"] = int(p.queued_topup_cents or 0)
+            row["queued_remove_cents"] = int(p.queued_remove_cents or 0)
+        if host and p is not None:  # the host sees who is waiting on them, right on the seat
+            row["request"] = next(({"id": r["id"], "kind": r["kind"], "amount_cents": r["amount_cents"]}
+                                   for r in t.requests if r["user_id"] == p.user_id), None)
+        row["present"] = bool(p and now - t.seen.get(p.user_id, -1e9) <= PRESENCE_WINDOW_S)
+        out.append(row)
+    return out
+
+
+def _action_view(t: LiveTable, sh: _Shared, viewer_seat: int | None) -> dict[str, Any]:
+    """The decision on the table, for its actor: what is legal, the raise window,
+    what a call costs (zeros for everybody else)."""
     legal = {"fold": False, "check_call": False, "raise": False}
     raise_bounds = {"min_chips": 0, "max_chips": 0, "min_cents": 0, "max_cents": 0}
     to_call_chips = 0
-    my_turn = (
-        t.phase == "in_hand"
-        and actor is not None
-        and viewer_seat is not None
-        and actor == viewer_seat
-        and info is not None
-    )
-    if my_turn and info is not None:
+    info, raw, actor = t.info, sh.raw, sh.actor
+    if t.phase == "in_hand" and actor is not None and viewer_seat is not None and actor == viewer_seat and info is not None:
         gm = info.gate_mask
-        legal = {
-            "fold": bool(gm[GATE_FOLD]),
-            "check_call": bool(gm[GATE_CHECK_CALL]),
-            "raise": bool(gm[GATE_RAISE]),
-        }
-        min_c = int(info.min_raise_chips)
-        max_c = int(info.max_raise_chips)
+        legal = {"fold": bool(gm[GATE_FOLD]), "check_call": bool(gm[GATE_CHECK_CALL]),
+                 "raise": bool(gm[GATE_RAISE])}
+        min_c, max_c = int(info.min_raise_chips), int(info.max_raise_chips)
         if legal["raise"] and min_c == 0 and max_c > 0:
             min_c = max_c
-        raise_bounds = {
-            "min_chips": min_c,
-            "max_chips": max_c,
-            "min_cents": chips_to_cents(min_c, t.bb_cents),
-            "max_cents": chips_to_cents(max_c, t.bb_cents),
-        }
-        street_commit = int(raw["street_commit"][actor])
-        stack = int(raw["stacks"][actor])
-        bet_to_call = int(raw["bet_to_call"])
-        to_call_chips = min(max(0, bet_to_call - street_commit), stack)
+        raise_bounds = {"min_chips": min_c, "max_chips": max_c,
+                        "min_cents": chips_to_cents(min_c, t.bb_cents),
+                        "max_cents": chips_to_cents(max_c, t.bb_cents)}
+        to_call_chips = min(max(0, int(raw["bet_to_call"]) - int(raw["street_commit"][actor])),
+                            int(raw["stacks"][actor]))
+    return {
+        "legal": legal,
+        "raise_bounds": raise_bounds,
+        "to_call_chips": to_call_chips,
+        "to_call_cents": chips_to_cents(to_call_chips, t.bb_cents),
+        "street_commit_chips": int(raw["street_commit"][actor]) if raw and actor is not None else 0,
+    }
 
-    if runout_live:
+
+def _runout_view(t: LiveTable, sh: _Shared) -> dict[str, Any]:
+    """The pot, the hand's results so far and the all-in runout's clock: nothing
+    runs ahead of what the runout has revealed (G11)."""
+    raw, n = sh.raw, t.num_seats
+    award_idx, n_awards = sh.award_idx, len(t.pot_awards or [])
+    if sh.runout_live:
         # Public so far: what each dealt-in seat put in, plus awards shown.
-        deltas_cents = [
-            chips_to_cents(display_stacks[i] - start_stacks[i], t.bb_cents)
-            if in_hand[i] else 0
-            for i in range(t.num_seats)
-        ]
+        deltas_cents = [chips_to_cents(sh.display_stacks[i] - sh.start_stacks[i], t.bb_cents)
+                        if sh.in_hand[i] else 0 for i in range(n)]
+        awarded = sum(int(st.get("chips") or 0) for st in (t.pot_awards or [])[: max(0, award_idx)])
+        pot_chips = max(0, int(t.terminal_pot) - awarded)
     else:
         deltas_cents = [chips_to_cents(d, t.bb_cents) for d in (t.last_deltas or [])]
-
-    if runout_live:
-        awarded = sum(
-            int(st.get("chips") or 0)
-            for st in (t.pot_awards or [])[: max(0, award_idx)]
-        )
-        pot_chips = max(0, int(t.terminal_pot) - awarded)
-    elif t.phase == "showdown":
-        pot_chips = 0
-    else:
-        pot_chips = int(raw["pot"]) if raw else 0
-
-    award_step = None
-    if t.runout_active and 0 <= award_idx < n_awards:
-        award_step = t.pot_awards[award_idx]
+        pot_chips = 0 if t.phase == "showdown" else (int(raw["pot"]) if raw else 0)
+    award_step = t.pot_awards[award_idx] if t.runout_active and 0 <= award_idx < n_awards else None
     if not t.runout_active:
         shown_awards: list[dict[str, Any]] = []
-    elif runout_live:
+    elif sh.runout_live:
         # Award steps only start once all five cards are out, so a released
         # step can never name an unrevealed board card.
         shown_awards = list(t.pot_awards[: max(0, award_idx + 1)])
@@ -2584,125 +3234,42 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
         shown_awards = list(t.pot_awards or [])
     pause = _street_pause(t)
     shown_len = _runout_shown_len(t) if t.runout_active else 0
-    start_len = max(3, int(t.runout_start_len or 3))
-    elapsed = (
-        time.monotonic() - t.runout_started_mono
-        if t.runout_active and t.runout_started_mono is not None
-        else 0.0
-    )
-    if t.runout_active and shown_len < 5 and pause > 0:
-        next_in = pause - (elapsed % pause)
-    else:
-        next_in = 0.0
-
-    eligible = sum(_eligible_mask(t, start_stacks if runout_live else None))
-    blocking = _runout_blocking(t)
-    can_show = False
-    if t.phase == "showdown" and t.env is not None and raw:
-        for i in range(t.num_seats):
-            if dealt[i] is None or dealt[i] != viewer_id or not in_hand[i]:
-                continue
-            occupant = t.seats[i].user_id if t.seats[i] is not None else None
-            if occupant is not None and occupant != dealt[i]:
-                continue
-            tabled = i in t.shown_seats or (reveal and not bool(raw["folded"][i]))
-            can_show = not tabled
-    bank_active, bank_left = _bank_state(t)
-    now_mono = time.monotonic()
-    now_wall = time.time()
-    last_hand_no = t.hand_no if (t.phase != "in_hand" and not blocking) else t.hand_no - 1
-    _fair_prepare_locked(t)
-    visible_cards = [int(c) for h in holes if h for c in h if int(c) >= 0] + ba_src + bb_src + burns_shown
+    elapsed = (time.monotonic() - t.runout_started_mono
+               if t.runout_active and t.runout_started_mono is not None else 0.0)
+    next_in = pause - (elapsed % pause) if (t.runout_active and shown_len < 5 and pause > 0) else 0.0
     return {
-        "fair": _fair_view(t, viewer_id, visible_cards),
-        "id": t.game_id,
-        "name": t.name,
-        # the game dealt here: PLO5 / PLO6 (hole cards per player, seat limit, graded?)
-        "variant": _norm_game(t.variant),
-        "game": _game_info(t.variant),
-        "hole_count": t.hole_count,
-        "status": t.status,
-        "phase": t.phase,
-        "hand_no": t.hand_no,
-        "action_seq": t.action_seq,
-        "rev": t.rev,
-        "epoch": t.epoch,
-        "num_seats": t.num_seats,
-        "button_seat": t.button,
-        "hero_seat": hero_seat,
-        "actor": actor,
-        "my_user_id": viewer_id,
-        "my_seat": viewer_seat,
-        "is_host": viewer_id == t.host_user_id,
-        "is_member": any(row["user_id"] == viewer_id for row in ledger),
-        "stakes": {
-            "sb_cents": t.sb_cents,
-            "bb_cents": t.bb_cents,
-            "ante_cents": t.ante_cents,
-            "default_buyin_cents": t.default_buyin_cents,
-            "bb_chips": BB_CHIPS,
-        },
-        "seats": seats_out,
-        "board": {"a": ba, "b": bb},
-        # PLO67: the burn cards turned face up so far (flop, turn, river); [] otherwise
-        "burns": burns_shown,
-        "burns_played": burns_played,
         "pot_chips": pot_chips,
         "pot_cents": chips_to_cents(pot_chips, t.bb_cents),
-        "settled_pot_chips": (
-            int(raw["pot"]) - sum(int(x) for x in raw["street_commit"]) if raw else 0
-        ),
-        "street": street,
-        "history": _history_entries(raw, t.bb_cents) if raw else [],
-        "legal": legal,
-        "raise_bounds": raise_bounds,
-        "to_call_chips": to_call_chips,
-        "to_call_cents": chips_to_cents(to_call_chips, t.bb_cents),
-        "street_commit_chips": (
-            int(raw["street_commit"][actor]) if raw and actor is not None else 0
-        ),
+        "settled_pot_chips": int(raw["pot"]) - sum(int(x) for x in raw["street_commit"]) if raw else 0,
         "hand_deltas_cents": deltas_cents,
-        "ledger": ledger,
-        "running": bool(t.running),
-        "can_deal": (
-            t.status == "open"
-            and t.running
-            and t.phase != "in_hand"
-            and not blocking
-            and viewer_seat is not None
-            and eligible >= 2
-        ),
-        "eligible_count": eligible,
-        "chat": _chat_messages(t.game_id),
-        "can_rabbit": bool(
-            t.phase == "showdown" and t.rabbit_available and not t.rabbit_shown
-        ),
-        "rabbit_shown": bool(t.rabbit_shown),
-        "auto_stack": {
-            "mode": _norm_auto_mode(t.auto_stack_mode),
-            "all_cents": int(t.auto_stack_all_cents or 0),
-        },
-        "decision_secs": int(t.decision_secs or 0),
-        "turn_remaining_secs": _turn_remaining_secs(t),
         "street_pause_secs": pause,
         "runout": {
             "active": bool(t.runout_active),
-            "start_len": start_len,
-            "shown_len": shown_len if t.runout_active else 0,
+            "start_len": max(3, int(t.runout_start_len or 3)),
+            "shown_len": shown_len,
             "pause_secs": pause,
             "next_in_secs": round(next_in, 2),
             "award_index": award_idx,
             "award_count": n_awards,
             "award_step": award_step,
-            "blocking": blocking,
+            "blocking": _runout_blocking(t),
         },
         "pot_awards": shown_awards,
         "pots": list(t.pots or []) if t.runout_active else [],
-        "live_pots": (
-            _live_pots(raw, in_hand, t.num_seats)
-            if raw and t.phase == "in_hand" and not t.runout_active else []
-        ),
-        # --- 2026-09-21 ----------------------------------------------------
+        "live_pots": sh.live_pots,
+    }
+
+
+def _settings_view(t: LiveTable) -> dict[str, Any]:
+    """The table's settings as the view carries them."""
+    return {
+        "stakes": {
+            "sb_cents": t.sb_cents, "bb_cents": t.bb_cents, "ante_cents": t.ante_cents,
+            "default_buyin_cents": t.default_buyin_cents, "bb_chips": BB_CHIPS,
+        },
+        "running": bool(t.running),
+        "auto_stack": {"mode": _norm_auto_mode(t.auto_stack_mode), "all_cents": int(t.auto_stack_all_cents or 0)},
+        "decision_secs": int(t.decision_secs or 0),
         "host_user_id": t.host_user_id,
         "settings": {
             "deal_delay_secs": float(t.deal_delay_secs or 0.0),
@@ -2720,6 +3287,96 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
             "all_target_cents": int(t.topup_all_target_cents or 0),
             "all_below_cents": int(t.topup_all_below_cents or 0),
         },
+    }
+
+
+def _view_ticks_locked(t: LiveTable) -> None:
+    """A view never lags the clock: the watchdog does this work every quarter
+    second, and a view does it first too (a clock ran out, a runout finished and
+    someone who left is due their cash-out, a result line is due) — otherwise the
+    viewer could see a state up to a tick old."""
+    _timeout_tick_locked(t)
+    _settle_locked(t)
+    _flush_result_locked(t)
+
+
+def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
+    """Everything one viewer sees of the table (HGB-003: assembled from
+    ``_shared`` — built once per state of the table for every viewer (PERF-004) —
+    and the viewer's own parts: ``_visible_holes``, ``_seat_rows``,
+    ``_action_view``, ``_runout_view``, ``_settings_view``, the shuffle's proofs of
+    the cards they see). Also marks the viewer present."""
+    _assert_lock_held(t)
+    viewer_id = int(viewer_id)
+    now_mono = time.monotonic()
+    t.seen[viewer_id] = now_mono  # presence (server-side dealing)
+    if viewer_id not in t.names:
+        u = pub._user_by_id(viewer_id)
+        t.names[viewer_id] = _display_name(u, t.club_id) if u is not None else f"Player {viewer_id}"
+    _view_ticks_locked(t)
+    sh = _shared(t)
+    holes, seqs = _visible_holes(t, sh, viewer_id)
+    viewer_seat = t.seat_of(viewer_id)
+    blocking = _runout_blocking(t)
+    can_show = False
+    if t.phase == "showdown" and t.env is not None and sh.raw:
+        for i in range(t.num_seats):
+            if sh.dealt[i] is None or sh.dealt[i] != viewer_id or not sh.in_hand[i]:
+                continue
+            occupant = t.seats[i].user_id if t.seats[i] is not None else None
+            if occupant is not None and occupant != sh.dealt[i]:
+                continue
+            can_show = not (i in t.shown_seats or (sh.reveal and not bool(sh.raw["folded"][i])))
+    bank_active, bank_left = _bank_state(t)
+    now_wall = time.time()
+    last_hand_no = t.hand_no if (t.phase != "in_hand" and not blocking) else t.hand_no - 1
+    _fair_prepare_locked(t)
+    visible = ([int(c) for h in holes if h for c in h if int(c) >= 0]
+               + list(sh.ba_src) + list(sh.bb_src) + list(sh.burns_shown))
+    out: dict[str, Any] = {
+        "fair": _fair_view(t, viewer_id, visible),
+        "id": t.game_id,
+        "name": t.name,
+        # the game dealt here: PLO5 / PLO6 / PLO67 (hole cards per player, seat limit, graded?)
+        "variant": _norm_game(t.variant),
+        "game": _game_info(t.variant),
+        "hole_count": t.hole_count,
+        "status": t.status,
+        "phase": t.phase,
+        "hand_no": t.hand_no,
+        "action_seq": t.action_seq,
+        "rev": t.rev,
+        "epoch": t.epoch,
+        "num_seats": t.num_seats,
+        "button_seat": t.button,
+        "hero_seat": viewer_seat if viewer_seat is not None else 0,
+        "actor": sh.actor,
+        "my_user_id": viewer_id,
+        "my_seat": viewer_seat,
+        "is_host": viewer_id == t.host_user_id,
+        "is_member": any(row["user_id"] == viewer_id for row in sh.ledger),
+        # SEC-008: the table's hands (history, replayer, proofs) are open to every
+        # member of its club — and the view is only ever built for one
+        "can_browse_hands": True,
+        "seats": _seat_rows(t, sh, viewer_id, holes, seqs, now_mono),
+        "board": {"a": _split_board(sh.ba_src), "b": _split_board(sh.bb_src)},
+        # PLO67: the burn cards turned face up so far (flop, turn, river); [] otherwise
+        "burns": list(sh.burns_shown),
+        "burns_played": sh.burns_played,
+        "street": sh.street,
+        "history": sh.history,
+        "ledger": sh.ledger,
+        # who pays whom, in the fewest payments (FEAT-001; the ledger sums to 0)
+        "settle_up": settle_up(sh.ledger, viewer_id),
+        "can_deal": (
+            t.status == "open" and t.running and t.phase != "in_hand" and not blocking
+            and viewer_seat is not None and sh.eligible >= 2
+        ),
+        "eligible_count": sh.eligible,
+        "chat": _chat_messages(t),
+        "can_rabbit": bool(t.phase == "showdown" and t.rabbit_available and not t.rabbit_shown),
+        "rabbit_shown": bool(t.rabbit_shown),
+        "turn_remaining_secs": _turn_remaining_secs(t),
         # buy-in approval: the host sees the queue, a player their own request
         "needs_approval": bool(t.approve_buyins) and not _is_trusted_cached(t, viewer_id),
         "requests": (
@@ -2729,6 +3386,11 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
             if viewer_id == t.host_user_id else []
         ),
         "my_avatar": _avatar_url(viewer_id),
+        # FEAT-008: the name this table shows for the viewer, and whether it is only the
+        # "Player <id>" stand-in (then the client asks them to choose one)
+        "my_name": t.names.get(viewer_id) or _user_name(t, viewer_id),
+        "my_name_default": _viewer_name_default_cached(t, viewer_id),
+        "client_build": client_build(),  # (an older page offers a refresh — OPS-039)
         "my_request": next(
             ({k: r[k] for k in ("id", "kind", "seat", "amount_cents")}
              for r in t.requests if r["user_id"] == viewer_id), None,
@@ -2737,14 +3399,14 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
         "join_requests": _table_join_requests(t, viewer_id),
         "club": _table_club(t, viewer_id),
         "spectators": sorted(
-            t.names.get(uid, "?") for uid, last in t.seen.items()
+            t.names.get(uid, "?") for uid, last in list(t.seen.items())
             if now_mono - last <= PRESENCE_WINDOW_S and t.seat_of(uid) is None
         ),
         "next_deal_in_secs": (
-            round(max(0.0, t.next_deal_mono - now_mono), 2)
-            if t.next_deal_mono is not None
-            else None
+            round(max(0.0, t.next_deal_mono - now_mono), 2) if t.next_deal_mono is not None else None
         ),
+        # FEAT-005: why the next hand isn't coming (None = it is, or nothing is due)
+        "deal_blocked_reason": _deal_blocked_reason(t),
         "time_bank": {
             "secs": int(t.time_bank_secs or 0),
             "active": bool(bank_active),
@@ -2759,14 +3421,49 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
             if now_wall - float(r["ts"]) <= REACTION_TTL_S
         ],
     }
+    out.update(_action_view(t, sh, viewer_seat))
+    out.update(_runout_view(t, sh))
+    out.update(_settings_view(t))
+    return out
+
+
+def _viewer_name_default_cached(t: LiveTable, uid: int) -> bool:
+    """``my_name_default`` without a query per view (PERF-004): kept per table, and
+    forgotten there when the name changes (``_rename_at_tables``)."""
+    hit = t.name_defaults.get(int(uid))
+    if hit is None:
+        hit = t.name_defaults[int(uid)] = _viewer_name_default(uid)
+    return hit
+
+
+def _viewer_name_default(uid: int) -> bool:
+    u = pub._user_by_id(int(uid))
+    return bool(u is not None and _name_is_default(u))
 
 
 def _is_trusted_cached(t: LiveTable, uid: int) -> bool:
-    """`_is_trusted` without a DB hit on every poll: only an UNSEATED viewer
-    needs the lookup, and only while approval is on."""
-    if not t.approve_buyins:
+    """`_is_trusted` without a DB hit on every poll (PERF-004: the name promised a
+    cache that did not exist): the host and seated players answer from memory, an
+    unseated viewer's lookup is kept until the table changes (trust is only ever
+    set inside a change, which moves ``rev``). Only while approval is on."""
+    if not t.approve_buyins or int(uid) == int(t.host_user_id):
         return True
-    return _is_trusted(t, uid)
+    p = t.player(int(uid))
+    if p is not None:
+        return bool(p.trusted)
+    if t.trust_cache is None or t.trust_cache[0] != t.rev:
+        t.trust_cache = (t.rev, {})
+    known = t.trust_cache[1]
+    if int(uid) not in known:
+        known[int(uid)] = _is_trusted(t, uid)
+    return known[int(uid)]
+
+
+def _require_host(t: LiveTable, uid: int, what: str) -> None:
+    """Host-only actions: 403 (a permission, like the club's rules — HGB-007: the
+    same check was pasted 13 times and answered 400)."""
+    if int(uid) != int(t.host_user_id):
+        raise HTTPException(status_code=403, detail=f"only the host can {what}")
 
 
 def _require_open(t: LiveTable) -> None:
@@ -2804,6 +3501,7 @@ def _cash_out_seat(t: LiveTable, i: int, *, closing: bool = False) -> None:
     the table's money over ALL seated stacks (module docstring, review
     2026-09-20 G10) — whole cents, zero-sum; it used to be an independent
     ``round()`` of the stack. All-or-nothing via ``_mutation``."""
+    _assert_lock_held(t)
     p = t.seats[i]
     if p is None:
         return
@@ -2828,13 +3526,15 @@ def _cash_out_seat(t: LiveTable, i: int, *, closing: bool = False) -> None:
 
 def _set_running_locked(t: LiveTable, uid: int, running: bool) -> None:
     _require_open(t)
-    if uid != t.host_user_id:
-        raise HTTPException(status_code=400, detail="only the host can start or pause")
+    _require_host(t, uid, "start or pause")
     was = bool(t.running)
     with _mutation(t):
         t.running = bool(running)
         _persist_meta(t)
     t.next_deal_mono = None
+    if running:  # the host's Start gives a table the watchdog paused a fresh chance
+        t.wd_failing_since = None
+        t.wd_next_mono = 0.0
     if not running:
         _fair_tick_locked(t)  # a deal waiting on its shuffle is called off (announced)
     if was != bool(running):
@@ -2844,19 +3544,26 @@ def _set_running_locked(t: LiveTable, uid: int, running: bool) -> None:
         _deal_locked(t)
 
 
-def _deal_locked(t: LiveTable) -> None:
+def _deal_preconditions(t: LiveTable) -> None:
     _require_open(t)
     if not t.running:
         raise HTTPException(status_code=400, detail="game is paused")
     if t.phase == "in_hand":
-        raise HTTPException(status_code=400, detail="hand already in progress")
+        raise HTTPException(status_code=409, detail="hand already in progress")  # (someone dealt first)
     if _runout_blocking(t):
         # (review 2026-09-20 G7) `can_deal` was only a hint in the payload:
         # POST /deal itself never checked, so any seated player could cut
         # everyone's river and pot awards short.
         raise HTTPException(status_code=400, detail="wait for the runout to finish")
-    if FAIR_ON and t.fair_next is not None and t.fair_next.pending:
-        return  # this deal is already waiting on its shuffle (an impatient second click)
+
+
+def _prepare_deal_locked(t: LiveTable) -> list[bool]:
+    """Everything a deal checks and does between hands — before the shuffle
+    wait AND again at the deal itself (things may have changed while the
+    devices confirmed): the preconditions, deferred cash-outs, "sit out next
+    hand", queued top-ups, automatic chips. Returns the seats dealt in (HGB-009:
+    it was written out twice, with drifting error texts)."""
+    _deal_preconditions(t)
     _settle_locked(t)
     _apply_sit_out_next_locked(t)
     _apply_queued_topups_locked(t, force=True)
@@ -2867,6 +3574,27 @@ def _deal_locked(t: LiveTable) -> None:
             status_code=400,
             detail="need at least 2 players with more than the ante",
         )
+    return mask
+
+
+def _player_deal_locked(t: LiveTable, uid: int) -> None:
+    """A player's "Deal" (POST /deal). Any seated player may deal the next hand
+    on a table dealt by hand; while the server is counting down to the next hand,
+    dealing NOW cuts short everyone's look at the showdown — that is the host's
+    call (HGT-024: the client offered "Deal now" to the host only, but the server
+    took it from anyone seated)."""
+    if t.seat_of(uid) is None:
+        raise HTTPException(status_code=400, detail="sit to deal")
+    if t.next_deal_mono is not None and int(uid) != int(t.host_user_id):
+        raise HTTPException(status_code=403, detail="only the host can skip the countdown to the next hand")
+    _deal_locked(t)
+
+
+def _deal_locked(t: LiveTable) -> None:
+    _deal_preconditions(t)
+    if FAIR_ON and t.fair_next is not None and t.fair_next.pending:
+        return  # this deal is already waiting on its shuffle (an impatient second click)
+    mask = _prepare_deal_locked(t)
     if FAIR_ON:
         # Verifiable shuffle: devices that take part get a moment to confirm.
         # A table nobody's browser takes part in (scripts, tests) deals at once.
@@ -2878,21 +3606,7 @@ def _deal_locked(t: LiveTable) -> None:
 
 def _deal_now_locked(t: LiveTable) -> None:
     """Put the hand on the table (the shuffle, if any, is settled)."""
-    _require_open(t)
-    if not t.running:
-        raise HTTPException(status_code=400, detail="game is paused")
-    if t.phase == "in_hand" or _runout_blocking(t):
-        raise HTTPException(status_code=400, detail="hand already in progress")
-    _settle_locked(t)
-    _apply_sit_out_next_locked(t)
-    _apply_queued_topups_locked(t, force=True)
-    _apply_auto_stacks_locked(t)
-    mask = _eligible_mask(t)
-    if sum(mask) < 2:
-        raise HTTPException(
-            status_code=400,
-            detail="need at least 2 players with more than the ante",
-        )
+    mask = _prepare_deal_locked(t)
     button = _next_button(t, mask)
     stacks = tuple(s.stack_chips if s is not None else 0 for s in t.seats)
     cfg = GameConfig(
@@ -2905,8 +3619,7 @@ def _deal_now_locked(t: LiveTable) -> None:
     )
     env = _make_env(cfg)
     nxt = t.fair_next if FAIR_ON else None
-    if nxt is not None and (nxt.hand_no != t.hand_no + 1 or nxt.sealed.num_seats != t.num_seats
-                            or nxt.sealed.hole != t.hole_count or nxt.sealed.burns != t.burns):
+    if nxt is not None and (nxt.hand_no != t.hand_no + 1 or not _seal_fits(t, nxt.sealed)):
         _fair_void_locked(t, "the table changed before the deal")
         raise HTTPException(status_code=409, detail="the shuffle is being redone")
     if nxt is not None:
@@ -2914,72 +3627,43 @@ def _deal_now_locked(t: LiveTable) -> None:
             nxt.sealed.set_lock({})  # nobody contributed: the seal still pins every card
         deck = nxt.sealed.finish(dict(nxt.reveals))
         _, info = env.reset_with_deck(deck, button, in_hand_mask=mask)
-        t.hand_seed = 0
-        t.hand_deck = list(deck)
-        t.fair_hand = nxt.sealed
-        t.fair_hand_meta = {
+        fair_meta = {
             "hand_no": int(t.hand_no) + 1,
             "names": [[st, _seat_name(t, st)] for st, _ in nxt.sealed.locked],
             "voids": list(nxt.voids),
         }
+        hand = HandState(hand_deck=list(deck), fair_hand=nxt.sealed, fair_hand_meta=fair_meta)
         t.fair_next = None
-        try:  # the transcript outlives the process (history, later audits)
-            pub.DB.q(
-                "INSERT OR REPLACE INTO homegame_fair(game_id,hand_no,data) VALUES(?,?,?)",
-                (t.game_id, int(t.hand_no) + 1, json.dumps(
-                    {"sealed": nxt.sealed.to_store(), "meta": t.fair_hand_meta},
-                    separators=(",", ":"))),
-            )
-        except Exception:  # noqa: BLE001 — never stop a hand over its paperwork
-            logger.exception("homegame fair transcript not stored (table %s)", t.game_id)
+        # The transcript outlives the process (history, later audits): owed, and
+        # saved with the table by the ``_persist_safe`` below — retried like the
+        # stacks if it fails (OPS-013).
+        t.unsaved.append(("fair", int(t.hand_no) + 1, json.dumps(
+            {"sealed": nxt.sealed.to_store(), "meta": fair_meta}, separators=(",", ":"))))
     else:
         seed = secrets.randbits(63)
         _, info = env.reset(seed, button, in_hand_mask=mask)
-        t.hand_seed = int(seed)
-        t.hand_deck = []
-        t.fair_hand = None
-        t.fair_hand_meta = {}
+        hand = HandState(hand_seed=int(seed))
         t.fair_next = None
-    t.hand_actions = []
-    # The engine accepted the hand — commit it to the table.
-    t.button = button
-    t.env = env
-    t.info = info
-    t.phase = "showdown" if env.is_terminal() else "in_hand"
-    t.hand_no += 1
-    t.action_seq = 0
-    t.rev += 1
-    t.turn_key = None
-    t.turn_started_mono = None
-    t.hand_start_stacks = list(stacks)
-    t.in_hand_mask = mask
+    t.deal_error = None  # (FEAT-005: whatever stopped the last automatic deal is over)
+    # The engine accepted the hand — commit it to the table: ONE fresh HandState
+    # (HGB-004: every per-hand field starts over; nothing is reset by hand).
+    hand.env, hand.info = env, info
+    hand.hand_start_stacks = list(stacks)
+    hand.in_hand_mask = mask
     # (review 2026-09-20 G2) WHO was dealt each seat — own-card visibility is
     # checked against this, never against the seat's current occupant.
-    t.dealt_user_ids = [
+    hand.dealt_user_ids = [
         s.user_id if (s is not None and mask[i]) else None
         for i, s in enumerate(t.seats)
     ]
-    t.showdown_reveal = False
-    t.last_deltas = []
-    t.last_holes = [None] * t.num_seats
-    t.rabbit_available = False
-    t.rabbit_shown = False
-    t.rabbit_played_len = 3
-    t.rabbit_full_a = []
-    t.rabbit_full_b = []
-    t.rabbit_burns = []
-    t.runout_active = False
-    t.runout_start_len = 3
-    t.runout_started_mono = None
-    t.leftover_stacks = []
-    t.terminal_pot = 0
-    t.terminal_commit = []
-    t.pot_awards = []
-    t.equity_by_len = {}
-    t.shown_seats = set()
+    t.button = button
+    t.hand = hand
+    # (``phase`` BEFORE ``hand_no``: ``_unpublished_guard`` reads the two without
+    # the lock, and this order makes a torn read hide a hand, never show one.)
+    t.phase = "showdown" if env.is_terminal() else "in_hand"
+    t.hand_no += 1
+    t.rev += 1
     t.next_deal_mono = None
-    t.bank_key = None
-    t.bank_started_mono = None
     cap = float(max(0, int(t.time_bank_secs or 0)))
     for i, p in enumerate(t.seats):
         if p is not None and mask[i]:
@@ -3011,7 +3695,10 @@ def _finish_hand_locked(t: LiveTable) -> None:
     # Engine stacks at terminal are leftover chips AFTER commits; the pot
     # is not credited back. ``payouts()`` is the chip delta vs hand start
     # (won − total_commit), zero-sum, which is what we persist.
-    payouts = [int(x) for x in t.env._rs.payouts()]
+    payouts = t.env.payouts()
+    if sum(payouts) != 0:  # (OPS-009: an engine or bookkeeping bug — say so)
+        logger.error("homegame table %s hand #%s: payouts do not sum to zero: %s",
+                     t.game_id, t.hand_no, payouts)
     t.last_deltas = list(payouts)
     folded = [bool(x) for x in raw["folded"]]
     alive = [
@@ -3023,18 +3710,16 @@ def _finish_hand_locked(t: LiveTable) -> None:
     # (review 2026-09-20 G1) Two or more live hands = showdown, cards are
     # tabled. One = everyone else folded: the winner stays face-down.
     t.showdown_reveal = len(alive) >= 2
-    holes: list[list[int] | None] = [None] * t.num_seats
-    if t.showdown_reveal:
-        all_holes = t.env.all_hole_cards()
-        for i in alive:
-            holes[i] = _sorted_hole([int(c) for c in all_holes[i]])
-    t.last_holes = holes
     for i, p in enumerate(t.seats):
         if p is not None:
             dealt = bool(t.in_hand_mask and i < len(t.in_hand_mask) and t.in_hand_mask[i])
             if dealt:
                 start = t.hand_start_stacks[i] if i < len(t.hand_start_stacks) else p.stack_chips
-                p.stack_chips = max(0, int(start) + (payouts[i] if i < len(payouts) else 0))
+                after = int(start) + (payouts[i] if i < len(payouts) else 0)
+                if after < 0:  # (OPS-009: impossible — the clamp stays, but it is reported)
+                    logger.error("homegame table %s hand #%s seat %d: negative stack %d (start %d)",
+                                 t.game_id, t.hand_no, i, after, int(start))
+                p.stack_chips = max(0, after)
             if p.sit_out_next:  # "sit out next hand" takes effect now
                 p.sit_out_next = False
                 p.sitting_out = True
@@ -3046,8 +3731,8 @@ def _finish_hand_locked(t: LiveTable) -> None:
     t.bank_started_mono = None
     t.next_deal_mono = None
     t.rev += 1
+    _record_hand_locked(t, raw, payouts, folded)  # owed: saved WITH the stacks
     _persist_safe(t)
-    _record_hand_locked(t, raw, payouts, folded)
     _settle_locked(t)  # no-op while an all-in runout is still revealing
     _flush_result_locked(t)
     _fair_prepare_locked(t)
@@ -3056,7 +3741,9 @@ def _finish_hand_locked(t: LiveTable) -> None:
 def _record_hand_locked(
     t: LiveTable, raw: dict[str, Any], payouts: list[int], folded: list[bool]
 ) -> None:
-    """Persist the finished hand (history + per-player results) and queue its
+    """Build the finished hand's record (history + per-player results + who
+    paid whom + its grading job) as an OWED write — committed together with the
+    stacks by the ``_persist_safe`` that follows (OPS-006) — and queue its
     one-line result for the event feed. Cosmetic: a failure here must never
     stop the hand from finishing.
 
@@ -3072,6 +3759,10 @@ def _record_hand_locked(
         full_b = [int(c) for c in (raw.get("board_b") or [])]
         n_board = len(full_a) if t.showdown_reveal else max(3, int(t.rabbit_played_len or 3))
         commit = [int(x) for x in (raw.get("total_commit") or [])]
+        # every dealt seat's result in cents, summing to zero like the chips (OPS-015)
+        dealt_seats = [i for i in range(t.num_seats) if mask[i] and dealt[i] is not None]
+        hand_cents = dict(zip(dealt_seats, zero_sum_cents(
+            [int(payouts[i]) if i < len(payouts) else 0 for i in dealt_seats], t.bb_cents)))
         # PLO67: the burns turned up while the hand was played (one per street)
         played_burns = [int(c) for c in (raw.get("burns") or [])][: max(0, n_board - 2)] if t.burns else []
         seats = []
@@ -3083,7 +3774,7 @@ def _record_hand_locked(
             name = p.name if (p is not None and p.user_id == dealt[i]) else None
             if name is None:
                 u = pub._user_by_id(int(dealt[i]))
-                name = _display_name(u) if u is not None else f"player-{dealt[i]}"
+                name = _display_name(u, t.club_id) if u is not None else f"Player {dealt[i]}"
             delta = int(payouts[i]) if i < len(payouts) else 0
             start = int(t.hand_start_stacks[i]) if i < len(t.hand_start_stacks) else 0
             is_folded = bool(folded[i]) if i < len(folded) else True
@@ -3093,7 +3784,7 @@ def _record_hand_locked(
                 "name": name,
                 "start_cents": chips_to_cents(start, t.bb_cents),
                 "start_chips": start,
-                "delta_cents": chips_to_cents(delta, t.bb_cents),
+                "delta_cents": hand_cents.get(i, 0),
                 "folded": is_folded,
                 "shown": bool(t.showdown_reveal and not is_folded),
                 "hole": _sorted_hole([int(c) for c in all_holes[i]]) if i < len(all_holes) else [],
@@ -3104,7 +3795,7 @@ def _record_hand_locked(
                 seats[-1]["hole_seq"] = [int(c) for c in all_holes[i]]
                 seats[-1]["counts"] = [_hole_count_on(t, i, st) for st in (1, 2, 3)]
             if delta > 0:
-                winners.append((name, chips_to_cents(delta, t.bb_cents)))
+                winners.append((name, hand_cents.get(i, 0)))
         pot_cents = chips_to_cents(sum(commit), t.bb_cents)
         actions = _history_entries(raw, t.bb_cents)
         for k, a in enumerate(actions):  # who decided: the player, or the clock
@@ -3121,6 +3812,7 @@ def _record_hand_locked(
             full_a, full_b, t.button,
         )
         record = {
+            "v": HAND_RECORD_VERSION,
             "hand_no": int(t.hand_no),
             "ended_at": pub._now(),
             "variant": _norm_game(t.variant),
@@ -3165,29 +3857,19 @@ def _record_hand_locked(
             ],
             "seats": seats,
         }
-        with pub.DB.transaction():
-            pub.DB.q(
-                "INSERT OR REPLACE INTO homegame_hands(game_id,hand_no,ended_at,"
-                "pot_cents,summary) VALUES(?,?,?,?,?)",
-                (t.game_id, int(t.hand_no), record["ended_at"], pot_cents,
-                 json.dumps(record, separators=(",", ":"))),
-            )
-            for s in seats:
-                pub.DB.q(
-                    "INSERT OR REPLACE INTO homegame_hand_results(game_id,hand_no,"
-                    "user_id,delta_cents,showdown) VALUES(?,?,?,?,?)",
-                    (t.game_id, int(t.hand_no), s["user_id"], s["delta_cents"],
-                     1 if s["shown"] else 0),
-                )
-            uid_of = {s["seat"]: s["user_id"] for s in seats}
-            for (a, b), v in flows.items():
-                if a in uid_of and b in uid_of and v > 0:
-                    pub.DB.q(
-                        "INSERT OR REPLACE INTO homegame_flows(game_id,hand_no,payer,"
-                        "payee,chips) VALUES(?,?,?,?,?)",
-                        (t.game_id, int(t.hand_no), uid_of[a], uid_of[b], int(v)),
-                    )
-        _enqueue_grading(t, mask, uid_of)
+        uid_of = {s["seat"]: s["user_id"] for s in seats}
+        t.unsaved.append(("hand", {
+            "record": record,
+            "results": [
+                {"user_id": s["user_id"], "delta_cents": s["delta_cents"],
+                 "delta_chips": int(payouts[s["seat"]]) if s["seat"] < len(payouts) else 0,
+                 "shown": s["shown"]}
+                for s in seats
+            ],
+            "flows": [(uid_of[a], uid_of[b], int(v)) for (a, b), v in flows.items()
+                      if a in uid_of and b in uid_of and v > 0],
+            "job": _grading_job(t, mask, uid_of),
+        }))
         t.pending_result = {
             "hand_no": int(t.hand_no),
             # Net winners; a hand where everyone got their money back (one
@@ -3201,63 +3883,148 @@ def _record_hand_locked(
 
 # --- background grading ------------------------------------------------------------
 
-_GRADE_Q: "queue.Queue[dict | None]" = queue.Queue()
-_GRADE_THREAD: threading.Thread | None = None
 
 
-def _enqueue_grading(t: LiveTable, mask: list[bool], uid_of: dict[int, int]) -> None:
-    """Hand over a finished hand to the grader (cheap: a snapshot of plain
-    values — the worker never touches the live table). Only games the network
-    knows are graded: there is no PLO6 network (yet)."""
+def _grading_job(t: LiveTable, mask: list[bool], uid_of: dict[int, int]) -> dict[str, Any] | None:
+    """What the grader needs to replay a finished hand (plain values — the worker
+    never touches the live table), or None when it is not graded. Only games the
+    network knows are graded: there is no PLO6 network (yet)."""
     if not GRADING_ON or not t.game["graded"] or not t.hand_actions or not (t.hand_seed or t.hand_deck):
-        return
-    _GRADE_Q.put({
-        "game_id": t.game_id, "hand_no": int(t.hand_no), "seed": int(t.hand_seed),
+        return None
+    job = {
+        "game_id": t.game_id, "hand_no": int(t.hand_no),
         "variant": _norm_game(t.variant),
         "deck": list(t.hand_deck or []),
         "button": int(t.button), "num_seats": int(t.num_seats),
         "stacks": [int(x) for x in (t.hand_start_stacks or [])],
         "ante": int(t.ante_chips), "mask": [bool(x) for x in mask],
-        "actions": list(t.hand_actions), "uid_of": dict(uid_of),
-    })
+        "actions": [list(a) for a in t.hand_actions], "uid_of": {str(k): v for k, v in uid_of.items()},
+    }
+    if not job["deck"]:
+        job["seed"] = int(t.hand_seed)  # (memory only: a seed is never persisted)
+    return job
+
+
+# The grading queue (OPS-016): bounded in memory; a job with a deck is ALSO in
+# homegame_grade_jobs from the moment its hand is saved until its grades are, so
+# neither a restart nor a full queue loses it — the grader sweeps the table for
+# jobs it does not hold (at start, and every GRADE_SWEEP_S while idle).
+GRADE_QUEUE_MAX = 200
+GRADE_MAX_ATTEMPTS = 3
+GRADE_SWEEP_S = 30.0
+
+
+def _queue_grading(job: dict[str, Any]) -> None:
+    key = (str(job["game_id"]), int(job["hand_no"]))
+    with CTX.grade_lock:
+        if key in CTX.grade_queued:
+            return
+        if len(CTX.grade_queued) >= GRADE_QUEUE_MAX:
+            if not job.get("deck"):  # memory only: it cannot wait for a sweep
+                logger.warning("homegame grading queue full: hand %s #%s not graded", *key)
+                _store_grades(job, [], note="not graded (the grading queue was full)")
+            return
+        CTX.grade_queued.add(key)
+    CTX.grade_q.put(job)
     _start_grader()
 
 
-def _start_grader() -> None:
-    global _GRADE_THREAD
-    if _GRADE_THREAD is not None and _GRADE_THREAD.is_alive():
-        return
-    _GRADE_THREAD = threading.Thread(target=_grader_loop, name="homegame-grader", daemon=True)
-    _GRADE_THREAD.start()
-
-
-def _grader_loop() -> None:
-    while not _WATCHDOG_STOP.is_set():
+def _sweep_grade_jobs() -> int:
+    """Queue saved jobs the grader does not hold yet (after a restart, or once a
+    full queue has drained). Returns how many were queued."""
+    n = 0
+    if _grading_model() is None:
+        return 0  # nothing to grade with yet: the jobs wait
+    for r in pub.DB.q(
+        "SELECT job FROM homegame_grade_jobs ORDER BY created_at, game_id, hand_no LIMIT ?",
+        (GRADE_QUEUE_MAX,),
+    ):
         try:
-            job = _GRADE_Q.get(timeout=0.5)
+            job = json.loads(r["job"])
+        except ValueError:
+            continue
+        with CTX.grade_lock:
+            if (str(job["game_id"]), int(job["hand_no"])) in CTX.grade_queued:
+                continue
+        _queue_grading(job)
+        n += 1
+    return n
+
+
+def _start_grader() -> None:
+    if CTX.grade_thread is not None and CTX.grade_thread.is_alive():
+        return
+    CTX.grader_stop.clear()
+    CTX.grade_thread = threading.Thread(target=_grader_loop, args=(CTX,), name="homegame-grader", daemon=True)
+    CTX.grade_thread.start()
+
+
+def _grader_loop(ctx: HomeGames | None = None) -> None:
+    ctx = ctx or CTX  # (a swapped context never steals a running grader)
+    next_sweep = 0.0  # (at once: jobs saved before a restart)
+    while not ctx.grader_stop.is_set():
+        if time.monotonic() >= next_sweep and ctx.grade_q.empty():
+            next_sweep = time.monotonic() + GRADE_SWEEP_S
+            try:
+                _sweep_grade_jobs()
+            except Exception:  # noqa: BLE001
+                logger.exception("homegame grading sweep")
+        try:
+            job = ctx.grade_q.get(timeout=0.5)
         except queue.Empty:
             continue
         if job is None:
+            ctx.grade_q.task_done()
             return
         try:
-            _store_grades(job, grade_hand(job))
-        except Exception:  # noqa: BLE001 — cosmetic; never take the table down
-            logger.exception("homegame grading failed (%s #%s)", job.get("game_id"), job.get("hand_no"))
+            _grade_job(job)
         finally:
-            _GRADE_Q.task_done()
+            with ctx.grade_lock:
+                ctx.grade_queued.discard((str(job["game_id"]), int(job["hand_no"])))
+            ctx.grade_q.task_done()
 
 
-def grade_hand(job: dict[str, Any]) -> list[dict[str, Any]]:
+def _grade_job(job: dict[str, Any]) -> None:
+    """Grade one hand. A replay that fails is tried again later (up to
+    GRADE_MAX_ATTEMPTS: a model being reloaded, say); then the hand is settled
+    with no marks and a note — never left "still being worked out" (OPS-016)."""
+    try:
+        grades = grade_hand(job)
+    except NoGradingModel:
+        return  # (saved jobs wait for a real model; see NoGradingModel)
+    except Exception:  # noqa: BLE001 — cosmetic; never take the table down
+        logger.exception("homegame grading failed (%s #%s)", job.get("game_id"), job.get("hand_no"))
+        attempts = GRADE_MAX_ATTEMPTS
+        if job.get("deck"):
+            with pub.DB.transaction():
+                pub.DB.q(
+                    "UPDATE homegame_grade_jobs SET attempts=attempts+1 WHERE game_id=? AND hand_no=?",
+                    (job["game_id"], int(job["hand_no"])),
+                )
+                row = pub.DB.one(
+                    "SELECT attempts FROM homegame_grade_jobs WHERE game_id=? AND hand_no=?",
+                    (job["game_id"], int(job["hand_no"])),
+                )
+            attempts = int(row["attempts"]) if row is not None else GRADE_MAX_ATTEMPTS
+        if attempts >= GRADE_MAX_ATTEMPTS:
+            _store_grades(job, [], note="could not be graded")
+        return
+    _store_grades(job, grades)
+
+
+def grade_hand(job: dict[str, Any], model: Any = None) -> list[dict[str, Any]]:
     """Replay the hand in a full-observation env and score every PLAYER decision
     with the Trainer's scorer against the served PLO5 model's node distribution
     (each node from the actor's own seat — exactly what Study would show them)."""
     from plo5bp.sizing import PLO_ANCHOR_SPEC
-    from plo5bp.ui import server as srv
     from plo5bp.ui import trainer as tr
 
     if not GAMES[_norm_game(job.get("variant"))]["graded"]:
         return []  # (never queued; a PLO5 network must never grade another game)
-    model = srv.MODEL
+    if model is None:
+        model = _grading_model()
+    if model is None:
+        raise NoGradingModel()
     device = next(model.parameters()).device
     cfg = GameConfig(
         num_seats=job["num_seats"], starting_stack=0,
@@ -3295,39 +4062,57 @@ def grade_hand(job: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
-def _store_grades(job: dict[str, Any], grades: list[dict[str, Any]]) -> None:
-    row = pub.DB.one(
-        "SELECT summary FROM homegame_hands WHERE game_id=? AND hand_no=?",
-        (job["game_id"], job["hand_no"]),
-    )
-    if row is None:
-        return
-    rec = json.loads(row["summary"])
-    rec["grades"] = grades
-    per_seat: dict[int, list[float]] = {}
-    for g in grades:
-        per_seat.setdefault(int(g["seat"]), []).append(float(g["score"]))
+@contextmanager
+def _edit_hand_record(game_id: str, hand_no: int) -> Iterator[dict[str, Any] | None]:
+    """Read-change-write ONE stored hand record atomically (OPS-007: ``/show``
+    and the grader each read the JSON, changed one field and wrote it all back,
+    so a Show landing just as the grades did could erase the other's change).
+    Yields the record (None if there is none) inside a transaction — the
+    database lock is held throughout — and writes it back when the block ends."""
     with pub.DB.transaction():
-        pub.DB.q(
-            "UPDATE homegame_hands SET summary=? WHERE game_id=? AND hand_no=?",
-            (json.dumps(rec, separators=(",", ":")), job["game_id"], job["hand_no"]),
+        row = pub.DB.one(
+            "SELECT summary FROM homegame_hands WHERE game_id=? AND hand_no=?",
+            (game_id, int(hand_no)),
         )
-        for seat, scores in per_seat.items():
-            uid = job["uid_of"].get(seat)
-            if uid is None:
-                continue
+        rec = json.loads(row["summary"]) if row is not None else None
+        yield rec
+        if rec is not None:
             pub.DB.q(
-                "UPDATE homegame_hand_results SET acc_sum=?, acc_n=? "
-                "WHERE game_id=? AND hand_no=? AND user_id=?",
-                (float(sum(scores)), len(scores), job["game_id"], job["hand_no"], int(uid)),
+                "UPDATE homegame_hands SET summary=? WHERE game_id=? AND hand_no=?",
+                (json.dumps(rec, separators=(",", ":")), game_id, int(hand_no)),
             )
 
 
+def _store_grades(job: dict[str, Any], grades: list[dict[str, Any]], *, note: str | None = None) -> None:
+    """The hand's marks (and each player's accuracy) land and its saved job is
+    done — in one transaction."""
+    per_seat: dict[int, list[float]] = {}
+    for g in grades:
+        per_seat.setdefault(int(g["seat"]), []).append(float(g["score"]))
+    uid_of = {int(k): v for k, v in (job.get("uid_of") or {}).items()}
+    with _edit_hand_record(job["game_id"], job["hand_no"]) as rec:
+        if rec is not None:
+            rec["grades"] = grades
+            if note:
+                rec["grades_note"] = note
+            for seat, scores in per_seat.items():
+                uid = uid_of.get(seat)
+                if uid is None:
+                    continue
+                pub.DB.q(
+                    "UPDATE homegame_hand_results SET acc_sum=?, acc_n=? "
+                    "WHERE game_id=? AND hand_no=? AND user_id=?",
+                    (float(sum(scores)), len(scores), job["game_id"], job["hand_no"], int(uid)),
+                )
+        pub.DB.q("DELETE FROM homegame_grade_jobs WHERE game_id=? AND hand_no=?",
+                 (job["game_id"], int(job["hand_no"])))
+
+
 def wait_for_grading(timeout: float = 20.0) -> bool:
-    """Tests: block until the grader has drained its queue."""
+    """Block until the grader has drained its queue (tests; the shutdown hook)."""
     end = time.monotonic() + timeout
     while time.monotonic() < end:
-        if _GRADE_Q.unfinished_tasks == 0:
+        if CTX.grade_q.unfinished_tasks == 0:
             return True
         time.sleep(0.05)
     return False
@@ -3336,7 +4121,7 @@ def wait_for_grading(timeout: float = 20.0) -> bool:
 def _flush_result_locked(t: LiveTable) -> None:
     """Release the finished hand's result line — only once its runout has
     finished revealing (review 2026-09-20 G11: nothing runs ahead of it)."""
-    pending = getattr(t, "pending_result", None)
+    pending = t.pending_result
     if not pending or _runout_blocking(t):
         return
     t.pending_result = None
@@ -3388,7 +4173,7 @@ def _capture_rabbit(t: LiveTable, played_len: int) -> None:
     holes: list[list[int] | None] = [None] * t.num_seats
     for i in alive:
         if i < len(all_holes):
-            holes[i] = [int(c) for c in all_holes[i]]
+            holes[i] = [int(c) for c in all_holes[i]]  # (build_awards: the hands at the river)
     folded_full = [True] * t.num_seats
     for i in alive:
         folded_full[i] = False
@@ -3399,16 +4184,13 @@ def _capture_rabbit(t: LiveTable, played_len: int) -> None:
         holes,
         folded_full,
         commit[: t.num_seats],
-        full_a if len(full_a) >= 3 else full_a,
-        full_b if len(full_b) >= 3 else full_b,
+        full_a,
+        full_b,
         t.button,
     )
     # The award steps carry the index of the pot they pay from (``build_awards``).
     t.pots = _named_pots(display_pots(commit[: t.num_seats], folded_full))
-    if t.burns:
-        _compute_plo67_equities(t, alive, full_a, full_b)
-    else:
-        _compute_runout_equities(t, {i: holes[i] for i in alive if holes[i]}, full_a, full_b)
+    _compute_runout_equities(t, alive, full_a, full_b)
 
 
 def _named_pots(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3447,10 +4229,33 @@ def _live_pots(raw: dict[str, Any], in_hand: list[bool], n: int) -> list[dict[st
     return _named_pots(display_pots(middle, gone))
 
 
+def _hand_on(t: LiveTable, seat: int, cards: list[int], board_len: int) -> list[int]:
+    """The hole cards ``seat`` held when the boards showed ``board_len`` cards: all
+    of them, except in PLO67 — there only the ones dealt by then (a red burn
+    still to come deals the rest). ``cards`` in deal order."""
+    if not t.burns or board_len >= 5:
+        return list(cards)
+    return list(cards)[: _hole_count_on(t, seat, max(3, board_len) - 2)]
+
+
+def _street_equities(t: LiveTable, holes: dict[int, list[int]], ba: list[int], bb: list[int],
+                     seed: int) -> dict[int, dict[str, float]]:
+    """{seat: {"a": share, "b": share}} with the boards at ``ba`` / ``bb``: PLO5 and
+    PLO6 enumerate every runout of each board (``runout.board_equities``);
+    PLO67 samples whole runouts the way the game deals them — burns still to
+    come, the cards red ones deal, the boards (``runout.plo67_equities``, Rust),
+    with the burns up so far dead."""
+    if t.burns:
+        return plo67_equities(holes, ba, bb, list(t.rabbit_burns)[: max(0, len(ba) - 2)],
+                              samples=PLO67_EQ_SAMPLES, seed=seed)
+    return board_equities(holes, ba, bb, seed=seed)
+
+
 def _compute_runout_equities(
-    t: LiveTable, alive_holes: dict[int, list[int]], full_a: list[int], full_b: list[int]
+    t: LiveTable, alive: list[int], full_a: list[int], full_b: list[int]
 ) -> None:
-    """Per-board equities for every street the runout will show.
+    """Per-board equities for every street the runout will show, each from the
+    ALIVE hands as they were on that street (HGB-024: one loop for every game).
 
     (review 2026-09-20 G3) ONCE per all-in hand, here, from the ALIVE seats'
     holes. It used to run inside every poll under the table lock, from the
@@ -3458,18 +4263,18 @@ def _compute_runout_equities(
     a contender (wrong numbers) and the per-viewer cache key made
     alternating polls recompute 0.5-2.9 s of pure Python each time. With the
     per-board marginal enumeration in runout.py the whole thing is ~0.1 s
-    worst case (a flop all-in), a few ms from the turn. Cosmetic: a failure
-    here must never stop the hand from finishing."""
+    worst case (a flop all-in), a few ms from the turn; PLO67's sampler ~10 ms
+    a street. Cosmetic: a failure here must never stop the hand from finishing."""
     t.equity_by_len = {}
-    if len(alive_holes) < 2:
+    if len(alive) < 2 or t.env is None:
         return
     try:
+        all_holes = t.env.all_hole_cards()
         for n in range(max(3, int(t.runout_start_len or 3)), 6):
             ba, bb = full_a[:n], full_b[:n]
+            holes = {i: _hand_on(t, i, [int(c) for c in all_holes[i]], n) for i in alive if i < len(all_holes)}
             seed = zlib.crc32(f"{t.game_id}:{t.hand_no}:{n}".encode())
-            t.equity_by_len[(len(ba), len(bb))] = board_equities(
-                alive_holes, ba, bb, seed=seed
-            )
+            t.equity_by_len[(len(ba), len(bb))] = _street_equities(t, holes, ba, bb, seed)
     except Exception:  # noqa: BLE001
         logger.exception("runout equities failed (table %s)", t.game_id)
         t.equity_by_len = {}
@@ -3480,41 +4285,14 @@ def _all_burns(t: LiveTable) -> list[int]:
     view trims them to the streets shown). [] for every other game."""
     if not t.burns or t.env is None:
         return []
-    fn = getattr(t.env._rs, "all_burns", None)
-    return [int(c) for c in fn()] if fn is not None else []
+    return t.env.all_burns()
 
 
 def _hole_count_on(t: LiveTable, seat: int, street: int) -> int:
     """PLO67: the hole cards ``seat`` held on ``street`` (1 flop, 2 turn,
     3 river) — the engine's own count (a seat's extras are a prefix of the red
     burns it was in the hand for)."""
-    return int(t.env._rs.hole_count_on(int(seat), int(street)))
-
-
-def _compute_plo67_equities(
-    t: LiveTable, alive: list[int], full_a: list[int], full_b: list[int]
-) -> None:
-    """PLO67's per-street runout equities: on each street the runout will show,
-    every alive hand as it was THEN, the burns up so far dead, and the rest —
-    burns still to come, the cards the red ones deal, the boards — sampled the
-    way the game deals them (``runout.plo67_equities``, Rust). Once per hand,
-    like ``_compute_runout_equities``; cosmetic, a failure never stops a hand."""
-    t.equity_by_len = {}
-    if len(alive) < 2 or t.env is None:
-        return
-    try:
-        all_holes = t.env.all_hole_cards()
-        burns = list(t.rabbit_burns)
-        for n in range(max(3, int(t.runout_start_len or 3)), 6):
-            holes = {i: [int(c) for c in all_holes[i]][: _hole_count_on(t, i, n - 2)] for i in alive}
-            seed = zlib.crc32(f"{t.game_id}:{t.hand_no}:{n}".encode())
-            t.equity_by_len[(n, n)] = plo67_equities(
-                holes, full_a[:n], full_b[:n], burns[: n - 2],
-                samples=PLO67_EQ_SAMPLES, seed=seed,
-            )
-    except Exception:  # noqa: BLE001
-        logger.exception("PLO67 runout equities failed (table %s)", t.game_id)
-        t.equity_by_len = {}
+    return t.env.hole_count_on(seat, street)
 
 
 def _rabbit_locked(t: LiveTable, uid: int) -> None:
@@ -3584,6 +4362,8 @@ def _apply_action_locked(
     t.action_seq += 1
     t.rev += 1
     if done:
+        # (the runout is set up BEFORE the hand is finished and its result written:
+        # ``_unpublished_guard`` relies on that order, see there)
         _capture_rabbit(t, pre_len)
         _finish_hand_locked(t)
     else:
@@ -3599,7 +4379,7 @@ def _act_locked(t: LiveTable, uid: int, gate: int, raise_chips: int) -> None:
     actor = t.env.current_actor()
     seat = t.seat_of(uid)
     if actor is None or seat is None or actor != seat:
-        raise HTTPException(status_code=400, detail="not your turn")
+        raise HTTPException(status_code=409, detail="not your turn")  # (a race, not a bad request — HGB-022)
     me = t.seats[seat]
     _apply_action_locked(t, gate, raise_chips, by_player=True)
     if me is not None:
@@ -3641,12 +4421,11 @@ def _sit_locked(
     if seat < 0 or seat >= t.num_seats:
         raise HTTPException(status_code=400, detail="invalid seat")
     if t.seats[seat] is not None:
-        raise HTTPException(status_code=400, detail="seat taken")
+        raise HTTPException(status_code=409, detail="seat taken")
     existing = t.seat_of(int(user["id"]))
     if existing is not None:
         raise HTTPException(status_code=400, detail="already seated")
-    if buyin_cents < t.bb_cents:
-        raise HTTPException(status_code=400, detail="buy-in must be at least 1 bb")
+    _check_amount(t, buyin_cents)
     _check_buyin_limits(t, buyin_cents, 0)
     chips = cents_to_chips(buyin_cents, t.bb_cents)
     prev = pub.DB.one(
@@ -3665,34 +4444,26 @@ def _sit_locked(
         raise HTTPException(
             status_code=400, detail=f"that seat is reserved for {holder['name']}"
         )
-    prev_auto = 0
-    if prev is not None:
-        try:
-            prev_auto = int(prev["auto_stack_cents"] or 0)
-        except (KeyError, IndexError, TypeError):
-            prev_auto = 0
     if t.auto_stack_mode == "host":
         auto = int(t.auto_stack_all_cents or 0)
     else:
-        auto = prev_auto
+        auto = int(prev["auto_stack_cents"] or 0) if prev is not None else 0
     if t.topup_mode == "host":
         top = (int(t.topup_all_target_cents or 0), int(t.topup_all_below_cents or 0))
+    elif prev is not None:
+        top = (int(prev["topup_target_cents"] or 0), int(prev["topup_below_cents"] or 0))
     else:
-        top = (
-            _row_int(prev, "topup_target_cents", 0) if prev is not None else 0,
-            _row_int(prev, "topup_below_cents", 0) if prev is not None else 0,
-        )
+        top = (0, 0)
     p = Seat(
         user_id=int(user["id"]),
-        name=_display_name(user),
-        email=user["email"],
+        name=_display_name(user, t.club_id),
         stack_chips=chips,
         sitting_out=False,
         buyin_cents=prev_buyin + buyin_cents,
         leftover_cents=leftover,
         auto_stack_cents=auto,
         time_bank_left=float(max(0, int(t.time_bank_secs or 0))),
-        trusted=bool(trust) or (bool(_row_int(prev, "trusted", 0)) if prev is not None else False),
+        trusted=bool(trust) or (bool(prev["trusted"]) if prev is not None else False),
         topup_target_cents=top[0],
         topup_below_cents=top[1],
     )
@@ -3705,6 +4476,29 @@ def _sit_locked(
         _persist_player(t, seat, p, True)
     _sync_idle_stack(t, seat)
     _emit(t, "join", f"{p.name} sat down with {_fmt_cents(buyin_cents)}", seat=seat)
+
+
+def _more_than_ante(t: LiveTable, cents: int) -> bool:
+    """Would a stack worth ``cents`` be dealt in (it must hold more than the ante)?"""
+    return int(cents) > int(t.ante_cents) and cents_to_chips(int(cents), t.bb_cents) > t.ante_chips
+
+
+def _check_amount(t: LiveTable, cents: int, stack_cents: int = 0, *, what: str = "buy-in") -> None:
+    """The floor and ceiling of any money brought to the table: at least 1 bb,
+    no absurd amount, and — so the seat can actually be dealt in (OPS-005: a $1
+    buy-in at a $3-ante table seated someone who was never dealt a hand) —
+    enough that the stack holds more than the ante afterwards."""
+    cents = int(cents)
+    if cents < t.bb_cents:
+        raise HTTPException(status_code=400, detail=f"{what} must be at least 1 bb")
+    if cents > MAX_CENTS:
+        raise HTTPException(status_code=400, detail=f"that {what} is too large")
+    if not _more_than_ante(t, int(stack_cents) + cents):
+        raise HTTPException(
+            status_code=400,
+            detail=(f"{what} must be more than the ante ({_fmt_cents(int(t.ante_cents))})" if not stack_cents
+                    else f"add enough to have more than the ante ({_fmt_cents(int(t.ante_cents))})"),
+        )
 
 
 def _check_buyin_limits(
@@ -3754,13 +4548,12 @@ def _request_locked(t: LiveTable, user: Any, kind: str, seat: int | None, cents:
     (a new one replaces it); a sit request holds its seat."""
     _require_open(t)
     uid = int(user["id"])
-    if cents < t.bb_cents:
-        raise HTTPException(status_code=400, detail="buy-in must be at least 1 bb")
     if kind == "sit":
+        _check_amount(t, cents)
         if seat is None or seat < 0 or seat >= t.num_seats:
             raise HTTPException(status_code=400, detail="invalid seat")
         if t.seats[seat] is not None:
-            raise HTTPException(status_code=400, detail="seat taken")
+            raise HTTPException(status_code=409, detail="seat taken")
         if t.seat_of(uid) is not None:
             raise HTTPException(status_code=400, detail="already seated")
         if any(r["kind"] == "sit" and r["seat"] == seat and r["user_id"] != uid for r in t.requests):
@@ -3772,6 +4565,7 @@ def _request_locked(t: LiveTable, user: Any, kind: str, seat: int | None, cents:
             raise HTTPException(status_code=400, detail="not seated")
         seat = t.seat_of(uid)
         have = chips_to_cents(p.stack_chips, t.bb_cents) + int(p.queued_topup_cents or 0)
+        _check_amount(t, cents, have, what="top-up")
         _check_buyin_limits(t, cents, have, fresh=False)
     # The same request again (a double tap, an impatient second tap) is not news:
     # the host used to get one "asks to" toast per tap, stacked over the table.
@@ -3782,7 +4576,7 @@ def _request_locked(t: LiveTable, user: Any, kind: str, seat: int | None, cents:
     if len(t.requests) >= MAX_REQUESTS:
         raise HTTPException(status_code=429, detail="too many pending requests")
     t.request_seq += 1
-    name = _display_name(user)
+    name = _display_name(user, t.club_id)
     t.requests.append({
         "id": t.request_seq, "user_id": uid, "name": name, "kind": kind,
         "seat": seat, "amount_cents": int(cents), "ts": time.time(),
@@ -3824,41 +4618,67 @@ def _resolve_request_locked(
 ) -> None:
     """Approve / decline a buy-in request. ``amount_cents`` lets the host approve
     a DIFFERENT amount than the one asked for (asked $150, seated with $80): the
-    player is told, and the usual buy-in limits apply to the new amount."""
+    player is told, and the usual buy-in limits apply to the new amount.
+
+    (HGB-001) The chips move FIRST; only then is the request taken off the list
+    and the approval announced. A buy-in that no longer fits (the host changed
+    the limits since) is an error for the host and the request stays — it used
+    to vanish after the table had already seen "approved"."""
     _require_open(t)
-    if uid != t.host_user_id:
-        raise HTTPException(status_code=400, detail="only the host can approve buy-ins")
+    _require_host(t, uid, "approve buy-ins")
     req = next((r for r in t.requests if r["id"] == int(req_id)), None)
     if req is None:
         raise HTTPException(status_code=404, detail="that request is gone")
-    cents = int(req["amount_cents"])
-    if approve and amount_cents is not None and int(amount_cents) != cents:
-        cents = int(amount_cents)
-        if cents < t.bb_cents or cents > MAX_CENTS:
-            raise HTTPException(status_code=400, detail="buy-in must be at least 1 bb")
-    t.requests = [r for r in t.requests if r["id"] != req["id"]]
-    t.rev += 1
+    asked = int(req["amount_cents"])
+    cents = asked if (not approve or amount_cents is None) else int(amount_cents)
     if not approve:
+        t.requests = [r for r in t.requests if r["id"] != req["id"]]
+        t.rev += 1
         _emit(t, "request", f"Host declined {req['name']}'s request")
         return
     user = pub._user_by_id(int(req["user_id"]))
     if user is None:
+        t.requests = [r for r in t.requests if r["id"] != req["id"]]
+        t.rev += 1
         raise HTTPException(status_code=404, detail="that player no longer exists")
-    if cents != int(req["amount_cents"]):
-        _emit(t, "request", f"Host approved {req['name']} for {_fmt_cents(cents)} (asked {_fmt_cents(int(req['amount_cents']))})")
-    if req["kind"] == "sit":
-        _sit_locked(t, user, int(req["seat"]), cents, trust=trust)
-    else:
-        if trust:
-            _set_trust_locked(t, uid, int(req["user_id"]), True)
-        _topup_locked(t, int(req["user_id"]), cents, queue_ok=True)
+    # The request's seat reservation must not block its own sit: it is set aside
+    # while the chips move, and put back if they cannot.
+    t.requests = [r for r in t.requests if r["id"] != req["id"]]
+    try:
+        if req["kind"] == "sit":
+            _sit_locked(t, user, int(req["seat"]), cents, trust=trust)
+        else:
+            _topup_locked(t, int(req["user_id"]), cents, queue_ok=True)
+            if trust:
+                _set_trust_locked(t, uid, int(req["user_id"]), True)
+    except BaseException:
+        t.requests.append(req)
+        t.requests.sort(key=lambda r: r["id"])
+        raise
+    t.rev += 1
+    if cents != asked:
+        _emit(t, "request", f"Host approved {req['name']} for {_fmt_cents(cents)} (asked {_fmt_cents(asked)})")
+
+
+def _let_through_locked(t: LiveTable, host_uid: int, requests: list[dict]) -> None:
+    """Approve requests nobody needs to approve any more (approval switched off,
+    the player now trusted). One that no longer fits — the limits changed since
+    it was asked — is dropped and the table is told why (HGB-001: it used to
+    vanish without a word)."""
+    for r in requests:
+        try:
+            _resolve_request_locked(t, host_uid, r["id"], True, False)
+        except HTTPException as e:
+            if any(x["id"] == r["id"] for x in t.requests):
+                t.requests = [x for x in t.requests if x["id"] != r["id"]]
+                t.rev += 1
+            _emit(t, "request", f"{r['name']}'s request could not go through: {e.detail}")
 
 
 def _set_trust_locked(t: LiveTable, uid: int, target_uid: int, on: bool) -> None:
     """Trusted players buy in, top up and auto top-up without asking."""
     _require_open(t)
-    if uid != t.host_user_id:
-        raise HTTPException(status_code=400, detail="only the host can trust a player")
+    _require_host(t, uid, "trust a player")
     target_uid = int(target_uid)
     p = t.player(target_uid)
     with _mutation(t):
@@ -3876,13 +4696,8 @@ def _set_trust_locked(t: LiveTable, uid: int, target_uid: int, on: bool) -> None
                 "UPDATE homegame_players SET trusted=? WHERE game_id=? AND user_id=?",
                 (1 if on else 0, t.game_id, target_uid),
             )
-    if on:
-        # whatever they were waiting for goes through now
-        for r in [r for r in t.requests if r["user_id"] == target_uid]:
-            try:
-                _resolve_request_locked(t, uid, r["id"], True, False)
-            except HTTPException:
-                pass
+    if on:  # whatever they were waiting for goes through now
+        _let_through_locked(t, uid, [r for r in t.requests if r["user_id"] == target_uid])
 
 
 def _topup_locked(t: LiveTable, uid: int, amount_cents: int, *, queue_ok: bool) -> None:
@@ -3895,9 +4710,8 @@ def _topup_locked(t: LiveTable, uid: int, amount_cents: int, *, queue_ok: bool) 
         _rebuy_locked(t, uid, amount_cents)
         return
     _require_open(t)
-    if amount_cents < t.bb_cents:
-        raise HTTPException(status_code=400, detail="rebuy must be at least 1 bb")
     have = chips_to_cents(p.stack_chips, t.bb_cents) + int(p.queued_topup_cents or 0)
+    _check_amount(t, amount_cents, have, what="top-up")
     _check_buyin_limits(t, amount_cents, have, fresh=False)
     if p.buyin_cents + p.queued_topup_cents + amount_cents > MAX_CENTS:
         raise HTTPException(status_code=400, detail="buy-in limit reached")
@@ -3945,7 +4759,7 @@ def _remove_chips_locked(t: LiveTable, uid: int, amount_cents: int, *, queue_ok:
         moved = min(cents_to_chips(amount_cents, t.bb_cents), int(p.stack_chips))
         p.stack_chips -= moved
         p.leftover_cents += amount_cents
-        _ledger_add(t, uid, "cashout", amount_cents)
+        _ledger_add(t, uid, "take_off", amount_cents)
         _persist_player(t, i, p, True)
     _sync_idle_stack(t, i)
     _emit(t, "cashout", f"{p.name} took {_fmt_cents(amount_cents)} off the table", seat=i)
@@ -3974,7 +4788,7 @@ def _apply_queued_topups_locked(t: LiveTable, *, force: bool = False) -> None:
                 moved = min(cents_to_chips(cents, t.bb_cents), int(p.stack_chips))
                 p.stack_chips -= moved
                 p.leftover_cents += cents
-                _ledger_add(t, p.user_id, "cashout", cents)
+                _ledger_add(t, p.user_id, "take_off", cents)
                 _persist_player(t, t.seat_of(p.user_id), p, True)
             _emit(t, "cashout", f"{p.name} took {_fmt_cents(cents)} off the table")
         except Exception:  # noqa: BLE001 — rolled back; nothing left the table
@@ -3992,7 +4806,7 @@ def _apply_queued_topups_locked(t: LiveTable, *, force: bool = False) -> None:
             with _mutation(t):
                 p.stack_chips += cents_to_chips(cents, t.bb_cents)
                 p.buyin_cents += cents
-                _ledger_add(t, p.user_id, "rebuy", cents)
+                _ledger_add(t, p.user_id, "topup", cents)
                 _persist_player(t, t.seat_of(p.user_id), p, True)
             _emit(t, "rebuy", f"{p.name} added {_fmt_cents(cents)}")
         except Exception:  # noqa: BLE001 — rolled back; the chips were never added
@@ -4040,6 +4854,48 @@ def _leave_locked(t: LiveTable, uid: int, *, now: bool = False) -> None:
     _cash_out_seat(t, i)
 
 
+def _move_locked(t: LiveTable, uid: int, seat: int) -> None:
+    """Change seats (FEAT-013, 2026-09-28): a seated player takes an empty seat, with
+    everything the seat carries (stack, ledger totals, automatic chips, time bank).
+    Only while they hold no cards — a player in the hand moves once it is over (the
+    client sends the move then) — and not while the next hand's shuffle is being
+    confirmed (its lock list names seats). A shuffle commitment made from the old seat
+    names that seat, so it is dropped: the device commits again for the new one."""
+    _require_open(t)
+    i = t.seat_of(uid)
+    if i is None:
+        raise HTTPException(status_code=400, detail="not seated")
+    if seat < 0 or seat >= t.num_seats:
+        raise HTTPException(status_code=400, detail="invalid seat")
+    if seat == i:
+        return
+    if t.seats[seat] is not None:
+        raise HTTPException(status_code=409, detail="seat taken")
+    holder = next((r for r in t.requests if r["kind"] == "sit" and r["seat"] == seat), None)
+    if holder is not None:
+        raise HTTPException(status_code=409, detail=f"that seat is reserved for {holder['name']}")
+    p = t.seats[i]
+    assert p is not None
+    if p.leave_after_hand or p.user_id in t.pending_kicks:
+        raise HTTPException(status_code=400, detail="you are leaving this table")
+    if _dealt_in(t, i):
+        raise HTTPException(status_code=409, detail="you can change seats when this hand is over")
+    nxt = t.fair_next
+    if nxt is not None and nxt.pending:
+        raise HTTPException(status_code=409, detail="the next hand is being dealt — try again in a moment")
+    with _mutation(t):
+        t.seats[seat] = p
+        t.seats[i] = None
+        _persist_player(t, seat, p, True)
+    # (a hand in progress that this player is not in: its snapshot follows both seats)
+    _sync_idle_stack(t, i)
+    _sync_idle_stack(t, seat)
+    if nxt is not None and nxt.stage == "commit" and nxt.commit_users.get(i) == int(uid):
+        nxt.commits.pop(i, None)
+        nxt.commit_users.pop(i, None)
+    _emit(t, "move", f"{p.name} moved to seat {seat + 1}", seat=seat)
+
+
 def _cancel_leave_locked(t: LiveTable, uid: int) -> None:
     p = t.player(uid)
     if p is None:
@@ -4072,19 +4928,17 @@ def _rebuy_locked(t: LiveTable, uid: int, amount_cents: int) -> None:
         # Chips behind cannot change while you hold cards (table stakes). A
         # busted / sitting-out player is not in the hand and may reload now.
         raise HTTPException(status_code=400, detail="wait for the hand to finish")
-    if amount_cents < t.bb_cents:
-        raise HTTPException(status_code=400, detail="rebuy must be at least 1 bb")
+    have = chips_to_cents(p.stack_chips, t.bb_cents)
+    _check_amount(t, amount_cents, have, what="rebuy")
     if p.buyin_cents + amount_cents > MAX_CENTS:
         raise HTTPException(status_code=400, detail="buy-in limit reached")
-    _check_buyin_limits(
-        t, amount_cents, chips_to_cents(p.stack_chips, t.bb_cents), fresh=False
-    )
+    _check_buyin_limits(t, amount_cents, have, fresh=False)
     with _mutation(t):
         p = t.player(uid)
         assert p is not None
         p.stack_chips += cents_to_chips(amount_cents, t.bb_cents)
         p.buyin_cents += amount_cents
-        _ledger_add(t, uid, "rebuy", amount_cents)
+        _ledger_add(t, uid, "topup", amount_cents)
         _persist_player(t, t.seat_of(uid), p, True)
     _sync_idle_stack(t, t.seat_of(uid))
     _emit(t, "rebuy", f"{p.name} added {_fmt_cents(amount_cents)}", seat=t.seat_of(uid))
@@ -4096,10 +4950,8 @@ def _sit_out_locked(
 ) -> None:
     _require_open(t)
     who = int(target_uid) if target_uid is not None else int(uid)
-    if target_uid is not None and uid != t.host_user_id:
-        raise HTTPException(
-            status_code=400, detail="only the host can sit another player out"
-        )
+    if target_uid is not None:
+        _require_host(t, uid, "sit another player out")
     if t.player(who) is None:
         raise HTTPException(status_code=400, detail="not seated")
     if (not on) and who in t.pending_kicks:
@@ -4147,10 +4999,7 @@ def _sit_out_locked(
 
 def _kick_locked(t: LiveTable, uid: int, target_uid: int) -> None:
     _require_open(t)
-    if uid != t.host_user_id:
-        raise HTTPException(
-            status_code=400, detail="only the host can remove a player"
-        )
+    _require_host(t, uid, "remove a player")
     target_uid = int(target_uid)
     if target_uid == uid:
         raise HTTPException(
@@ -4165,22 +5014,6 @@ def _kick_locked(t: LiveTable, uid: int, target_uid: int) -> None:
     _cash_out_seat(t, i)
 
 
-def _set_decision_secs_locked(t: LiveTable, uid: int, secs: int) -> None:
-    _require_open(t)
-    if uid != t.host_user_id:
-        raise HTTPException(
-            status_code=400, detail="only the host can set decision time"
-        )
-    n = _valid_decision_secs(secs)
-    with _mutation(t):
-        t.decision_secs = n
-        _persist_meta(t)
-    if t.phase == "in_hand":
-        _start_clock_locked(t, restart=True)  # the host changed the rules
-    else:
-        t.turn_started_mono = None
-
-
 def _valid_decision_secs(secs: int) -> int:
     n = int(secs)
     if n < 0:
@@ -4193,27 +5026,34 @@ def _valid_decision_secs(secs: int) -> int:
     return n
 
 
-def _set_street_pause_locked(t: LiveTable, uid: int, secs: float) -> None:
-    _require_open(t)
-    if uid != t.host_user_id:
-        raise HTTPException(
-            status_code=400, detail="only the host can set runout speed"
-        )
+MAX_STREET_PAUSE_S = 5.0
+
+
+def _valid_street_pause(secs: float) -> float:
     n = float(secs)
     # `not (a <= n <= b)` also rejects NaN, which sails through `n < a or
     # n > b` and then 500'd every GET of the table (review 2026-09-20 G4).
-    if not math.isfinite(n) or not (0.3 <= n <= 5.0):
+    if not math.isfinite(n) or not (MIN_STREET_PAUSE_S <= n <= MAX_STREET_PAUSE_S):
         raise HTTPException(
-            status_code=400, detail="runout pause must be between 0.3 and 5 seconds"
+            status_code=400,
+            detail=f"runout pause must be between {MIN_STREET_PAUSE_S:g} and {MAX_STREET_PAUSE_S:g} seconds",
         )
+    return n
+
+
+def _set_street_pause_locked(t: LiveTable, uid: int, secs: float) -> None:
+    _require_open(t)
+    _require_host(t, uid, "set runout speed")
+    n = _valid_street_pause(secs)
     with _mutation(t):
         t.street_pause_secs = n
         _persist_meta(t)
 
 
-def _close_locked(t: LiveTable, uid: int) -> None:
-    if uid != t.host_user_id:
-        raise HTTPException(status_code=400, detail="only the host can close the table")
+def _close_table_locked(t: LiveTable) -> None:
+    """Close the table: everyone is cashed out (the host stays the host of the
+    finished session), the game stops, nothing is waiting any more. The ONE
+    closing path (HGB-008) — the host's Close and the club owner's Exclude."""
     if _hand_busy(t):
         raise HTTPException(status_code=400, detail="wait for the hand to finish")
     with _mutation(t):
@@ -4224,14 +5064,21 @@ def _close_locked(t: LiveTable, uid: int) -> None:
         t.running = False
         t.phase = "waiting"
         _persist_meta(t)
-    t.env = None
-    t.info = None
-    t.runout_active = False
+    t.hand = HandState()  # (HGB-004: nothing of the last hand is left on a closed table)
+    t.next_deal_mono = None
+    t.fair_next = None  # never dealt: a closed table deals nothing
+    if t.requests:
+        t.requests = []
+    t.rev += 1
+
+
+def _close_locked(t: LiveTable, uid: int) -> None:
+    _require_host(t, uid, "close the table")
+    _close_table_locked(t)
 
 
 def _host_fold_locked(t: LiveTable, uid: int) -> None:
-    if uid != t.host_user_id:
-        raise HTTPException(status_code=400, detail="only the host can fold a player")
+    _require_host(t, uid, "fold a player")
     if t.phase != "in_hand" or t.env is None or t.info is None:
         raise HTTPException(status_code=400, detail="no hand in progress")
     if t.env.current_actor() is None:
@@ -4264,20 +5111,16 @@ def _show_locked(t: LiveTable, uid: int) -> None:
     t.shown_seats.add(seat)
     t.rev += 1
     _emit(t, "show", f"{_seat_name(t, seat)} shows", seat=seat)
-    # Keep the stored hand in step, so history shows what the table saw.
+    # Keep the stored hand in step, so history shows what the table saw
+    # (atomically: the grader may be writing the same record — OPS-007).
     try:
-        row = pub.DB.one(
-            "SELECT summary FROM homegame_hands WHERE game_id=? AND hand_no=?",
-            (t.game_id, int(t.hand_no)),
-        )
-        if row is not None:
-            rec = json.loads(row["summary"])
-            for s in rec.get("seats") or []:
+        with _edit_hand_record(t.game_id, int(t.hand_no)) as rec:
+            for s in (rec or {}).get("seats") or []:
                 if int(s.get("seat", -1)) == seat:
                     s["shown"] = True
-            pub.DB.q(
-                "UPDATE homegame_hands SET summary=? WHERE game_id=? AND hand_no=?",
-                (json.dumps(rec, separators=(",", ":")), t.game_id, int(t.hand_no)),
+            pub.DB.q(  # (SEC-004: a shown hand's marks sort like a tabled one's)
+                "UPDATE homegame_hand_results SET shown=1 WHERE game_id=? AND hand_no=? AND user_id=?",
+                (t.game_id, int(t.hand_no), int(uid)),
             )
     except Exception:  # noqa: BLE001 — cosmetic
         logger.exception("homegame show: history update failed (%s)", t.game_id)
@@ -4308,8 +5151,7 @@ def _react_locked(t: LiveTable, uid: int, emote: Any) -> None:
 
 def _transfer_host_locked(t: LiveTable, uid: int, target_uid: int) -> None:
     _require_open(t)
-    if uid != t.host_user_id:
-        raise HTTPException(status_code=400, detail="only the host can hand over the table")
+    _require_host(t, uid, "hand over the table")
     target_uid = int(target_uid)
     p = t.player(target_uid)
     if p is None:
@@ -4328,14 +5170,13 @@ def _settings_locked(t: LiveTable, uid: int, body: dict) -> None:
     it), so stakes/pace changes simply apply from the next deal. Seat count
     is the exception — it reshapes the table, so it waits for the hand."""
     _require_open(t)
-    if uid != t.host_user_id:
-        raise HTTPException(status_code=400, detail="only the host can change table settings")
+    _require_host(t, uid, "change table settings")
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="invalid settings")
     changed: list[str] = []
     with _mutation(t):
         if body.get("name") is not None:
-            name = " ".join(str(body["name"]).split())
+            name = _clean_text(body["name"])
             if not name:
                 raise HTTPException(status_code=400, detail="table name cannot be empty")
             if len(name) > MAX_NAME_LEN:
@@ -4346,20 +5187,29 @@ def _settings_locked(t: LiveTable, uid: int, body: dict) -> None:
             if name != t.name:
                 t.name = name
                 changed.append(f"table renamed to “{name}”")
+        ante_changed = False
         if body.get("ante_cents") is not None:
             ante = _parse_cents(body, "ante_cents")
             if ante <= 0 or cents_to_chips(ante, t.bb_cents) <= 0:
                 raise HTTPException(status_code=400, detail="ante must be positive")
             if ante != t.ante_cents:
                 t.ante_cents = ante
+                ante_changed = True
                 changed.append(f"ante is now {_fmt_cents(ante)} (next hand)")
         lo = _parse_cents(body, "min_buyin_cents", t.min_buyin_cents)
         hi = _parse_cents(body, "max_buyin_cents", t.max_buyin_cents)
         dflt = _parse_cents(body, "default_buyin_cents", t.default_buyin_cents)
-        _validate_buyin_window(t.bb_cents, lo, hi, dflt)
+        if (lo, hi, dflt) != (t.min_buyin_cents, t.max_buyin_cents, t.default_buyin_cents) or ante_changed:
+            # (checked when the window or the ante moves — a table saved under an
+            # older, looser rule can still be renamed without fixing it first)
+            _validate_buyin_window(t.bb_cents, lo, hi, dflt, t.ante_cents)
         if (lo, hi, dflt) != (t.min_buyin_cents, t.max_buyin_cents, t.default_buyin_cents):
             t.min_buyin_cents, t.max_buyin_cents, t.default_buyin_cents = lo, hi, dflt
             changed.append("buy-in limits changed")
+            capped = _cap_auto_chips_locked(t)
+            if capped:
+                changed.append(f"automatic chips now stop at the new maximum ({_fmt_cents(hi)})"
+                               + f" — {', '.join(capped)}")
         if body.get("decision_secs") is not None:
             secs = _valid_decision_secs(pub.body_int(body, "decision_secs"))
             if secs != t.decision_secs:
@@ -4384,13 +5234,7 @@ def _settings_locked(t: LiveTable, uid: int, body: dict) -> None:
                     "manual dealing" if delay == 0 else f"next hand after {delay:g}s"
                 )
         if body.get("street_pause_secs") is not None:
-            pause = _parse_secs(body, "street_pause_secs", 1.5)
-            if not (0.3 <= pause <= 5.0):
-                raise HTTPException(
-                    status_code=400,
-                    detail="runout pause must be between 0.3 and 5 seconds",
-                )
-            t.street_pause_secs = pause
+            t.street_pause_secs = _valid_street_pause(_parse_secs(body, "street_pause_secs", 1.5))
         if body.get("listed") is not None:
             t.listed = _parse_bool(body, "listed", t.listed)
         if body.get("allow_rabbit") is not None:
@@ -4412,7 +5256,7 @@ def _settings_locked(t: LiveTable, uid: int, body: dict) -> None:
             if n != t.num_seats:
                 _resize_locked(t, n)
                 changed.append(f"table is now {n}-max")
-        _persist_meta(t)
+        _persist_seats(t)  # the settings, and any automatic-chips target a lower maximum capped
     if body.get("decision_secs") is not None:
         if t.phase == "in_hand":
             _start_clock_locked(t, restart=True)  # the host changed the rules
@@ -4420,21 +5264,29 @@ def _settings_locked(t: LiveTable, uid: int, body: dict) -> None:
             t.turn_started_mono = None
     if not t.approve_buyins and t.requests:
         # approval was switched off: everything that was waiting goes through
-        for r in list(t.requests):
-            try:
-                _resolve_request_locked(t, uid, r["id"], True, False)
-            except HTTPException:
-                pass
+        _let_through_locked(t, uid, list(t.requests))
     for line in changed:
         _emit(t, "settings", f"Host: {line}")
     _remember_host_prefs(t)
 
 
-def _validate_buyin_window(bb_cents: int, lo: int, hi: int, dflt: int) -> None:
+def _validate_buyin_window(bb_cents: int, lo: int, hi: int, dflt: int, ante_cents: int = 0) -> None:
+    """The host's buy-in window. Every amount in it must also buy MORE than the
+    ante (OPS-005: a table whose default buy-in was at or below the ante could
+    never deal, and its players never knew why)."""
+    def dealable(c: int) -> bool:
+        return c > ante_cents and cents_to_chips(c, bb_cents) > cents_to_chips(ante_cents, bb_cents)
+
     if dflt < bb_cents:
         raise HTTPException(status_code=400, detail="default buy-in must be at least 1 bb")
+    if not dealable(dflt):
+        raise HTTPException(status_code=400,
+                            detail=f"default buy-in must be more than the ante ({_fmt_cents(ante_cents)})")
     if lo and lo < bb_cents:
         raise HTTPException(status_code=400, detail="minimum buy-in must be at least 1 bb")
+    if lo and not dealable(lo):
+        raise HTTPException(status_code=400,
+                            detail=f"minimum buy-in must be more than the ante ({_fmt_cents(ante_cents)})")
     if lo and hi and hi < lo:
         raise HTTPException(status_code=400, detail="maximum buy-in is below the minimum")
     if lo and dflt < lo:
@@ -4495,284 +5347,10 @@ def _resize_locked(t: LiveTable, n: int) -> None:
     t.seats = seats
     t.num_seats = n
     t.button = int(t.button) % n
-    # Per-hand arrays are sized to the table that played them: drop them, the
-    # finished hand is no longer drawn after a reshape.
-    t.env = None
-    t.info = None
+    # Per-hand state is sized to the table that played it: the finished hand is no
+    # longer drawn after a reshape (HGB-004: a fresh HandState — every field of it).
+    t.hand = HandState()
     t.phase = "waiting"
-    t.in_hand_mask = []
-    t.dealt_user_ids = []
-    t.hand_start_stacks = []
-    t.last_deltas = []
-    t.last_holes = []
-    t.shown_seats = set()
-    t.runout_active = False
-    t.pot_awards = []
-    t.rabbit_available = False
-    t.rabbit_full_a = []
-    t.rabbit_full_b = []
-
-
-def _hand_for_viewer(
-    rec: dict[str, Any], viewer_id: int, show_all_grades: bool = True
-) -> dict[str, Any]:
-    """A stored hand as THIS viewer may see it: own cards, plus hands tabled
-    at showdown or shown voluntarily. Everything else is face-down — same
-    rule as the live table (review 2026-09-20 G1/G2).
-
-    Grades follow the cards (owner, 2026-09-26): you see the network's marks
-    on your own actions and on the actions of a hand you can see (tabled at
-    showdown or shown) — a mucked hand's marks would say what it was. The
-    table's ``show_grades`` off = your own marks only. Every grade still counts
-    in everyone's accuracy (`homegame_hand_results`); only the display hides."""
-    out = dict(rec)
-    seats = []
-    for s in rec.get("seats") or []:
-        s2 = dict(s)
-        mine = int(s.get("user_id") or -1) == int(viewer_id)
-        if not (mine or s.get("shown")):
-            s2["hole"] = None
-            if "hole_seq" in s2:  # (PLO67: the deal order would say the same cards)
-                s2["hole_seq"] = None
-        s2["is_me"] = mine
-        s2["avatar"] = _avatar_url(s.get("user_id"))
-        s2.pop("user_id", None)
-        seats.append(s2)
-    out["seats"] = seats
-    my_seats = {int(s["seat"]) for s in seats if s.get("is_me")}
-    seen = my_seats | {int(s["seat"]) for s in seats if s.get("shown")}
-    grades = rec.get("grades")
-    if grades is not None:
-        keep = seen if show_all_grades else my_seats
-        grades = [g for g in grades if int(g.get("seat", -1)) in keep]
-    out["grades"] = grades
-    out["grades_public"] = bool(show_all_grades)
-    return out
-
-
-def _hands_visible_upto(t: LiveTable) -> int:
-    """Newest hand number whose result may be served: never the hand being
-    played, never one whose runout is still revealing (G11)."""
-    if t.phase == "in_hand" or _runout_blocking(t):
-        return int(t.hand_no) - 1
-    return int(t.hand_no)
-
-
-def _hands_list(t: LiveTable, viewer_id: int, before: int | None, limit: int) -> dict[str, Any]:
-    upto = _hands_visible_upto(t)
-    if before is not None:
-        upto = min(upto, int(before) - 1)
-    limit = max(1, min(HANDS_PAGE_MAX, int(limit)))
-    rows = pub.DB.q(
-        "SELECT hand_no, ended_at, pot_cents, summary FROM homegame_hands "
-        "WHERE game_id=? AND hand_no<=? ORDER BY hand_no DESC LIMIT ?",
-        (t.game_id, upto, limit),
-    )
-    hands = []
-    for r in rows:
-        try:
-            rec = _hand_for_viewer(json.loads(r["summary"]), viewer_id, t.show_grades)
-        except Exception:  # noqa: BLE001
-            continue
-        me = next((s for s in rec["seats"] if s.get("is_me")), None)
-        hands.append({
-            "hand_no": int(r["hand_no"]),
-            "ended_at": r["ended_at"],
-            "pot_cents": int(r["pot_cents"]),
-            "showdown": bool(rec.get("showdown")),
-            "board_a": rec.get("board_a") or [],
-            "board_b": rec.get("board_b") or [],
-            "winners": [
-                {"name": s["name"], "delta_cents": s["delta_cents"]}
-                for s in rec["seats"] if int(s.get("delta_cents") or 0) > 0
-            ],
-            "my_delta_cents": int(me["delta_cents"]) if me else None,
-            "my_hole": me.get("hole") if me else None,
-            "my_accuracy": _seat_accuracy(rec.get("grades"), me["seat"]) if me else None,
-        })
-    stats = pub.DB.q(
-        "SELECT r.user_id, COUNT(*) hands, SUM(CASE WHEN r.delta_cents>0 THEN 1 ELSE 0 END) wins, "
-        "SUM(r.showdown) showdowns, MAX(r.delta_cents) biggest, SUM(r.acc_sum) acc_sum, "
-        "SUM(r.acc_n) acc_n, u.name, u.email "
-        "FROM homegame_hand_results r JOIN users u ON u.id=r.user_id "
-        "WHERE r.game_id=? AND r.hand_no<=? GROUP BY r.user_id ORDER BY hands DESC",
-        (t.game_id, _hands_visible_upto(t)),
-    )
-    return {
-        "hands": hands,
-        "more": bool(hands) and hands[-1]["hand_no"] > 1 and len(hands) == limit,
-        "stats": [
-            {
-                "name": _display_name(r),
-                "is_me": int(r["user_id"]) == int(viewer_id),
-                "hands": int(r["hands"] or 0),
-                "wins": int(r["wins"] or 0),
-                "showdowns": int(r["showdowns"] or 0),
-                "biggest_win_cents": max(0, int(r["biggest"] or 0)),
-                "accuracy": (
-                    round(float(r["acc_sum"] or 0) / int(r["acc_n"]), 1)
-                    if int(r["acc_n"] or 0) else None
-                ),
-                "graded": int(r["acc_n"] or 0),
-            }
-            for r in stats
-        ],
-        "h2h": _table_h2h(t),
-    }
-
-
-def _seat_accuracy(grades: list | None, seat: int) -> float | None:
-    mine = [float(g["score"]) for g in (grades or []) if int(g.get("seat", -1)) == int(seat)]
-    return round(sum(mine) / len(mine), 1) if mine else None
-
-
-def _table_h2h(t: LiveTable) -> list[dict[str, Any]]:
-    """Net money between every pair at this table: ``to`` is up ``cents`` on
-    ``from``. Hands still revealing are excluded (G11)."""
-    rows = pub.DB.q(
-        "SELECT payer, payee, SUM(chips) chips FROM homegame_flows "
-        "WHERE game_id=? AND hand_no<=? GROUP BY payer, payee",
-        (t.game_id, _hands_visible_upto(t)),
-    )
-    gross = {(int(r["payer"]), int(r["payee"])): int(r["chips"] or 0) for r in rows}
-    names: dict[int, str] = {}
-    out = []
-    for (a, b), v in gross.items():
-        net = v - gross.get((b, a), 0)
-        if net <= 0:
-            continue
-        for uid in (a, b):
-            if uid not in names:
-                u = pub._user_by_id(uid)
-                names[uid] = _display_name(u) if u is not None else f"player-{uid}"
-        out.append({"from": names[a], "to": names[b],
-                    "cents": chips_to_cents(net, t.bb_cents)})
-    out.sort(key=lambda x: -x["cents"])
-    return out
-
-
-# --- the club: everyone's numbers, side by side ------------------------------------------
-#
-# Home games are a private circle (admin-granted), so stats are open inside it:
-# every member sees every player's accuracy, profit and loss, the money between
-# every pair, and can browse anyone's hands (cards still follow the reveal
-# rule). Sessions an admin took out of the record (``homegames.excluded`` —
-# test tables) count nowhere; that is a soft flag and can be undone.
-
-
-def _revealing_now() -> list[tuple[str, int]]:
-    """(game_id, hand_no) of hands whose runout is still being shown: their
-    result must not surface through an aggregate a few seconds early (G11)."""
-    with HUB._lock:
-        tables = list(HUB._tables.values())
-    out = []
-    for tb in tables:
-        with tb.lock:
-            if _runout_blocking(tb):
-                out.append((tb.game_id, int(tb.hand_no)))
-    return out
-
-
-def _club_clause(clubs: list[str] | None, col: str = "g.club_id") -> tuple[str, list[Any]]:
-    """`` AND g.club_id IN (...)`` for a stats scope (None = no restriction)."""
-    if clubs is None:
-        return "", []
-    if not clubs:
-        return " AND 0", []
-    return f" AND {col} IN ({','.join('?' * len(clubs))})", list(clubs)
-
-
-def _games_played(where: str, args: list[Any]) -> dict[str, int]:
-    """Hands per game in a stats scope (``where`` over ``g`` = homegames, ``r`` =
-    homegame_hand_results): which game switches a stats view offers."""
-    out: dict[str, int] = {}
-    for r in pub.DB.q(
-        "SELECT g.variant v, COUNT(DISTINCT r.game_id || ':' || r.hand_no) n "
-        f"FROM homegame_hand_results r JOIN homegames g ON g.id=r.game_id WHERE {where} GROUP BY g.variant",
-        tuple(args),
-    ):
-        code = _norm_game(r["v"])
-        out[code] = out.get(code, 0) + int(r["n"] or 0)
-    return out
-
-
-def _games_summary(played: dict[str, int]) -> list[dict[str, Any]]:
-    return [{"code": c, "label": g["label"], "hands": int(played.get(c, 0)), "graded": bool(g["graded"])}
-            for c, g in GAMES.items()]
-
-
-def _community(viewer_id: int, club_id: str, can_manage: bool,
-               variant: str | None = None) -> dict[str, Any]:
-    """ONE club's numbers (rankings never mix clubs) for ONE game: PLO5 and PLO6
-    are different games, so their profits, accuracy and head-to-head are kept
-    apart (2026-09-26). ``variant`` None = the game the club has played most.
-    ``can_manage`` = the club's owner: sees excluded sessions and may exclude /
-    restore them."""
-    skip = _revealing_now()
-    guard = "".join(" AND NOT (r.game_id=? AND r.hand_no=?)" for _ in skip)
-    gargs = [x for pair in skip for x in pair]
-    played = _games_played(f"g.excluded=0 AND g.club_id=?{guard}", [club_id] + gargs)
-    if variant is None:
-        variant = max(GAMES, key=lambda c: (played.get(c, 0), c == DEFAULT_GAME))
-    rows = pub.DB.q(
-        "SELECT r.user_id, u.name, u.email, COUNT(*) hands, SUM(r.delta_cents) net, "
-        "SUM(r.acc_sum) a, SUM(r.acc_n) n, SUM(CASE WHEN r.delta_cents>0 THEN 1 ELSE 0 END) wins, "
-        "COUNT(DISTINCT r.game_id) sessions, MAX(r.delta_cents) best "
-        "FROM homegame_hand_results r JOIN homegames g ON g.id=r.game_id "
-        f"JOIN users u ON u.id=r.user_id WHERE g.excluded=0 AND g.club_id=? AND g.variant=?{guard} "
-        "GROUP BY r.user_id",
-        tuple([club_id, variant] + gargs),
-    )
-    players = [
-        {
-            "user_id": int(r["user_id"]), "name": _display_name(r),
-            "avatar": _avatar_url(r["user_id"]),
-            "is_me": int(r["user_id"]) == int(viewer_id),
-            "hands": int(r["hands"] or 0), "wins": int(r["wins"] or 0),
-            "sessions": int(r["sessions"] or 0), "net_cents": int(r["net"] or 0),
-            "best_cents": max(0, int(r["best"] or 0)),
-            "accuracy": round(float(r["a"] or 0) / int(r["n"]), 1) if int(r["n"] or 0) else None,
-            "graded": int(r["n"] or 0),
-        }
-        for r in rows
-    ]
-    players.sort(key=lambda x: -x["net_cents"])
-    fguard = guard.replace("r.game_id", "f.game_id").replace("r.hand_no", "f.hand_no")
-    gross: dict[tuple[int, int], float] = {}
-    for r in pub.DB.q(
-        "SELECT f.payer, f.payee, SUM(f.chips * g.bb_cents) v FROM homegame_flows f "
-        f"JOIN homegames g ON g.id=f.game_id WHERE g.excluded=0 AND g.club_id=? AND g.variant=?{fguard} "
-        "GROUP BY f.payer, f.payee", tuple([club_id, variant] + gargs),
-    ):
-        gross[(int(r["payer"]), int(r["payee"]))] = float(r["v"] or 0) / BB_CHIPS
-    pairs = []
-    for (a, b), v in gross.items():
-        net = v - gross.get((b, a), 0.0)
-        if net > 0.5:  # b is up `cents` on a
-            pairs.append({"from": a, "to": b, "cents": int(round(net))})
-    sess = pub.DB.q(
-        "SELECT g.id, g.name, g.variant, g.status, g.excluded, g.created_at, g.closed_at, g.hand_no, "
-        "g.sb_cents, g.bb_cents, g.ante_cents, "
-        "(SELECT COUNT(*) FROM homegame_players p WHERE p.game_id=g.id AND p.buyin_cents>0) players "
-        "FROM homegames g WHERE g.club_id=? " + ("" if can_manage else "AND g.excluded=0 ") +
-        "ORDER BY g.created_at DESC LIMIT 300", (club_id,),
-    )
-    return {
-        "club": club_id, "players": players, "pairs": pairs,
-        # the game these numbers are for, and every game with its hand count (the switch)
-        "variant": variant, "games": _games_summary(played),
-        "can_manage": bool(can_manage), "is_admin": bool(can_manage),
-        # (every session of the club, each tagged with its game — a list, not a total)
-        "sessions": [
-            {"id": r["id"], "name": r["name"], "variant": _norm_game(r["variant"]),
-             "open": r["status"] == "open",
-             "excluded": bool(int(r["excluded"] or 0)), "created_at": r["created_at"],
-             "closed_at": r["closed_at"], "hands": int(r["hand_no"] or 0),
-             "players": int(r["players"] or 0), "sb_cents": int(r["sb_cents"]),
-             "bb_cents": int(r["bb_cents"]), "ante_cents": int(r["ante_cents"])}
-            for r in sess
-        ],
-    }
 
 
 def _exclude_locked(t: LiveTable, user: Any, on: bool) -> None:
@@ -4784,186 +5362,9 @@ def _exclude_locked(t: LiveTable, user: Any, on: bool) -> None:
     if user is None or _club_role(t.club_id, int(user["id"])) != "owner":
         raise HTTPException(status_code=403, detail="only the club's owner can do that")
     if on and t.status == "open":
-        if _hand_busy(t):
-            raise HTTPException(status_code=400, detail="wait for the hand to finish")
-        with _mutation(t):
-            for i in list(t.occupied()):
-                _cash_out_seat(t, i, closing=True)
-            t.pending_kicks.clear()
-            t.status = "closed"
-            t.running = False
-            t.phase = "waiting"
-            _persist_meta(t)
-        t.env = None
-        t.info = None
-        t.runout_active = False
+        _close_table_locked(t)
     pub.DB.q("UPDATE homegames SET excluded=? WHERE id=?", (1 if on else 0, t.game_id))
     t.rev += 1
-
-
-# --- a player's lifetime database ---------------------------------------------------
-
-_MY_SORTS = {
-    "time": "h.ended_at",
-    "pot": "h.pot_cents",
-    "net": "r.delta_cents",
-    "accuracy": "(CASE WHEN r.acc_n>0 THEN r.acc_sum/r.acc_n ELSE NULL END)",
-}
-
-
-def _my_hands(viewer_id: int, sort: str, direction: str, game_id: str | None,
-              offset: int, limit: int, player_id: int | None = None,
-              clubs: list[str] | None = None, variant: str | None = None) -> dict[str, Any]:
-    """``player_id``'s hands (default: the viewer's own). The club is private and
-    everyone may browse everyone's history — but the CARDS in it follow the live
-    table's rule for the VIEWER: their own, plus hands that were tabled or shown.
-    Browsing Riley's history never turns over a hand Riley mucked, and neither
-    do its accuracy marks (they still count in Riley's totals). ``variant`` =
-    one game's hands only (None = every game)."""
-    player = int(player_id) if player_id is not None else int(viewer_id)
-    col = _MY_SORTS.get(sort, _MY_SORTS["time"])
-    if player != int(viewer_id) and sort == "accuracy":
-        # someone else's per-hand marks show only where their hand was tabled —
-        # sorting on the hidden ones would leak them (2026-09-26)
-        col = f"(CASE WHEN r.showdown=1 THEN {col} ELSE NULL END)"
-    desc = str(direction).lower() != "asc"
-    limit = max(1, min(HANDS_PAGE_MAX, int(limit)))
-    offset = max(0, int(offset))
-    scope, sargs = _club_clause(clubs)
-    where = "r.user_id=? AND g.excluded=0" + scope
-    args: list[Any] = [player] + sargs
-    if game_id:
-        where += " AND r.game_id=?"
-        args.append(str(game_id))
-    if variant:
-        where += " AND g.variant=?"
-        args.append(str(variant))
-    # A hand is never served while its table is still playing / revealing it.
-    live = {}
-    with HUB._lock:
-        tables = list(HUB._tables.values())
-    for tb in tables:
-        with tb.lock:
-            live[tb.game_id] = _hands_visible_upto(tb)
-    total = pub.DB.one(
-        "SELECT COUNT(*) c FROM homegame_hand_results r "
-        f"JOIN homegames g ON g.id=r.game_id WHERE {where}", tuple(args)
-    )["c"]
-    rows = pub.DB.q(
-        "SELECT r.game_id, r.hand_no, r.delta_cents, r.acc_sum, r.acc_n, h.ended_at, "
-        "h.pot_cents, h.summary, g.name AS table_name, g.variant FROM homegame_hand_results r "
-        "JOIN homegame_hands h ON h.game_id=r.game_id AND h.hand_no=r.hand_no "
-        "JOIN homegames g ON g.id=r.game_id "
-        f"WHERE {where} ORDER BY ({col} IS NULL), {col} {'DESC' if desc else 'ASC'}, "
-        "h.ended_at DESC LIMIT ? OFFSET ?",
-        tuple(args + [limit, offset]),
-    )
-    hands = []
-    for r in rows:
-        if r["game_id"] in live and int(r["hand_no"]) > live[r["game_id"]]:
-            continue
-        try:
-            full = json.loads(r["summary"])
-            seat_no = next(
-                (int(x["seat"]) for x in full.get("seats") or []
-                 if int(x.get("user_id") or -1) == player), None,
-            )
-            rec = _hand_for_viewer(full, viewer_id)
-        except Exception:  # noqa: BLE001
-            continue
-        me = next((x for x in rec["seats"] if int(x["seat"]) == seat_no), None)
-        seen = player == int(viewer_id) or bool(me and me.get("shown"))
-        hands.append({
-            "game_id": r["game_id"], "table_name": r["table_name"],
-            "variant": _norm_game(r["variant"]),
-            "hand_no": int(r["hand_no"]), "ended_at": r["ended_at"],
-            "pot_cents": int(r["pot_cents"]), "net_cents": int(r["delta_cents"]),
-            "accuracy": (round(float(r["acc_sum"]) / int(r["acc_n"]), 1)
-                         if seen and int(r["acc_n"] or 0) else None),
-            "showdown": bool(rec.get("showdown")),
-            "my_hole": me.get("hole") if me else None,
-            "board_a": rec.get("board_a") or [], "board_b": rec.get("board_b") or [],
-        })
-    return {"hands": hands, "total": int(total), "offset": offset, "limit": limit}
-
-
-def _my_stats(viewer_id: int, clubs: list[str] | None = None,
-              variant: str | None = None) -> dict[str, Any]:
-    """A player's numbers, within ``clubs`` (None = everything they played), for
-    one game (``variant``) or all of them. ``games`` = hands per game in the same
-    scope, whatever ``variant`` is (the switch between them)."""
-    uid = int(viewer_id)
-    who = pub._user_by_id(uid)
-    scope, sargs = _club_clause(clubs)
-    played = _games_played(f"r.user_id=? AND g.excluded=0{scope}", [uid] + sargs)
-    if variant:
-        scope += " AND g.variant=?"
-        sargs = sargs + [str(variant)]
-    tot = pub.DB.one(
-        "SELECT COUNT(*) hands, COALESCE(SUM(r.delta_cents),0) net, COALESCE(SUM(r.acc_sum),0) a, "
-        "COALESCE(SUM(r.acc_n),0) n, SUM(CASE WHEN r.delta_cents>0 THEN 1 ELSE 0 END) wins "
-        "FROM homegame_hand_results r JOIN homegames g ON g.id=r.game_id "
-        f"WHERE r.user_id=? AND g.excluded=0{scope}", tuple([uid] + sargs),
-    )
-    sessions = pub.DB.q(
-        "SELECT g.id, g.name, g.variant, g.status, g.sb_cents, g.bb_cents, g.ante_cents, COUNT(*) hands, "
-        "SUM(r.delta_cents) net, SUM(r.acc_sum) a, SUM(r.acc_n) n, MAX(h.ended_at) last "
-        "FROM homegame_hand_results r JOIN homegames g ON g.id=r.game_id "
-        "JOIN homegame_hands h ON h.game_id=r.game_id AND h.hand_no=r.hand_no "
-        f"WHERE r.user_id=? AND g.excluded=0{scope} GROUP BY g.id ORDER BY last DESC LIMIT 200",
-        tuple([uid] + sargs),
-    )
-    # head to head, in CENTS (chips are relative to each table's big blind)
-    vs: dict[int, float] = {}
-    for r in pub.DB.q(
-        "SELECT f.payer, f.payee, SUM(f.chips * g.bb_cents) v FROM homegame_flows f "
-        f"JOIN homegames g ON g.id=f.game_id WHERE (f.payer=? OR f.payee=?) AND g.excluded=0{scope} "
-        "GROUP BY f.payer, f.payee", tuple([uid, uid] + sargs),
-    ):
-        other = int(r["payee"]) if int(r["payer"]) == uid else int(r["payer"])
-        sign = -1 if int(r["payer"]) == uid else 1
-        vs[other] = vs.get(other, 0.0) + sign * float(r["v"] or 0) / BB_CHIPS
-    versus = []
-    for other, cents in vs.items():
-        u = pub._user_by_id(other)
-        versus.append({"user_id": other,
-                       "name": _display_name(u) if u is not None else f"player-{other}",
-                       "net_cents": int(round(cents))})
-    versus.sort(key=lambda x: -x["net_cents"])
-    n = int(tot["n"] or 0)
-    return {
-        "user_id": uid, "name": _display_name(who) if who is not None else f"player-{uid}",
-        "variant": variant, "games": _games_summary(played),
-        "hands": int(tot["hands"] or 0), "wins": int(tot["wins"] or 0),
-        "net_cents": int(tot["net"] or 0),
-        "accuracy": round(float(tot["a"]) / n, 1) if n else None, "graded": n,
-        "sessions": [
-            {"id": r["id"], "name": r["name"], "variant": _norm_game(r["variant"]),
-             "open": r["status"] == "open",
-             "sb_cents": int(r["sb_cents"]), "bb_cents": int(r["bb_cents"]),
-             "ante_cents": int(r["ante_cents"]), "hands": int(r["hands"]),
-             "net_cents": int(r["net"] or 0),
-             "accuracy": round(float(r["a"]) / int(r["n"]), 1) if int(r["n"] or 0) else None,
-             "last_played": r["last"]}
-            for r in sessions
-        ],
-        "versus": versus,
-    }
-
-
-def _hand_detail(t: LiveTable, viewer_id: int, hand_no: int) -> dict[str, Any]:
-    if int(hand_no) > _hands_visible_upto(t):
-        raise HTTPException(status_code=404, detail="Not Found")
-    row = pub.DB.one(
-        "SELECT summary FROM homegame_hands WHERE game_id=? AND hand_no=?",
-        (t.game_id, int(hand_no)),
-    )
-    if row is None:
-        raise HTTPException(status_code=404, detail="Not Found")
-    out = _hand_for_viewer(json.loads(row["summary"]), viewer_id, t.show_grades)
-    out["game_id"] = t.game_id
-    out["table_name"] = t.name
-    return out
 
 
 def _parse_cents(body: dict, key: str, default: int | None = None) -> int:
@@ -4989,7 +5390,11 @@ def _parse_cents(body: dict, key: str, default: int | None = None) -> int:
         raise HTTPException(status_code=400, detail=f"{key} must be >= 0")
     if f > MAX_CENTS:
         raise HTTPException(status_code=400, detail=f"{key} is too large")
-    return int(round(f))
+    if f != int(f):
+        # HGB-021: money moves in whole cents; a fraction is a client bug, and
+        # round() would have rounded it banker's-style (12.5 -> 12, 13.5 -> 14)
+        raise HTTPException(status_code=400, detail=f"{key} must be whole cents")
+    return int(f)
 
 
 def _parse_secs(body: dict, key: str, default: float) -> float:
@@ -5097,7 +5502,7 @@ def _apply_remembered_locked(t: LiveTable, uid: int, prefs: dict[str, Any]) -> N
 
 
 def _create_table(user: Any, body: dict) -> LiveTable:
-    name = " ".join(str(body.get("name") or "").split()) or "Table 1"
+    name = _clean_text(body.get("name")) or "Table 1"
     if len(name) > MAX_NAME_LEN:
         raise HTTPException(
             status_code=400, detail=f"table name is limited to {MAX_NAME_LEN} characters"
@@ -5125,7 +5530,7 @@ def _create_table(user: Any, body: dict) -> LiveTable:
         raise HTTPException(status_code=400, detail="default buy-in must be at least 1 bb")
     lo = _parse_cents(body, "min_buyin_cents", 0)
     hi = _parse_cents(body, "max_buyin_cents", 0)
-    _validate_buyin_window(bb, lo, hi, buyin)
+    _validate_buyin_window(bb, lo, hi, buyin, ante)
     bank = _valid_time_bank(pub.body_int(body, "time_bank_secs", 0))
     # Absent = MANUAL dealing (see MAX_DEAL_DELAY_SECS); the dialog sends 5.
     delay = _valid_deal_delay(_parse_secs(body, "deal_delay_secs", 0.0))
@@ -5172,132 +5577,53 @@ def _create_table(user: Any, body: dict) -> LiveTable:
         allow_rathole=rathole,
         variant=variant,
     )
-    # The table row and the host's seat land together or not at all.
-    with pub.DB.transaction():
+    # The table row and the host's seat land together or not at all. (The table
+    # is nobody else's yet; its lock is taken anyway — BEFORE the transaction, in
+    # the lock order — because `_sit_locked` expects it.)
+    with t.lock, pub.DB.transaction():
+        cols = ["id", "sb_cents", "bb_cents", "club_id", "variant", "created_at"] + [c.col for c in META]
         pub.DB.q(
-            "INSERT INTO homegames(id,host_user_id,name,num_seats,sb_cents,bb_cents,"
-            "ante_cents,default_buyin_cents,status,running,decision_secs,button,"
-            "hand_no,created_at,deal_delay_ms,time_bank_secs,min_buyin_cents,"
-            "max_buyin_cents,listed,approve_buyins,allow_rathole,club_id,variant) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (gid, int(user["id"]), name, n, sb, bb, ante, buyin, "open", 0, secs,
-             0, 0, pub._now(), int(round(delay * 1000)), bank, lo, hi,
-             1 if listed else 0, 1 if approve else 0, 1 if rathole else 0, club_id, variant),
+            f"INSERT INTO homegames({','.join(cols)}) VALUES({','.join('?' * len(cols))})",
+            (gid, sb, bb, club_id, variant, pub._now(), *(c.to_db(getattr(t, c.attr)) for c in META)),
         )
         # Host sits seat 0 with the default buy-in so they can deal once a
         # second player sits.
         _sit_locked(t, user, 0, buyin)
-    HUB.put(t)
+    CTX.hub.put(t)
     return t
 
 
-def _lobby_row(row: Any, viewer_id: int | None = None) -> dict[str, Any]:
-    players = pub.DB.q(
-        "SELECT p.user_id, p.seat, u.name, u.email FROM homegame_players p "
-        "JOIN users u ON u.id=p.user_id WHERE p.game_id=? AND p.seat IS NOT NULL "
-        "ORDER BY p.seat",
-        (row["id"],),
-    )
-    host = pub._user_by_id(int(row["host_user_id"]))
-    member = False
-    if viewer_id is not None:
-        member = pub.DB.one(
-            "SELECT 1 FROM homegame_players WHERE game_id=? AND user_id=?",
-            (row["id"], int(viewer_id)),
-        ) is not None
-    return {
-        "id": row["id"],
-        "name": row["name"],
-        "variant": _norm_game(row["variant"] if "variant" in row.keys() else None),
-        "num_seats": row["num_seats"],
-        "seated": len(players),
-        "sb_cents": row["sb_cents"],
-        "bb_cents": row["bb_cents"],
-        "ante_cents": row["ante_cents"],
-        "default_buyin_cents": row["default_buyin_cents"],
-        "hand_no": row["hand_no"],
-        "running": bool(int(row["running"] if "running" in row.keys() else 0)),
-        "host_name": _display_name(host) if host else "?",
-        "created_at": row["created_at"],
-        # No emails, no user ids of other people (review 2026-09-20 G12).
-        "players": [
-            {"seat": int(p["seat"]), "name": _display_name(p),
-             "is_me": viewer_id is not None and int(p["user_id"]) == int(viewer_id)}
-            for p in players
-        ],
-        "is_host": viewer_id is not None and int(row["host_user_id"]) == int(viewer_id),
-        "is_seated": any(
-            viewer_id is not None and int(p["user_id"]) == int(viewer_id) for p in players
-        ),
-        "is_member": bool(member),
-        "listed": bool(_row_int(row, "listed", 1)),
-    }
+CHAT_SHOWN = 80  # the newest lines a view carries
 
 
-def _lobby_visible(row: Any, viewer_id: int | None) -> bool:
-    """Unlisted tables are link-only: they show up in the lobby of the host
-    and of anyone who has played at them, and nobody else's."""
-    if bool(_row_int(row, "listed", 1)):
-        return True
-    if viewer_id is None:
-        return False
-    if int(row["host_user_id"]) == int(viewer_id):
-        return True
-    return pub.DB.one(
-        "SELECT 1 FROM homegame_players WHERE game_id=? AND user_id=?",
-        (row["id"], int(viewer_id)),
-    ) is not None
-
-
-def _my_sessions(viewer_id: int, club_id: str | None = None, limit: int = 12) -> list[dict[str, Any]]:
-    """The viewer's finished sessions (closed tables they played at), in one club."""
-    scope, sargs = _club_clause([club_id] if club_id else None)
-    rows = pub.DB.q(
-        "SELECT g.id, g.name, g.variant, g.sb_cents, g.bb_cents, g.ante_cents, g.hand_no, "
-        "g.closed_at, p.buyin_cents, p.leftover_cents FROM homegame_players p "
-        "JOIN homegames g ON g.id=p.game_id "
-        f"WHERE p.user_id=? AND g.status='closed' AND p.buyin_cents>0 AND g.excluded=0{scope} "
-        "ORDER BY g.closed_at DESC LIMIT ?",
-        tuple([int(viewer_id)] + sargs + [int(limit)]),
-    )
-    out = []
-    for r in rows:
-        hands = pub.DB.one(
-            "SELECT COUNT(*) c FROM homegame_hand_results WHERE game_id=? AND user_id=?",
-            (r["id"], int(viewer_id)),
-        )["c"]
-        out.append({
-            "id": r["id"],
-            "name": r["name"],
-            "variant": _norm_game(r["variant"]),
-            "sb_cents": int(r["sb_cents"]),
-            "bb_cents": int(r["bb_cents"]),
-            "ante_cents": int(r["ante_cents"]),
-            "closed_at": r["closed_at"],
-            "hands": int(hands or 0),
-            "buyin_cents": int(r["buyin_cents"]),
-            "net_cents": int(r["leftover_cents"]) - int(r["buyin_cents"]),
-        })
-    return out
-
-
-def _chat_messages(game_id: str) -> list[dict[str, Any]]:
-    rows = pub.DB.q(
-        "SELECT c.id, c.body, c.created_at, c.user_id, u.name, u.email "
-        "FROM homegame_chat c JOIN users u ON u.id=c.user_id "
-        "WHERE c.game_id=? ORDER BY c.id DESC LIMIT 80",
-        (game_id,),
-    )
-    out = []
-    for r in reversed(list(rows)):
-        out.append({
-            "id": int(r["id"]),
-            "name": _display_name(r),
-            "avatar": _avatar_url(r["user_id"]),
-            "text": r["body"],
-            "created_at": r["created_at"],
-        })
-    return out
+def _chat_messages(t: LiveTable) -> list[dict[str, Any]]:
+    """The table's newest chat lines. Read from the database once and kept on
+    the table until a new line is posted (PERF-003: every view — every poll and
+    every live push, for every viewer — used to query the chat, and without an
+    index that scanned every line of every table)."""
+    if t.chat_cache is None:
+        rows = pub.DB.q(
+            "SELECT c.id, c.body, c.created_at, c.user_id, u.name, u.email "
+            "FROM homegame_chat c JOIN users u ON u.id=c.user_id "
+            "WHERE c.game_id=? ORDER BY c.id DESC LIMIT ?",
+            (t.game_id, CHAT_SHOWN),
+        )
+        t.chat_cache = [
+            {"id": int(r["id"]), "name": _display_name(r, t.club_id), "user_id": int(r["user_id"]),
+             "text": r["body"], "created_at": r["created_at"]}
+            for r in reversed(list(rows))
+        ]
+    return [
+        {
+            "id": m["id"],
+            "name": m["name"],
+            "user_id": m["user_id"],  # (the client matches on this, not the name — HGT-027)
+            "avatar": _avatar_url(m["user_id"]),
+            "text": m["text"],
+            "created_at": m["created_at"],
+        }
+        for m in t.chat_cache
+    ]
 
 
 def _chat_add(t: LiveTable, user: Any, text: Any) -> None:
@@ -5305,7 +5631,7 @@ def _chat_add(t: LiveTable, user: Any, text: Any) -> None:
     _require_member(t, uid)  # review 2026-09-20 G12
     if not isinstance(text, str):
         raise HTTPException(status_code=400, detail="invalid message")
-    body = " ".join(text[: CHAT_MAX_LEN * 8].split())
+    body = _clean_text(text[: CHAT_MAX_LEN * 8])
     if not body:
         raise HTTPException(status_code=400, detail="empty message")
     if len(body) > CHAT_MAX_LEN:
@@ -5321,675 +5647,55 @@ def _chat_add(t: LiveTable, user: Any, text: Any) -> None:
         "INSERT INTO homegame_chat(game_id,user_id,body,created_at) VALUES(?,?,?,?)",
         (t.game_id, uid, body, pub._now()),
     )
+    t.chat_cache = None  # (the next view reads the newest lines again)
     times.append(now)
     t.rev += 1
 
 
-def _page_html(static_dir: Path) -> str:
-    return (static_dir / "games.html").read_text(encoding="utf-8")
-
-
-# Security headers for the home-games page (the lobby and every table). Scripts
-# run ONLY from this site: no inline <script>, no inline event-handler attribute
-# (onclick=...), no javascript: URL — a script injected through a name or a chat
-# line cannot run. Styles/fonts come from this site and Google Fonts; images from
-# this site or data: URIs (so injected CSS cannot send anything elsewhere either);
-# no other site may frame the page. A new outside resource (a CDN, an image host)
-# needs its origin added here; test_homegame_page_headers.py scans the client for
-# inline handlers the policy would silently block.
-PAGE_CSP = "; ".join((
-    "default-src 'self'",
-    "script-src 'self'",
-    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
-    "font-src 'self' https://fonts.gstatic.com",
-    "img-src 'self' data:",
-    "connect-src 'self'",
-    "object-src 'none'",
-    "base-uri 'none'",
-    "form-action 'self'",
-    "frame-ancestors 'none'",
-))
-PAGE_HEADERS: dict[str, str] = {
-    "Cache-Control": "no-store, must-revalidate",
-    "Content-Security-Policy": PAGE_CSP,
-    "X-Frame-Options": "DENY",
-    "X-Content-Type-Options": "nosniff",
-    "Referrer-Policy": "same-origin",
-    # allow-popups: "Open in Study" fills the new tab it opens before sending it on
-    "Cross-Origin-Opener-Policy": "same-origin-allow-popups",
-}
-
-
-# --- clubs (2026-09-25) -----------------------------------------------------------
-#
-# Home games are open to every signed-in user; a CLUB is the private circle: its
-# tables, its members and its numbers. A table belongs to exactly one club. Only
-# members see it in the lobby, sit, watch or open its history, and every ranking,
-# accuracy score, profit table and head-to-head is computed from ONE club's tables:
-# nothing ranks the whole user base. Anyone can start a club and host in it.
-# People join with the club's invite link (the owner can make it "ask first"), or
-# ask from a table link and wait for the owner or an admin to let them in.
-# The site's original private circle is the MAIN club: the migration gives it every
-# table and player that predate clubs, and the /admin home-games switch adds and
-# removes people there.
-
-CLUB_ROLES = ("owner", "admin", "member")
-MAX_CLUBS_OWNED = 5
-MAX_CLUB_NAME = 40
-JOIN_RETRY_S = 60.0     # a declined request can be sent again after this
-JOIN_REFRESH_S = 5.0    # how stale a club manager's view of the requests may be
-_CODE_RE = re.compile(r"^[A-Za-z0-9_-]{6,40}$")
-
-
-def _club(club_id: Any) -> Any:
-    if not club_id or not _CODE_RE.match(str(club_id)):
-        return None
-    return pub.DB.one("SELECT * FROM homegame_clubs WHERE id=?", (str(club_id),))
-
-
-def _club_role(club_id: Any, uid: Any) -> str | None:
-    if not club_id or uid is None:
-        return None
-    r = pub.DB.one(
-        "SELECT role FROM homegame_club_members WHERE club_id=? AND user_id=?", (str(club_id), int(uid))
-    )
-    return str(r["role"]) if r is not None else None
-
-
-def _require_club(club_id: Any, uid: int, *roles: str) -> tuple[Any, str]:
-    """The club and the viewer's role in it. Not a member = 404 (a club's
-    existence is nobody else's business); a member without one of ``roles`` = 403."""
-    club = _club(club_id)
-    role = _club_role(club["id"], uid) if club is not None else None
-    if club is None or role is None:
-        raise HTTPException(status_code=404, detail="Not Found")
-    if roles and role not in roles:
-        who = "the club's owner" if roles == ("owner",) else "the club's owner or an admin"
-        raise HTTPException(status_code=403, detail=f"only {who} can do that")
-    return club, role
-
-
-def _club_member_ids(club_id: str) -> set[int]:
-    return {int(r["user_id"]) for r in pub.DB.q(
-        "SELECT user_id FROM homegame_club_members WHERE club_id=?", (club_id,))}
-
-
-def _add_member(club_id: str, uid: int, role: str = "member") -> None:
-    now = pub._now()
-    pub.DB.q(
-        "INSERT OR IGNORE INTO homegame_club_members(club_id,user_id,role,joined_at) VALUES(?,?,?,?)",
-        (club_id, int(uid), role, now),
-    )
-    pub.DB.q(
-        "UPDATE homegame_club_requests SET status='approved', decided_at=? "
-        "WHERE club_id=? AND user_id=? AND status='pending'", (now, club_id, int(uid)),
-    )
-
-
-def _create_club(user: Any, name: Any, *, main: bool = False) -> str:
-    name = " ".join(str(name or "").split())
-    if not name:
-        raise HTTPException(status_code=400, detail="give the club a name")
-    if len(name) > MAX_CLUB_NAME:
-        raise HTTPException(status_code=400, detail=f"a club name is limited to {MAX_CLUB_NAME} characters")
-    uid = int(user["id"])
-    owned = pub.DB.one("SELECT COUNT(*) c FROM homegame_clubs WHERE owner_user_id=?", (uid,))["c"]
-    if not main and int(owned) >= MAX_CLUBS_OWNED:
-        raise HTTPException(status_code=429, detail=f"you already run {MAX_CLUBS_OWNED} clubs")
-    cid = secrets.token_urlsafe(6)
-    now = pub._now()
-    with pub.DB.transaction():
-        pub.DB.q(
-            "INSERT INTO homegame_clubs(id,name,owner_user_id,invite_code,approve_joins,is_main,created_at) "
-            "VALUES(?,?,?,?,0,?,?)",
-            (cid, name, uid, secrets.token_urlsafe(9), 1 if main else 0, now),
-        )
-        pub.DB.q(
-            "INSERT OR IGNORE INTO homegame_club_members(club_id,user_id,role,joined_at) VALUES(?,?,'owner',?)",
-            (cid, uid, now),
-        )
-    return cid
-
-
-def _main_club(create_for: int | None = None) -> str | None:
-    """The site's original circle (see above). Made on first need: by the
-    migration, or by the first /admin home-games grant (``create_for`` = the
-    granting admin, who then owns it)."""
-    r = pub.DB.one("SELECT id FROM homegame_clubs WHERE is_main=1 ORDER BY created_at LIMIT 1")
-    if r is not None:
-        return str(r["id"])
-    owner = pub._user_by_id(int(create_for)) if create_for is not None else None
-    if owner is None:
-        return None
-    first = (_display_name(owner) or "Home").split(" ")[0]
-    return _create_club(owner, f"{first}'s club"[:MAX_CLUB_NAME], main=True)
-
-
-def _migrate_clubs() -> None:
-    """Tables that predate clubs (``club_id`` NULL) join the MAIN club, and so
-    does everyone who ever hosted or sat at one, plus everyone who had the old
-    admin-granted home-games flag: the circle and its numbers carry on exactly as
-    they were. Idempotent (nothing left to move = nothing happens)."""
-    legacy = pub.DB.q("SELECT id, host_user_id FROM homegames WHERE club_id IS NULL ORDER BY created_at")
-    if not legacy:
-        return
-    granted = [int(r["id"]) for r in pub.DB.q("SELECT id FROM users WHERE homegame_access=1 ORDER BY created_at")]
-    admins = [int(r["id"]) for r in pub.DB.q("SELECT id, email FROM users ORDER BY created_at") if pub._is_admin(r)]
-    owner = admins[0] if admins else int(legacy[0]["host_user_id"])
-    cid = _main_club(create_for=owner)
-    if cid is None:
-        return
-    members = set(granted) | {int(r["host_user_id"]) for r in legacy}
-    for r in pub.DB.q("SELECT DISTINCT p.user_id FROM homegame_players p JOIN homegames g ON g.id=p.game_id "
-                      "WHERE g.club_id IS NULL"):
-        members.add(int(r["user_id"]))
-    with pub.DB.transaction():
-        for uid in sorted(members):
-            if pub._user_by_id(uid) is not None:
-                pub.DB.q(
-                    "INSERT OR IGNORE INTO homegame_club_members(club_id,user_id,role,joined_at) "
-                    "VALUES(?,?,'member',?)", (cid, uid, pub._now()),
-                )
-        pub.DB.q("UPDATE homegames SET club_id=? WHERE club_id IS NULL", (cid,))
-    logger.info("clubs: %d table(s) and %d player(s) moved into the main club %s", len(legacy), len(members), cid)
-
-
-def _club_for_new_table(uid: int, requested: Any) -> str:
-    """Any member may host in a club. Without a choice (scripts, older clients):
-    the main club when the host is in it, else their oldest club."""
-    if requested:
-        club, _ = _require_club(requested, uid)
-        return str(club["id"])
-    r = pub.DB.one(
-        "SELECT m.club_id FROM homegame_club_members m JOIN homegame_clubs c ON c.id=m.club_id "
-        "WHERE m.user_id=? ORDER BY c.is_main DESC, m.joined_at LIMIT 1", (int(uid),),
-    )
-    if r is None:
-        raise HTTPException(status_code=400, detail="start a club (or join one) before you host a table")
-    return str(r["club_id"])
-
-
-def _mask_email(email: Any) -> str:
-    """Enough to tell two Alexes apart, not a mailing list: ``a•••@gmail.com``."""
-    s = str(email or "")
-    if "@" not in s:
-        return ""
-    user, dom = s.split("@", 1)
-    return f"{user[:1]}•••@{dom}"
-
-
-def _join_retry_in(decided_at: str | None) -> float:
-    try:
-        dt = datetime.fromisoformat(str(decided_at))
-    except (TypeError, ValueError):
-        return 0.0
-    return max(0.0, JOIN_RETRY_S - (datetime.now(timezone.utc) - dt).total_seconds())
-
-
-def _request_state(club_id: str, uid: int) -> tuple[str | None, float]:
-    r = pub.DB.one(
-        "SELECT status, decided_at FROM homegame_club_requests WHERE club_id=? AND user_id=?", (club_id, int(uid))
-    )
-    if r is None:
-        return None, 0.0
-    status = str(r["status"])
-    return status, (_join_retry_in(r["decided_at"]) if status == "declined" else 0.0)
-
-
-def _request_club(club_id: str, uid: int) -> None:
-    """Ask to join (from a table link, or an invite link of an ask-first club).
-    Once pending, or declined less than a minute ago, asking again is a no-op."""
-    if _club_role(club_id, uid) is not None:
-        return
-    status, retry = _request_state(club_id, uid)
-    if status == "pending" or (status == "declined" and retry > 0):
-        return
-    pub.DB.q(
-        "INSERT OR REPLACE INTO homegame_club_requests(club_id,user_id,status,created_at,decided_at) "
-        "VALUES(?,?,'pending',?,NULL)", (club_id, int(uid), pub._now()),
-    )
-    user = pub._user_by_id(uid)
-    for t in _open_club_tables_in_memory(club_id):
-        with t.lock:
-            t.join_checked_mono = 0.0
-            _emit(t, "joinreq", f"{_display_name(user) if user else 'Someone'} asks to join the club")
-            t.rev += 1
-
-
-def _open_club_tables_in_memory(club_id: str) -> list[LiveTable]:
-    with HUB._lock:
-        return [t for t in HUB._tables.values() if t.club_id == club_id and t.status == "open"]
-
-
-def _club_requests(club_id: str) -> list[dict[str, Any]]:
-    """Pending requests, oldest first (people who got in meanwhile drop out)."""
-    club = _club(club_id)
-    rows = pub.DB.q(
-        "SELECT r.user_id, r.created_at, u.name, u.email FROM homegame_club_requests r "
-        "JOIN users u ON u.id=r.user_id WHERE r.club_id=? AND r.status='pending' ORDER BY r.created_at",
-        (club_id,),
-    )
-    members = _club_member_ids(club_id)
-    return [
-        {"club_id": club_id, "club_name": str(club["name"]) if club else "", "user_id": int(r["user_id"]),
-         "name": _display_name(r), "avatar": _avatar_url(r["user_id"]),
-         "email": _mask_email(r["email"]), "since": str(r["created_at"])}
-        for r in rows if int(r["user_id"]) not in members
-    ]
-
-
-def _decide_club_request(club_id: str, by_uid: int, target: int, allow: bool) -> dict[str, Any]:
-    _require_club(club_id, by_uid, "owner", "admin")
-    status, _ = _request_state(club_id, target)
-    if status != "pending" or _club_role(club_id, target) is not None:
-        raise HTTPException(status_code=409, detail="that request is gone")
-    user = pub._user_by_id(target)
-    if allow:
-        _add_member(club_id, target)
-    else:
-        pub.DB.q("UPDATE homegame_club_requests SET status='declined', decided_at=? WHERE club_id=? AND user_id=?",
-                 (pub._now(), club_id, int(target)))
-    for t in _open_club_tables_in_memory(club_id):
-        with t.lock:
-            t.join_checked_mono = 0.0
-            if allow:
-                _emit(t, "join", f"{_display_name(user) if user else 'A new player'} joined the club")
-            t.rev += 1
-    return {"ok": True, "allowed": bool(allow)}
-
-
-def _table_join_requests(t: LiveTable, viewer_id: int | None) -> list[dict[str, Any]]:
-    """What the club's owner / an admin at this table is asked to decide."""
-    if viewer_id is None or _club_role(t.club_id, viewer_id) not in ("owner", "admin"):
-        return []
-    now = time.monotonic()
-    if now - t.join_checked_mono > JOIN_REFRESH_S:
-        t.join_checked_mono = now
-        try:
-            t.join_reqs = _club_requests(t.club_id) if t.club_id else []
-        except Exception:  # noqa: BLE001 — cosmetic: never take the view down
-            logger.exception("club requests (table %s)", t.game_id)
-    return list(t.join_reqs)
-
-
-def _table_club(t: LiveTable, viewer_id: int | None) -> dict[str, Any] | None:
-    """The table's club as its view shows it (cached per table: names rarely change)."""
-    now = time.monotonic()
-    if t.club_info is None or now - t.club_checked_mono > 30.0:
-        t.club_checked_mono = now
-        club = _club(t.club_id)
-        t.club_info = {"id": str(club["id"]), "name": str(club["name"])} if club is not None else None
-    if t.club_info is None:
-        return None
-    return dict(t.club_info, role=_club_role(t.club_id, viewer_id))
-
-
-def _table_access(t: LiveTable, uid: int) -> None:
-    """Only the table's club may see it, sit, watch or act. Anyone else gets 403
-    naming the club (and where their request stands), so a table link can offer
-    "ask to join the club" instead of a dead end."""
-    if t.club_id and _club_role(t.club_id, uid) is not None:
-        return
-    club = _club(t.club_id)
-    if club is None:  # (no club at all cannot happen after the migration: its host only)
-        if int(uid) == int(t.host_user_id):
-            return
-        raise HTTPException(status_code=404, detail="Not Found")
-    status, retry = _request_state(str(club["id"]), uid)
-    raise HTTPException(status_code=403, detail={
-        "error": "club", "club": {"id": str(club["id"]), "name": str(club["name"])},
-        "request": status, "retry_in": round(retry, 1),
-        "message": f"This table belongs to the club “{club['name']}”.",
-    })
-
-
-def _busy_in_club(club_id: str, uid: int, who: str) -> str | None:
-    """Why this person can't leave the club right now (``who`` = "you" or their
-    name), or None: a seat at one of its open tables, or hosting one (a table
-    whose host is outside its club would have nobody left to run it)."""
-    r = pub.DB.one(
-        "SELECT g.name FROM homegame_players p JOIN homegames g ON g.id=p.game_id "
-        "WHERE g.club_id=? AND g.status='open' AND p.user_id=? AND p.seat IS NOT NULL LIMIT 1",
-        (club_id, int(uid)),
-    )
-    if r is not None:
-        return f"{who} {'have' if who == 'you' else 'has'} a seat at “{r['name']}” — leave the table first"
-    r = pub.DB.one(
-        "SELECT name FROM homegames WHERE club_id=? AND status='open' AND host_user_id=? LIMIT 1",
-        (club_id, int(uid)),
-    )
-    if r is not None:
-        return f"{who} {'host' if who == 'you' else 'hosts'} “{r['name']}” — hand the table over or close it first"
-    return None
-
-
-def _club_summary(r: Any, uid: int) -> dict[str, Any]:
-    cid, role = str(r["id"]), str(r["role"])
-    manage = role in ("owner", "admin")
-    return {
-        "id": cid, "name": str(r["name"]), "role": role, "is_main": bool(int(r["is_main"] or 0)),
-        "members": int(pub.DB.one("SELECT COUNT(*) c FROM homegame_club_members WHERE club_id=?", (cid,))["c"]),
-        "open_tables": int(pub.DB.one(
-            "SELECT COUNT(*) c FROM homegames WHERE club_id=? AND status='open'", (cid,))["c"]),
-        "requests": len(_club_requests(cid)) if manage else 0,
-    }
-
-
-def _my_clubs(uid: int) -> list[dict[str, Any]]:
-    rows = pub.DB.q(
-        "SELECT c.*, m.role FROM homegame_club_members m JOIN homegame_clubs c ON c.id=m.club_id "
-        "WHERE m.user_id=? ORDER BY c.is_main DESC, c.created_at", (int(uid),),
-    )
-    return [_club_summary(r, uid) for r in rows]
-
-
-_ROLE_RANK = {"owner": 0, "admin": 1, "member": 2}
-
-
-def _club_view(club_id: Any, uid: int) -> dict[str, Any]:
-    club, role = _require_club(club_id, uid)
-    cid = str(club["id"])
-    manage = role in ("owner", "admin")
-    owner = pub._user_by_id(int(club["owner_user_id"]))
-    rows = pub.DB.q(
-        "SELECT m.user_id, m.role, m.joined_at, u.name, u.email FROM homegame_club_members m "
-        "JOIN users u ON u.id=m.user_id WHERE m.club_id=?", (cid,),
-    )
-    members = sorted(
-        ({"user_id": int(r["user_id"]), "name": _display_name(r), "role": str(r["role"]),
-          "avatar": _avatar_url(r["user_id"]),
-          "is_me": int(r["user_id"]) == int(uid), "joined_at": str(r["joined_at"])} for r in rows),
-        key=lambda m: (_ROLE_RANK.get(m["role"], 9), m["name"].lower()),
-    )
-    return {
-        "id": cid, "name": str(club["name"]), "role": role, "is_main": bool(int(club["is_main"] or 0)),
-        "approve_joins": bool(int(club["approve_joins"] or 0)),
-        "owner": {"user_id": int(club["owner_user_id"]), "name": _display_name(owner) if owner else "?"},
-        "members": members,
-        "invite_code": str(club["invite_code"]) if manage else None,
-        "requests": _club_requests(cid) if manage else [],
-        "created_at": str(club["created_at"]),
-    }
-
-
-def _club_settings(club_id: Any, uid: int, body: dict) -> dict[str, Any]:
-    club, _ = _require_club(club_id, uid, "owner")
-    cid = str(club["id"])
-    name = str(club["name"])
-    if body.get("name") is not None:
-        name = " ".join(str(body.get("name") or "").split())
-        if not name:
-            raise HTTPException(status_code=400, detail="give the club a name")
-        if len(name) > MAX_CLUB_NAME:
-            raise HTTPException(status_code=400, detail=f"a club name is limited to {MAX_CLUB_NAME} characters")
-    approve = _parse_bool(body, "approve_joins", bool(int(club["approve_joins"] or 0)))
-    pub.DB.q("UPDATE homegame_clubs SET name=?, approve_joins=? WHERE id=?", (name, 1 if approve else 0, cid))
-    return _club_view(cid, uid)
-
-
-def _reset_invite(club_id: Any, uid: int) -> dict[str, Any]:
-    club, _ = _require_club(club_id, uid, "owner", "admin")
-    pub.DB.q("UPDATE homegame_clubs SET invite_code=? WHERE id=?", (secrets.token_urlsafe(9), str(club["id"])))
-    return _club_view(str(club["id"]), uid)
-
-
-def _set_member(club_id: Any, by_uid: int, target: int, *, role: Any = None, remove: bool = False) -> dict[str, Any]:
-    club, my_role = _require_club(club_id, by_uid, "owner", "admin")
-    cid = str(club["id"])
-    their = _club_role(cid, target)
-    if their is None:
-        raise HTTPException(status_code=404, detail="they are not in the club")
-    who = pub._user_by_id(target)
-    name = _display_name(who) if who is not None else "They"
-    if remove:
-        if int(target) == int(by_uid):
-            raise HTTPException(status_code=400, detail="to go, use Leave club")
-        if their == "owner":
-            raise HTTPException(status_code=403, detail="the owner can't be removed")
-        if my_role == "admin" and their != "member":
-            raise HTTPException(status_code=403, detail="only the owner can remove an admin")
-        busy = _busy_in_club(cid, target, name)
-        if busy:
-            raise HTTPException(status_code=409, detail=busy)
-        pub.DB.q("DELETE FROM homegame_club_members WHERE club_id=? AND user_id=?", (cid, int(target)))
-        return _club_view(cid, by_uid)
-    if my_role != "owner":
-        raise HTTPException(status_code=403, detail="only the club's owner can change roles")
-    role = str(role or "")
-    if role not in CLUB_ROLES:
-        raise HTTPException(status_code=400, detail="role must be owner, admin or member")
-    if role == "owner":
-        # handing the club over: the old owner stays on as an admin
-        if int(target) == int(by_uid):
-            return _club_view(cid, by_uid)
-        with pub.DB.transaction():
-            pub.DB.q("UPDATE homegame_clubs SET owner_user_id=? WHERE id=?", (int(target), cid))
-            pub.DB.q("UPDATE homegame_club_members SET role='owner' WHERE club_id=? AND user_id=?", (cid, int(target)))
-            pub.DB.q("UPDATE homegame_club_members SET role='admin' WHERE club_id=? AND user_id=?", (cid, int(by_uid)))
-        return _club_view(cid, by_uid)
-    if their == "owner":
-        raise HTTPException(status_code=400, detail="the owner's role only changes by handing the club over")
-    pub.DB.q("UPDATE homegame_club_members SET role=? WHERE club_id=? AND user_id=?", (role, cid, int(target)))
-    return _club_view(cid, by_uid)
-
-
-def _leave_club(club_id: Any, uid: int) -> None:
-    club, role = _require_club(club_id, uid)
-    cid = str(club["id"])
-    if role == "owner":
-        raise HTTPException(status_code=400, detail="hand the club to another member first (Club settings → Members)")
-    busy = _busy_in_club(cid, uid, "you")
-    if busy:
-        raise HTTPException(status_code=409, detail=busy[0].upper() + busy[1:])
-    pub.DB.q("DELETE FROM homegame_club_members WHERE club_id=? AND user_id=?", (cid, int(uid)))
-
-
-def _club_by_code(code: Any) -> Any:
-    if not code or not _CODE_RE.match(str(code)):
-        return None
-    return pub.DB.one("SELECT * FROM homegame_clubs WHERE invite_code=?", (str(code),))
-
-
-def _invite_info(code: Any, uid: int | None) -> dict[str, Any]:
-    club = _club_by_code(code)
-    if club is None:
-        raise HTTPException(status_code=404, detail="This invite link is no longer valid — ask for a new one.")
-    cid = str(club["id"])
-    owner = pub._user_by_id(int(club["owner_user_id"]))
-    status, retry = _request_state(cid, uid) if uid is not None else (None, 0.0)
-    return {
-        "club": {"id": cid, "name": str(club["name"]), "owner_name": _display_name(owner) if owner else "?",
-                 "members": len(_club_member_ids(cid))},
-        "member": uid is not None and _club_role(cid, uid) is not None,
-        "approve": bool(int(club["approve_joins"] or 0)),
-        "request": status, "retry_in": round(retry, 1),
-    }
-
-
-def _join_by_invite(code: Any, uid: int) -> dict[str, Any]:
-    club = _club_by_code(code)
-    if club is None:
-        raise HTTPException(status_code=404, detail="This invite link is no longer valid — ask for a new one.")
-    cid = str(club["id"])
-    if _club_role(cid, uid) is None:
-        if bool(int(club["approve_joins"] or 0)):
-            _request_club(cid, uid)
-        else:
-            _add_member(cid, uid)
-    return _invite_info(code, uid)
-
-
-# --- pages for someone who is not signed in ----------------------------------------
-#
-# Home games need an account: the lobby, a table link or a club invite link opened
-# signed out answers with a small page (no scripts) naming what it is and a
-# "Sign in with Google" button that comes straight back to the same link.
-
-_SIGNIN_PATH = re.compile(r"^/games(?:/t/([A-Za-z0-9_-]{1,40})|/join/([A-Za-z0-9_-]{6,40}))?$")
-INVITE_HEADERS: dict[str, str] = {
-    "Cache-Control": "no-store, must-revalidate",
-    "Content-Security-Policy": "; ".join((
-        "default-src 'none'",
-        "style-src 'unsafe-inline' https://fonts.googleapis.com",
-        "font-src https://fonts.gstatic.com",
-        "img-src 'self' data:",
-        "form-action 'self'",
-        "base-uri 'none'",
-        "frame-ancestors 'none'",
-    )),
-    "X-Frame-Options": "DENY",
-    "X-Content-Type-Options": "nosniff",
-    "Referrer-Policy": "same-origin",
-}
-_INVITE_CSS = """
-:root{color-scheme:dark}*{box-sizing:border-box}
-body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px 16px;
-background:radial-gradient(1200px 600px at 50% -10%,#123127 0,#070b11 60%) #070b11;color:#e8edf3;
-font:15px/1.5 Geist,system-ui,-apple-system,"Segoe UI",sans-serif}
-.card{width:100%;max-width:420px;background:#0f1620;border:1px solid #223041;border-radius:18px;
-padding:28px 24px;box-shadow:0 20px 60px rgba(0,0,0,.45);text-align:center}
-.brand{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:#8794a6;margin-bottom:14px}
-h1{font-size:22px;line-height:1.25;margin:0 0 10px}p{margin:0 0 18px;color:#b7c2d0}
-.btn{display:inline-block;width:100%;border:0;border-radius:12px;padding:13px 16px;font:inherit;
-font-weight:700;cursor:pointer;text-decoration:none;background:linear-gradient(#f3d27a,#d9a93c);color:#1a1405}
-"""
-
-
-def _signin_html(head: str, text: str, next_path: str) -> str:
-    """``text`` is HTML (its names already escaped); ``head`` is plain text."""
-    def esc(s: str) -> str:  # (text nodes: & < > only — "You're" stays readable)
-        return html_mod.escape(str(s), quote=False)
-    return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
-            '<meta name="viewport" content="width=device-width, initial-scale=1">'
-            f"<title>{esc(head)} · Home games</title>"
-            '<link rel="icon" type="image/svg+xml" href="/static/brand/wrap-app-icon-dark.svg">'
-            '<link rel="apple-touch-icon" sizes="180x180" href="/static/brand/apple-touch-icon.png">'
-            '<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400..800&display=swap" rel="stylesheet">'
-            f"<style>{_INVITE_CSS}</style></head><body><main class=\"card\">"
-            f'<div class="brand">WrapGTO · Home games</div><h1>{esc(head)}</h1><p>{text}</p>'
-            f'<a class="btn" href="/auth/login?next={html_mod.escape(next_path, quote=True)}">Sign in with Google</a></main></body></html>')
-
-
-def _invite_response(request: Request, path: str, user: Any) -> Response | None:
-    """``pub._GAMES_INVITE_HOOK``: a /games page opened SIGNED OUT (or None for
-    the hidden 404 — the API, the assets and unknown links)."""
-    if user is not None or request.method.upper() not in ("GET", "HEAD"):
-        return None
-    if "text/html" not in request.headers.get("accept", "text/html"):
-        return None
-    m = _SIGNIN_PATH.match(path)
-    if m is None:
-        return None
-    esc = html_mod.escape
-    game_id, code = m.group(1), m.group(2)
-    if game_id:
-        table = pub.DB.one(
-            "SELECT g.name, g.status, g.variant, u.name AS host_name, c.name AS club_name FROM homegames g "
-            "JOIN users u ON u.id=g.host_user_id LEFT JOIN homegame_clubs c ON c.id=g.club_id WHERE g.id=?",
-            (game_id,),
-        )
-        if table is None or table["status"] != "open":
-            return None
-        club = f" in <b>{esc(str(table['club_name']))}</b>" if table["club_name"] else ""
-        label = GAMES[_norm_game(table["variant"])]["label"]
-        html = _signin_html(
-            f"You're invited to {table['name']}",
-            f"<b>{esc(str(table['host_name'] or 'A friend'))}</b> is hosting a {label} double-board bomb-pot "
-            f"game{club}. Sign in with Google to join — you'll come straight back to the table.",
-            path,
-        )
-    elif code:
-        club = _club_by_code(code)
-        if club is None:
-            return None
-        owner = pub._user_by_id(int(club["owner_user_id"]))
-        html = _signin_html(
-            f"Join {club['name']}",
-            f"<b>{esc(_display_name(owner) if owner else 'A friend')}</b> invited you to their home-games club: "
-            "PLO5 and PLO6 double-board bomb pots with friends, with the stats kept inside the club. "
-            "Sign in with Google to join.",
-            path,
-        )
-    else:
-        html = _signin_html(
-            "Home games",
-            "PLO5 and PLO6 double-board bomb pots with your friends, in private clubs. Sign in with Google to start a "
-            "club or join one.",
-            "/games",
-        )
-    return HTMLResponse(html, headers=dict(INVITE_HEADERS))
-
-
-def _main_club_member(uid: int) -> bool:
-    """/admin's home-games column: is this person in the main club?"""
-    cid = _main_club()
-    return cid is not None and _club_role(cid, uid) is not None
-
-
-def _admin_games_access(admin_uid: int, uid: int, grant: bool) -> bool:
-    """/admin's home-games switch: add to / remove from the MAIN club (made on the
-    first grant, owned by the granting admin). Returns membership afterwards."""
-    cid = _main_club(create_for=admin_uid if grant else None)
-    if cid is None:
-        return False
-    if grant:
-        _add_member(cid, uid)
-    elif _club_role(cid, uid) not in (None, "owner"):
-        who = pub._user_by_id(uid)
-        busy = _busy_in_club(cid, uid, _display_name(who) if who is not None else "They")
-        if busy:
-            raise HTTPException(status_code=409, detail=busy)
-        pub.DB.q("DELETE FROM homegame_club_members WHERE club_id=? AND user_id=?", (cid, int(uid)))
-    return _club_role(cid, uid) is not None
-
-
-_ADMIN_IDS: dict[int, bool] = {}
-
-
-def _viewer_is_admin(uid: int | None) -> bool:
-    if uid is None:
-        return False
-    hit = _ADMIN_IDS.get(int(uid))
-    if hit is None:
-        hit = _ADMIN_IDS[int(uid)] = bool(pub._is_admin(pub._user_by_id(int(uid))))
-    return hit
-
-
-def _require_sync(t: LiveTable, body: dict, *, with_seq: bool) -> None:
-    """Reject a request composed against a state the table has left.
-
-    (review 2026-09-20 G8) `/act` carried no hand or decision identity, so a
-    click that arrived late landed on the NEXT decision — "Call $1" could
-    call a different bet, and an armed pre-fold folded the next hand. The
-    client echoes the ``hand_no`` (and for `/act` the ``action_seq``) of the
-    state it was looking at; a mismatch is 409 and the client just re-renders.
-    Optional so scripted callers keep working."""
-    if not isinstance(body, dict):
-        return
-    if body.get("hand_no") is not None:
-        if pub.body_int(body, "hand_no") != t.hand_no:
-            raise HTTPException(status_code=409, detail="stale: the hand has moved on")
-    if with_seq and body.get("action_seq") is not None:
-        if pub.body_int(body, "action_seq") != t.action_seq:
-            raise HTTPException(status_code=409, detail="stale: the action has moved on")
-
-
-def _stream_sig(t: LiveTable) -> tuple:
-    """Everything that can change what a viewer sees WITHOUT bumping ``rev``
-    (the runout reveals itself by the clock). Cheap, lock-free reads."""
-    return (
-        t.epoch, t.rev, t.phase, t.hand_no, t.action_seq, len(t.requests),
-        _runout_shown_len(t) if t.runout_active else 0,
-        _runout_award_index(t) if t.runout_active else 0,
-        t.next_deal_mono is not None, t.bank_key,
-    )
-
-
-def install(app: FastAPI, *, static_dir: Path) -> None:
+def _read_env_settings() -> None:
+    """The environment-driven settings, read again for the app being installed
+    (BE-007: the app factory can build several apps in one process — tests; the
+    server installs once, right after import, so these are the values it started with)."""
+    global MAX_OPEN_TABLES_PER_USER, GRADING_ON
+    MAX_OPEN_TABLES_PER_USER = _env_max_tables()
+    GRADING_ON = _env_grading_on()
+
+
+def install(app: FastAPI, *, static_dir: Path, model_provider: Any = None) -> None:
+    """Mount the home games on the public app: the pages and the gated client
+    files here, the API from the module's ``router``. ``model_provider()`` returns
+    the PLO5 model grading scores with (or server.py calls ``set_model_provider``).
+
+    The app's state is the CURRENT context: ``server.create_app`` makes a fresh
+    ``HomeGames()`` current before installing (``use_context``), so every app
+    starts with its own tables, workers and caches; the settings are read again
+    and the request budgets (keyed by the app database's user ids) start empty."""
+    _read_env_settings()
+    for budget in (API_RATE, JOIN_RATE, AVATAR_RATE):
+        if budget is not None:
+            budget.reset()
+    _take_process_lock()
     _ensure_schema()
+    # The clubs' role cache forgets itself on any write to the club tables (PERF-004).
+    if _on_clubs_write not in pub.DB.write_listeners:
+        pub.DB.write_listeners.append(_on_clubs_write)
+    _check_ledger_at_start()  # (OPS-017: logged, never fatal)
+    try:  # the site's /health reports the home games' workers and money (OPS-011 / OPS-017)
+        from plo5bp.ui import middleware as _mw
+
+        _mw.register_health_check("home_games", _site_health)
+    except Exception:  # noqa: BLE001 — an older site without the hook still runs the games
+        logger.warning("homegame: the site's health checks are not available")
+    if model_provider is not None:
+        set_model_provider(model_provider)
+    # OPS-008: save what tables still owe the database and stop the workers
+    # when the server stops (it had no shutdown hook at all).
+    app.router.on_shutdown.append(_on_app_shutdown)
+    _build_cache["dir"] = static_dir  # (client_build() in the views)
     pub._GAMES_INVITE_HOOK = _invite_response
     pub._GAMES_ACCESS_HOOK = _admin_games_access
     pub._GAMES_MEMBER_HOOK = _main_club_member
+    pub._GAMES_MEMBERS_HOOK = _main_club_members  # (/admin's user list: one lookup — PERF-010)
 
     def _html() -> HTMLResponse:
         return HTMLResponse(_page_html(static_dir), headers=dict(PAGE_HEADERS))
@@ -6011,637 +5717,251 @@ def install(app: FastAPI, *, static_dir: Path) -> None:
         return _html()
 
     @app.get("/games/static/{name}")
-    def games_asset(name: str):
-        """Gated, no-store copies of the lobby JS/CSS.
+    def games_asset(name: str, v: str | None = None):
+        """Gated copies of the lobby JS/CSS.
 
         Served under /games/ (not /static/) so a previously cached 404 on
-        /static/games.js cannot keep the create button dead.
+        /static/games.js cannot keep the create button dead. The address the
+        page links (`?v=` = the file's content hash, see `_page_html`) is kept
+        by the browser for a year; any other address is never cached.
         """
-        allowed = {name: media for name, media in GAMES_ASSETS.items()}
-        media = allowed.get(name)
+        media = GAMES_ASSETS.get(name)
         if media is None:
             raise HTTPException(status_code=404, detail="Not Found")
         path = static_dir / name
         if not path.is_file():
             raise HTTPException(status_code=404, detail="Not Found")
+        body = path.read_text(encoding="utf-8")
+        current = bool(v) and v == _asset_hash(static_dir, name)
         return Response(
-            path.read_text(encoding="utf-8"),
+            body,
             media_type=media,
-            headers={"Cache-Control": "no-store, must-revalidate", "X-Content-Type-Options": "nosniff"},
-        )
-
-    def _uid() -> int:
-        uid = pub._CURRENT_USER_ID.get()
-        if uid is None:
-            raise HTTPException(status_code=404, detail="Not Found")
-        return int(uid)
-
-    def _table_for(game_id: str) -> LiveTable:
-        """Every table endpoint comes through here: members of the table's club only."""
-        t = HUB.get(game_id)
-        _table_access(t, _uid())
-        return t
-
-    def _scope_clubs(uid: int, club: str | None, *, own: bool) -> list[str] | None:
-        """Whose tables a stats query may read: one club the viewer is in; else, for
-        the viewer's OWN numbers, everything they played (None); for somebody
-        else's, only the clubs the viewer shares with them."""
-        if club:
-            row, _ = _require_club(club, uid)
-            return [str(row["id"])]
-        if own:
-            return None
-        return [c["id"] for c in _my_clubs(uid)]
-
-    @app.get("/games/api/tables")
-    def api_list(club: str | None = None):
-        """The lobby: the viewer's clubs, one club's tables (plus the viewer's own
-        seats elsewhere), their finished sessions there, and — for the club's
-        owner and admins — who is asking to join."""
-        viewer = _uid()
-        clubs = _my_clubs(viewer)
-        by_id = {c["id"]: c for c in clubs}
-        if club and club not in by_id:
-            raise HTTPException(status_code=404, detail="Not Found")
-        rows = pub.DB.q(
-            "SELECT * FROM homegames WHERE status='open' AND club_id IN (%s) ORDER BY created_at DESC"
-            % ",".join("?" * len(by_id)), tuple(by_id),
-        ) if by_id else []
-        tables = []
-        for r in rows:
-            if not _lobby_visible(r, viewer):
-                continue
-            row = _lobby_row(r, viewer)
-            if club and r["club_id"] != club and not (row["is_host"] or row["is_seated"]):
-                continue
-            row["club_id"] = str(r["club_id"])
-            row["club_name"] = by_id[str(r["club_id"])]["name"]
-            tables.append(row)
-        manage = bool(club) and by_id[club]["role"] in ("owner", "admin")
-        return {
-            "clubs": clubs,
-            "club": club,
-            "tables": tables,
-            "sessions": _my_sessions(viewer, club),
-            "join_requests": _club_requests(club) if manage else [],
-            "my_avatar": _avatar_url(viewer),
-        }
-
-    # --- clubs --------------------------------------------------------------------
-    @app.get("/games/api/clubs")
-    def api_clubs():
-        return {"clubs": _my_clubs(_uid())}
-
-    @app.post("/games/api/clubs")
-    def api_club_create(body: dict = Body({})):
-        uid = _uid()
-        user = pub._user_by_id(uid)
-        if user is None:
-            raise HTTPException(status_code=404, detail="Not Found")
-        return _club_view(_create_club(user, (body or {}).get("name")), uid)
-
-    @app.get("/games/api/clubs/{club_id}")
-    def api_club(club_id: str):
-        return _club_view(club_id, _uid())
-
-    @app.post("/games/api/clubs/{club_id}/settings")
-    def api_club_settings(club_id: str, body: dict = Body({})):
-        return _club_settings(club_id, _uid(), body or {})
-
-    @app.post("/games/api/clubs/{club_id}/invite")
-    def api_club_invite_reset(club_id: str):
-        """A new invite link (the old one stops working)."""
-        return _reset_invite(club_id, _uid())
-
-    @app.post("/games/api/clubs/{club_id}/members")
-    def api_club_member(club_id: str, body: dict = Body({})):
-        body = body or {}
-        return _set_member(club_id, _uid(), pub.body_int(body, "user_id"), role=body.get("role"),
-                           remove=_parse_bool(body, "remove", False))
-
-    @app.post("/games/api/clubs/{club_id}/leave")
-    def api_club_leave(club_id: str):
-        _leave_club(club_id, _uid())
-        return {"ok": True}
-
-    @app.post("/games/api/clubs/{club_id}/request")
-    def api_club_request(club_id: str):
-        """Ask to join (from a table link: the club's id only travels in the answer
-        a table link gives a non-member). The owner or an admin decides."""
-        uid = _uid()
-        club = _club(club_id)
-        if club is None:
-            raise HTTPException(status_code=404, detail="Not Found")
-        cid = str(club["id"])
-        _request_club(cid, uid)
-        status, retry = _request_state(cid, uid)
-        return {"ok": True, "member": _club_role(cid, uid) is not None, "request": status,
-                "retry_in": round(retry, 1)}
-
-    @app.post("/games/api/clubs/{club_id}/requests/decide")
-    def api_club_decide(club_id: str, body: dict = Body({})):
-        return _decide_club_request(club_id, _uid(), pub.body_int(body, "user_id"), bool((body or {}).get("allow")))
-
-    @app.get("/games/api/invites/{code}")
-    def api_invite(code: str):
-        return _invite_info(code, _uid())
-
-    @app.post("/games/api/invites/{code}/join")
-    def api_invite_join(code: str):
-        return _join_by_invite(code, _uid())
-
-    @app.post("/games/api/tables")
-    def api_create(body: dict = Body({})):
-        uid = pub._CURRENT_USER_ID.get()
-        user = pub._user_by_id(int(uid)) if uid is not None else None
-        if user is None:
-            raise HTTPException(status_code=404, detail="Not Found")
-        t = _create_table(user, body or {})
-        prefs = _host_prefs(int(user["id"])) if (body or {}).get("remembered") else None
-        with t.lock:
-            if prefs:
-                _apply_remembered_locked(t, int(user["id"]), prefs)
-            _remember_host_prefs(t)
-            return _view(t, int(user["id"]))
-
-    @app.get("/games/api/host_prefs")
-    def api_host_prefs():
-        """The settings of the last table this user hosted (None = never)."""
-        return {"prefs": _host_prefs(_uid())}
-
-    @app.get("/games/api/tables/{game_id}")
-    def api_get(game_id: str):
-        t = _table_for(game_id)
-        with t.lock:
-            return _view(t, _uid())
-
-    @app.post("/games/api/tables/{game_id}/sit")
-    def api_sit(game_id: str, body: dict = Body({})):
-        t = _table_for(game_id)
-        uid = _uid()
-        user = pub._user_by_id(uid)
-        if user is None:
-            raise HTTPException(status_code=404, detail="Not Found")
-        seat = pub.body_int(body, "seat", -1)
-        buyin = _parse_cents(body, "buyin_cents", t.default_buyin_cents)
-        with t.lock:
-            if _needs_approval(t, uid):
-                _request_locked(t, user, "sit", seat, buyin)
-            else:
-                _sit_locked(t, user, seat, buyin)
-            return _view(t, uid)
-
-    @app.post("/games/api/tables/{game_id}/leave")
-    def api_leave(game_id: str, body: dict = Body({})):
-        """Leave the seat. Holding cards: after this hand (the default) — or
-        ``now`` = out of the hand at once (folded when facing a bet)."""
-        t = _table_for(game_id)
-        uid = _uid()
-        with t.lock:
-            _leave_locked(t, uid, now=_parse_bool(body or {}, "now", False))
-            return _view(t, uid)
-
-    @app.post("/games/api/tables/{game_id}/sit_out")
-    def api_sit_out(game_id: str, body: dict = Body({})):
-        t = _table_for(game_id)
-        uid = _uid()
-        on = _parse_bool(body, "on", True)
-        next_hand = _parse_bool(body, "next_hand", False)
-        with t.lock:
-            _sit_out_locked(t, uid, on, next_hand=next_hand)
-            return _view(t, uid)
-
-    @app.post("/games/api/tables/{game_id}/settings")
-    def api_settings(game_id: str, body: dict = Body({})):
-        t = _table_for(game_id)
-        uid = _uid()
-        with t.lock:
-            _settings_locked(t, uid, body or {})
-            return _view(t, uid)
-
-    @app.post("/games/api/tables/{game_id}/transfer_host")
-    def api_transfer_host(game_id: str, body: dict = Body({})):
-        t = _table_for(game_id)
-        uid = _uid()
-        target = pub.body_int(body, "user_id")
-        with t.lock:
-            _transfer_host_locked(t, uid, target)
-            return _view(t, uid)
-
-    @app.post("/games/api/tables/{game_id}/show")
-    def api_show(game_id: str, body: dict = Body({})):
-        t = _table_for(game_id)
-        uid = _uid()
-        with t.lock:
-            _require_sync(t, body, with_seq=False)
-            _show_locked(t, uid)
-            return _view(t, uid)
-
-    @app.post("/games/api/tables/{game_id}/react")
-    def api_react(game_id: str, body: dict = Body({})):
-        t = _table_for(game_id)
-        uid = _uid()
-        with t.lock:
-            _react_locked(t, uid, (body or {}).get("emote"))
-            return _view(t, uid)
-
-    @app.get("/games/api/my/hands")
-    def api_my_hands(sort: str = "time", dir: str = "desc", game: str | None = None,
-                     offset: int = 0, limit: int = 40, club: str | None = None,
-                     variant: str | None = None):
-        """The signed-in player's hand database (one club's, or all of it; one
-        game's — ``variant`` plo5 / plo6 — or every game's). ``game`` = one table."""
-        uid = _uid()
-        return _my_hands(uid, sort, dir, game, offset, limit, clubs=_scope_clubs(uid, club, own=True),
-                         variant=_game_filter(variant))
-
-    @app.get("/games/api/my/stats")
-    def api_my_stats(club: str | None = None, variant: str | None = None):
-        uid = _uid()
-        return _my_stats(uid, clubs=_scope_clubs(uid, club, own=True), variant=_game_filter(variant))
-
-    def _avatar_changed(uid: int) -> None:
-        """The tables this player sits at redraw with the new picture now."""
-        with HUB._lock:
-            tables = list(HUB._tables.values())
-        for tb in tables:
-            with tb.lock:
-                if tb.player(uid) is not None:
-                    tb.rev += 1
-
-    @app.post("/games/api/me/avatar")
-    def api_set_avatar(body: dict = Body({})):
-        """{data_url}: a PNG / JPEG / WebP picture (the page sends a 256 px square)."""
-        uid = _uid()
-        url = _set_avatar(uid, (body or {}).get("data_url") or "")
-        _avatar_changed(uid)
-        return {"avatar": url}
-
-    @app.delete("/games/api/me/avatar")
-    def api_clear_avatar():
-        uid = _uid()
-        url = _set_avatar(uid, None)
-        _avatar_changed(uid)
-        return {"avatar": url}
-
-    @app.get("/games/api/avatars/{user_id}")
-    def api_avatar(user_id: int):
-        """Someone's picture — for them, or anyone sharing a club with them."""
-        viewer = _uid()
-        if int(user_id) != viewer and pub.DB.one(
-            "SELECT 1 FROM homegame_club_members a JOIN homegame_club_members b "
-            "ON a.club_id=b.club_id WHERE a.user_id=? AND b.user_id=? LIMIT 1",
-            (viewer, int(user_id)),
-        ) is None:
-            raise HTTPException(status_code=404, detail="Not Found")
-        row = pub.DB.one("SELECT mime, data FROM homegame_avatars WHERE user_id=?", (int(user_id),))
-        if row is None or row["mime"] not in _AVATAR_MIMES:
-            raise HTTPException(status_code=404, detail="Not Found")
-        return Response(bytes(row["data"]), media_type=row["mime"], headers=AVATAR_HEADERS)
-
-    @app.get("/games/api/community")
-    def api_community(club: str | None = None, variant: str | None = None):
-        """One club's numbers for ONE game (``variant`` plo5 / plo6; none = the
-        club's most-played game): player cards, the pairwise money, all sessions.
-        The rankings never mix clubs, nor games. (No club named: the main club,
-        else the first.)"""
-        uid = _uid()
-        game = _game_filter(variant)
-        if not club:
-            mine = _my_clubs(uid)
-            if not mine:
-                return {"club": None, "players": [], "pairs": [], "sessions": [], "can_manage": False,
-                        "is_admin": False, "variant": game or DEFAULT_GAME, "games": _games_summary({})}
-            club = mine[0]["id"]
-        row, role = _require_club(club, uid)
-        return _community(uid, str(row["id"]), role == "owner", variant=game)
-
-    @app.get("/games/api/players/{player_id}/stats")
-    def api_player_stats(player_id: int, club: str | None = None, variant: str | None = None):
-        uid = _uid()
-        if pub._user_by_id(int(player_id)) is None:
-            raise HTTPException(status_code=404, detail="Not Found")
-        return _my_stats(int(player_id), clubs=_scope_clubs(uid, club, own=int(player_id) == uid),
-                         variant=_game_filter(variant))
-
-    @app.get("/games/api/players/{player_id}/hands")
-    def api_player_hands(player_id: int, sort: str = "time", dir: str = "desc",
-                         game: str | None = None, offset: int = 0, limit: int = 40, club: str | None = None,
-                         variant: str | None = None):
-        uid = _uid()
-        return _my_hands(uid, sort, dir, game, offset, limit, player_id=int(player_id),
-                         clubs=_scope_clubs(uid, club, own=int(player_id) == uid),
-                         variant=_game_filter(variant))
-
-    @app.post("/games/api/tables/{game_id}/remove_chips")
-    def api_remove_chips(game_id: str, body: dict = Body({})):
-        t = _table_for(game_id)
-        uid = _uid()
-        with t.lock:
-            _remove_chips_locked(t, uid, _parse_cents(body, "amount_cents"), queue_ok=_parse_bool(body, "queue", False))
-            return _view(t, uid)
-
-    @app.post("/games/api/tables/{game_id}/stay")
-    def api_stay(game_id: str):
-        t = _table_for(game_id)
-        uid = _uid()
-        with t.lock:
-            _cancel_leave_locked(t, uid)
-            return _view(t, uid)
-
-    @app.post("/games/api/tables/{game_id}/fair/commit")
-    def api_fair_commit(game_id: str, body: dict = Body({})):
-        t = _table_for(game_id)
-        uid = _uid()
-        with t.lock:
-            _fair_commit_locked(t, uid, str(body.get("hand_id") or ""), str(body.get("commit") or ""))
-            return {"ok": True}
-
-    @app.post("/games/api/tables/{game_id}/fair/reveal")
-    def api_fair_reveal(game_id: str, body: dict = Body({})):
-        t = _table_for(game_id)
-        uid = _uid()
-        with t.lock:
-            _fair_reveal_locked(t, uid, str(body.get("hand_id") or ""), str(body.get("nonce") or ""))
-            return {"ok": True}
-
-    @app.get("/games/api/tables/{game_id}/fair/{hand_no}")
-    def api_fair_transcript(game_id: str, hand_no: int):
-        t = _table_for(game_id)
-        uid = _uid()
-        with t.lock:
-            return _fair_transcript(t, uid, int(hand_no))
-
-    @app.post("/games/api/tables/{game_id}/exclude")
-    def api_exclude(game_id: str, body: dict = Body({})):
-        t = _table_for(game_id)
-        uid = _uid()
-        user = pub._user_by_id(uid)
-        on = _parse_bool(body, "on", True)
-        with t.lock:
-            _exclude_locked(t, user, on)
-        return {"ok": True, "id": t.game_id, "excluded": on}
-
-    @app.get("/games/api/tables/{game_id}/hands")
-    def api_hands(game_id: str, before: int | None = None, limit: int = 30):
-        t = _table_for(game_id)
-        uid = _uid()
-        with t.lock:
-            _require_member(t, uid)
-            return _hands_list(t, uid, before, limit)
-
-    @app.get("/games/api/tables/{game_id}/hands/{hand_no}")
-    def api_hand(game_id: str, hand_no: int):
-        t = _table_for(game_id)
-        uid = _uid()
-        with t.lock:
-            _require_member(t, uid)
-            return _hand_detail(t, uid, hand_no)
-
-    @app.post("/games/api/tables/{game_id}/sit_out_player")
-    def api_sit_out_player(game_id: str, body: dict = Body({})):
-        t = _table_for(game_id)
-        uid = _uid()
-        target = pub.body_int(body, "user_id")
-        on = _parse_bool(body, "on", True)
-        with t.lock:
-            _sit_out_locked(t, uid, on, target_uid=target)
-            return _view(t, uid)
-
-    @app.post("/games/api/tables/{game_id}/kick")
-    def api_kick(game_id: str, body: dict = Body({})):
-        t = _table_for(game_id)
-        uid = _uid()
-        target = pub.body_int(body, "user_id")
-        with t.lock:
-            _kick_locked(t, uid, target)
-            return _view(t, uid)
-
-    @app.post("/games/api/tables/{game_id}/decision_time")
-    def api_decision_time(game_id: str, body: dict = Body({})):
-        t = _table_for(game_id)
-        uid = _uid()
-        secs = pub.body_int(body, "secs", 0)
-        with t.lock:
-            _set_decision_secs_locked(t, uid, secs)
-            return _view(t, uid)
-
-    @app.post("/games/api/tables/{game_id}/street_pause")
-    def api_street_pause(game_id: str, body: dict = Body({})):
-        t = _table_for(game_id)
-        uid = _uid()
-        secs = _parse_secs(body, "secs", 1.5)
-        with t.lock:
-            _set_street_pause_locked(t, uid, secs)
-            return _view(t, uid)
-
-    @app.post("/games/api/tables/{game_id}/rebuy")
-    def api_rebuy(game_id: str, body: dict = Body({})):
-        t = _table_for(game_id)
-        uid = _uid()
-        amount = _parse_cents(body, "amount_cents")
-        queue = _parse_bool(body, "queue", False)
-        with t.lock:
-            if _needs_approval(t, uid):
-                user = pub._user_by_id(uid)
-                if user is None:
-                    raise HTTPException(status_code=404, detail="Not Found")
-                _request_locked(t, user, "rebuy", None, amount)
-            else:
-                _topup_locked(t, uid, amount, queue_ok=queue)
-            return _view(t, uid)
-
-    @app.post("/games/api/tables/{game_id}/request")
-    def api_request(game_id: str, body: dict = Body({})):
-        """Host: approve / decline a pending buy-in. Requester: cancel their own."""
-        t = _table_for(game_id)
-        uid = _uid()
-        action = str((body or {}).get("action") or "").strip().lower()
-        with t.lock:
-            if action == "cancel":
-                _cancel_request_locked(t, uid)
-            elif action in ("approve", "deny"):
-                _resolve_request_locked(
-                    t, uid, pub.body_int(body, "id"), action == "approve",
-                    _parse_bool(body, "trust", False),
-                    amount_cents=_parse_cents(body, "amount_cents") if body.get("amount_cents") is not None else None,
-                )
-            else:
-                raise HTTPException(status_code=400, detail="action must be approve, deny or cancel")
-            return _view(t, uid)
-
-    @app.post("/games/api/tables/{game_id}/trust")
-    def api_trust(game_id: str, body: dict = Body({})):
-        t = _table_for(game_id)
-        uid = _uid()
-        target = pub.body_int(body, "user_id")
-        on = _parse_bool(body, "on", True)
-        with t.lock:
-            _set_trust_locked(t, uid, target, on)
-            return _view(t, uid)
-
-    @app.post("/games/api/tables/{game_id}/auto_topup")
-    def api_auto_topup(game_id: str, body: dict = Body({})):
-        t = _table_for(game_id)
-        uid = _uid()
-        with t.lock:
-            _auto_topup_host_locked(t, uid, body or {})
-            return _view(t, uid)
-
-    @app.post("/games/api/tables/{game_id}/auto_chips_self")
-    def api_auto_chips_self(game_id: str, body: dict = Body({})):
-        t = _table_for(game_id)
-        uid = _uid()
-        with t.lock:
-            _auto_chips_self_locked(t, uid, body or {})
-            return _view(t, uid)
-
-    @app.get("/games/api/tables/{game_id}/stream")
-    async def api_stream(game_id: str, max_events: int = 0):
-        """Live push (SSE): the viewer's state whenever it changes, plus a
-        heartbeat. Replaces the 450 ms poll (which stays as the fallback)."""
-        t = _table_for(game_id)
-        uid = _uid()
-
-        def snapshot() -> tuple[tuple, str | None]:
-            # (removed from the club mid-stream: the push ends, and the client's
-            # next poll gets the "ask to join" answer)
-            try:
-                _table_access(t, uid)
-            except HTTPException:
-                return (), None
-            with t.lock:
-                view = _view(t, uid)
-                return _stream_sig(t), json.dumps(view, separators=(",", ":"))
-
-        async def gen():
-            sent = 0
-            last_sig: tuple | None = None
-            last_push = 0.0
-            yield "retry: 1500\n\n"
-            while not _WATCHDOG_STOP.is_set():
-                now = time.monotonic()
-                if _stream_sig(t) != last_sig or now - last_push >= STREAM_HEARTBEAT_S:
-                    last_sig, payload = await run_in_threadpool(snapshot)
-                    if payload is None:
-                        return
-                    last_push = now
-                    yield f"data: {payload}\n\n"
-                    sent += 1
-                    if max_events and sent >= max_events:
-                        return
-                await asyncio.sleep(STREAM_TICK_S)
-
-        return StreamingResponse(
-            gen(),
-            media_type="text/event-stream",
             headers={
-                "Cache-Control": "no-cache, no-transform",
-                "X-Accel-Buffering": "no",
-                "Connection": "keep-alive",
+                "Cache-Control": "private, max-age=31536000, immutable" if current else "no-store, must-revalidate",
+                "X-Content-Type-Options": "nosniff",
             },
         )
 
-    @app.post("/games/api/tables/{game_id}/run")
-    def api_run(game_id: str, body: dict = Body({})):
-        t = _table_for(game_id)
-        uid = _uid()
-        running = _parse_bool(body, "running", True)
-        with t.lock:
-            _set_running_locked(t, uid, running)
-            return _view(t, uid)
-
-    @app.post("/games/api/tables/{game_id}/deal")
-    def api_deal(game_id: str, body: dict = Body({})):
-        t = _table_for(game_id)
-        uid = _uid()
-        with t.lock:
-            if t.seat_of(uid) is None:
-                raise HTTPException(status_code=400, detail="sit to deal")
-            # `hand_no` = the finished hand the client saw; 409 if another
-            # player (or the host's auto-deal) already dealt the next one.
-            _require_sync(t, body, with_seq=False)
-            _deal_locked(t)
-            return _view(t, uid)
-
-    @app.post("/games/api/tables/{game_id}/act")
-    def api_act(game_id: str, body: dict = Body({})):
-        t = _table_for(game_id)
-        uid = _uid()
-        gate = _gate_key(body.get("gate"))
-        chips = pub.body_int(body, "chips", 0)
-        raise_to = (
-            pub.body_int(body, "raise_to_chips")
-            if gate == GATE_RAISE and body.get("raise_to_chips") is not None
-            else None
-        )
-        # (review 2026-09-20 G8) ONE lock acquisition: the raise-TO -> raise-BY
-        # conversion used to read the actor's street commit under one `with
-        # t.lock`, release, and act under a second — another action could
-        # land in between and the conversion applied to the wrong node.
-        with t.lock:
-            _require_sync(t, body, with_seq=True)
-            if raise_to is not None:
-                if t.env is None or t.env.current_actor() is None:
-                    raise HTTPException(status_code=400, detail="no hand in progress")
-                raw = _obs_dict(t.env)
-                actor = int(raw["actor"])
-                # Optional raise-TO total in chips -> the engine's raise-BY.
-                chips = raise_to - int(raw["street_commit"][actor])
-            _act_locked(t, uid, gate, chips)
-            return _view(t, uid)
-
-    @app.post("/games/api/tables/{game_id}/host_fold")
-    def api_host_fold(game_id: str):
-        t = _table_for(game_id)
-        uid = _uid()
-        with t.lock:
-            _host_fold_locked(t, uid)
-            return _view(t, uid)
-
-    @app.post("/games/api/tables/{game_id}/rabbit")
-    def api_rabbit(game_id: str):
-        t = _table_for(game_id)
-        uid = _uid()
-        with t.lock:
-            _rabbit_locked(t, uid)
-            return _view(t, uid)
-
-    @app.post("/games/api/tables/{game_id}/auto_stack")
-    def api_auto_stack(game_id: str, body: dict = Body({})):
-        t = _table_for(game_id)
-        uid = _uid()
-        with t.lock:
-            _auto_stack_host_locked(t, uid, body or {})
-            return _view(t, uid)
-
-    @app.post("/games/api/tables/{game_id}/auto_stack_self")
-    def api_auto_stack_self(game_id: str, body: dict = Body({})):
-        t = _table_for(game_id)
-        uid = _uid()
-        cents = _parse_cents(body or {}, "cents", 0)
-        with t.lock:
-            _auto_stack_self_locked(t, uid, cents)
-            return _view(t, uid)
-
-    @app.post("/games/api/tables/{game_id}/chat")
-    def api_chat(game_id: str, body: dict = Body({})):
-        t = _table_for(game_id)
-        uid = _uid()
-        user = pub._user_by_id(uid)
-        if user is None:
-            raise HTTPException(status_code=404, detail="Not Found")
-        with t.lock:
-            _chat_add(t, user, body.get("text", ""))
-            return _view(t, uid)
-
-    @app.post("/games/api/tables/{game_id}/close")
-    def api_close(game_id: str):
-        t = _table_for(game_id)
-        uid = _uid()
-        with t.lock:
-            _close_locked(t, uid)
-            return _view(t, uid)
-
+    app.include_router(router)  # (the API: every /games/api route — HGB-002)
     _start_watchdog()
+    if GRADING_ON:
+        _start_grader()  # (its first sweep picks up jobs saved before a restart)
     logger.info("homegame routes installed")
+
+
+# --- account export / deletion (main site ACC-009 / SEC-017) ------------------------
+# Registered in `public.ACCOUNT_HOOKS`: the site's "Download my data" includes a
+# player's home games, and "Delete my account" anonymizes them WITHOUT breaking
+# anyone else's history — ledgers, hand results and money flows keep the user id
+# (their sums stay exact: every ledger still adds up to zero), the id's row in
+# `users` becomes an anonymous tombstone, and the name stored inside hand records
+# is replaced. What was only theirs (picture, chat lines, host preferences, club
+# memberships and join requests) is removed.
+
+
+def _account_export(uid: int) -> dict[str, Any]:
+    uid = int(uid)
+    q = pub.DB.q
+    results = q(
+        "SELECT r.game_id, r.hand_no, r.delta_cents, r.showdown, r.acc_sum, r.acc_n, h.summary "
+        "FROM homegame_hand_results r LEFT JOIN homegame_hands h "
+        "ON h.game_id=r.game_id AND h.hand_no=r.hand_no WHERE r.user_id=? "
+        "ORDER BY r.game_id, r.hand_no", (uid,),
+    )
+    hands = []
+    for r in results:
+        own_hole = None
+        try:
+            rec = json.loads(r["summary"]) if r["summary"] else {}
+            mine = next((s for s in rec.get("seats", []) if int(s.get("user_id", -1)) == uid), None)
+            own_hole = mine.get("hole") if mine else None
+        except (ValueError, TypeError):
+            pass
+        hands.append({
+            "table": r["game_id"], "hand_no": r["hand_no"], "net_cents": r["delta_cents"],
+            "showdown": bool(r["showdown"]), "your_cards": own_hole,
+            "accuracy": round(r["acc_sum"] / r["acc_n"], 1) if r["acc_n"] else None,
+        })
+    prefs = pub.DB.one("SELECT prefs FROM homegame_host_prefs WHERE user_id=?", (uid,))
+    return {
+        "name_at_the_tables": _chosen_name(uid),
+        "clubs": [dict(r) for r in q(
+            "SELECT c.id, c.name, m.role, m.joined_at, m.nickname FROM homegame_club_members m "
+            "JOIN homegame_clubs c ON c.id=m.club_id WHERE m.user_id=?", (uid,))],
+        "tables_hosted": [dict(r) for r in q(
+            "SELECT id, name, variant, status, created_at, closed_at FROM homegames "
+            "WHERE host_user_id=? ORDER BY created_at", (uid,))],
+        "ledger": [dict(r) for r in q(
+            "SELECT game_id AS table_id, kind, amount_cents, created_at FROM homegame_ledger "
+            "WHERE user_id=? ORDER BY id", (uid,))],
+        "hands": hands,
+        "chat": [dict(r) for r in q(
+            "SELECT game_id AS table_id, body, created_at FROM homegame_chat "
+            "WHERE user_id=? ORDER BY id", (uid,))],
+        "host_preferences": json.loads(prefs["prefs"]) if prefs else None,
+        "has_picture": pub.DB.one(
+            "SELECT 1 FROM homegame_avatars WHERE user_id=?", (uid,)) is not None,
+    }
+
+
+def _account_blockers(uid: int) -> list[str]:
+    """Deleting is refused while the player is part of a live game, or owns a
+    club other people are still in (it would have no owner)."""
+    uid = int(uid)
+    out: list[str] = []
+    seat = pub.DB.one(
+        "SELECT g.name FROM homegame_players p JOIN homegames g ON g.id=p.game_id "
+        "WHERE g.status='open' AND p.user_id=? AND p.seat IS NOT NULL LIMIT 1", (uid,),
+    )
+    if seat is not None:
+        out.append(f"Leave the table “{seat['name']}” first.")
+    hosting = pub.DB.one(
+        "SELECT name FROM homegames WHERE status='open' AND host_user_id=? LIMIT 1", (uid,),
+    )
+    if hosting is not None:
+        out.append(f"Hand over or close the table “{hosting['name']}” first.")
+    owned = pub.DB.one(
+        "SELECT c.name FROM homegame_clubs c WHERE c.owner_user_id=? AND c.archived_at IS NULL AND EXISTS ("
+        "SELECT 1 FROM homegame_club_members m WHERE m.club_id=c.id AND m.user_id<>?) LIMIT 1",
+        (uid, uid),
+    )  # (an archived club no longer needs an owner: FEAT-007)
+    if owned is not None:
+        out.append(f"Hand the club “{owned['name']}” over to another member first.")
+    return out
+
+
+def _account_anonymize(uid: int) -> None:
+    uid = int(uid)
+    user = pub._user_by_id(uid)
+    old_name = _display_name(user) if user is not None else None
+    deleted = "Deleted player"
+    game_ids = [r["game_id"] for r in pub.DB.q(
+        "SELECT DISTINCT game_id FROM homegame_hand_results WHERE user_id=?", (uid,))]
+    with pub.DB.transaction():
+        for gid in game_ids:
+            for h in pub.DB.q(
+                "SELECT hand_no, summary FROM homegame_hands WHERE game_id=?", (gid,),
+            ):
+                try:
+                    rec = json.loads(h["summary"])
+                except (ValueError, TypeError):
+                    continue
+                changed = False
+                for s in rec.get("seats", []):
+                    if int(s.get("user_id", -1)) == uid and s.get("name") != deleted:
+                        s["name"] = deleted
+                        changed = True
+                wins = rec.get("winners")
+                if old_name and isinstance(wins, list):
+                    for w in wins:
+                        if isinstance(w, list) and w and w[0] == old_name:
+                            w[0] = deleted
+                            changed = True
+                if changed:
+                    pub.DB.q(
+                        "UPDATE homegame_hands SET summary=? WHERE game_id=? AND hand_no=?",
+                        (json.dumps(rec, separators=(",", ":")), gid, h["hand_no"]),
+                    )
+        pub.DB.q("DELETE FROM homegame_avatars WHERE user_id=?", (uid,))
+        pub.DB.q("DELETE FROM homegame_names WHERE user_id=?", (uid,))
+        pub.DB.q("DELETE FROM homegame_chat WHERE user_id=?", (uid,))
+        pub.DB.q("DELETE FROM homegame_host_prefs WHERE user_id=?", (uid,))
+        pub.DB.q("DELETE FROM homegame_club_members WHERE user_id=?", (uid,))
+        pub.DB.q("DELETE FROM homegame_club_requests WHERE user_id=?", (uid,))
+    with CTX.avatar_lock:
+        CTX.avatar_urls.pop(uid, None)
+    with CTX.names_lock:  # (their table name, and every club's nicknames they were in)
+        CTX.chosen_names.pop(uid, None)
+        CTX.club_nicks.clear()
+
+
+_hooks = getattr(pub, "ACCOUNT_HOOKS", None)
+if isinstance(_hooks, dict):
+    _hooks["home_games"] = {
+        "export": _account_export,
+        "blockers": _account_blockers,
+        "anonymize": _account_anonymize,
+    }
+
+
+# --- the parts split out of this module (HGB-006) ---------------------------------------------
+# homegame_schema (the tables and their migrations), homegame_people (names, nicknames,
+# pictures), homegame_clubs (clubs, who may see what), homegame_stats (histories, numbers,
+# receipts, the lobby's rows), homegame_pages (the client's build and the pages) and
+# homegame_routes (the /games/api router). Their code reaches every home-games name through
+# this module (``hg.X``, looked up when it runs): patching ``homegame.X`` patches it for them
+# too, and ``use_context`` swaps their state. Every name they define is re-exported here, so
+# ``homegame.X`` keeps working for all of it. They are imported afresh with this module: a
+# test that purges and re-imports homegame gets parts bound to the new module.
+SPLIT_MODULES = (
+    "homegame_schema",
+    "homegame_people",
+    "homegame_clubs",
+    "homegame_stats",
+    "homegame_pages",
+    "homegame_routes",
+)
+
+
+def _import_split_modules() -> None:
+    import importlib
+
+    for part in SPLIT_MODULES:
+        name = f"{__package__}.{part}"
+        sys.modules.pop(name, None)  # (a part bound to an earlier import of this module)
+        mod = importlib.import_module(name)
+        for export in mod.__all__:
+            globals()[export] = getattr(mod, export)
+
+
+_import_split_modules()
+
+# (the clubs' role cache forgets itself on any write to the club tables — PERF-004 —
+# through a listener on the app's database, registered by `install`: the database is
+# opened when an app installs the public layer, not when a module is imported — BE-007)
+
+
+def _lock_checked(fn: Any) -> Any:
+    """``fn(t, ...)`` that first checks ``t.lock`` is held (LOCK_CHECKS only)."""
+    @functools.wraps(fn)
+    def checked(t: LiveTable, *args: Any, **kw: Any) -> Any:
+        _assert_lock_held(t)
+        return fn(t, *args, **kw)
+
+    checked.__hg_lock_checked__ = True  # type: ignore[attr-defined]
+    return checked
+
+
+def _locked_functions(ns: dict[str, Any]) -> list[str]:
+    """The names the ``*_locked`` rule covers in a module namespace."""
+    ours = {__name__} | {f"{__package__}.{part}" for part in SPLIT_MODULES}
+    return sorted(
+        name for name, fn in ns.items()
+        if name.endswith("_locked") and inspect.isfunction(fn) and fn.__module__ in ours
+    )
+
+
+if LOCK_CHECKS:  # (HGB-018: in the test session every `*_locked` function checks its lock)
+    for _name in _locked_functions(globals()):
+        globals()[_name] = _lock_checked(globals()[_name])
+
+
+class _HomegameModule(types.ModuleType):
+    """``homegame.HUB``, ``homegame._WATCHDOG_THREAD`` … read and write the CURRENT
+    context's state (HGB-006: other modules and the tests keep their names)."""
+
+    def __getattr__(self, name: str) -> Any:
+        attr = _LEGACY_STATE.get(name)
+        if attr is None:
+            raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+        return getattr(self.__dict__["CTX"], attr)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        attr = _LEGACY_STATE.get(name)
+        if attr is not None:
+            setattr(self.__dict__["CTX"], attr, value)
+        else:
+            super().__setattr__(name, value)
+
+
+sys.modules[__name__].__class__ = _HomegameModule

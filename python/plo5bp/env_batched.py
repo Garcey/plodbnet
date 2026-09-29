@@ -4,18 +4,18 @@ Array-shaped analogue of `BombPotEnv`. Owns a single `PyBatchedEngine` and
 returns observations / rewards / legal masks as stacked NumPy arrays for
 all N envs at once. Does *not* auto-reset terminal envs — the caller uses
 `reset_terminal_batch` to re-seed the envs whose `dones[i]` came back true.
-The observation layout follows the config's variant (991-dim PLO or
-995-dim NLH), same as the scalar env.
+The observation layout follows the config's variant and obs mode (PLO full
+1171 / minimal 796, NLH 995), same as the scalar env.
 
 Design goals:
   - Bit-exact parity with `BombPotEnv` on (obs, legal_mask, reward, done)
     for matched (seed, button, action-sequence). Enforced by
-    `tests/python/test_env_batched.py`.
-  - Single FFI call per "step" group: one `apply_action_batch` plus one
-    `hero_category_batch` (×2 boards), one `legal_mask_batch`, one
-    `actor_batch`, one `observation_arrays`.
-  - Vectorized encoder (`encode_observation_batch`) — no per-env Python
-    loop anywhere on the hot path.
+    `tests/python/engine/test_env_batched.py`.
+  - One FFI call per refresh: `BatchedEngine.encode` packs the engine state
+    and encodes every row in Rust (PLO5_RUST_ENCODER), or
+    `observation_and_features_batch` + the vectorized numpy encoders
+    (`encode_observation_batch*`, NLH always) — no per-env Python loop
+    anywhere on the hot path.
 """
 
 from __future__ import annotations
@@ -42,14 +42,33 @@ from plo5bp.encoding import (
     OBS_DIM_MINIMAL,
     encode_observation_batch_minimal,
     encode_observation_batch,
-    project_obs_minimal,
 )
+from plo5bp.engine_abi import require as _engine_require
 
 # Width the Rust obs encoder (observation_encoded_batch) emits. Width-gated
 # against OBS_DIM so a stale extension cannot silently truncate the obs.
 # Bump when porting new tail dims into rust_engine (obs_v7_inc / obs_layout).
 _RUST_ENCODER_OBS_DIM = 1171
 from plo5bp.encoding_nlh import OBS_DIM_NLH, encode_observation_batch_nlh
+
+# Everything this env calls on the engine that an older build lacked (a stale
+# engine is an import error -- engine_abi -- never a silent slower path).
+_engine_require(
+    "BatchedEngine.encode", "BatchedEngine.payouts_ev_subset",
+    "BatchedEngine.observation_and_features_subset_batch",
+    "BatchedEngine.all_hole_cards_subset_batch",
+)
+
+
+def _rust_encoder_requested() -> bool:
+    """PLO5_RUST_ENCODER: the Rust encoder (`BatchedEngine.encode`) unless it
+    is "0" / "false" / "no" / "off" (the numpy batch encoders -- the
+    reference, for debugging and A/B). Default ON since 2026-09-28 (ML-015:
+    it was opt-in, so every run not launched by a guardian -- local runs, new
+    scripts, tests -- silently took the slow numpy path; the two are pinned
+    bit-exact). Read at every env construction."""
+    raw = os.environ.get("PLO5_RUST_ENCODER", "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
 
 
 @dataclass
@@ -103,51 +122,34 @@ class BatchedBombPotEnv:
         if mode == "minimal":
             opp_outcome_mc = 0
         self._opp_outcome_mc = int(opp_outcome_mc)
-        # Rust observation encoder (PLO5_RUST_ENCODER): one-FFI pack+encode
-        # (Rayon per row). Full mode is width-gated to _RUST_ENCODER_OBS_DIM
-        # (1171). Minimal mode uses observation_encoded_minimal_batch which
-        # emits 796 directly (no engineered tails / MC / v7 pack scans).
-        # NLH stays on the numpy path. Capability-gated so a stale binary
-        # without the minimal methods falls back to numpy safely.
-        rust_flag = bool(int(os.environ.get("PLO5_RUST_ENCODER", "0")))
-        has_minimal_rust = hasattr(
-            BatchedEngine, "observation_encoded_minimal_batch"
-        )
-        if self._is_nlh or not rust_flag:
-            self._use_rust_encoder = False
-            self._rust_minimal = False
-        elif mode == "minimal":
-            self._use_rust_encoder = has_minimal_rust
-            self._rust_minimal = has_minimal_rust
-        else:
-            self._use_rust_encoder = OBS_DIM == _RUST_ENCODER_OBS_DIM
-            self._rust_minimal = False
-        # In-place minimal encoders (2026-09-23): the engine writes the rows
-        # straight into self._obs — no fresh (N, 796) array per step, no copy,
-        # no masked zeroing pass. Bit-identical buffer contents; capability-
-        # gated so an older engine keeps the copying path.
-        self._rust_minimal_into = bool(self._rust_minimal) and all(
-            hasattr(BatchedEngine, m)
-            for m in (
-                "observation_encoded_minimal_into",
-                "observation_encoded_minimal_subset_into",
+        # Rust observation encoder (PLO5_RUST_ENCODER): `BatchedEngine.encode`
+        # packs the engine state and encodes every row in one FFI call (Rayon
+        # per row), straight into self._obs and/or the packed copy (see
+        # enable_packed_obs) -- no fresh (N, dim) array per step (at 29k envs
+        # the full layout's was ~137 MB of page faults + a copy every step).
+        # Bit-exact with the numpy batch encoders (pinned by
+        # test_encoding_rust.py and friends). NLH always encodes through numpy
+        # (the engine's encoder is PLO-only).
+        self._use_rust_encoder = _rust_encoder_requested() and not self._is_nlh
+        if (
+            self._use_rust_encoder
+            and mode == "full"
+            and OBS_DIM != _RUST_ENCODER_OBS_DIM
+        ):
+            raise RuntimeError(
+                f"encoding.OBS_DIM={OBS_DIM} but the Rust encoder emits "
+                f"{_RUST_ENCODER_OBS_DIM} columns: port the new features to "
+                "rust_engine (and bump _RUST_ENCODER_OBS_DIM), or run the numpy "
+                "encoder with PLO5_RUST_ENCODER=0"
             )
+        self._encode_layout = mode  # `BatchedEngine.encode` layout name
+        # The Rust encoder keeps the packed copy in step (or writes only it);
+        # PLO5BP_NO_FULL_PACKED=1 keeps the full layout on the pre-2026-09-26
+        # dense-only path (an A/B switch for digests).
+        self._keep_packed = self._use_rust_encoder and not (
+            mode == "full"
+            and os.environ.get("PLO5BP_NO_FULL_PACKED", "").strip() == "1"
         )
-        # The full layout's in-place encoder (2026-09-26): same idea for the
-        # (N, OBS_DIM) rows of the full-obs runs, where the fresh array per step
-        # was ~137 MB at 29k envs (page faults + a copy on every step).
-        self._rust_full_into = (
-            bool(self._use_rust_encoder) and not self._rust_minimal
-            and hasattr(BatchedEngine, "observation_encoded_into")
-        )
-        # ... which (engine 2026-09-26) also write the packed copy, or ONLY it
-        # (out=None), and have a subset variant -- the full layout can keep the
-        # packed copy in step like the minimal one.
-        self._rust_full_packed = bool(self._rust_full_into) and bool(
-            getattr(BatchedEngine, "FULL_INTO_PACKED", False)
-        ) and hasattr(BatchedEngine, "observation_encoded_subset_into") and (
-            os.environ.get("PLO5BP_NO_FULL_PACKED", "").strip() != "1"
-        )  # PLO5BP_NO_FULL_PACKED=1: the pre-2026-09-26 dense path (A/B, digests)
         # Packed copy of self._obs (compact_obs layout), kept in step by the
         # in-place encoders when `enable_packed_obs` is on -- None otherwise.
         self._obs_bits: np.ndarray | None = None
@@ -161,9 +163,9 @@ class BatchedBombPotEnv:
             BatchedBombPotEnv._encoder_log_once = True
             print(
                 f"[obs-encoder] rust={self._use_rust_encoder} "
-                f"rust_minimal={getattr(self, '_rust_minimal', False)} "
+                f"layout={self._encode_layout} "
                 f"OBS_DIM={self._obs_dim} "
-                f"PLO5_RUST_ENCODER={os.environ.get('PLO5_RUST_ENCODER', '0')!r} "
+                f"PLO5_RUST_ENCODER={os.environ.get('PLO5_RUST_ENCODER', '')!r} "
                 f"opp_mc={self._opp_outcome_mc} "
                 f"variant={self.config.variant} obs_mode={self._obs_mode}"
             )
@@ -200,7 +202,7 @@ class BatchedBombPotEnv:
         )
         # (N,) u64 — current max street_commit per env. Used by rollout
         # to compute the actor's pre-step amount-to-call for the
-        # aggression-bonus reward shaping.
+        # F/T/R telemetry.
         self._bet_to_call = np.zeros(self.n, dtype=np.uint64)
         # (N, num_seats) u64 — current per-seat street_commit per env.
         # `bet_to_call - street_commit[actor]` is the actor's call portion;
@@ -210,7 +212,7 @@ class BatchedBombPotEnv:
         )
         # (N,) u8 — current street index per env (0=preflop, 1=flop,
         # 2=turn, 3=river, 4=showdown). Bomb pots start at 1; rollout
-        # consults this to bucket per-street aggression-bonus diagnostics.
+        # consults this to bucket the per-street F/T/R telemetry.
         self._street = np.zeros(self.n, dtype=np.uint8)
         # (N,) u64 — current pot per env. Was only ever created inside
         # `_unpack_post`, so `_refresh_subset` (in-place `self._pot[idx] =`)
@@ -287,6 +289,29 @@ class BatchedBombPotEnv:
             self._zero_packed_obs()
         self._reset_seeds.fill(0)
         self._pot.fill(0)
+
+    def sizing(self) -> np.ndarray:
+        """(N, 4) int64 `(min_raise, max_raise, pot, to_call)` of every env's
+        current actor -- the `sizing` input of `ActorCritic*.act`, where
+        to_call = max(bet_to_call - the actor's street commit, 0). Rows of a
+        finished env are well-defined but meaningless. The one definition the
+        evaluation tools share (plo5bp.evaluation)."""
+        rows = np.arange(self.n)
+        actor = np.where(self._actors >= 0, self._actors, 0).astype(np.intp)
+        to_call = np.maximum(
+            self._bet_to_call.astype(np.int64)
+            - self._street_commit[rows, actor].astype(np.int64),
+            0,
+        )
+        return np.stack(
+            [
+                self._min_raise.astype(np.int64),
+                self._max_raise.astype(np.int64),
+                self._pot.astype(np.int64),
+                to_call,
+            ],
+            axis=-1,
+        )
 
     def reset_batch(
         self, seeds: np.ndarray, buttons: np.ndarray, snapshot: bool = True
@@ -397,23 +422,16 @@ class BatchedBombPotEnv:
             rows = np.nonzero(newly_terminal)[0]
             if self._ev_runout_samples > 0:
                 ev_seeds = self._reset_seeds ^ np.uint64(0x9E3779B97F4A7C15)
-                if hasattr(self._be, "payouts_ev_subset"):
-                    # Only the newly-terminal rows (same values as the
-                    # whole-batch call's rows; envs that finished earlier
-                    # are not re-run).
-                    rewards[rows] = np.asarray(
-                        self._be.payouts_ev_subset(
-                            self._ev_runout_samples,
-                            ev_seeds[rows],
-                            rows.astype(np.int64),
-                        ),
-                        dtype=np.float32,
-                    )
-                else:
-                    payouts = self._be.payouts_ev_batch(
-                        self._ev_runout_samples, ev_seeds
-                    )
-                    rewards[rows] = np.asarray(payouts, dtype=np.float32)[rows]
+                # Only the newly-terminal rows (same values as the whole-batch
+                # call's rows; envs that finished earlier are not re-run).
+                rewards[rows] = np.asarray(
+                    self._be.payouts_ev_subset(
+                        self._ev_runout_samples,
+                        ev_seeds[rows],
+                        rows.astype(np.int64),
+                    ),
+                    dtype=np.float32,
+                )
             else:
                 payouts = self._be.payouts_batch()
                 rewards[rows] = np.asarray(payouts, dtype=np.float32)[rows]
@@ -450,98 +468,44 @@ class BatchedBombPotEnv:
         """Re-pack engine state and re-encode observations.
 
         `encode_mask` (optional bool (n,)): skipped rows get zeroed obs
-        (terminal convention). Engine caches (commit / legal / actors / …)
-        always refresh for every env.
+        (terminal convention). Engine caches (commit / legal / actors / ...)
+        always refresh for every env. The rollout's post-apply refresh passes
+        ~newly_terminal: finished hands need no meaningful obs before re-deal.
 
-        Post-apply rollout uses encode_mask=~newly_terminal so finished
-        hands need not keep a meaningful obs before re-deal. Rust path:
-        one FFI observation_encoded_batch then zero ~mask (attack #3 —
-        no second pack). Numpy path: pack once, encode subset or full.
-        Kept rows bit-exact vs full encode; skipped rows zero.
+        Rust path: ONE `BatchedEngine.encode` call writes every kept row
+        straight into self._obs and/or the packed copy (skipped rows zeroed),
+        or, when every row is skipped, only the aux arrays are read (no encode
+        pass). numpy path: pack once, encode the kept rows. Kept rows are
+        bit-exact with a full encode; skipped rows are zero.
         """
+        em = None
+        if encode_mask is not None:
+            em = np.asarray(encode_mask, dtype=bool)
+            if em.shape != (self.n,):
+                raise ValueError(f"encode_mask shape {em.shape} != ({self.n},)")
         if self._use_rust_encoder:
-            # Attack #3 (2026-07-13): avoid the old partial-mask double pack
-            # (features_batch full pack + encoded_subset pack+encode).
-            # - Full / mixed masks: one observation_encoded[_minimal]_batch,
-            #   then zero skipped rows in-place. Encoding actor==-1 is cheap
-            #   (zero row).
-            # - All-skipped mask: pack+aux only (observation_and_features_batch),
-            #   zero obs — no encode pass at all.
-            # Minimal path emits 796 directly (no project step).
-            em = None
-            if encode_mask is not None:
-                em = np.asarray(encode_mask, dtype=bool)
-                if em.shape != (self.n,):
-                    raise ValueError(
-                        f"encode_mask shape {em.shape} != ({self.n},)"
-                    )
             if em is not None and not bool(em.any()):
                 with record_function("step1a_bundle/obs_features_batch"):
                     bundle = self._be.observation_and_features_batch()
                 with record_function("step1/encoder"):
-                    if not self._dense_obs:
-                        pass  # packed-only: the dense rows stay the NaN tripwire
-                    elif self._obs.shape == (self.n, self._obs_dim):
-                        self._obs.fill(0.0)
-                    else:
-                        self._obs = np.zeros(
-                            (self.n, self._obs_dim), dtype=np.float32
-                        )
+                    # (packed-only: the dense rows stay the NaN tripwire)
+                    if self._dense_obs:
+                        self._obs_buffer().fill(0.0)
                     self._zero_packed_obs()
                 with record_function("step1a_unpack/post"):
                     self._unpack_post(bundle)
                 return
-            if getattr(self, "_rust_minimal_into", False):
-                # Encode straight into the cached buffer; rows with a False
-                # mask entry come back zeroed (same bits as the copy + zero
-                # below).
-                with record_function("step1a_bundle/obs_features_batch"):
-                    bundle = self._be.observation_encoded_minimal_into(
-                        self._obs_buffer() if self._dense_obs else None,
-                        None if em is None or bool(em.all())
-                        else np.ascontiguousarray(em),
-                        **self._packed_kwargs(),
-                    )
-                with record_function("step1a_unpack/post"):
-                    self._unpack_post(bundle)
-                return
-            if getattr(self, "_rust_full_into", False):
-                # Full layout, encoded straight into the cached buffer; rows
-                # with a False mask entry come back zeroed (same bits as the
-                # copy + zero below). With the packed encoders (2026-09-26)
-                # the packed copy is written in the same pass, or ONLY it.
-                if not getattr(self, "_rust_full_packed", False):
-                    self._drop_packed_obs()
-                with record_function("step1a_bundle/obs_features_batch"):
-                    bundle = self._be.observation_encoded_into(
-                        self._obs_buffer() if self._dense_obs else None,
-                        None if em is None or bool(em.all())
-                        else np.ascontiguousarray(em),
-                        **(self._packed_kwargs()
-                           if getattr(self, "_rust_full_packed", False) else {}),
-                    )
-                with record_function("step1a_unpack/post"):
-                    self._unpack_post(bundle)
-                return
-            self._drop_packed_obs()  # only the in-place path keeps it in step
+            if not self._keep_packed:
+                self._drop_packed_obs()
             with record_function("step1a_bundle/obs_features_batch"):
-                if getattr(self, "_rust_minimal", False):
-                    bundle = self._be.observation_encoded_minimal_batch()
-                else:
-                    bundle = self._be.observation_encoded_batch()
-            with record_function("step1/encoder"):
-                obs = np.asarray(bundle["obs"], dtype=np.float32)
-                if (
-                    self._obs is not None
-                    and self._obs.shape == obs.shape
-                    and self._obs.dtype == obs.dtype
-                ):
-                    np.copyto(self._obs, obs)
-                else:
-                    self._obs = obs
-                if em is not None and not bool(em.all()):
-                    self._obs[~em] = 0.0
-            self._maybe_project_obs()
+                bundle = self._be.encode(
+                    self._encode_layout,
+                    out=self._obs_buffer() if self._dense_obs else None,
+                    encode_mask=(
+                        None if em is None or bool(em.all()) else np.ascontiguousarray(em)
+                    ),
+                    **self._packed_kwargs(),
+                )
             with record_function("step1a_unpack/post"):
                 self._unpack_post(bundle)
             return
@@ -600,7 +564,6 @@ class BatchedBombPotEnv:
                 else:
                     self._obs.fill(0.0)
                 self._obs[idx] = obs_sub
-        self._maybe_project_obs()
         with record_function("step1a_unpack/post"):
             self._unpack_post(bundle)
 
@@ -612,26 +575,21 @@ class BatchedBombPotEnv:
         wants packed rows (the rollout's GPU uploads + trajectory storage)
         gathers `_obs_bits` / `_obs_real` instead of packing the dense rows
         again. Bytes identical to `compact_obs.pack_rows_into(self._obs,
-        ...)`. Needs the in-place Rust encoder with packed outputs; returns
-        whether the packed copy is on (idempotent).
+        ...)`. Needs the Rust encoder (not the numpy one, nor the full
+        layout under PLO5BP_NO_FULL_PACKED=1); returns whether the packed copy
+        is on (idempotent).
 
-        `dense=False` (needs an engine with MINIMAL_INTO_PACKED_ONLY) stops
-        maintaining the dense rows altogether: every encode writes only the
-        packed copy -- (N, 796) floats per refresh are not written -- and
-        `self._obs` is filled with NaN so any reader of dense rows fails
-        loudly. Only for a consumer that reads nothing but the packed copy
-        (the rollout collector's CUDA upload path). `_snapshot` unpacks."""
+        `dense=False` stops maintaining the dense rows altogether: every
+        encode writes only the packed copy -- (N, obs_dim) floats per refresh
+        are not written -- and `self._obs` is filled with NaN so any reader of
+        dense rows fails loudly. Only for a consumer that reads nothing but
+        the packed copy (the rollout collector's CUDA upload path). `_snapshot`
+        unpacks."""
         if layout is None or int(layout.obs_dim) != int(self._obs_dim):
             return False
-        minimal_ok = getattr(self, "_rust_minimal_into", False) and getattr(
-            BatchedEngine, "MINIMAL_INTO_PACKED", False
-        )
-        full_ok = getattr(self, "_rust_full_packed", False)
-        if not (minimal_ok or full_ok):
+        if not self._keep_packed:
             return False
-        want_dense = bool(dense) or not (
-            full_ok or getattr(BatchedEngine, "MINIMAL_INTO_PACKED_ONLY", False)
-        )
+        want_dense = bool(dense)
         if self._packed_layout is layout and self._obs_bits is not None:
             self._set_dense_obs(want_dense)
             return True
@@ -696,8 +654,8 @@ class BatchedBombPotEnv:
             raise RuntimeError(
                 "BatchedBombPotEnv: a refresh path that cannot keep the packed "
                 "copy ran in packed-only mode -- the dense rows are not "
-                "maintained (enable_packed_obs(dense=False) needs the in-place "
-                "minimal encoder)"
+                "maintained (enable_packed_obs(dense=False) needs the Rust "
+                "encoder)"
             )
         self._obs_bits = self._obs_real = None
         self._packed_layout = None
@@ -720,27 +678,6 @@ class BatchedBombPotEnv:
         if not self._obs_is_buffer():
             self._obs = np.zeros((self.n, self._obs_dim), dtype=np.float32)
         return self._obs
-
-    def _maybe_project_obs(self) -> None:
-        """Legacy no-op: minimal mode encodes 796-d directly.
-
-        Kept so call sites stay stable. If a full-width buffer ever lands
-        here (e.g. stale rust encoder path), gather via project_obs_minimal.
-        """
-        if getattr(self, "_obs_mode", "full") != "minimal":
-            return
-        full = self._obs
-        if full is None or full.shape[-1] == self._obs_dim:
-            return
-        proj = project_obs_minimal(full)
-        if (
-            self._obs is not None
-            and self._obs.shape == proj.shape
-            and self._obs.dtype == proj.dtype
-        ):
-            np.copyto(self._obs, proj)
-        else:
-            self._obs = proj
 
     def _unpack_post(self, bundle) -> None:
         """Write engine-derived caches from a full-batch observation bundle."""
@@ -777,7 +714,7 @@ class BatchedBombPotEnv:
         `encode_observation_batch` is purely per-row, so encoding the masked
         subset and scattering gives results identical to encoding the full
         batch and slicing. Parity is asserted in
-        `tests/python/test_refresh_subset_parity.py`.
+        `tests/python/engine/test_refresh_subset_parity.py`.
 
         Skips all work when `mask` selects nothing.
         """
@@ -785,53 +722,23 @@ class BatchedBombPotEnv:
         if idx.size == 0:
             return
         idx_i64 = idx.astype(np.int64)
-        if (
-            self._use_rust_encoder
-            and getattr(self, "_rust_minimal_into", False)
-            and self._obs_is_buffer()
-        ):
-            # Rows go straight into self._obs[idx] (bit-identical to the
-            # compact encode + scatter below); the aux arrays stay compact.
+        if self._use_rust_encoder:
+            # Rows straight into self._obs[idx] and/or the packed copy
+            # (bit-identical to an encode + scatter); the aux arrays stay
+            # compact (k rows).
+            if not self._keep_packed:
+                self._drop_packed_obs()
+            if self._dense_obs and not self._obs_is_buffer():
+                # An in-place-capable copy that keeps the other rows.
+                self._obs = np.array(self._obs, dtype=np.float32, order="C")
             with record_function("step1a_bundle/obs_features_subset"):
-                bundle = self._be.observation_encoded_minimal_subset_into(
+                bundle = self._be.encode(
+                    self._encode_layout,
                     idx_i64,
-                    self._obs if self._dense_obs else None,
+                    out=self._obs if self._dense_obs else None,
                     **self._packed_kwargs(),
                 )
             obs_sub = None
-            actors_sub = np.asarray(bundle["actor"], dtype=np.int8)
-        elif (
-            self._use_rust_encoder
-            and getattr(self, "_rust_full_packed", False)
-            and (not self._dense_obs or self._obs_is_buffer())
-        ):
-            # Full layout, rows straight into self._obs[idx] and/or the packed
-            # copy (2026-09-26; bit-identical to the encode + scatter below).
-            with record_function("step1a_bundle/obs_features_subset"):
-                bundle = self._be.observation_encoded_subset_into(
-                    idx_i64,
-                    self._obs if self._dense_obs else None,
-                    **self._packed_kwargs(),
-                )
-            obs_sub = None
-            actors_sub = np.asarray(bundle["actor"], dtype=np.int8)
-        elif self._use_rust_encoder:
-            self._drop_packed_obs()
-            with record_function("step1a_bundle/obs_features_subset"):
-                if getattr(self, "_rust_minimal", False):
-                    bundle = self._be.observation_encoded_minimal_subset_batch(
-                        idx_i64
-                    )
-                else:
-                    bundle = self._be.observation_encoded_subset_batch(idx_i64)
-            obs_sub = np.asarray(bundle["obs"], dtype=np.float32)
-            # Legacy safety: if a full-width buffer somehow arrives under
-            # minimal mode (stale binary), project. True minimal rust emits 796.
-            if (
-                getattr(self, "_obs_mode", "full") == "minimal"
-                and obs_sub.shape[-1] != self._obs_dim
-            ):
-                obs_sub = project_obs_minimal(obs_sub)
             actors_sub = np.asarray(bundle["actor"], dtype=np.int8)
         else:
             self._drop_packed_obs()

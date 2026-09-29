@@ -40,16 +40,15 @@ import torch
 
 from .encoding import FLAG_MASK_FULL, FLAG_MASK_MINIMAL
 
-try:
-    from ._engine import pack_obs_rows as _rust_pack_obs_rows
-    from ._engine import unpack_obs_rows as _rust_unpack_obs_rows
-except ImportError:  # an engine built before compact storage existed
-    _rust_pack_obs_rows = None
-    _rust_unpack_obs_rows = None
+from .engine_abi import functions as _engine_functions
 
-# False only for a stale engine binary; the rollout then stores dense rows and
-# says so once (rollout._resolve_obs_layout).
-RUST_PACKER_AVAILABLE: bool = _rust_pack_obs_rows is not None
+# The engine's packer / unpacker (a stale engine without them is an import
+# error -- engine_abi -- never a silent fall back to dense storage). `unpack`
+# sends CPU tensors through `_rust_unpack_obs_rows`; tests set it to None to
+# pin the torch (GPU) path on the CPU.
+_rust_pack_obs_rows, _rust_unpack_obs_rows = _engine_functions(
+    "pack_obs_rows", "unpack_obs_rows"
+)
 
 # Bit pattern of 1.0f32 — with 0 the only values a flag column may hold.
 _F32_ONE_BITS = np.uint32(0x3F80_0000)
@@ -303,6 +302,22 @@ class PackedObs:
     def dense(self) -> torch.Tensor:
         """The whole dense matrix — tests/diagnostics only (full size!)."""
         return unpack(self.bits, self.real, self.layout)
+
+    def column(self, col: int, rows: "torch.Tensor | None" = None) -> torch.Tensor:
+        """ONE observation column (of every row, or of the row indices
+        `rows`), as float32 on the host -- without unpacking any row (a flag
+        column is one bit of one byte per row). For per-update diagnostics
+        over a production batch (e.g. the street one-hot, ppo.value_health)."""
+        sel = slice(None) if rows is None else rows.to(self.bits.device)
+        flag = np.searchsorted(self.layout.flag_cols, col)
+        if flag < self.layout.n_flag and int(self.layout.flag_cols[flag]) == col:
+            byte, bit = divmod(int(flag), 8)  # packbits order: MSB first
+            b = self.bits[sel, byte].detach().cpu()
+            return ((b >> (7 - bit)) & 1).to(torch.float32)
+        real = np.searchsorted(self.layout.real_cols, col)
+        if real < self.layout.n_real and int(self.layout.real_cols[real]) == col:
+            return self.real[sel, int(real)].detach().cpu().to(torch.float32)
+        raise IndexError(f"column {col} is outside the {self.layout.obs_dim}-wide layout")
 
     @staticmethod
     def cat(parts: Sequence["PackedObs"]) -> "PackedObs":

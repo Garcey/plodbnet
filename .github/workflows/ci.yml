@@ -1,0 +1,119 @@
+# CI: every push to main (and every pull request) runs the whole test suite on
+# Linux — the Python tests (with Node for the browser code), the Rust tests, a
+# check of every shell script, and a secret scan — and builds the Linux engine
+# wheel the production server can use instead of compiling (ENGINE_WHEEL=…).
+# The deploy script refuses a commit whose CI failed (ALLOW_RED=1 overrides).
+# Locally the same checks: bash scripts/check.sh
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  python:
+    name: Python tests (engine built fresh)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"      # what the production server runs
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Rust (the version rust-toolchain.toml pins)
+        run: rustup toolchain install "$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' rust-toolchain.toml)" --profile minimal -c rustfmt -c clippy --no-self-update
+      - uses: Swatinem/rust-cache@v2
+      - name: Install (CPU torch) and build the engine (release, like production)
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install "maturin>=1.7,<2"
+          maturin develop --release --locked --extras dev
+      - name: pytest
+        run: |
+          . .venv/bin/activate
+          pytest -ra --strict-markers --durations=25
+        # CI=true (set by GitHub) makes tests/conftest.py stop on a stale engine and
+        # turn "engine build has no …" / "node is not installed" skips into failures;
+        # --strict-markers catches a mistyped marker (register new ones in pyproject.toml).
+
+  rust:
+    name: Rust tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Rust (the version rust-toolchain.toml pins)
+        run: rustup toolchain install "$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' rust-toolchain.toml)" --profile minimal -c rustfmt -c clippy --no-self-update
+      - uses: Swatinem/rust-cache@v2
+      - name: format, lints, tests (scripts/rust_check.sh — the same gate as locally)
+        run: |
+          export PYO3_PYTHON="$(command -v python)"
+          bash scripts/rust_check.sh
+
+  shell-and-secrets:
+    name: Shell scripts + secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0              # gitleaks scans the history of the push
+      - name: bash -n (every shell script)
+        run: |
+          set -e
+          for f in $(git ls-files '*.sh') ops/bin/* scripts/hooks/*; do bash -n "$f"; done
+      - name: shellcheck (the production tooling)
+        run: |
+          files="scripts/deploy_prod.sh ops/deploy-remote.sh ops/bin/* scripts/hooks/* scripts/check.sh"
+          shellcheck -S warning $files || true   # shown, not fatal
+          shellcheck -S error $files             # errors fail the build
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+
+  engine-wheel:
+    name: Linux engine wheel (for the server)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - id: rust
+        name: The Rust version rust-toolchain.toml pins
+        run: echo "channel=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --locked --out dist
+          manylinux: auto
+          rust-toolchain: ${{ steps.rust.outputs.channel }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-wheel-${{ github.sha }}
+          path: dist/*.whl
+          retention-days: 30

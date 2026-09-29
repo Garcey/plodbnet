@@ -5,7 +5,7 @@ Usage::
     .venv/Scripts/python scripts/profile_rollout.py
 
 Runs N_STEPS of rollout data through both paths with a small random-init
-`ActorCritic`, no opponent pool, at 6-seat 20bb (matching the plan's
+`ActorCriticV5` (the production head family), no opponent pool, at 6-seat 20bb (matching the plan's
 target configuration). Reports steps/sec, total wall clock, and the
 speedup ratio. Targets from the plan:
 
@@ -28,7 +28,7 @@ import numpy as np
 import torch
 
 from plo5bp.config import GameConfig, TrainingConfig
-from plo5bp.network import ActorCritic
+from plo5bp.network import ActorCriticV5
 from plo5bp.rollout import collect_rollout, collect_rollout_batched
 from plo5bp.selfplay import OpponentPool
 
@@ -61,10 +61,10 @@ def run(
     print(f"device={device} seats={num_seats} stack={starting_stack}bb/100 "
           f"num_envs={num_envs} rollout_length={rollout_length}")
 
-    learner = ActorCritic(hidden_dim=hidden_dim).to(device).eval()
+    learner = ActorCriticV5(hidden_dim=hidden_dim).to(device).eval()
     pool = OpponentPool(capacity=max(1, opponents))
     for _ in range(opponents):
-        snap = ActorCritic(hidden_dim=hidden_dim).to(device).eval()
+        snap = ActorCriticV5(hidden_dim=hidden_dim).to(device).eval()
         pool.snapshot(snap)
 
     for warm in range(warmup):

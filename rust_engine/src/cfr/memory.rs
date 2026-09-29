@@ -21,8 +21,18 @@ pub const BYTES_PER_INFOSET_BASE: u64 = 640;
 const BYTES_PER_ACTION: u64 = 24;
 /// One `String` path label (header + heap) per history step in the dump.
 const BYTES_PER_PATH_STEP: u64 = 40;
-/// Soft default RAM budget if not overridden (8 GB).
+/// Default RAM budget when `SolveConfig::ram_budget_mb` is 0 (8 GB). The
+/// desktop app / Python API pass the machine's own budget (TOOL-032).
 pub const DEFAULT_RAM_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// (TOOL-008) Vectorized DCFR: regret + strategy sum (f64) for every hand, per
+/// action of every decision node.
+pub const VECTOR_BYTES_PER_ACTION: u64 = 1_326 * 16;
+/// (TOOL-008) Vectorized DCFR: per decision node beyond its vectors (state,
+/// action line, child links).
+pub const VECTOR_NODE_OVERHEAD_BYTES: u64 = 512;
+/// (TOOL-008) Vectorized DCFR: one exported strategy row (id, labels, probs,
+/// dump) — the report holds a row per (decision node, live hand).
+pub const VECTOR_EXPORT_BYTES_PER_ROW: u64 = 900;
 /// Stop walking the public tree past this many decision nodes (per street
 /// totals are then lower bounds and the solve is refused as unbounded).
 const TREE_WALK_NODE_CAP: u64 = 5_000_000;
@@ -37,6 +47,10 @@ pub struct TreeCount {
     pub nodes_by_street: [u64; 4],
     /// Σ over nodes of (BASE + actions + path) bytes, per street.
     pub bytes_by_street: [u64; 4],
+    /// Σ over nodes of their action count, per street.
+    pub actions_by_street: [u64; 4],
+    /// Decision nodes per street of seats 0 and 1 (heads-up trees: every node).
+    pub hu_nodes_by_seat_street: [[u64; 4]; 2],
     /// True when the walk hit [`TREE_WALK_NODE_CAP`] (counts are lower bounds).
     pub truncated: bool,
 }
@@ -67,7 +81,9 @@ fn walk(
     if follow_runouts && state.needs_runout() {
         // Representative next card: lowest index not on the board.
         let blen = state.board_len as usize;
-        let card = (0..52u8).find(|c| !state.board[..blen].contains(c)).unwrap_or(0);
+        let card = (0..52u8)
+            .find(|c| !state.board[..blen].contains(c))
+            .unwrap_or(0);
         let mut child = state.clone();
         child.deal_board_card(card);
         return walk(&child, raise_pm, allin, follow_runouts, depth, out);
@@ -83,6 +99,10 @@ fn walk(
     out.nodes_by_street[street] += 1;
     out.bytes_by_street[street] +=
         BYTES_PER_INFOSET_BASE + BYTES_PER_ACTION * acts.len() as u64 + BYTES_PER_PATH_STEP * depth;
+    out.actions_by_street[street] += acts.len() as u64;
+    if let Some(seat @ 0..=1) = state.actor {
+        out.hu_nodes_by_seat_street[seat as usize][street] += 1;
+    }
     if out.total_nodes() >= TREE_WALK_NODE_CAP {
         out.truncated = true;
         return;
@@ -165,6 +185,9 @@ pub fn estimate_solve_memory(root: &RootSpec, config: &SolveConfig) -> MemoryEst
         1_326
     };
     let root_street = root.street as usize;
+    if config.is_vector() {
+        return vector_estimate(root, config, &tree, private_views);
+    }
     let mut est_infosets = 0u64;
     let mut est_bytes = 0u64;
     let mut one_runout_bytes = 0u64;
@@ -197,8 +220,8 @@ pub fn estimate_solve_memory(root: &RootSpec, config: &SolveConfig) -> MemoryEst
         est_infosets = est_infosets.saturating_add(n);
         let avg_bytes = tree.bytes_by_street[street] / nodes;
         est_bytes = est_bytes.saturating_add(n.saturating_mul(avg_bytes));
-        one_runout_bytes = one_runout_bytes
-            .saturating_add(nodes.saturating_mul(views).saturating_mul(avg_bytes));
+        one_runout_bytes =
+            one_runout_bytes.saturating_add(nodes.saturating_mul(views).saturating_mul(avg_bytes));
     }
     // A finite run cannot create more infosets than it visits: each sampled
     // deal touches at most every decision node of ONE runout, once per seat
@@ -218,6 +241,92 @@ pub fn estimate_solve_memory(root: &RootSpec, config: &SolveConfig) -> MemoryEst
         est_infosets,
         est_bytes,
         one_runout_bytes,
+        private_views,
+        card_abs: config.card_abstraction.clone(),
+        public_nodes: tree.total_nodes(),
+        tree_truncated: tree.truncated,
+    }
+}
+
+/// Distinct public boards `street` can show below a postflop root.
+fn boards_below(root: &RootSpec, street: usize) -> u64 {
+    let mut b = 1u64;
+    let mut cards_left = 52 - root.board.len() as u64;
+    for _ in (root.street as usize)..street {
+        b = b.saturating_mul(cards_left);
+        cards_left = cards_left.saturating_sub(1);
+    }
+    b
+}
+
+/// (TOOL-008) Size of the vectorized solver's tree, which is built WHOLE up
+/// front — every runout: `(decision nodes, rows, tree bytes)`. Tree bytes = the
+/// regret + strategy vectors and node overhead; rows = (decision node, hand in
+/// the actor's range) pairs, the report's size. `live` = each seat's live
+/// combos at the root (None: full ranges); a later street keeps a combo only
+/// when the new cards miss it, so a seat's rows there are
+/// `boards × live × C(52 - b - 2, k) / C(52 - b, k)` for `k` new cards on a
+/// root board of `b` — exact for full ranges, the expectation otherwise.
+pub fn vector_tree_size(
+    root: &RootSpec,
+    tree: &TreeCount,
+    live: Option<[u64; 2]>,
+) -> (u64, u64, u64) {
+    let b = root.board.len() as u64;
+    let full = (52 - b) * (51 - b) / 2;
+    let live = live.unwrap_or([full, full]);
+    let (mut nodes_all, mut rows, mut bytes) = (0u64, 0.0f64, 0u64);
+    for street in 0..4usize {
+        let nodes = tree.nodes_by_street[street];
+        if nodes == 0 {
+            continue;
+        }
+        let boards = boards_below(root, street);
+        nodes_all = nodes_all.saturating_add(nodes.saturating_mul(boards));
+        // P(a combo misses the k new cards) = C(50-b, k) / C(52-b, k).
+        let k = street.saturating_sub(root.street as usize) as u64;
+        let mut survive = 1.0f64;
+        for i in 0..k {
+            survive *= (50 - b - i) as f64 / (52 - b - i) as f64;
+        }
+        for seat in 0..2 {
+            let n = tree.hu_nodes_by_seat_street[seat][street] as f64;
+            rows += n * boards as f64 * live[seat] as f64 * survive;
+        }
+        let per_board = tree.actions_by_street[street]
+            .saturating_mul(VECTOR_BYTES_PER_ACTION)
+            .saturating_add(nodes.saturating_mul(VECTOR_NODE_OVERHEAD_BYTES));
+        bytes = bytes.saturating_add(per_board.saturating_mul(boards));
+    }
+    (nodes_all, rows.round() as u64, bytes)
+}
+
+/// (TOOL-008) Every node is visited every iteration (no visit cap) and the
+/// whole tree plus the exported rows must fit: `est_infosets` = report rows,
+/// `est_bytes` = tree + rows (also `one_runout_bytes`, the refusal test).
+fn vector_estimate(
+    root: &RootSpec,
+    config: &SolveConfig,
+    tree: &TreeCount,
+    private_views: u64,
+) -> MemoryEstimate {
+    // The report holds one row per hand IN THE RANGE: parse them (a range that
+    // does not parse is the solve's own error — estimate the full range then).
+    let live = |spec: &str| {
+        super::range::Range::parse(spec, &root.board)
+            .map(|r| r.live_combos() as u64)
+            .ok()
+    };
+    let live = match (live(&root.range_oop), live(&root.range_ip)) {
+        (Some(a), Some(b)) => Some([a, b]),
+        _ => None,
+    };
+    let (_, rows, tree_bytes) = vector_tree_size(root, tree, live);
+    let bytes = tree_bytes.saturating_add(rows.saturating_mul(VECTOR_EXPORT_BYTES_PER_ROW));
+    MemoryEstimate {
+        est_infosets: rows,
+        est_bytes: bytes,
+        one_runout_bytes: bytes,
         private_views,
         card_abs: config.card_abstraction.clone(),
         public_nodes: tree.total_nodes(),
@@ -275,14 +384,15 @@ pub fn refuse_if_unsafe(root: &RootSpec, config: &SolveConfig) -> Result<MemoryE
     // runout and how many get visited depends on the run length, so those are
     // bounded at run time instead: the solve loop stops with
     // `early_stop=memory_budget` once the live table passes the budget.
-    if est.one_runout_bytes > DEFAULT_RAM_BUDGET_BYTES {
+    let budget = config.ram_budget_bytes();
+    if est.one_runout_bytes > budget {
         return Err(CfrError::InvalidConfig(format!(
             "estimated memory {:.1} GB ({} public nodes x {} private views) exceeds budget {:.1} GB; \
              use coarser sizes (micro) or shallower stacks",
             est.one_runout_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             est.public_nodes,
             est.private_views,
-            DEFAULT_RAM_BUDGET_BYTES as f64 / (1024.0 * 1024.0 * 1024.0)
+            budget as f64 / (1024.0 * 1024.0 * 1024.0)
         )));
     }
     Ok(est)
@@ -305,13 +415,8 @@ mod tests {
 
     #[test]
     fn refuse_exact_flop() {
-        let root = RootSpec::postflop_hu(
-            StreetRoot::Flop,
-            10.0,
-            50.0,
-            vec![0, 1, 2],
-            vec![500, 1000],
-        );
+        let root =
+            RootSpec::postflop_hu(StreetRoot::Flop, 10.0, 50.0, vec![0, 1, 2], vec![500, 1000]);
         let mut cfg = SolveConfig::default();
         cfg.card_abstraction = "none".into();
         assert!(refuse_if_unsafe(&root, &cfg).is_err());
@@ -323,13 +428,8 @@ mod tests {
 
     #[test]
     fn allow_bucketed_flop() {
-        let root = RootSpec::postflop_hu(
-            StreetRoot::Flop,
-            10.0,
-            50.0,
-            vec![0, 1, 2],
-            vec![500, 1000],
-        );
+        let root =
+            RootSpec::postflop_hu(StreetRoot::Flop, 10.0, 50.0, vec![0, 1, 2], vec![500, 1000]);
         let mut cfg = SolveConfig::default();
         cfg.card_abstraction = "ochs".into();
         assert!(refuse_if_unsafe(&root, &cfg).is_ok());
@@ -422,13 +522,8 @@ mod tests {
     /// A finite iteration count caps the estimate (flop solves stay allowed).
     #[test]
     fn finite_iterations_cap_the_estimate() {
-        let root = RootSpec::postflop_hu(
-            StreetRoot::Flop,
-            8.0,
-            20.0,
-            vec![0, 5, 10],
-            vec![500, 1000],
-        );
+        let root =
+            RootSpec::postflop_hu(StreetRoot::Flop, 8.0, 20.0, vec![0, 5, 10], vec![500, 1000]);
         let mut cfg = SolveConfig::default();
         cfg.card_abstraction = "ochs".into();
         cfg.max_iterations = 60;

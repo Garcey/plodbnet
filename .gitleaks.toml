@@ -1,0 +1,16 @@
+# gitleaks — secret scanning for this repository (CI runs it on every push; the
+# pre-commit hook in scripts/hooks/ runs it before each commit when gitleaks is
+# installed: winget install gitleaks.gitleaks  /  brew install gitleaks).
+title = "WrapGTO"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Obvious test placeholders"
+regexes = [
+  '''(sk|rk|pk)_(live|test)_(fake|dummy|example|x{6,}|0{6,})''',
+]
+paths = [
+  '''docs/improvements/''',
+]

@@ -1,5 +1,8 @@
 # Build artifacts
 target/
+# The benchmarks' lock is derived from the root Cargo.lock (scripts/rust_env.sh).
+rust_engine/bench/Cargo.lock
+rust_engine/bench/Cargo.lock.root
 dist/
 build/
 *.egg-info/
@@ -23,6 +26,7 @@ runs/
 
 # Local OCR captures and debug artifacts
 screenrecords/
+recordings/
 tmp/
 tmp_sweep/
 _*.png
@@ -44,8 +48,21 @@ ui.log
 .DS_Store
 Thumbs.db
 
-# Public-build secrets + user data (never commit)
-.env.public
+# Secrets and user data (never commit). The deploy additionally content-scans
+# what it ships, and gitleaks (.gitleaks.toml) scans commits.
+.env
+.env.*
+!.env.example
+!*.example
+client_secret*
+*.key
+*.p12
+*.pfx
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
 data/
 
 # SSH keys / known_hosts for the training pod + VPS (never commit — a broad
@@ -55,4 +72,8 @@ ssh/
 id_ed25519*
 id_rsa*
 
-
+# Tools and other assistants' scratch space
+node_modules/
+.grok/
+.ruff_cache/
+.mypy_cache/

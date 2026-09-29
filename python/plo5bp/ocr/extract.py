@@ -1,10 +1,14 @@
-"""Stateless per-frame state extractor.
+"""Per-frame state extractor.
 
 Public entry point: `extract_frame_state(img: np.ndarray) -> FrameState`
-where `img` is a BGR numpy array (as returned by `cv2.imread`).
+where `img` is a BGR numpy array (as returned by `cv2.imread`), at the
+calibration geometry (`fit_to_calibration` brings a live capture there).
 
-Phase 1 is intentionally stateless: no cross-frame diff, no event detection.
-Fields that can't be read confidently come back as None / False.
+One frame in, one FrameState out: no cross-frame diff, no event detection
+(that is `events.EventReconstructor`). The only state is the optional
+per-crop read `cache` the live loop passes, which reuses a read while its
+crop's pixels are unchanged. Fields that can't be read confidently come
+back as None / False.
 """
 
 from __future__ import annotations
@@ -60,11 +64,31 @@ def _safe_future_result(fut: Future) -> int | None:
         return None
 
 
-def _classify_row(img: np.ndarray, rois: tuple[roi_mod.ROI, ...]) -> tuple[Card | None, ...]:
+def _cached_card(cache: dict | None, key: str, fp: object, read):
+    """A card read, reused while its crop's pixels are unchanged (TOOL-014:
+    boards and hero cards rarely change between ticks, and every read runs
+    the glyph pipeline — de-rotations included for hero cards)."""
+    if cache is None:
+        return read()
+    entry = cache.get(key)
+    if entry is not None and entry[0] == fp:
+        return entry[1]
+    val = read()
+    cache[key] = (fp, val)
+    return val
+
+
+def _classify_row(
+    img: np.ndarray, rois: tuple[roi_mod.ROI, ...], cache: dict | None = None,
+    name: str = "row",
+) -> tuple[Card | None, ...]:
     out: list[Card | None] = []
-    for roi in rois:
+    for i, roi in enumerate(rois):
         crop = roi.crop(img)
-        out.append(card_mod.classify_card(crop))
+        out.append(_cached_card(
+            cache, f"card_{name}_{i}", _crop_fp(crop),
+            lambda crop=crop: card_mod.classify_card(crop),
+        ))
     return tuple(out)
 
 
@@ -152,14 +176,23 @@ def _best_over_angles(crop: np.ndarray, slot: int) -> Card | None:
     return best_card
 
 
-def _classify_hero_hole(img: np.ndarray) -> tuple[Card | None, ...]:
+def _classify_hero_hole(
+    img: np.ndarray, cache: dict | None = None
+) -> tuple[Card | None, ...]:
     out: list[Card | None] = []
     for i, roi in enumerate(roi_mod.HERO_HOLE):
-        card = _best_over_angles(roi.crop(img), i)
-        if card is None and i == 0:
-            # Slot 0 also needs the wider ROI for some glyphs (e.g. K).
-            card = _best_over_angles(_HERO_HOLE_SLOT0_WIDE.crop(img), 0)
-        out.append(card)
+        crop = roi.crop(img)
+        wide = _HERO_HOLE_SLOT0_WIDE.crop(img) if i == 0 else None
+
+        def read(crop=crop, wide=wide, i=i) -> Card | None:
+            card = _best_over_angles(crop, i)
+            if card is None and wide is not None:
+                # Slot 0 also needs the wider ROI for some glyphs (e.g. K).
+                card = _best_over_angles(wide, 0)
+            return card
+
+        fp = (_crop_fp(crop), _crop_fp(wide) if wide is not None else None)
+        out.append(_cached_card(cache, f"card_hero_{i}", fp, read))
     return tuple(out)
 
 
@@ -173,7 +206,7 @@ def _build_seat_obs(
 ) -> SeatObs:
     """Assemble a ``SeatObs`` from resolved Tesseract reads + card-back crop.
 
-    Shared by both serial (`_read_seat`) and parallel (`extract_frame_state`)
+    Used by `extract_frame_state` (and directly by the in-hand rule tests)
     paths so the multi-signal in-hand rule lives in exactly one place.
 
     Multi-signal "in hand" detection. ``has_cards_back`` alone is fragile
@@ -224,29 +257,11 @@ def _build_seat_obs(
     )
 
 
-def _read_seat(
-    img: np.ndarray,
-    seat_rois: roi_mod.SeatROIs,
-    hero_hole: tuple[Card | None, ...],
-) -> SeatObs:
-    """Serial per-seat reader retained for tests that monkeypatch
-    ``text_mod.read_chip_amount`` / ``read_seat_commit`` directly."""
-    stack = text_mod.read_chip_amount(seat_rois.stack_label.crop(img))
-    committed = text_mod.read_seat_commit(seat_rois.committed_label.crop(img))
-    cards_back_crop = seat_rois.cards_back.crop(img)
-    timer_bar_crop = seat_rois.timer_bar_left.crop(img)
-    return _build_seat_obs(
-        seat_rois, hero_hole, stack, committed, cards_back_crop, timer_bar_crop
-    )
-
-
 def _detect_button(img: np.ndarray, seat_rois: tuple[roi_mod.SeatROIs, ...]) -> int | None:
     # Score each seat by the largest connected amber blob in its anchor.
     # Using the biggest component (not raw pixel fraction) means a thin
     # actor-countdown ring can't outscore the compact D disc when both
     # sit in the same HSV band.
-    import cv2
-
     best_seat: int | None = None
     best_score = 0.0
     lower = np.array([15, 120, 120], dtype=np.uint8)
@@ -303,6 +318,26 @@ def _submit_cached(pool, cache, key, crop, read_fn):
     return _resolve
 
 
+def fit_to_calibration(img: np.ndarray) -> tuple[np.ndarray | None, str | None]:
+    """Bring a live capture to the calibration geometry (TOOL-003).
+
+    ``(img, None)`` when it already matches; ``(resized, note)`` for a
+    same-aspect capture of another size (resized to `rois.CALIBRATION_SIZE`,
+    area-averaged when shrinking, so ROIs, glyph pixel floors and the rank
+    templates all see calibration-scale pixels); ``(None, reason)`` when the
+    aspect ratio differs — every ROI would read the wrong pixels.
+    """
+    h, w = img.shape[:2]
+    action, note = roi_mod.frame_geometry(int(w), int(h))
+    if action == "refuse":
+        return None, note
+    if action == "rescale":
+        cw, ch = roi_mod.CALIBRATION_SIZE
+        interp = cv2.INTER_AREA if w > cw else cv2.INTER_CUBIC
+        return cv2.resize(img, (cw, ch), interpolation=interp), note
+    return img, None
+
+
 def extract_frame_state(
     img: np.ndarray, num_seats: int = 6, cache: dict | None = None
 ) -> FrameState:
@@ -318,7 +353,8 @@ def extract_frame_state(
         Optional per-crop read cache for the live polling loop. When provided,
         a stack/commit/pot crop whose pixels are unchanged since last tick reuses
         its prior Tesseract result instead of re-running OCR (stacks only change
-        on an action, so most ticks skip all 13 reads). ``None`` = stateless;
+        on an action, so most ticks skip all 13 reads), and a card crop reuses
+        its prior classification (boards rarely change). ``None`` = stateless;
         callers that want a guaranteed-fresh read (rescan, CLI, tests) omit it.
 
     Tesseract reads (``num_seats`` stack labels + ``num_seats`` committed
@@ -330,9 +366,9 @@ def extract_frame_state(
     if img is None or img.ndim != 3:
         raise ValueError("extract_frame_state expects a BGR image (H, W, 3)")
 
-    board_a = _classify_row(img, roi_mod.BOARD_A)
-    board_b = _classify_row(img, roi_mod.BOARD_B)
-    hero_hole = _classify_hero_hole(img)
+    board_a = _classify_row(img, roi_mod.BOARD_A, cache, "board_a")
+    board_b = _classify_row(img, roi_mod.BOARD_B, cache, "board_b")
+    hero_hole = _classify_hero_hole(img, cache)
 
     seat_rois = roi_mod.seats(num_seats)
 
@@ -340,7 +376,7 @@ def extract_frame_state(
     stack_crops = [sr.stack_label.crop(img) for sr in seat_rois]
     commit_crops = [sr.committed_label.crop(img) for sr in seat_rois]
     cards_back_crops = [sr.cards_back.crop(img) for sr in seat_rois]
-    timer_bar_crops = [sr.timer_bar_left.crop(img) for sr in seat_rois]
+    timer_bar_crops = [sr.timer_bar_band.crop(img) for sr in seat_rois]
     pot_crop = roi_mod.POT_BANNER.crop(img)
 
     # Warm the Tesseract config on the main thread before we submit any

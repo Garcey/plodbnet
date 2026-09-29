@@ -1,19 +1,25 @@
 //! Game state machine: deal, apply action, advance street, settle payouts.
 
 use crate::actions::{Action, NUM_ACTIONS};
-use crate::cards::{Card, Deck};
+use crate::cards::{Card, CardMask, Deck, NO_CARD};
 use crate::double_board::{
-    double_board_payout, double_board_payout_runout, single_board_payout, PotLayers,
-    RunoutRanker,
+    double_board_payout, double_board_payout_runout, single_board_payout,
+    single_board_payout_layers, PotLayers, RunoutRanker,
 };
+// The observation-feature half of the old impl lives in obs_features.rs
+// (ENG-010); these stay reachable at their old paths.
+#[cfg(test)]
+use crate::obs_features::outcome_mc_seed;
+pub use crate::obs_features::{nlh_category_for, nlh_opp_outcome_for, BoardPairTable};
 use crate::state::{
     ActionRecord, GameConfig, GameState, Street, StudyError, StudyTerminal, Variant,
 };
 
 impl GameState {
     /// Deal a fresh hand: shuffle deck with `ChaCha8Rng::seed_from_u64(seed)`,
-    /// post antes, deal 5 hole cards per seat, pre-deal both full boards,
-    /// reveal flop on both, and set actor to first active seat left of button.
+    /// deal every seat its `hole_count` hole cards (PLO67: plus its reserved
+    /// extras), pre-deal the full board(s) and burns, post the antes (and
+    /// blinds), reveal the flops (bomb pots) and seat the first actor.
     pub fn new_hand(config: GameConfig, seed: u64, button: usize) -> Self {
         Self::new_hand_with_mask(config, seed, button, None)
     }
@@ -45,179 +51,115 @@ impl GameState {
     /// `new_hand_with_mask(seed)` is exactly this with `Deck::new_shuffled(seed)`.
     pub fn new_hand_from_deck(
         config: GameConfig,
-        mut deck: Deck,
+        deck: Deck,
         button: usize,
         in_hand_mask: Option<Vec<bool>>,
     ) -> Self {
-        let n = config.num_seats;
+        let mut state = GameState::blank(config);
+        state.deal(deck, button, in_hand_mask.as_deref());
+        state
+    }
+
+    /// Re-deal this table for a new hand: exactly
+    /// `new_hand(config.clone(), seed, button)` -- every seat in, the same
+    /// deal order, posts and first actor -- written into the previous hand's
+    /// buffers instead of ~20 fresh allocations (PERF-034: the batched engine
+    /// re-deals about one table in eight every step).
+    pub fn redeal(&mut self, config: &GameConfig, seed: u64, button: usize) {
+        self.config.clone_from(config);
+        self.deal(Deck::new_shuffled(seed), button, None);
+    }
+
+    /// The deal behind [`Self::new_hand_from_deck`] and [`Self::redeal`]:
+    /// the cards in the public deal order, every other field at its deal-time
+    /// value ([`Self::reset_table`]), antes, blinds, the flop's burn and the
+    /// first actor -- into this state's own buffers.
+    fn deal(&mut self, mut deck: Deck, button: usize, in_hand_mask: Option<&[bool]>) {
+        let n = self.config.num_seats;
         assert!(n >= 2, "need at least 2 seats");
         // Named failure instead of the deck's index-out-of-bounds (PLO5 at
         // 9 seats, PLO6 at 8). The Python `GameConfig` and the PyO3
         // constructors reject these up front (review 2026-09-20 C4/B8).
         assert!(
-            n <= config.variant.max_seats(),
+            n <= self.config.variant.max_seats(),
             "deck cannot cover {n} seats for this variant (max {})",
-            config.variant.max_seats()
+            self.config.variant.max_seats()
         );
         assert!(button < n, "button out of range");
-        if let Some(ref m) = in_hand_mask {
+        if let Some(m) = in_hand_mask {
             assert_eq!(m.len(), n, "in_hand_mask length must equal num_seats");
             assert!(
                 m.iter().filter(|&&b| b).count() >= 2,
                 "in_hand_mask must include at least 2 seats"
             );
         }
+        assert_eq!(
+            self.config.starting_stacks.len(),
+            n,
+            "starting_stacks length must equal num_seats"
+        );
 
-        let hole_count = config.variant.hole_count();
-        let hole_slots = config.variant.hole_slots();
-        let num_boards = config.variant.num_boards();
+        let variant = self.config.variant;
+        let (hole_count, hole_slots) = (variant.hole_count(), variant.hole_slots());
 
         // Deal order (determinism contract): `hole_slots` cards per seat,
         // seat 0 first, then full board A, then full board B (two-board
         // variants only), then the burns (PLO67 only). Every variant but
         // PLO67 has `hole_slots == hole_count` and no burns: the same cards
         // in the same order as before PLO67 existed.
-        let mut hole_cards: Vec<Vec<Card>> = Vec::with_capacity(n);
-        let mut extra_holes: Vec<Vec<Card>> = Vec::with_capacity(n);
-        for _ in 0..n {
-            let mut h = Vec::with_capacity(hole_slots);
+        self.hole_cards.resize_with(n, Vec::new);
+        self.extra_holes.resize_with(n, Vec::new);
+        for (h, extra) in self.hole_cards.iter_mut().zip(self.extra_holes.iter_mut()) {
+            h.clear();
             for _ in 0..hole_count {
                 h.push(deck.deal_one());
             }
-            let mut extra = Vec::with_capacity(hole_slots - hole_count);
+            extra.clear();
             for _ in hole_count..hole_slots {
                 extra.push(deck.deal_one());
             }
-            hole_cards.push(h);
-            extra_holes.push(extra);
         }
-
-        let mut full_board_a = [Card(0); 5];
-        for c in full_board_a.iter_mut() {
+        for c in self.full_board_a.iter_mut() {
             *c = deck.deal_one();
         }
-        // Single-board variants leave board B as never-read sentinels.
-        let mut full_board_b = [Card(0); 5];
-        if num_boards == 2 {
-            for c in full_board_b.iter_mut() {
+        // Single-board variants leave board B undealt.
+        self.full_board_b = [NO_CARD; 5];
+        if variant.num_boards() == 2 {
+            for c in self.full_board_b.iter_mut() {
                 *c = deck.deal_one();
             }
         }
-        let full_burns: Vec<Card> = (0..config.variant.burn_count()).map(|_| deck.deal_one()).collect();
-
-        assert_eq!(
-            config.starting_stacks.len(),
-            n,
-            "starting_stacks length must equal num_seats"
-        );
-        let mut stacks = config.starting_stacks.clone();
-        let mut total_commit = vec![0u64; n];
-        let mut all_in = vec![false; n];
-        let mut folded = vec![false; n];
-        let mut pot: u64 = 0;
-        for i in 0..n {
-            let in_hand = in_hand_mask.as_ref().map_or(true, |m| m[i]);
-            if !in_hand {
-                folded[i] = true;
-                continue;
-            }
-            let paid = stacks[i].min(config.ante);
-            stacks[i] -= paid;
-            total_commit[i] = paid;
-            pot += paid;
-            if stacks[i] == 0 {
-                all_in[i] = true;
-            }
-        }
-
-        // Blinds (variants with a preflop round): posted LIVE into
-        // street_commit after the dead antes. Posting is not an action —
-        // no history record, `acted_this_street` stays false, so the BB
-        // option (round can't close until the BB acts) falls out of the
-        // existing round-close machinery. Short posts go all-in;
-        // `bet_to_call` stays at the NOMINAL bb so callers owe the full
-        // blind and side pots absorb any shortfall.
-        let mut street_commit = vec![0u64; n];
-        let mut bet_to_call = 0u64;
-        let mut blind_seats: Option<(usize, usize)> = None;
-        if config.variant.has_preflop() {
-            let (sb_seat, bb_seat) = nlh_blind_seats(n, button, &folded);
-            for (seat, amount) in [(sb_seat, config.sb), (bb_seat, config.bb)] {
-                let paid = stacks[seat].min(amount);
-                stacks[seat] -= paid;
-                street_commit[seat] += paid;
-                total_commit[seat] += paid;
-                pot += paid;
-                if stacks[seat] == 0 {
-                    all_in[seat] = true;
-                }
-            }
-            bet_to_call = config.bb;
-            blind_seats = Some((sb_seat, bb_seat));
+        self.full_burns.clear();
+        for _ in 0..variant.burn_count() {
+            self.full_burns.push(deck.deal_one());
         }
 
         // Preflop variants reveal nothing until the first round closes;
         // bomb pots start with both flops exposed.
-        let (street, board_a, board_b) = if config.variant.has_preflop() {
-            (Street::Preflop, Vec::new(), Vec::new())
+        let preflop = variant.has_preflop();
+        let street = if preflop {
+            Street::Preflop
         } else {
-            (
-                Street::Flop,
-                full_board_a[0..3].to_vec(),
-                full_board_b[0..3].to_vec(),
-            )
+            Street::Flop
         };
-        let acted_this_street = vec![false; n];
-        let street_level_acted = vec![0u64; n];
-
-        let eff_stack_cap_at_hand_start =
-            compute_eff_stack_cap(&config.starting_stacks, &folded);
-
-        let mut state = GameState {
-            config,
-            button,
-            sb_seat: blind_seats.map(|(sb, _)| sb),
-            bb_seat: blind_seats.map(|(_, bb)| bb),
-            street,
-            pot,
-            stacks,
-            folded,
-            all_in,
-            hole_cards,
-            extra_holes,
-            full_burns,
-            burns: Vec::new(),
-            board_a,
-            board_b,
-            full_board_a,
-            full_board_b,
-            street_commit,
-            total_commit,
-            bet_to_call,
-            last_raise_size: 0, // set below from bb
-            last_aggression_was_full_raise: true,
-            street_level_acted,
-            actor: None,
-            last_aggressor: None,
-            acted_this_street,
-            history: Vec::new(),
-            study_mode: false,
-            awaiting_next_street: None,
-            study_terminal: None,
-            study_hero_seat: None,
-            action_close_board_len: None,
-            eff_stack_cap_at_hand_start,
-        };
-        state.last_raise_size = state.config.bb;
+        self.board_a.clear();
+        self.board_b.clear();
+        if !preflop {
+            self.board_a.extend_from_slice(&self.full_board_a[..3]);
+            self.board_b.extend_from_slice(&self.full_board_b[..3]);
+        }
+        self.reset_table(button, street);
+        self.post_antes(in_hand_mask);
+        let blind_seats = preflop.then(|| self.post_blinds());
         // PLO67: the flop's burn is turned up before the flops come, and a
         // red one deals every seat in the hand its fifth card.
         if street == Street::Flop {
-            state.reveal_burn();
+            self.reveal_burn();
         }
 
-        state.actor = match blind_seats {
-            Some((_, bb_seat)) => state.first_to_act_preflop(bb_seat),
-            None => state.first_to_act_postflop(),
+        self.actor = match blind_seats {
+            Some((_, bb_seat)) => self.first_to_act_preflop(bb_seat),
+            None => self.first_to_act_postflop(),
         };
 
         // If nobody can voluntarily act, auto-run to showdown: every seat
@@ -226,11 +168,201 @@ impl GameState {
         // (the actor walk skips it — `nothing_to_contest`, review
         // 2026-09-20 C1; it used to get a forced check node). The hand is
         // then terminal at deal.
-        if state.actor.is_none() {
-            state.run_out_to_showdown();
+        if self.actor.is_none() {
+            self.run_out_to_showdown();
         }
+    }
 
-        state
+    /// A just-dealt hand before any chips go in (ENG-003: the one struct
+    /// literal the three deal constructors share): every field at its
+    /// deal-time value — stacks at the starting stacks, nothing committed or
+    /// folded, no actor, not a study hand. The constructors then post the
+    /// antes ([`Self::post_antes`]) and blinds ([`Self::post_blinds`]) in
+    /// that order.
+    fn skeleton(
+        config: GameConfig,
+        button: usize,
+        hole_cards: Vec<Vec<Card>>,
+        extra_holes: Vec<Vec<Card>>,
+        (full_board_a, full_board_b): ([Card; 5], [Card; 5]),
+        full_burns: Vec<Card>,
+        (street, board_a, board_b): (Street, Vec<Card>, Vec<Card>),
+    ) -> Self {
+        let mut g = GameState::blank(config);
+        g.hole_cards = hole_cards;
+        g.extra_holes = extra_holes;
+        g.full_board_a = full_board_a;
+        g.full_board_b = full_board_b;
+        g.full_burns = full_burns;
+        g.board_a = board_a;
+        g.board_b = board_b;
+        g.reset_table(button, street);
+        g
+    }
+
+    /// A state holding nothing yet: the one struct literal (every field named,
+    /// so a new field is a compile error here), filled by [`Self::deal`] or
+    /// [`Self::skeleton`].
+    fn blank(config: GameConfig) -> Self {
+        GameState {
+            button: 0,
+            sb_seat: None,
+            bb_seat: None,
+            street: Street::Flop,
+            pot: 0,
+            stacks: Vec::new(),
+            folded: Vec::new(),
+            all_in: Vec::new(),
+            hole_cards: Vec::new(),
+            extra_holes: Vec::new(),
+            full_burns: Vec::new(),
+            burns: Vec::new(),
+            board_a: Vec::new(),
+            board_b: Vec::new(),
+            full_board_a: [NO_CARD; 5],
+            full_board_b: [NO_CARD; 5],
+            street_commit: Vec::new(),
+            total_commit: Vec::new(),
+            bet_to_call: 0,
+            last_raise_size: 0,
+            last_aggression_was_full_raise: true,
+            street_level_acted: Vec::new(),
+            actor: None,
+            last_aggressor: None,
+            acted_this_street: Vec::new(),
+            history: Vec::new(),
+            study_mode: false,
+            awaiting_next_street: None,
+            study_terminal: None,
+            study_hero_seat: None,
+            action_close_board_len: None,
+            eff_stack_cap_at_hand_start: Vec::new(),
+            config,
+        }
+    }
+
+    /// Every field but the cards and the config at its deal-time value
+    /// (ENG-003's one list): stacks at the starting stacks, nothing committed
+    /// or folded, no actor, not a study hand -- in place, reusing the buffers
+    /// (PERF-034). The destructure is exhaustive: a new field is a compile
+    /// error here until it gets its deal-time value.
+    fn reset_table(&mut self, button: usize, street: Street) {
+        fn refill<T: Clone>(v: &mut Vec<T>, n: usize, x: T) {
+            v.clear();
+            v.resize(n, x);
+        }
+        let n = self.config.num_seats;
+        let GameState {
+            button: button_field,
+            sb_seat,
+            bb_seat,
+            street: street_field,
+            pot,
+            stacks,
+            folded,
+            all_in,
+            hole_cards: _,
+            extra_holes: _,
+            full_burns: _,
+            burns,
+            board_a: _,
+            board_b: _,
+            full_board_a: _,
+            full_board_b: _,
+            street_commit,
+            total_commit,
+            bet_to_call,
+            last_raise_size,
+            last_aggression_was_full_raise,
+            street_level_acted,
+            actor,
+            last_aggressor,
+            acted_this_street,
+            history,
+            study_mode,
+            awaiting_next_street,
+            study_terminal,
+            study_hero_seat,
+            action_close_board_len,
+            eff_stack_cap_at_hand_start,
+            config,
+        } = self;
+        *button_field = button;
+        *sb_seat = None;
+        *bb_seat = None;
+        *street_field = street;
+        *pot = 0;
+        stacks.clone_from(&config.starting_stacks);
+        refill(folded, n, false);
+        refill(all_in, n, false);
+        burns.clear();
+        refill(street_commit, n, 0);
+        refill(total_commit, n, 0);
+        *bet_to_call = 0;
+        *last_raise_size = config.bb;
+        *last_aggression_was_full_raise = true;
+        refill(street_level_acted, n, 0);
+        *actor = None;
+        *last_aggressor = None;
+        refill(acted_this_street, n, false);
+        history.clear();
+        *study_mode = false;
+        *awaiting_next_street = None;
+        *study_terminal = None;
+        *study_hero_seat = None;
+        *action_close_board_len = None;
+        eff_stack_cap_at_hand_start.clear();
+    }
+
+    /// Post the antes (dead): every dealt-in seat pays `min(stack, ante)` and
+    /// is all-in if that was everything; a seat outside `in_hand` sits out —
+    /// folded from the start, posting nothing. Then freeze the per-seat
+    /// effective-stack caps (they depend on who is dealt in).
+    fn post_antes(&mut self, in_hand: Option<&[bool]>) {
+        let ante = self.config.ante;
+        for i in 0..self.config.num_seats {
+            if !in_hand.is_none_or(|m| m[i]) {
+                self.folded[i] = true;
+                continue;
+            }
+            let paid = self.stacks[i].min(ante);
+            self.stacks[i] -= paid;
+            self.total_commit[i] = paid;
+            self.pot += paid;
+            if self.stacks[i] == 0 {
+                self.all_in[i] = true;
+            }
+        }
+        eff_stack_cap_into(
+            &mut self.eff_stack_cap_at_hand_start,
+            &self.config.starting_stacks,
+            &self.folded,
+        );
+    }
+
+    /// Post the blinds of a variant with a preflop round, LIVE into
+    /// `street_commit`, after the dead antes. Posting is not an action — no
+    /// history record, `acted_this_street` stays false, so the BB option
+    /// (the round can't close until the BB acts) falls out of the existing
+    /// round-close machinery. Short posts go all-in; `bet_to_call` stays at
+    /// the NOMINAL bb so callers owe the full blind and side pots absorb any
+    /// shortfall. Returns and stores (sb seat, bb seat).
+    fn post_blinds(&mut self) -> (usize, usize) {
+        let (sb_seat, bb_seat) = nlh_blind_seats(self.config.num_seats, self.button, &self.folded);
+        for (seat, amount) in [(sb_seat, self.config.sb), (bb_seat, self.config.bb)] {
+            let paid = self.stacks[seat].min(amount);
+            self.stacks[seat] -= paid;
+            self.street_commit[seat] += paid;
+            self.total_commit[seat] += paid;
+            self.pot += paid;
+            if self.stacks[seat] == 0 {
+                self.all_in[seat] = true;
+            }
+        }
+        self.bet_to_call = self.config.bb;
+        self.sb_seat = Some(sb_seat);
+        self.bb_seat = Some(bb_seat);
+        (sb_seat, bb_seat)
     }
 
     /// Deal a study-mode hand at the flop with user-supplied cards.
@@ -277,11 +409,14 @@ impl GameState {
         // taking two cards) is dual-board-shaped. NLH study support is a
         // separate workstream — reject rather than half-behave.
         if config.variant != Variant::Plo5DoubleBomb {
-            return Err(StudyError::WrongState);
+            return Err(StudyError::UnsupportedVariant);
         }
         let n = config.num_seats;
         if n < 2 || button >= n || hero_seat >= n {
             return Err(StudyError::SeatOutOfRange);
+        }
+        if config.starting_stacks.len() != n {
+            return Err(StudyError::StackCountMismatch);
         }
         // The placeholder deal needs 5 cards per non-hero seat on top of
         // the hero hole and both full boards; 10 seats used to index past
@@ -290,25 +425,17 @@ impl GameState {
             return Err(StudyError::TooManySeats);
         }
         if let Some(ref m) = in_hand_mask {
-            if m.len() != n {
-                return Err(StudyError::SeatOutOfRange);
-            }
-            if !m[hero_seat] {
-                return Err(StudyError::SeatOutOfRange);
-            }
-            if m.iter().filter(|&&b| b).count() < 2 {
-                return Err(StudyError::SeatOutOfRange);
+            if m.len() != n || !m[hero_seat] || m.iter().filter(|&&b| b).count() < 2 {
+                return Err(StudyError::BadMask);
             }
         }
 
         // Validate 11 distinct card indices across hero hole + both flops.
-        let mut used = [false; 52];
-        for c in hero_hole.iter().chain(flop_a.iter()).chain(flop_b.iter()) {
-            let i = c.index() as usize;
-            if i >= 52 || used[i] {
+        let mut used = CardMask::EMPTY;
+        for &c in hero_hole.iter().chain(flop_a.iter()).chain(flop_b.iter()) {
+            if !used.insert(c) {
                 return Err(StudyError::DuplicateCard);
             }
-            used[i] = true;
         }
 
         // Seed a deck from a hash of all user inputs for deterministic opp hole draws.
@@ -316,15 +443,12 @@ impl GameState {
 
         // Build the unseen deck (excluding the 11 user-supplied cards) and
         // shuffle it via ChaCha8Rng for bit-exact reproducibility.
-        let unseen: Vec<Card> = (0..52u8)
-            .filter(|&i| !used[i as usize])
-            .map(Card::from_index)
-            .collect();
+        let unseen: Vec<Card> = used.unseen().collect();
         let mut deck_order = unseen;
         {
             use rand::seq::SliceRandom;
-            use rand_chacha::ChaCha8Rng;
             use rand_chacha::rand_core::SeedableRng;
+            use rand_chacha::ChaCha8Rng;
             let mut rng = ChaCha8Rng::seed_from_u64(seed);
             deck_order.shuffle(&mut rng);
         }
@@ -345,84 +469,25 @@ impl GameState {
             }
         }
 
-        // Post antes exactly as new_hand. Sitting-out seats (mask[i]==false)
-        // post no ante and are marked folded so they never become actors.
-        if config.starting_stacks.len() != n {
-            return Err(StudyError::SeatOutOfRange);
-        }
-        let mut stacks = config.starting_stacks.clone();
-        let mut total_commit = vec![0u64; n];
-        let mut all_in = vec![false; n];
-        let mut folded = vec![false; n];
-        let mut pot: u64 = 0;
-        for i in 0..n {
-            let in_hand = in_hand_mask.as_ref().map_or(true, |m| m[i]);
-            if !in_hand {
-                folded[i] = true;
-                continue;
-            }
-            let paid = stacks[i].min(config.ante);
-            stacks[i] -= paid;
-            total_commit[i] = paid;
-            pot += paid;
-            if stacks[i] == 0 {
-                all_in[i] = true;
-            }
-        }
-
-        // full_board_* carry flop in [0..3] and Card(0) sentinels in [3..5].
-        let mut full_board_a = [Card(0); 5];
-        let mut full_board_b = [Card(0); 5];
-        for i in 0..3 {
-            full_board_a[i] = flop_a[i];
-            full_board_b[i] = flop_b[i];
-        }
-        let board_a: Vec<Card> = flop_a.to_vec();
-        let board_b: Vec<Card> = flop_b.to_vec();
-
-        let street_commit = vec![0u64; n];
-        let acted_this_street = vec![false; n];
-        let street_level_acted = vec![0u64; n];
-
-        let eff_stack_cap_at_hand_start =
-            compute_eff_stack_cap(&config.starting_stacks, &folded);
-
-        let mut state = GameState {
+        // full_board_* carry the flop in [0..3] and NO_CARD in [3..5] (the UI
+        // supplies the turn and river later).
+        let mut full_board_a = [NO_CARD; 5];
+        let mut full_board_b = [NO_CARD; 5];
+        full_board_a[..3].copy_from_slice(&flop_a);
+        full_board_b[..3].copy_from_slice(&flop_b);
+        let mut state = GameState::skeleton(
             config,
             button,
-            sb_seat: None,
-            bb_seat: None,
-            street: Street::Flop,
-            pot,
-            stacks,
-            folded,
-            all_in,
-            extra_holes: vec![Vec::new(); hole_cards.len()],
             hole_cards,
-            full_burns: Vec::new(),
-            burns: Vec::new(),
-            board_a,
-            board_b,
-            full_board_a,
-            full_board_b,
-            street_commit,
-            total_commit,
-            bet_to_call: 0,
-            last_raise_size: 0,
-            last_aggression_was_full_raise: true,
-            street_level_acted,
-            actor: None,
-            last_aggressor: None,
-            acted_this_street,
-            history: Vec::new(),
-            study_mode: true,
-            awaiting_next_street: None,
-            study_terminal: None,
-            study_hero_seat: Some(hero_seat),
-            action_close_board_len: None,
-            eff_stack_cap_at_hand_start,
-        };
-        state.last_raise_size = state.config.bb;
+            vec![Vec::new(); n],
+            (full_board_a, full_board_b),
+            Vec::new(),
+            (Street::Flop, flop_a.to_vec(), flop_b.to_vec()),
+        );
+        state.study_mode = true;
+        state.study_hero_seat = Some(hero_seat);
+        // Antes exactly as new_hand: sitting-out seats post none, folded.
+        state.post_antes(in_hand_mask.as_deref());
         state.actor = state.first_to_act_postflop();
         // Nobody can act at construction (every seat all-in from the
         // antes, or a lone seat with chips and nothing to contest): close
@@ -479,16 +544,13 @@ impl GameState {
         // grounds for rejection — `redraw_colliding_placeholders` moves
         // them out of the way instead.
         let hero_seat = self.study_hero_seat.ok_or(StudyError::WrongState)?;
-        let mut used = [false; 52];
-        for c in self.hole_cards[hero_seat].iter() {
-            used[c.index() as usize] = true;
-        }
-        for c in self.board_a.iter().chain(self.board_b.iter()) {
-            used[c.index() as usize] = true;
-        }
-        let ia = card_a.index() as usize;
-        let ib = card_b.index() as usize;
-        if ia >= 52 || ib >= 52 || ia == ib || used[ia] || used[ib] {
+        let mut used = CardMask::of(
+            self.hole_cards[hero_seat]
+                .iter()
+                .chain(self.board_a.iter())
+                .chain(self.board_b.iter()),
+        );
+        if !used.insert(card_a) || !used.insert(card_b) {
             return Err(StudyError::DuplicateCard);
         }
 
@@ -541,17 +603,14 @@ impl GameState {
         hero_seat: usize,
         new_cards: &[Card],
     ) -> Result<(), StudyError> {
-        let mut used = [false; 52];
-        for c in self
-            .hole_cards
-            .iter()
-            .flatten()
-            .chain(self.board_a.iter())
-            .chain(self.board_b.iter())
-            .chain(new_cards.iter())
-        {
-            used[c.index() as usize] = true;
-        }
+        let mut used = CardMask::of(
+            self.hole_cards
+                .iter()
+                .flatten()
+                .chain(self.board_a.iter())
+                .chain(self.board_b.iter())
+                .chain(new_cards.iter()),
+        );
         // Decide every replacement before touching the state, so an error
         // leaves the hand exactly as it was.
         let mut redraws: Vec<(usize, usize, Card)> = Vec::new();
@@ -564,10 +623,7 @@ impl GameState {
                     if held != card {
                         continue;
                     }
-                    let unused: Vec<Card> = (0..52u8)
-                        .filter(|&i| !used[i as usize])
-                        .map(Card::from_index)
-                        .collect();
+                    let unused: Vec<Card> = used.unseen().collect();
                     // Unreachable past the constructors' `max_seats`
                     // check (the full hand fits one deck); never index an
                     // empty deck regardless.
@@ -580,7 +636,7 @@ impl GameState {
                     mixer.write_u8(seat as u8);
                     mixer.write_u8(slot as u8);
                     let pick = unused[(mixer.finish() % unused.len() as u64) as usize];
-                    used[pick.index() as usize] = true;
+                    used.add(pick);
                     redraws.push((seat, slot, pick));
                 }
             }
@@ -605,40 +661,35 @@ impl GameState {
         hero_hole: [Card; 2],
     ) -> Result<Self, StudyError> {
         if config.variant != Variant::NlhSingle {
-            return Err(StudyError::WrongState);
+            return Err(StudyError::UnsupportedVariant);
         }
         let n = config.num_seats;
         if n < 2 || button >= n || hero_seat >= n {
             return Err(StudyError::SeatOutOfRange);
         }
         if config.starting_stacks.len() != n {
-            return Err(StudyError::SeatOutOfRange);
+            return Err(StudyError::StackCountMismatch);
         }
         // Same deck bound as the PLO study constructor (review 2026-09-20 C4).
         if n > config.variant.max_seats() {
             return Err(StudyError::TooManySeats);
         }
 
-        let mut used = [false; 52];
-        for c in hero_hole.iter() {
-            let i = c.index() as usize;
-            if i >= 52 || used[i] {
+        let mut used = CardMask::EMPTY;
+        for &c in hero_hole.iter() {
+            if !used.insert(c) {
                 return Err(StudyError::DuplicateCard);
             }
-            used[i] = true;
         }
 
         // Deterministic placeholder holes from a hash of the user inputs
         // (same recipe as the PLO study constructor).
         let seed = study_deal_seed(button, hero_seat, &[&hero_hole]);
-        let mut deck_order: Vec<Card> = (0..52u8)
-            .filter(|&i| !used[i as usize])
-            .map(Card::from_index)
-            .collect();
+        let mut deck_order: Vec<Card> = used.unseen().collect();
         {
             use rand::seq::SliceRandom;
-            use rand_chacha::ChaCha8Rng;
             use rand_chacha::rand_core::SeedableRng;
+            use rand_chacha::ChaCha8Rng;
             let mut rng = ChaCha8Rng::seed_from_u64(seed);
             deck_order.shuffle(&mut rng);
         }
@@ -657,74 +708,20 @@ impl GameState {
             }
         }
 
-        // Antes (dead) then blinds (live) — the exact new_hand sequence.
-        let mut stacks = config.starting_stacks.clone();
-        let mut total_commit = vec![0u64; n];
-        let mut all_in = vec![false; n];
-        let folded = vec![false; n];
-        let mut pot: u64 = 0;
-        for i in 0..n {
-            let paid = stacks[i].min(config.ante);
-            stacks[i] -= paid;
-            total_commit[i] = paid;
-            pot += paid;
-            if stacks[i] == 0 {
-                all_in[i] = true;
-            }
-        }
-        let mut street_commit = vec![0u64; n];
-        let (sb_seat, bb_seat) = nlh_blind_seats(n, button, &folded);
-        for (seat, amount) in [(sb_seat, config.sb), (bb_seat, config.bb)] {
-            let paid = stacks[seat].min(amount);
-            stacks[seat] -= paid;
-            street_commit[seat] += paid;
-            total_commit[seat] += paid;
-            pot += paid;
-            if stacks[seat] == 0 {
-                all_in[seat] = true;
-            }
-        }
-        let bet_to_call = config.bb;
-
-        let eff_stack_cap_at_hand_start =
-            compute_eff_stack_cap(&config.starting_stacks, &folded);
-
-        let mut state = GameState {
+        let mut state = GameState::skeleton(
             config,
             button,
-            sb_seat: Some(sb_seat),
-            bb_seat: Some(bb_seat),
-            street: Street::Preflop,
-            pot,
-            stacks,
-            folded,
-            all_in,
-            extra_holes: vec![Vec::new(); hole_cards.len()],
             hole_cards,
-            full_burns: Vec::new(),
-            burns: Vec::new(),
-            board_a: Vec::new(),
-            board_b: Vec::new(),
-            full_board_a: [Card(0); 5],
-            full_board_b: [Card(0); 5],
-            street_commit,
-            total_commit,
-            bet_to_call,
-            last_raise_size: 0,
-            last_aggression_was_full_raise: true,
-            street_level_acted: vec![0u64; n],
-            actor: None,
-            last_aggressor: None,
-            acted_this_street: vec![false; n],
-            history: Vec::new(),
-            study_mode: true,
-            awaiting_next_street: None,
-            study_terminal: None,
-            study_hero_seat: Some(hero_seat),
-            action_close_board_len: None,
-            eff_stack_cap_at_hand_start,
-        };
-        state.last_raise_size = state.config.bb;
+            vec![Vec::new(); n],
+            ([NO_CARD; 5], [NO_CARD; 5]),
+            Vec::new(),
+            (Street::Preflop, Vec::new(), Vec::new()),
+        );
+        state.study_mode = true;
+        state.study_hero_seat = Some(hero_seat);
+        // Antes (dead) then blinds (live) — the exact new_hand sequence.
+        state.post_antes(None);
+        let (_, bb_seat) = state.post_blinds();
         state.actor = state.first_to_act_preflop(bb_seat);
         // Same construction-time classification as the PLO study
         // constructor: nobody can act → `study_terminal = RunOut`
@@ -750,11 +747,7 @@ impl GameState {
         self.set_next_street_nlh(Street::River, &[card])
     }
 
-    fn set_next_street_nlh(
-        &mut self,
-        expected: Street,
-        cards: &[Card],
-    ) -> Result<(), StudyError> {
+    fn set_next_street_nlh(&mut self, expected: Street, cards: &[Card]) -> Result<(), StudyError> {
         if !self.study_mode || self.config.variant != Variant::NlhSingle {
             return Err(StudyError::WrongState);
         }
@@ -762,16 +755,11 @@ impl GameState {
             return Err(StudyError::WrongState);
         }
         let hero_seat = self.study_hero_seat.ok_or(StudyError::WrongState)?;
-        let mut used = [false; 52];
-        for c in self.hole_cards[hero_seat].iter().chain(self.board_a.iter()) {
-            used[c.index() as usize] = true;
-        }
-        for c in cards {
-            let i = c.index() as usize;
-            if i >= 52 || used[i] {
+        let mut used = CardMask::of(self.hole_cards[hero_seat].iter().chain(self.board_a.iter()));
+        for &c in cards {
+            if !used.insert(c) {
                 return Err(StudyError::DuplicateCard);
             }
-            used[i] = true;
         }
         self.redraw_colliding_placeholders(hero_seat, cards)?;
         let base = self.board_a.len();
@@ -829,7 +817,7 @@ impl GameState {
             Action::BetPct100,
         ];
         for (i, &act) in sizings.iter().enumerate() {
-            let chips = self.compute_sizing_chips(act, actor);
+            let chips = self.sizing_chips(act, actor, min_total, max_total);
             let target_total = current_commit + chips;
             if target_total >= min_total && target_total <= max_total && chips > 0 {
                 sizing_chips[i] = chips;
@@ -838,22 +826,7 @@ impl GameState {
         }
 
         let shove_chips = stack;
-        let shove_total = current_commit + shove_chips;
-        // AllIn is legal when (a) the shove is at least a full raise
-        // (meets min_total), (b) facing a bet, the shove is strictly
-        // above the call but below min (short raise — doesn't reopen),
-        // or (c) not facing a bet but stack can't reach 1bb (short open
-        // — sub-min bet, doesn't reset the min-raise floor). Cases (b)
-        // and (c) flow through apply()'s short-shove branch when
-        // raise_delta < prev_raise_size.
-        let allin_is_full = shove_total >= min_total;
-        let allin_is_short_raise =
-            facing_bet && shove_total > self.bet_to_call && shove_total < min_total;
-        let allin_is_short_open =
-            !facing_bet && shove_total > 0 && shove_total < min_total;
-        let allin_feasible = shove_chips > 0
-            && shove_total <= max_total
-            && (allin_is_full || allin_is_short_raise || allin_is_short_open);
+        let allin_feasible = self.all_in_feasible(actor, min_total, max_total);
 
         // Mask sizings: each is legal iff feasible AND chips differs from
         // (a) CheckCall, (b) all lower-indexed feasible sizings, (c) AllIn (if feasible).
@@ -887,6 +860,38 @@ impl GameState {
     /// `legal_action_mask()[Fold]` without building the mask: a seat is to
     /// act and faces a bet.
     #[inline]
+    /// Whether the actor may shove, given the wager bounds: (a) the shove is
+    /// at least a full raise (meets `min_total`), (b) facing a bet, it is
+    /// strictly above the call but below the minimum (a short raise that
+    /// doesn't reopen), or (c) not facing a bet, the stack can't reach 1bb (a
+    /// short open that doesn't reset the min-raise floor). Cases (b) and (c)
+    /// flow through `commit_chips`' short-shove branch. The caller has
+    /// already ruled out an empty stack and the short-shove lockout.
+    fn all_in_feasible(&self, actor: usize, min_total: u64, max_total: u64) -> bool {
+        let shove_chips = self.stacks[actor];
+        let shove_total = self.street_commit[actor] + shove_chips;
+        let facing_bet = self.bet_to_call > self.street_commit[actor];
+        let allin_is_full = shove_total >= min_total;
+        let allin_is_short_raise =
+            facing_bet && shove_total > self.bet_to_call && shove_total < min_total;
+        let allin_is_short_open = !facing_bet && shove_total > 0 && shove_total < min_total;
+        shove_chips > 0
+            && shove_total <= max_total
+            && (allin_is_full || allin_is_short_raise || allin_is_short_open)
+    }
+
+    /// `legal_action_mask()[AllIn]` without the five pot-fraction sizings the
+    /// mask also works out (PERF-031: the hybrid path's gate 3 needs only
+    /// this bit).
+    pub fn all_in_is_legal(&self) -> bool {
+        match self.actor {
+            Some(a) if self.stacks[a] > 0 && !self.short_shove_lockout() => {
+                self.all_in_feasible(a, self.min_bet_total(), self.max_bet_total())
+            }
+            _ => false,
+        }
+    }
+
     pub fn fold_is_legal(&self) -> bool {
         match self.actor {
             Some(a) => self.bet_to_call > self.street_commit[a],
@@ -937,54 +942,26 @@ impl GameState {
             .action_to_chips(action)
             .expect("illegal action passed to apply");
 
-        match action {
-            Action::Fold => {
-                self.folded[actor] = true;
-                self.history.push(ActionRecord {
-                    seat: actor,
-                    action,
-                    chips: 0,
-                    street: self.street,
-                });
-            }
-            _ => {
-                self.stacks[actor] -= chips;
-                self.pot += chips;
-                self.street_commit[actor] += chips;
-                self.total_commit[actor] += chips;
-
-                let new_commit = self.street_commit[actor];
-                if new_commit > self.bet_to_call {
-                    let raise_delta = new_commit - self.bet_to_call;
-                    let prev_raise_size = self.last_raise_size;
-                    self.bet_to_call = new_commit;
-                    if raise_delta >= prev_raise_size {
-                        // Full raise (or opening bet ≥ 1bb): reopens action.
-                        self.last_raise_size = raise_delta;
-                        self.last_aggression_was_full_raise = true;
-                    } else {
-                        // Short shove below the min-raise floor: bet_to_call
-                        // advances but floor is preserved and already-acted
-                        // seats cannot re-raise.
-                        self.last_aggression_was_full_raise = false;
-                    }
-                    self.last_aggressor = Some(actor);
-                }
-                if self.stacks[actor] == 0 {
-                    self.all_in[actor] = true;
-                }
-                self.history.push(ActionRecord {
-                    seat: actor,
-                    action,
-                    chips,
-                    street: self.street,
-                });
-            }
+        if action == Action::Fold {
+            self.folded[actor] = true;
+            self.history.push(ActionRecord {
+                seat: actor,
+                action,
+                chips: 0,
+                street: self.street,
+            });
+            self.acted_this_street[actor] = true;
+            self.street_level_acted[actor] = self.bet_to_call;
+        } else {
+            self.commit_chips(actor, chips, action);
         }
+        self.advance_after_action(actor);
+    }
 
-        self.acted_this_street[actor] = true;
-        self.street_level_acted[actor] = self.bet_to_call;
-
+    /// After `actor`'s action: a fold-out ends the hand; otherwise the next
+    /// seat with a decision acts, or the betting round closes. The one tail of
+    /// [`Self::apply`] and [`Self::apply_raise_chips`] (ENG-014).
+    fn advance_after_action(&mut self, actor: usize) {
         // Fold-out: single non-folded seat wins.
         if self.alive_count() == 1 {
             if self.study_mode {
@@ -993,7 +970,6 @@ impl GameState {
             self.finalize_terminal();
             return;
         }
-
         // Find next voluntary actor. If none, close the round.
         match self.find_next_actor(actor) {
             Some(next) => self.actor = Some(next),
@@ -1063,15 +1039,16 @@ impl GameState {
     /// hands in this rollout; resampling them would skew the estimate).
     ///
     /// Delegates to [`Self::payouts`] when sampling would be a no-op:
-    /// study mode, fold-out (card-agnostic), river-close, or
-    /// `num_samples == 0`.
+    /// study mode, fold-out (card-agnostic), river-close, `num_samples == 0`,
+    /// and PLO67 (its undealt burns change the HANDS, so the actual deal is
+    /// the answer — see `payouts` / `plo67_runout_equities`).
     ///
     /// Sum is zero-sum up to integer-division rounding (at most `num_seats`
     /// chips of rounding slack).
     pub fn payouts_ev(&self, num_samples: u32, seed: u64) -> Vec<i64> {
         use rand::Rng;
-        use rand_chacha::ChaCha8Rng;
         use rand_chacha::rand_core::SeedableRng;
+        use rand_chacha::ChaCha8Rng;
         let n = self.config.num_seats;
         // PLO67: the undealt burns decide how many cards each hand holds, so
         // resampling only the boards would score hands that were never dealt.
@@ -1092,32 +1069,22 @@ impl GameState {
         let draw_per_sample = missing * num_boards;
 
         // Unseen deck: 52 − all hole cards − known prefix of the board(s).
-        let mut used = [false; 52];
-        for hole in &self.hole_cards {
-            for c in hole.iter() {
-                used[c.index() as usize] = true;
-            }
-        }
-        for c in &self.full_board_a[..close_len] {
-            used[c.index() as usize] = true;
+        let mut used = CardMask::of(self.hole_cards.iter().flatten());
+        for &c in &self.full_board_a[..close_len] {
+            used.add(c);
         }
         if num_boards == 2 {
-            for c in &self.full_board_b[..close_len] {
-                used[c.index() as usize] = true;
+            for &c in &self.full_board_b[..close_len] {
+                used.add(c);
             }
         }
-        let mut deck: Vec<Card> = (0..52u8)
-            .filter(|&i| !used[i as usize])
-            .map(Card::from_index)
-            .collect();
+        let mut deck: Vec<Card> = used.unseen().collect();
         let deck_size = deck.len();
 
-        let mut full_a = [Card(0); 5];
-        let mut full_b = [Card(0); 5];
-        for i in 0..close_len {
-            full_a[i] = self.full_board_a[i];
-            full_b[i] = self.full_board_b[i];
-        }
+        let mut full_a = [NO_CARD; 5];
+        let mut full_b = [NO_CARD; 5];
+        full_a[..close_len].copy_from_slice(&self.full_board_a[..close_len]);
+        full_b[..close_len].copy_from_slice(&self.full_board_b[..close_len]);
 
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let mut totals: Vec<i128> = vec![0i128; n];
@@ -1125,13 +1092,19 @@ impl GameState {
         // it once, and reuse one output buffer (double-board variants). So
         // are each hand's encoded hole pairs and its score on the board
         // cards already out: the ranker holds both (identical ranks).
-        let layers = (num_boards == 2).then(|| PotLayers::new(&self.folded, &self.total_commit));
+        let layers = PotLayers::new(&self.folded, &self.total_commit);
         // Next-card tables once the samples deal at least a deck's worth of
         // cards (they cost one evaluation pass per deck card; same ranks).
         let tables = (num_samples as usize) * missing >= deck_size;
         let ranker = (num_boards == 2).then(|| {
             RunoutRanker::new(
-                &self.hole_cards, &self.folded, &full_a, &full_b, close_len, &deck, tables,
+                &self.hole_cards,
+                &self.folded,
+                &full_a,
+                &full_b,
+                close_len,
+                &deck,
+                tables,
             )
         });
         let mut won_buf = vec![0u64; n];
@@ -1142,15 +1115,11 @@ impl GameState {
                 let j = rng.gen_range(i..deck_size);
                 deck.swap(i, j);
             }
-            for i in 0..missing {
-                full_a[close_len + i] = deck[i];
-            }
-            if let (Some(layers), Some(ranker)) = (layers.as_ref(), ranker.as_ref()) {
-                for i in 0..missing {
-                    full_b[close_len + i] = deck[missing + i];
-                }
+            full_a[close_len..close_len + missing].copy_from_slice(&deck[..missing]);
+            if let Some(ranker) = ranker.as_ref() {
+                full_b[close_len..close_len + missing].copy_from_slice(&deck[missing..2 * missing]);
                 double_board_payout_runout(
-                    layers,
+                    &layers,
                     ranker,
                     &self.hole_cards,
                     &self.folded,
@@ -1161,12 +1130,14 @@ impl GameState {
                     &mut won_buf,
                 );
             } else {
-                won_buf = single_board_payout(
+                single_board_payout_layers(
+                    &layers,
                     &self.hole_cards,
                     &self.folded,
                     &self.total_commit,
                     &full_a,
                     self.button,
+                    &mut won_buf,
                 );
             }
             for i in 0..n {
@@ -1275,8 +1246,7 @@ impl GameState {
         let facing_bet = self.bet_to_call > self.street_commit[actor];
         facing_bet
             && self.acted_this_street[actor]
-            && self.bet_to_call
-                < self.street_level_acted[actor] + self.last_raise_size
+            && self.bet_to_call < self.street_level_acted[actor] + self.last_raise_size
     }
 
     /// Smallest chip delta the current actor can add to make a legal
@@ -1389,24 +1359,16 @@ impl GameState {
         } else {
             chips
         };
-        self.commit_chips_as_raise(actor, chips, Action::BetPct100);
-
-        // Round-close + next-actor logic identical to `apply`.
-        if self.alive_count() == 1 {
-            if self.study_mode {
-                self.study_terminal = Some(StudyTerminal::FoldOut);
-            }
-            self.finalize_terminal();
-            return Ok(());
-        }
-        match self.find_next_actor(actor) {
-            Some(next) => self.actor = Some(next),
-            None => self.close_round_or_run_out(),
-        }
+        self.commit_chips(actor, chips, Action::BetPct100);
+        self.advance_after_action(actor);
         Ok(())
     }
 
-    fn commit_chips_as_raise(&mut self, actor: usize, chips: u64, label: Action) {
+    /// `actor` puts `chips` in -- a call, a bet, a raise or an all-in, whatever
+    /// the amount makes it (the history records it as `label`): stacks, pot and
+    /// commits, the bet to call, the raise floor and the last aggressor, the
+    /// all-in flag, and the seat's acted-this-street marks.
+    fn commit_chips(&mut self, actor: usize, chips: u64, label: Action) {
         self.stacks[actor] -= chips;
         self.pot += chips;
         self.street_commit[actor] += chips;
@@ -1418,9 +1380,13 @@ impl GameState {
             let prev_raise_size = self.last_raise_size;
             self.bet_to_call = new_commit;
             if raise_delta >= prev_raise_size {
+                // Full raise (or opening bet >= 1bb): reopens action.
                 self.last_raise_size = raise_delta;
                 self.last_aggression_was_full_raise = true;
             } else {
+                // Short shove below the min-raise floor: bet_to_call
+                // advances but the floor is preserved and already-acted
+                // seats cannot re-raise.
                 self.last_aggression_was_full_raise = false;
             }
             self.last_aggressor = Some(actor);
@@ -1438,523 +1404,15 @@ impl GameState {
         self.street_level_acted[actor] = self.bet_to_call;
     }
 
-    /// Hand category index (0..=8 per `CAT_*` constants) of seat's current
-    /// best hand on `board` (0=A, 1=B) under the variant's evaluation
-    /// rule. Returns 0 if board has <3 cards (always for board B on
-    /// single-board variants — its progressive view stays empty).
-    pub fn hero_category(&self, seat: usize, board: u8) -> u8 {
-        let b = if board == 0 { &self.board_a } else { &self.board_b };
-        if b.len() < 3 {
-            return 0;
-        }
-        let hole = &self.hole_cards[seat];
-        let rank = match self.config.variant {
-            Variant::Plo4DoubleBomb
-            | Variant::Plo5DoubleBomb
-            | Variant::Plo6DoubleBomb
-            | Variant::Plo67DoubleBomb => crate::hand_eval::evaluate_plo5_partial(hole, b),
-            Variant::NlhSingle => crate::hand_eval::evaluate_nlh(hole, b),
-        };
-        (rank >> 20) as u8
-    }
-
-    /// v7 obs batch-2 hero/board engine dims for the CURRENT actor
-    /// (V7_OBS_CANDIDATES.md BRD-7 / BRD-12 / DUAL-2):
-    /// `[boat_a, boat_b, improve_a, improve_b, combos_a, combos_b,
-    ///   mask_a, mask_b]` — boat-or-better outs, strict-category-improve
-    /// outs, best-category combo counts (all raw counts; the encoders
-    /// normalize), and the best-holding 5-bit hole masks (bit i = i-th
-    /// hole card sorted by card index DESCENDING). The unseen deck for
-    /// the out counts is GLOBAL (hole + BOTH boards), matching the
-    /// encoder's cross-board visibility convention. All-zero when there
-    /// is no actor, for NLH (any-combo eval — these are PLO semantics),
-    /// or before both boards have flops.
-    pub fn hero_board_v3(&self) -> [u8; 8] {
-        let mut out = [0u8; 8];
-        if self.config.variant == Variant::NlhSingle {
-            return out;
-        }
-        let hero = match self.actor {
-            Some(s) => s,
-            None => return out,
-        };
-        if self.board_a.len() < 3 || self.board_b.len() < 3 {
-            return out;
-        }
-        let hole = &self.hole_cards[hero];
-        let mut used = [false; 52];
-        for c in hole
-            .iter()
-            .chain(self.board_a.iter())
-            .chain(self.board_b.iter())
-        {
-            used[c.index() as usize] = true;
-        }
-        // Fused per-board: one pair_best_cks + one unseen scan each
-        // (byte-identical to the three free fns called separately).
-        let (ba, ia, ca, ma) =
-            crate::hand_eval::hero_board_one(hole, &self.board_a, &used);
-        let (bb, ib, cb, mb) =
-            crate::hand_eval::hero_board_one(hole, &self.board_b, &used);
-        out[0] = ba;
-        out[1] = bb;
-        out[2] = ia;
-        out[3] = ib;
-        out[4] = ca;
-        out[5] = cb;
-        out[6] = ma;
-        out[7] = mb;
-        out
-    }
-
-    /// v7 BRD-5/BRD-6/DUAL-5 hot block:
-    /// [ds_a, ds_b, u_a, n_a, u_b, n_b, scoop] raw counts; encoder
-    /// normalizes. All-zero for NLH / no-actor / short boards.
-    pub fn board_draw_v3(&self) -> [u8; 7] {
-        let zero = [0u8; 7];
-        if self.config.variant == Variant::NlhSingle {
-            return zero;
-        }
-        let hero = match self.actor {
-            Some(s) => s,
-            None => return zero,
-        };
-        if self.board_a.len() < 3 || self.board_b.len() < 3 {
-            return zero;
-        }
-        let hole = &self.hole_cards[hero];
-        let mut used = [false; 52];
-        for c in hole
-            .iter()
-            .chain(self.board_a.iter())
-            .chain(self.board_b.iter())
-        {
-            used[c.index() as usize] = true;
-        }
-        crate::hand_eval::board_draw_v3(hole, &self.board_a, &self.board_b, &used)
-    }
-
-    /// Fraction of unseen-deck k-card opponent hands that produce each of
-    /// 4 outcomes vs the hero (current actor) on both boards, for
-    /// k ∈ {2, 3, 4}. Returns a length-12 `Vec<f32>` in row-major
-    /// `[k][outcome]` order:
-    /// - Outcome 0: opp scoops (opp wins both boards).
-    /// - Outcome 1: opp quarters hero (opp wins one, ties the other).
-    /// - Outcome 2: hero scoops (hero wins both).
-    /// - Outcome 3: hero quarters opp (hero wins one, ties the other).
-    ///
-    /// Chops, splits, and double-ties are intentionally excluded; the
-    /// network can infer them as residuals.
-    ///
-    /// Evaluation rule (current-rank dominance): each k-card opp hand is
-    /// evaluated on the *visible* board under PLO5 rules (exactly 2 from
-    /// k + 3 from board). No runout sampling on flop/turn.
-    ///
-    /// Sampling: k=2 is exhaustive; k=3 and k=4 use `mc_samples` MC
-    /// draws each. PRNG seeded deterministically from the immutable
-    /// observation state so the feature is reproducible (parity tests
-    /// survive at a fixed sample count).
-    ///
-    /// Returns all-zero before the flop or when the hand is terminal.
-    ///
-    /// Serial / UI / eval callers use the 1024-sample
-    /// `opp_outcome_fractions` wrapper; batched training passes a
-    /// smaller `mc_samples` (e.g. 256) — this feature is ~94% of the
-    /// per-decision encode cost, so halving the MC budget roughly
-    /// doubles obs-build throughput at a benign ~1-3% extra noise.
-    pub fn opp_outcome_fractions_mc(&self, mc_samples: usize) -> Vec<f32> {
-        self.outcome_features_mc(mc_samples)[..12].to_vec()
-    }
-
-    /// Deterministic key for the opp-outcome MC — a hash of exactly the inputs
-    /// the MC depends on (street, hero hole, both boards — each as a card
-    /// SET; see [`outcome_mc_seed`]). Returns `None` in precisely the cases
-    /// `outcome_features_mc` returns all-zeros (no actor, or fewer than 3
-    /// board cards on either board). Used as the per-env cache key in the
-    /// batched pack: equal key => the MC would produce the identical output,
-    /// so the cached value can be reused.
-    ///
-    /// Shares [`outcome_mc_seed`] with the seed inside `outcome_features_mc`
-    /// below, so the two stay in lockstep by construction.
-    pub fn outcome_seed(&self) -> Option<u64> {
-        let hero_seat = self.actor?;
-        if self.board_a.len() < 3 || self.board_b.len() < 3 {
-            return None;
-        }
-        Some(outcome_mc_seed(
-            self.street,
-            &self.hole_cards[hero_seat],
-            &self.board_a,
-            &self.board_b,
-        ))
-    }
-
-    /// Superset of [`Self::opp_outcome_fractions_mc`]: the 12 joint
-    /// outcome fractions PLUS an 8-dim PER-BOARD decomposition (obs v2,
-    /// V5_DESIGN.md P1), all from the SAME single pass — the extra dims
-    /// are counter increments inside the existing k=2 exhaustive loop
-    /// (no extra evals, no extra RNG draws, so dims 0..12 stay
-    /// bit-identical to the pre-v5 feature).
-    ///
-    /// Dims 12..20, hero-centric, k=2 EXHAUSTIVE universe only (exact,
-    /// deterministic):
-    /// - 12/13/14: board A — fraction of combos hero currently beats /
-    ///   ties / is behind (sums to 1 when active).
-    /// - 15/16/17: board B — same.
-    /// - 18: win-exactly-one (hero ahead on one board, behind on the
-    ///   other, either direction) — the modal double-board outcome the
-    ///   12-dim block folds into its residual.
-    /// - 19: tie on BOTH boards.
-    pub fn outcome_features_mc(&self, mc_samples: usize) -> Vec<f32> {
-        self.outcome_features_mc_shared(mc_samples, None)
-    }
-
-    /// The pair-rank table `outcome_features_mc`'s k=2 exhaustive pass reads,
-    /// for EVERY 2-card holding of cards on neither board (2026-09-26): it
-    /// depends only on the two boards, so one table serves every seat that
-    /// acts on this street -- the batched packer keeps one per env and the
-    /// k=2 pass becomes lookups (the evaluations were most of the MC's cost,
-    /// and they were repeated for each acting seat). `None` before both
-    /// boards have a flop (the MC returns zeros there anyway).
-    pub fn board_pair_table(&self) -> Option<BoardPairTable> {
-        if self.board_a.len() < 3 || self.board_b.len() < 3 {
-            return None;
-        }
-        let mut on_board = [false; 52];
-        for c in self.board_a.iter().chain(self.board_b.iter()) {
-            on_board[c.index() as usize] = true;
-        }
-        let mut t = BoardPairTable {
-            key: BoardPairTable::key_of(&self.board_a, &self.board_b),
-            ranks_a: vec![0u32; 52 * 52],
-            ranks_b: vec![0u32; 52 * 52],
-        };
-        let mut pair = [Card::from_index(0); 2];
-        for c0 in 0..52u8 {
-            if on_board[c0 as usize] {
-                continue;
-            }
-            for c1 in (c0 + 1)..52u8 {
-                if on_board[c1 as usize] {
-                    continue;
-                }
-                pair[0] = Card::from_index(c0);
-                pair[1] = Card::from_index(c1);
-                let k = c0 as usize * 52 + c1 as usize;
-                t.ranks_a[k] = crate::hand_eval::evaluate_plo5_k_partial(&pair, &self.board_a);
-                t.ranks_b[k] = crate::hand_eval::evaluate_plo5_k_partial(&pair, &self.board_b);
-            }
-        }
-        Some(t)
-    }
-
-    /// `outcome_features_mc` with the k=2 pass's pair ranks read from `shared`
-    /// (a `board_pair_table()` of THESE boards) instead of evaluated: the same
-    /// ranks, so the same output bit for bit (pinned by
-    /// `shared_pair_table_matches_outcome_features_mc`). A table of other
-    /// boards is ignored (falls back to evaluating).
-    pub fn outcome_features_mc_shared(
-        &self,
-        mc_samples: usize,
-        shared: Option<&BoardPairTable>,
-    ) -> Vec<f32> {
-        let shared = shared.filter(|t| t.key == BoardPairTable::key_of(&self.board_a, &self.board_b));
-        // N_OUT 20 → 22 (2026-07-12, DUAL-4): dims 20/21 append the k=2
-        // guaranteed-pot-share bounds g_min/g_max. Dims 0..20 stay
-        // byte-identical to the pre-append body — the P1 pin test compares
-        // them against the frozen reference; the share trackers add no
-        // evals, no RNG draws, and no reordering.
-        const N_OUT: usize = 22;
-        // mc_samples == 0: caller does not need outcome features (e.g.
-        // obs_mode=minimal). Skip all evals / deck work and return zeros.
-        if mc_samples == 0 {
-            return vec![0.0; N_OUT];
-        }
-        const SCOOP_OPP: usize = 0;
-        const QUARTER_OPP: usize = 1;
-        const SCOOP_HERO: usize = 2;
-        const QUARTER_HERO: usize = 3;
-        const PER_BOARD_OFF: usize = 12;
-        const SHARE_OFF: usize = 20;
-
-        let hero_seat = match self.actor {
-            Some(s) => s,
-            None => return vec![0.0; N_OUT],
-        };
-        if self.board_a.len() < 3 || self.board_b.len() < 3 {
-            return vec![0.0; N_OUT];
-        }
-
-        let hero_hole = &self.hole_cards[hero_seat];
-        let hero_a = crate::hand_eval::evaluate_plo5_partial(hero_hole, &self.board_a);
-        let hero_b = crate::hand_eval::evaluate_plo5_partial(hero_hole, &self.board_b);
-
-        // Build unseen deck (52 minus hero hole minus visible board on
-        // both boards).
-        let mut used = [false; 52];
-        for c in hero_hole.iter() {
-            used[c.index() as usize] = true;
-        }
-        for c in self.board_a.iter().chain(self.board_b.iter()) {
-            used[c.index() as usize] = true;
-        }
-        let unseen: Vec<Card> = (0..52u8)
-            .filter(|&i| !used[i as usize])
-            .map(Card::from_index)
-            .collect();
-        let n_unseen = unseen.len();
-
-        // Deterministic seed from the observation-visible state (the same
-        // derivation `outcome_seed` exposes as the batched cache key).
-        let seed = outcome_mc_seed(self.street, hero_hole, &self.board_a, &self.board_b);
-
-        use rand_chacha::ChaCha8Rng;
-        use rand_chacha::rand_core::{RngCore, SeedableRng};
-        let mut rng = ChaCha8Rng::seed_from_u64(seed);
-
-        let mut out = vec![0.0f32; N_OUT];
-        let mut opp_buf: Vec<Card> = Vec::with_capacity(4);
-
-        // Per-holding board comparisons; +1 = opp ahead, 0 = tie, -1 = opp
-        // behind (higher HandRank = stronger). Joint/per-board tallying
-        // happens at the call sites.
-        let cmp_ranks = |opp_a: u32, opp_b: u32| -> (i8, i8) {
-            let cmp_a: i8 = if opp_a > hero_a {
-                1
-            } else if opp_a < hero_a {
-                -1
-            } else {
-                0
-            };
-            let cmp_b: i8 = if opp_b > hero_b {
-                1
-            } else if opp_b < hero_b {
-                -1
-            } else {
-                0
-            };
-            (cmp_a, cmp_b)
-        };
-        let tally_joint = |counters: &mut [u32; 4], cmp_a: i8, cmp_b: i8| {
-            match (cmp_a, cmp_b) {
-                (1, 1) => counters[SCOOP_OPP] += 1,
-                (-1, -1) => counters[SCOOP_HERO] += 1,
-                (1, 0) | (0, 1) => counters[QUARTER_OPP] += 1,
-                (-1, 0) | (0, -1) => counters[QUARTER_HERO] += 1,
-                _ => {}
-            }
-        };
-
-        // P1: per-board pair-rank scratch tables, filled by the k=2 exhaustive
-        // pass and reused by the k=3/4 MC arms. A PLO holding must use EXACTLY
-        // 2 hole cards, so a k-card holding's rank factorizes as max over its
-        // C(k,2) pairs of that pair's rank — and every MC-drawable pair is
-        // enumerated by the k=2 pass (same unseen deck), so the MC arms become
-        // table lookups instead of full evaluate_plo5_k_partial calls (~81-84%
-        // of this block's hand-eval work at 384 samples). Degenerate pairs
-        // (duplicate-card states; every combo ck==0-filtered) store
-        // ck_to_hand_rank(7462) == 0 == the u32 order bottom, exactly
-        // mirroring the k-level per-combo skip — the identity holds for every
-        // state, duplicates included. Indexed by unseen-deck POSITIONS
-        // (lo*STRIDE + hi, lo<hi); stride 52 covers every variant and
-        // duplicate-card state (PLO4 flop = 42 unseen; duplicated hole/board
-        // cards push n_unseen higher still). No engine path produces
-        // duplicates any more — study mode redraws colliding placeholders
-        // (review 2026-09-20 C8) — but the function stays total over them.
-        // Byte-identity vs the frozen pre-P1 body is pinned by
-        // outcome_mc_p1_tests.
-        const PAIR_STRIDE: usize = 52;
-        debug_assert!(n_unseen <= PAIR_STRIDE);
-        let mut tab_a = [0u32; PAIR_STRIDE * PAIR_STRIDE];
-        let mut tab_b = [0u32; PAIR_STRIDE * PAIR_STRIDE];
-
-        for (idx_k, &k) in [2usize, 3, 4].iter().enumerate() {
-            let mut counters = [0u32; 4];
-            let mut samples: u32 = 0;
-
-            // k=2 exhaustive (C(<=41, 2) <= 820 is cheap); k=3,4 always
-            // MC (`mc_samples` draws each). Previously k=3 was exhaustive
-            // at turn+river (C(39,3) and C(37,3) both <= 10k), but that's
-            // ~18k evals/env vs ~2*mc_samples for MC — dominated bundle cost.
-            if k == 2 {
-                // Per-board counters (obs v2 P1): [ahead, tie, behind] per
-                // board from HERO's perspective + win-exactly-one + tie-both.
-                let mut pb = [0u32; 8];
-                // DUAL-4: hero's per-combo pot share s = 0.5·[wins A] +
-                // 0.25·[ties A] + 0.5·[wins B] + 0.25·[ties B]; track the
-                // min/max over the exhaustive k=2 universe. Values land
-                // exactly on {0, .25, .5, .75, 1}. Free riders on the
-                // existing loop — no extra evals, no RNG.
-                let mut g_min = f32::MAX;
-                let mut g_max = f32::MIN;
-                let mut idx: Vec<usize> = (0..k).collect();
-                loop {
-                    opp_buf.clear();
-                    for &i in idx.iter() {
-                        opp_buf.push(unseen[i]);
-                    }
-                    let (opp_a, opp_b) = match shared {
-                        Some(t) => {
-                            // idx[0] < idx[1] and `unseen` ascends, so the
-                            // card indices are ordered too.
-                            let k = opp_buf[0].index() as usize * 52 + opp_buf[1].index() as usize;
-                            (t.ranks_a[k], t.ranks_b[k])
-                        }
-                        None => (
-                            crate::hand_eval::evaluate_plo5_k_partial(&opp_buf, &self.board_a),
-                            crate::hand_eval::evaluate_plo5_k_partial(&opp_buf, &self.board_b),
-                        ),
-                    };
-                    // P1: record this pair's per-board ranks for the k=3/4
-                    // MC arms (idx[0] < idx[1] by the combination enumerator).
-                    tab_a[idx[0] * PAIR_STRIDE + idx[1]] = opp_a;
-                    tab_b[idx[0] * PAIR_STRIDE + idx[1]] = opp_b;
-                    let (cmp_a, cmp_b) = cmp_ranks(opp_a, opp_b);
-                    tally_joint(&mut counters, cmp_a, cmp_b);
-                    match cmp_a {
-                        -1 => pb[0] += 1, // hero ahead on A
-                        0 => pb[1] += 1,
-                        _ => pb[2] += 1,
-                    }
-                    match cmp_b {
-                        -1 => pb[3] += 1, // hero ahead on B
-                        0 => pb[4] += 1,
-                        _ => pb[5] += 1,
-                    }
-                    if (cmp_a == -1 && cmp_b == 1) || (cmp_a == 1 && cmp_b == -1) {
-                        pb[6] += 1; // win exactly one
-                    }
-                    if cmp_a == 0 && cmp_b == 0 {
-                        pb[7] += 1; // tie both
-                    }
-                    let share = 0.5 * ((cmp_a == -1) as u32 as f32)
-                        + 0.25 * ((cmp_a == 0) as u32 as f32)
-                        + 0.5 * ((cmp_b == -1) as u32 as f32)
-                        + 0.25 * ((cmp_b == 0) as u32 as f32);
-                    if share < g_min {
-                        g_min = share;
-                    }
-                    if share > g_max {
-                        g_max = share;
-                    }
-                    samples += 1;
-                    let mut pos = k;
-                    let advanced = loop {
-                        if pos == 0 {
-                            break false;
-                        }
-                        pos -= 1;
-                        if idx[pos] < n_unseen - (k - pos) {
-                            idx[pos] += 1;
-                            for j in (pos + 1)..k {
-                                idx[j] = idx[j - 1] + 1;
-                            }
-                            break true;
-                        }
-                    };
-                    if !advanced {
-                        break;
-                    }
-                }
-                if samples > 0 {
-                    let inv = 1.0f32 / samples as f32;
-                    for j in 0..8 {
-                        out[PER_BOARD_OFF + j] = pb[j] as f32 * inv;
-                    }
-                    out[SHARE_OFF] = g_min;
-                    out[SHARE_OFF + 1] = g_max;
-                }
-            } else {
-                debug_assert!(n_unseen <= 64);
-                let mut pos = [0usize; 4];
-                for _ in 0..mc_samples {
-                    let mut mask: u64 = 0;
-                    let mut written = 0;
-                    while written < k {
-                        let i = (rng.next_u32() as usize) % n_unseen;
-                        let bit = 1u64 << i;
-                        if mask & bit == 0 {
-                            mask |= bit;
-                            // P1: record the drawn POSITION. The draw loop
-                            // itself (RNG call count, modulo, rejection mask)
-                            // is untouched — the sample stream stays
-                            // byte-identical to the pre-P1 body.
-                            pos[written] = i;
-                            written += 1;
-                        }
-                    }
-                    // P1: holding rank = max over its C(k,2) pairs of the
-                    // stored pair ranks (exactly-2-of-k factorization; see
-                    // the table comment above). Drawn positions are unordered
-                    // while the table is filled for lo < hi only.
-                    let mut opp_a = 0u32;
-                    let mut opp_b = 0u32;
-                    for p0 in 0..k {
-                        for p1 in (p0 + 1)..k {
-                            let (lo, hi) = if pos[p0] < pos[p1] {
-                                (pos[p0], pos[p1])
-                            } else {
-                                (pos[p1], pos[p0])
-                            };
-                            let ra = tab_a[lo * PAIR_STRIDE + hi];
-                            if ra > opp_a {
-                                opp_a = ra;
-                            }
-                            let rb = tab_b[lo * PAIR_STRIDE + hi];
-                            if rb > opp_b {
-                                opp_b = rb;
-                            }
-                        }
-                    }
-                    let (cmp_a, cmp_b) = cmp_ranks(opp_a, opp_b);
-                    tally_joint(&mut counters, cmp_a, cmp_b);
-                    samples += 1;
-                }
-            }
-
-            if samples > 0 {
-                let inv = 1.0f32 / samples as f32;
-                let base = idx_k * 4;
-                out[base + SCOOP_OPP] = counters[SCOOP_OPP] as f32 * inv;
-                out[base + QUARTER_OPP] = counters[QUARTER_OPP] as f32 * inv;
-                out[base + SCOOP_HERO] = counters[SCOOP_HERO] as f32 * inv;
-                out[base + QUARTER_HERO] = counters[QUARTER_HERO] as f32 * inv;
-            }
-        }
-        out
-    }
-
-    /// 1024-sample MC convenience wrapper (serial / UI / eval path).
-    /// See [`Self::opp_outcome_fractions_mc`].
-    pub fn opp_outcome_fractions(&self) -> Vec<f32> {
-        self.opp_outcome_fractions_mc(1024)
-    }
-
-    /// NLH single-board opponent-outcome fractions: the share of
-    /// unseen-deck 2-card opponent combos currently AHEAD of / TIED with
-    /// / BEHIND the hero (current actor) at the visible board, evaluated
-    /// exhaustively (≤ C(47, 2) = 1081 combos) under the any-combo NLH
-    /// rule. Current-rank dominance, no runout sampling — the same
-    /// convention as the PLO opp-outcome feature. Exhaustive enumeration
-    /// makes it exactly reproducible with no seed.
-    ///
-    /// Returns `[opp_ahead, tied, opp_behind]`. All-zero preflop, on
-    /// terminal states, and for non-NLH variants.
-    pub fn nlh_opp_outcome_fractions(&self) -> Vec<f32> {
-        const N_OUT: usize = 3;
-        if self.config.variant != Variant::NlhSingle {
-            return vec![0.0; N_OUT];
-        }
-        let hero_seat = match self.actor {
-            Some(s) => s,
-            None => return vec![0.0; N_OUT],
-        };
-        nlh_opp_outcome_for(&self.hole_cards[hero_seat], &self.board_a).to_vec()
-    }
-
     // ---- Internal helpers ----
 
     fn compute_sizing_chips(&self, action: Action, actor: usize) -> u64 {
+        self.sizing_chips(action, actor, self.min_bet_total(), self.max_bet_total())
+    }
+
+    /// [`Self::compute_sizing_chips`] with the wager bounds already worked
+    /// out (the legal mask sizes five actions against the same bounds).
+    fn sizing_chips(&self, action: Action, actor: usize, min_total: u64, max_total: u64) -> u64 {
         let current_commit = self.street_commit[actor];
         let stack = self.stacks[actor];
         let (num, den) = match action.pot_fraction() {
@@ -1974,8 +1432,6 @@ impl GameState {
         } else {
             self.bet_to_call + raise_over
         };
-        let min_total = self.min_bet_total();
-        let max_total = self.max_bet_total();
         let clamped = target_total.max(min_total).min(max_total);
         let chips_want = clamped.saturating_sub(current_commit);
         chips_want.min(stack)
@@ -2137,7 +1593,9 @@ impl GameState {
             self.acted_this_street.fill(false);
 
             // Does a new round start? Need >=2 non-folded non-all-in seats.
-            let can_act = (0..n).filter(|&i| !self.folded[i] && !self.all_in[i]).count();
+            let can_act = (0..n)
+                .filter(|&i| !self.folded[i] && !self.all_in[i])
+                .count();
             if can_act >= 2 {
                 self.actor = self.first_to_act_postflop();
                 return;
@@ -2242,14 +1700,19 @@ impl GameState {
             Street::Turn => 2,
             Street::River | Street::Showdown => 3,
         };
-        let red = self.burns.iter().take(upto).filter(|&&c| Variant::burn_is_red(c)).count();
+        let red = self
+            .burns
+            .iter()
+            .take(upto)
+            .filter(|&&c| Variant::burn_is_red(c))
+            .count();
         let received = self.hole_cards[seat].len().saturating_sub(hc);
         hc + red.min(received)
     }
 
     fn finalize_terminal(&mut self) {
         // In production, reveal the full pre-dealt boards for observability.
-        // In study mode, turn/river may be undealt (`Card(0)` sentinels) so
+        // In study mode, turn/river may be undealt (`NO_CARD`) so
         // leave the progressive view intact — payouts for FoldOut are
         // card-agnostic (uncontested pot) and RunOut/Showdown return zeros.
         if !self.study_mode {
@@ -2282,8 +1745,8 @@ pub fn plo67_runout_equities(
     seed: u64,
 ) -> Result<Vec<[f64; 2]>, String> {
     use rand::Rng;
-    use rand_chacha::ChaCha8Rng;
     use rand_chacha::rand_core::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
 
     let n = holes.len();
     if n == 0 {
@@ -2292,26 +1755,42 @@ pub fn plo67_runout_equities(
     if board_a.len() != board_b.len() || !(3..=5).contains(&board_a.len()) {
         return Err("both boards need the same 3..=5 cards".into());
     }
-    let mut used = [false; 52];
-    for c in holes.iter().flatten().chain(board_a).chain(board_b).chain(dead) {
-        let i = c.index() as usize;
-        if i >= 52 || used[i] {
-            return Err(format!("card {i} is out of range or appears twice"));
+    let mut used = CardMask::EMPTY;
+    for &c in holes
+        .iter()
+        .flatten()
+        .chain(board_a)
+        .chain(board_b)
+        .chain(dead)
+    {
+        if !used.insert(c) {
+            return Err(format!(
+                "card {} is out of range or appears twice",
+                c.index()
+            ));
         }
-        used[i] = true;
     }
-    if holes.iter().any(|h| !(4..=crate::hand_eval::MAX_PLO_HOLE).contains(&h.len())) {
+    if holes
+        .iter()
+        .any(|h| !(4..=crate::hand_eval::MAX_PLO_HOLE).contains(&h.len()))
+    {
         return Err("every hand holds 4..=7 cards".into());
     }
     let missing = 5 - board_a.len();
-    let mut stub: Vec<Card> = (0..52u8).filter(|&i| !used[i as usize]).map(Card::from_index).collect();
+    let mut stub: Vec<Card> = used.unseen().collect();
     // the most a runout can take: per street a burn, one card per hand, two board cards
     let need = missing * (3 + n);
     if need > stub.len() {
-        return Err(format!("{} unseen cards cannot run out {missing} streets for {n} hands", stub.len()));
+        return Err(format!(
+            "{} unseen cards cannot run out {missing} streets for {n} hands",
+            stub.len()
+        ));
     }
     let score = |h: &[Card], a: &[Card; 5], b: &[Card; 5]| {
-        [crate::hand_eval::evaluate_plo5(h, a), crate::hand_eval::evaluate_plo5(h, b)]
+        [
+            crate::hand_eval::evaluate_plo(h, a),
+            crate::hand_eval::evaluate_plo(h, b),
+        ]
     };
     // one runout's result: each board's best hand(s) take a share of 1
     fn add_shares(acc: &mut [[f64; 2]], ranks: &[[u32; 2]]) {
@@ -2326,8 +1805,8 @@ pub fn plo67_runout_equities(
         }
     }
     let mut acc = vec![[0f64; 2]; n];
-    let mut full_a = [Card(0); 5];
-    let mut full_b = [Card(0); 5];
+    let mut full_a = [NO_CARD; 5];
+    let mut full_b = [NO_CARD; 5];
     full_a[..board_a.len()].copy_from_slice(board_a);
     full_b[..board_b.len()].copy_from_slice(board_b);
     let mut ranks: Vec<[u32; 2]> = vec![[0, 0]; n];
@@ -2384,57 +1863,41 @@ pub fn plo67_runout_equities(
 /// bump could silently change every seeded draw. Pinned by
 /// `b4_seed_mixer_known_answers`; do not "upgrade" it without versioning
 /// the observation. (review 2026-09-20 B4)
-struct SeedMixer(u64);
+pub(crate) struct SeedMixer(u64);
 
 impl SeedMixer {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         SeedMixer(0xCBF2_9CE4_8422_2325) // FNV-1a 64-bit offset basis
     }
 
-    fn write_u8(&mut self, byte: u8) {
+    pub(crate) fn write_u8(&mut self, byte: u8) {
         self.0 = (self.0 ^ byte as u64).wrapping_mul(0x0000_0100_0000_01B3); // FNV prime
     }
 
     /// Write `cards` as a SET: length byte, then the indices in the
     /// project's canonical multiset order (card index descending), so the
     /// hash cannot see deal / entry order.
-    fn write_card_set(&mut self, cards: &[Card]) {
-        let mut idx: Vec<u8> = cards.iter().map(|c| c.index()).collect();
+    pub(crate) fn write_card_set(&mut self, cards: &[Card]) {
+        // A stack buffer (PERF-030): this runs for every row's MC seed / cache
+        // key. Hole cards (<= 7) and boards (<= 5) always fit.
+        let mut buf = [0u8; 16];
+        let idx = &mut buf[..cards.len()];
+        for (x, c) in idx.iter_mut().zip(cards) {
+            *x = c.index();
+        }
         idx.sort_unstable_by(|a, b| b.cmp(a));
         self.write_u8(idx.len() as u8);
-        for i in idx {
+        for &i in idx.iter() {
             self.write_u8(i);
         }
     }
 
-    fn finish(self) -> u64 {
+    pub(crate) fn finish(self) -> u64 {
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^ (z >> 31)
     }
-}
-
-/// Seed of the opp-outcome MC (`GameState::outcome_features_mc`) and its
-/// batched cache key (`GameState::outcome_seed`): street + hero hole +
-/// visible board A + visible board B, each hashed as a card SET.
-///
-/// PRODUCTION BEHAVIOR CHANGE (review 2026-09-20 B4): the seed used to be
-/// `DefaultHasher` over (hero SEAT, street, hole in DEAL order, boards in
-/// DEAL order), so the k=3/k=4 MC dims (obs 982-989) moved with the
-/// absolute seat, with card order (user entry order in study mode), and
-/// potentially with the Rust toolchain — against the encoder's
-/// canonical-ordering and hero-relative rules. The evaluation itself only
-/// ever depended on the sets; now the draws do too. Same distribution,
-/// different bits for a given state: every checkpoint sees fresh MC noise
-/// on those 8 dims.
-fn outcome_mc_seed(street: Street, hero_hole: &[Card], board_a: &[Card], board_b: &[Card]) -> u64 {
-    let mut mixer = SeedMixer::new();
-    mixer.write_u8(street.index() as u8);
-    mixer.write_card_set(hero_hole);
-    mixer.write_card_set(board_a);
-    mixer.write_card_set(board_b);
-    mixer.finish()
 }
 
 /// Seed of a study hand's placeholder (non-hero) hole deal: button, hero
@@ -2480,114 +1943,35 @@ fn nlh_blind_seats(n: usize, button: usize, folded: &[bool]) -> (usize, usize) {
     }
 }
 
-/// The (hole, board)-parameterized core of `nlh_opp_outcome_fractions`,
-/// shared with the range-grid packer where candidate holes belong to no
-/// engine state: the share of unseen-deck 2-card opponent combos AHEAD
-/// of / TIED with / BEHIND `hole` at `board` under the any-combo NLH
-/// rule (exhaustive, ≤ C(47, 2)). All-zero when the board has fewer
-/// than 3 cards, matching the state method's preflop guard bit-exactly.
-pub fn nlh_opp_outcome_for(hole: &[Card], board: &[Card]) -> [f32; 3] {
-    const N_OUT: usize = 3;
-    if board.len() < 3 {
-        return [0.0; N_OUT];
-    }
-    let hero_rank = crate::hand_eval::evaluate_nlh(hole, board);
-
-    let mut used = [false; 52];
-    for c in hole.iter().chain(board.iter()) {
-        used[c.index() as usize] = true;
-    }
-    let unseen: Vec<Card> = (0..52u8)
-        .filter(|&i| !used[i as usize])
-        .map(Card::from_index)
-        .collect();
-    let m = unseen.len();
-    let mut counters = [0u64; N_OUT];
-    let mut total = 0u64;
-    for i in 0..m {
-        for j in (i + 1)..m {
-            let opp = [unseen[i], unseen[j]];
-            let opp_rank = crate::hand_eval::evaluate_nlh(&opp, board);
-            let k = if opp_rank > hero_rank {
-                0
-            } else if opp_rank == hero_rank {
-                1
-            } else {
-                2
-            };
-            counters[k] += 1;
-            total += 1;
-        }
-    }
-    if total == 0 {
-        return [0.0; N_OUT];
-    }
-    let inv = 1.0f32 / total as f32;
-    [
-        counters[0] as f32 * inv,
-        counters[1] as f32 * inv,
-        counters[2] as f32 * inv,
-    ]
-}
-
-/// Any-combo NLH hand-category (0..=8) for an arbitrary (hole, board);
-/// 0 when the board has fewer than 3 cards — the (hole, board) core of
-/// `hero_category` for the NLH variant (same `rank >> 20` extraction).
-pub fn nlh_category_for(hole: &[Card], board: &[Card]) -> u8 {
-    if board.len() < 3 {
-        return 0;
-    }
-    (crate::hand_eval::evaluate_nlh(hole, board) >> 20) as u8
-}
-
 /// Per-seat hand-start effective-stack cap. For seat `i`:
 /// `min(starting_stacks[i], max(starting_stacks[j] for j != i and !folded[j]))`.
 /// At construction `folded[i]` is true iff seat `i` is sitting out, so
 /// the `max_other` reduction excludes sit-outs. Returns own stack when
 /// no other in-hand seat exists.
 pub fn compute_eff_stack_cap(starting_stacks: &[u64], folded: &[bool]) -> Vec<u64> {
+    let mut cap = Vec::new();
+    eff_stack_cap_into(&mut cap, starting_stacks, folded);
+    cap
+}
+
+/// [`compute_eff_stack_cap`] into `out` (overwritten; its buffer reused).
+fn eff_stack_cap_into(out: &mut Vec<u64>, starting_stacks: &[u64], folded: &[bool]) {
     let n = starting_stacks.len();
-    let mut cap = vec![0u64; n];
-    for i in 0..n {
+    out.clear();
+    out.extend((0..n).map(|i| {
         let max_other = (0..n)
             .filter(|&j| j != i && !folded[j])
             .map(|j| starting_stacks[j])
             .max()
             .unwrap_or(starting_stacks[i]);
-        cap[i] = starting_stacks[i].min(max_other);
-    }
-    cap
-}
-
-/// Board-only pair ranks for the opp-outcome MC (see
-/// `GameState::board_pair_table`): entry `c0 * 52 + c1` (c0 < c1, neither on
-/// a board) = that 2-card holding's best PLO rank on board A / board B.
-#[derive(Clone, Debug)]
-pub struct BoardPairTable {
-    pub key: [u8; 12],
-    pub ranks_a: Vec<u32>,
-    pub ranks_b: Vec<u32>,
-}
-
-impl BoardPairTable {
-    /// Both boards' cards in deal order + lengths (255-padded).
-    pub fn key_of(board_a: &[Card], board_b: &[Card]) -> [u8; 12] {
-        let mut k = [255u8; 12];
-        for (j, c) in board_a.iter().enumerate().take(5) {
-            k[j] = c.index();
-        }
-        for (j, c) in board_b.iter().enumerate().take(5) {
-            k[5 + j] = c.index();
-        }
-        k[10] = board_a.len() as u8;
-        k[11] = board_b.len() as u8;
-        k
-    }
+        starting_stacks[i].min(max_other)
+    }));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::{flop3, hole5};
 
     fn default_config() -> GameConfig {
         GameConfig::default_6max_20bb()
@@ -2597,6 +1981,60 @@ mod tests {
     /// dealing from `Deck::new_shuffled(seed)`'s order reproduces the seeded
     /// hand card for card, and a card's slot is `5*seat + k` / `5n + m` /
     /// `5n + 5 + m` whoever is sitting out.
+    /// PERF-034: re-dealing a used table is the fresh deal, field for field
+    /// (Debug prints every field), whatever the previous hand left behind --
+    /// another variant, seat count, stacks, a study hand, a finished hand.
+    #[test]
+    fn redeal_is_exactly_a_new_hand() {
+        use crate::test_util::{flop3, hole5, nlh, plo};
+        use rand::{Rng, SeedableRng};
+        use rand_chacha::ChaCha8Rng;
+        let configs = [
+            plo(Variant::Plo5DoubleBomb, &[400_000; 6], 30_000, 10_000),
+            plo(
+                Variant::Plo4DoubleBomb,
+                &[25_000, 900_000, 60_000],
+                30_000,
+                10_000,
+            ),
+            plo(Variant::Plo6DoubleBomb, &[200_000; 7], 30_000, 10_000),
+            plo(
+                Variant::Plo67DoubleBomb,
+                &[300_000, 30_000, 500_000, 90_000],
+                30_000,
+                10_000,
+            ),
+            nlh(&[1_000_000, 8_000, 2_000_000], 5_000, 5_000, 10_000),
+            plo(Variant::Plo5DoubleBomb, &[30_000, 30_000], 30_000, 10_000),
+        ];
+        let mut rng = ChaCha8Rng::seed_from_u64(34);
+        let mut g = GameState::new_study(
+            plo(Variant::Plo5DoubleBomb, &[400_000; 6], 30_000, 10_000),
+            0,
+            0,
+            hole5([0, 1, 2, 3, 4]),
+            flop3([10, 11, 12]),
+            flop3([20, 21, 22]),
+        )
+        .unwrap();
+        for round in 0..300 {
+            let cfg = &configs[round % configs.len()];
+            let (seed, button) = (rng.gen::<u64>(), round % cfg.num_seats);
+            g.redeal(cfg, seed, button);
+            let want = GameState::new_hand(cfg.clone(), seed, button);
+            assert_eq!(format!("{g:?}"), format!("{want:?}"), "round {round}");
+            // Leave some state behind for the next re-deal.
+            for _ in 0..rng.gen_range(0..12) {
+                if g.is_terminal() {
+                    break;
+                }
+                let mask = g.legal_action_mask();
+                let legal: Vec<usize> = (0..NUM_ACTIONS).filter(|&a| mask[a]).collect();
+                g.apply(Action::from_index(legal[rng.gen_range(0..legal.len())] as u8).unwrap());
+            }
+        }
+    }
+
     #[test]
     fn hand_from_explicit_deck_matches_the_seeded_deal() {
         for seed in [0u64, 7, 2026, u64::MAX >> 1] {
@@ -2634,7 +2072,10 @@ mod tests {
         let g = GameState::new_hand(cfg, 7, 0);
         // Caps: A=min(20, max(30,40))=20, B=min(30, max(20,40))=30,
         // C=min(40, max(20,30))=30. Frozen at hand start.
-        assert_eq!(g.eff_stack_cap_at_hand_start, vec![20 * bb, 30 * bb, 30 * bb]);
+        assert_eq!(
+            g.eff_stack_cap_at_hand_start,
+            vec![20 * bb, 30 * bb, 30 * bb]
+        );
         // Cap is read-only; it doesn't change as stacks shrink or seats fold.
         let mut g2 = g.clone();
         g2.folded[2] = true;
@@ -2979,8 +2420,8 @@ mod tests {
         let mut g = GameState::new_hand(cfg, 42, 2);
 
         g.apply_raise_chips(900).unwrap(); // seat 0 pots it
-        // Seat 1: PL max delta 3600 > stack 2700 → stack-capped max 2700.
-        // Raising 2699 would leave 1 chip (≤ bb/100 = 1) → snapped to 2700.
+                                           // Seat 1: PL max delta 3600 > stack 2700 → stack-capped max 2700.
+                                           // Raising 2699 would leave 1 chip (≤ bb/100 = 1) → snapped to 2700.
         assert_eq!(g.actor, Some(1));
         assert_eq!(g.max_raise_chips(), 2_700);
         g.apply_raise_chips(2_699).unwrap();
@@ -2989,8 +2430,8 @@ mod tests {
         assert_eq!(g.bet_to_call, 2_700);
 
         g.apply(Action::Fold); // seat 2
-        // Seat 0 calls the all-in: only one live-with-chips seat remains →
-        // streets run out and the hand finalizes at showdown.
+                               // Seat 0 calls the all-in: only one live-with-chips seat remains →
+                               // streets run out and the hand finalizes at showdown.
         assert_eq!(g.actor, Some(0));
         g.apply(Action::CheckCall);
         assert!(g.is_terminal(), "all-in call must run out to showdown");
@@ -3101,7 +2542,11 @@ mod tests {
         cfg.starting_stacks = vec![1150, 1450, 1350];
         let mut g = GameState::new_hand(cfg, 0, 2);
         // Post-ante: stacks = [850, 1150, 1050], pot = 900.
-        assert_eq!(g.actor, Some(0), "SB acts first postflop in 3-way (button=2)");
+        assert_eq!(
+            g.actor,
+            Some(0),
+            "SB acts first postflop in 3-way (button=2)"
+        );
         assert_eq!(g.stacks, vec![850, 1150, 1050]);
         // SB shoves all-in for 850 (full open: 8.5 BB ≥ 1 BB floor).
         g.apply(Action::AllIn);
@@ -3146,7 +2591,10 @@ mod tests {
         let actor = g.actor.unwrap();
         assert_eq!(g.stacks[actor], 170000);
         let mask = g.legal_action_mask();
-        assert!(!mask[Action::BetPct100 as usize], "B100 should be masked as AllIn dupe");
+        assert!(
+            !mask[Action::BetPct100 as usize],
+            "B100 should be masked as AllIn dupe"
+        );
         assert!(mask[Action::AllIn as usize]);
         for a in [
             Action::BetPct10,
@@ -3172,7 +2620,10 @@ mod tests {
         assert_eq!(g.stacks[actor], 2700);
         let mask = g.legal_action_mask();
         assert!(mask[Action::BetPct100 as usize], "B100 should be legal");
-        assert!(!mask[Action::AllIn as usize], "AllIn should be masked by PL cap");
+        assert!(
+            !mask[Action::AllIn as usize],
+            "AllIn should be masked by PL cap"
+        );
         let chips = g.action_to_chips(Action::BetPct100).unwrap();
         assert_eq!(chips, 1800);
     }
@@ -3233,19 +2684,6 @@ mod tests {
     }
 
     // ---- Study-mode tests ----
-
-    fn cards(idxs: &[u8]) -> Vec<Card> {
-        idxs.iter().map(|&i| Card::from_index(i)).collect()
-    }
-
-    fn hole5(idxs: [u8; 5]) -> [Card; 5] {
-        let v = cards(&idxs);
-        [v[0], v[1], v[2], v[3], v[4]]
-    }
-    fn flop3(idxs: [u8; 3]) -> [Card; 3] {
-        let v = cards(&idxs);
-        [v[0], v[1], v[2]]
-    }
 
     #[test]
     fn new_study_rejects_duplicate_cards() {
@@ -3383,11 +2821,13 @@ mod tests {
         for _ in 0..6 {
             g.apply(Action::CheckCall);
         }
-        g.set_turn(Card::from_index(11), Card::from_index(12)).unwrap();
+        g.set_turn(Card::from_index(11), Card::from_index(12))
+            .unwrap();
         for _ in 0..6 {
             g.apply(Action::CheckCall);
         }
-        g.set_river(Card::from_index(13), Card::from_index(14)).unwrap();
+        g.set_river(Card::from_index(13), Card::from_index(14))
+            .unwrap();
         for _ in 0..6 {
             g.apply(Action::CheckCall);
         }
@@ -3427,7 +2867,8 @@ mod tests {
         assert_eq!(g.actor, Some(1));
         g.apply(Action::Fold); // SB folds
         assert_eq!(g.awaiting_next_street, Some(Street::Turn));
-        g.set_turn(Card::from_index(11), Card::from_index(12)).unwrap();
+        g.set_turn(Card::from_index(11), Card::from_index(12))
+            .unwrap();
         // First-to-act on turn: skip SB (folded), so actor = BB (seat 2).
         assert_eq!(g.actor, Some(2));
     }
@@ -3503,7 +2944,10 @@ mod tests {
         assert_eq!(alive, 1);
         let realized = g.payouts();
         let ev = g.payouts_ev(500, 7);
-        assert_eq!(ev, realized, "fold-out: EV must equal realized (card-agnostic)");
+        assert_eq!(
+            ev, realized,
+            "fold-out: EV must equal realized (card-agnostic)"
+        );
     }
 
     #[test]
@@ -3682,7 +3126,10 @@ mod tests {
             let mut g_disc = GameState::new_hand(cfg.clone(), 999, 1);
             let mut g_cont = GameState::new_hand(cfg, 999, 1);
             let mask = g_disc.legal_action_mask();
-            assert!(mask[pct as usize], "pct {pct:?} must be legal on fresh flop");
+            assert!(
+                mask[pct as usize],
+                "pct {pct:?} must be legal on fresh flop"
+            );
             let actor = g_disc.actor.unwrap();
             let chips = g_disc.compute_sizing_chips(pct, actor);
             g_disc.apply(pct);
@@ -3709,15 +3156,17 @@ mod tests {
                 "pct={pct:?} last_raise_size mismatch"
             );
             assert_eq!(
-                g_disc.last_aggression_was_full_raise,
-                g_cont.last_aggression_was_full_raise,
+                g_disc.last_aggression_was_full_raise, g_cont.last_aggression_was_full_raise,
                 "pct={pct:?} full-raise flag mismatch"
             );
             assert_eq!(
                 g_disc.acted_this_street, g_cont.acted_this_street,
                 "pct={pct:?} acted flags mismatch"
             );
-            assert_eq!(g_disc.actor, g_cont.actor, "pct={pct:?} next actor mismatch");
+            assert_eq!(
+                g_disc.actor, g_cont.actor,
+                "pct={pct:?} next actor mismatch"
+            );
             assert_eq!(
                 g_disc.last_aggressor, g_cont.last_aggressor,
                 "pct={pct:?} last_aggressor mismatch"
@@ -3925,9 +3374,8 @@ mod tests {
                 .collect()
         };
         assert_eq!(idx(&a), idx(&b));
-        let board = |g: &GameState| -> Vec<u8> {
-            g.full_board_a.iter().map(|c| c.index()).collect()
-        };
+        let board =
+            |g: &GameState| -> Vec<u8> { g.full_board_a.iter().map(|c| c.index()).collect() };
         assert_eq!(board(&a), board(&b));
         assert_eq!(a.actor, b.actor);
     }
@@ -3958,397 +3406,19 @@ mod tests {
             0,
             0,
             [Card::from_index(0); 5],
-            [Card::from_index(10), Card::from_index(11), Card::from_index(12)],
-            [Card::from_index(20), Card::from_index(21), Card::from_index(22)],
+            [
+                Card::from_index(10),
+                Card::from_index(11),
+                Card::from_index(12),
+            ],
+            [
+                Card::from_index(20),
+                Card::from_index(21),
+                Card::from_index(22),
+            ],
         );
-        assert_eq!(r.err(), Some(StudyError::WrongState));
-    }
-}
-
-#[cfg(test)]
-mod outcome_mc_p1_tests {
-    //! P1 bit-exactness harness. `outcome_features_mc_reference` is a FROZEN
-    //! copy of the pre-pair-table function body (as of 2026-07-09). Do NOT
-    //! "sync" it with the live function — its entire purpose is to pin that
-    //! the P1 pair-table rewrite produces byte-identical output on every
-    //! reachable state class: all PLO variants, all streets, rotated heroes,
-    //! and the degenerate study-mode duplicate-card states that exercise the
-    //! all-combos-filtered pair fallback (HandRank 0) and n_unseen > 41.
-    use super::*;
-
-    #[allow(clippy::needless_range_loop)]
-    fn outcome_features_mc_reference(g: &GameState, mc_samples: usize) -> Vec<f32> {
-        const N_OUT: usize = 20;
-        const SCOOP_OPP: usize = 0;
-        const QUARTER_OPP: usize = 1;
-        const SCOOP_HERO: usize = 2;
-        const QUARTER_HERO: usize = 3;
-        const PER_BOARD_OFF: usize = 12;
-
-        let hero_seat = match g.actor {
-            Some(s) => s,
-            None => return vec![0.0; N_OUT],
-        };
-        if g.board_a.len() < 3 || g.board_b.len() < 3 {
-            return vec![0.0; N_OUT];
-        }
-
-        let hero_hole = &g.hole_cards[hero_seat];
-        let hero_a = crate::hand_eval::evaluate_plo5_partial(hero_hole, &g.board_a);
-        let hero_b = crate::hand_eval::evaluate_plo5_partial(hero_hole, &g.board_b);
-
-        let mut used = [false; 52];
-        for c in hero_hole.iter() {
-            used[c.index() as usize] = true;
-        }
-        for c in g.board_a.iter().chain(g.board_b.iter()) {
-            used[c.index() as usize] = true;
-        }
-        let unseen: Vec<Card> = (0..52u8)
-            .filter(|&i| !used[i as usize])
-            .map(Card::from_index)
-            .collect();
-        let n_unseen = unseen.len();
-
-        // The ONE deliberate edit to this frozen body (review 2026-09-20
-        // B4): the seed derivation moved to the pinned set-based
-        // `outcome_mc_seed`, and the reference has to draw from the same
-        // stream to stay comparable. Everything downstream of the seed is
-        // still the untouched pre-P1 code.
-        let seed = outcome_mc_seed(g.street, hero_hole, &g.board_a, &g.board_b);
-
-        use rand_chacha::ChaCha8Rng;
-        use rand_chacha::rand_core::{RngCore, SeedableRng};
-        let mut rng = ChaCha8Rng::seed_from_u64(seed);
-
-        let mut out = vec![0.0f32; N_OUT];
-        let mut opp_buf: Vec<Card> = Vec::with_capacity(4);
-
-        let outcomes = |opp: &[Card]| -> (i8, i8) {
-            let opp_a = crate::hand_eval::evaluate_plo5_k_partial(opp, &g.board_a);
-            let opp_b = crate::hand_eval::evaluate_plo5_k_partial(opp, &g.board_b);
-            let cmp_a: i8 = if opp_a > hero_a {
-                1
-            } else if opp_a < hero_a {
-                -1
-            } else {
-                0
-            };
-            let cmp_b: i8 = if opp_b > hero_b {
-                1
-            } else if opp_b < hero_b {
-                -1
-            } else {
-                0
-            };
-            (cmp_a, cmp_b)
-        };
-        let tally_joint = |counters: &mut [u32; 4], cmp_a: i8, cmp_b: i8| {
-            match (cmp_a, cmp_b) {
-                (1, 1) => counters[SCOOP_OPP] += 1,
-                (-1, -1) => counters[SCOOP_HERO] += 1,
-                (1, 0) | (0, 1) => counters[QUARTER_OPP] += 1,
-                (-1, 0) | (0, -1) => counters[QUARTER_HERO] += 1,
-                _ => {}
-            }
-        };
-
-        for (idx_k, &k) in [2usize, 3, 4].iter().enumerate() {
-            let mut counters = [0u32; 4];
-            let mut samples: u32 = 0;
-
-            if k == 2 {
-                let mut pb = [0u32; 8];
-                let mut idx: Vec<usize> = (0..k).collect();
-                loop {
-                    opp_buf.clear();
-                    for &i in idx.iter() {
-                        opp_buf.push(unseen[i]);
-                    }
-                    let (cmp_a, cmp_b) = outcomes(&opp_buf);
-                    tally_joint(&mut counters, cmp_a, cmp_b);
-                    match cmp_a {
-                        -1 => pb[0] += 1,
-                        0 => pb[1] += 1,
-                        _ => pb[2] += 1,
-                    }
-                    match cmp_b {
-                        -1 => pb[3] += 1,
-                        0 => pb[4] += 1,
-                        _ => pb[5] += 1,
-                    }
-                    if (cmp_a == -1 && cmp_b == 1) || (cmp_a == 1 && cmp_b == -1) {
-                        pb[6] += 1;
-                    }
-                    if cmp_a == 0 && cmp_b == 0 {
-                        pb[7] += 1;
-                    }
-                    samples += 1;
-                    let mut pos = k;
-                    let advanced = loop {
-                        if pos == 0 {
-                            break false;
-                        }
-                        pos -= 1;
-                        if idx[pos] < n_unseen - (k - pos) {
-                            idx[pos] += 1;
-                            for j in (pos + 1)..k {
-                                idx[j] = idx[j - 1] + 1;
-                            }
-                            break true;
-                        }
-                    };
-                    if !advanced {
-                        break;
-                    }
-                }
-                if samples > 0 {
-                    let inv = 1.0f32 / samples as f32;
-                    for j in 0..8 {
-                        out[PER_BOARD_OFF + j] = pb[j] as f32 * inv;
-                    }
-                }
-            } else {
-                debug_assert!(n_unseen <= 64);
-                for _ in 0..mc_samples {
-                    let mut mask: u64 = 0;
-                    opp_buf.clear();
-                    let mut written = 0;
-                    while written < k {
-                        let i = (rng.next_u32() as usize) % n_unseen;
-                        let bit = 1u64 << i;
-                        if mask & bit == 0 {
-                            mask |= bit;
-                            opp_buf.push(unseen[i]);
-                            written += 1;
-                        }
-                    }
-                    let (cmp_a, cmp_b) = outcomes(&opp_buf);
-                    tally_joint(&mut counters, cmp_a, cmp_b);
-                    samples += 1;
-                }
-            }
-
-            if samples > 0 {
-                let inv = 1.0f32 / samples as f32;
-                let base = idx_k * 4;
-                out[base + SCOOP_OPP] = counters[SCOOP_OPP] as f32 * inv;
-                out[base + QUARTER_OPP] = counters[QUARTER_OPP] as f32 * inv;
-                out[base + SCOOP_HERO] = counters[SCOOP_HERO] as f32 * inv;
-                out[base + QUARTER_HERO] = counters[QUARTER_HERO] as f32 * inv;
-            }
-        }
-        out
-    }
-
-    fn assert_bit_identical(g: &GameState, mc_samples: usize, tag: &str) {
-        let new = g.outcome_features_mc(mc_samples);
-        let reference = outcome_features_mc_reference(g, mc_samples);
-        // The live fn appends the DUAL-4 share bounds (dims 20/21,
-        // 2026-07-12); the frozen reference stays 20-wide by design. The
-        // pin's purpose is unchanged: dims 0..20 byte-identical.
-        assert_eq!(new.len(), 22, "{tag}: live output must be 22-wide");
-        assert_eq!(reference.len(), 20, "{tag}: frozen reference is 20-wide");
-        for (i, (x, y)) in new.iter().zip(reference.iter()).enumerate() {
-            assert_eq!(
-                x.to_bits(),
-                y.to_bits(),
-                "{tag}: dim {i} differs (new {x} vs ref {y})"
-            );
-        }
-        // Appended share bounds: either both zero (inactive / no combos)
-        // or a valid quantized min<=max pair.
-        let (g_min, g_max) = (new[20], new[21]);
-        assert!(
-            (g_min == 0.0 && g_max == 0.0) || g_min <= g_max,
-            "{tag}: share bounds invalid ({g_min}, {g_max})"
-        );
-        for v in [g_min, g_max] {
-            assert!(
-                [0.0, 0.25, 0.5, 0.75, 1.0].contains(&v),
-                "{tag}: share bound {v} not on the quarter grid"
-            );
-        }
-    }
-
-    fn reveal_turn(g: &mut GameState) {
-        g.board_a.push(g.full_board_a[3]);
-        g.board_b.push(g.full_board_b[3]);
-        g.street = Street::Turn;
-    }
-
-    fn reveal_river(g: &mut GameState) {
-        g.board_a.push(g.full_board_a[4]);
-        g.board_b.push(g.full_board_b[4]);
-        g.street = Street::River;
-    }
-
-    fn variant_cfg(variant: Variant, num_seats: usize) -> GameConfig {
-        GameConfig {
-            num_seats,
-            starting_stacks: vec![200_000; num_seats],
-            ante: 30_000,
-            bb: 10_000,
-            sb: 0,
-            variant,
-        }
-    }
-
-    #[test]
-    fn shared_pair_table_matches_outcome_features_mc() {
-        // The batched packer's shared board table (2026-09-26) must change
-        // nothing: every variant x street x seat count x hero, one table per
-        // (hand, street) shared by all heroes, compared bit for bit with the
-        // self-evaluating path -- plus a STALE table (another street's), which
-        // must be ignored.
-        let variants = [
-            Variant::Plo5DoubleBomb,
-            Variant::Plo4DoubleBomb,
-            Variant::Plo6DoubleBomb,
-        ];
-        for &variant in variants.iter() {
-            for &num_seats in &[2usize, 3, 6] {
-                for seed in 0..4u64 {
-                    let mut g = GameState::new_hand(variant_cfg(variant, num_seats), 1000 + seed, 1);
-                    let mut stale: Option<BoardPairTable> = None;
-                    for street in 0..3usize {
-                        if street == 1 {
-                            reveal_turn(&mut g);
-                        }
-                        if street == 2 {
-                            reveal_river(&mut g);
-                        }
-                        let table = g.board_pair_table().expect("both boards have a flop");
-                        for hero in 0..num_seats {
-                            g.actor = Some(hero);
-                            for &mc in &[1usize, 64, 384] {
-                                let a = g.outcome_features_mc(mc);
-                                let b = g.outcome_features_mc_shared(mc, Some(&table));
-                                let bits = |v: &Vec<f32>| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-                                assert_eq!(bits(&a), bits(&b), "{variant:?} seats {num_seats} seed {seed} street {street} hero {hero} mc {mc}");
-                                if let Some(t) = stale.as_ref() {
-                                    let c = g.outcome_features_mc_shared(mc, Some(t));
-                                    assert_eq!(bits(&a), bits(&c), "stale table used");
-                                }
-                            }
-                        }
-                        stale = Some(table);
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn pair_table_matches_reference() {
-        // Production-shaped states: every PLO variant x street x seeds x seat
-        // counts, with the hero rotated across every seat (the actor is the
-        // only seat the function reads).
-        let variants = [
-            Variant::Plo5DoubleBomb,
-            Variant::Plo4DoubleBomb,
-            Variant::Plo6DoubleBomb,
-        ];
-        for (vi, &variant) in variants.iter().enumerate() {
-            for &num_seats in &[2usize, 6] {
-                for seed in 0..3u64 {
-                    for street in 0..3usize {
-                        let mut g = GameState::new_hand(
-                            variant_cfg(variant, num_seats),
-                            seed * 7919 + street as u64,
-                            0,
-                        );
-                        if street >= 1 {
-                            reveal_turn(&mut g);
-                        }
-                        if street >= 2 {
-                            reveal_river(&mut g);
-                        }
-                        for hero in 0..num_seats {
-                            g.actor = Some(hero);
-                            assert_bit_identical(
-                                &g,
-                                64,
-                                &format!(
-                                    "variant#{vi} seats={num_seats} seed={seed} \
-                                     street={street} hero={hero}"
-                                ),
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        // Deployed sample count on one full-size case, plus the mc_samples=1
-        // edge.
-        let g = GameState::new_hand(variant_cfg(Variant::Plo5DoubleBomb, 6), 12345, 2);
-        assert_bit_identical(&g, 384, "plo5 6max flop mc=384");
-        assert_bit_identical(&g, 1, "mc=1");
-        // mc_samples == 0 is NOT a reference case: since 289bf87 it is the
-        // minimal-obs "skip the whole pass" switch and returns zeros without
-        // running even the exhaustive k=2 arm, which the frozen body still
-        // does. The old bit-identity pin here was stale (review 2026-09-20
-        // C5); pin the contract the callers actually rely on instead.
-        let skipped = g.outcome_features_mc(0);
-        assert_eq!(skipped.len(), 22, "mc=0: output stays 22-wide");
-        assert!(
-            skipped.iter().all(|x| x.to_bits() == 0),
-            "mc=0 must return all +0.0, got {skipped:?}"
-        );
-    }
-
-    #[test]
-    fn pair_table_matches_reference_degenerate_study_states() {
-        // Duplicate-card states: hole cards colliding with board cards and
-        // boards sharing cards shrink the `used` union (n_unseen past the 41
-        // production ceiling, up to 46+) and exercise the degenerate-pair
-        // fallback (all combos ck==0-filtered -> HandRank 0). Production
-        // deals never reach these; the study path could (a user street card
-        // landing on a villain placeholder) until review 2026-09-20 C8 made
-        // it redraw the placeholder. Hand-built here to keep the pair-table
-        // identity pinned over the function's whole domain.
-        let mut g = GameState::new_hand(variant_cfg(Variant::Plo5DoubleBomb, 6), 99, 0);
-        let hero = g.actor.unwrap();
-
-        // Hero hole card duplicated onto board_a: at the flop there is exactly
-        // one board triple, so every combo using that hole card degenerates.
-        let mut g1 = g.clone();
-        g1.board_a[0] = g1.hole_cards[hero][0];
-        assert_bit_identical(&g1, 64, "hero hole card duplicated on board_a");
-
-        // Boards sharing a card.
-        let mut g2 = g.clone();
-        g2.board_b[1] = g2.board_a[1];
-        assert_bit_identical(&g2, 64, "board_a/board_b share a card");
-
-        // Pathological mass duplication: several hero cards on both boards +
-        // a cross-board duplicate (n_unseen well past 41).
-        let mut g3 = g.clone();
-        g3.board_a[0] = g3.hole_cards[hero][0];
-        g3.board_a[1] = g3.hole_cards[hero][1];
-        g3.board_b[0] = g3.hole_cards[hero][2];
-        g3.board_b[1] = g3.hole_cards[hero][3];
-        g3.board_b[2] = g3.board_a[2];
-        assert_bit_identical(&g3, 64, "mass-duplicate study state");
-
-        // INTRA-board duplicate: the only state class where an OPP pair's
-        // evals can ALL degenerate (opp cards come from the unseen deck, so
-        // they never collide with board cards — a 5-card combo can only
-        // contain a duplicate if the board TRIPLE itself does). At the flop
-        // board_a has exactly one triple, and it contains the dup, so every
-        // opp pair's tab_a entry takes the all-combos-filtered fallback
-        // (u16::MAX -> 7462 -> HandRank 0) — pinning the max-fold identity's
-        // hardest case for real. Unreachable via study input validation
-        // (DuplicateCard guard); pinned at the function level regardless.
-        let mut g4 = g.clone();
-        g4.board_a[1] = g4.board_a[0];
-        assert_bit_identical(&g4, 64, "intra-board duplicate (all-degenerate pairs)");
-
-        // Turn-street collision: 4-card board, so the colliding pair keeps
-        // some valid triples (partial-degeneracy path).
-        reveal_turn(&mut g);
-        g.board_a[0] = g.hole_cards[hero][0];
-        assert_bit_identical(&g, 64, "turn-street hole/board collision");
+        // ENG-024: named for what it is (was the generic WrongState).
+        assert_eq!(r.err(), Some(StudyError::UnsupportedVariant));
     }
 }
 
@@ -4357,14 +3427,12 @@ mod plo6_tests {
     use super::*;
 
     fn plo6_cfg(num_seats: usize, stack: u64) -> GameConfig {
-        GameConfig {
-            num_seats,
-            starting_stacks: vec![stack; num_seats],
-            ante: 30_000,
-            bb: 10_000,
-            sb: 0,
-            variant: Variant::Plo6DoubleBomb,
-        }
+        crate::test_util::plo(
+            Variant::Plo6DoubleBomb,
+            &vec![stack; num_seats],
+            30_000,
+            10_000,
+        )
     }
 
     #[test]
@@ -4446,8 +3514,16 @@ mod plo6_tests {
             Card::from_index(12),
             Card::from_index(16),
         ];
-        let fa = [Card::from_index(20), Card::from_index(24), Card::from_index(28)];
-        let fb = [Card::from_index(32), Card::from_index(36), Card::from_index(40)];
+        let fa = [
+            Card::from_index(20),
+            Card::from_index(24),
+            Card::from_index(28),
+        ];
+        let fb = [
+            Card::from_index(32),
+            Card::from_index(36),
+            Card::from_index(40),
+        ];
         let r = GameState::new_study(cfg, 0, 0, hero, fa, fb);
         assert!(r.is_err(), "study mode is PLO5-only until the UI phase");
     }
@@ -4458,14 +3534,12 @@ mod plo4_tests {
     use super::*;
 
     fn plo4_cfg(num_seats: usize, stack: u64) -> GameConfig {
-        GameConfig {
-            num_seats,
-            starting_stacks: vec![stack; num_seats],
-            ante: 30_000,
-            bb: 10_000,
-            sb: 0,
-            variant: Variant::Plo4DoubleBomb,
-        }
+        crate::test_util::plo(
+            Variant::Plo4DoubleBomb,
+            &vec![stack; num_seats],
+            30_000,
+            10_000,
+        )
     }
 
     #[test]
@@ -4545,8 +3619,16 @@ mod plo4_tests {
             Card::from_index(12),
             Card::from_index(16),
         ];
-        let fa = [Card::from_index(20), Card::from_index(24), Card::from_index(28)];
-        let fb = [Card::from_index(32), Card::from_index(36), Card::from_index(40)];
+        let fa = [
+            Card::from_index(20),
+            Card::from_index(24),
+            Card::from_index(28),
+        ];
+        let fb = [
+            Card::from_index(32),
+            Card::from_index(36),
+            Card::from_index(40),
+        ];
         let r = GameState::new_study(cfg, 0, 0, hero, fa, fb);
         assert!(r.is_err(), "study mode is PLO5-only until the UI phase");
     }
@@ -4670,10 +3752,38 @@ mod nlh_study_tests {
     }
 
     #[test]
+    fn study_errors_name_the_problem() {
+        // ENG-024: mask and stack-count problems used to read "seat out of range".
+        let cfg = GameConfig::new_uniform(4, 200_000, 30_000, 10_000);
+        let (h, fa, fb) = (
+            [0u8, 1, 2, 3, 4].map(Card::from_index),
+            [10u8, 11, 12].map(Card::from_index),
+            [20u8, 21, 22].map(Card::from_index),
+        );
+        for mask in [
+            vec![true; 3],
+            vec![false, true, true, true],
+            vec![true, false, false, false],
+        ] {
+            let r = GameState::new_study_with_mask(cfg.clone(), 0, 0, h, fa, fb, Some(mask));
+            assert_eq!(r.err(), Some(StudyError::BadMask));
+        }
+        let mut short = cfg.clone();
+        short.starting_stacks.pop();
+        let r = GameState::new_study(short, 0, 0, h, fa, fb);
+        assert_eq!(r.err(), Some(StudyError::StackCountMismatch));
+        let mut nlh = GameConfig::new_nlh_uniform(3, 1_000_000, 5_000, 10_000, 0);
+        nlh.starting_stacks.push(1);
+        let r = GameState::new_study_nlh(nlh, 0, 0, hero2(0, 4));
+        assert_eq!(r.err(), Some(StudyError::StackCountMismatch));
+        assert!(StudyError::BadMask.to_string().contains("mask"));
+    }
+
+    #[test]
     fn nlh_study_rejected_for_plo() {
         let plo = GameConfig::new_uniform(6, 200_000, 30_000, 10_000);
         let r = GameState::new_study_nlh(plo, 0, 0, hero2(0, 4));
-        assert_eq!(r.err(), Some(StudyError::WrongState));
+        assert_eq!(r.err(), Some(StudyError::UnsupportedVariant));
     }
 
     #[test]
@@ -4721,45 +3831,12 @@ mod review_2026_09_20_tests {
     //! classification), C4 (seat-count panics), C8 (study placeholder
     //! collisions), B4 (opp-outcome MC seed).
     use super::*;
+    use crate::test_util::{cards, flop3, hole5, nlh, plo};
     use rand::Rng;
     use rand_chacha::rand_core::SeedableRng;
     use rand_chacha::ChaCha8Rng;
 
     const BB: u64 = 10_000;
-
-    fn nlh(stacks: &[u64], ante: u64, sb: u64, bb: u64) -> GameConfig {
-        GameConfig {
-            num_seats: stacks.len(),
-            starting_stacks: stacks.to_vec(),
-            ante,
-            bb,
-            sb,
-            variant: Variant::NlhSingle,
-        }
-    }
-
-    fn plo(variant: Variant, stacks: &[u64], ante: u64, bb: u64) -> GameConfig {
-        GameConfig {
-            num_seats: stacks.len(),
-            starting_stacks: stacks.to_vec(),
-            ante,
-            bb,
-            sb: 0,
-            variant,
-        }
-    }
-
-    fn cards(idxs: &[u8]) -> Vec<Card> {
-        idxs.iter().map(|&i| Card::from_index(i)).collect()
-    }
-
-    fn hole5(idxs: [u8; 5]) -> [Card; 5] {
-        idxs.map(Card::from_index)
-    }
-
-    fn flop3(idxs: [u8; 3]) -> [Card; 3] {
-        idxs.map(Card::from_index)
-    }
 
     fn bits(v: &[f32]) -> Vec<u32> {
         v.iter().map(|x| x.to_bits()).collect()
@@ -4978,11 +4055,20 @@ mod review_2026_09_20_tests {
                 "{tag}: check/call illegal"
             );
             // The mask-free fast paths agree with the mask at every node.
-            assert_eq!(g.fold_is_legal(), legal[Action::Fold as usize], "{tag}: fold fast path");
+            assert_eq!(
+                g.fold_is_legal(),
+                legal[Action::Fold as usize],
+                "{tag}: fold fast path"
+            );
             assert_eq!(
                 g.check_call_is_legal(),
                 legal[Action::CheckCall as usize],
                 "{tag}: check/call fast path"
+            );
+            assert_eq!(
+                g.all_in_is_legal(),
+                legal[Action::AllIn as usize],
+                "{tag}: all-in fast path"
             );
             if legal[Action::Fold as usize] {
                 // No phantom bets: Fold is only ever offered against chips
@@ -5016,8 +4102,17 @@ mod review_2026_09_20_tests {
             assert!(steps < 400, "{tag}: hand did not terminate");
         }
         let legal = g.legal_action_mask();
-        assert_eq!(g.fold_is_legal(), legal[Action::Fold as usize], "{tag}: terminal fold");
-        assert_eq!(g.check_call_is_legal(), legal[Action::CheckCall as usize], "{tag}: terminal call");
+        assert_eq!(
+            g.fold_is_legal(),
+            legal[Action::Fold as usize],
+            "{tag}: terminal fold"
+        );
+        assert_eq!(
+            g.check_call_is_legal(),
+            legal[Action::CheckCall as usize],
+            "{tag}: terminal call"
+        );
+        assert!(!g.all_in_is_legal(), "{tag}: terminal all-in");
         g
     }
 
@@ -5073,7 +4168,7 @@ mod review_2026_09_20_tests {
             assert_settlement(&g, &tag);
             assert_eq!(g.pot, g.total_commit.iter().sum::<u64>(), "{tag}: pot");
             for i in 0..n {
-                let dealt = mask.as_ref().map_or(true, |m| m[i]);
+                let dealt = mask.as_ref().is_none_or(|m| m[i]);
                 assert_eq!(
                     g.stacks[i] + g.total_commit[i],
                     stacks[i],
@@ -5333,7 +4428,7 @@ mod review_2026_09_20_tests {
             assert_eq!(r.err(), Some(StudyError::TooManySeats), "{n} seats");
         }
         let r = GameState::new_study_nlh(
-            nlh(&vec![1_000_000; 24], 5_000, 5_000, 10_000),
+            nlh(&[1_000_000; 24], 5_000, 5_000, 10_000),
             0,
             0,
             [Card::from_index(51), Card::from_index(47)],
@@ -5599,7 +4694,7 @@ mod plo67_tests {
     //! and every red burn deals each seat still in the hand one more card.
     use super::review_2026_09_20_tests::{assert_settlement, play_random_hand};
     use super::*;
-    use crate::hand_eval::{evaluate_5, evaluate_plo5, HandRank};
+    use crate::hand_eval::{evaluate_5, evaluate_plo, HandRank};
     use rand::Rng;
     use rand_chacha::rand_core::SeedableRng;
     use rand_chacha::ChaCha8Rng;
@@ -5611,21 +4706,18 @@ mod plo67_tests {
     const BLACK: [u8; 3] = [0, 3, 4]; // 2c 2s 3c
 
     fn cfg(stacks: &[u64]) -> GameConfig {
-        GameConfig {
-            num_seats: stacks.len(),
-            starting_stacks: stacks.to_vec(),
-            ante: ANTE,
-            bb: BB,
-            sb: 0,
-            variant: Variant::Plo67DoubleBomb,
-        }
+        crate::test_util::plo(Variant::Plo67DoubleBomb, stacks, ANTE, BB)
     }
 
     /// A shuffled deck with `burns` in the three burn slots (7n+10..7n+13);
     /// every other card keeps its shuffled order.
     fn deck_with_burns(n: usize, burns: [u8; 3], seed: u64) -> Vec<u8> {
         let order = crate::cards::Deck::new_shuffled(seed).order();
-        let mut rest: Vec<u8> = order.iter().copied().filter(|c| !burns.contains(c)).collect();
+        let mut rest: Vec<u8> = order
+            .iter()
+            .copied()
+            .filter(|c| !burns.contains(c))
+            .collect();
         for (k, &b) in burns.iter().enumerate() {
             rest.insert(7 * n + 10 + k, b);
         }
@@ -5657,7 +4749,9 @@ mod plo67_tests {
                 for a in 0..5 {
                     for b in (a + 1)..5 {
                         for c in (b + 1)..5 {
-                            best = best.max(evaluate_5(&[hole[i], hole[j], board[a], board[b], board[c]]));
+                            best = best.max(evaluate_5(&[
+                                hole[i], hole[j], board[a], board[b], board[c],
+                            ]));
                         }
                     }
                 }
@@ -5681,10 +4775,25 @@ mod plo67_tests {
             (Variant::Plo6DoubleBomb, 6, 7),
             (Variant::NlhSingle, 2, 23),
         ] {
-            assert_eq!((v.hole_slots(), v.burn_count(), v.max_seats()), (hc, 0, max), "{v:?}");
+            assert_eq!(
+                (v.hole_slots(), v.burn_count(), v.max_seats()),
+                (hc, 0, max),
+                "{v:?}"
+            );
         }
-        for (red, card) in [(false, 0u8), (true, 1), (true, 2), (false, 3), (true, 50), (false, 51)] {
-            assert_eq!(Variant::burn_is_red(Card::from_index(card)), red, "card {card}");
+        for (red, card) in [
+            (false, 0u8),
+            (true, 1),
+            (true, 2),
+            (false, 3),
+            (true, 50),
+            (false, 51),
+        ] {
+            assert_eq!(
+                Variant::burn_is_red(Card::from_index(card)),
+                red,
+                "card {card}"
+            );
         }
     }
 
@@ -5696,7 +4805,11 @@ mod plo67_tests {
                 let g = deal(&vec![1_000_000; n], &order);
                 let held = if burns == RED { 5 } else { 4 };
                 for s in 0..n {
-                    assert_eq!(idx(&g.hole_cards[s]), order[7 * s..7 * s + held].to_vec(), "n {n} seat {s}");
+                    assert_eq!(
+                        idx(&g.hole_cards[s]),
+                        order[7 * s..7 * s + held].to_vec(),
+                        "n {n} seat {s}"
+                    );
                     assert_eq!(idx(&g.extra_holes[s]), order[7 * s + 4..7 * s + 7].to_vec());
                 }
                 assert_eq!(idx(&g.full_board_a), order[7 * n..7 * n + 5].to_vec());
@@ -5704,7 +4817,10 @@ mod plo67_tests {
                 assert_eq!(idx(&g.full_burns), burns.to_vec());
                 // the flop's burn is face up from the deal; the others wait
                 assert_eq!(idx(&g.burns), vec![burns[0]]);
-                assert_eq!((g.street, g.board_a.len(), g.board_b.len()), (Street::Flop, 3, 3));
+                assert_eq!(
+                    (g.street, g.board_a.len(), g.board_b.len()),
+                    (Street::Flop, 3, 3)
+                );
             }
         }
         // the seeded deal is the same contract: 48 distinct cards for 5 seats
@@ -5730,19 +4846,33 @@ mod plo67_tests {
         // Button 0: seat 1 acts first. Seat 2 is short (70k behind the ante).
         let order = deck_with_burns(3, RED, 1);
         let mut g = deal(&[1_000_000, 1_000_000, 100_000], &order);
-        assert!(g.hole_cards.iter().all(|h| h.len() == 5), "red flop burn: five cards each");
+        assert!(
+            g.hole_cards.iter().all(|h| h.len() == 5),
+            "red flop burn: five cards each"
+        );
         assert_eq!(g.actor, Some(1));
         g.apply(Action::CheckCall); // seat 1 checks
         g.apply(Action::AllIn); // seat 2 all-in (70k)
         g.apply(Action::CheckCall); // seat 0 calls
         g.apply(Action::Fold); // seat 1 folds
-        // one seat left with chips: the turn and river are run out, burns and all
+                               // one seat left with chips: the turn and river are run out, burns and all
         assert!(g.is_terminal());
         assert_eq!(idx(&g.burns), RED.to_vec());
-        assert_eq!(g.hole_cards.iter().map(|h| h.len()).collect::<Vec<_>>(), vec![7, 5, 7]);
+        assert_eq!(
+            g.hole_cards.iter().map(|h| h.len()).collect::<Vec<_>>(),
+            vec![7, 5, 7]
+        );
         assert_eq!(counts(&g, 0), [5, 6, 7]);
-        assert_eq!(counts(&g, 1), [5, 5, 5], "folded before the turn burn: no more cards");
-        assert_eq!(counts(&g, 2), [5, 6, 7], "all-in seats keep receiving cards");
+        assert_eq!(
+            counts(&g, 1),
+            [5, 5, 5],
+            "folded before the turn burn: no more cards"
+        );
+        assert_eq!(
+            counts(&g, 2),
+            [5, 6, 7],
+            "all-in seats keep receiving cards"
+        );
         for s in [0usize, 2] {
             assert_eq!(idx(&g.hole_cards[s]), order[7 * s..7 * s + 7].to_vec());
         }
@@ -5753,9 +4883,12 @@ mod plo67_tests {
         assert_eq!(p[1], -30_000);
         let mut won = [0i64; 3];
         for board in [&g.full_board_a, &g.full_board_b] {
-            let (r0, r2) = (brute(&g.hole_cards[0], board), brute(&g.hole_cards[2], board));
-            assert_eq!(evaluate_plo5(&g.hole_cards[0], board), r0);
-            assert_eq!(evaluate_plo5(&g.hole_cards[2], board), r2);
+            let (r0, r2) = (
+                brute(&g.hole_cards[0], board),
+                brute(&g.hole_cards[2], board),
+            );
+            assert_eq!(evaluate_plo(&g.hole_cards[0], board), r0);
+            assert_eq!(evaluate_plo(&g.hole_cards[2], board), r2);
             match r0.cmp(&r2) {
                 std::cmp::Ordering::Greater => won[0] += 115_000,
                 std::cmp::Ordering::Less => won[2] += 115_000,
@@ -5798,11 +4931,17 @@ mod plo67_tests {
         g.apply(Action::CheckCall); // seat 1 calls -> turn
         assert_eq!(g.street, Street::Turn);
         assert_eq!(g.burns.len(), 2);
-        assert_eq!(g.hole_cards.iter().map(|h| h.len()).collect::<Vec<_>>(), vec![4, 5, 5]);
+        assert_eq!(
+            g.hole_cards.iter().map(|h| h.len()).collect::<Vec<_>>(),
+            vec![4, 5, 5]
+        );
         g.apply(Action::CheckCall);
         g.apply(Action::CheckCall); // -> river
         assert_eq!(g.street, Street::River);
-        assert_eq!(g.hole_cards.iter().map(|h| h.len()).collect::<Vec<_>>(), vec![4, 6, 6]);
+        assert_eq!(
+            g.hole_cards.iter().map(|h| h.len()).collect::<Vec<_>>(),
+            vec![4, 6, 6]
+        );
         g.apply(Action::CheckCall);
         g.apply(Action::CheckCall);
         assert!(g.is_terminal());
@@ -5851,13 +4990,19 @@ mod plo67_tests {
     fn runout_equities_are_exact_on_the_river_and_sum_to_one() {
         let c = |i: u8| Card::from_index(i);
         // river: complete boards -> the actual result, shares sum to 1 per board
-        let holes = vec![vec![c(48), c(49), c(0), c(4), c(8)], vec![c(44), c(45), c(1), c(5), c(9), c(13)]];
+        let holes = vec![
+            vec![c(48), c(49), c(0), c(4), c(8)],
+            vec![c(44), c(45), c(1), c(5), c(9), c(13)],
+        ];
         let a = [c(50), c(51), c(20), c(24), c(28)];
         let b = [c(40), c(41), c(21), c(25), c(29)];
         let eq = plo67_runout_equities(&holes, &a, &b, &[c(2)], 100, 1).unwrap();
         for k in 0..2 {
             let board = if k == 0 { &a } else { &b };
-            let (r0, r1) = (evaluate_plo5(&holes[0], board), evaluate_plo5(&holes[1], board));
+            let (r0, r1) = (
+                evaluate_plo(&holes[0], board),
+                evaluate_plo(&holes[1], board),
+            );
             let want = match r0.cmp(&r1) {
                 std::cmp::Ordering::Greater => [1.0, 0.0],
                 std::cmp::Ordering::Less => [0.0, 1.0],
@@ -5871,16 +5016,40 @@ mod plo67_tests {
             vec![c(44), c(45), c(1), c(5), c(9)],
             vec![c(40), c(41), c(2), c(6)],
         ];
-        let eq = plo67_runout_equities(&holes, &[c(50), c(51), c(20)], &[c(36), c(37), c(21)], &[c(3)], 2000, 7).unwrap();
+        let eq = plo67_runout_equities(
+            &holes,
+            &[c(50), c(51), c(20)],
+            &[c(36), c(37), c(21)],
+            &[c(3)],
+            2000,
+            7,
+        )
+        .unwrap();
         for k in 0..2 {
             let total: f64 = eq.iter().map(|e| e[k]).sum();
             assert!((total - 1.0).abs() < 1e-9, "board {k}: {total}");
         }
         // deterministic from the seed
-        let again = plo67_runout_equities(&holes, &[c(50), c(51), c(20)], &[c(36), c(37), c(21)], &[c(3)], 2000, 7).unwrap();
+        let again = plo67_runout_equities(
+            &holes,
+            &[c(50), c(51), c(20)],
+            &[c(36), c(37), c(21)],
+            &[c(3)],
+            2000,
+            7,
+        )
+        .unwrap();
         assert_eq!(eq, again);
         // a repeated card is refused, never a panic
-        assert!(plo67_runout_equities(&holes, &[c(48), c(51), c(20)], &[c(36), c(37), c(21)], &[], 10, 1).is_err());
+        assert!(plo67_runout_equities(
+            &holes,
+            &[c(48), c(51), c(20)],
+            &[c(36), c(37), c(21)],
+            &[],
+            10,
+            1
+        )
+        .is_err());
     }
 
     #[test]
@@ -5891,8 +5060,16 @@ mod plo67_tests {
         let order = deck_with_burns(2, [BLACK[0], RED[0], RED[1]], 11);
         let g0 = deal(&[ANTE; 2], &order); // all-in from the ante: runs out at the deal
         assert!(g0.is_terminal());
-        let holes: Vec<Vec<Card>> = (0..2).map(|s| order[7 * s..7 * s + 4].iter().map(|&i| Card::from_index(i)).collect()).collect();
-        let (fa, fb): (Vec<Card>, Vec<Card>) = (g0.full_board_a[..3].to_vec(), g0.full_board_b[..3].to_vec());
+        let holes: Vec<Vec<Card>> = (0..2)
+            .map(|s| {
+                order[7 * s..7 * s + 4]
+                    .iter()
+                    .map(|&i| Card::from_index(i))
+                    .collect()
+            })
+            .collect();
+        let (fa, fb): (Vec<Card>, Vec<Card>) =
+            (g0.full_board_a[..3].to_vec(), g0.full_board_b[..3].to_vec());
         let burn0 = g0.full_burns[0];
         let eq = plo67_runout_equities(&holes, &fa, &fb, &[burn0], 20_000, 3).unwrap();
         // the engine: keep the visible cards, reshuffle every other card into its slots
@@ -5913,12 +5090,24 @@ mod plo67_tests {
             let mut it = rest.into_iter();
             for s in 0..2usize {
                 for k in 0..7 {
-                    deck[7 * s + k] = if k < 4 { holes[s][k].index() } else { it.next().unwrap() };
+                    deck[7 * s + k] = if k < 4 {
+                        holes[s][k].index()
+                    } else {
+                        it.next().unwrap()
+                    };
                 }
             }
             for m in 0..5 {
-                deck[14 + m] = if m < 3 { fa[m].index() } else { it.next().unwrap() };
-                deck[19 + m] = if m < 3 { fb[m].index() } else { it.next().unwrap() };
+                deck[14 + m] = if m < 3 {
+                    fa[m].index()
+                } else {
+                    it.next().unwrap()
+                };
+                deck[19 + m] = if m < 3 {
+                    fb[m].index()
+                } else {
+                    it.next().unwrap()
+                };
             }
             deck[24] = burn0.index();
             deck[25] = it.next().unwrap();
@@ -5931,7 +5120,10 @@ mod plo67_tests {
             deck[27..].copy_from_slice(&tail);
             let g = deal(&[ANTE; 2], &deck);
             for (k, board) in [&g.full_board_a, &g.full_board_b].into_iter().enumerate() {
-                let (r0, r1) = (evaluate_plo5(&g.hole_cards[0], board), evaluate_plo5(&g.hole_cards[1], board));
+                let (r0, r1) = (
+                    evaluate_plo(&g.hole_cards[0], board),
+                    evaluate_plo(&g.hole_cards[1], board),
+                );
                 match r0.cmp(&r1) {
                     std::cmp::Ordering::Greater => won[0][k] += 1.0,
                     std::cmp::Ordering::Less => won[1][k] += 1.0,
@@ -5945,7 +5137,11 @@ mod plo67_tests {
         for s in 0..2 {
             for k in 0..2 {
                 let engine = won[s][k] / trials as f64;
-                assert!((engine - eq[s][k]).abs() < 0.025, "seat {s} board {k}: engine {engine} sampler {}", eq[s][k]);
+                assert!(
+                    (engine - eq[s][k]).abs() < 0.025,
+                    "seat {s} board {k}: engine {engine} sampler {}",
+                    eq[s][k]
+                );
             }
         }
     }
@@ -5976,7 +5172,7 @@ mod plo67_tests {
             assert_settlement(&g, &tag);
             let red = g.burns.iter().filter(|&&c| Variant::burn_is_red(c)).count();
             for s in 0..n {
-                let dealt = mask.as_ref().map_or(true, |m| m[s]);
+                let dealt = mask.as_ref().is_none_or(|m| m[s]);
                 let have = g.hole_cards[s].len();
                 if !dealt {
                     assert_eq!(have, 4, "{tag}: a sitting-out seat never gets extras");
@@ -5986,7 +5182,8 @@ mod plo67_tests {
                     assert!(have <= 4 + red, "{tag}: folded seat {s}");
                 }
                 assert_eq!(g.hole_count_on(s, Street::River), have, "{tag}");
-                let hc = [Street::Flop, Street::Turn, Street::River].map(|st| g.hole_count_on(s, st));
+                let hc =
+                    [Street::Flop, Street::Turn, Street::River].map(|st| g.hole_count_on(s, st));
                 assert!(hc[0] <= hc[1] && hc[1] <= hc[2], "{tag}: counts only grow");
             }
             // every card on the table is distinct

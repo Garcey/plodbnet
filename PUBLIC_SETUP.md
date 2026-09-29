@@ -1,189 +1,98 @@
-# Public build — setup & operations
+# The public build — running it locally, and the one-time account setup
 
-## PRODUCTION (current): Hetzner VPS
+The public build (`PLO5BP_PUBLIC=1`) is the website at wrapgto.com: Study, the
+Trainer and the private home games behind a sign-in, with an admin page at `/admin`
+(users, comps, the System panel: served models, health, maintenance notice). It has
+no live table capture — `/ocr`, `/pokernow` and `/ranges` are stripped. The same
+codebase without the flag is the full local build.
 
-wrapgto.com is served by a Hetzner CCX13 (2 vCPU/8GB) at **87.99.132.209**
-(`ssh root@87.99.132.209`, laptop key). The laptop is DEV ONLY now — its
-`run_public.ps1` no longer starts a tunnel, and its `.env.public` is the
-dev config (localhost base URL + dev login).
+**While the models are in development the whole site is free** for signed-in users
+(`PLO5BP_FREE_FOR_ALL`, default on): no daily trainer quota, Study unlocked, checkout
+closed. The Stripe subscription and the 5-hands-a-day free tier are built and tested
+and come back with `PLO5BP_FREE_FOR_ALL=0`.
 
-- App: `/opt/wrapgto/app` (repo), venv at `.venv`, runs as user `wrapgto`
-  via **`wrapgto.service`** (uvicorn 127.0.0.1:8770; `systemctl
-  status|restart wrapgto`). Env: `/etc/wrapgto/env` (prod config: https
-  base URL, dev login OFF, Google + Stripe keys).
-- Tunnel: **`cloudflared.service`**, config `/etc/cloudflared/config.yml`
-  (apex + www → :8770). No inbound ports open except SSH (Hetzner firewall).
-- Logs: `journalctl -u wrapgto -f` (capped 200M). Security updates:
-  unattended-upgrades. Reboot-safe (verified): both services auto-start.
-- Backups: `/etc/cron.daily/wrapgto-backup` → `/opt/wrapgto/backups/`
-  (14 daily SQLite snapshots, WAL-safe backup API).
-- **Promote a checkpoint to prod** (from the laptop repo):
+Production (the server, deploys, models, backups, alerts) is in
+[docs/ops/PRODUCTION.md](docs/ops/PRODUCTION.md) — this page is about your own PC.
 
-```bash
-scp checkpoints/stub.pt root@87.99.132.209:/opt/wrapgto/app/checkpoints/stub.pt
-ssh root@87.99.132.209 systemctl restart wrapgto
+## Run it on your PC
+
+```powershell
+.\run_public.ps1            # reads .env.public; Ctrl+C stops
+.\run_public.ps1 -Detached  # in the background
 ```
 
-- Deploy code changes: **`scripts/deploy_prod.sh`** (Git Bash; any machine whose
-  key the server accepts). `check` = read-only look at the server; `pack` = what
-  would ship (offline); `stage` = upload, BUILD THE RUST ENGINE and start-test the
-  new code in `/opt/wrapgto/ship-staging` without touching the live site; no
-  argument = stage, then switch: copy of the live code kept in
-  `/opt/wrapgto/backups/app-before-*.tgz`, one restart, health poll, automatic
-  rollback if the app does not come up. It runs the daily DB backup job first.
-  The engine is built by ROOT (rustup lives in `/root`; `wrapgto` is a no-login
-  service account and should stay one) as a wheel in staging, so Python and engine
-  go live together and a failed build changes nothing. Engine matters since
-  2026-09-25: the home games' verifiable shuffle needs `reset_with_deck`
-  (`SKIP_ENGINE=1` reuses the live engine; tables then say "Unverified shuffle").
-  Kill switch: `PLO5BP_HOMEGAME_FAIR=0` in `/etc/wrapgto/env`. A restart ends a
-  home-game hand in progress — `check` shows how many tables are open.
-- **Deploying from a new machine** (one-time, ~10 min). Every machine gets its
-  OWN key — never copy a private key between machines; a lost PC is then one
-  line to revoke.
-  1. On the new machine (PowerShell): `ssh-keygen -t ed25519 -C "wrapgto-<machine>"
-     -f "$env:USERPROFILE\.ssh\wrapgto_<machine>"` — give it a passphrase.
-  2. Once, in an ADMIN PowerShell: `Get-Service ssh-agent | Set-Service
-     -StartupType Automatic; Start-Service ssh-agent`, then (normal shell)
-     `ssh-add "$env:USERPROFILE\.ssh\wrapgto_<machine>"`. Windows keeps the
-     unlocked key for your account, so the passphrase is typed this once.
-  3. From a machine that already has access, append the new `.pub` line to the
-     server's `/root/.ssh/authorized_keys`.
-  4. `~/.ssh/config` on the new machine: `Host wrapgto-prod` / `HostName <the
-     address above>` / `User root` / `IdentityFile ~/.ssh/wrapgto_<machine>` /
-     `IdentitiesOnly yes`.
-  5. `scripts/deploy_prod.sh check` (read-only) must say "connected", "app
-     service: active" and cargo (root) / maturin "ok". The script uses Windows' own
-     `ssh.exe` when it exists (that is the one that talks to the agent) and ships
-     through a temp archive — PowerShell 5.1 pipes are not binary-safe, so never
-     `tar | ssh` from PowerShell. `scripts/deploy_prod.sh pack` shows, offline,
-     exactly what would ship.
-  To revoke a machine: delete its line from `authorized_keys`.
-- **After every deploy** glance at `journalctl -u wrapgto -n 40`: an `OBS-REV
-  MISMATCH` line means the served model and the encoder disagree (see
-  `PLO5BP_OBS_REV` below); `scripts/deploy_prod.sh` prints the app's own health
-  but does not read the model warnings.
-- Scale-up path: Hetzner console → resize to CCX23 (4 vCPU/16GB), ~1 min
-  downtime, nothing else changes.
-
-The public build (`PLO5BP_PUBLIC=1`) serves the trainer + study tabs behind
-Google sign-in with a $10/mo Stripe subscription, a 5-hands/day free trainer
-tier, and an admin dashboard at `/admin` (user list, comp grants, revenue).
-No OCR / live capture is mounted. Everything lives in the same codebase; the
-local build (flag unset) is untouched by any of this.
-
-## Run it (laptop)
+or by hand (Git Bash):
 
 ```bash
 PLO5BP_PUBLIC=1 PLO5BP_DEV_LOGIN=1 \
   .venv/Scripts/python -m uvicorn plo5bp.ui.server:app --port 8770
 ```
 
-- `PLO5BP_DEV_LOGIN=1` enables a **loopback-only** fake sign-in (email box on
-  the landing card) so you can use the app before Google/Stripe are
-  configured. It refuses non-127.0.0.1 clients, but still: **never expose a
-  tunnel while dev login is on** — anyone could sign in as any email,
-  including the admin's. Drop the env var once Google OAuth works.
-- Data: SQLite at `data/public.db` (override `PLO5BP_DB`), per-user trainer
-  stats at `data/trainer_stats/u<id>.json`. Delete the DB to reset everything.
-- The model served is `checkpoints/stub.pt` (same promote flow as always).
-- Your admin account: sign in with the Google account for
-  `themilesgarcia@icloud.com` (override list via `PLO5BP_ADMIN_EMAILS`,
-  comma-separated). Admins bypass the paywall and see the Admin button.
+- `.env.public` (git-ignored) holds your local settings: keep `PLO5BP_BASE_URL=http://127.0.0.1:8770`,
+  `PLO5BP_DEV_LOGIN=1`, and only Stripe **test** keys (`sk_test_…` — the app refuses to
+  start with a live key next to the dev login or a loopback URL).
+- `PLO5BP_DEV_LOGIN=1` = a **loopback-only** fake sign-in (an email box on the landing
+  card) so you can use the app without Google. Never start a tunnel from a dev
+  machine: a second connector on the `wrapgto` tunnel would take a share of the live
+  traffic, and anyone could sign in as anyone.
+- Data: SQLite at `data/public.db` (`PLO5BP_DB` to move it), per-user trainer stats
+  in `data/trainer_stats/`. Delete the folder to start over.
+- The model served is `checkpoints/stub.pt` (no file = a random-init placeholder,
+  flagged "untrained" in the UI).
+- Admins: `PLO5BP_ADMIN_EMAILS` (comma-separated; the default is the owner's
+  address). Admins see the Admin button.
 
-## One-time: Google sign-in credentials
+## One-time: Google sign-in
 
 1. https://console.cloud.google.com/ → create (or pick) a project.
-2. **APIs & Services → OAuth consent screen**: External, app name, your
-   email; add scopes `openid`, `email`, `profile` (non-sensitive). While the
-   app is in "Testing" status, add your + your friends' Gmail addresses under
-   Test users (or publish the app to allow anyone).
-3. **APIs & Services → Credentials → Create credentials → OAuth client ID**:
-   Application type **Web application**. Authorized redirect URIs — add:
-   - `http://127.0.0.1:8770/auth/callback`
-   - `http://localhost:8770/auth/callback`
-   (When you later host/tunnel, add `https://<your-domain>/auth/callback`.)
-4. Export before launching:
+2. **APIs & Services → OAuth consent screen**: External, app name, your email; scopes
+   `openid`, `email`, `profile`. While the app is in "Testing", add the testers'
+   Gmail addresses (or publish it to allow anyone).
+3. **Credentials → Create credentials → OAuth client ID** → Web application.
+   Authorized redirect URIs: `https://wrapgto.com/auth/callback` (production) and, for
+   local testing with real Google sign-in, `http://127.0.0.1:8770/auth/callback`.
+4. Put `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` in `.env.public` (local) or
+   `/etc/wrapgto/env` (production). The landing card then shows "Sign in with Google".
 
-```bash
-export GOOGLE_CLIENT_ID="...apps.googleusercontent.com"
-export GOOGLE_CLIENT_SECRET="..."
-```
+## One-time: Stripe (only when the paywall is back)
 
-The landing card then shows "Sign in with Google" (dev login row disappears
-unless `PLO5BP_DEV_LOGIN=1`).
+1. https://dashboard.stripe.com/ → an account. Start in **Test mode** (keys `sk_test_…`).
+2. Developers → API keys → the **Secret key** → `STRIPE_SECRET_KEY`.
+3. On the first checkout the server creates the "$10 / month" price and remembers it
+   (or pin one with `STRIPE_PRICE_ID`; change the amount with `PLO5BP_PRICE_CENTS`
+   BEFORE the first checkout).
+4. Test card `4242 4242 4242 4242`, any future expiry / CVC.
+5. Webhooks are optional: subscription status is re-checked with Stripe after the
+   paid period ends (and daily), so cancellations are picked up without one. For
+   instant updates: `stripe listen --forward-to 127.0.0.1:8770/stripe/webhook` and
+   `STRIPE_WEBHOOK_SECRET`.
+6. Going live: live-mode keys go ONLY in `/etc/wrapgto/env` on the server. Revenue
+   truth lives in Stripe; the admin page mirrors what the app recorded.
 
-## One-time: Stripe
+## Letting friends in without paying
 
-1. https://dashboard.stripe.com/ → create account. Use **Test mode** first
-   (toggle top-right); test-mode keys start `sk_test_`.
-2. Developers → API keys → copy the **Secret key**:
+They sign in once → they appear in `/admin` → **Grant comp** (full access, no
+billing); **Revoke comp** takes it back. Stripe subscriptions are cancelled in Stripe
+— that button never touches money.
 
-```bash
-export STRIPE_SECRET_KEY="sk_test_..."
-```
+## Free tier (only with `PLO5BP_FREE_FOR_ALL=0`)
 
-3. That's it for the happy path — on first checkout the server auto-creates
-   the "PLO5 Bomb-Pot Trainer — Monthly" $10 price and caches its id in the
-   DB (or pin one yourself via `STRIPE_PRICE_ID`). Change the amount with
-   `PLO5BP_PRICE_CENTS` (default 1000) BEFORE the first checkout.
-4. Test a purchase with card `4242 4242 4242 4242`, any future expiry/CVC.
-5. Webhooks are OPTIONAL on a laptop: subscription status is lazily
-   re-verified against Stripe after the cached period ends (and daily), so
-   cancellations are picked up without a public URL. For instant lifecycle
-   events later:
-   `stripe listen --forward-to 127.0.0.1:8770/stripe/webhook` and export the
-   printed `STRIPE_WEBHOOK_SECRET`.
-6. Go live: flip to Live mode keys, and manage/cancel real subs from the
-   Stripe dashboard. **Revenue truth lives in Stripe**; the admin page's
-   revenue/MRR are convenience mirrors of locally recorded events.
+- Signed-in non-subscribers: **5 trainer hands a day** (UTC reset, `PLO5BP_FREE_HANDS`),
+  counted on New Hand; repeat / review / what-if of those hands are free.
+- Study is for subscribers (the server answers 402 and the page offers the upgrade).
 
-## Letting friends in (before Stripe / instead of paying)
+## Settings for local runs
 
-They sign in with Google once → they appear in `/admin` → click **Grant
-comp**. Comp = full access, no billing. **Revoke comp** takes it back.
-Stripe-sourced subs can't be revoked from the dashboard (cancel in Stripe) —
-that button never touches money.
-
-## Free tier
-
-- Signed-in non-subscribers: **5 trainer hands/day** (UTC reset), counted on
-  New Hand (`PLO5BP_FREE_HANDS` to change). Repeat/review/what-if of those
-  hands is free. The remaining count shows in the top-bar pill.
-- Study mode is subscriber-only (server-enforced 402 + upgrade modal).
-
-## Exposing it beyond the laptop (later)
-
-Quickest: `cloudflared tunnel --url http://127.0.0.1:8770` (or ngrok). Then:
-set `PLO5BP_BASE_URL=https://<tunnel-host>` (OAuth redirects + Stripe return
-URLs derive from it), add that `/auth/callback` to the Google client, and
-REMOVE `PLO5BP_DEV_LOGIN`. Cookies switch to `Secure` automatically when the
-base URL is https. A real deploy (Docker etc.) is the next slice.
-
-## Env reference
-
-| Var | Default | Meaning |
+| Variable | Default | Meaning |
 |---|---|---|
-| `PLO5BP_PUBLIC` | unset | 1 = public build (auth+billing on, live capture off) |
-| `PLO5BP_BASE_URL` | `http://127.0.0.1:8770` | External URL for OAuth/Stripe redirects |
-| `PLO5BP_DB` | `data/public.db` | SQLite path |
-| `PLO5BP_ADMIN_EMAILS` | `themilesgarcia@icloud.com` | Comma-separated admin allowlist |
-| `PLO5BP_FREE_FOR_ALL` | `1` | **1 = the whole site is free** for every signed-in user while the models are in development (no quota, Study unlocked, checkout closed). Set `0` to bring the paywall back |
-| `PLO5BP_OBS_REV` | `2` | **Production sets `1`** (added to `/etc/wrapgto/env` on 2026-09-22): the checkpoints on the server predate the 2026-09-20 observation-semantics fix and must be served with the semantics they were trained on. Without it the log says `OBS-REV MISMATCH` at startup and every recommendation / home-game grade is slightly off. Drop it only when a checkpoint trained at rev 2 is promoted |
-| `PLO5BP_HOMEGAME_FAIR` | `1` | Home games' verifiable shuffle (sealed deck + the players' cut). `0` = deal the old way. Also off by itself when the engine on this machine predates `reset_with_deck` — rebuild it (`scripts/deploy_prod.sh`) |
-| `PLO5BP_HOMEGAME_GRADING` | `1` | Background network grading of every home-game action (`0` = off) |
-| `PLO5BP_FREE_HANDS` | `5` | Free trainer hands per UTC day (only when `PLO5BP_FREE_FOR_ALL=0`) |
-| `PLO5BP_PRICE_CENTS` | `1000` | Monthly price (before first checkout) |
-| `PLO5BP_DEV_LOGIN` | unset | 1 = loopback fake sign-in (testing only). The route is only registered when `PLO5BP_BASE_URL`'s host is loopback, and it rejects any request carrying a forwarding header (XFF, CF-Connecting-IP, Forwarded, …) |
-| `PLO5BP_DEV_LOGIN_TESTCLIENT` | unset | 1 = also accept Starlette's `testclient` host (the test fixtures set it; never in a real deployment) |
-| `PLO5BP_STRIPE_TIMEOUT` | `8` | Seconds before a Stripe status re-check gives up (runs in a threadpool, never on the event loop) |
-| `PLO5BP_STRIPE_GRACE_DAYS` | `3` | On a Stripe ERROR, keep access only until `current_period_end` + this many days ("No such subscription" is INACTIVE immediately) |
-| `PLO5BP_STRIPE_RETRY_S` | `900` | Minimum seconds between Stripe re-checks per user while the status is uncertain |
-| `PLO5BP_HOMEGAME_MAX_TABLES` | `5` | Open home-game tables per host |
-| `PLO5BP_OBS_REV` | `2` | Observation-semantics revision. Set `1` while the served checkpoint was trained before 2026-09-20 (the server logs `OBS-REV MISMATCH` and `/formats` reports `obs_rev_mismatch` when it disagrees with the checkpoint's stamp) |
-| `GOOGLE_CLIENT_ID/SECRET` | unset | Google OAuth (sign-in disabled without) |
-| `STRIPE_SECRET_KEY` | unset | Stripe (checkout 503s without) |
-| `STRIPE_WEBHOOK_SECRET` | unset | Only if running `stripe listen` / hosted webhook |
-| `STRIPE_PRICE_ID` | auto-created | Pin an existing Stripe price |
-| `PLO5BP_MAX_RUNTIMES` | `300` | LRU cap on in-memory per-user states |
-| `PLO5BP_ACTIVE_WINDOW` | `300` | Seconds a user counts as "active" (admin top-bar counter) |
+| `PLO5BP_PUBLIC` | unset | 1 = the public build |
+| `PLO5BP_BASE_URL` | `http://127.0.0.1:8770` | the site's own URL (sign-in redirects, Stripe return URLs; https ⇒ Secure cookies) |
+| `PLO5BP_DEV_LOGIN` | unset | 1 = loopback-only fake sign-in; only registered when the base URL is loopback, and refuses forwarded requests |
+| `PLO5BP_DEV_LOGIN_TESTCLIENT` | unset | tests only: also accept Starlette's test client |
+| `PLO5BP_DB` | `data/public.db` | the SQLite database |
+| `PLO5BP_CHECKPOINT` | `checkpoints/stub.pt` | the PLO5 model |
+| `PLO5BP_OBS_REV` | `2` | set `1` to serve a checkpoint trained before 2026-09-20 exactly as trained (`OBS-REV MISMATCH` in the log / `/health` otherwise) |
+| `PLO5BP_FREE_FOR_ALL` | `1` | `0` = the paywall and the free-tier quota |
+
+Every other setting — models, home games, limits, e-mail sign-in, Stripe timeouts —
+is listed with its default in [ops/env.example](ops/env.example).

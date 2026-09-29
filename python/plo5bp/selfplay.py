@@ -26,31 +26,59 @@ from plo5bp.network import ActorCritic
 
 
 class OpponentPool:
-    """Fixed-capacity FIFO buffer of frozen policy state_dicts.
+    """Frozen policy state_dicts the learner plays against: a fixed-capacity
+    FIFO of recent snapshots, plus -- optional, `set_anchors` -- ANCHORS: older
+    members of the run (--pool-anchors, 2026-09-28, ML-033: the FIFO of 8
+    snapshots every 5 updates only remembers ~40 updates, which lets
+    self-play drift).
 
-    `tags` mirrors `snapshots` 1:1 with the update index each member was
-    snapshotted at (-1 when unknown) — metadata only, so resumed runs can
-    persist `pool_member_updates` in checkpoints and later rebuild the
-    exact membership. Collectors read `snapshots` / `sample()` and never
-    see tags.
+    `snapshots` = the FIFO members, then the anchors; `tags` mirrors it 1:1
+    with the update each member was snapshotted at (-1 when unknown) —
+    metadata only. `fifo_tags` (the FIFO part) is what checkpoints persist as
+    `pool_member_updates`, so a resumed run rebuilds the exact FIFO; anchors
+    are re-derived from the numbered checkpoints. Collectors read `snapshots`
+    / `sample()` and never see tags.
     """
 
     def __init__(self, capacity: int = 16, seed: int | None = None):
         self.capacity = capacity
-        self.snapshots: list[dict[str, Any]] = []
-        self.tags: list[int] = []
+        self._fifo: list[dict[str, Any]] = []
+        self._fifo_tags: list[int] = []
+        self._anchors: list[dict[str, Any]] = []
+        self._anchor_tags: list[int] = []
         # Serial-path sampling RNG, seeded per run (train.py passes the
         # run seed) so serial/eval rollouts reproduce. Previously sampled
         # via the GLOBAL unseeded `random` module (V5_DESIGN.md B8);
         # None preserves that OS-entropy behavior for ad-hoc callers.
         self._rng = random.Random(seed)
 
+    @property
+    def snapshots(self) -> list[dict[str, Any]]:
+        return self._fifo + self._anchors
+
+    @property
+    def tags(self) -> list[int]:
+        return self._fifo_tags + self._anchor_tags
+
+    @property
+    def fifo_tags(self) -> list[int]:
+        return list(self._fifo_tags)
+
+    @property
+    def anchor_tags(self) -> list[int]:
+        return list(self._anchor_tags)
+
+    def set_anchors(self, members: "list[tuple[int, dict[str, Any]]]") -> None:
+        """Replace the anchor members with `members` = [(tag, state_dict)]."""
+        self._anchor_tags = [int(t) for t, _ in members]
+        self._anchors = [sd for _, sd in members]
+
     def _push(self, sd: dict[str, Any], tag: int) -> None:
-        if len(self.snapshots) >= self.capacity:
-            self.snapshots.pop(0)
-            self.tags.pop(0)
-        self.snapshots.append(sd)
-        self.tags.append(int(tag))
+        if len(self._fifo) >= self.capacity:
+            self._fifo.pop(0)
+            self._fifo_tags.pop(0)
+        self._fifo.append(sd)
+        self._fifo_tags.append(int(tag))
 
     def snapshot(self, model: ActorCritic, tag: int = -1) -> None:
         with record_function("step14/pool_snapshot"):
@@ -204,36 +232,117 @@ def seed_pool_from_checkpoints(
         snapshot_every,
         preferred=preferred,
     )
-    ref_shapes = {k: tuple(v.shape) for k, v in reference_state_dict.items()}
     seeded: list[int] = []
     for u in chosen:  # oldest-first → natural FIFO order
-        path = family[u]
-        try:
-            ckpt = torch.load(path, map_location="cpu", weights_only=False)
-        except (OSError, RuntimeError, ValueError) as e:
-            print(f"[pool] skip {path.name}: unreadable ({e})")
-            continue
-        variant = str(ckpt.get("variant", "plo5_double_bomb"))
-        head = int(ckpt.get("head_version", 1))
-        sd = ckpt.get("model")
-        if variant != expected_variant or head != expected_head_version:
-            print(
-                f"[pool] skip {path.name}: variant/head mismatch "
-                f"({variant}, v{head})"
-            )
-            continue
-        obs_rev = int(ckpt.get("obs_rev", 1))
-        if expected_obs_rev is not None and obs_rev != int(expected_obs_rev):
-            print(
-                f"[pool] skip {path.name}: obs_rev mismatch (file "
-                f"{obs_rev} vs run {int(expected_obs_rev)})"
-            )
-            continue
-        if not isinstance(sd, dict) or {
-            k: tuple(v.shape) for k, v in sd.items()
-        } != ref_shapes:
-            print(f"[pool] skip {path.name}: model state shape mismatch")
-            continue
-        pool.seed({k: v.detach().clone().cpu() for k, v in sd.items()}, tag=u)
-        seeded.append(u)
+        sd = load_pool_member(
+            family[u], expected_variant, expected_head_version,
+            reference_state_dict, expected_obs_rev,
+        )
+        if sd is not None:
+            pool.seed(sd, tag=u)
+            seeded.append(u)
     return seeded
+
+
+def load_pool_member(
+    path: "Path",
+    expected_variant: str,
+    expected_head_version: int,
+    reference_state_dict: "dict[str, Any]",
+    expected_obs_rev: "int | None" = None,
+) -> "dict[str, Any] | None":
+    """The actor state dict of a checkpoint that may join this run's pool, or
+    None (with a `[pool] skip` line) when it is unreadable or does not fit:
+    another variant / head version / observation revision (absent = 1), or
+    other parameter names or shapes than `reference_state_dict`."""
+    import torch
+
+    path = Path(path)
+    try:
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    except (OSError, RuntimeError, ValueError) as e:
+        print(f"[pool] skip {path.name}: unreadable ({e})")
+        return None
+    variant = str(ckpt.get("variant", "plo5_double_bomb"))
+    head = int(ckpt.get("head_version", 1))
+    sd = ckpt.get("model")
+    if variant != expected_variant or head != expected_head_version:
+        print(f"[pool] skip {path.name}: variant/head mismatch ({variant}, v{head})")
+        return None
+    obs_rev = int(ckpt.get("obs_rev", 1))
+    if expected_obs_rev is not None and obs_rev != int(expected_obs_rev):
+        print(
+            f"[pool] skip {path.name}: obs_rev mismatch (file "
+            f"{obs_rev} vs run {int(expected_obs_rev)})"
+        )
+        return None
+    ref_shapes = {k: tuple(v.shape) for k, v in reference_state_dict.items()}
+    if not isinstance(sd, dict) or {k: tuple(v.shape) for k, v in sd.items()} != ref_shapes:
+        print(f"[pool] skip {path.name}: model state shape mismatch")
+        return None
+    return {k: v.detach().clone().cpu() for k, v in sd.items()}
+
+
+def select_anchor_updates(
+    available: "list[int]",
+    current_update: int,
+    ages: "list[int]",
+    snapshot_every: int,
+    exclude: "set[int] | None" = None,
+) -> "list[int]":
+    """The pool ANCHORS for `current_update` (--pool-anchors): for each age,
+    the available numbered checkpoint nearest to current_update - age (the
+    target rounded down to the snapshot grid, so the choice only moves every
+    `snapshot_every` updates), never a future one, none twice, none already
+    in the FIFO (`exclude`), none past the run's start (a young run simply
+    has fewer anchors). Returns update numbers oldest-first."""
+    s = max(1, int(snapshot_every))
+    pool_of = sorted({int(a) for a in available if int(a) <= int(current_update)})
+    skip = set(exclude or ())
+    chosen: list[int] = []
+    for age in sorted({int(a) for a in ages if int(a) > 0}):
+        target = ((int(current_update) - age) // s) * s
+        if not pool_of or target < pool_of[0]:
+            continue
+        cands = [a for a in pool_of if a not in skip and a not in chosen]
+        if not cands:
+            break
+        chosen.append(min(cands, key=lambda a: (abs(a - target), a)))
+    return sorted(chosen)
+
+
+def refresh_pool_anchors(
+    pool: OpponentPool,
+    ckpt_path: "Path",
+    current_update: int,
+    ages: "list[int]",
+    snapshot_every: int,
+    expected_variant: str,
+    expected_head_version: int,
+    reference_state_dict: "dict[str, Any]",
+    expected_obs_rev: "int | None" = None,
+    directory: "Path | None" = None,
+) -> "list[int]":
+    """Point `pool`'s anchors at `select_anchor_updates` of the run's numbered
+    checkpoints (`<stem>_<N>.pt` beside `ckpt_path`); an anchor that stays
+    chosen keeps its loaded weights, only newly chosen files are read.
+    Returns the anchor tags."""
+    _, family = discover_checkpoint_family(ckpt_path, directory)
+    chosen = select_anchor_updates(
+        list(family), current_update, ages, snapshot_every, exclude=set(pool.fifo_tags)
+    )
+    if chosen == pool.anchor_tags:
+        return chosen
+    have = dict(zip(pool.anchor_tags, pool._anchors))
+    members: list[tuple[int, dict[str, Any]]] = []
+    for u in chosen:
+        sd = have.get(u)
+        if sd is None:
+            sd = load_pool_member(
+                family[u], expected_variant, expected_head_version,
+                reference_state_dict, expected_obs_rev,
+            )
+        if sd is not None:
+            members.append((u, sd))
+    pool.set_anchors(members)
+    return pool.anchor_tags

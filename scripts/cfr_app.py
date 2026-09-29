@@ -133,13 +133,79 @@ def _start_server(host: str, port: int):
     t = threading.Thread(target=_run, name="cfr-uvicorn", daemon=True)
     t.start()
 
-    for _ in range(100):  # ≤10s
+    # Imports take well under a second now that the API no longer loads torch
+    # (TOOL-020); the generous bound covers a cold disk / antivirus scan.
+    for _ in range(300):  # ≤30s
         if _port_listening(host, port):
             return server, t
         if not t.is_alive():
             raise RuntimeError("CFR server thread died before binding a port")
         time.sleep(0.1)
     raise RuntimeError(f"CFR server did not become ready on {host}:{port}")
+
+
+# ---------------------------------------------------------------------------
+# Closing the window while a solve runs (TOOL-031)
+# ---------------------------------------------------------------------------
+
+_ACTIVE = ("queued", "running", "paused")
+ANSWER_SAVE, ANSWER_CLOSE, ANSWER_CANCEL = "save", "close", "cancel"
+
+
+def _ask_close(job: dict) -> str:
+    """Native Yes / No / Cancel box: stop-and-save, close now, or keep solving."""
+    iters = job.get("iterations_run") or 0
+    msg = (
+        f"A solve is still {job.get('status', 'running')} ({int(iters):,} iterations so far).\n\n"
+        "Yes — stop it and save the strategy, then close (a few seconds)\n"
+        "No — close now (its last live snapshot stays in the Library)\n"
+        "Cancel — keep solving"
+    )
+    if sys.platform == "win32":
+        import ctypes
+
+        # MB_YESNOCANCEL | MB_ICONWARNING | MB_TOPMOST
+        r = ctypes.windll.user32.MessageBoxW(0, msg, "CFR Solver", 0x3 | 0x30 | 0x40000)
+        return {6: ANSWER_SAVE, 7: ANSWER_CLOSE}.get(r, ANSWER_CANCEL)
+    return ANSWER_CLOSE  # other platforms: the pywebview dialog below decides
+
+
+def close_decision(session, ask=_ask_close, *, on_saved=None, wait_secs: float = 60.0) -> bool:
+    """Whether the window may close NOW (True) — the closing-event handler.
+
+    Idle → close. A live solve → ask: Cancel keeps it running; No closes at once
+    (the spawn child dies with the app; its last snapshot is listed in the Library
+    as "interrupted"); Yes requests a graceful stop, keeps the window open while
+    the solver exports its strategy (the UI shows "stopping"), and ``on_saved``
+    closes it from a background thread once the job is final (or after
+    ``wait_secs``).
+    """
+    job = session.active_job()
+    if not job or job.get("status") not in _ACTIVE:
+        return True
+    answer = ask(job)
+    if answer == ANSWER_CANCEL:
+        return False
+    if answer == ANSWER_CLOSE:
+        return True
+    job_id = job.get("job_id")
+    try:
+        session.stop(job_id)
+    except KeyError:
+        return True
+
+    def _wait_then_close() -> None:
+        deadline = time.time() + wait_secs
+        while time.time() < deadline:
+            j = session.get_job(job_id, full=False)
+            if not j or j.get("status") not in _ACTIVE:
+                break
+            time.sleep(0.25)
+        if on_saved is not None:
+            on_saved()
+
+    threading.Thread(target=_wait_then_close, name="cfr-close-after-save", daemon=True).start()
+    return False
 
 
 def _stop_server(server) -> None:
@@ -174,6 +240,8 @@ def _run_desktop(host: str, port: int | None) -> int:
             return 0
 
     icon = str(_ICON) if _ICON.is_file() else None
+    # confirm_close stays False: pywebview's box would ask on EVERY close. The
+    # closing handler below asks only while a solve is running (TOOL-031).
     kwargs = dict(
         title="CFR Solver — NLH",
         url=url,
@@ -186,11 +254,35 @@ def _run_desktop(host: str, port: int | None) -> int:
     # pywebview versions differ on the icon kwarg name / support.
     if icon:
         try:
-            webview.create_window(**kwargs, icon=icon)
+            window = webview.create_window(**kwargs, icon=icon)
         except TypeError:
-            webview.create_window(**kwargs)
+            window = webview.create_window(**kwargs)
     else:
-        webview.create_window(**kwargs)
+        window = webview.create_window(**kwargs)
+
+    def _on_closing() -> bool:
+        try:
+            from plo5bp.cfr_app import server as cfr_server  # the module uvicorn serves
+        except Exception:
+            return True
+        ask = _ask_close
+        if sys.platform != "win32":
+            def ask(job):  # noqa: E306 — pywebview's own two-button dialog
+                ok = window.create_confirmation_dialog(
+                    "CFR Solver", "A solve is still running. Close anyway? "
+                    "Its last live snapshot stays in the Library."
+                )
+                return ANSWER_CLOSE if ok else ANSWER_CANCEL
+        try:
+            return close_decision(cfr_server.session, ask, on_saved=window.destroy)
+        except Exception:
+            _log("close handler failed:\n" + traceback.format_exc())
+            return True
+
+    try:
+        window.events.closing += _on_closing
+    except AttributeError:
+        _log("pywebview without window events — closing will not confirm a running solve")
 
     try:
         webview.start()
@@ -218,6 +310,18 @@ def _run_browser(host: str, port: int, reload: bool) -> int:
     return 0
 
 
+def _is_loopback(host: str) -> bool:
+    h = (host or "").strip().strip("[]").lower()
+    if h == "localhost":
+        return True
+    try:
+        import ipaddress
+
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
+
+
 def main(argv: list[str] | None = None) -> int:
     # Default to desktop when launched via pythonw (no console) or when
     # CFR_APP_DESKTOP=1 is set by the shortcut. Explicit --browser wins.
@@ -225,7 +329,17 @@ def main(argv: list[str] | None = None) -> int:
     env_desktop = os.environ.get("CFR_APP_DESKTOP", "").strip() in ("1", "true", "yes")
 
     p = argparse.ArgumentParser(description="CFR Solver desktop app")
-    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Bind address. Loopback only unless --allow-remote (TOOL-058)",
+    )
+    p.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="Allow a non-loopback --host: ANYONE who can reach this machine can then "
+        "drive the solver and read its files. Same-origin requests only.",
+    )
     p.add_argument(
         "--port",
         type=int,
@@ -252,6 +366,23 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     desktop = bool(args.desktop) and not bool(args.browser)
+    # (TOOL-058) The server's Host-header guard is no defence once the socket is
+    # on the network (a LAN client can send "Host: 127.0.0.1"), so binding a
+    # non-loopback address is refused unless the user asks for it by name.
+    if not _is_loopback(args.host):
+        if not args.allow_remote:
+            print(
+                f"[cfr_app] refusing --host {args.host}: it would expose the solver to the "
+                "network. Use 127.0.0.1, or add --allow-remote if you really mean it.",
+                file=sys.stderr,
+            )
+            return 2
+        os.environ["CFR_APP_ALLOWED_HOSTS"] = "*"  # same-origin only, see server.py
+        print(
+            f"[cfr_app] WARNING: listening on {args.host} — anyone who can reach this "
+            "machine can drive the solver.",
+            file=sys.stderr,
+        )
     try:
         if desktop:
             port = args.port  # None → pick free

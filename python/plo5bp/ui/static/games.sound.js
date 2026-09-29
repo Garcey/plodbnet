@@ -89,19 +89,29 @@
     win(t) { [523, 659, 784, 1047].forEach((f, i) => tone(t + i * 0.09, f, 0.4, 0.17, "triangle")); for (let i = 0; i < 8; i++) clack(t + 0.2 + i * 0.05, 0.7); },
     pot(t) { for (let i = 0; i < 6; i++) clack(t + i * 0.04, 0.75); },
     msg(t) { tone(t, 880, 0.09, 0.1, "sine", 1320); },
+    ask(t) { tone(t, 740, 0.1, 0.12, "sine", 988); tone(t + 0.14, 988, 0.16, 0.12, "sine"); },  // a request waiting for you
     sit(t) { tone(t, 440, 0.12, 0.13, "sine"); tone(t + 0.1, 554, 0.18, 0.13, "sine"); },
     error(t) { tone(t, 220, 0.18, 0.16, "square", 150); },
   };
 
+  // Three kinds of sound, each with its own switch in Preferences (FEAT-011): someone who
+  // only wants to hear their turn used to have to mute everything. The master switch
+  // (`enabled`: the top bar's speaker) still silences them all.
+  const KIND = { turn: "turn", tick: "turn", urgent: "turn", ask: "turn", msg: "chat" };  // the rest: "table"
+  let kinds = { turn: true, chat: true, table: true };
+  const kindOf = (name) => KIND[name] || "table";
+
   HG.sound = {
     unlock,
+    kindOf,
     play(name) {
-      if (!enabled || !SOUNDS[name]) return;
+      if (!enabled || !SOUNDS[name] || kinds[kindOf(name)] === false) return;
       const c = ensure();
       if (!c || c.state !== "running") return;
       try { SOUNDS[name](c.currentTime + 0.005); } catch (_) { /* never break the table */ }
     },
     setEnabled(on) { enabled = !!on; },
+    setKinds(k) { kinds = Object.assign({}, kinds, k); },
     setVolume(v) {
       volume = Math.max(0, Math.min(1, Number(v) || 0));
       if (master) master.gain.value = volume;

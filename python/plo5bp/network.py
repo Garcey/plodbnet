@@ -1,28 +1,35 @@
-"""Actor-critic with hybrid gate + continuous-raise policy head.
+"""The actor and critic networks.
 
-Policy factorises as P(action) = P(gate) * P(chips | gate=Raise). The
-gate is a 3-way Categorical over {Fold, CheckCall, Raise} masked by
-engine legality. The raise amount is a Beta(α, β) sample on [0, 1]
-mapped to chips in [min_raise, max_raise] per env via an affine
-transform; α, β are produced by a small linear head with softplus so
-they stay ≥ 1 (keeps the Beta unimodal and log-prob stable near the
-endpoints). Short shoves are encoded as Raise at u=1 — the engine's
-`max_raise_chips` already clamps to stack.
+Policy (every actor): P(action) = P(gate) * P(size | gate = Raise). The gate
+is a 3-way Categorical over {Fold, CheckCall, Raise} masked by engine
+legality. The raise SIZE is chosen over an anchor ladder of pot fractions
+(plo5bp.sizing: PLO 11 anchors min..pot, NLH 12 with an all-in atom), then
+refined inside the anchor's bracket by a Beta slider. Actor generations,
+sniffed from their head tensors (`model_class_for_state_dict`):
 
-For PPO, log-prob is `log P(gate) + 1[gate==Raise] * log p(u)` in
-u-space, and entropy is `H(Cat) + P(gate==Raise) * H(Beta)` — the
-conditional weighting matches the generative process. The Beta head
-is masked to a deterministic 0-log-prob / 0-entropy contribution in
-two regimes (symmetrically in `act` and `evaluate` to keep the PPO
-ratio at 1.0):
+  - ActorCriticV5 (head_version 4, `mix_head`) -- the production head (every
+    vSix stem): a K-component mixture of discretized logistics over the
+    anchors. Its anchor marginal is a plain Categorical, so log-prob and
+    entropy are exact closed forms.
+  - ActorCriticV4 (3, `size_head`) -- one discretized logistic (mu, s).
+  - ActorCriticV2 (2, `anchor_head`) -- a flat anchor Categorical.
+  - ActorCritic (v1, `raise_head`) -- the retired Beta-over-[min, max] raise
+    head; kept only so v1 checkpoints still load and serve (training refuses
+    them).
 
-  - `min_raise == max_raise` — pot-corner / max-equals-min: the
-    chips action is deterministic regardless of u.
-  - `min_raise == 0` (with `max_raise > 0`) — sub-min-raise stack:
-    the env redirects GATE_RAISE to `apply(Action::AllIn)` and
-    ignores the chip amount, so the Beta sample is moot. Masking
-    the Beta head's gradient prevents the policy from training a
-    raise-amount distribution that the env never consults.
+Every actor has an observation-only "display" value head (the UI's EV). The
+TRAINING values come from `CentralCritic`, which also sees every opponent's
+hole cards (a distributional HL-Gauss value head plus a dueling Q head on the
+v6 stems).
+
+For PPO the joint log-prob is log P(gate) + 1[Raise] * (log P(anchor) +
+log p(u | anchor)) and the entropy H(gate) + P(Raise) * (H(anchor) +
+sum_k p_k H(Beta_k)); `act` and `evaluate` mask the degenerate brackets
+symmetrically, so the PPO ratio is exactly 1 at the start of an update.
+Checkpoints describe themselves: `actor_arch` / `critic_arch` (stamped as
+ckpt["arch"] by the trainer) and `build_actor_from_checkpoint` /
+`build_critic_from_checkpoint` rebuild both networks without the caller
+passing a size.
 """
 
 from __future__ import annotations
@@ -141,6 +148,38 @@ _ACT_MODULES = {"relu": nn.ReLU, "silu": nn.SiLU, "gelu": nn.GELU}
 _ACT_IDS = {"relu": 0, "silu": 1, "gelu": 2}
 
 
+def _build_torso(
+    hidden_dim: int, obs_dim: int, num_layers: int, torso_layernorm: bool
+) -> nn.Sequential:
+    """The actors' shared MLP torso (every generation builds it the same way;
+    parameter names and construction order -- hence the random init -- are
+    part of the checkpoint format):
+
+    - `num_layers <= 2`: flat `Sequential(Linear, ReLU, [Linear, ReLU]*)`
+      (`torso.0.weight`, `torso.2.weight`: the original 128x2 layout).
+    - `num_layers >= 3`: an input projection + `num_layers - 1` residual
+      blocks (`torso.0.0.weight`, `torso.{i}.linear.weight`) -- without the
+      residuals the 2048x4 net fails to train; `torso_layernorm` adds the v6
+      pre-norm (`torso.{i}.norm.weight`)."""
+    if num_layers < 1:
+        raise ValueError(f"num_layers must be >= 1, got {num_layers}")
+    if torso_layernorm and num_layers < 3:
+        raise ValueError(
+            "torso_layernorm requires num_layers >= 3 (the residual torso)"
+        )
+    if num_layers >= 3:
+        input_block = nn.Sequential(nn.Linear(obs_dim, hidden_dim), nn.ReLU())
+        blocks: list[nn.Module] = [
+            _ResidualBlock(hidden_dim, use_norm=torso_layernorm)
+            for _ in range(num_layers - 1)
+        ]
+        return nn.Sequential(input_block, *blocks)
+    layers: list[nn.Module] = [nn.Linear(obs_dim, hidden_dim), nn.ReLU()]
+    for _ in range(num_layers - 1):
+        layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
+    return nn.Sequential(*layers)
+
+
 class ActorCritic(nn.Module):
     """Shared MLP torso, gate + raise + value heads.
 
@@ -161,24 +200,7 @@ class ActorCritic(nn.Module):
         torso_layernorm: bool = False,
     ):
         super().__init__()
-        if num_layers < 1:
-            raise ValueError(f"num_layers must be >= 1, got {num_layers}")
-        if torso_layernorm and num_layers < 3:
-            raise ValueError(
-                "torso_layernorm requires num_layers >= 3 (the residual torso)"
-            )
-        if num_layers >= 3:
-            input_block = nn.Sequential(nn.Linear(obs_dim, hidden_dim), nn.ReLU())
-            blocks: list[nn.Module] = [
-                _ResidualBlock(hidden_dim, use_norm=torso_layernorm)
-                for _ in range(num_layers - 1)
-            ]
-            self.torso = nn.Sequential(input_block, *blocks)
-        else:
-            layers: list[nn.Module] = [nn.Linear(obs_dim, hidden_dim), nn.ReLU()]
-            for _ in range(num_layers - 1):
-                layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
-            self.torso = nn.Sequential(*layers)
+        self.torso = _build_torso(hidden_dim, obs_dim, num_layers, torso_layernorm)
         self.gate_head = nn.Linear(hidden_dim, GATE_ACTIONS)
         # Two outputs → (α, β). softplus+1 keeps them ≥ 1 so the Beta is
         # unimodal and log-prob doesn't blow up at u∈{0,1}.
@@ -369,24 +391,7 @@ class ActorCriticV2(nn.Module):
         torso_layernorm: bool = False,
     ):
         super().__init__()
-        if num_layers < 1:
-            raise ValueError(f"num_layers must be >= 1, got {num_layers}")
-        if torso_layernorm and num_layers < 3:
-            raise ValueError(
-                "torso_layernorm requires num_layers >= 3 (the residual torso)"
-            )
-        if num_layers >= 3:
-            input_block = nn.Sequential(nn.Linear(obs_dim, hidden_dim), nn.ReLU())
-            blocks: list[nn.Module] = [
-                _ResidualBlock(hidden_dim, use_norm=torso_layernorm)
-                for _ in range(num_layers - 1)
-            ]
-            self.torso = nn.Sequential(input_block, *blocks)
-        else:
-            layers: list[nn.Module] = [nn.Linear(obs_dim, hidden_dim), nn.ReLU()]
-            for _ in range(num_layers - 1):
-                layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
-            self.torso = nn.Sequential(*layers)
+        self.torso = _build_torso(hidden_dim, obs_dim, num_layers, torso_layernorm)
         # The spec is the variant's ladder (PLO 11 anchors / NLH 12 with
         # the all-in atom). Atoms are always first+last, so the refine
         # head is `count - 2` interior slots in every spec.
@@ -576,11 +581,14 @@ class ActorCriticV2(nn.Module):
         torch.Tensor, torch.Tensor, torch.Tensor,
         torch.Tensor, torch.Tensor, torch.Tensor,
         torch.Tensor, torch.Tensor,
+        torch.Tensor, torch.Tensor, torch.Tensor,
     ]:
         """Return (log_prob, entropy, display_value, gate_H, anchor_H,
-        beta_H_eff, gate_log_prob, anchor_log_prob) for stored actions.
-        The last two are the per-head log-prob components (for per-head
-        KL diagnostics in the trainer).
+        beta_H_eff, gate_log_prob, anchor_log_prob, gate_logits,
+        anchor_head_out, refine) for stored actions. gate/anchor log-probs
+        are the per-head components (per-head KL diagnostics in the trainer);
+        the last three are the raw head outputs, reused by the KL-anchor
+        magnet instead of a second forward.
 
         Entropy follows the generative process:
         H(gate) + P(Raise) · (H(anchor) + Σ_k p_k · H(Beta_k) · refine_ok_k).
@@ -1049,19 +1057,51 @@ def _torso_has_norm(state_dict: dict) -> bool:
     return any(".norm.weight" in k for k in state_dict)
 
 
+def state_dict_actor_size(state_dict: dict) -> "tuple[int, int]":
+    """(hidden_dim, num_layers) of an actor state dict, read off its torso
+    (`_build_torso`'s two layouts): a residual torso has `torso.0.0.weight`
+    plus one `torso.<i>.*` block per extra layer; a flat one has one
+    `torso.<2k>.weight` Linear per layer."""
+    if "torso.0.0.weight" in state_dict:
+        hidden = int(state_dict["torso.0.0.weight"].shape[0])
+        blocks = {
+            k.split(".")[1] for k in state_dict
+            if k.startswith("torso.") and k.split(".")[1] != "0"
+        }
+        return hidden, 1 + len(blocks)
+    hidden = int(state_dict["torso.0.weight"].shape[0])
+    linears = [
+        k for k in state_dict
+        if k.startswith("torso.") and k.count(".") == 2 and k.endswith(".weight")
+    ]
+    return hidden, len(linears)
+
+
 def build_actor_from_state_dict(
-    state_dict: dict, hidden_dim: int, num_layers: int
+    state_dict: dict,
+    hidden_dim: "int | None" = None,
+    num_layers: "int | None" = None,
 ) -> nn.Module:
-    """Build the actor a checkpoint was saved from: sniffs the head
-    class, the trained obs width (constructing at the current OBS_DIM
-    default would shape-fail on 959-era checkpoints), and the anchor
-    spec (PLO 11 / NLH 12), then loads the weights. Pair with
+    """Build the actor a checkpoint was saved from: sniffs the head class, the
+    torso size (`state_dict_actor_size`), the trained obs width (constructing
+    at the current OBS_DIM default would shape-fail on 959-era checkpoints),
+    the LayerNorm'd torso and the anchor spec (PLO 11 / NLH 12), then loads
+    the weights strictly. `hidden_dim` / `num_layers` are optional
+    CROSS-CHECKS (2026-09-28, ML-017): a caller that passes a size the weights
+    do not have gets an error instead of a silent default. Pair with
     `obs_adapter` at inference time."""
     cls = model_class_for_state_dict(state_dict)
+    hid, nl = state_dict_actor_size(state_dict)
+    for name, want, have in (("hidden_dim", hidden_dim, hid), ("num_layers", num_layers, nl)):
+        if want is not None and int(want) != have:
+            raise ValueError(
+                f"{name}={want} was asked for, but the weights are {name}={have} "
+                f"(an actor of {hid}x{nl})"
+            )
     kwargs = dict(
-        hidden_dim=hidden_dim,
+        hidden_dim=hid,
         obs_dim=state_dict_obs_dim(state_dict),
-        num_layers=num_layers,
+        num_layers=nl,
         torso_layernorm=_torso_has_norm(state_dict),
     )
     count = state_dict_anchor_count(state_dict)
@@ -1073,6 +1113,126 @@ def build_actor_from_state_dict(
     model = cls(**kwargs)
     model.load_state_dict(state_dict)
     return model
+
+
+# ---- self-describing checkpoints (2026-09-28, ML-031) ----------------------
+# The trainer stamps ckpt["arch"] = {"actor": actor_arch(model), "critic":
+# critic_arch(critic)}: every constructor argument, including the ones no
+# tensor shape reveals (the v7 Q-surface flags, the value support, the
+# critic's activation). A NEW top-level key: loaders that predate it ignore
+# it, and a checkpoint without it rebuilds by sniffing as before.
+_ACTOR_CLASSES = {
+    "ActorCritic": ActorCritic,
+    "ActorCriticV2": ActorCriticV2,
+    "ActorCriticV4": ActorCriticV4,
+    "ActorCriticV5": ActorCriticV5,
+}
+
+
+def actor_arch(model: nn.Module) -> dict:
+    """Every constructor argument of an actor, as plain JSON-able values."""
+    first = model.torso[0]
+    lin = first[0] if isinstance(first, nn.Sequential) else first
+    residual = isinstance(first, nn.Sequential)
+    arch: dict = {
+        "class": type(model).__name__,
+        "head_version": int(model.head_version),
+        "hidden_dim": int(lin.out_features),
+        "obs_dim": int(lin.in_features),
+        "num_layers": (len(model.torso) if residual
+                       else sum(isinstance(m, nn.Linear) for m in model.torso)),
+        "torso_layernorm": any(
+            isinstance(m, _ResidualBlock) and m.norm is not None for m in model.torso
+        ),
+    }
+    spec = getattr(model, "anchor_spec", None)
+    if spec is not None:
+        arch["anchor_spec"] = spec.name
+        arch["anchor_count"] = int(spec.count)
+    if hasattr(model, "_size_floor"):
+        arch["size_scale_floor"] = float(model._size_floor)
+        arch["size_scale_cap"] = float(model._size_floor + model._size_span)
+    if hasattr(model, "_mixture_k"):
+        arch["mixture_k"] = int(model._mixture_k)
+        arch["mix_weight_floor"] = float(model._mix_floor)
+    return arch
+
+
+def critic_arch(critic: "CentralCritic") -> dict:
+    """Every constructor argument of a CentralCritic, as plain values."""
+    return {
+        "class": "CentralCritic",
+        "obs_dim": int(critic.obs_dim),
+        "hidden_dim": int(critic.torso[0][0].out_features),
+        "num_blocks": len(critic.torso) - 1,
+        "q_actions": int(critic.q_actions),
+        "torso_layernorm": any(
+            isinstance(m, _ResidualBlock) and m.norm is not None for m in critic.torso
+        ),
+        "value_bins": int(critic.value_bins),
+        "value_support": float(critic.value_support),
+        "hlgauss_sigma": float(critic.hlgauss_sigma_bins),
+        "q_fold_zero": bool(critic.q_fold_zero),
+        "q_base_raw": bool(critic.q_base_raw),
+        "act": str(critic.act_name),
+        "in_norm": bool(critic.in_norm),
+        "v_raw": bool(critic.v_raw),
+    }
+
+
+def actor_from_arch(arch: dict) -> nn.Module:
+    """A fresh (untrained) actor built from `actor_arch`'s description."""
+    kw = {k: v for k, v in arch.items()
+          if k not in ("class", "head_version", "anchor_spec", "anchor_count")}
+    if "anchor_count" in arch:
+        kw["anchor_spec"] = anchor_spec_for_count(int(arch["anchor_count"]))
+    return _ACTOR_CLASSES[arch["class"]](**kw)
+
+
+def critic_from_arch(arch: dict) -> "CentralCritic":
+    """A fresh (untrained) critic built from `critic_arch`'s description."""
+    return CentralCritic(**{k: v for k, v in arch.items() if k != "class"})
+
+
+def _ckpt_arch(ckpt: dict, part: str) -> "dict | None":
+    arch = ckpt.get("arch")
+    return arch.get(part) if isinstance(arch, dict) else None
+
+
+def build_actor_from_checkpoint(ckpt: dict, ema: bool = False) -> nn.Module:
+    """The actor of a checkpoint dict, weights loaded. `ema=True` takes the
+    KL-anchor EMA weights (`model_ema`; ValueError when the run kept none).
+    Uses ckpt["arch"] when present (written since 2026-09-28), else sniffs the
+    state dict -- the same network for every existing checkpoint."""
+    sd = ckpt.get("model_ema") if ema else ckpt.get("model", ckpt)
+    if ema and not sd:
+        raise ValueError("this checkpoint carries no EMA actor (model_ema)")
+    arch = _ckpt_arch(ckpt, "actor")
+    if arch:
+        model = actor_from_arch(arch)
+        model.load_state_dict(sd)
+        return model
+    return build_actor_from_state_dict(sd)
+
+
+def build_critic_from_checkpoint(ckpt: dict) -> "CentralCritic":
+    """The centralized critic of a checkpoint dict, weights loaded -- with the
+    Q-surface flags and the value support the run trained with (from
+    ckpt["arch"] when present, else from ckpt["config"])."""
+    sd = ckpt["critic"]
+    arch = _ckpt_arch(ckpt, "critic")
+    if arch:
+        critic = critic_from_arch(arch)
+        critic.load_state_dict(sd)
+        return critic
+    cfg = ckpt.get("config") or {}
+    return build_critic_from_state_dict(
+        sd,
+        q_fold_zero=bool(cfg.get("q_fold_zero", False)),
+        q_base_raw=bool(cfg.get("q_base_raw", False)),
+        value_support=cfg.get("value_support"),
+        value_hlgauss_sigma=cfg.get("value_hlgauss_sigma"),
+    )
 
 
 def opp_holes_multihot(holes: torch.Tensor) -> torch.Tensor:
@@ -1135,6 +1295,10 @@ class CentralCritic(nn.Module):
         if act not in _ACTS:
             raise ValueError(f"critic act must be one of {sorted(_ACTS)}, got {act!r}")
         self.act_name = act
+        # Constructor arguments not recoverable exactly from the weights
+        # (critic_arch / ckpt["arch"]): the support in bb and sigma in bin widths.
+        self.value_support = float(value_support)
+        self.hlgauss_sigma_bins = float(hlgauss_sigma)
         self.in_norm = bool(in_norm)
         self.v_raw = bool(v_raw)
         layers: list[nn.Module] = [nn.Linear(obs_dim + opp_dim, hidden_dim)]

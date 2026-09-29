@@ -46,6 +46,11 @@ fn map_err(e: CfrError) -> PyErr {
     poll_every=500,
     pause_file="",
     progress_file="",
+    progress_secs=2.0,
+    report_path="",
+    root_extra=None,
+    expl_check_secs=0.0,
+    ram_budget_mb=0,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn cfr_solve<'py>(
@@ -76,6 +81,11 @@ pub fn cfr_solve<'py>(
     poll_every: u32,
     pause_file: &str,
     progress_file: &str,
+    progress_secs: f64,
+    report_path: &str,
+    root_extra: Option<Vec<(String, String)>>,
+    expl_check_secs: f64,
+    ram_budget_mb: u64,
 ) -> PyResult<Bound<'py, PyDict>> {
     let street = street_from_u8(street)?;
     let rid = if root_id.is_empty() {
@@ -112,10 +122,30 @@ pub fn cfr_solve<'py>(
         poll_every: poll_every.max(1),
         pause_file: pause_file.to_string(),
         progress_file: progress_file.to_string(),
+        progress_secs,
+        report_path: report_path.to_string(),
+        expl_check_secs,
+        ram_budget_mb,
     };
     // Release the GIL so the FastAPI / desktop event loop can keep serving
     // progress polls while a long solve runs (was the main "app freezes" bug).
-    let report = py.allow_threads(|| solve(&root, &config)).map_err(map_err)?;
+    // (TOOL-006) With `report_path` the report is streamed to that file here,
+    // still without the GIL, and only its scalars come back to Python.
+    let extra = root_extra.unwrap_or_default();
+    let report = py
+        .detach(|| -> Result<_, CfrError> {
+            let rep = solve(&root, &config)?;
+            if !config.report_path.is_empty()
+                && !rep.write_json_file(std::path::Path::new(&config.report_path), &extra)
+            {
+                return Err(CfrError::InvalidConfig(format!(
+                    "could not write the report to {}",
+                    config.report_path
+                )));
+            }
+            Ok(rep)
+        })
+        .map_err(map_err)?;
 
     let d = PyDict::new(py);
     d.set_item("status", report.status)?;
@@ -178,10 +208,25 @@ pub fn cfr_solve<'py>(
     cfg_d.set_item("poll_every", report.config.poll_every)?;
     cfg_d.set_item("pause_file", report.config.pause_file.clone())?;
     cfg_d.set_item("progress_file", report.config.progress_file.clone())?;
+    cfg_d.set_item("progress_secs", report.config.progress_secs)?;
+    cfg_d.set_item("report_path", report.config.report_path.clone())?;
+    cfg_d.set_item("expl_check_secs", report.config.expl_check_secs)?;
+    cfg_d.set_item("ram_budget_mb", report.config.ram_budget_mb)?;
     d.set_item("config", cfg_d)?;
 
-    let strat = strategy_to_pydict(py, &report.strategy)?;
-    d.set_item("strategy", strat)?;
+    if report.config.report_path.is_empty() {
+        let strat = strategy_to_pydict(py, &report.strategy)?;
+        d.set_item("strategy", strat)?;
+    } else {
+        // (TOOL-006) The strategy lives in the file; hand back its summary.
+        let sd = PyDict::new(py);
+        sd.set_item("root_id", report.strategy.root_id.clone())?;
+        sd.set_item("schema_version", report.strategy.schema_version)?;
+        sd.set_item("num_infosets", report.strategy.infosets.len())?;
+        sd.set_item("infosets_omitted", true)?;
+        sd.set_item("report_path", report.config.report_path.clone())?;
+        d.set_item("strategy", sd)?;
+    }
     Ok(d)
 }
 
@@ -239,6 +284,9 @@ pub fn cfr_induce_range(
     raise_sizes_pm=vec![330, 500, 1000, 1500],
     progress_file="",
     line=None,
+    bb_chips=10000,
+    sb_chips=5000,
+    ante_chips=5000,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn cfr_pipeline<'py>(
@@ -258,8 +306,12 @@ pub fn cfr_pipeline<'py>(
     raise_sizes_pm: Vec<u32>,
     progress_file: &str,
     line: Option<Vec<String>>,
+    bb_chips: u64,
+    sb_chips: u64,
+    ante_chips: u64,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let mut pf = RootSpec::preflop_hu(stack_bb, 10_000, 5_000, 5_000);
+    // (TOOL-050) The stakes used to be fixed at the ClubGG 10k/5k/5k chips.
+    let mut pf = RootSpec::preflop_hu(stack_bb, bb_chips, sb_chips, ante_chips);
     if !raise_sizes_pm.is_empty() {
         pf.raise_sizes_pm = raise_sizes_pm;
     }
@@ -302,7 +354,7 @@ pub fn cfr_pipeline<'py>(
     // ["RAISE_500", "CHECK_CALL"]) takes precedence over the legacy
     // `ip_action` / `oop_action` indices (review 2026-09-20 D9).
     let pipe = py
-        .allow_threads(|| match line {
+        .detach(|| match line {
             Some(ref labels) => super::pipeline::solve_preflop_to_postflop_line(
                 &pf,
                 &pcfg,
@@ -348,10 +400,7 @@ pub fn cfr_pipeline<'py>(
     d.set_item("notes", pipe.notes.clone())?;
     d.set_item("line", pipe.line.clone())?;
     d.set_item("preflop_notes", pipe.preflop.notes.clone())?;
-    d.set_item(
-        "induced_oop_mass",
-        pipe.induced_oop.iter().sum::<f64>(),
-    )?;
+    d.set_item("induced_oop_mass", pipe.induced_oop.iter().sum::<f64>())?;
     d.set_item("induced_ip_mass", pipe.induced_ip.iter().sum::<f64>())?;
     // Full strategies for overnight training dumps
     d.set_item(
@@ -392,6 +441,15 @@ fn infoset_to_pydict<'py>(
     idict.set_item("probs", is.probs.clone())?;
     if let Some(v) = is.visit_mass {
         idict.set_item("visit_mass", v)?;
+    }
+    if let Some(v) = is.visits {
+        idict.set_item("visits", v)?;
+    }
+    if let Some(v) = is.ev_bb {
+        idict.set_item("ev_bb", v)?;
+    }
+    if let Some(v) = is.equity {
+        idict.set_item("equity", v)?;
     }
     if is.schema_version > 0 {
         idict.set_item("schema_version", is.schema_version)?;
@@ -442,4 +500,127 @@ fn infoset_to_pydict<'py>(
         }
     }
     Ok(idict)
+}
+
+/// (TOOL-029) The native range parser, for the desktop app's cross-check:
+/// `spec` → 1326 combo weights (board-blocked combos 0). ValueError on a bad
+/// token, exactly as a solve would refuse it.
+#[pyfunction]
+#[pyo3(signature = (spec, board=vec![]))]
+pub fn cfr_parse_range(spec: &str, board: Vec<u8>) -> PyResult<Vec<f64>> {
+    super::range::Range::parse(spec, &board)
+        .map(|r| r.weights)
+        .map_err(map_err)
+}
+
+/// (TOOL-032) Memory / size estimate of a solve BEFORE running it — what the
+/// solver itself checks to refuse a root (`refuse_reason` set when it would).
+#[pyfunction]
+#[pyo3(signature = (
+    street,
+    pot_bb,
+    effective_stack_bb,
+    board,
+    raise_sizes_pm,
+    max_iterations=200,
+    thread_num=1,
+    card_abstraction="none",
+    num_seats=2,
+    bb_chips=10000,
+    sb_chips=5000,
+    ante_chips=5000,
+    allin_atom=true,
+    stacks_bb=vec![],
+    ram_budget_mb=0,
+    time_budget_secs=0.0,
+    algorithm="dcfr",
+    range_oop="",
+    range_ip="",
+))]
+#[allow(clippy::too_many_arguments)]
+pub fn cfr_estimate_memory<'py>(
+    py: Python<'py>,
+    street: u8,
+    pot_bb: f64,
+    effective_stack_bb: f64,
+    board: Vec<u8>,
+    raise_sizes_pm: Vec<u32>,
+    max_iterations: u32,
+    thread_num: u32,
+    card_abstraction: &str,
+    num_seats: u8,
+    bb_chips: u64,
+    sb_chips: u64,
+    ante_chips: u64,
+    allin_atom: bool,
+    stacks_bb: Vec<f64>,
+    ram_budget_mb: u64,
+    time_budget_secs: f64,
+    algorithm: &str,
+    range_oop: &str,
+    range_ip: &str,
+) -> PyResult<Bound<'py, PyDict>> {
+    let street = street_from_u8(street)?;
+    let root = RootSpec {
+        num_seats,
+        street,
+        pot_bb,
+        effective_stack_bb,
+        bb_chips,
+        sb_chips,
+        ante_chips,
+        board,
+        raise_sizes_pm,
+        allin_atom,
+        // (TOOL-008) the full-range solver's report holds a row per hand IN
+        // the range, so its estimate reads them (the sampled one ignores them).
+        range_ip: range_ip.to_string(),
+        range_oop: range_oop.to_string(),
+        stacks_bb,
+        root_id: "estimate".into(),
+    };
+    root.validate_for_solve().map_err(map_err)?;
+    let mut cfg = SolveConfig::default();
+    cfg.max_iterations = max_iterations;
+    cfg.thread_num = thread_num.max(1);
+    cfg.card_abstraction = card_abstraction.to_string();
+    cfg.ram_budget_mb = ram_budget_mb;
+    cfg.time_budget_secs = time_budget_secs;
+    cfg.algorithm = algorithm.to_string();
+    if !cfg.is_vector()
+        && root.street == StreetRoot::Flop
+        && root.num_seats == 2
+        && matches!(card_abstraction, "" | "none")
+    {
+        cfg.card_abstraction = "ochs".into(); // what solve() does for a flop root
+    }
+    let (est, refuse) = py.detach(|| {
+        let est = super::memory::estimate_solve_memory(&root, &cfg);
+        let refuse = if cfg.is_vector() {
+            // (TOOL-008) the full-range solver's own up-front check.
+            super::vector::check_root(&root, &cfg)
+                .err()
+                .map(|e| e.to_string())
+        } else if root.num_seats == 2 && root.street != StreetRoot::Preflop {
+            super::memory::refuse_if_unsafe(&root, &cfg)
+                .err()
+                .map(|e| e.to_string())
+        } else {
+            None
+        };
+        (est, refuse)
+    });
+    let d = PyDict::new(py);
+    d.set_item("est_infosets", est.est_infosets)?;
+    d.set_item("est_bytes", est.est_bytes)?;
+    d.set_item("est_mb", est.mb())?;
+    d.set_item("one_runout_bytes", est.one_runout_bytes)?;
+    d.set_item("public_nodes", est.public_nodes)?;
+    d.set_item("private_views", est.private_views)?;
+    d.set_item("card_abstraction", cfg.card_abstraction.clone())?;
+    d.set_item("tree_truncated", est.tree_truncated)?;
+    d.set_item("budget_bytes", cfg.ram_budget_bytes())?;
+    d.set_item("refuse_reason", refuse)?;
+    d.set_item("algorithm", cfg.algorithm.clone())?;
+    Ok(d)
 }

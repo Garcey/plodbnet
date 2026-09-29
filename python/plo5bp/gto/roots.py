@@ -8,12 +8,17 @@ this stake structure. Chip unit matches the rest of the project:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterator, Sequence
-
-import numpy as np
+from typing import TYPE_CHECKING, Iterator, Sequence
 
 from plo5bp.config import VARIANT_NLH, GameConfig
-from plo5bp.sizing import NLH_ANCHOR_SPEC
+
+if TYPE_CHECKING:  # numpy is imported where the sampler runs (TOOL-020)
+    import numpy as np
+
+# ``plo5bp.sizing.NLH_ANCHOR_SPEC.name``, spelled out so importing the roots (and
+# with them ``cfr_api``) does not load torch through sizing.py (TOOL-020). Pinned
+# equal by tests/python/gto/test_gto_import_cost.py.
+NLH_ANCHOR_SPEC_NAME = "nlh_overbet"
 
 
 # Locked ClubGG reference table (user decision 2026-07-16).
@@ -37,7 +42,7 @@ class ClubGGRoot:
     default_stack_bb: float = CLUBGG_DEFAULT_STACK_BB
     stack_min_bb: float = CLUBGG_STACK_MIN_BB
     stack_max_bb: float = CLUBGG_STACK_MAX_BB
-    anchor_spec_name: str = NLH_ANCHOR_SPEC.name
+    anchor_spec_name: str = NLH_ANCHOR_SPEC_NAME
 
     def game_config(
         self,
@@ -153,6 +158,8 @@ def sample_train_roots(
     Day-1 labels are **HU-heavy postflop** (unique NE, measurable). Multiway
     seats may be requested later; T1 still *plays* 2–6 via net generalization.
     """
+    import numpy as np
+
     rng = np.random.default_rng(int(seed))
     out: list[RootSample] = []
     seat_choices = list(seats)

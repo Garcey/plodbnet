@@ -1,0 +1,64 @@
+# /etc/systemd/system/wrapgto.service — the WrapGTO web app (uvicorn on 127.0.0.1:8770,
+# reached only through the Cloudflare tunnel). Before replacing the live unit, compare:
+#   systemctl cat wrapgto        (ops/SERVER_SETUP.md, "Moving the current server over")
+[Unit]
+Description=WrapGTO web app
+Documentation=file:///opt/wrapgto/app/ops/SERVER_SETUP.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=wrapgto
+Group=wrapgto
+WorkingDirectory=/opt/wrapgto/app
+EnvironmentFile=/etc/wrapgto/env
+# A writable HOME / cache for the libraries (the code and the venv are read-only).
+Environment=PYTHONUNBUFFERED=1 HOME=/var/lib/wrapgto XDG_CACHE_HOME=/var/cache/wrapgto
+StateDirectory=wrapgto
+CacheDirectory=wrapgto
+# Exactly ONE process — never --workers: the live home-game tables live in this
+# process's memory, and a second process on the same database refuses to start
+# (homegame._take_process_lock). --timeout-graceful-shutdown: open live streams (SSE)
+# would otherwise keep uvicorn from ever reaching its shutdown hooks (the grader's
+# drain), so every stop would wait for systemd's kill.
+ExecStart=/opt/wrapgto/app/.venv/bin/python -m uvicorn plo5bp.ui.server:app --host 127.0.0.1 --port 8770 --no-server-header --timeout-graceful-shutdown 3
+Restart=on-failure
+RestartSec=5
+# torch and the models load before the app listens
+TimeoutStartSec=180
+TimeoutStopSec=30
+
+# --- Sandboxing (SEC-030). The deploy makes the code root-owned and read-only; the
+# service may write only its data (users, games, backups-in-progress) and the
+# checkpoints folder (the admin page's no-restart model promote swaps files there).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/wrapgto/app/data /opt/wrapgto/app/checkpoints
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
+LimitNOFILE=65536
+# Not set on purpose: MemoryDenyWriteExecute (breaks JIT code in the numeric
+# libraries) and SystemCallFilter (torch's thread pools use NUMA/affinity calls
+# outside @system-service). Check the result with: systemd-analyze security wrapgto
+
+[Install]
+WantedBy=multi-user.target

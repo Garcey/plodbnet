@@ -13,7 +13,6 @@ H7 (OCR never locks a duplicate card) and I10 (tick idles outside PLO5).
 
 from __future__ import annotations
 
-import asyncio
 import sys
 import types
 
@@ -26,6 +25,8 @@ from plo5bp.config import GameConfig  # noqa: E402
 from plo5bp.ocr.events import EventReconstructor  # noqa: E402
 from plo5bp.ocr.types import Card, FrameState, SeatObs  # noqa: E402
 from plo5bp.ui import server  # noqa: E402
+from plo5bp.ui.live import clubgg, tracking  # noqa: E402
+from plo5bp.ui.live.state import live_state  # noqa: E402
 
 
 def _c(rank: int, suit: int) -> Card:
@@ -52,7 +53,7 @@ def _fs(seats, *, button=2, hero=H1, flop=True, board_a=None, board_b=None):
     ba = board_a if board_a is not None else (FLOP_A if flop else NONE5)
     bb = board_b if board_b is not None else (FLOP_B if flop else NONE5)
     return FrameState(board_a=ba, board_b=bb, hero_hole=hero, button_seat=button,
-                      pot_total_chips=0, seats=tuple(seats))
+                      pot_total_chips=None, seats=tuple(seats))
 
 
 def _full(**kw):
@@ -68,27 +69,26 @@ def _clean_session():
     s.num_seats = 6
     s.button_seat = 0
     s.hero_seat = 0
-    s.simple_ocr_mode = True
+    live_state.simple_ocr_mode = True
     server._new_session_defaults()
-    server._reset_live_tracking()
-    server.ocr_runner._reconstructor = None
-    server.ocr_runner.running = False
-    server.ocr_runner.latest_frame = None
-    server.ocr_runner.last_error = None
-    server.ocr_runner._tick_lock = asyncio.Lock()
-    server._set_active_reconstructor(None)
+    tracking._reset_live_tracking()
+    clubgg.ocr_runner._reconstructor = None
+    clubgg.ocr_runner.running = False
+    clubgg.ocr_runner.latest_frame = None
+    clubgg.ocr_runner.last_error = None
+    tracking._set_active_reconstructor(None)
     server._rebuild_env()
     yield
-    s.simple_ocr_mode = True
+    live_state.simple_ocr_mode = True
     s.variant = server.VARIANT_PLO5
     s.game_config = GameConfig(starting_stack=400000)
     s.dollars_per_bb = 2.0
     s.button_seat = 0
     server._new_session_defaults()
-    server._reset_live_tracking()
-    server.ocr_runner._reconstructor = None
-    server.ocr_runner.latest_frame = None
-    server._set_active_reconstructor(None)
+    tracking._reset_live_tracking()
+    clubgg.ocr_runner._reconstructor = None
+    clubgg.ocr_runner.latest_frame = None
+    tracking._set_active_reconstructor(None)
     server._rebuild_env()
 
 
@@ -96,13 +96,13 @@ def _clean_session():
 def begin_calls(monkeypatch):
     """Records every `_begin_new_hand` invocation (button, had hero cards)."""
     calls: list[tuple[int, bool]] = []
-    real = server._begin_new_hand
+    real = tracking._begin_new_hand
 
     def spy(fs, **kw):
         calls.append((kw.get("button_seat"), kw.get("hero_hole_indices") is not None))
         return real(fs, **kw)
 
-    monkeypatch.setattr(server, "_begin_new_hand", spy)
+    monkeypatch.setattr(tracking, "_begin_new_hand", spy)
     return calls
 
 
@@ -112,13 +112,14 @@ def tick(monkeypatch):
     queue: list[FrameState] = []
     fake = types.ModuleType("plo5bp.ocr.extract")
     fake.extract_frame_state = lambda img, num_seats=6, cache=None: queue.pop(0)
+    fake.fit_to_calibration = lambda img: (img, None)
     monkeypatch.setitem(sys.modules, "plo5bp.ocr.extract", fake)
 
-    runner = server.ocr_runner
+    runner = clubgg.ocr_runner
     runner._reconstructor = EventReconstructor(num_seats=6)
-    server._set_active_reconstructor(runner._reconstructor)
+    tracking._set_active_reconstructor(runner._reconstructor)
     runner.latest_frame = object()  # non-None sentinel; extraction is faked
-    server.session.simple_ocr_mode = False
+    live_state.simple_ocr_mode = False
 
     def run(fs: FrameState) -> None:
         queue.append(fs)
@@ -135,38 +136,38 @@ def _engine() -> dict:
 
 
 def test_i1_begin_new_hand_clears_an_unreadable_baseline():
-    server.session.last_hero_hole = _idx(H1)
-    server._begin_new_hand(_fs(_full(), hero=NONE5), button_seat=3, hero_hole_indices=None)
-    assert server.session.last_hero_hole is None  # used to stay on H1
+    live_state.last_hero_hole = _idx(H1)
+    tracking._begin_new_hand(_fs(_full(), hero=NONE5), button_seat=3, hero_hole_indices=None)
+    assert live_state.last_hero_hole is None  # used to stay on H1
 
 
 def test_i1_one_unreadable_button_frame_does_not_restart_the_hand(begin_calls):
     s = server.session
     for _ in range(3):
-        server._mirror_observable_state(_fs(_full(stack=34000), button=2, hero=H1))
-    assert begin_calls == [(2, True)] and s.last_hero_hole == _idx(H1)
+        tracking._mirror_observable_state(_fs(_full(stack=34000), button=2, hero=H1))
+    assert begin_calls == [(2, True)] and live_state.last_hero_hole == _idx(H1)
     for _ in range(6):
-        server._mirror_observable_state(_fs(_full(stack=34000), button=2, hero=H1))
+        tracking._mirror_observable_state(_fs(_full(stack=34000), button=2, hero=H1))
     begin_calls.clear()
 
     # Hand 2: the button moves BEFORE hero's new cards are visible.
     for _ in range(4):
-        server._mirror_observable_state(
+        tracking._mirror_observable_state(
             _fs(_full(stack=34000), button=3, hero=NONE5, flop=False)
         )
     assert begin_calls == [(3, False)]
-    assert s.last_hero_hole is None, "baseline must not stay on the old hand"
+    assert live_state.last_hero_hole is None, "baseline must not stay on the old hand"
     begin_calls.clear()
 
     # Hand 2 proceeds; hero's cards are revealed and ADOPTED as the baseline.
     for _ in range(12):
-        server._mirror_observable_state(_fs(_full(stack=34000), button=3, hero=H2))
-    assert s.last_hero_hole == _idx(H2)
-    assert s._pending_hero_hole_rotation_ticks == 0, "rotation must not latch"
+        tracking._mirror_observable_state(_fs(_full(stack=34000), button=3, hero=H2))
+    assert live_state.last_hero_hole == _idx(H2)
+    assert live_state.pending_hero_hole_rotation_ticks == 0, "rotation must not latch"
     s.action_log = [{"gate": int(server.GATE_RAISE), "chips": 60000, "seat": 4}]
 
     # ONE frame with the dealer button occluded used to wipe the live hand.
-    server._mirror_observable_state(_fs(_full(stack=34000), button=None, hero=H2))
+    tracking._mirror_observable_state(_fs(_full(stack=34000), button=None, hero=H2))
     assert begin_calls == []
     assert len(s.action_log) == 1
     assert s.button_seat == 3
@@ -176,18 +177,18 @@ def test_i1_rotation_never_fires_on_a_frame_without_a_button_read(begin_calls):
     """Even with a genuinely rotated hole, an unreadable button confirms
     nothing; the trigger waits for a positive read of the moved button."""
     s = server.session
-    for _ in range(2 + server._LOCK_AFTER_TICKS):
-        server._mirror_observable_state(_fs(_full(), button=2, hero=H1))
+    for _ in range(2 + tracking._LOCK_AFTER_TICKS):
+        tracking._mirror_observable_state(_fs(_full(), button=2, hero=H1))
     begin_calls.clear()
 
-    for _ in range(server._STABILITY_TICKS_REQUIRED_LOCKED + 4):
-        server._mirror_observable_state(_fs(_full(), button=None, hero=H2))
+    for _ in range(tracking._STABILITY_TICKS_REQUIRED_LOCKED + 4):
+        tracking._mirror_observable_state(_fs(_full(), button=None, hero=H2))
     assert begin_calls == [] and s.button_seat == 2
 
-    for _ in range(server._STABILITY_TICKS_REQUIRED_LOCKED):
-        server._mirror_observable_state(_fs(_full(), button=4, hero=H2))
+    for _ in range(tracking._STABILITY_TICKS_REQUIRED_LOCKED):
+        tracking._mirror_observable_state(_fs(_full(), button=4, hero=H2))
     assert begin_calls and begin_calls[0][0] == 4
-    assert s.button_seat == 4 and s.last_hero_hole == _idx(H2)
+    assert s.button_seat == 4 and live_state.last_hero_hole == _idx(H2)
 
 
 def test_i1_a_baseline_that_was_stale_at_birth_is_replaced(begin_calls):
@@ -197,29 +198,29 @@ def test_i1_a_baseline_that_was_stale_at_birth_is_replaced(begin_calls):
     the latched rotation bypasses the button debounce and one misread button
     frame restarts the hand."""
     s = server.session
-    for _ in range(2 + server._LOCK_AFTER_TICKS):
-        server._mirror_observable_state(_fs(_full(), button=2, hero=H1))
-    for _ in range(server._BUTTON_STABLE_TICKS_LOCKED):
-        server._mirror_observable_state(_fs(_full(), button=3, hero=H1))
-    assert s.button_seat == 3 and s.last_hero_hole == _idx(H1)  # stale at birth
+    for _ in range(2 + tracking._LOCK_AFTER_TICKS):
+        tracking._mirror_observable_state(_fs(_full(), button=2, hero=H1))
+    for _ in range(tracking._BUTTON_STABLE_TICKS_LOCKED):
+        tracking._mirror_observable_state(_fs(_full(), button=3, hero=H1))
+    assert s.button_seat == 3 and live_state.last_hero_hole == _idx(H1)  # stale at birth
     begin_calls.clear()
 
-    for _ in range(server._LOCK_AFTER_TICKS + server._STABILITY_TICKS_REQUIRED_LOCKED + 2):
-        server._mirror_observable_state(_fs(_full(), button=3, hero=H2))
+    for _ in range(tracking._LOCK_AFTER_TICKS + tracking._STABILITY_TICKS_REQUIRED_LOCKED + 2):
+        tracking._mirror_observable_state(_fs(_full(), button=3, hero=H2))
     assert begin_calls == []
-    assert s.last_hero_hole == _idx(H2)
-    assert s._pending_hero_hole_rotation_ticks == 0
+    assert live_state.last_hero_hole == _idx(H2)
+    assert live_state.pending_hero_hole_rotation_ticks == 0
 
     s.action_log = [{"gate": int(server.GATE_CHECK_CALL), "chips": 0, "seat": 4}]
-    server._mirror_observable_state(_fs(_full(), button=5, hero=H2))  # 1-frame misread
+    tracking._mirror_observable_state(_fs(_full(), button=5, hero=H2))  # 1-frame misread
     assert begin_calls == [] and len(s.action_log) == 1 and s.button_seat == 3
 
 
 def test_i1_baseline_is_not_adopted_before_a_hand_is_committed():
     """Debouncer invariant: nothing hand-scoped is written pre-commit."""
-    server._mirror_observable_state(_fs(_full(), button=2, hero=H1))
+    tracking._mirror_observable_state(_fs(_full(), button=2, hero=H1))
     assert not server.session.hand_in_hand_mask
-    assert server.session.last_hero_hole is None
+    assert live_state.last_hero_hole is None
     assert server.session.button_seat == 0  # not updated pre-commit
     assert server.session.sitting_out_seats == frozenset()
 
@@ -231,9 +232,9 @@ def test_i5_begin_new_hand_invalidates_the_env():
     assert server.session.env is not None
     seats = [_seat(0, 34000), _seat(1, 145513), _seat(2, 163513),
              _seat(3, None, folded=True), _seat(4, 24650), _seat(5, None, folded=True)]
-    server._begin_new_hand(_fs(seats, button=2), button_seat=2, hero_hole_indices=None)
+    tracking._begin_new_hand(_fs(seats, button=2), button_seat=2, hero_hole_indices=None)
     assert server.session.env is None
-    view = server._engine_view_from_session()  # rebuilds on demand
+    view = tracking._engine_view_from_session()  # rebuilds on demand
     assert view.button_seat == 2
     assert view.current_actor == 4  # left of button 2 with seat 3 out
     assert view.stacks[1] == 145513 * 5  # the new hand's seeded stack, post-ante
@@ -258,7 +259,7 @@ def test_i5_bet_inside_the_debounce_window_lands_on_the_bettor(tick):
     # The bet used to be replayed onto HERO (stale pre-hand EngineView).
     assert list(raw["street_commit"]) == [0, 0, 90000, 0, 0, 0]
     assert int(raw["actor"]) == 4
-    assert server.ocr_runner.last_error is None
+    assert clubgg.ocr_runner.last_error is None
 
 
 # --- I8: hero and the participant mask ---------------------------------------------
@@ -278,13 +279,13 @@ def _hero_missing_anchor():
 def test_i8_hero_joins_the_mask_through_expansion():
     s = server.session
     anchor, live = _hero_missing_anchor()
-    server._mirror_observable_state(anchor)
-    server._mirror_observable_state(anchor)
+    tracking._mirror_observable_state(anchor)
+    tracking._mirror_observable_state(anchor)
     assert s.hand_in_hand_mask == frozenset({1, 2, 4})  # anchor missed hero
 
-    server._mirror_observable_state(live)
+    tracking._mirror_observable_state(live)
     assert 0 not in s.hand_in_hand_mask  # one tick is not enough
-    server._mirror_observable_state(live)
+    tracking._mirror_observable_state(live)
     assert s.hand_in_hand_mask == frozenset({0, 1, 2, 4})
     assert s.sitting_out_seats == frozenset({3, 5})
 
@@ -303,10 +304,10 @@ def test_i8_hero_joins_the_mask_through_expansion():
 def test_i8_engine_view_never_reports_hero_as_sitting_out():
     s = server.session
     anchor, _ = _hero_missing_anchor()
-    server._mirror_observable_state(anchor)
-    server._mirror_observable_state(anchor)
+    tracking._mirror_observable_state(anchor)
+    tracking._mirror_observable_state(anchor)
     assert 0 in s.sitting_out_seats  # session bookkeeping is unchanged...
-    view = server._engine_view_from_session()
+    view = tracking._engine_view_from_session()
     # ...but the walk must not skip a seat the engine is going to wait on.
     assert view.sitting_out == (False, False, False, True, False, True)
 
@@ -314,13 +315,13 @@ def test_i8_engine_view_never_reports_hero_as_sitting_out():
 def test_i8_a_folded_hero_is_not_re_added():
     s = server.session
     _, live = _hero_missing_anchor()
-    server._mirror_observable_state(live)
-    server._mirror_observable_state(live)
+    tracking._mirror_observable_state(live)
+    tracking._mirror_observable_state(live)
     assert 0 in s.hand_in_hand_mask
     s.folded_this_hand = frozenset({0})
     s.hand_in_hand_mask = frozenset({1, 2, 4})  # pretend hero was never in
     for _ in range(4):
-        server._mirror_observable_state(live)
+        tracking._mirror_observable_state(live)
     assert 0 not in s.hand_in_hand_mask
 
 
@@ -330,35 +331,35 @@ def test_i8_a_folded_hero_is_not_re_added():
 def test_f10_reset_drops_the_stale_anchor():
     s = server.session
     recon = EventReconstructor(num_seats=6)
-    server._set_active_reconstructor(recon)
+    tracking._set_active_reconstructor(recon)
 
     start = _fs(_full(stack=40000), button=2)
-    server._mirror_observable_state(start)
-    server._mirror_observable_state(start)
+    tracking._mirror_observable_state(start)
+    tracking._mirror_observable_state(start)
     assert s.hand_in_hand_mask == frozenset(range(6))
 
     t1_seats = _full(stack=40000)
     t1_seats[3] = _seat(3, 40000, folded=True)
     stale = _fs(t1_seats, button=2)          # becomes the pending anchor
-    server._mirror_observable_state(stale)
+    tracking._mirror_observable_state(stale)
     now_seats = [_seat(0, 10000), _seat(1, 10000), _seat(2, 40000),
                  _seat(3, 40000, folded=True), _seat(4, 40000), _seat(5, 40000)]
     now = _fs(now_seats, button=2)
     for _ in range(10):
-        server._mirror_observable_state(now)
-    assert s._pending_anchor_fs is stale
+        tracking._mirror_observable_state(now)
+    assert live_state.pending_anchor_fs is stale
 
     server.reset()
-    assert s._pending_anchor_fs is None and s._pending_stable_ticks == 0
-    assert s.last_hero_hole is None and not s.hand_in_hand_mask
+    assert live_state.pending_anchor_fs is None and live_state.pending_stable_ticks == 0
+    assert live_state.last_hero_hole is None and not s.hand_in_hand_mask
 
     # The next hand debounces from scratch on FRESH frames...
-    server._mirror_observable_state(now)
+    tracking._mirror_observable_state(now)
     assert not s.hand_in_hand_mask
-    server._mirror_observable_state(now)
+    tracking._mirror_observable_state(now)
     assert s.hand_in_hand_mask == frozenset({0, 1, 2, 4, 5})
     # ...and is seeded / rebaselined from them, not from the stale anchor.
-    want = server._ocr_cents_to_engine_chips(10000) + s.game_config.ante
+    want = tracking._ocr_cents_to_engine_chips(10000) + s.game_config.ante
     assert s.game_config.resolved_stacks[0] == want
     assert recon.last_fs is now
 
@@ -366,14 +367,14 @@ def test_f10_reset_drops_the_stale_anchor():
 def test_f10_format_switch_drops_live_tracking():
     s = server.session
     frame = _fs(_full(), button=2)
-    server._mirror_observable_state(frame)
-    server._mirror_observable_state(frame)
-    server._mirror_observable_state(_fs(_full(), button=4))  # new pending anchor
-    assert s.hand_in_hand_mask and s._pending_anchor_fs is not None
+    tracking._mirror_observable_state(frame)
+    tracking._mirror_observable_state(frame)
+    tracking._mirror_observable_state(_fs(_full(), button=4))  # new pending anchor
+    assert s.hand_in_hand_mask and live_state.pending_anchor_fs is not None
     try:
         server.set_format(server.FormatRequest(format="nlh_single"))
-        assert s._pending_anchor_fs is None and s._pending_button is None
-        assert s.last_hero_hole is None and not s.hand_in_hand_mask
+        assert live_state.pending_anchor_fs is None and live_state.pending_button is None
+        assert live_state.last_hero_hole is None and not s.hand_in_hand_mask
     finally:
         server.set_format(server.FormatRequest(format="plo5_double_bomb"))
 
@@ -382,14 +383,14 @@ def test_f10_no_hand_start_loop_while_nobody_is_in_the_hand(begin_calls):
     empty = _fs([_seat(i, folded=True) for i in range(6)], button=3,
                 hero=NONE5, flop=False)
     for _ in range(10):
-        server._mirror_observable_state(empty)
+        tracking._mirror_observable_state(empty)
     # The button move itself is one legitimate hand boundary; the empty mask
     # it produced used to re-arm `first_commit` on every following tick (9×).
     assert begin_calls == [(3, False)]
 
     dealt = _fs(_full(), button=3, hero=NONE5, flop=False)
-    server._mirror_observable_state(dealt)
-    server._mirror_observable_state(dealt)
+    tracking._mirror_observable_state(dealt)
+    tracking._mirror_observable_state(dealt)
     assert server.session.hand_in_hand_mask == frozenset(range(6))
     assert len(begin_calls) == 2
 
@@ -420,16 +421,16 @@ def test_f11_single_frame_fold_flicker_on_the_reveal_tick_is_ignored(tick):
     # Turn reveal; seat 2's card backs are missed on exactly this frame.
     tick(_fs(_three_handed(folded2=True), button=2, board_a=TURN_A, board_b=TURN_B))
     assert s.folded_this_hand == frozenset()
-    assert s._pending_reveal_folds == frozenset({2})
+    assert live_state.pending_reveal_folds == frozenset({2})
     assert all(e["gate"] != int(server.GATE_FOLD) for e in s.action_log)
 
     # Next tick: seat 2 reads in-hand again → the candidate is dropped.
     tick(_fs(_three_handed(), button=2, board_a=TURN_A, board_b=TURN_B))
     assert s.folded_this_hand == frozenset()
-    assert s._pending_reveal_folds == frozenset()
-    assert s._pending_reveal_target is None
+    assert live_state.pending_reveal_folds == frozenset()
+    assert live_state.pending_reveal_target is None
     assert all(e["gate"] != int(server.GATE_FOLD) for e in s.action_log)
-    assert server._engine_view_from_session().sitting_out[2] is False
+    assert tracking._engine_view_from_session().sitting_out[2] is False
     assert list(_engine()["folded"])[:3] == [False, False, False]
 
 
@@ -439,12 +440,12 @@ def test_f11_pending_candidates_do_not_survive_to_a_later_reveal():
     s = server.session
     s.hand_in_hand_mask = frozenset({0, 1, 2})
     glitch = _fs(_three_handed(folded2=True), button=2)
-    assert server._reconcile_missed_folds_on_street_reveal(glitch) is False
-    assert s._pending_reveal_folds == frozenset({2})
+    assert tracking._reconcile_missed_folds_on_street_reveal(glitch) is False
+    assert live_state.pending_reveal_folds == frozenset({2})
     clean = _fs(_three_handed(), button=2)
-    assert server._reconcile_missed_folds_on_street_reveal(clean) is False
-    assert s._pending_reveal_folds == frozenset()
-    assert server._reconcile_missed_folds_on_street_reveal(glitch) is False
+    assert tracking._reconcile_missed_folds_on_street_reveal(clean) is False
+    assert live_state.pending_reveal_folds == frozenset()
+    assert tracking._reconcile_missed_folds_on_street_reveal(glitch) is False
     assert s.action_log == [] and s.folded_this_hand == frozenset()
 
 
@@ -452,7 +453,7 @@ def test_f11_exact_sources_reconcile_immediately():
     s = server.session
     s.hand_in_hand_mask = frozenset({0, 1, 2})
     frame = _fs(_three_handed(folded2=True), button=2)
-    assert server._reconcile_missed_folds_on_street_reveal(frame, exact=True) is True
+    assert tracking._reconcile_missed_folds_on_street_reveal(frame, exact=True) is True
     assert s.folded_this_hand == frozenset({2})
     assert s.action_log == [{"gate": int(server.GATE_FOLD), "chips": 0}]
 
@@ -465,8 +466,8 @@ def test_h7_mirror_does_not_lock_a_card_another_slot_holds():
     dup = H1[0]
     board_a = (dup, _c(8, 0), _c(11, 0), None, None)  # flop_a[0] misread as hero's card
     frame = _fs(_full(), button=2, hero=H1, board_a=board_a)
-    for _ in range(server._CARD_STABLE_TICKS + 2):
-        server._mirror_observable_state(frame)
+    for _ in range(tracking._CARD_STABLE_TICKS + 2):
+        tracking._mirror_observable_state(frame)
     assert s.hero_hole == list(_idx(H1))
     assert s.flop_a[0] is None and s._card_slot_locked["flop_a"][0] is False
     assert s.flop_a[1:] == [_idx([board_a[1]])[0], _idx([board_a[2]])[0]]
@@ -480,10 +481,10 @@ def test_i10_tick_idles_when_the_format_is_not_plo5(tick):
     s = server.session
     try:
         server.set_format(server.FormatRequest(format="nlh_single"))
-        s.simple_ocr_mode = False
+        live_state.simple_ocr_mode = False
         cfg, hole = s.game_config, list(s.hero_hole)
         tick(_fs(_full(), button=2))  # a 5-card / 2-board frame
-        assert "PLO5" in (server.ocr_runner.last_error or "")
+        assert "PLO5" in (clubgg.ocr_runner.last_error or "")
         assert s.game_config is cfg and s.hero_hole == hole
         assert not s.hand_in_hand_mask
     finally:

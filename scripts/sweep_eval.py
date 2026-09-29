@@ -8,6 +8,10 @@ For every checkpoint index N = every-1, 2*every-1, ... (i.e. after `every`,
   - utilization: scripts/utilization_probe.py on each, fixed flop states
     (-> runs/utilization_history.jsonl) and self-play states
     (-> runs/utilization_selfplay.jsonl)
+Every checkpoint of a series plays the SAME tables and deals (one h2h seed,
+`--seed` + `--seed-offset`; 2026-09-28 ML-002: the seed used to be N, so each
+point of a trend sat on different tables and its error bar did not show that
+noise). `--seed-per-update` restores the old per-checkpoint seeds.
 Finished (stem, N) pairs are remembered in runs/sweep_eval_done.json, so the
 driver can be re-run or left looping (--loop SECONDS) while the runs train.
 A second driver against another reference needs its own `--done` file (the
@@ -61,8 +65,12 @@ def main() -> None:
                     help="candidates play their argmax action (h2h_eval --greedy-a)")
     ap.add_argument("--greedy-b", action="store_true",
                     help="the reference plays its argmax action (h2h_eval --greedy-b)")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="the h2h seed of EVERY checkpoint (paired comparisons)")
     ap.add_argument("--seed-offset", type=int, default=0,
-                    help="added to the per-update h2h seed (independent deals)")
+                    help="added to the h2h seed (another series' independent deals)")
+    ap.add_argument("--seed-per-update", action="store_true",
+                    help="legacy: seed = checkpoint index + offset (unpaired)")
     args = ap.parse_args()
     stems = [s for s in args.stems.split(",") if s]
 
@@ -98,7 +106,8 @@ def main() -> None:
                     continue
                 cmd = [py, "scripts/h2h_eval.py", str(cand), str(ref),
                        "--deals", str(args.deals), "--device", args.device,
-                       "--seed", str(n + args.seed_offset)]
+                       "--seed", str((n if args.seed_per_update else args.seed)
+                                     + args.seed_offset)]
                 if args.greedy_a:
                     cmd.append("--greedy-a")
                 if args.greedy_b:

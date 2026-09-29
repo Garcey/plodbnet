@@ -194,3 +194,92 @@ def test_has_active_timer_bar_one_seat_per_reference_frame(frame_rel):
         f"{frame_rel}: expected exactly 1 seat to register active "
         f"timer bar, got {hits}"
     )
+
+
+# --- TOOL-012: timer bar read from a drift-tolerant band -----------------------------
+
+
+def _band_with(rows_yellow: list[int], h: int = 10, w: int = 26) -> "np.ndarray":
+    import numpy as np
+
+    band = np.zeros((h, w, 3), dtype=np.uint8)
+    band[:, :] = (180, 110, 40)  # blue felt (BGR)
+    for r in rows_yellow:
+        band[r, :] = (20, 200, 240)  # warm yellow (BGR)
+    return band
+
+
+@pytest.mark.parametrize("row", [0, 3, 6, 9])
+def test_timer_bar_found_anywhere_in_the_band(row):
+    assert card_mod.has_active_timer_bar(_band_with([row]))
+
+
+def test_scattered_yellow_is_not_a_timer_bar():
+    import numpy as np
+
+    band = _band_with([])
+    rng = np.random.default_rng(0)
+    ys, xs = rng.integers(0, 10, 60), rng.integers(0, 26, 60)
+    band[ys, xs] = (20, 200, 240)  # ~23% of pixels, no row mostly yellow
+    assert not card_mod.has_active_timer_bar(band)
+    assert not card_mod.has_active_timer_bar(_band_with([]))
+
+
+def test_template_bootstrap_never_writes_into_the_package(rank_templates_bootstrapped):
+    """TEST-032: the session's templates live in a temp folder; the shipped
+    `plo5bp/ocr/templates/` is only ever read."""
+    from pathlib import Path
+
+    shipped = Path(card_mod.__file__).parent / "templates"
+    assert Path(card_mod.TEMPLATES_DIR).resolve() != shipped.resolve()
+
+
+# --- TOOL-014: precomputed template features, cached card reads --------------------
+
+
+def test_precomputed_features_score_bit_identically():
+    import numpy as np
+
+    rng = np.random.default_rng(7)
+    glyph = (rng.random((40, 28)) > 0.5).astype(np.uint8) * 255
+    templates = {r: [(rng.random((44, 30)) > 0.5).astype(np.uint8) * 255 for _ in range(3)]
+                 for r in range(4)}
+    feats = card_mod._template_features(templates)
+    g = card_mod._features(glyph)
+    for rank, tmpls in templates.items():
+        for t, tf in zip(tmpls, feats[rank]):
+            assert card_mod._score_features(g, tf) == card_mod._shape_score(glyph, t)
+
+
+def test_unchanged_card_crops_are_not_classified_again(monkeypatch):
+    import numpy as np
+
+    from plo5bp.ocr import extract as extract_mod
+
+    calls: list[int] = []
+    monkeypatch.setattr(card_mod, "classify_card", lambda crop: calls.append(1))
+    img = np.zeros((1391, 1927, 3), dtype=np.uint8)
+    cache: dict = {}
+    extract_mod._classify_row(img, roi_mod.BOARD_A, cache, "board_a")
+    extract_mod._classify_row(img, roi_mod.BOARD_A, cache, "board_a")
+    assert len(calls) == len(roi_mod.BOARD_A)  # second pass: all cache hits
+    img[:, :, 0] = 1  # pixels changed -> read again
+    extract_mod._classify_row(img, roi_mod.BOARD_A, cache, "board_a")
+    assert len(calls) == 2 * len(roi_mod.BOARD_A)
+
+
+def test_hero_templates_are_harvested_upright(monkeypatch, tmp_path):
+    """TOOL-041: the runtime de-rotates each fanned hole card before matching,
+    so the labeler de-rotates it the same way before cutting the template."""
+    import numpy as np
+
+    from plo5bp.ocr import extract as extract_mod
+    from plo5bp.ocr.tools import label_cards as labeler
+
+    frame = tmp_path / "f.png"
+    cv2.imwrite(str(frame), np.zeros((1391, 1927, 3), dtype=np.uint8))
+    angles: list[float] = []
+    real = extract_mod._rotate
+    monkeypatch.setattr(extract_mod, "_rotate", lambda c, d: (angles.append(d), real(c, d))[1])
+    labeler.build_templates(frame, "hero_hole", list("AKQJT"), out_dir=tmp_path / "t")
+    assert angles == [r[0] for r in extract_mod._HERO_HOLE_ROTATIONS]

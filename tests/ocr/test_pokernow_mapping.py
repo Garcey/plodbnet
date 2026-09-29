@@ -309,3 +309,76 @@ def test_pre_v1_key_spelling_is_rejected():
     }
     with pytest.raises(PokerNowPayloadError, match="stackDollars"):
         map_payload(stale)
+
+
+# --- TOOL-015: only PLO5 double-board tables are followed ------------------------
+
+
+def test_plo5_double_board_is_supported():
+    r = map_payload(_river_payload())
+    assert (r.hole_count, r.boards_dealt) == (5, 2)
+    assert r.unsupported_reason() is None
+
+
+@pytest.mark.parametrize("hero, reason_part", [
+    (["Ts", "As", "4h", "3d"], "hero holds 4 cards"),              # PLO4
+    (["Ts", "As", "4h", "3d", "2d", "9c"], "hero holds 6 cards"),  # PLO6
+    (["Ts", "As"], "hero holds 2 cards"),                          # hold'em
+])
+def test_other_hand_widths_are_refused(hero, reason_part):
+    p = _river_payload()
+    p["heroCards"] = hero
+    p["seats"][0]["cards"] = list(hero)
+    reason = map_payload(p).unsupported_reason()
+    assert reason is not None and reason_part in reason
+
+
+def test_single_board_table_is_refused():
+    p = _river_payload()
+    p["boards"] = p["boards"][:1]
+    r = map_payload(p)
+    assert r.boards_dealt == 1
+    assert "only one board" in r.unsupported_reason()
+
+
+def test_explicit_other_variant_is_refused_and_unknown_is_not():
+    p = _river_payload()
+    p["variant"] = "nlh"
+    assert "'nlh'" in map_payload(p).unsupported_reason()
+    p["variant"] = "unknown"
+    assert map_payload(p).unsupported_reason() is None
+
+
+def test_no_hero_cards_or_no_flop_is_not_a_reason():
+    p = _river_payload()
+    p["heroCards"] = None
+    p["seats"][0]["cards"] = []
+    p["seats"][0]["folded"] = True
+    p["boards"] = []
+    r = map_payload(p)
+    assert (r.hole_count, r.boards_dealt) == (None, 0)
+    assert r.unsupported_reason() is None
+
+
+# --- TOOL-038 / TOOL-016 / TOOL-040: hero seat, collector, gap -------------------------
+
+
+def test_a_hand_without_the_users_seat_is_refused():
+    p = _river_payload()
+    p["heroCards"] = None
+    for s in p["seats"]:
+        s["isHero"] = False
+    r = map_payload(p)
+    assert r.has_hero is False
+    assert "spectating isn't supported" in r.unsupported_reason()
+
+
+def test_collector_and_gap_are_read_leniently():
+    p = _river_payload()
+    r = map_payload(p)
+    assert (r.collector, r.gap) == (None, 0)  # pre-1.3.0 scripts send neither
+    p.update(collector="1.3.0", gap=7)
+    r = map_payload(p)
+    assert (r.collector, r.gap) == ("1.3.0", 7)
+    p.update(gap="lots")  # junk never breaks the mapping
+    assert map_payload(p).gap == 0

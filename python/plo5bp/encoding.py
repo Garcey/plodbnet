@@ -2,7 +2,23 @@
 dict emitted by `PyGameState.observation_dict()` (augmented in `env._pack_obs`
 with Rust-computed hand categories).
 
-Layout (991 dims total):
+Layouts: the full PLO observation is OBS_DIM = 1171 dims -- the base block
+0..991 described below, then two pure tail appends: the obs-v2 tail 991..1020
+(per-board outcome, blockers-to-nuts, effective price, log1p SPR; see the
+`_PER_BOARD_OUTCOME_OFF` block) and the v7 tail 1020..1171 (stack / board /
+dual geometry; the `_STK1_OFF` block). The minimal layout (OBS_DIM_MINIMAL =
+796, `--obs-mode minimal`) is a column subset (`project_obs_minimal`); NLH has
+its own 995-dim layout (encoding_nlh.py). Checkpoints trained at 959 / 991 /
+1020 serve through the exact prefix/downgrade adapters (`network.obs_adapter`).
+The ENGINE encoder (rust_engine, `BatchedEngine.encode`) is what runs: training
+and -- through the one-row `_engine.encode_game_state` (2026-09-28, ML-008) --
+the serial env (the site's Study / Trainer, eval) for PLO4/5/6. The numpy
+encoders here are the ORACLES the engine is pinned bit-exact against
+(test_encoding_rust.py, test_serial_encode.py), and still encode NLH, PLO67
+(serial) and PLO5_RUST_ENCODER=0 runs. A new feature: implement it in the
+engine, and in the numpy encoders only while those are still needed for it.
+
+Base layout (0..991):
   0..52     hero hole multi-hot (52)
   52..104   board A multi-hot (52)
   104..156  board B multi-hot (52)
@@ -98,7 +114,6 @@ Layout (991 dims total):
 from __future__ import annotations
 
 import os
-import warnings
 from itertools import combinations
 from typing import Any, Mapping, NamedTuple
 
@@ -113,6 +128,7 @@ from plo5bp._engine import (  # type: ignore[attr-defined]
 )
 from plo5bp.actions import CHECK_CALL, FOLD
 from plo5bp.config import GameConfig
+from plo5bp.engine_abi import require as _engine_require
 from plo5bp.sizing import (  # v7 STK-2 raise-ladder envelope
     ANCHOR_COUNT,
     n_legal_anchors_np,
@@ -174,30 +190,19 @@ def _read_obs_semantics_rev() -> int:
 
 OBS_SEMANTICS_REV: int = _read_obs_semantics_rev()
 
-# The Rust side of the switch. A binary built before the switch has no
-# `obs_semantics_rev`; it implements rev-1 values only (see `_draw_flags_boards`).
-_rust_obs_rev_fn = getattr(_engine, "obs_semantics_rev", None) or getattr(
-    _engine.GameState, "obs_semantics_rev", None
+# The Rust side of the switch: the engine reads the same variable, and both
+# sides must agree (an engine without `obs_semantics_rev` predates the switch
+# -- engine_abi refuses it rather than let it emit rev-1 values).
+_engine_require(
+    "obs_semantics_rev", "GameState.obs_semantics_rev", "BatchedEngine.obs_semantics_rev"
 )
-_RUST_OBS_REV_AWARE: bool = _rust_obs_rev_fn is not None
-if _RUST_OBS_REV_AWARE:
-    _rust_rev = int(_rust_obs_rev_fn())
-    if _rust_rev != OBS_SEMANTICS_REV:
-        raise RuntimeError(
-            f"observation-semantics revision mismatch: Python read {OBS_REV_ENV}"
-            f"={OBS_SEMANTICS_REV} but the Rust engine reads {_rust_rev}"
-        )
-    del _rust_rev
-elif OBS_SEMANTICS_REV != OBS_REV_LEGACY:
-    warnings.warn(
-        "plo5bp._engine predates the observation-semantics switch and only "
-        "implements rev-1 values: the numpy batch encoder falls back to its "
-        "numpy draw flags (slower, exact), but the fused Rust encoder "
-        "(PLO5_RUST_ENCODER=1) would emit rev-1 observations. Rebuild with "
-        "`maturin develop --release`.",
-        RuntimeWarning,
-        stacklevel=2,
+_rust_rev = int(_engine.obs_semantics_rev())
+if _rust_rev != OBS_SEMANTICS_REV:
+    raise RuntimeError(
+        f"observation-semantics revision mismatch: Python read {OBS_REV_ENV}"
+        f"={OBS_SEMANTICS_REV} but the Rust engine reads {_rust_rev}"
     )
+del _rust_rev
 
 # v1 (pre-anchor-head era) observation layout: 17-dim history slots, no
 # pot-fraction dim, tail blocks 32 lower. v1 checkpoints can keep
@@ -207,8 +212,8 @@ OBS_DIM_V1: int = 959
 
 # The 991-dim layout that v2/v4 stems (through vFour4) trained at —
 # everything before the obs-v2 tail append of 2026-07-06 (V5_DESIGN.md
-# §3.2). Those checkpoints keep serving via `downgrade_obs_to_v2` (a
-# plain tail slice; the append is exactly function-preserving).
+# §3.2). Those checkpoints keep serving via `network.obs_adapter` (a
+# plain prefix slice; the append is exactly function-preserving).
 OBS_DIM_V2: int = 991
 
 _HOLE_OFF = 0
@@ -292,7 +297,8 @@ _BET_PCT_POT_OFF = 990  # 1 dim; to_call / max(pot - to_call, 1), clipped [0, 4]
 
 # ---- obs v2 tail (appended 2026-07-06, V5_DESIGN.md §3.2) -------------------
 # Everything below is a pure append: dims 0..991 are byte-identical to the
-# pre-v5 layout, so 991-era checkpoints serve via `downgrade_obs_to_v2` and
+# pre-v5 layout, so 991-era checkpoints serve via a prefix slice
+# (`network.obs_adapter`) and
 # warm-starts zero-pad the first-layer columns (function-preserving).
 _PER_BOARD_OUTCOME_OFF = 991  # 8 dims; hero ahead/tie/behind per board
 _PER_BOARD_OUTCOME_DIM = 8    # (k=2 exhaustive) + win-exactly-one + tie-both
@@ -305,7 +311,7 @@ _SPR_LOG_OFF = 1012    # 8 dims; log1p(effective SPR) per seat, UNCLIPPED —
 
 # ---- obs v3 batch-2 tail (stack + board + dual; 2026-07-12) -----------------
 # Pure tail append after 1019 (V7_OBS_IMPL_PLAN.md). Everything 0..1020 is
-# byte-identical to the obs-v2 layout, so downgrade_obs_to_v2/v1 stay exact
+# byte-identical to the obs-v2 layout, so the prefix slice / v1 downgrade stay exact
 # tail slices and old checkpoints keep serving. Blocks marked [ENGINE] need
 # Rust plumbing (Chunk B) and stay 0.0 until then; both encoders write zeros
 # there, so serial/batched parity holds through Chunk A.
@@ -366,13 +372,6 @@ def downgrade_obs_to_v1(vec: np.ndarray) -> np.ndarray:
     (trained at OBS_DIM 959) after the encoder upgrades.
     """
     return np.ascontiguousarray(vec[..., _V1_INDEX])
-
-
-def downgrade_obs_to_v2(vec: np.ndarray) -> np.ndarray:
-    """Slice a current-layout observation onto the 991-dim layout that
-    v2/v4 stems trained at. Exact — the obs-v2 additions are a pure tail
-    append."""
-    return np.ascontiguousarray(vec[..., :OBS_DIM_V2])
 
 
 
@@ -2451,7 +2450,7 @@ def encode_observation(obs: Mapping[str, Any], config: GameConfig) -> np.ndarray
 # once per env.
 #
 # Bit-exact parity with `encode_observation` is enforced by a golden test in
-# `tests/python/test_encoding_batch.py`. Do NOT change a dim layout here
+# `tests/python/engine/test_encoding_batch.py`. Do NOT change a dim layout here
 # without mirroring it in the scalar path — they must stay in lockstep.
 # -----------------------------------------------------------------------------
 
@@ -2531,18 +2530,9 @@ def _draw_flags_boards(
     hole: np.ndarray, board_a: np.ndarray, board_b: np.ndarray, rev: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """(flush_a, straight_a, flush_b, straight_b) for the batch encoder: the
-    Rust `draw_flags_batch` hot path under semantics revision `rev`.
-
-    A binary built before the switch takes no `obs_rev` and computes the rev-1
-    flags, so with it rev 1 still uses Rust and rev 2 falls back to the numpy
-    twin (exact, ~60x slower; import warned about the stale binary)."""
-    if _RUST_OBS_REV_AWARE:
-        return _rust_draw_flags(hole, board_a, board_b, obs_rev=rev)
-    if rev == OBS_REV_LEGACY:
-        return _rust_draw_flags(hole, board_a, board_b)
-    f_a, s_a = _draw_flags_batch(hole, board_a, rev)
-    f_b, s_b = _draw_flags_batch(hole, board_b, rev)
-    return f_a, s_a, f_b, s_b
+    Rust `draw_flags_batch` hot path under semantics revision `rev`
+    (`_draw_flags_batch` is its numpy reference, in the tests)."""
+    return _rust_draw_flags(hole, board_a, board_b, obs_rev=rev)
 
 
 def _pair_features_batch(

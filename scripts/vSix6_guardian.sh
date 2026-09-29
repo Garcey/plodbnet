@@ -1,6 +1,6 @@
 #!/bin/bash
 # vSix6 guardian (2026-09-26/27) — the redesigned recipe after the regression
-# diagnosis (CLAUDE.md "Regression diagnosis + redesign"). vSix5 had converged:
+# diagnosis (docs/training-log.md "Regression diagnosis + redesign"). vSix5 had converged:
 # its updates were ~87% noise around a fixed point, its critic read values ~43%
 # low (a log-space average) with 77% of its input layer dead, and every visible
 # gain since u940 came from lowering entropy. vSix6 changes the fixed point and
@@ -16,7 +16,7 @@
 #     over 0.10 within two updates, argmax kept; 0.03 hurt argmax);
 #   - ACTOR_SIZE (default 1024x3): a student distilled from u1290 holds the
 #     2048x4 policy (held-out gate KL .0034 vs the same-size copy's .0031); the
-#     round-2 size study decides — see CLAUDE.md;
+#     round-2 size study decides — see docs/training-log.md;
 #   - pipeline: rollouts of ROLLOUT_LENGTH rows with the batch in host RAM as
 #     float16 real columns (--obs-real-f16: ~1.1 KB per row instead of ~2.1),
 #     micro-batched PPO, the engine's shared MC board tables and packed-only
@@ -35,6 +35,18 @@ cd /workspace/plodbnet || exit 1
 
 ACTOR_HD=${ACTOR_HD:-1024}
 ACTOR_NL=${ACTOR_NL:-3}
+# 2026-09-28 (docs/training-log.md "Plateau check + recipe rounds 3-5"): the run had stalled
+# since ~u1340 at entropy 0.06 / lambda 0.95 / lr 1.5e-4 / 10 setups per tier. Its
+# updates are noise-dominated: bigger or faster steps hurt, and every noise cut
+# helped (sampled / argmax vs the u1390 start after 10 search-scale updates, old
+# recipe -0.001 / +0.034): entropy 0.045 +0.057 / +0.017, + lambda 0.8 +0.103 /
+# +0.046, + lr 7.5e-5 +0.085 / +0.047, both +0.117 / +0.051, and with 30 setups
+# per tier +0.119 / +0.072 (setups alone did nothing: once the other noise is cut,
+# WHICH setups an update drew dominates). 90 setups cost ~20% rollout time here.
+ENTROPY=${ENTROPY:-0.045}
+LAMBDA=${LAMBDA:-0.8}
+LR=${LR:-7.5e-5}
+CONFIGS_PER_TIER=${CONFIGS_PER_TIER:-30}
 ROLLOUT_LENGTH=${ROLLOUT_LENGTH:-150000000}
 NUM_ENVS=${NUM_ENVS:-880000}
 MICRO_ROWS=${MICRO_ROWS:-500000}
@@ -45,23 +57,28 @@ LOG=runs/vSix6.log
 MAX_RESTARTS=4          # crashes allowed within RESTART_WINDOW seconds
 RESTART_WINDOW=21600    # 6 h
 POLL=300
+# A trainer whose heartbeat (runs/vSix6.heartbeat, written after every update
+# since 2026-09-28) is older than this is HUNG: killed, then relaunched like a crash.
+STALE_SECS=${STALE_SECS:-10800}
 restart_times=()
+
+STEM=vSix6
+PY=.venv/bin/python
+# Ships together with scripts/guardian_lib.sh and python/plo5bp/train/ (one pull):
+# the lib refuses to run without its helper module.
+# shellcheck source=scripts/guardian_lib.sh
+. scripts/guardian_lib.sh
 
 log(){ echo "[vSix6-guardian $(date -u '+%m-%d %H:%M:%S')] $*" >> "$GLOG"; }
 train_pid(){ pgrep -f "python -u scripts/[t]rain.py .*--checkpoint checkpoints/vSix6.pt" | head -1; }
 other_trainer(){ pgrep -f "python -u scripts/[t]rain.py" | grep -v "^$(train_pid)\$" | head -1; }
 
-numa_prefix(){
-  command -v taskset >/dev/null 2>&1 || return 0
-  local bus node
-  bus=$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader 2>/dev/null | head -1 | tr 'A-F' 'a-f')
-  node=$(cat "/sys/bus/pci/devices/${bus: -12}/numa_node" 2>/dev/null || echo -1)
-  if [ "$node" -ge 0 ] 2>/dev/null && [ -r "/sys/devices/system/node/node${node}/cpulist" ]; then
-    echo "taskset -c $(cat "/sys/devices/system/node/node${node}/cpulist")"
-  fi
-}
+numa_prefix(){ gl_numa_prefix; }
 
 launch(){
+  # This stem's own Inductor autotune cache (a cache shared with evaluators or
+  # sweeps can change the compiled kernels' numerics between relaunches).
+  export TORCHINDUCTOR_CACHE_DIR="$(gl_inductor_cache)"
   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
   export PATH="$HOME/.cargo/bin:$PATH"
   export PLO5_RUST_ENCODER=1
@@ -85,7 +102,7 @@ launch(){
   esac
   local numa
   numa=$(numa_prefix)
-  log "launch: ${ACTOR_HD}x${ACTOR_NL}, ${ROLLOUT_LENGTH} rows, ${NUM_ENVS} envs, micro ${MICRO_ROWS}, ${load:-cold} ${first}, ${numa:-unpinned}"
+  log "launch: ${ACTOR_HD}x${ACTOR_NL}, ${ROLLOUT_LENGTH} rows, ${NUM_ENVS} envs, micro ${MICRO_ROWS}, entropy ${ENTROPY}, lambda ${LAMBDA}, lr ${LR}, ${CONFIGS_PER_TIER} setups/tier, ${load:-cold} ${first}, ${numa:-unpinned}"
   setsid nohup $numa .venv/bin/python -u scripts/train.py \
     --variant plo5_double_bomb \
     --v6 \
@@ -97,9 +114,9 @@ launch(){
     --num-envs "$NUM_ENVS" --rollout-length "$ROLLOUT_LENGTH" \
     --batch-on-host --obs-real-f16 --micro-batch-rows "$MICRO_ROWS" \
     --num-minibatches 16 --ppo-epochs 2 \
-    --mix-configs --configs-per-tier 10 --mix-tiers clubgg,clubgg_deep,deep \
-    --entropy-coef 0.06 --sizing-entropy-scale 0.3 \
-    --lr 1.5e-4 --lr-warmup-updates 0 --clip-room-mid 0.07 \
+    --mix-configs --configs-per-tier "$CONFIGS_PER_TIER" --mix-tiers clubgg,clubgg_deep,deep \
+    --entropy-coef "$ENTROPY" --sizing-entropy-scale 0.3 --gae-lambda "$LAMBDA" \
+    --lr "$LR" --lr-warmup-updates 0 --clip-room-mid 0.07 \
     --target-kl 0.5 --kl-hard 10.0 --adv-clip 8 --cpu-threads 24 \
     --snapshot-every 5 --checkpoint-every 1 \
     $load $first --checkpoint checkpoints/vSix6.pt \
@@ -107,34 +124,16 @@ launch(){
   disown 2>/dev/null || true
 }
 
-compatible_ckpt(){
-  [ -f "$1" ] || return 1
-  ACTOR_HD="$ACTOR_HD" ACTOR_NL="$ACTOR_NL" .venv/bin/python - "$1" <<'PY'
-import os, sys, torch
-try:
-    ck = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
-except Exception:
-    sys.exit(1)
-cfg = ck.get("config") or {}
-ok = (int(cfg.get("hidden_dim") or 0) == int(os.environ["ACTOR_HD"])
-      and int(cfg.get("num_layers") or 0) == int(os.environ["ACTOR_NL"])
-      and (not os.path.basename(sys.argv[1]).startswith("vSix6")
-           or (int(cfg.get("critic_hidden_dim") or 0) == 1536
-               and str(cfg.get("critic_act") or "relu") == "silu"))
-      and str(cfg.get("obs_mode") or "full") == "full" and int(ck.get("obs_rev") or 1) == 1)
-sys.exit(0 if ok else 1)
-PY
-}
-
 pick_warm(){
-  # The rolling vSix6.pt counts too: the first update after any (re)launch
-  # writes no numbered checkpoint (train.py numbers from the 2nd update on).
-  local f
-  for f in $(ls -t checkpoints/vSix6_*.pt checkpoints/vSix6.pt 2>/dev/null); do
-    compatible_ckpt "$f" && { echo "$f"; return 0; }
-  done
-  [ -n "${WARM:-}" ] && compatible_ckpt "$WARM" && { echo "$WARM"; return 0; }
-  return 1
+  # The HIGHEST-numbered compatible vSix6_<N>.pt -- or the rolling vSix6.pt when
+  # its counter says it is newer (the first update after any (re)launch writes
+  # no numbered checkpoint) -- else $WARM. By update number, not modification
+  # time (plo5bp/train/guardian.py). The critic requirements apply to vSix6's
+  # own files only: a launch from another stem installs CRITIC_INIT.
+  gl_pick_warm --need hidden_dim="$ACTOR_HD" --need num_layers="$ACTOR_NL" \
+    --need obs_mode=full --need obs_rev=1 \
+    --need-own critic_hidden_dim=1536 --need-own critic_act=silu \
+    ${WARM:+--also "$WARM"}
 }
 
 if [ -f "$STOPFLAG" ]; then
@@ -163,6 +162,8 @@ while true; do
   [ -f "$STOPFLAG" ] && { log "stop flag present -> exiting"; exit 0; }
   sleep "$POLL"
   PID=$(train_pid)
+  # Alive but hung (heartbeat older than STALE_SECS): kill it, relaunch below.
+  [ -n "$PID" ] && gl_check_heartbeat "$PID" && PID=""
   if [ -z "$PID" ]; then
     sleep 15; PID=$(train_pid)
     if [ -z "$PID" ]; then

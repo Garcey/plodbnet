@@ -117,12 +117,7 @@ fn self_folded(state: &PublicState, i: usize) -> bool {
 
 /// Expected EV for seat under full range product at showdown (no private card).
 /// Used for root value reporting.
-pub fn range_vs_range_ev(
-    state: &PublicState,
-    seat: usize,
-    ranges: &[Range],
-    ranks: &[u32],
-) -> f64 {
+pub fn range_vs_range_ev(state: &PublicState, seat: usize, ranges: &[Range], ranks: &[u32]) -> f64 {
     let n = state.n();
     if state.alive_count() == 1 {
         return state.fold_payout_chips(seat) as f64;

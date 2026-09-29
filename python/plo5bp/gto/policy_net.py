@@ -12,7 +12,9 @@ host load path. **Badge "GTO AI"** requires validated meta — see
    teacher, every label's exploitability was produced by a final estimator,
    and it sits under a recorded teacher cap no looser than
    ``TEACHER_MAX_EXPL_BB``,
-3. a recorded holdout probe pass.
+3. a recorded holdout probe pass on at least :data:`BADGE_MIN_PROBE_N` holdout
+   rows (TOOL-019: a pass on a handful of rows proves nothing, whatever
+   ``--min-n`` the probe ran with).
 
 A bare ``is_gto_validated=True`` / ``source="rust_cfr"`` asserted by a script
 is NOT honoured (review 2026-09-20 F6).
@@ -37,6 +39,9 @@ from plo5bp.sizing import NLH_ANCHOR_SPEC
 logger = logging.getLogger(__name__)
 
 POLICY_KIND = "gto_policy_net"
+# The badge needs a probe over at least this many holdout rows (TOOL-019). The
+# probe CLI defaults its --min-n gate to the same number.
+BADGE_MIN_PROBE_N = 50
 DEFAULT_HIDDEN = 512
 DEFAULT_LAYERS = 2
 
@@ -160,6 +165,18 @@ def label_provenance_problem(
     return None
 
 
+def probe_n_problem(probe: dict[str, Any] | None) -> str | None:
+    """Why a recorded probe is too small for the badge (None = big enough)."""
+    report = (probe or {}).get("report") if isinstance(probe, dict) else None
+    try:
+        n = int((report or {}).get("n"))
+    except (TypeError, ValueError):
+        return "probe row count missing"
+    if n < BADGE_MIN_PROBE_N:
+        return f"probe holdout has {n} rows; the badge needs >= {BADGE_MIN_PROBE_N}"
+    return None
+
+
 def _meta_claims_gto(meta: dict[str, Any]) -> bool:
     """rust_cfr source + record-derived label provenance + probe.passed.
 
@@ -172,6 +189,8 @@ def _meta_claims_gto(meta: dict[str, Any]) -> bool:
         return False
     probe = meta.get("probe")
     if not (isinstance(probe, dict) and probe.get("passed") is True):
+        return False
+    if probe_n_problem(probe) is not None:
         return False
     # The HOLDOUT the probe scored against must itself be verified teacher
     # labels (``probe.report.holdout_provenance``, derived from its records).

@@ -10,7 +10,11 @@ optimum) that averaging cancels.
     .venv/Scripts/python scripts/average_checkpoints.py OUT.pt A.pt B.pt ...
 
 The actor ("model") and the critic are averaged tensor by tensor (float64, cast
-back); everything else is copied from the LAST input. Shapes must match.
+back). The rest follows plo5bp.train.checkpoint.derived_checkpoint (2026-09-28,
+ML-056): what describes the networks comes from the LAST input, the source
+run's bookkeeping (update counter, pool members, live-control stamp, anneal
+state, EMA) does NOT -- a warm start from an average starts its own numbering,
+seed and pool -- and `derived_from` records the inputs. Shapes must match.
 """
 
 from __future__ import annotations
@@ -20,10 +24,12 @@ import sys
 
 import torch
 
+from plo5bp.train.checkpoint import derived_checkpoint
+
 
 def average(paths: list[str]) -> dict:
     cks = [torch.load(p, map_location="cpu", weights_only=False) for p in paths]
-    out = dict(cks[-1])
+    out: dict = {}
     for key in ("model", "critic"):
         if not all(isinstance(c.get(key), dict) for c in cks):
             continue
@@ -41,9 +47,10 @@ def average(paths: list[str]) -> dict:
                 acc += v.to(torch.float64)
             avg[name] = (acc / len(cks)).to(t.dtype)
         out[key] = avg
-    out["model_ema"] = None
-    out["averaged_from"] = list(paths)
-    return out
+    # Same architecture as every input: the last input's description holds.
+    if "arch" in cks[-1]:
+        out["arch"] = cks[-1]["arch"]
+    return derived_checkpoint(cks[-1], "average", list(paths), averaged_from=list(paths), **out)
 
 
 def main() -> None:

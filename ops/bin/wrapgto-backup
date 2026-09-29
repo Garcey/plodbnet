@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# wrapgto-backup — WrapGTO's data backup. Install: /usr/local/sbin/wrapgto-backup
+# (ops/SERVER_SETUP.md, "Backups"); wrapgto-backup.timer runs it nightly. Every
+# deploy / rollback / restore-db / install-unit runs the copy it UPLOADS (this file,
+# as committed), local copy only — never whatever older job the server has.
+#
+#   wrapgto-backup           local snapshot + encrypted off-site copy (if set up) + ping
+#   wrapgto-backup --drill   restore the newest OFF-SITE snapshot into a scratch folder
+#                            and prove it opens (wrapgto-backup-drill.timer, monthly)
+#   wrapgto-backup --check   is the newest local backup fresh and readable? (exit 1 if not)
+#   WRAPGTO_BACKUP_LOCAL_ONLY=1 wrapgto-backup     the local snapshot only (the deploy)
+#
+# Local, in /opt/wrapgto/backups (root-only — the database holds the cookie-signing
+# secret, hole cards and shuffle keys), kept $DAYS days:
+#   public-<UTC>.db.gz   the SQLite database (online backup API: safe while the app
+#                        writes; PRAGMA integrity_check before it is kept)
+#   data-<UTC>.tgz       everything else in data/ (the per-user trainer stats, …)
+#   manifest-<UTC>.txt   sha256s and sizes, the live commit, the served models' sha256
+# Off-site (optional, /etc/wrapgto/backup.env — ops/backup.env.example): restic,
+# client-side encrypted, to any restic repository (Backblaze B2, a Hetzner Storage
+# Box over sftp, S3…). A copy with ANOTHER provider survives losing the server and
+# the hosting account together.
+# Monitoring (optional): HC_PING_URL (healthchecks.io or similar) is pinged on
+# success and <url>/fail on failure; HC_DRILL_URL likewise for --drill.
+set -euo pipefail
+
+APP="${WRAPGTO_APP:-/opt/wrapgto/app}"
+KEEP="${WRAPGTO_BACKUPS:-/opt/wrapgto/backups}"
+CONF="${WRAPGTO_BACKUP_CONF:-/etc/wrapgto/backup.env}"
+ENVFILE="${WRAPGTO_ENVFILE:-/etc/wrapgto/env}"
+TS="$(date -u +%Y%m%d-%H%M%S)"
+MODE="${1:-backup}"
+LOCAL_ONLY="${WRAPGTO_BACKUP_LOCAL_ONLY:-}"
+TMPS=()
+
+# The config first: every setting below may come from it (WRAPGTO_BACKUP_DAYS…).
+# shellcheck source=/dev/null
+if [ -r "$CONF" ]; then set -a; . "$CONF"; set +a; fi
+DAYS="${WRAPGTO_BACKUP_DAYS:-14}"
+case "$DAYS" in ''|*[!0-9]*) DAYS=14 ;; esac
+PY="${WRAPGTO_PY:-$(command -v python3 || echo "$APP/.venv/bin/python")}"
+
+say() { printf '%s\n' "$*"; }
+ping_hc() {  # $1 = base URL (may be empty), $2 = "" | /fail, $3 = message
+  if [ -z "${1:-}" ] || ! command -v curl >/dev/null; then return 0; fi
+  curl -fsS -m 10 --retry 3 --data-raw "${3:-}" "$1$2" >/dev/null 2>&1 || true
+}
+finish() {  # every exit: remove temporary copies, then report to the monitor
+  local rc=$?
+  if [ "${#TMPS[@]}" -gt 0 ]; then rm -rf "${TMPS[@]}"; fi
+  if [ "$MODE" = "backup" ] && [ -z "$LOCAL_ONLY" ]; then
+    if [ "$rc" = 0 ]; then ping_hc "${HC_PING_URL:-}" "" "ok $TS"; else ping_hc "${HC_PING_URL:-}" "/fail" "backup FAILED $TS (exit $rc)"; fi
+  fi
+  if [ "$MODE" = "--drill" ]; then
+    if [ "$rc" = 0 ]; then ping_hc "${HC_DRILL_URL:-}" "" "drill ok $TS"; else ping_hc "${HC_DRILL_URL:-}" "/fail" "drill FAILED $TS (exit $rc)"; fi
+  fi
+  exit "$rc"
+}
+trap finish EXIT
+fail() { say "!! $*"; exit 1; }
+
+# The database the app uses: WRAPGTO_DB (the deploy passes the path it resolved from the
+# service's real settings), else PLO5BP_DB in the app's env file, else data/public.db.
+DB="$APP/data/public.db"
+if [ -n "${WRAPGTO_DB:-}" ]; then
+  DB="$WRAPGTO_DB"
+elif [ -r "$ENVFILE" ]; then
+  v="$(sed -n 's/^[[:space:]]*PLO5BP_DB[[:space:]]*=[[:space:]]*//p' "$ENVFILE" | tail -1 | tr -d "\"'")" || v=""
+  if [ -n "$v" ]; then case "$v" in /*) DB="$v" ;; *) DB="$APP/$v" ;; esac; fi
+fi
+
+snapshot() {
+  [ -f "$DB" ] || fail "no database at $DB"
+  umask 077
+  mkdir -p "$KEEP"; chmod 700 "$KEEP"
+  local owner tmpd base
+  owner="$(stat -c %U "$DB")"
+  # Read the database AS ITS OWNER: a root connection could leave root-owned
+  # -wal/-shm files that the app can no longer open.
+  tmpd="$(mktemp -d)"; TMPS+=("$tmpd")
+  chmod 700 "$tmpd"; chown "$owner" "$tmpd"
+  local as=()
+  if [ "$(id -un)" != "$owner" ]; then as=(runuser -u "$owner" --); fi
+  "${as[@]}" "$PY" - "$DB" "$tmpd/snap.db" <<'PY' || fail "the SQLite backup of $DB failed"
+import sqlite3, sys
+src = sqlite3.connect(sys.argv[1], timeout=60)
+dst = sqlite3.connect(sys.argv[2])
+try:
+    src.backup(dst)
+    ok = dst.execute("PRAGMA integrity_check").fetchone()[0]
+finally:
+    dst.close()
+    src.close()
+if ok != "ok":
+    sys.exit("integrity_check: %s" % ok)
+PY
+  gzip -9 -c "$tmpd/snap.db" > "$KEEP/.public-$TS.db.gz.part"
+  mv -f "$KEEP/.public-$TS.db.gz.part" "$KEEP/public-$TS.db.gz"
+  # Everything else in data/ (the database files themselves are in the snapshot). The app
+  # keeps writing while this runs: a file that changes or disappears mid-read (trainer
+  # stats are replaced atomically) is GNU tar's exit 1 — "some files differ", the archive
+  # is complete. Only 2 and above are real failures.
+  base="$(basename "$DB")"
+  local trc=0
+  tar -czf "$KEEP/.data-$TS.tgz.part" --warning=no-file-changed --warning=no-file-removed \
+    --ignore-failed-read -C "$(dirname "$DB")" \
+    --exclude="./$base" --exclude="./$base-wal" --exclude="./$base-shm" --exclude="./$base-journal" \
+    --exclude="./$base.homegames.lock" . || trc=$?
+  [ "$trc" -le 1 ] || fail "archiving $(dirname "$DB") failed (tar exit $trc)"
+  mv -f "$KEEP/.data-$TS.tgz.part" "$KEEP/data-$TS.tgz"
+  manifest > "$KEEP/manifest-$TS.txt"
+  find "$KEEP" -maxdepth 1 -type f \( -name 'public-*.db.gz' -o -name 'data-*.tgz' -o -name 'manifest-*.txt' \) \
+    -mtime +"$DAYS" -delete
+  # restore-db's replaced-<time> folders (a whole database each): past the same age,
+  # but never the newest one
+  local d n=0
+  for d in $(ls -1td "$KEEP"/replaced-* 2>/dev/null); do
+    n=$((n + 1))
+    if [ "$n" -gt 1 ] && [ -n "$(find "$d" -maxdepth 0 -mtime +"$DAYS" 2>/dev/null)" ]; then rm -rf "${d:?}"; fi
+  done
+  say "local backup: $KEEP/public-$TS.db.gz ($(du -h "$KEEP/public-$TS.db.gz" | cut -f1))"
+}
+
+manifest() {
+  local m
+  echo "WrapGTO backup $TS (UTC)"
+  echo "database: $DB"
+  (cd "$KEEP" && sha256sum "public-$TS.db.gz" "data-$TS.tgz" && du -b "public-$TS.db.gz" "data-$TS.tgz")
+  if [ -f "$APP/BUILD_INFO.json" ]; then echo "live code: $(tr -d '\n' < "$APP/BUILD_INFO.json")"; fi
+  for m in "$APP/checkpoints/stub.pt" "$APP/checkpoints/nlh_stub.pt"; do
+    if [ -f "$m" ]; then echo "model $(basename "$m"): $(sha256sum "$m" | cut -d' ' -f1)"; fi
+  done
+  return 0
+}
+
+offsite() {
+  if [ -z "${RESTIC_REPOSITORY:-}" ]; then
+    say "off-site copy: not set up (ops/SERVER_SETUP.md, 'Backups')"
+    return 0
+  fi
+  command -v restic >/dev/null || fail "RESTIC_REPOSITORY is set but restic is not installed"
+  restic backup --quiet --host wrapgto --tag wrapgto \
+    "$KEEP/public-$TS.db.gz" "$KEEP/data-$TS.tgz" "$KEEP/manifest-$TS.txt" || fail "restic backup failed"
+  local prune=()
+  if [ "$(date -u +%u)" = "7" ]; then prune=(--prune); fi   # the slow part, once a week
+  restic forget --quiet --host wrapgto --tag wrapgto \
+    --keep-daily 14 --keep-weekly 8 --keep-monthly 24 "${prune[@]}" || fail "restic forget failed"
+  touch "$KEEP/.offsite-ok"
+  say "off-site copy: ok"
+}
+
+drill() {
+  [ -n "${RESTIC_REPOSITORY:-}" ] || fail "no off-site copy is set up — nothing to drill"
+  local d f
+  d="$(mktemp -d)"; TMPS+=("$d"); chmod 700 "$d"
+  restic restore latest --quiet --host wrapgto --tag wrapgto --target "$d" || fail "restic restore failed"
+  f="$(find "$d" -name 'public-*.db.gz' | sort | tail -1)"
+  [ -n "$f" ] || fail "the newest off-site snapshot has no database in it"
+  gzip -dc "$f" > "$d/restored.db"
+  "$PY" - "$d/restored.db" <<'PY' || fail "the restored database is damaged"
+import sqlite3, sys
+con = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
+ok = con.execute("PRAGMA integrity_check").fetchone()[0]
+tables = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+users = con.execute("SELECT COUNT(*) FROM users").fetchone()[0] if "users" in tables else "?"
+con.close()
+print("restored database: integrity %s, %d tables, %s users" % (ok, len(tables), users))
+sys.exit(0 if ok == "ok" else 1)
+PY
+  touch "$KEEP/.drill-ok"
+  say "restore drill: ok — $(basename "$f") from the off-site copy opens and is intact"
+}
+
+case "$MODE" in
+  backup)
+    snapshot
+    if [ -z "$LOCAL_ONLY" ]; then offsite; fi
+    ;;
+  --drill)
+    drill
+    ;;
+  --check)
+    tool="$APP/ops/deploytool.py"
+    [ -f "$tool" ] || fail "no $tool (deploy a release that has ops/)"
+    "$PY" "$tool" backup-check --dir "$KEEP" --max-age-hours 26
+    ;;
+  *)
+    sed -n '2,23p' "$0"
+    exit 2
+    ;;
+esac

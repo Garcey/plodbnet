@@ -93,13 +93,16 @@ def _desktop_dir() -> Path:
     return Path.home() / "Desktop"
 
 
-def _start_menu_dir() -> Path:
+def _start_menu_dir(*, create: bool = True) -> Path:
+    """The "CFR Solver" Start Menu folder. ``create=False`` for uninstall, which
+    used to CREATE the folder it was about to remove (TOOL-023)."""
     programs = _special_folder("Programs")
     if programs is None:
         appdata = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
         programs = appdata / "Microsoft" / "Windows" / "Start Menu" / "Programs"
     d = programs / "CFR Solver"
-    d.mkdir(parents=True, exist_ok=True)
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
     return d
 
 
@@ -196,15 +199,15 @@ def install() -> list[Path]:
 
 def uninstall() -> list[Path]:
     removed: list[Path] = []
+    sm = _start_menu_dir(create=False)
     for p in (
         _desktop_dir() / "CFR Solver.lnk",
-        _start_menu_dir() / "CFR Solver.lnk",
+        sm / "CFR Solver.lnk",
     ):
         if p.is_file():
             p.unlink()
             removed.append(p)
-    # Remove empty Start Menu folder.
-    sm = _start_menu_dir()
+    # Remove the Start Menu folder if it is now empty.
     try:
         if sm.is_dir() and not any(sm.iterdir()):
             sm.rmdir()
@@ -223,10 +226,10 @@ def _warn_if_app_deps_missing() -> None:
 
     missing = [m for m in ("fastapi", "uvicorn", "multipart") if importlib.util.find_spec(m) is None]
     if missing:
-        print(f'WARNING: missing packages {missing} — run:  .venv\\Scripts\\pip install -e ".[ui,dev]"')
+        print(f'WARNING: missing packages {missing} — run:  .venv\\Scripts\\pip install -e ".[dev,desktop]"')
     if importlib.util.find_spec("webview") is None:
         print("note: pywebview is not installed — the app will open in your browser instead "
-              'of its own window (pip install -e ".[ui]" adds it).')
+              'of its own window (pip install -e ".[desktop]" adds it).')
     # Look for the built file rather than importing plo5bp (that pulls in torch,
     # and an unrelated import error would masquerade as "extension not built").
     pkg = _ROOT / "python" / "plo5bp"

@@ -125,12 +125,12 @@ impl RootSpec {
     /// Validate root; allows multiway (2..=6 seats).
     pub fn validate_for_solve(&self) -> Result<(), CfrError> {
         if self.num_seats < 2 || self.num_seats > 6 {
-            return Err(CfrError::InvalidRoot(
-                "num_seats must be 2..=6".into(),
-            ));
+            return Err(CfrError::InvalidRoot("num_seats must be 2..=6".into()));
         }
         if self.pot_bb <= 0.0 || !self.pot_bb.is_finite() {
-            return Err(CfrError::InvalidRoot("pot_bb must be positive finite".into()));
+            return Err(CfrError::InvalidRoot(
+                "pot_bb must be positive finite".into(),
+            ));
         }
         if self.effective_stack_bb <= 0.0 || !self.effective_stack_bb.is_finite() {
             return Err(CfrError::InvalidRoot(
@@ -151,7 +151,9 @@ impl RootSpec {
         }
         for &c in &self.board {
             if c >= 52 {
-                return Err(CfrError::InvalidRoot(format!("card index {c} out of 0..51")));
+                return Err(CfrError::InvalidRoot(format!(
+                    "card index {c} out of 0..51"
+                )));
             }
         }
         let mut seen = [false; 52];
@@ -163,7 +165,8 @@ impl RootSpec {
         }
         if self.raise_sizes_pm.is_empty() && !self.allin_atom {
             return Err(CfrError::InvalidRoot(
-                "need at least one raise size or allin_atom=true (empty menu is push/fold only)".into(),
+                "need at least one raise size or allin_atom=true (empty menu is push/fold only)"
+                    .into(),
             ));
         }
         // stacks_bb: empty = use effective_stack_bb for all seats; otherwise must match num_seats
@@ -275,9 +278,23 @@ pub struct SolveConfig {
     /// If non-empty and this path exists, the solver **pauses** (spin-sleep)
     /// until the file is removed or stop_file appears. Does not discard state.
     pub pause_file: String,
-    /// If non-empty, write a partial SolveReport JSON here every `poll_every`
-    /// iterations so a live UI can stream strategy without waiting for finish.
+    /// If non-empty, a live UI's progress file: the full average-strategy
+    /// SNAPSHOT is written here (at most every `progress_secs`, and at most ~10%
+    /// of the run — TOOL-005), and the counters every `poll_every` iterations to
+    /// `<progress_file>.counters` ([`SolveConfig::counters_path`]).
     pub progress_file: String,
+    /// (TOOL-005) Minimum wall-clock seconds between two full progress snapshots.
+    pub progress_secs: f64,
+    /// (TOOL-006) If non-empty, the finished report is streamed to this file as
+    /// JSON (scalars first, strategy last) and the Python caller receives only
+    /// the scalars — no nested dict copies of a 100+ MB strategy.
+    pub report_path: String,
+    /// (TOOL-030) Check exploitability every this many wall-clock seconds while
+    /// solving (0 = only when a target is set). Never stops a solve by itself;
+    /// the value is written to the progress counters.
+    pub expl_check_secs: f64,
+    /// (TOOL-032) RAM budget for the infoset table, MB (0 = the 8 GB default).
+    pub ram_budget_mb: u64,
 }
 
 impl Default for SolveConfig {
@@ -295,6 +312,10 @@ impl Default for SolveConfig {
             poll_every: 500,
             pause_file: String::new(),
             progress_file: String::new(),
+            progress_secs: 2.0,
+            report_path: String::new(),
+            expl_check_secs: 0.0,
+            ram_budget_mb: 0,
         }
     }
 }
@@ -332,8 +353,18 @@ impl Discounting {
 impl SolveConfig {
     /// Accepted `algorithm` tags. (review 2026-09-20, latent) Anything else
     /// used to run undiscounted CFR while the report said "DCFR".
-    pub const KNOWN_ALGORITHMS: [&'static str; 6] =
-        ["dcfr", "linear", "cfr", "vanilla", "mccfr_es", "mccfr"];
+    ///
+    /// `dcfr_vector` (TOOL-008) = DCFR over the full ranges every iteration
+    /// (HU river / turn roots, `vector.rs`); `dcfr` = chance-sampled DCFR.
+    pub const KNOWN_ALGORITHMS: [&'static str; 7] = [
+        "dcfr",
+        "linear",
+        "cfr",
+        "vanilla",
+        "mccfr_es",
+        "mccfr",
+        "dcfr_vector",
+    ];
 
     /// Accepted `card_abstraction` tags ("" = "none"; "exact" = "none").
     pub const KNOWN_CARD_ABSTRACTIONS: [&'static str; 7] =
@@ -343,10 +374,15 @@ impl SolveConfig {
         self.algorithm.trim().to_ascii_lowercase()
     }
 
+    /// The vectorized full-range solver (`algorithm = "dcfr_vector"`, TOOL-008).
+    pub fn is_vector(&self) -> bool {
+        self.algorithm_tag() == "dcfr_vector"
+    }
+
     /// Discounting implied by `algorithm` (the tag is validated separately).
     pub fn discounting(&self) -> Discounting {
         match self.algorithm_tag().as_str() {
-            "dcfr" => Discounting::Dcfr,
+            "dcfr" | "dcfr_vector" => Discounting::Dcfr,
             "linear" => Discounting::Linear,
             _ => Discounting::None,
         }
@@ -399,7 +435,31 @@ impl SolveConfig {
         if self.poll_every == 0 {
             return Err(CfrError::InvalidConfig("poll_every must be > 0".into()));
         }
+        for (name, v) in [
+            ("expl_check_secs", self.expl_check_secs),
+            ("progress_secs", self.progress_secs),
+        ] {
+            if !v.is_finite() || v < 0.0 {
+                return Err(CfrError::InvalidConfig(format!(
+                    "{name} must be finite and >= 0"
+                )));
+            }
+        }
         Ok(())
+    }
+
+    /// RAM budget for the infoset table in bytes.
+    pub fn ram_budget_bytes(&self) -> u64 {
+        if self.ram_budget_mb > 0 {
+            self.ram_budget_mb.saturating_mul(1024 * 1024)
+        } else {
+            super::memory::DEFAULT_RAM_BUDGET_BYTES
+        }
+    }
+
+    /// Where the counters-only progress file goes (beside `progress_file`).
+    pub fn counters_path(&self) -> String {
+        format!("{}.counters", self.progress_file)
     }
 
     /// Effective iteration ceiling (0 → ~4e9, effectively unlimited).
@@ -417,9 +477,7 @@ impl SolveConfig {
     /// Wall-clock `time_budget` and `stop_file` are checked **every**
     /// iteration (cheap). Pause + progress cadence still use `poll_every`.
     pub fn should_stop(&self, start: std::time::Instant, iteration: u32) -> Option<&'static str> {
-        if self.time_budget_secs > 0.0
-            && start.elapsed().as_secs_f64() >= self.time_budget_secs
-        {
+        if self.time_budget_secs > 0.0 && start.elapsed().as_secs_f64() >= self.time_budget_secs {
             return Some("time_budget");
         }
         if !self.stop_file.is_empty() && std::path::Path::new(&self.stop_file).exists() {
@@ -427,7 +485,7 @@ impl SolveConfig {
         }
         let every = self.poll_every.max(1);
         // Pause is polled (spin-sleep); don't stat the pause file every iter.
-        if iteration % every != 0 && iteration > 1 {
+        if !iteration.is_multiple_of(every) && iteration > 1 {
             return None;
         }
         // Pause: spin until resume (file removed) or stop / budget.
@@ -464,12 +522,17 @@ impl SolveConfig {
         out
     }
 
-    /// Write a lightweight progress JSON (status + iters + optional strategy).
-    /// Best-effort: IO errors are ignored so the solve never fails on a bad path.
+    /// Write the progress file: status + counters and, when given, the full
+    /// average-strategy snapshot. Best-effort: IO errors never fail the solve.
     ///
     /// `expl_kind` labels what `exploitability_bb` is (e.g. `"mc_poll"` for the
     /// cheap in-loop Monte-Carlo estimate) — written as an extra `expl_kind`
     /// key so a live viewer never mistakes a poll for the final number.
+    ///
+    /// (TOOL-005) Streamed through a buffered writer straight into the temp
+    /// file (it used to build the whole 100+ MB JSON as one String) and NOT
+    /// fsync'ed: a snapshot is a convenience the next one replaces, and the
+    /// rename alone keeps readers from ever seeing a torn file.
     #[allow(clippy::too_many_arguments)]
     pub fn write_progress(
         &self,
@@ -484,19 +547,87 @@ impl SolveConfig {
         if self.progress_file.is_empty() {
             return;
         }
+        let head = Self::progress_head(
+            iterations_run,
+            exploitability_bb,
+            expl_kind,
+            n_infosets,
+            root_id,
+            paused,
+        );
+        Self::write_file_atomic_with(std::path::Path::new(&self.progress_file), false, |w| {
+            use std::io::Write;
+            w.write_all(head.as_bytes())?;
+            if let Some(strat) = strategy {
+                let mut buf = String::with_capacity(256);
+                buf.push_str(",\n  \"strategy\": {\n    \"root_id\": \"");
+                buf.push_str(&Self::json_escape_str(&strat.root_id));
+                buf.push_str("\",\n    \"schema_version\": ");
+                buf.push_str(&strat.schema_version.to_string());
+                buf.push_str(",\n    \"infosets\": [");
+                w.write_all(buf.as_bytes())?;
+                for (i, is) in strat.infosets.iter().enumerate() {
+                    buf.clear();
+                    if i > 0 {
+                        buf.push(',');
+                    }
+                    buf.push_str("\n      ");
+                    is.write_json_object(&mut buf);
+                    w.write_all(buf.as_bytes())?;
+                }
+                w.write_all(b"\n    ]\n  }")?;
+            }
+            w.write_all(b"\n}\n")
+        });
+    }
+
+    /// (TOOL-005) The counters alone, written often and cheaply to
+    /// [`SolveConfig::counters_path`] — the live UI's iteration / exploitability
+    /// read, while the big snapshot is written only every few seconds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_progress_counters(
+        &self,
+        iterations_run: u32,
+        exploitability_bb: Option<f64>,
+        expl_kind: Option<&str>,
+        n_infosets: usize,
+        root_id: &str,
+        paused: bool,
+    ) {
+        if self.progress_file.is_empty() {
+            return;
+        }
+        let mut body = Self::progress_head(
+            iterations_run,
+            exploitability_bb,
+            expl_kind,
+            n_infosets,
+            root_id,
+            paused,
+        );
+        body.push_str("\n}\n");
+        Self::write_file_atomic_with(std::path::Path::new(&self.counters_path()), false, |w| {
+            use std::io::Write;
+            w.write_all(body.as_bytes())
+        });
+    }
+
+    fn progress_head(
+        iterations_run: u32,
+        exploitability_bb: Option<f64>,
+        expl_kind: Option<&str>,
+        n_infosets: usize,
+        root_id: &str,
+        paused: bool,
+    ) -> String {
         let status = if paused { "paused" } else { "running" };
         let mut body = format!(
             "{{\n  \"status\": \"{status}\",\n  \"iterations_run\": {iterations_run},\n  \"num_infosets\": {n_infosets},\n  \"root_id\": \"{}\"",
             Self::json_escape_str(root_id)
         );
-        if let Some(e) = exploitability_bb {
-            if e.is_finite() {
-                body.push_str(&format!(",\n  \"exploitability_bb\": {e}"));
-            } else {
-                body.push_str(",\n  \"exploitability_bb\": null");
-            }
-        } else {
-            body.push_str(",\n  \"exploitability_bb\": null");
+        match exploitability_bb {
+            Some(e) if e.is_finite() => body.push_str(&format!(",\n  \"exploitability_bb\": {e}")),
+            _ => body.push_str(",\n  \"exploitability_bb\": null"),
         }
         if let Some(kind) = expl_kind {
             body.push_str(&format!(
@@ -504,26 +635,10 @@ impl SolveConfig {
                 Self::json_escape_str(kind)
             ));
         }
-        if let Some(strat) = strategy {
-            body.push_str(",\n  \"strategy\": {\n    \"root_id\": \"");
-            body.push_str(&Self::json_escape_str(&strat.root_id));
-            body.push_str("\",\n    \"schema_version\": ");
-            body.push_str(&format!("{}", strat.schema_version));
-            body.push_str(",\n    \"infosets\": [");
-            for (i, is) in strat.infosets.iter().enumerate() {
-                if i > 0 {
-                    body.push(',');
-                }
-                body.push_str("\n      ");
-                is.write_json_object(&mut body);
-            }
-            body.push_str("\n    ]\n  }");
-        }
-        body.push_str("\n}\n");
-        Self::write_file_atomic(std::path::Path::new(&self.progress_file), body.as_bytes());
+        body
     }
 
-    /// Write `bytes` to a sibling temp file, then rename it OVER `path`.
+    /// Write a sibling temp file, then rename it OVER `path`.
     ///
     /// (review 2026-09-20, latent) `std::fs::rename` replaces an existing
     /// destination on every platform (Windows: `MOVEFILE_REPLACE_EXISTING`),
@@ -533,26 +648,90 @@ impl SolveConfig {
     /// A rename can still fail transiently on Windows while a reader holds the
     /// target open: retry briefly, then keep the previous (complete) snapshot.
     /// Best-effort: IO errors never fail the solve.
-    pub(crate) fn write_file_atomic(path: &std::path::Path, bytes: &[u8]) {
+    /// The content is streamed by `fill` through a 1 MB buffer; `durable` =
+    /// fsync before the rename (final reports; progress snapshots skip it).
+    pub(crate) fn write_file_atomic_with<F>(path: &std::path::Path, durable: bool, fill: F) -> bool
+    where
+        F: FnOnce(&mut std::io::BufWriter<std::fs::File>) -> std::io::Result<()>,
+    {
         use std::io::Write;
-        let tmp = path.with_extension(format!("progress.{}.tmp", std::process::id()));
-        let written = std::fs::File::create(&tmp).and_then(|mut f| {
-            f.write_all(bytes)?;
-            f.sync_all()
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let tmp = path.with_file_name(format!("{name}.{}.tmp", std::process::id()));
+        let written = std::fs::File::create(&tmp).and_then(|f| {
+            let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
+            fill(&mut w)?;
+            w.flush()?;
+            if durable {
+                w.get_ref().sync_all()?;
+            }
+            Ok(())
         });
         if written.is_err() {
             let _ = std::fs::remove_file(&tmp);
-            return;
+            return false;
         }
         for attempt in 0..5 {
             if std::fs::rename(&tmp, path).is_ok() {
-                return;
+                return true;
             }
             if attempt < 4 {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
         let _ = std::fs::remove_file(&tmp);
+        false
+    }
+}
+
+/// (TOOL-005) When the next FULL progress snapshot is due: never more often
+/// than `progress_secs`, and never more than ~10% of the wall clock (a
+/// snapshot that took `d` waits at least `9 d` before the next one).
+#[derive(Debug, Default)]
+pub struct SnapshotPacer {
+    last_end: Option<std::time::Instant>,
+    last_cost: std::time::Duration,
+}
+
+impl SnapshotPacer {
+    pub fn due(&self, cfg: &SolveConfig) -> bool {
+        match self.last_end {
+            None => true,
+            Some(end) => {
+                let gap = std::time::Duration::from_secs_f64(cfg.progress_secs.max(0.0))
+                    .max(self.last_cost * 9);
+                end.elapsed() >= gap
+            }
+        }
+    }
+
+    pub fn record(&mut self, started: std::time::Instant) {
+        self.last_cost = started.elapsed();
+        self.last_end = Some(std::time::Instant::now());
+    }
+}
+
+/// JSON number for a finite f64 that parses back to the SAME value, as a
+/// float (TOOL-006): Rust's `Display` is shortest-round-trip but never uses an
+/// exponent and prints `3` for 3.0 — so integral values get `.0` and tiny /
+/// huge magnitudes use `{:e}`. Non-finite → `null`.
+pub(crate) fn push_json_f64(out: &mut String, v: f64) {
+    use std::fmt::Write;
+    if !v.is_finite() {
+        out.push_str("null");
+        return;
+    }
+    let a = v.abs();
+    if a != 0.0 && !(1e-5..1e16).contains(&a) {
+        let _ = write!(out, "{v:e}");
+        return;
+    }
+    let start = out.len();
+    let _ = write!(out, "{v}");
+    if !out[start..].contains('.') {
+        out.push_str(".0");
     }
 }
 
@@ -582,6 +761,15 @@ pub struct InfosetStrategy {
     pub iso_id: Option<u32>,
     /// Sum of ``strategy_sum``. 0 ⇒ untouched (average strategy is the 1/n default).
     pub visit_mass: Option<f64>,
+    /// (TOOL-028) How many times the average strategy was accumulated here.
+    pub visits: Option<u32>,
+    /// (TOOL-035) Expected value of this hand at this node under the solved
+    /// strategies, in bb: its expected share of the final pot minus what it
+    /// still puts in from here (HU postflop exact-card infosets only).
+    pub ev_bb: Option<f64>,
+    /// (TOOL-035) Showdown equity of this hand against the range that reaches
+    /// this node (win + half the ties, over every remaining runout).
+    pub equity: Option<f64>,
 }
 
 impl InfosetStrategy {
@@ -591,6 +779,7 @@ impl InfosetStrategy {
             actions: node.actions.iter().map(|a| a.label()).collect(),
             probs: node.average_strategy(),
             visit_mass: Some(node.strategy_sum.iter().sum()),
+            visits: Some(node.visits),
             ..Default::default()
         };
         if let Some(ref d) = node.dump {
@@ -617,8 +806,15 @@ impl InfosetStrategy {
         self.iso_id = d.iso_id;
     }
 
-    /// Append one JSON object (no trailing comma) for progress dumps.
+    /// Append one JSON object (no trailing comma) for progress dumps
+    /// (probabilities to 8 decimals — a snapshot the next one replaces).
     pub fn write_json_object(&self, body: &mut String) {
+        self.write_json(body, false);
+    }
+
+    /// Append one JSON object. `exact` = every float round-trips (the final
+    /// report, TOOL-006); otherwise 8 decimals (live snapshots).
+    pub fn write_json(&self, body: &mut String, exact: bool) {
         body.push_str("{\"infoset_id\": \"");
         body.push_str(&SolveConfig::json_escape_str(&self.infoset_id));
         body.push_str("\", \"actions\": [");
@@ -635,10 +831,12 @@ impl InfosetStrategy {
             if j > 0 {
                 body.push(',');
             }
-            if p.is_finite() {
-                body.push_str(&format!("{p:.8}"));
-            } else {
+            if !p.is_finite() {
                 body.push('0');
+            } else if exact {
+                push_json_f64(body, *p);
+            } else {
+                body.push_str(&format!("{p:.8}"));
             }
         }
         body.push(']');
@@ -722,10 +920,22 @@ impl InfosetStrategy {
             }
         }
         if let Some(v) = self.visit_mass {
-            if v.is_finite() {
-                body.push_str(&format!(", \"visit_mass\": {v:.8}"));
-            } else {
+            if !v.is_finite() {
                 body.push_str(", \"visit_mass\": 0");
+            } else if exact {
+                body.push_str(", \"visit_mass\": ");
+                push_json_f64(body, v);
+            } else {
+                body.push_str(&format!(", \"visit_mass\": {v:.8}"));
+            }
+        }
+        if let Some(v) = self.visits {
+            body.push_str(&format!(", \"visits\": {v}"));
+        }
+        for (name, val) in [("ev_bb", self.ev_bb), ("equity", self.equity)] {
+            if let Some(v) = val {
+                body.push_str(&format!(", \"{name}\": "));
+                push_json_f64(body, v);
             }
         }
         body.push('}');
@@ -778,6 +988,133 @@ pub struct SolveReport {
     pub notes: Vec<String>,
 }
 
+fn push_json_str(out: &mut String, s: &str) {
+    out.push('"');
+    out.push_str(&SolveConfig::json_escape_str(s));
+    out.push('"');
+}
+
+impl SolveReport {
+    /// (TOOL-006) Stream the report to `path` (temp file + fsync + rename) in
+    /// the layout Python's `SolveReport.as_dict()` writes, except that the
+    /// scalars come FIRST and the strategy LAST (a reader of the first kilobytes
+    /// gets everything but the infosets). Floats round-trip exactly.
+    /// `root_extra` adds string fields to `root` (the app's `range_*_text`).
+    pub fn write_json_file(&self, path: &std::path::Path, root_extra: &[(String, String)]) -> bool {
+        let mut head = String::with_capacity(4096);
+        head.push_str("{\"status\":");
+        push_json_str(&mut head, &self.status);
+        head.push_str(",\"root\":");
+        self.push_root_json(&mut head, root_extra);
+        head.push_str(",\"config\":");
+        self.push_config_json(&mut head);
+        head.push_str(&format!(",\"iterations_run\":{}", self.iterations_run));
+        head.push_str(",\"exploitability_bb\":");
+        match self.exploitability_bb {
+            Some(e) => push_json_f64(&mut head, e),
+            None => head.push_str("null"),
+        }
+        head.push_str(",\"notes\":[");
+        for (i, n) in self.notes.iter().enumerate() {
+            if i > 0 {
+                head.push(',');
+            }
+            push_json_str(&mut head, n);
+        }
+        head.push_str("],\"strategy\":{\"root_id\":");
+        push_json_str(&mut head, &self.strategy.root_id);
+        head.push_str(&format!(
+            ",\"schema_version\":{},\"infosets\":[",
+            self.strategy.schema_version
+        ));
+        SolveConfig::write_file_atomic_with(path, true, |w| {
+            use std::io::Write;
+            w.write_all(head.as_bytes())?;
+            let mut buf = String::with_capacity(512);
+            for (i, is) in self.strategy.infosets.iter().enumerate() {
+                buf.clear();
+                if i > 0 {
+                    buf.push(',');
+                }
+                is.write_json(&mut buf, true);
+                w.write_all(buf.as_bytes())?;
+            }
+            w.write_all(b"]}}\n")
+        })
+    }
+
+    fn push_root_json(&self, out: &mut String, extra: &[(String, String)]) {
+        let r = &self.root;
+        out.push_str(&format!("{{\"street\":{},\"pot_bb\":", r.street as u8));
+        push_json_f64(out, r.pot_bb);
+        out.push_str(",\"effective_stack_bb\":");
+        push_json_f64(out, r.effective_stack_bb);
+        let board: Vec<String> = r.board.iter().map(|c| c.to_string()).collect();
+        out.push_str(&format!(",\"board\":[{}]", board.join(",")));
+        out.push_str(&format!(
+            ",\"num_seats\":{},\"bb_chips\":{},\"sb_chips\":{},\"ante_chips\":{}",
+            r.num_seats, r.bb_chips, r.sb_chips, r.ante_chips
+        ));
+        let sizes: Vec<String> = r.raise_sizes_pm.iter().map(|x| x.to_string()).collect();
+        out.push_str(&format!(
+            ",\"raise_sizes_pm\":[{}],\"allin_atom\":{}",
+            sizes.join(","),
+            r.allin_atom
+        ));
+        out.push_str(",\"range_ip\":");
+        push_json_str(out, &r.range_ip);
+        out.push_str(",\"range_oop\":");
+        push_json_str(out, &r.range_oop);
+        out.push_str(",\"stacks_bb\":[");
+        for (i, x) in r.stacks_bb.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            push_json_f64(out, *x);
+        }
+        out.push_str("],\"root_id\":");
+        push_json_str(out, &r.root_id);
+        for (k, v) in extra {
+            out.push(',');
+            push_json_str(out, k);
+            out.push(':');
+            push_json_str(out, v);
+        }
+        out.push('}');
+    }
+
+    fn push_config_json(&self, out: &mut String) {
+        let c = &self.config;
+        out.push_str(&format!(
+            "{{\"max_iterations\":{},\"target_exploitability_bb\":",
+            c.max_iterations
+        ));
+        push_json_f64(out, c.target_exploitability_bb);
+        out.push_str(&format!(
+            ",\"thread_num\":{},\"seed\":{},\"use_isomorphism\":{},\"algorithm\":",
+            c.thread_num, c.seed, c.use_isomorphism
+        ));
+        push_json_str(out, &c.algorithm);
+        out.push_str(",\"card_abstraction\":");
+        push_json_str(out, &c.card_abstraction);
+        out.push_str(",\"time_budget_secs\":");
+        push_json_f64(out, c.time_budget_secs);
+        out.push_str(",\"stop_file\":");
+        push_json_str(out, &c.stop_file);
+        out.push_str(&format!(",\"poll_every\":{},\"pause_file\":", c.poll_every));
+        push_json_str(out, &c.pause_file);
+        out.push_str(",\"progress_file\":");
+        push_json_str(out, &c.progress_file);
+        out.push_str(",\"progress_secs\":");
+        push_json_f64(out, c.progress_secs);
+        out.push_str(",\"report_path\":");
+        push_json_str(out, &c.report_path);
+        out.push_str(",\"expl_check_secs\":");
+        push_json_f64(out, c.expl_check_secs);
+        out.push_str(&format!(",\"ram_budget_mb\":{}}}", c.ram_budget_mb));
+    }
+}
+
 #[cfg(test)]
 mod stop_tests {
     use super::*;
@@ -807,7 +1144,10 @@ mod stop_tests {
             // The target exists and is complete after EVERY write (the old
             // remove-then-rename sequence had a window with no file at all).
             let body = std::fs::read_to_string(&path).expect("progress file present");
-            assert!(body.contains(&format!("\"iterations_run\": {it}")), "{body}");
+            assert!(
+                body.contains(&format!("\"iterations_run\": {it}")),
+                "{body}"
+            );
             assert!(body.contains("\"expl_kind\": \"mc_poll\""));
             assert!(body.trim_end().ends_with('}'));
         }
@@ -818,6 +1158,61 @@ mod stop_tests {
             .filter(|n| n != "job.progress.json")
             .collect();
         assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (TOOL-006) floats written for the report parse back to the same value,
+    /// as floats (never `3` for 3.0, never 300 zeros for 1e-300).
+    #[test]
+    fn json_floats_round_trip() {
+        for v in [
+            0.0,
+            -0.0,
+            3.0,
+            0.1,
+            1.0 / 3.0,
+            1e-7,
+            1e-300,
+            2.5e17,
+            123456.789,
+            -42.0,
+            1e-5,
+        ] {
+            let mut s = String::new();
+            push_json_f64(&mut s, v);
+            assert!(s.contains('.') || s.contains('e'), "{v} -> {s}");
+            let back: f64 = s.parse().unwrap();
+            assert!(
+                back.to_bits() == v.to_bits() || (v == 0.0 && back == 0.0),
+                "{v} -> {s}"
+            );
+            assert!(s.len() < 30, "{v} -> {s}");
+        }
+        let mut s = String::new();
+        push_json_f64(&mut s, f64::NAN);
+        assert_eq!(s, "null");
+    }
+
+    /// (TOOL-005) counters go to their own small file; the snapshot pacer
+    /// allows the first snapshot at once and then waits.
+    #[test]
+    fn counters_file_and_snapshot_pacing() {
+        let dir = std::env::temp_dir().join(format!("cfr_counters_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = SolveConfig::default();
+        cfg.progress_file = dir.join("j.progress.json").to_string_lossy().into_owned();
+        cfg.write_progress_counters(12, Some(1.5), Some("mc_poll"), 99, "r", false);
+        let body = std::fs::read_to_string(cfg.counters_path()).unwrap();
+        assert!(body.contains("\"iterations_run\": 12") && body.contains("\"num_infosets\": 99"));
+        assert!(!std::path::Path::new(&cfg.progress_file).exists());
+        cfg.progress_secs = 60.0;
+        let mut pacer = SnapshotPacer::default();
+        assert!(pacer.due(&cfg));
+        pacer.record(std::time::Instant::now());
+        assert!(!pacer.due(&cfg));
+        cfg.progress_secs = 0.0;
+        std::thread::sleep(std::time::Duration::from_millis(5)); // > 9x the (ns) snapshot cost
+        assert!(pacer.due(&cfg));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -836,7 +1231,10 @@ mod stop_tests {
         assert!(c.validate().is_err());
         let mut c = ok.clone();
         c.max_iterations = 0;
-        assert!(c.validate().is_err(), "unlimited run with no stop condition");
+        assert!(
+            c.validate().is_err(),
+            "unlimited run with no stop condition"
+        );
         c.stop_file = "x.stop".into();
         assert!(c.validate().is_ok());
         c.stop_file.clear();

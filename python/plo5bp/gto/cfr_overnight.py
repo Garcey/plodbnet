@@ -43,13 +43,13 @@ from plo5bp.gto.cfr_api import (
     solve,
 )
 from plo5bp.gto.roots import CLUBGG_NLH_ROOT
+from plo5bp.gto.jsonio import atomic_write_json, jsonable
 
 
-def _atomic_write_json(path: Path, obj: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(obj, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(path)
+def _atomic_write_json(path: Path, obj: Any, *, indent: int | None = 2) -> None:
+    """Strict JSON via the shared writer (TOOL-048); strategy payloads pass
+    ``indent=None`` (compact — indentation inflated 100+ MB reports)."""
+    atomic_write_json(path, obj, indent=indent)
 
 
 def _marker(out_dir: Path, job_id: str) -> Path:
@@ -238,7 +238,7 @@ def promote_progress_if_any(
         "promoted_from_progress": True,
     }
     path = _partial_path(out_dir, job_id)
-    _atomic_write_json(path, payload)
+    _atomic_write_json(path, payload, indent=None)
     _marker(out_dir, job_id).parent.mkdir(parents=True, exist_ok=True)
     _marker(out_dir, job_id).write_text(
         f"partial promoted_from_progress iters={iters}\n",
@@ -289,7 +289,7 @@ def _run_blueprint(job: dict[str, Any], *, stop_file: str, out_dir: Path) -> dic
     payload["job"] = job
     payload["wall_secs"] = elapsed
     path = _strategy_path(out_dir, job_id)
-    _atomic_write_json(path, payload)
+    _atomic_write_json(path, payload, indent=None)
     _marker(out_dir, job_id).parent.mkdir(parents=True, exist_ok=True)
     _marker(out_dir, job_id).write_text(
         f"ok iters={rep.iterations_run} expl={rep.exploitability_bb}\n",
@@ -357,6 +357,10 @@ def _run_pipeline_board(
             postflop_time_budget_secs=float(job.get("postflop_time_budget_secs", 1200)),
             stop_file=stop_file,
             raise_sizes_pm=[int(x) for x in sizes],
+            # (TOOL-050) the grid's stakes (ClubGG 5/10 + $5 ante when absent)
+            bb_chips=int(job.get("bb_chips", CLUBGG_NLH_ROOT.bb)),
+            sb_chips=int(job.get("sb_chips", CLUBGG_NLH_ROOT.sb)),
+            ante_chips=int(job.get("ante_chips", CLUBGG_NLH_ROOT.ante)),
         )
     )
     elapsed = time.perf_counter() - t0
@@ -368,7 +372,7 @@ def _run_pipeline_board(
     payload["wall_secs"] = elapsed
     payload["source"] = "rust_cfr_pipeline"
     path = _strategy_path(out_dir, job_id)
-    _atomic_write_json(path, payload)
+    _atomic_write_json(path, payload, indent=None)
     _marker(out_dir, job_id).parent.mkdir(parents=True, exist_ok=True)
     _marker(out_dir, job_id).write_text(
         f"ok pf_iters={payload.get('preflop_iterations')} "
@@ -394,18 +398,7 @@ def _run_pipeline_board(
     }
 
 
-def _jsonable(obj: Any) -> Any:
-    if isinstance(obj, dict):
-        return {str(k): _jsonable(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_jsonable(x) for x in obj]
-    if isinstance(obj, (str, int, float, bool)) or obj is None:
-        return obj
-    # PyO3 / numpy leftovers
-    try:
-        return float(obj)
-    except Exception:
-        return str(obj)
+_jsonable = jsonable  # one implementation (TOOL-048)
 
 
 @dataclass

@@ -59,11 +59,14 @@ fn class_strategy_at(
 /// Actions are aligned **by label**. Returns `(w_oop, w_ip, notes)` with
 /// seat 0 = BB = postflop OOP and seat 1 = BTN/SB = postflop IP; each vector
 /// is normalized to sum 1.
+/// `(w_oop, w_ip, notes)` of [`induce_ranges_along_line`].
+pub type InducedRanges = (Vec<f64>, Vec<f64>, Vec<String>);
+
 pub fn induce_ranges_along_line(
     preflop_root: &RootSpec,
     strategy: &Strategy,
     line: &[String],
-) -> Result<(Vec<f64>, Vec<f64>, Vec<String>), CfrError> {
+) -> Result<InducedRanges, CfrError> {
     let prior = 1.0 / NUM_PREFLOP_CLASSES as f64;
     let mut w = [
         vec![prior; NUM_PREFLOP_CLASSES],
@@ -78,7 +81,11 @@ pub fn induce_ranges_along_line(
                 "preflop line step {k} ({label}): betting is already closed after {path:?}"
             ))
         })? as usize;
-        let acts = legal_actions(&state, &preflop_root.raise_sizes_pm, preflop_root.allin_atom);
+        let acts = legal_actions(
+            &state,
+            &preflop_root.raise_sizes_pm,
+            preflop_root.allin_atom,
+        );
         let act = *acts.iter().find(|a| &a.label() == label).ok_or_else(|| {
             CfrError::InvalidConfig(format!(
                 "preflop line step {k}: {label:?} is not legal after {path:?}; legal = {:?}",
@@ -118,7 +125,7 @@ pub fn induce_ranges_along_line(
     ));
     for (seat, v) in w.iter_mut().enumerate() {
         let t: f64 = v.iter().sum();
-        if !(t > 0.0) {
+        if t.is_nan() || t <= 0.0 {
             return Err(CfrError::InvalidConfig(format!(
                 "preflop line {line:?} has zero probability for every class of seat {seat}; \
                  the induced range would be empty"
@@ -181,6 +188,7 @@ fn line_from_indices(
 /// `oop_action` / `ip_action` are action INDICES at each player's root
 /// decision (see [`line_from_indices`]); use
 /// [`solve_preflop_to_postflop_line`] to pass labels / longer lines.
+#[allow(clippy::too_many_arguments)]
 pub fn solve_preflop_to_postflop(
     preflop_root: &RootSpec,
     preflop_cfg: &SolveConfig,
@@ -238,7 +246,11 @@ pub fn solve_preflop_to_postflop_line(
         let mut state = hu_preflop_root(preflop_root)?;
         let mut any = false;
         for label in line {
-            let acts = legal_actions(&state, &preflop_root.raise_sizes_pm, preflop_root.allin_atom);
+            let acts = legal_actions(
+                &state,
+                &preflop_root.raise_sizes_pm,
+                preflop_root.allin_atom,
+            );
             if state.actor == Some(seat as u8) {
                 any = true;
             }
@@ -372,28 +384,61 @@ mod tests {
         assert!(pipe.postflop.is_some());
         assert_eq!(pipe.postflop.as_ref().unwrap().status, "ok");
         assert_eq!(pipe.induced_oop.len(), 169);
-        assert_eq!(pipe.line, vec!["CHECK_CALL".to_string(), "CHECK_CALL".to_string()]);
+        assert_eq!(
+            pipe.line,
+            vec!["CHECK_CALL".to_string(), "CHECK_CALL".to_string()]
+        );
         assert!(pipe.notes.iter().any(|n| n.contains("closes_preflop=true")));
         let post = pipe.postflop.as_ref().unwrap();
-        assert!(post.notes.iter().any(|n| n.starts_with("ranges=parsed")), "{:?}", post.notes);
+        assert!(
+            post.notes.iter().any(|n| n.starts_with("ranges=parsed")),
+            "{:?}",
+            post.notes
+        );
 
         // oop_action without ip_action has no defined node → error.
         assert!(solve_preflop_to_postflop(
-            &pf, &pcfg, &board, StreetRoot::River, 12.0, 40.0, Some(0), None, &rcfg
+            &pf,
+            &pcfg,
+            &board,
+            StreetRoot::River,
+            12.0,
+            40.0,
+            Some(0),
+            None,
+            &rcfg
         )
         .is_err());
         // Illegal line step → error before any solving.
         assert!(solve_preflop_to_postflop_line(
-            &pf, &pcfg, &board, StreetRoot::River, 12.0, 40.0, &["RAISE_77".to_string()], &rcfg
+            &pf,
+            &pcfg,
+            &board,
+            StreetRoot::River,
+            12.0,
+            40.0,
+            &["RAISE_77".to_string()],
+            &rcfg
         )
         .is_err());
         // No line → nothing induced → postflop solve is labelled uniform.
         let pipe = solve_preflop_to_postflop(
-            &pf, &pcfg, &board, StreetRoot::River, 12.0, 40.0, None, None, &rcfg,
+            &pf,
+            &pcfg,
+            &board,
+            StreetRoot::River,
+            12.0,
+            40.0,
+            None,
+            None,
+            &rcfg,
         )
         .expect("no line");
         let post = pipe.postflop.as_ref().unwrap();
-        assert!(post.notes.iter().any(|n| n.starts_with("ranges=uniform_fallback")));
+        assert!(post
+            .notes
+            .iter()
+            .any(|n| n.starts_with("ranges=uniform_fallback")));
     }
 
     fn fake_infoset(
@@ -436,14 +481,56 @@ mod tests {
         };
         let infosets = vec![
             // Deep BTN node (facing a 3-bet) — sorts FIRST by id ("pf_p1_h1…").
-            fake_infoset(1, &[&raise, &raise], aa, &["FOLD", "CHECK_CALL"], &[0.0, 1.0], "pf_p1_h1_c0"),
-            fake_infoset(1, &[&raise, &raise], sevdeuce, &["FOLD", "CHECK_CALL"], &[1.0, 0.0], "pf_p1_h1_c1"),
+            fake_infoset(
+                1,
+                &[&raise, &raise],
+                aa,
+                &["FOLD", "CHECK_CALL"],
+                &[0.0, 1.0],
+                "pf_p1_h1_c0",
+            ),
+            fake_infoset(
+                1,
+                &[&raise, &raise],
+                sevdeuce,
+                &["FOLD", "CHECK_CALL"],
+                &[1.0, 0.0],
+                "pf_p1_h1_c1",
+            ),
             // BTN ROOT node, actions deliberately listed in a different order.
-            fake_infoset(1, &[], aa, &[&raise, "CHECK_CALL", "FOLD"], &[0.9, 0.1, 0.0], "pf_p1_h9_c0"),
-            fake_infoset(1, &[], sevdeuce, &[&raise, "CHECK_CALL", "FOLD"], &[0.1, 0.1, 0.8], "pf_p1_h9_c1"),
+            fake_infoset(
+                1,
+                &[],
+                aa,
+                &[&raise, "CHECK_CALL", "FOLD"],
+                &[0.9, 0.1, 0.0],
+                "pf_p1_h9_c0",
+            ),
+            fake_infoset(
+                1,
+                &[],
+                sevdeuce,
+                &[&raise, "CHECK_CALL", "FOLD"],
+                &[0.1, 0.1, 0.8],
+                "pf_p1_h9_c1",
+            ),
             // BB facing the raise.
-            fake_infoset(0, &[&raise], aa, &["FOLD", "CHECK_CALL", &raise], &[0.0, 0.2, 0.8], "pf_p0_h5_c0"),
-            fake_infoset(0, &[&raise], sevdeuce, &["FOLD", "CHECK_CALL", &raise], &[0.95, 0.05, 0.0], "pf_p0_h5_c1"),
+            fake_infoset(
+                0,
+                &[&raise],
+                aa,
+                &["FOLD", "CHECK_CALL", &raise],
+                &[0.0, 0.2, 0.8],
+                "pf_p0_h5_c0",
+            ),
+            fake_infoset(
+                0,
+                &[&raise],
+                sevdeuce,
+                &["FOLD", "CHECK_CALL", &raise],
+                &[0.95, 0.05, 0.0],
+                "pf_p0_h5_c1",
+            ),
         ];
         let strat = Strategy::new("t", infosets);
         let line = vec![raise.clone(), "CHECK_CALL".to_string()];
@@ -460,7 +547,14 @@ mod tests {
         // range (the empty induced range used to parse as "no range given").
         let never: Vec<InfosetStrategy> = (0..NUM_PREFLOP_CLASSES as u32)
             .map(|c| {
-                fake_infoset(1, &[], c, &["FOLD", "CHECK_CALL", &raise], &[0.5, 0.5, 0.0], "x")
+                fake_infoset(
+                    1,
+                    &[],
+                    c,
+                    &["FOLD", "CHECK_CALL", &raise],
+                    &[0.5, 0.5, 0.0],
+                    "x",
+                )
             })
             .collect();
         let err = induce_ranges_along_line(&pf, &Strategy::new("t", never), &line[..1])

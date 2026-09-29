@@ -160,17 +160,6 @@ class EngineView:
 
 
 @dataclass(frozen=True)
-class HandStart:
-    """A new hand is about to begin. Fires on the first FrameState we
-    see with flop cards present, or after a HandEnd when fresh flop
-    cards show up."""
-
-    button_seat: int
-    starting_stacks: tuple[int | None, ...]
-    in_hand_mask: tuple[bool, ...] = ()
-
-
-@dataclass(frozen=True)
 class HeroHoleRevealed:
     """Hero's 5 hole cards are visible. Card indices are `rank*4+suit`
     (the encoding used by `Session.hero_hole` and the rust engine)."""
@@ -206,12 +195,6 @@ class SeatAction:
 
 
 @dataclass(frozen=True)
-class HandEnd:
-    """The current hand ended. Caller should reset session state so the
-    next StreetReveal / SeatAction starts fresh."""
-
-
-@dataclass(frozen=True)
 class OcrWarning:
     """Reconstructor couldn't fully explain a state delta. Caller should
     log and keep going — the next poll often resolves the ambiguity."""
@@ -219,14 +202,9 @@ class OcrWarning:
     message: str
 
 
-OcrEvent = (
-    HandStart
-    | HeroHoleRevealed
-    | StreetReveal
-    | SeatAction
-    | HandEnd
-    | OcrWarning
-)
+# Hand boundaries are not reconstructor events: the server's debounced
+# hand-start machine (`plo5bp.ui.live.tracking`) owns them.
+OcrEvent = HeroHoleRevealed | StreetReveal | SeatAction | OcrWarning
 
 
 def _card_to_index(c: Card) -> int:
@@ -248,6 +226,25 @@ def _count_cards(board: tuple[Card | None, ...]) -> int:
             break
         n += 1
     return n
+
+
+#: Hero's seat in the OCR pipeline (ROIs: seat 0 is hero, south-centre).
+HERO_SEAT = 0
+
+
+def _next_live_seat(
+    actor: int,
+    num_seats: int,
+    folded: list[bool],
+    all_in: list[bool],
+    sitting_out: list[bool],
+) -> int | None:
+    """The seat after ``actor`` (engine order) that still gets a turn."""
+    for k in range(1, num_seats):
+        s = (actor + k) % num_seats
+        if not (folded[s] or all_in[s] or sitting_out[s]):
+            return s
+    return None
 
 
 def _resolve_active_actor(fs: FrameState) -> int | None:
@@ -350,6 +347,20 @@ class EventReconstructor:
         self.hero_hole_emitted = False
         self._clear_tracking()
 
+    def snapshot(self) -> dict:
+        """Everything `step` may change, for `restore` (the server takes one
+        before each step so a walk whose action the engine refuses can be
+        undone and re-derived from the next frame — TOOL-025)."""
+        state = dict(self.__dict__)
+        state["_unexplained_evidence_seats"] = set(self._unexplained_evidence_seats)
+        return state
+
+    def restore(self, state: dict) -> None:
+        """Return to a `snapshot`: the next `step` diffs against that
+        baseline again, so the refused step's evidence is not consumed."""
+        self.__dict__.update(state)
+        self._unexplained_evidence_seats = set(state["_unexplained_evidence_seats"])
+
     def rebaseline(self, fs: FrameState) -> None:
         """Adopt `fs` as the new diff baseline without emitting events.
 
@@ -398,11 +409,13 @@ class EventReconstructor:
 
         # Hero hole reveal (first time we see all 5 after they were
         # missing). Fires once per hand.
+        hero_revealed_now = False
         if not self.hero_hole_emitted:
             hole = _hole_as_indices(fs.hero_hole)
             if hole is not None:
                 events.append(HeroHoleRevealed(cards=hole))
                 self.hero_hole_emitted = True
+                hero_revealed_now = True
 
         # Street reveals. A "turn" reveal is the 4th card appearing on
         # BOTH boards; "river" is the 5th on both. We only emit when
@@ -512,6 +525,16 @@ class EventReconstructor:
 
         if now_active is not None and not walk.hold_timer_lock:
             self._observed_active_actor = now_active
+        elif (
+            hero_revealed_now
+            and now_active is None
+            and engine_view.current_actor == HERO_SEAT
+        ):
+            # TOOL-002: ClubGG turns hero's cards face up when hero's turn
+            # comes. With hero's 1-2 px timer bar unread, that is the only
+            # sign hero ever held the turn — lock on it, so the bar moving to
+            # the next seat reads as hero's CHECK (the `timer_moved` branch).
+            self._observed_active_actor = HERO_SEAT
 
         # Street boundary ⇒ adopt the newest stacks wholesale (see
         # `_store_baseline`): a reveal this tick, the engine's street
@@ -915,6 +938,23 @@ class EventReconstructor:
                 and now_active is not None
                 and now_active != actor
             )
+            # TOOL-002: the turn has PASSED to the next seat. `timer_moved`
+            # needs this seat's own bar seen as the lit one first; right after
+            # a hand-start (the lock is cleared) hero, first to act, may
+            # already have checked, and hero's bar was never read — nothing
+            # recovered that until a villain put chips in or the next card
+            # came. The NEXT live seat in engine order holding the bar on two
+            # positive reads (the lock and this frame) proves it: only the
+            # player to act has a timer. Same chip-evidence guards as below.
+            next_live = _next_live_seat(
+                actor, self.num_seats, folded, all_in, sitting_out
+            )
+            turn_passed = (
+                to_call_here == 0
+                and next_live is not None
+                and prev_active == next_live
+                and now_active == next_live
+            )
             stacks_readable = (
                 prev_stack_cents is not None and new_stack_cents is not None
             )
@@ -954,7 +994,7 @@ class EventReconstructor:
                 # (timer-bar transition, downstream activity) lives in
                 # the branches below.
                 new_commit = primary_read
-            elif timer_moved and stacks_readable:
+            elif (timer_moved or turn_passed) and stacks_readable:
                 # Active-actor transition signal: the yellow turn-timer
                 # bar was on `actor` last tick and has moved to a
                 # different seat this tick, with no facing bet here.
@@ -969,8 +1009,8 @@ class EventReconstructor:
                 if _timer_debug_enabled():
                     logger.warning(
                         "ocr.walk: timer_bar_branch_fired seat=%d "
-                        "prev=%s now=%s",
-                        actor, prev_active, now_active,
+                        "prev=%s now=%s turn_passed=%s",
+                        actor, prev_active, now_active, turn_passed,
                     )
             elif to_call_here == 0 and self._any_remaining_delta(
                 new_seats,

@@ -17,4 +17,5 @@ Dev / browser mode::
 from __future__ import annotations
 
 __all__ = ["__version__"]
-__version__ = "0.2.0"
+# The ONE version string: the server (FastAPI + /api/health) and the UI read it.
+__version__ = "0.4.0"

@@ -4,12 +4,14 @@ Review 2026-09-20:
 
 - **D8 / F6** A root is judged against the teacher cap only when its
   ``exploitability_bb`` comes from a FINAL estimator
-  (:func:`plo5bp.gto.teacher.expl_provenance`). Poll / early-stop /
-  time-budget numbers are biased (5.27 polled vs 1.99 final), so such a root
-  is neither accepted nor rejected: it is written to ``unverified/`` with
-  marker ``unverified`` and teacher export skips it. There is no binding that
-  re-evaluates a finished strategy, so nothing can be re-verified here. A
-  solve cut short by the STOP file gets NO done-marker — resume re-runs it.
+  (:func:`plo5bp.gto.teacher.expl_provenance`). Poll numbers are biased (5.27
+  polled vs 1.99 final), so such a root is neither accepted nor rejected: it is
+  written to ``unverified/`` with marker ``unverified`` and teacher export skips
+  it. A target / time-budget stop IS judged when the solver re-computed the
+  final estimator on the way out (``expl_kind=exact_infoset`` / ``hero_enum``,
+  TOOL-001) — batch configs keep ``target_exploitability_bb=0.5``, so those are
+  the best-converging roots. A solve cut short by the STOP file gets NO
+  done-marker — resume re-runs it.
 - **F10** New grid ids carry a game fingerprint (board / pot / stacks / sizes),
   a changed solve config is not silently "resumed", and manifests are written
   atomically. Campaign directories written under the old bare ids still
@@ -46,11 +48,16 @@ from plo5bp.gto.cfr_api import (
     solve,
 )
 from plo5bp.gto.iso import TEACHER_USE_ISOMORPHISM
+from plo5bp.gto.jsonio import atomic_write_json, atomic_write_text
 from plo5bp.gto.teacher import (
+    TEACHER_HOLDOUT_FRAC,
     TEACHER_MAX_EXPL_BB,
+    TEACHER_SPLIT_SEED,
     expl_provenance,
     expl_reject_reason,
     root_fingerprint,
+    root_stratum,
+    split_root_ids,
 )
 
 MARKER_OK = "ok"
@@ -88,7 +95,7 @@ class BatchManifest:
     finished_at: float = 0.0
 
     def write(self, path: Path) -> None:
-        _atomic_write_text(path, json.dumps(asdict(self), indent=2) + "\n")
+        atomic_write_json(path, asdict(self), indent=2)
 
     @classmethod
     def load(cls, path: Path) -> "BatchManifest":
@@ -106,13 +113,10 @@ class BatchManifest:
         )
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
-    """Temp file + ``os.replace``: a kill mid-write never leaves a torn or
-    empty manifest for the next resume to choke on (review 2026-09-20 F10)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+# Temp file + ``os.replace``: a kill mid-write never leaves a torn or empty
+# manifest for the next resume to choke on (review 2026-09-20 F10). One shared
+# implementation (TOOL-048); the underscore name stays for old callers.
+_atomic_write_text = atomic_write_text
 
 
 def _grid_job(root: RootSpec, cfg: SolveConfig, base_id: str) -> BatchJob:
@@ -130,8 +134,14 @@ def expand_river_grid(
     size_preset: str = "coarse",
     iters: int = 200,
     streets: Sequence[int] | None = None,
+    algorithm: str = "dcfr",
 ) -> list[BatchJob]:
-    """Deterministic postflop board grid (river default; flop/turn supported)."""
+    """Deterministic postflop board grid (river default; flop/turn supported).
+
+    ``algorithm="dcfr_vector"`` (TOOL-008) solves the river / turn roots with
+    full-range DCFR — a few hundred iterations instead of hundreds of thousands;
+    flop roots stay on bucketed sampled ``dcfr``.
+    """
     import random
 
     rng = random.Random(seed)
@@ -156,10 +166,12 @@ def expand_river_grid(
                 root_id=base_id,
             )
             abs_ = "ochs" if street == 1 else "none"
+            algo = algorithm if algorithm != "dcfr_vector" or int(street) in (2, 3) else "dcfr"
             cfg = SolveConfig.teacher(
                 max_iterations=iters,
                 seed=seed + idx,
                 card_abstraction=abs_,
+                algorithm=algo,
             )
             jobs.append(_grid_job(root, cfg, base_id))
             idx += 1
@@ -174,8 +186,13 @@ def expand_river_spr_grid(
     spr_points: Sequence[float] = (1.0, 2.0, 3.0, 5.0),
     size_preset: str = "micro",
     iters: int = 20_000,
+    algorithm: str = "dcfr",
 ) -> list[BatchJob]:
-    """HU river boards × SPR points (not the overnight full-hand grid)."""
+    """HU river boards × SPR points (not the overnight full-hand grid).
+
+    ``algorithm="dcfr_vector"`` (TOOL-008): full-range DCFR — pass far fewer
+    ``iters`` (~300 reach < 0.05 bb on a standard river tree).
+    """
     import random
 
     rng = random.Random(seed)
@@ -202,6 +219,7 @@ def expand_river_spr_grid(
                 max_iterations=iters,
                 seed=seed + idx + 1,
                 card_abstraction="none",
+                algorithm=algorithm,
             )
             jobs.append(_grid_job(root, cfg, base_id))
             idx += 1
@@ -386,16 +404,65 @@ def stale_resume_reason(out_dir: Path, job: BatchJob) -> str | None:
 
 
 def _write_report(path: Path, payload: dict[str, Any]) -> None:
-    _atomic_write_text(path, json.dumps(payload, indent=2) + "\n")
+    """Reports compact (they reach 100+ MB); job sidecars are small anyway."""
+    atomic_write_json(path, payload)
+
+
+def _stream_path(out_dir: Path, job_id: str) -> Path:
+    """Where the native solver streams a job's report before it is judged."""
+    return out_dir / "tmp" / f"{job_id}.json"
+
+
+def _publish_report(rep: Any, dest: Path) -> None:
+    """Put the full report at ``dest``: MOVE the streamed file (TOOL-006 — no
+    parse, no copy in memory), or write an in-memory report."""
+    if getattr(rep, "streamed", False):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(rep.report_path, dest)
+    else:
+        _write_report(dest, rep.as_dict())
+
+
+def _publish_rejected(rep: Any, dest: Path, head: dict[str, Any]) -> None:
+    """The rejected wrapper ``{…head, "report": <report>}`` — streamed around
+    the report file's bytes instead of loading the report."""
+    if not getattr(rep, "streamed", False):
+        _write_report(dest, {**head, "report": rep.as_dict()})
+        return
+    import json
+    import shutil
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(f"{dest.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as out:
+            out.write(json.dumps(head, allow_nan=False)[:-1] + ',"report":')
+            with open(rep.report_path, encoding="utf-8") as src:
+                shutil.copyfileobj(src, out, 1 << 20)
+            out.write("}\n")
+        os.replace(tmp, dest)
+    finally:
+        tmp.unlink(missing_ok=True)
+    Path(rep.report_path).unlink(missing_ok=True)
 
 
 def _run_one(payload: dict[str, Any]) -> dict[str, Any]:
-    """Worker entry (picklable)."""
+    """Worker entry (picklable).
+
+    (TOOL-006) The native solver streams the full report to
+    ``tmp/<job_id>.json``; judging it needs only the scalars, and publishing it
+    is a file move (strategies/ or unverified/) or a streamed wrapper
+    (rejected/) — the 100+ MB strategy is never turned into Python objects.
+    """
     root = RootSpec(**payload["root"])
     cfg = SolveConfig(**payload["config"])
     out_dir = Path(payload["out_dir"])
     job_id = payload["job_id"]
     max_expl_bb = payload.get("max_expl_bb", TEACHER_MAX_EXPL_BB)
+    stream = _stream_path(out_dir, job_id)
+    stream.parent.mkdir(parents=True, exist_ok=True)
+    stream.unlink(missing_ok=True)
+    cfg.report_path = str(stream)
     try:
         rep = solve(root, cfg)
         if rep.status != "ok":
@@ -415,15 +482,17 @@ def _run_one(payload: dict[str, Any]) -> dict[str, Any]:
             "expl": prov.as_dict(),
         }
 
-        def _finish(status: str, path: Path, body: dict[str, Any], **extra: Any):
-            _write_report(path, body)
+        cfg_meta = {**cfg.as_dict(), "report_path": ""}  # a scratch path, not config
+
+        def _finish(status: str, publish, **extra: Any):
+            publish()
             _write_report(
                 _job_meta_path(out_dir, job_id),
                 {
                     **base,
                     "status": status,
                     "fingerprint": root.fingerprint(),
-                    "config": cfg.as_dict(),
+                    "config": cfg_meta,
                 },
             )
             _write_marker(out_dir, job_id, f"{status}\n")
@@ -435,7 +504,7 @@ def _run_one(payload: dict[str, Any]) -> dict[str, Any]:
             if prov.early_stop == "stop_file":
                 # Interrupted, not finished: keep the partial for inspection
                 # but write NO done-marker so resume solves it again.
-                _write_report(_unverified_path(out_dir, job_id), rep.as_dict())
+                _publish_report(rep, _unverified_path(out_dir, job_id))
                 return {
                     **base,
                     "status": "interrupted",
@@ -446,8 +515,7 @@ def _run_one(payload: dict[str, Any]) -> dict[str, Any]:
                 }
             return _finish(
                 MARKER_UNVERIFIED,
-                _unverified_path(out_dir, job_id),
-                rep.as_dict(),
+                lambda: _publish_report(rep, _unverified_path(out_dir, job_id)),
                 ok=False,
                 unverified=True,
                 error=f"expl_unverified:{prov.reason}",
@@ -458,26 +526,34 @@ def _run_one(payload: dict[str, Any]) -> dict[str, Any]:
                 rep.exploitability_bb, max_expl_bb=float(max_expl_bb)
             )
         if why is not None:
+            head = {
+                "job_id": job_id,
+                "reason": why,
+                "status": "rejected",
+                "exploitability_bb": rep.exploitability_bb,
+                "max_expl_bb": max_expl_bb,
+            }
             return _finish(
                 MARKER_REJECTED,
-                _rejected_path(out_dir, job_id),
-                {
-                    "job_id": job_id,
-                    "reason": why,
-                    "status": "rejected",
-                    "exploitability_bb": rep.exploitability_bb,
-                    "max_expl_bb": max_expl_bb,
-                    "report": rep.as_dict(),
-                },
+                lambda: _publish_rejected(rep, _rejected_path(out_dir, job_id), head),
                 ok=False,
                 rejected=True,
                 error=why,
             )
-        return _finish(
-            MARKER_OK, _strategy_path(out_dir, job_id), rep.as_dict(), ok=True
-        )
-    except Exception as e:
-        return {"job_id": job_id, "status": "error", "ok": False, "error": str(e)}
+        return _finish(MARKER_OK, lambda: _publish_report(rep, _strategy_path(out_dir, job_id)), ok=True)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as e:  # noqa: BLE001 — PyO3's PanicException is a BaseException
+        # (TOOL-047) a native panic on one root used to abort the whole batch
+        # before the manifest was written; it is now that root's error.
+        return {
+            "job_id": job_id,
+            "status": "error",
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+        }
+    finally:
+        stream.unlink(missing_ok=True)  # a report that was not published
 
 
 def _record_worker_result(manifest: BatchManifest, r: dict[str, Any]) -> None:
@@ -556,21 +632,18 @@ def run_batch(
             print(f"[cfr_batch] re-solve {j.job_id}: existing solve {why}", flush=True)
         pending.append(j)
 
-    _atomic_write_text(
+    atomic_write_json(
         out_dir / "plan.json",
-        json.dumps(
-            {
-                "n_jobs": len(jobs),
-                "pending": [j.job_id for j in pending],
-                "skipped": manifest.skipped,
-                "stale_resolve": stale,
-                "dry_run": dry_run,
-                "use_isomorphism": TEACHER_USE_ISOMORPHISM,
-                "max_expl_bb": max_expl_bb,
-            },
-            indent=2,
-        )
-        + "\n",
+        {
+            "n_jobs": len(jobs),
+            "pending": [j.job_id for j in pending],
+            "skipped": manifest.skipped,
+            "stale_resolve": stale,
+            "dry_run": dry_run,
+            "use_isomorphism": TEACHER_USE_ISOMORPHISM,
+            "max_expl_bb": max_expl_bb,
+        },
+        indent=2,
     )
 
     if dry_run:
@@ -580,18 +653,169 @@ def run_batch(
 
     payloads = [job_payload(j, out_dir, max_expl_bb) for j in pending]
 
-    if workers <= 1:
-        for p in payloads:
-            _record_worker_result(manifest, _run_one(p))
-    else:
-        with ProcessPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(_run_one, p): p["job_id"] for p in payloads}
-            for fut in as_completed(futs):
-                _record_worker_result(manifest, fut.result())
-
-    manifest.finished_at = time.time()
-    manifest.write(out_dir / "manifest.json")
+    try:
+        if workers <= 1:
+            for p in payloads:
+                _record_worker_result(manifest, _run_one(p))
+        else:
+            with ProcessPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(_run_one, p): p["job_id"] for p in payloads}
+                for r in _collect_results(futs):
+                    _record_worker_result(manifest, r)
+    finally:
+        # (TOOL-047) whatever happens — a crashed worker, Ctrl-C — the manifest
+        # records what finished, so the next run can resume from it.
+        manifest.finished_at = time.time()
+        manifest.write(out_dir / "manifest.json")
     return manifest
+
+
+def _collect_results(futs: dict[Any, str]) -> Iterator[dict[str, Any]]:
+    """Worker results as they finish; a future that raised becomes an error row.
+
+    (TOOL-047) ``fut.result()`` re-raises whatever killed the worker — a native
+    crash surfaces as ``BrokenProcessPool`` for EVERY job still in flight — and
+    used to abort the batch. Those jobs get no done-marker, so a resumed batch
+    solves them again.
+    """
+    for fut in as_completed(futs):
+        job_id = futs[fut]
+        try:
+            yield fut.result()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as e:  # noqa: BLE001
+            yield {
+                "job_id": job_id,
+                "status": "error",
+                "ok": False,
+                "error": f"worker failed ({type(e).__name__}: {e}) — not marked done, "
+                "resume re-runs it",
+            }
+
+
+# ---------------------------------------------------------------------------
+# Public API for campaign scripts (TOOL-060). The archived step-6/7 campaigns
+# (scripts/archive/gto_campaigns/) reached into the underscore helpers above and
+# into each other; these are the supported names.
+# ---------------------------------------------------------------------------
+
+strategy_path = _strategy_path
+marker_path = _marker_path
+job_meta_path = _job_meta_path
+rejected_path = _rejected_path
+unverified_path = _unverified_path
+run_job = _run_one  # one root, in this process: the worker entry of run_batch
+record_result = _record_worker_result
+
+
+def teacher_split(jobs: Sequence[BatchJob]) -> tuple[list[str], list[str]]:
+    """The stratified train / holdout split teacher export will compute for
+    these roots (street x seats x SPR — review 2026-09-20 D4)."""
+    return split_root_ids(
+        [j.job_id for j in jobs],
+        seed=TEACHER_SPLIT_SEED,
+        holdout_frac=TEACHER_HOLDOUT_FRAC,
+        strata={j.job_id: root_stratum(j.root) for j in jobs},
+    )
+
+
+def clear_job(out_dir: Path | str, job_id: str) -> None:
+    """Delete a root's marker, job sidecar, report (any folder) and live
+    progress file, so the next run solves it again."""
+    out_dir = Path(out_dir)
+    for fn in (_marker_path, _job_meta_path, _rejected_path, _strategy_path, _unverified_path):
+        fn(out_dir, job_id).unlink(missing_ok=True)
+    (out_dir / "progress" / f"{job_id}.progress.json").unlink(missing_ok=True)
+
+
+def _replace_rows(rows: list[dict[str, Any]], job_id: str) -> list[dict[str, Any]]:
+    return [x for x in rows if x.get("job_id") != job_id]
+
+
+def run_jobs_incremental(
+    jobs: Sequence[BatchJob],
+    out_dir: Path | str,
+    *,
+    stop_file: Path | str,
+    threads: int = 1,
+    full_iterations: bool = True,
+    max_expl_bb: float | None = TEACHER_MAX_EXPL_BB,
+    tag: str = "batch",
+) -> BatchManifest:
+    """Long campaigns: solve ``jobs`` one after another in THIS process,
+    rewriting ``manifest.json`` after every root (a kill loses nothing) and
+    stopping cleanly once ``stop_file`` exists.
+
+    - roots with a done-marker are skipped (``clear_job`` first to re-solve);
+    - an existing manifest is extended, and a re-solved root's old rows are
+      replaced, not duplicated;
+    - each job gets the teacher iso policy, ``thread_num=threads``, the stop
+      file and ``progress/<id>.progress.json``; ``full_iterations`` (default)
+      sets ``target_exploitability_bb=0`` so every root runs its whole budget.
+    """
+    out_dir = Path(out_dir)
+    stop_file = Path(stop_file)
+    for sub in ("strategies", "markers", "rejected", "unverified", "progress"):
+        (out_dir / sub).mkdir(parents=True, exist_ok=True)
+    man_path = out_dir / "manifest.json"
+    if man_path.exists():
+        man = BatchManifest.load(man_path)
+    else:
+        man = BatchManifest(out_dir=str(out_dir), started_at=time.time())
+    for j in jobs:
+        if j.job_id not in man.jobs:
+            man.jobs.append(j.job_id)
+
+    def _save() -> None:
+        man.finished_at = time.time()
+        man.write(man_path)
+
+    for j in jobs:
+        if stop_file.exists():
+            print(f"[{tag}] STOP {stop_file} — remaining jobs skipped", flush=True)
+            break
+        apply_teacher_iso_policy(j.config)
+        if full_iterations:
+            j.config.target_exploitability_bb = 0.0
+        j.config.thread_num = int(threads)
+        j.config.stop_file = str(stop_file)
+        j.config.progress_file = str(out_dir / "progress" / f"{j.job_id}.progress.json")
+        done = marker_status(out_dir, j.job_id)
+        if done is not None:
+            print(f"[{tag}] SKIP {j.job_id} marker={done}", flush=True)
+            if j.job_id not in man.skipped:
+                man.skipped.append(j.job_id)
+            _save()
+            continue
+        print(
+            f"[{tag}] ROOT START {j.job_id} spr={j.root.effective_stack_bb / j.root.pot_bb:g} "
+            f"board={j.root.board} iters={j.config.max_iterations}",
+            flush=True,
+        )
+        t0 = time.time()
+        r = _run_one(job_payload(j, out_dir, max_expl_bb))
+        status = (
+            "UNVERIFIED" if r.get("unverified")
+            else "REJECTED" if r.get("rejected") else ("OK" if r.get("ok") else "FAILED")
+        )
+        print(
+            f"[{tag}] ROOT {status} {j.job_id} expl_bb={r.get('exploitability_bb')} "
+            f"iters={r.get('iterations')} wall_s={time.time() - t0:.1f} err={r.get('error')}",
+            flush=True,
+        )
+        man.completed = [x for x in man.completed if x != j.job_id]
+        man.rejected = _replace_rows(man.rejected, j.job_id)
+        man.unverified = _replace_rows(man.unverified, j.job_id)
+        man.failed = _replace_rows(man.failed, j.job_id)
+        _record_worker_result(man, r)
+        if r.get("rejected"):  # keep what a retry decision needs on the row
+            man.rejected[-1].update(
+                exploitability_bb=r.get("exploitability_bb"), iters=r.get("iterations")
+            )
+        _save()
+    _save()
+    return man
 
 
 def iter_strategy_files(dir_path: Path | str) -> Iterator[Path]:

@@ -1,0 +1,10 @@
+# /etc/systemd/system/wrapgto-watch.timer — enable: systemctl enable --now wrapgto-watch.timer
+[Unit]
+Description=WrapGTO health watch every 5 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target

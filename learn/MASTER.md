@@ -1,5 +1,28 @@
 # The plo5dbbp training system — master document
 
+> **What changed since this was checked against the code (2026-07-23 → 2026-09-28).**
+> The mechanisms described here still hold; these parts and numbers moved — the
+> dated record is CLAUDE.md, "Current state":
+> - **The run**: the main stem is **vSix6**, not vSix4 / vMin1 — actor **1024×3**
+>   (distilled from the 2048×4 vSix5), a rebuilt **1536×2 SiLU critic** (value read as
+>   a raw-space mean, Q losses scaled by the return variance, Q_fold pinned to 0),
+>   entropy **0.045**, GAE λ **0.8**, learning rate **7.5e-5**, **30 table setups per
+>   tier** per update. The site serves vSix6_1300 (docs/models.md).
+> - **Scale**: ~**164M rows per update** at **1.76M environments** (July: ~6M rows at
+>   49k); in-flight hands are finished at the end of each rollout instead of cut off.
+> - **Memory**: observations are stored **compact** — the 0/1 columns as bits, the
+>   real-valued ones as float16 — the whole batch lives in **host RAM**
+>   (`--batch-on-host`) and PPO runs in **micro-batches** on the GPU.
+> - **Observations**: still 1171 wide, but a **semantics revision**
+>   (`PLO5BP_OBS_REV`, 2026-09-20) fixed several feature values; the live models use rev 1.
+> - **Opponents**: every pool snapshot acts in ONE batched forward pass; a resumed run
+>   draws its own random stream.
+> - **Code**: the training loop moved from `scripts/train.py` into
+>   `python/plo5bp/train/` (cli, loop, control, checkpoint, tiers, metrics,
+>   diagnostics); `scripts/train.py` is a thin wrapper.
+> - **Paused**: the minimal-observation line (vMin1–vMin3), ~2 bb/seat-hand weaker
+>   than the full-observation model.
+
 *The complete technical description of how this project trains the PLO5
 double-board bomb-pot model: engine to encoder to networks to optimizer to
 ops. Written dense and unsimplified — this is the reference spine of the

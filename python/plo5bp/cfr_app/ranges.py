@@ -1,34 +1,34 @@
 """Strict range-text parser for the CFR desktop app.
 
-(review 2026-09-20 E11) The native parser (``rust_engine/src/cfr/range.rs``)
-splits on commas only, reads the first two characters of a token, and falls
-back to the UNIFORM range when nothing parses. So, silently:
+The native solver has its own strict parser (``rust_engine/src/cfr/range.rs``,
+``Range::parse``; exposed to Python as ``plo5bp._engine.cfr_parse_range``): an
+unknown token is an error there too, and ``22`` is pocket twos. This module
+parses the same grammar for the app — the 13×13 grid, validation messages, class
+summaries — and hands the solver a canonical string (whole-class tokens and
+zero-padded ``0123:w`` combo ids) that both parsers read identically.
+``tests/python/site/test_ranges_cross_check.py`` pins that the two agree on random
+range texts, and on every canonical string (review 2026-09-20 E11; TOOL-029).
+It is the ONE implementation the app uses: ``/api/validate_root``,
+``/api/solve`` and the range grid all go through it.
 
-- ``KK-TT``            → KK
-- ``AA KK QQ``         → AA           (whitespace is not a separator there)
-- ``AA:0.5`` / ``AsKs`` → 100% range  (nothing parsed → uniform fallback)
-- ``AA,AA,AA,KK``      → AA at 3× the weight of KK
-
-This module parses the text strictly — an unknown token is an ERROR, never a
-fallback — and expands it to a canonical string built only from the two forms
-the current native parser handles correctly (whole-class tokens ``AA``/``AKs``/
-``AKo`` and ``combo_id:weight`` pairs), so solves are right today and stay right
-when the native parser improves. It is the ONE implementation of the grammar:
-``/api/validate_root``, ``/api/solve`` and the 13×13 range grid all go through it.
-
-Grammar — tokens separated by commas and/or whitespace; each ``<hand>[:<weight>]``
-with ``0 < weight <= 1``; later tokens override earlier ones per combo:
+Grammar — tokens separated by commas, semicolons and/or whitespace; each
+``<hand>[:<weight>]``; later tokens override earlier ones per combo:
 
     AA  AKs  AKo  AK        a class (AK = suited + offsuit)
     QQ+                     pairs QQ and better
-    A5s+                    same top card, kicker 5 and better (A5s..AKs)
+    A5s+  KT+               same top card, kicker 5 (T) and better
     KK-TT                   pair range, either order
     A5s-A2s                 same top card, kicker range
     T9s-76s                 same gap, both cards step together
     AsKs  AdAh              one explicit combo
-    0123:0.5  0123          a combo id — 3+ digits (canonical output pads to 4),
-                            so "22".."99" are always PAIRS and "72" is 72s+72o
-    random / 100% / empty   the full range
+    0123:0.5  #44           a combo id — 3+ digits, or ``#`` + digits
+    random / 100% / any / all / * / empty    the full range
+
+Deliberate differences from the native parser: weights here are frequencies,
+``0 < w <= 1`` (the solver accepts any ``w >= 0`` — relative weights); a one- or
+two-digit number is always hand text here (``22``, ``72`` = 72s+72o), while the
+solver also reads an all-numeric ``id:w`` list as combo ids (its machine format);
+``all`` means the full range here only.
 """
 
 from __future__ import annotations
@@ -48,17 +48,16 @@ _RANKS = "23456789TJQKA"
 _SUITS = "cdhs"
 NUM_COMBOS = 1326
 
-_FULL_RANGE = ("", "random", "100%", "any", "all")
+_FULL_RANGE = ("", "random", "100%", "any", "all", "*")
 
-_RE_SPLIT = re.compile(r"[,\s]+")
+_RE_SPLIT = re.compile(r"[,;\s]+")
 _RE_COMBO = re.compile(r"^([2-9TJQKA])([cdhs])([2-9TJQKA])([cdhs])$")
 _RE_CLASS = re.compile(r"^([2-9TJQKA])([2-9TJQKA])([so]?)(\+?)$")
-# A combo ID is 3+ digits — the canonical form zero-pads ids to 4 ("0022:1").
-# One- and two-digit tokens are HAND TEXT: "22".."99" are pairs and "72" is the
-# class 72s+72o. Treating "22" as combo id 22 (one arbitrary 32o hand) silently
-# corrupts six of the thirteen pairs — the native parser has exactly that bug,
-# which is also why canonical() never emits a bare numeric pair token.
-_RE_ID = re.compile(r"^\d{3,}$")
+# A combo ID is 3+ digits or "#" + digits — the canonical form zero-pads ids to 4
+# ("0022:1"). One- and two-digit tokens are HAND TEXT: "22".."99" are pairs and
+# "72" is the class 72s+72o (the native parser agrees outside its all-numeric
+# machine format; canonical() never emits a bare numeric pair token either way).
+_RE_ID = re.compile(r"^(?:\d{3,}|#\d+)$")
 _ID_WIDTH = 4
 
 
@@ -160,7 +159,7 @@ def _parse_class(tok: str, original: str) -> tuple[int, int, str, bool]:
 def _expand_hand(tok: str, original: str) -> list[int]:
     """One ``<hand>`` (no weight) → combo ids."""
     if _RE_ID.match(tok):
-        cid = int(tok)
+        cid = int(tok.lstrip("#"))
         if not 0 <= cid < NUM_COMBOS:
             raise RangeError(f"range token {original!r}: combo id must be 0..{NUM_COMBOS - 1}")
         return [cid]
@@ -249,7 +248,7 @@ def parse_range(text: str | None, board: Sequence[int] | None = None) -> ParsedR
 
     live = {cid: w for cid, w in weights.items() if not (set(combo_to_cards(cid)) & blocked)}
     if not live:
-        # The native parser would silently fall back to the 100% range here.
+        # (The native parser refuses such a range as well.)
         raise RangeError(f"range {raw!r} has no combos left on this board")
     return ParsedRange(text=raw, weights=dict(sorted(live.items())), blocked=blocked)
 
@@ -288,7 +287,8 @@ def _class_weights(weights: dict[int, float], blocked: frozenset[int]) -> dict[s
 def _canonical(weights: dict[int, float]) -> str:
     """Whole classes at weight 1 → the class token; everything else → ``id:w``.
 
-    Both forms are handled correctly by the CURRENT native parser. A class token
+    Both forms mean the same to the native parser (pinned by the cross-check
+    test). A class token
     is only used when ALL of the class's combos (blocked ones included — the
     native side drops those itself) are present at exactly 1.0, because the
     native expansion always means "every combo, weight 1".
@@ -297,8 +297,8 @@ def _canonical(weights: dict[int, float]) -> str:
     for label, members in _by_class(weights).items():
         ids = _class_ids(label)
         whole = len(members) == len(ids) and all(w == 1.0 for w in members.values())
-        # A numeric pair label ("22".."99") is NEVER emitted: the native parser
-        # reads an all-digit token as a combo id, so "22" would mean combo #22.
+        # A numeric pair label ("22".."99") is never emitted: the native parser
+        # would read it as combo id 22 in its all-numeric machine format.
         if whole and not label.isdigit():
             parts.append(label)
         else:

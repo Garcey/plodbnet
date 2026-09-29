@@ -4,9 +4,6 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>CFR Solver — NLH</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="/static/style.css" />
   </head>
   <body>
@@ -24,8 +21,18 @@
       <div class="top-status">
         <span id="rust-badge" class="badge badge-unknown">CFR …</span>
         <span id="job-badge" class="badge badge-idle">idle</span>
+        <!-- (TOOL-054) engine self-tests live here, not in the main panel -->
+        <details id="diag-menu" class="diag-menu">
+          <summary class="btn btn-ghost btn-sm" title="Diagnostics">Diagnostics</summary>
+          <div class="diag-pop">
+            <button type="button" id="btn-kuhn" class="btn btn-ghost btn-block">Solver self-test (Kuhn poker)</button>
+            <p class="hint">Solves Kuhn poker and checks the known Nash value (−1/18). The result shows in the Solve tab's status.</p>
+            <p class="hint" id="app-version"></p>
+          </div>
+        </details>
       </div>
     </header>
+    <div id="conn-banner" class="conn-banner hidden" role="alert" aria-live="assertive"></div>
 
     <main id="app">
       <!-- ============== SOLVE / TREE BUILDER ============== -->
@@ -34,9 +41,6 @@
           <aside class="card side-col">
             <h2>Presets</h2>
             <div id="preset-list" class="preset-list"></div>
-            <div class="divider"></div>
-            <button type="button" id="btn-kuhn" class="btn btn-ghost btn-block">Solve Kuhn (NE gate)</button>
-            <p class="hint">Correctness check — value ≈ −1/18. Result stays here, not in Strategy.</p>
           </aside>
 
           <div class="card grow">
@@ -86,10 +90,13 @@
                     <input id="f-sizes" type="text" value="330,500,750,1000,1500" />
                   </label>
                   <label>Algorithm
+                    <!-- (TOOL-008) options a root cannot use are disabled by app.js -->
                     <select id="f-algo">
-                      <option value="dcfr" selected>dcfr</option>
-                      <option value="mccfr_es">mccfr_es</option>
+                      <option value="dcfr_vector" selected>Full-range DCFR</option>
+                      <option value="dcfr">Sampled DCFR</option>
+                      <option value="mccfr_es">MCCFR</option>
                     </select>
+                    <span class="field-hint" id="f-algo-hint">Heads-up river / turn: every hand and every river, each iteration.</span>
                   </label>
                   <label>Card abstraction
                     <select id="f-abs">
@@ -158,11 +165,18 @@
                 <input id="c-iters" type="number" min="0" value="200" />
               </label>
               <p class="hint" id="c-iters-hint">0 or Unlimited = run until Pause/Stop.</p>
-              <label>Threads
-                <input id="c-threads" type="number" min="1" value="4" />
+              <!-- (TOOL-017) what this number means depends on the algorithm: app.js
+                   relabels it (threads / deals per iteration / unused) -->
+              <label><span id="c-threads-label">Threads</span>
+                <input id="c-threads" type="number" min="1" value="1" />
+                <span class="field-hint" id="c-threads-hint">Turn roots solve their rivers in parallel.</span>
               </label>
               <label>Target expl (bb, 0=off)
                 <input id="c-expl" type="number" step="0.01" value="0" />
+              </label>
+              <label>Check expl every (s, 0=off)
+                <input id="c-expl-check" type="number" step="1" min="0" value="10"
+                       title="Measures exploitability while the solve runs, so the status shows a live number. Never more than ~20% of the run time." />
               </label>
               <label>Time budget (s, 0=off)
                 <input id="c-time" type="number" step="1" min="0" value="0"
@@ -186,6 +200,8 @@
               <button type="button" id="btn-validate" class="btn btn-ghost">Validate</button>
               <button type="button" id="btn-view-job" class="btn btn-ghost" disabled>Open strategy</button>
             </div>
+            <!-- (TOOL-032) Validate: what the text means and what the solve will need -->
+            <div id="validate-result" class="validate-result hidden" aria-live="polite"></div>
             <div id="solve-status" class="solve-status">
               <div class="status-line"><span class="k">Status</span><span id="st-status">idle</span></div>
               <div class="status-line"><span class="k">Job</span><span id="st-job">—</span></div>
@@ -261,6 +277,8 @@
                       <th>Path</th>
                       <th>Strategy</th>
                       <th>Primary</th>
+                      <th class="num" title="Expected value at this node under the solved strategies (bb)">EV</th>
+                      <th class="num" title="Chance of winning at showdown against the range that reaches the node">Equity</th>
                     </tr>
                   </thead>
                   <tbody></tbody>
@@ -285,13 +303,12 @@
               <div id="quality-panel" class="quality-panel muted">Quality metrics appear after load.</div>
               <div class="divider"></div>
               <h2>Compare</h2>
-              <p class="hint">L1 vs another library file (same hands).</p>
-              <label>Path B
-                <input id="cmp-path" type="text" placeholder="data/cfr/…" />
+              <p class="hint">How far this solution is from another one in the Library (L1 over the hands both contain).</p>
+              <label>Compare with
+                <select id="cmp-path"><option value="">Choose a solution…</option></select>
               </label>
               <button type="button" id="btn-compare" class="btn btn-ghost btn-block">Compare</button>
               <pre id="cmp-out" class="notes"></pre>
-              <div id="line-tree" class="hidden"></div>
             </aside>
           </div>
         </div>

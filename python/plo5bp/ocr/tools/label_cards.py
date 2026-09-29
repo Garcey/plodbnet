@@ -40,8 +40,13 @@ def build_templates(
     group: str,
     rank_chars: list[str],
     overwrite: bool = False,
+    out_dir: Path | None = None,
 ) -> list[Path]:
     """Extract rank templates from a labeled row.
+
+    ``out_dir`` defaults to the classifier's shipped template folder
+    (`cards.TEMPLATES_DIR`) — what the labeling tool is for. Tests pass a
+    temporary folder so a test run never changes the source tree.
 
     Writes one file per (rank, source-frame+group+slot) so the classifier
     can see the same rank rendered under different card-body colors /
@@ -55,7 +60,8 @@ def build_templates(
     rois = _ROI_GROUPS[group]
     if len(rank_chars) != len(rois):
         raise ValueError(f"expected {len(rois)} labels, got {len(rank_chars)}")
-    card_mod.TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(out_dir) if out_dir is not None else card_mod.TEMPLATES_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
     frame_tag = frame_path.stem
     written: list[Path] = []
     for slot_idx, (roi, rc) in enumerate(zip(rois, rank_chars)):
@@ -65,10 +71,18 @@ def build_templates(
             raise ValueError(f"unknown rank char {rc!r}")
         rank = RANK_CHARS.index(rc.upper())
         tag = f"{frame_tag}_{group}_{slot_idx}"
-        out_path = card_mod.TEMPLATES_DIR / f"rank_{rank}_{tag}.png"
+        out_path = out_dir / f"rank_{rank}_{tag}.png"
         if out_path.exists() and not overwrite:
             continue
         crop = roi.crop(img)
+        if group == "hero_hole":
+            # The runtime de-rotates each fanned hole card to its slot's
+            # calibrated angle before matching (`extract._best_over_angles`),
+            # so harvest templates from the same upright crop (TOOL-041) — a
+            # template cut from the tilted edge cards attracts misreads.
+            from plo5bp.ocr.extract import _HERO_HOLE_ROTATIONS, _rotate
+
+            crop = _rotate(crop, _HERO_HOLE_ROTATIONS[slot_idx][0])
         glyph = _extract_glyph(crop)
         if glyph is None:
             print(f"warn: could not extract glyph for {rc!r} at roi {roi}")

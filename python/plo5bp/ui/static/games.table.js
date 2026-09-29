@@ -12,19 +12,28 @@
   const SUIT = ["c", "d", "h", "s"];
   const GLYPH = { c: "♣", d: "♦", h: "♥", s: "♠" };
   const RING = 2 * Math.PI * 46;
+  const TIMER_TICK_MS = 100;
   const EMOTES = {
     gg: "🤝", nh: "👏", ty: "🙏", gl: "🍀", lol: "😂", wow: "😮",
     cry: "😭", angry: "😡", fire: "🔥", clap: "👌", think: "🤔", ship: "🚢",
+  };
+  // what the menus and the tray call them (CPY-003: "NH", "TY", and "CLAP" for 👌) —
+  // the server's keys above stay as they are
+  const TAG_WORDS = { red: "red", amber: "amber", green: "green", blue: "blue", violet: "violet" };
+  const EMOTE_NAMES = {
+    gg: "Good game", nh: "Nice hand", ty: "Thanks", gl: "Good luck", lol: "LOL", wow: "Wow",
+    cry: "Ouch", angry: "Tilted", fire: "On fire", clap: "OK", think: "Hmm…", ship: "Ship it",
   };
 
   const $ = (id) => document.getElementById(id);
   // Card rows per game (2026-09-26: PLO6 next to PLO5). A six-card row takes about the
   // room of a five-card one, so the tuned layout holds: the hero's cards are 10% smaller
   // and overlap a little more, a face-down fan tucks tighter, a tabled row starts tighter.
-  // (keep in step with the #stage.h6 variables in games.css)
   // PLO67 (2026-09-27) holds 4 to 7: the table is laid out for its widest hand (seven
   // cards, 18% smaller, a third of each tucked under the next — #stage.h7) and every
-  // row shows what the hand holds now.
+  // row shows what the hand holds now. The layout math reads these numbers and layout()
+  // publishes the ones the CSS draws with (--hero-cw, --hero-ov: FE-010 — this file is
+  // their only source; the face-down fans' --fov / --mid / --rot are games.css's own).
   const ROW = {
     5: { heroK: 1, heroOv: 0.24, openOv: 0.3, openMax: 0.56 },
     6: { heroK: 0.9, heroOv: 0.28, openOv: 0.4, openMax: 0.6 },
@@ -45,14 +54,19 @@
     ro: null,
   };
 
-  const el = (tag, cls, html) => {
+  // markup only through html`` (FE-003: every value escaped); games.js loads after this
+  // file, hence the call-time wrappers. el()'s content: markup (html``) or text.
+  const html = (strings, ...values) => HG.core.html(strings, ...values);
+  const el = (tag, cls, content) => {
     const e = document.createElement(tag);
     if (cls) e.className = cls;
-    if (html != null) e.innerHTML = html;
+    if (content != null) HG.core.put(e, content);
     return e;
   };
-  const icon = (id) => `<svg class="ico"><use href="#${id}"/></svg>`;
-  const anim = () => (HG.core && HG.core.G.prefs.anim) !== "off";
+  const icon = (id) => html`<svg class="ico"><use href="#${id}"/></svg>`;
+  // The Animations preference, or on "auto" the device's Reduce Motion (games.js motionOn):
+  // these JavaScript animations are out of reach of the CSS reduced-motion rule.
+  const anim = () => { const c = HG.core; return !c || (c.motionOn ? c.motionOn() : c.G.prefs.anim !== "off"); };
   const play = (n) => HG.sound && HG.sound.play(n);
   const fmt = (c, s) => HG.core.fmtAmt(c, s);
 
@@ -73,7 +87,7 @@
 
   // ------------------------------------------------------------------ cards
   function cardEl(c, extra) {
-    const e = el("div", "card" + (extra ? " " + extra : ""), '<div class="card-in"><div class="card-f"></div><div class="card-b"></div></div>');
+    const e = el("div", "card" + (extra ? " " + extra : ""), html`<div class="card-in"><div class="card-f"></div><div class="card-b"></div></div>`);
     setCard(e, c);
     return e;
   }
@@ -86,7 +100,7 @@
       const suit = SUIT[c % 4];
       const r = RANK[(c / 4) | 0];
       e.classList.add("s-" + suit);
-      e.firstChild.firstChild.innerHTML = `<b class="hg-card-bigrank">${r === "T" ? "10" : r}</b><i>${GLYPH[suit]}</i>`;
+      e.firstChild.firstChild.innerHTML = html`<b class="hg-card-bigrank">${r === "T" ? "10" : r}</b><i>${GLYPH[suit]}</i>`;
       e.classList.remove("is-down");
     } else {
       e.classList.add("is-down");
@@ -147,19 +161,33 @@
     return [-px / d, -(py - c) / d];
   }
   const rOver = (a, b, m) => Math.max(0, Math.min(a[2], b[2] + m) - Math.max(a[0], b[0] - m)) * Math.max(0, Math.min(a[3], b[3] + m) - Math.max(a[1], b[1] - m));
-  // The award caption's height at this scale (font floors), measured on the real node.
+  // Where a part of a seat (plate, badge, avatar) RESTS on screen, whatever it is animating:
+  // a badge pops in from higher up and smaller (badgein), so its live box in the render that
+  // shows it was ~9 px above where it lands and the pots were fitted against that (HGT-007,
+  // 2026-09-28). Its seat's box (a plain translate) plus its layout offsets inside the seat.
+  function restBox(node, seatEl) {
+    let x = 0, y = 0, n = node;
+    while (n && n !== seatEl) { x += n.offsetLeft; y += n.offsetTop; n = n.offsetParent; }
+    if (n !== seatEl) return node.getBoundingClientRect();
+    const s = seatEl.getBoundingClientRect(), left = s.left + x, top = s.top + y;
+    return { left, top, right: left + node.offsetWidth, bottom: top + node.offsetHeight };
+  }
+  // The award caption's height at this scale (font floors), measured on the real node —
+  // at its full width (a showdown's --cap-room, fitCaption, must not move the boards).
   function captionHeight(g) {
     const cap = $("award-caption");
     const was = { hidden: cap.hidden, text: cap.textContent, vis: cap.style.visibility };
     cap.style.visibility = "hidden"; cap.hidden = false; cap.textContent = "Side pot 1 · Board 1 · Somebody wins $100.00 with a full house, As full of Qs";
+    cap.style.setProperty("--cap-room", "100vw");
     const h = cap.getBoundingClientRect().height || g.u * 3;
+    cap.style.removeProperty("--cap-room");
     cap.hidden = was.hidden; cap.textContent = was.text; cap.style.visibility = was.vis;
     return h;
   }
   // A bet pill's real size at this scale (font floors make it relatively bigger
   // on a small phone), measured once per layout on a throwaway twin.
   function pillSize(g) {
-    const probe = el("div", "bet on", '<span class="chips"><i class="c-red"></i><i class="c-red"></i></span><span class="amt">$188.50</span>');
+    const probe = el("div", "bet on", html`<span class="chips"><i class="c-red"></i><i class="c-red"></i></span><span class="amt">$188.50</span>`);
     probe.style.visibility = "hidden";
     $("bets").appendChild(probe);
     const r = probe.getBoundingClientRect();
@@ -203,7 +231,14 @@
       const top = g.wide ? g.h - u * (1 + g.heroCw * 1.38) : heroV.y - u * (3.5 + g.heroCw * 1.38);
       heroCards = [hx - half, top, hx + half, top + cw * 1.38];
       fixed.push(heroCards);
+      // (a phone on its side: the hero's bet goes up into the band where #hero-tag says what
+      // you hold — MOB-004 — and the tag steps aside while it is out: updateMoney, games.css.
+      // Kept free of it, the bet had to go beside the cards, under the action bar.)
     }
+    // (a phone on its side: the dock floats over the felt's bottom corners — Sit out / Add chips /
+    // Leave on the left, the action bar on the right — and covers whatever is under it: the
+    // hero's dealer button landed under "Sit out next hand", 2026-09-28)
+    if (g.wide) for (const id of ["dock-left", "actbar"]) { const e = $(id); if (e && e.offsetWidth && e.offsetHeight) fixed.push(rectOf(e)); }
     const boxes = T.seats.map((sv) => [sv.x - u * 5.9, sv.y - u * (sv === heroV ? 3 : 5.1), sv.x + u * 5.9, sv.y + bottom]);
     const inStage = (r) => r[0] >= u * 0.4 && r[1] >= u * 0.4 && r[2] <= g.w - u * 0.4 && r[3] <= g.h - u * 0.4;
     // distance along (dx, dy) at which a (hw x hh) box is just clear of `own`
@@ -262,14 +297,24 @@
       // (the hero's bet leaves from the hero's CARDS — the button stays by the hero's plate)
       const ang = sv === heroV ? Math.atan2(sv.normal[1], sv.normal[0]) : Math.atan2(sv.by - sv.y, sv.bx - sv.x);
       let pick = [sv.x, sv.y], pickOver = Infinity;
-      for (const off of sv === heroV || (n % 2 === 0 && sv.rel === n / 2) ? [-90, 90, -66, 66, -112, 112] : [48, -48, 66, -66, 90, -90, 112, -112]) {
-        const th = ang + (off * Math.PI) / 180, dx = Math.cos(th), dy = Math.sin(th);
-        const r = reach(sv.x, sv.y, own, dx, dy, disc, u * 0.2), x = sv.x + dx * r, y = sv.y + dy * r;
-        const rc = [x - disc.hw, y - disc.hh, x + disc.hw, y + disc.hh];
-        let over = inStage(rc) ? 0 : 1e6;
-        for (const o of others) over += rOver(rc, o, u * 0.2);
-        if (over < pickOver) { pickOver = over; pick = [x, y]; }
-        if (over === 0) break;
+      // (±40: a phone on its side has the dock beside the hero's plate and the cards on its other
+      // side — the button goes up past the plate's corner, clear of the boards)
+      const offs = sv === heroV || (n % 2 === 0 && sv.rel === n / 2) ? [-90, 90, -66, 66, -112, 112, -40, 40] : [48, -48, 66, -66, 90, -90, 112, -112];
+      // Beside the plate first. With nowhere free (a 7-seat table on a small phone), the disc
+      // tucks onto its OWN seat — a small price, deeper only as needed — rather than onto the pot
+      // row's "Total", a board or a neighbour's bet (HGT-005; the upper side seat of a 7-seat table
+      // at 375x667 is 4 px from the boards). It sits under the seats, so the plate stays whole.
+      search: for (const tuck of [0, 1, 2, 3]) {
+        for (const off of offs) {
+          const th = ang + (off * Math.PI) / 180, dx = Math.cos(th), dy = Math.sin(th);
+          const r = reach(sv.x, sv.y, own, dx, dy, disc, u * 0.2) - tuck * disc.hw * 1.1, x = sv.x + dx * r, y = sv.y + dy * r;
+          const rc = [x - disc.hw, y - disc.hh, x + disc.hw, y + disc.hh];
+          let over = inStage(rc) ? 0 : 1e6;
+          for (const o of others) over += rOver(rc, o, u * 0.2);
+          over += rOver(rc, own, 0) * 0.15;
+          if (over < pickOver) { pickOver = over; pick = [x, y]; }
+          if (over === 0) break search;
+        }
       }
       sv.dx = pick[0]; sv.dy = pick[1];
     }
@@ -298,15 +343,15 @@
     let h = w / aspect;
     if (h > bh) { h = bh; w = h * aspect; }
     const u = portrait ? w / 58 : w / 100;
-    // Felt rectangle = the CSS insets of #felt (keep the two in step).
+    // Felt rectangle (layout() publishes it as #felt's --felt-inset: one source, FE-010).
     const ins = portrait ? { t: 0.075, r: 0.1, b: 0.16, l: 0.1 } : { t: 0.105, r: 0.085, b: 0.14, l: 0.085 };
     // Seats along the top edge table their cards ABOVE the avatar at showdown:
     // keep that much air over them however flat the window is.
     ins.t = Math.max(ins.t, (u * 9.3) / h);
     if (wide) { ins.t = (u * 7) / h; ins.b = (u * 3) / h; ins.l = ins.r = 0.07; }
     const fx = w * ins.l, fy = h * ins.t, fw = w * (1 - ins.l - ins.r), fh = h * (1 - ins.t - ins.b);
-    // hero card width in units — keep in step with #hero-hole in games.css (--hk scales it
-    // for six cards); the row is heroSpan cards wide (each card after the first overlaps)
+    // hero card width in units (layout() publishes it: #hero-hole's --hero-cw) — smaller
+    // for six or seven cards; the row is heroSpan cards wide (each card after the first overlaps)
     const row = rowOf(T.hole);
     const heroCw = (wide ? 6 : portrait ? 6.6 : 6.3) * row.heroK;
     const heroSpan = T.hole - (T.hole - 1) * row.heroOv;
@@ -322,8 +367,13 @@
     stage.style.setProperty("--u", g.u + "px");
     stage.classList.toggle("portrait", g.portrait);
     stage.classList.toggle("wide", g.wide);
-    const felt = $("felt");
-    felt.style.inset = `${(g.fy / g.h) * 100}% ${(1 - (g.fx + g.fw) / g.w) * 100}% ${(1 - (g.fy + g.fh) / g.h) * 100}% ${(g.fx / g.w) * 100}%`;
+    // What the CSS draws with, from the numbers the layout math uses (FE-010: they used to be
+    // copied into games.css by hand, and two of them had drifted): the felt's insets, the
+    // hero's card width and overlap, a tabled card's width.
+    stage.style.setProperty("--felt-inset", `${(g.fy / g.h) * 100}% ${(1 - (g.fx + g.fw) / g.w) * 100}% ${(1 - (g.fy + g.fh) / g.h) * 100}% ${(g.fx / g.w) * 100}%`);
+    stage.style.setProperty("--hero-cw", g.u * g.heroCw + "px");
+    stage.style.setProperty("--hero-ov", String(rowOf(T.hole).heroOv));
+    stage.style.setProperty("--open-cw", g.u * openCw(g) + "px");
     const n = T.n;
     const pad = g.u * 0.4;
     const W = g.fw + 2 * pad, H = g.fh + 2 * pad;
@@ -382,14 +432,16 @@
     placeDealer(T.lastButton);
     fitPots($("pots"));
     fitPots($("live-pots"));
+    nudgePot(T.lastS);
     fitSeats();
   }
 
   // A tabled row's geometry (fitSeats places it, fitPots keeps the pots clear of it):
   // card width, how many cards, and the band it covers (a winning card lifts 0.18 of
-  // a card). (keep in step with .seat-cards.open in games.css)
+  // a card). The card width is published as --open-cw (.seat-cards.open, games.css).
+  const openCw = (g) => (g.wide ? 3 : 3.5);  // (units)
   function openRow(sv, g) {
-    const n = sv.cardEls.length || T.hole, cw = g.u * (g.wide ? 3 : 3.5);
+    const n = sv.cardEls.length || T.hole, cw = g.u * openCw(g);
     const cy = sv.y + g.u * (g.wide ? -0.4 : -5.5);
     return { n, cw, cy, top: cy - cw * 0.87, bot: cy + cw * 0.69, row: rowOf(n), width: (ov) => (n - (n - 1) * ov) * cw };
   }
@@ -413,6 +465,7 @@
       const r = e.getBoundingClientRect();
       blocks.push([r.left - st.left, r.top - st.top, r.right - st.left, r.bottom - st.top]);
     }
+    fitCaption(g, st);
     const capBox = captionLanding(g, st);
     if (capBox) blocks.push(capBox);
     const box = (e) => { const r = e.getBoundingClientRect(); return [r.left - st.left, r.top - st.top, r.right - st.left, r.bottom - st.top]; };
@@ -426,6 +479,10 @@
     const hz = $("hero-zone");
     const heroBox = hz && !hz.hidden && hz.offsetWidth ? box(hz) : null;
     const gap = g.u * 0.4, edge = g.u * 0.6;
+    // (a label sliding off a block may use the stage's own margin too, up to 2 px from the
+    // screen edge: a phone's side seat's label ended 2-4 px over a board's end card)
+    const sb = $("stage-box").getBoundingClientRect();
+    const mL = Math.min(4, 2 - Math.max(0, st.left - sb.left)), mR = Math.min(4, 2 - Math.max(0, sb.right - st.right));
     const labelBox = [], rowBox = [];
     T.seats.forEach((sv, i) => {
       if (sv.x == null) return;
@@ -439,10 +496,10 @@
         const hit = blocks.filter((b) => b[1] < lb.bot && b[3] > lb.top && b[0] < r + hx + gap && b[2] > l + hx - gap);
         if (hit.length && left) {
           const bl = Math.min(...hit.map((b) => b[0])) - gap;
-          if (sv.x < bl) hx = Math.max(m - l, Math.min(hx, bl - r));
+          if (sv.x < bl) hx = Math.max(mL - l, Math.min(hx, bl - r));
         } else if (hit.length) {
           const br = Math.max(...hit.map((b) => b[2])) + gap;
-          if (sv.x > br) hx = Math.min(g.w - m - r, Math.max(hx, br - l));
+          if (sv.x > br) hx = Math.min(g.w - mR - r, Math.max(hx, br - l));
         }
         labelBox[i] = [l + hx, lb.top, r + hx, lb.bot];
       }
@@ -452,7 +509,9 @@
       const { n, cw, top, bot, row, width } = openRow(sv, g);
       let ov = row.openOv, hw = width(ov) / 2;
       let c = Math.max(g.u + hw, Math.min(g.w - g.u - hw, sv.x));
-      const hits = blocks.filter((b) => b[1] < bot && b[3] > top && b[0] < c + hw + gap && b[2] > c - hw - gap);
+      // (the hero's cards too: on a short phone the two seats beside the hero table their
+      // rows level with them — a PLO6 row reached over the hero's first card, 2026-09-28)
+      const hits = (heroBox ? blocks.concat([heroBox]) : blocks).filter((b) => b[1] < bot && b[3] > top && b[0] < c + hw + gap && b[2] > c - hw - gap);
       const inner = !hits.length ? null : left ? Math.min(...hits.map((b) => b[0])) - gap : Math.max(...hits.map((b) => b[2])) + gap;
       if (inner != null && n > 1 && (left ? sv.x < inner : sv.x > inner)) {  // (beside the block, not over it)
         const room = left ? inner - edge : g.w - edge - inner;
@@ -460,9 +519,25 @@
         hw = width(ov) / 2;
         c = left ? Math.max(edge + hw, Math.min(inner - hw, sv.x)) : Math.min(g.w - edge - hw, Math.max(inner + hw, sv.x));
       }
+      // Still over the block — a runout's six pots stay wider than the gap between the upper
+      // side seats' rows at their tightest (7 seats, 360-375 px phones; HGT-007): the row drops
+      // onto its own avatar — never onto its name and stack — or rises (at most a card's
+      // width), by what it takes to clear it, and only to a band that is clear.
+      let lift = 0;
+      const obst = heroBox ? blocks.concat([heroBox]) : blocks;
+      const over = n > 1 ? obst.filter((b) => b[1] < bot && b[3] > top && b[0] < c + hw && b[2] > c - hw) : [];
+      if (over.length) {
+        const mid = (top + bot) / 2;
+        const above = over.filter((b) => (b[1] + b[3]) / 2 < mid), below = over.filter((b) => (b[1] + b[3]) / 2 >= mid);
+        const want = below.length ? (above.length ? 0 : -Math.max(...below.map((b) => bot - b[1] + 2))) : Math.max(...above.map((b) => b[3] - top + 2));
+        const free = (d) => !obst.some((b) => b[1] < bot + d && b[3] > top + d && b[0] < c + hw && b[2] > c - hw);
+        const plate = sv.el.querySelector(".seat-plate");
+        const drop = plate && plate.offsetWidth ? restBox(plate, sv.el).top - st.top - 2 - bot : cw;  // (down to the plate)
+        if (want && (want > 0 ? want <= drop : -want <= cw) && free(want)) lift = Math.round(want * 10) / 10;
+      }
       const shift = Math.round((c - sv.x) * 10) / 10, ovr = Math.round(ov * 1000) / 1000;
-      if (sv.openShift !== shift || sv.openOv !== ovr) { sv.openShift = shift; sv.openOv = ovr; placeCards(sv); }
-      if (sv.cards.classList.contains("open") && sv.cardEls.length) rowBox[i] = [c - hw, top, c + hw, bot];
+      if (sv.openShift !== shift || sv.openOv !== ovr || (sv.openLift || 0) !== lift) { sv.openShift = shift; sv.openOv = ovr; sv.openLift = lift; placeCards(sv); }
+      if (sv.cards.classList.contains("open") && sv.cardEls.length) rowBox[i] = [c - hw, top + lift, c + hw, bot + lift];
     });
     // On a short phone a label can still land on the next seat down (its
     // avatar or tabled cards), the hero's cards or a board: then it steps back
@@ -486,17 +561,76 @@
     d.classList.toggle("covered", covered);
   }
 
+  // The award caption keeps clear of the seats level with it (HGT-007, 2026-09-28).
+  // Upright, it wraps (games.css: at most 35 u wide): on a 7-seat table the lower side seats
+  // sit on the rail's bottom curve, 34.5 u apart, and a THREE-line caption (a long hand, a
+  // four-figure amount) reached their avatars — while its lines are level with an avatar or
+  // a plate, the free width between them is published as #stage's --cap-room, which caps it.
+  // (Not the room the layout keeps under the boards: captionHeight measures at the full 35 u.)
+  // A caption of three lines (a long name, a four-figure amount, a full house) hung onto the
+  // top of the hero's cards — their ranks: it rises instead (--cap-up, at most to 0.7 u under
+  // the boards) over the street tag, which steps aside meanwhile (#stage.cap-up).
+  // On a phone on its side it is one line just over the hero's cards, and the hero's plate
+  // sits LEFT of them: a long line slides right into the free span (--cap-dx), and is cut
+  // short (…) only if even that is too narrow.
+  function fitCaption(g, st) {
+    const cap = $("award-caption"), host = $("center");
+    let v = "", dx = 0;
+    if ((g.portrait || g.wide) && cap && !cap.hidden && host && cap.offsetHeight) {
+      const hr = host.getBoundingClientRect();
+      const dy = (parseFloat(getComputedStyle(cap).getPropertyValue("--cap-dy")) || 0) * g.u;
+      const top = hr.top - st.top + cap.offsetTop + dy, bot = top + cap.offsetHeight;
+      const mid = hr.left - st.left + cap.offsetLeft, m = g.u * 0.4;  // (its centre: #center's)
+      let L = m, R = g.w - m, level = false;
+      for (const sv of T.seats) {
+        if (sv.x == null) continue;
+        for (const node of [sv.el.querySelector(".seat-av"), sv.el.querySelector(".seat-plate")]) {
+          if (!node || !node.offsetWidth) continue;
+          const r = restBox(node, sv.el), l = r.left - st.left, rt = r.right - st.left;
+          if (r.bottom - st.top <= top || r.top - st.top >= bot) continue;
+          if (rt <= mid) { L = Math.max(L, rt + m); level = true; } else if (l >= mid) { R = Math.min(R, l - m); level = true; }
+        }
+      }
+      if (g.portrait) {
+        if (level) v = Math.floor(Math.max(g.u * 24, 2 * Math.min(mid - L, R - mid))) + "px";
+      } else if (level) {
+        const w = Math.max(cap.offsetWidth, cap.scrollWidth + cap.offsetWidth - cap.clientWidth);  // (its whole line, even while cut short)
+        if (w > R - L) v = Math.floor(R - L) + "px";
+        const cw = Math.min(w, R - L);
+        dx = Math.round(Math.max(L, Math.min(R - cw, mid - cw / 2)) - (mid - cw / 2));
+      }
+    }
+    if (T.capRoom !== v) { T.capRoom = v; if (v) $("stage").style.setProperty("--cap-room", v); else $("stage").style.removeProperty("--cap-room"); }
+    if ((T.capDx || 0) !== dx) { T.capDx = dx; if (dx) cap.style.setProperty("--cap-dx", dx + "px"); else cap.style.removeProperty("--cap-dx"); }
+    let up = 0;  // (read after the room is set: it decides how many lines the caption has)
+    const hh = $("hero-hole");
+    if (g.portrait && !T.burnN && T.seated && cap && !cap.hidden && host && cap.offsetHeight && hh && hh.offsetWidth) {
+      const dy = (parseFloat(getComputedStyle(cap).getPropertyValue("--cap-dy")) || 0) * g.u;
+      const bot = host.getBoundingClientRect().top - st.top + cap.offsetTop + dy + cap.offsetHeight;
+      const over = bot + g.u * 0.3 - (hh.getBoundingClientRect().top - st.top);
+      if (over > 0) up = Math.round(Math.max(0, Math.min(over, dy - g.u * 0.7)));
+    }
+    if ((T.capUp || 0) !== up) {
+      T.capUp = up;
+      if (up) cap.style.setProperty("--cap-up", up + "px"); else cap.style.removeProperty("--cap-up");
+      $("stage").classList.toggle("cap-up", up > 0);
+    }
+  }
+
   // Where the award caption LANDS (stage coordinates). It slides in (capin: from higher
   // up and smaller) and this runs in its first frame — its live box was the wrong one: a
   // tabled row level with where it ends up (the side seats of a 7-seat table, PLO6's
   // default) was left under it. Layout box (offsets ignore transforms) + its resting
-  // shift: -50% across, --cap-dy units down (games.css; the only place it is set).
+  // shift: -50% (+ --cap-dx, fitCaption) across, --cap-dy units down (games.css; the only
+  // place --cap-dy is set).
   function captionLanding(g, st) {
     const cap = $("award-caption"), host = $("center");
     if (!cap || cap.hidden || !cap.offsetWidth || !host) return null;
     const hr = host.getBoundingClientRect();  // (#center: a pure translate — its box is exact)
-    const dy = (parseFloat(getComputedStyle(cap).getPropertyValue("--cap-dy")) || 0) * g.u;
-    const left = hr.left - st.left + cap.offsetLeft - cap.offsetWidth / 2, top = hr.top - st.top + cap.offsetTop + dy;
+    const cs = getComputedStyle(cap);
+    const dy = (parseFloat(cs.getPropertyValue("--cap-dy")) || 0) * g.u - (parseFloat(cs.getPropertyValue("--cap-up")) || 0);
+    const dx = parseFloat(cs.getPropertyValue("--cap-dx")) || 0;
+    const left = hr.left - st.left + cap.offsetLeft - cap.offsetWidth / 2 + dx, top = hr.top - st.top + cap.offsetTop + dy;
     return [left, top, left + cap.offsetWidth, top + cap.offsetHeight];
   }
 
@@ -505,8 +639,9 @@
     if (c.classList.contains("open")) {
       c.style.setProperty("--cx", (sv.openShift || 0) + "px");
       c.style.setProperty("--ov", String(sv.openOv || rowOf(sv.cardEls.length || T.hole).openOv));
-      // (wide: no air above the top seats — tabled cards sit ON the avatar)
-      c.style.setProperty("--cy", T.geom && T.geom.wide ? "calc(var(--u) * -0.4)" : "calc(var(--u) * -5.5)");
+      // (wide: no air above the top seats — tabled cards sit ON the avatar; openLift: fitSeats)
+      const lift = sv.openLift ? ` + ${sv.openLift}px` : "";
+      c.style.setProperty("--cy", `calc(var(--u) * ${T.geom && T.geom.wide ? -0.4 : -5.5}${lift})`);
     } else {
       c.style.setProperty("--cx", "0px");
       c.style.setProperty("--cy", "calc(var(--u) * -3.1)");
@@ -549,15 +684,8 @@
     for (let i = 0; i < T.n; i++) {
       const e = el("div", "seat");
       e.dataset.seat = String(i);
-      e.innerHTML =
-        '<div class="seat-cards"></div>' +
-        '<div class="seat-main">' +
-        '<div class="seat-av"><svg class="actor-timer" viewBox="0 0 100 100"><circle class="trk" cx="50" cy="50" r="46"/><circle class="arc" cx="50" cy="50" r="46"/></svg>' +
-        `<span class="av-txt"></span><img class="av-img" alt="" hidden/><span class="av-count"></span><span class="av-crown">${icon("i-crown")}</span></div>` +
-        '<div class="seat-plate"><span class="seat-pos"></span><div class="seat-name"></div><div class="seat-stack num"></div></div>' +
-        "</div>" +
-        '<div class="seat-badge"></div><div class="seat-hand"></div>';
-      const sit = el("button", "seat-sit", `${icon("i-plus")}<span>Sit</span>`);
+      e.innerHTML = html`<div class="seat-cards"></div><div class="seat-main"><div class="seat-av"><svg class="actor-timer" viewBox="0 0 100 100"><circle class="trk" cx="50" cy="50" r="46"/><circle class="arc" cx="50" cy="50" r="46"/></svg><span class="av-txt"></span><img class="av-img" alt="" hidden/><span class="av-count"></span><span class="av-crown">${icon("i-crown")}</span></div><div class="seat-plate"><span class="seat-pos"></span><div class="seat-name"></div><div class="seat-stack num"></div></div></div><div class="seat-badge"></div><div class="seat-hand"></div>`;
+      const sit = el("button", "seat-sit", html`${icon("i-plus")}<span>Sit</span>`);
       sit.type = "button";
       sit.hidden = true;  // the render shows it on empty seats (else a bare button flashes on load)
       sit.addEventListener("click", () => {
@@ -566,7 +694,13 @@
         if (held && st.is_host && HG.ui && HG.ui.openRequest) HG.ui.openRequest(i);
         else if (HG.ui) HG.ui.openSit(i);
       });
-      e.querySelector(".seat-main").addEventListener("click", () => HG.ui && HG.ui.openPlayer(i));
+      // the seat is a button: the player card opens from the keyboard too, and a screen
+      // reader hears who sits there (A11Y-005; the label is kept up to date in updateSeat)
+      const main = e.querySelector(".seat-main");
+      main.setAttribute("role", "button");
+      main.tabIndex = 0;
+      main.addEventListener("click", () => HG.ui && HG.ui.openPlayer(i));
+      main.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); if (HG.ui) HG.ui.openPlayer(i); } });
       e.appendChild(sit);
       seatsEl.appendChild(e);
       const avImg = e.querySelector(".av-img");
@@ -581,7 +715,7 @@
         badge: e.querySelector(".seat-badge"), hand: e.querySelector(".seat-hand"), sit,
         stackCents: null, cardEls: [], nameKey: null, folded: false,
       });
-      const b = el("div", "bet", '<span class="chips"></span><span class="amt"></span>');
+      const b = el("div", "bet", html`<span class="chips"></span><span class="amt"></span>`);
       betsEl.appendChild(b);
       T.bets.push({ el: b, chips: b.firstChild, amt: b.lastChild, cents: 0 });
     }
@@ -663,9 +797,9 @@
     };
     requestAnimationFrame(step);
   }
-  function floatDelta(i, cents, s) {
+  function floatDelta(i, cents, s) {  // (with no motion it just shows, still: games.css)
     const sv = T.seats[i];
-    if (!sv || !anim()) return;
+    if (!sv) return;
     const d = el("div", "seat-delta " + (cents >= 0 ? "up" : "down"));
     d.textContent = (cents >= 0 ? "+" : "−") + fmt(Math.abs(cents), s);
     sv.el.appendChild(d);
@@ -695,11 +829,7 @@
   }
 
   // -------------------------------------------------------------- seat update
-  function kindOf(h) {
-    if (h.action === 0) return "fold";
-    if (h.action === 1) return h.chips > 0 ? "call" : "check";
-    return h.action === 7 ? "allin" : "raise";
-  }
+  const kindOf = (h) => HG.core.actionKind(h);  // (games.js: the one reading of action ids)
   function shortLabel(h, s) {
     const k = kindOf(h);
     if (k === "fold") return "Fold";
@@ -718,13 +848,20 @@
     sv.main.hidden = empty;
     sv.sit.hidden = !empty;
     const held = empty && !!seat.reserved_by;
-    e.classList.toggle("locked", empty && !held && (s.my_seat != null || s.status !== "open"));
+    // a seated player sees the empty seats as places to move to (FEAT-013), quietly
+    const movable = empty && !held && s.my_seat != null && s.status === "open";
+    e.classList.toggle("locked", empty && !held && !movable && (s.my_seat != null || s.status !== "open"));
+    e.classList.toggle("can-move", movable);
     e.classList.toggle("reserved", held);
     e.classList.toggle("host-review", held && !!s.is_host);
     e.classList.toggle("has-request", !empty && !!seat.request);
     if (empty) {
-      const label = held ? seat.reserved_by : "Sit";
-      if (sv.sit.dataset.l !== label) { sv.sit.dataset.l = label; sv.sit.lastChild.textContent = label; sv.sit.title = held ? (s.is_host ? `${seat.reserved_by} asks to buy in — tap to review` : `Reserved for ${seat.reserved_by} — waiting for the host`) : ""; }
+      const label = held ? seat.reserved_by : movable ? "Move" : "Sit";
+      if (sv.sit.dataset.l !== label) {
+        sv.sit.dataset.l = label; sv.sit.lastChild.textContent = label;
+        sv.sit.title = held ? (s.is_host ? `${seat.reserved_by} asks to buy in — tap to review` : `Reserved for ${seat.reserved_by} — waiting for the host`) : movable ? `Move to seat ${i + 1}` : "";
+        sv.sit.setAttribute("aria-label", held ? sv.sit.title : movable ? `Move to seat ${i + 1}` : `Sit in seat ${i + 1}`);
+      }
       sv.sit.disabled = held && !s.is_host;  // (the host taps it to approve)
     }
     if (empty) {
@@ -750,10 +887,19 @@
       sv.avUrl = pic;
       if (pic) { sv.avImg.src = pic; sv.avImg.hidden = false; } else { sv.avImg.hidden = true; sv.avImg.removeAttribute("src"); }
     }
-    // my private colour tag for this player (games.ui.js, localStorage)
+    // my private colour tag for this player (games.seat.js, localStorage; its colour: games.css [data-tag])
     const tag = HG.ui && seat.user_id !== s.my_user_id ? HG.ui.noteFor(seat.user_id).tag : "none";
-    if (tag && tag !== "none") { sv.av.dataset.tag = tag; sv.av.style.setProperty("--tagc", HG.ui.TAGS[tag]); }
+    if (tag && tag !== "none") { if (sv.av.dataset.tag !== tag) sv.av.dataset.tag = tag; }
     else delete sv.av.dataset.tag;
+    // the two little dots on an avatar say what they are (HGT-025): your private colour
+    // tag (bottom-left) and "not connected" (bottom-right) — and the seat's spoken label
+    {
+      const tip = [seat.present === false ? "Not connected right now" : "", tag && tag !== "none" ? `Your tag: ${TAG_WORDS[tag] || tag}` : ""].filter(Boolean).join(" · ");
+      const says = `${seat.name}, ${fmt(seat.stack_cents, s)}${seat.is_host ? ", host" : ""}${seat.sitting_out ? ", sitting out" : ""}` +
+        `${seat.in_hand && seat.folded && s.phase === "in_hand" ? ", folded" : seat.in_hand && seat.all_in ? ", all-in" : ""}${seat.is_actor && s.phase === "in_hand" ? ", to act" : ""}${tip ? ". " + tip : ""}`;
+      if (sv.main.title !== tip) sv.main.title = tip;
+      if (sv.main.getAttribute("aria-label") !== says) sv.main.setAttribute("aria-label", says);
+    }
     const dealtIn = !!seat.in_hand && (s.phase === "in_hand" || showdown);
     const folded = dealtIn && !!seat.folded;
     e.classList.toggle("is-hero", !!seat.is_hero);
@@ -788,16 +934,16 @@
     // All-in runout: each player's chance to win each board takes the badge
     // line while cards are still to come (over the seat, where it used to hang,
     // the tabled cards covered it).
-    let eqHtml = "";
+    let eq = null;
     if (dealtIn && !folded && (seat.equity_a != null || seat.equity_b != null) && s.runout.active && (s.runout.shown_len || 0) < 5) {
       const p = (x) => (x == null ? "–" : Math.round(x * 100) + "%");
-      eqHtml = `<span data-b="1">${p(seat.equity_a)}</span><span data-b="2">${p(seat.equity_b)}</span>`;
+      eq = html`<span data-b="1">${p(seat.equity_a)}</span><span data-b="2">${p(seat.equity_b)}</span>`;
     }
-    const bkey = eqHtml ? "eq|" + eqHtml : label ? cls + "|" + label : "";
+    const bkey = eq ? "eq|" + String(eq) : label ? cls + "|" + label : "";
     if (sv.badge.dataset.k !== bkey) {
       sv.badge.dataset.k = bkey;
-      if (eqHtml) sv.badge.innerHTML = eqHtml; else sv.badge.textContent = label;
-      sv.badge.className = "seat-badge" + (eqHtml ? " show k-eq" : label ? " show " + cls : "");
+      HG.core.put(sv.badge, eq || label);
+      sv.badge.className = "seat-badge" + (eq ? " show k-eq" : label ? " show " + cls : "");
     }
 
     // cards
@@ -813,11 +959,10 @@
 
     // showdown labels (the short form: "Js full of 4s" — the caption, the dock
     // and the hand history keep the full wording)
-    let handHtml = "";
-    if (!isHeroCards && seat.hand_desc && (showdown || s.runout.active)) {
-      handHtml = seat.hand_desc.map((d, k) => (d ? `<span><b>${k + 1}</b>${HG.core.esc(shortHand(d))}</span>` : "")).join("");
-    }
-    if (sv.hand.dataset.h !== handHtml) { sv.hand.dataset.h = handHtml; sv.hand.innerHTML = handHtml; }  // (placed by fitSeats)
+    const labels = !isHeroCards && seat.hand_desc && (showdown || s.runout.active)
+      ? html`${seat.hand_desc.map((d, k) => (d ? html`<span><b>${k + 1}</b>${shortHand(d)}</span>` : ""))}` : null;
+    const hkey = labels ? String(labels) : "";
+    if (sv.hand.dataset.h !== hkey) { sv.hand.dataset.h = hkey; HG.core.put(sv.hand, labels); }  // (placed by fitSeats)
   }
 
   // A made hand as the felt labels it: short enough to sit beside the boards on
@@ -933,6 +1078,14 @@
     const me = s.my_seat != null ? s.seats[s.my_seat] : null;
     const hole = me && me.hole && me.hole.length && me.hole[0] >= 0 && me.in_hand && s.phase !== "waiting" ? me.hole : null;
     hz.hidden = !hole;
+    // A phone on its side has no room for the row of labels under the felt (MOB-004): what
+    // you hold on each board rides over your cards instead, in the felt's short words.
+    // (games.css shows it only on the wide table; placeBetSpots keeps its band free.)
+    const tag = $("hero-tag");
+    const desc = hole && !me.folded && me.hand_desc ? me.hand_desc : null;
+    const tagMarkup = desc && desc.some(Boolean) ? html`${desc.map((d, k) => (d ? html`<span><b>${k + 1}</b>${shortHand(d)}</span>` : ""))}` : null;
+    const tkey = tagMarkup ? String(tagMarkup) : "";
+    if (tag && tag.dataset.k !== tkey) { tag.dataset.k = tkey; HG.core.put(tag, tagMarkup); tag.hidden = !tagMarkup; }
     if (!hole) {
       if (T.heroCards.length) { T.heroCards.forEach((c) => c.remove()); T.heroCards = []; }
       return;
@@ -1079,9 +1232,7 @@
   }
 
   // ------------------------------------------------------------- pot + bets
-  function chipsToCents(chips, s) {
-    return Math.round((chips * s.stakes.bb_cents) / (s.stakes.bb_chips || 10000));
-  }
+  const chipsToCents = (chips, s) => HG.core.chipsToCents(chips, s);
   function updateMoney(s, prev, ctx) {
     const inHand = s.phase === "in_hand";
     const potEl = $("pot"), amt = $("pot-amt"), total = $("pot-total");
@@ -1120,6 +1271,9 @@
         b.el.classList.toggle("on", cents > 0);
       }
     }
+    // (a phone on its side: the hero's bet goes up from the cards into #hero-tag's band — the
+    // tag steps aside while the bet is out, games.css)
+    $("stage").classList.toggle("hero-bet", T.seated && T.bets[T.hero] && T.bets[T.hero].cents > 0);
     // 3. antes at the start of a hand
     if (ctx.dealing && ctx.animate) {
       s.seats.forEach((seat, i) => {
@@ -1187,6 +1341,8 @@
     const names = {};
     s.seats.forEach((x) => { if (!x.empty) names[x.seat] = x.is_hero && s.my_seat === x.seat ? "You" : x.name; });
     const pots = renderPots(s, step);
+    T.lastS = s;
+    nudgePot(s);  // (before the chips fly from it)
     let line = "";
     if (step) {
       const amt = fmt(chipsToCents(step.chips, s), s);
@@ -1204,10 +1360,20 @@
       line = `${names[i] || "Winner"} ${names[i] === "You" ? "win" : "wins"} ${fmt((s.hand_deltas_cents || [])[i] || 0, s)}`;
     }
     cap.hidden = !line;
+    $("stage").classList.toggle("has-cap", !!line);  // (a phone on its side: #hero-tag gives it the band over the cards)
     if (cap.textContent !== line) { cap.textContent = line; if (line) { cap.style.animation = "none"; void cap.offsetWidth; cap.style.animation = ""; } }
 
     // chips: pot -> winners, once per award step / fold-out
-    if (!ctx.animate) { T.awardKey = step ? `${s.hand_no}:${s.runout.award_index}` : T.awardKey; if (foldout) T.foldoutKey = s.hand_no; return; }
+    if (!ctx.animate) {
+      if (ctx.still) {  // (no motion: no chips fly, but the "+$" amounts still show, still — games.css)
+        if (step && T.awardKey !== `${s.hand_no}:${s.runout.award_index}`) {
+          Object.entries(step.shares || {}).forEach(([k, v]) => floatDelta(Number(k), chipsToCents(v, s), s));
+        } else if (!step && foldout && T.foldoutKey !== s.hand_no && prev && prev.hand_no === s.hand_no && prev.phase === "in_hand") {
+          winners.forEach((i) => floatDelta(i, (s.hand_deltas_cents || [])[i] || 0, s));
+        }
+      }
+      T.awardKey = step ? `${s.hand_no}:${s.runout.award_index}` : T.awardKey; if (foldout) T.foldoutKey = s.hand_no; return;
+    }
     // the chips leave the pot they belong to (side pots first, main pot last)
     const potNode = step && pots.length > 1 && pots[step.pot] ? pots[step.pot] : potAnchor();
     const pc = centerOf(potNode);
@@ -1267,6 +1433,32 @@
     return Array.from(host.children);
   }
 
+  // One pot at a showdown stays the pot pill — and a top seat's label or badge can hang a few px
+  // into it (6 seats at 375x667: the seat across the table's showdown label). It slides down by
+  // that much like the row of pots does (fitPots; never onto the boards) — through the `translate`
+  // property, so the pot's "bump" (a transform animation) still plays (HGT-007, 2026-09-28).
+  function nudgePot(s) {
+    const pot = $("pot");
+    if (!pot || !s) return;
+    if (pot.style.translate) pot.style.translate = "";
+    const pr = pot.getBoundingClientRect();
+    if (!pr.width || !(s.phase === "showdown" || (s.runout && s.runout.active)) || !$("pots").hidden) return;
+    let need = 0, lab = 0;
+    for (const sv of T.seats) {
+      for (const node of [sv.el.querySelector(".seat-plate"), sv.badge, sv.x != null ? sv.hand : null]) {
+        if (!node || !node.offsetWidth) continue;
+        const r = restBox(node, sv.el);
+        if (r.right <= pr.left || r.left >= pr.right || r.top >= pr.top || r.bottom <= pr.top) continue;
+        if (node === sv.hand) lab = Math.max(lab, r.bottom - pr.top + 2);
+        else need = Math.max(need, r.bottom - pr.top + 2);
+      }
+    }
+    const free = $("boards").getBoundingClientRect().top - pr.bottom - 1;
+    if (lab - 2 < free) need = Math.max(need, lab);  // (a label it cannot clear steps aside: fitSeats)
+    const dy = Math.round(Math.max(0, Math.min(need, free)));
+    if (dy) pot.style.translate = `0 ${dy}px`;
+  }
+
   // One pot as a pill: its name ("Side pot 1", on a phone "Side 1"), a chip
   // stack and what is in it. The title names the players who can win it;
   // hovering it lights them up.
@@ -1274,8 +1466,7 @@
     const d = el("div", "potc");
     d.dataset.pot = id;
     const short = p.label === "Main pot" ? "Main" : String(p.label).replace(/^Side pot /, "Side ");
-    d.innerHTML = `<small class="lab-l">${HG.core.esc(p.label)}</small><small class="lab-s">${HG.core.esc(short)}</small>` +
-      `<span class="chips"></span><b class="num">${fmt(cents, s)}</b>`;
+    d.innerHTML = html`<small class="lab-l">${p.label}</small><small class="lab-s">${short}</small><span class="chips"></span><b class="num">${fmt(cents, s)}</b>`;
     chipStack(d.querySelector(".chips"), Math.max(cents, 1), s);
     const names = (p.eligible || []).map((i) => s.seats[i] && (s.seats[i].is_hero && s.my_seat === i ? "You" : s.seats[i].name)).filter(Boolean);
     d.title = `${p.label}: ${names.join(", ")}`;
@@ -1374,19 +1565,48 @@
     const total = $("pot-total");
     const flank = host.id === "live-pots" && !total.hidden ? total.offsetWidth + T.geom.u * 1.1 : 0;
     const tabled = T.seats.map((sv) => (sv.cards.classList.contains("open") ? sv.cardEls.length : 0)).join("");
-    const key = `${host.dataset.k}|${T.geom.w}x${T.geom.h}|${Math.round(flank)}|${tabled}`;
+    // (and what the seats beside it show: a badge that appears at an award step — the winner's
+    // "+$" — or a wider stack moves into the row's band after it was fitted, 2026-09-28)
+    const beside = T.seats.map((sv) => `${sv.badge.dataset.k || ""}/${(sv.el.querySelector(".seat-plate") || {}).textContent || ""}`).join("|");
+    const key = `${host.dataset.k}|${T.geom.w}x${T.geom.h}|${Math.round(flank)}|${tabled}|${beside}`;
     if (host.dataset.fit === key) return;
     host.dataset.fit = key;
     host.classList.remove("tight");
     host.style.transform = "";
     const st = $("stage").getBoundingClientRect(), pr = host.getBoundingClientRect();
     const mid = (pr.left + pr.right) / 2, gap = T.geom.u * 0.5;
+    // HGT-007: on a short phone the top seats' badge line (a runout's equities) hangs a few
+    // px into the showdown's row of pots — the row slides down by that much (into the gap
+    // over the boards, never onto them), so those seats end up beside it, not over it.
+    let dy = 0;
+    if (host.id === "pots") {
+      for (const sv of T.seats) {
+        for (const node of [sv.el.querySelector(".seat-plate"), sv.badge]) {
+          if (!node || !node.offsetWidth) continue;
+          const r = restBox(node, sv.el);
+          if (r.right <= pr.left || r.left >= pr.right || r.top >= pr.top || r.bottom <= pr.top) continue;
+          dy = Math.max(dy, r.bottom - pr.top + 2);
+        }
+      }
+      const free = $("boards").getBoundingClientRect().top - pr.bottom - 1;
+      // (and a top seat's showdown label — 6 seats at 375x667 hung it 2 px in — when the row can
+      // clear it: one that hangs in further steps aside instead, fitSeats' crowded labels)
+      const lab = Math.max(0, ...T.seats.map((sv) => {
+        if (sv.x == null || !sv.hand.offsetWidth) return 0;
+        const r = restBox(sv.hand, sv.el);
+        return r.right <= pr.left || r.left >= pr.right || r.top >= pr.top || r.bottom <= pr.top ? 0 : r.bottom - pr.top + 2;
+      }));
+      if (lab - 2 < free) dy = Math.max(dy, lab);  // (clear of it, if not by the whole 2 px of air)
+      dy = Math.round(Math.max(0, Math.min(dy, free)));
+    }
+    const top = pr.top + dy, bot = pr.bottom + dy, shift = dy ? `translateY(${dy}px)` : "";
+    host.style.transform = shift;
     let room = 2 * Math.min(mid - st.left, st.right - mid) - 2 * gap;
     for (const sv of T.seats) {
       for (const node of [sv.el.querySelector(".seat-plate"), sv.badge]) {
         if (!node || !node.offsetWidth) continue;
-        const r = node.getBoundingClientRect();
-        if (r.bottom <= pr.top || r.top >= pr.bottom) continue;
+        const r = restBox(node, sv.el);
+        if (r.bottom <= top || r.top >= bot) continue;
         if (r.right <= mid) room = Math.min(room, 2 * (mid - r.right - gap));
         else if (r.left >= mid) room = Math.min(room, 2 * (r.left - mid - gap));
       }
@@ -1394,7 +1614,7 @@
       const lw = sv.x == null ? 0 : sv.hand.offsetWidth;
       if (lw) {
         const r = sv.hand.getBoundingClientRect();
-        if (!(r.bottom <= pr.top || r.top >= pr.bottom)) {
+        if (!(r.bottom <= top || r.top >= bot)) {
           if (st.left + sv.x < mid) room = Math.min(room, 2 * (mid - (st.left + 4 + lw) - gap));
           else room = Math.min(room, 2 * (st.right - 4 - lw - mid - gap));
         }
@@ -1403,7 +1623,7 @@
       // default) the upper side seats' rows are level with the pots of an all-in runout
       if (sv.x == null || !sv.cards.classList.contains("open") || !sv.cardEls.length) continue;
       const o = openRow(sv, T.geom);
-      if (st.top + o.bot <= pr.top || st.top + o.top >= pr.bottom) continue;
+      if (st.top + o.bot <= top || st.top + o.top >= bot) continue;
       const need = T.geom.u * 0.6 + o.width(o.row.openMax);  // (fitSeats' stage-edge inset + the row)
       if (sv.x < T.geom.w / 2) room = Math.min(room, 2 * (mid - (st.left + need) - gap));
       else room = Math.min(room, 2 * (st.right - need - mid - gap));
@@ -1412,7 +1632,7 @@
     if (host.offsetWidth <= room) return;
     host.classList.add("tight");
     const w = host.offsetWidth;
-    if (w > room) host.style.transform = `scale(${Math.max(0.7, room / w).toFixed(3)})`;
+    if (w > room) host.style.transform = `${shift} scale(${Math.max(0.7, room / w).toFixed(3)})`.trim();
   }
 
   // The rabbit hunt: a small button in the gap the turn and river would fill.
@@ -1450,7 +1670,7 @@
       if (bank && tm.mine) play("urgent");
       clearRings();
     } else if (Math.abs(tm.deadline - deadline) > 700) tm.deadline = deadline;
-    if (!T.raf) T.raf = requestAnimationFrame(tickTimer);
+    if (!T.raf) T.raf = setTimeout(tickTimer, 0);
   }
   function clearRings() {
     T.seats.forEach((sv) => { sv.el.classList.remove("t-warn", "t-crit", "t-bank"); sv.arc.style.strokeDashoffset = "0"; sv.count.textContent = ""; });
@@ -1474,7 +1694,9 @@
       if (tm.mine && secs !== tm.lastTick && secs <= 5 && secs > 0) { tm.lastTick = secs; play("tick"); }
     }
     if (HG.ui && HG.ui.onClock) HG.ui.onClock(left, tm);
-    T.raf = requestAnimationFrame(tickTimer);
+    // ~10 updates a second (the ring's CSS transition fills in between): it used to be
+    // redrawn every animation frame, all hand long
+    T.raf = setTimeout(tickTimer, TIMER_TICK_MS);
   }
 
   // ----------------------------------------------------------------- render
@@ -1493,7 +1715,8 @@
     const animate = samePrev && anim() && !document.hidden;
     const newHand = samePrev && prev.hand_no !== s.hand_no && s.phase !== "waiting";
     const ctx = {
-      animate, dealing: animate && newHand, unitChanged: !!o.unitChanged, lastAction: {}, collected: false,
+      animate, still: samePrev && !animate && !document.hidden,  // (a live update drawn without motion)
+      dealing: animate && newHand, unitChanged: !!o.unitChanged, lastAction: {}, collected: false,
       settled: s.phase === "showdown" && !s.runout.blocking, deltas: s.hand_deltas_cents || [],
     };
     if (T.handNo !== s.hand_no) { T.handNo = s.hand_no; T.awardKey = null; }
@@ -1534,7 +1757,7 @@
     const lastId = chat.length ? chat[chat.length - 1].id : 0;
     if (T.chatSeen != null && HG.core.G.prefs.bubbles !== false) {
       chat.filter((m) => m.id > T.chatSeen).slice(-3).forEach((m) => {
-        const seat = s.seats.find((x) => !x.empty && x.name === m.name);
+        const seat = s.seats.find((x) => !x.empty && (m.user_id != null ? x.user_id === m.user_id : x.name === m.name));  // (by user id: HGT-027)
         if (seat) bubble(seat.seat, m.text, false);
       });
     }
@@ -1544,5 +1767,5 @@
     });
   }
 
-  HG.table = { render, layout, EMOTES, shortHand, seatCenter: (i) => (T.seats[i] ? [T.seats[i].x, T.seats[i].y] : null) };
+  HG.table = { render, layout, EMOTES, EMOTE_NAMES, shortHand, seatCenter: (i) => (T.seats[i] ? [T.seats[i].x, T.seats[i].y] : null) };
 })();

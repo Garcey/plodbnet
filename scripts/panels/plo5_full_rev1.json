@@ -1,0 +1,18 @@
+{
+  "name": "plo5-full-rev1",
+  "members": [
+    ["vSix4_940", "checkpoints/prod_vSix4_940.pt"],
+    ["vSix4_1240", "checkpoints/prod_vSix4_1240.pt"],
+    ["vSix5_1248", "checkpoints/vSix5_1248.pt"],
+    ["vSix5_1290", "checkpoints/vSix5_1290.pt"],
+    ["swa_1248_1258", "checkpoints/swa_peak_1248_1258.pt"],
+    ["vSix6_1300", "checkpoints/vSix6_1300.pt"],
+    ["call", "baseline:call"],
+    ["pot", "baseline:pot"]
+  ],
+  "deals": 512,
+  "configs_per_tier": 4,
+  "seed": 0,
+  "modes": ["argmax", "sampled"],
+  "ev_samples": 64
+}

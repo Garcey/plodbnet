@@ -1,0 +1,33 @@
+# Criterion benchmarks of the engine's hot kernels (TEST-026):
+#   bash scripts/rust_bench.sh [name regex] [-- criterion options]
+#
+# A workspace of its own on purpose: the engine's workspace -- so every
+# production, CI and pod build of it, `cargo metadata` included -- never sees
+# Criterion or its dependencies. Its Cargo.lock (git-ignored) is derived from
+# the root one by scripts/rust_bench.sh, so the engine's dependencies are the
+# exact versions production builds with.
+[workspace]
+
+[package]
+name = "plo5bp_engine_bench"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.93"
+publish = false
+
+[dependencies]
+plo5bp_engine = { path = "..", features = ["bench"] }
+rayon = "1.8"
+
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "kernels"
+harness = false
+
+# = the root Cargo.toml's [profile.release] (fat LTO, one codegen unit): time
+# the code production ships. `cargo bench` builds with it.
+[profile.release]
+lto = "fat"
+codegen-units = 1

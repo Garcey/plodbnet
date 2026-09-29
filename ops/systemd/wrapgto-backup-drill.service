@@ -1,0 +1,10 @@
+# /etc/systemd/system/wrapgto-backup-drill.service — prove the off-site copy restores
+[Unit]
+Description=WrapGTO backup restore drill
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wrapgto-backup --drill
+Nice=10

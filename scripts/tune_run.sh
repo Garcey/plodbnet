@@ -8,8 +8,9 @@
 # UPDATES override the recipe (argparse keeps the LAST value), e.g.
 #   bash scripts/tune_run.sh t1lr500 1 20 --lr 5e-4
 # Every candidate of a wave starts from the same weights, optimizer state, opponent
-# pool and random stream (the resume seed is (seed, 40)), so the waves compare the
-# overridden coefficients alone. Log: runs/STEM.log; checkpoints STEM_41.pt, ...
+# pool and random stream (the resume seed is (seed, 40)) -- the same tables and
+# hands for the FIRST update only: the shared stream then drifts with each
+# policy's hand lengths. For truly paired waves add --crn-streams (ML-004). Log: runs/STEM.log; checkpoints STEM_41.pt, ...
 # Stop early: touch runs/STEM.stop, then kill -TERM the trainer.
 set -uo pipefail
 cd /workspace/plodbnet || exit 1

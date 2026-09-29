@@ -30,10 +30,10 @@ if ($env:PLO5BP_DEV_LOGIN) {
 }
 Write-Host "URL: $($env:PLO5BP_BASE_URL)   admin: $($env:PLO5BP_ADMIN_EMAILS)"
 
-# PRODUCTION NOTE: wrapgto.com is served by the Hetzner VPS (87.99.132.209,
-# systemd units wrapgto.service + cloudflared). This script is for LOCAL DEV
-# only and must NOT start a tunnel — a second connector on the 'wrapgto'
-# tunnel would route live traffic to this laptop.
+# PRODUCTION NOTE: wrapgto.com is served by the production server (ssh alias
+# wrapgto-prod; docs/ops/PRODUCTION.md). This script is for LOCAL DEV only and
+# must NOT start a tunnel — a second connector on the 'wrapgto' tunnel would
+# route live traffic to this machine.
 if ($env:PLO5BP_BASE_URL -like "https*") {
     Write-Host "[!!] BASE_URL is public ($($env:PLO5BP_BASE_URL)) but prod lives on the VPS." -ForegroundColor Red
     Write-Host "     For local dev set PLO5BP_BASE_URL=http://127.0.0.1:8770 in .env.public." -ForegroundColor Red

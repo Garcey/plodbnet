@@ -4,8 +4,8 @@ PokerNow (pokernow.com / .club) is a browser web app, so — unlike ClubGG,
 which needs pixel OCR because it's a WDA-protected Unity window — its entire
 game state is readable straight from the DOM. A small Tampermonkey userscript
 (``tools/pokernow/pokernow.user.js``) snapshots the table on every change and
-streams a normalized JSON payload to the server's ``/pokernow/ingest``
-websocket. This module turns one such payload into the *same* `FrameState`
+POSTs a normalized JSON payload to the server's ``/pokernow/ingest``
+(``plo5bp.ui.live``). This module turns one such payload into the *same* `FrameState`
 the OCR pipeline produces, so it can ride the existing
 `EventReconstructor` → `Session` → `_rebuild_env` machinery unchanged.
 
@@ -86,7 +86,10 @@ class PokerNowFrame:
     in-hand seats (the engine seat count for this hand). `seat_names` maps an
     engine seat index → the PokerNow player name (for the UI). `physical_to_engine`
     maps PokerNow's physical seat number → engine seat index. `bomb_pot` /
-    `variant` echo the table flags.
+    `variant` echo the table flags. `hole_count` is how many cards hero's hand
+    shows (None = unknown: no hero cards on the frame) and `boards_dealt` how
+    many boards show a flop — the facts `unsupported_reason` checks, since
+    `_parse_cards` normalizes every hand and board to width 5.
     """
 
     frame: FrameState
@@ -95,6 +98,55 @@ class PokerNowFrame:
     physical_to_engine: dict[int, int]
     bomb_pot: bool
     variant: str
+    hole_count: int | None = None
+    boards_dealt: int = 0
+    #: A seat of this hand is flagged as the user's (``isHero``).
+    has_hero: bool = True
+    #: The collector's version (``collector``; None = before 1.3.0) and how
+    #: many frames it had to drop before this one (``gap``, TOOL-040).
+    collector: str | None = None
+    gap: int = 0
+
+    def unsupported_reason(self) -> str | None:
+        """Why live capture can't follow this table (None = it can).
+
+        Live capture models PLO5 double-board bomb pots only; any other game
+        mapped through the 5-card / two-board shape gets confident but wrong
+        advice, so such frames are refused. Decided from what the frame
+        SHOWS (hero's hole-card count, the number of boards with a flop) plus
+        an explicit variant name. The userscript's `bombPot` flag comes from
+        a DOM selector never verified against a live table, so it is not a
+        reason to refuse; a non-bomb-pot hand shows up as a pot that doesn't
+        match the antes instead (the live pot check).
+        """
+        if self.variant not in ("plo5", "unknown"):
+            return (
+                f"PokerNow game is {self.variant!r}; live capture follows "
+                "PLO5 double-board bomb pots only — frame ignored"
+            )
+        if self.hole_count is not None and self.hole_count != SUPPORTED_HOLE_CARDS:
+            return (
+                f"hero holds {self.hole_count} cards; live capture follows "
+                "PLO5 (5-card) double-board bomb pots only — frame ignored"
+            )
+        if self.boards_dealt == 1:
+            return (
+                "only one board is dealt; live capture follows double-board "
+                "bomb pots only — frame ignored"
+            )
+        if not self.has_hero:
+            # TOOL-038: without the user's seat the table can't be rotated to
+            # hero = seat 0 and ordered clockwise (PokerNow's seat numbers do
+            # not follow the table), so the walk would visit the wrong seats.
+            return (
+                "you have no seat in this hand — sit in at the table "
+                "(spectating isn't supported) — frame ignored"
+            )
+        return None
+
+
+#: Hole cards per hand in the one game live capture follows (PLO5).
+SUPPORTED_HOLE_CARDS = 5
 
 
 def _bad(where: str, problem: str, value) -> PokerNowPayloadError:
@@ -253,8 +305,9 @@ def _engine_order(seats: list[dict]) -> list[dict]:
     """
     hero = next((s for s in seats if s.get("isHero")), None)
     if hero is None:
-        # No hero seat flagged — fall back to physical-seat order so the
-        # caller still gets a deterministic (if unrotated) layout.
+        # No hero seat flagged: a deterministic (but NOT clockwise) order so
+        # the mapping still succeeds; such frames are refused downstream
+        # (`PokerNowFrame.unsupported_reason`, TOOL-038).
         return sorted(seats, key=lambda s: s.get("seat", 0))
     # `or 0.0`: the key may be present with an explicit null.
     hero_ang = float(hero.get("angleCW") or 0.0)
@@ -349,6 +402,13 @@ def map_payload(payload: dict) -> PokerNowFrame:
         hero_seat = next((s for s in ordered if s.get("isHero")), None)
         hero_cards = hero_seat.get("cards") if hero_seat else None
     hero_hole = _parse_cards(hero_cards)
+    # Raw widths, before `_parse_cards` pads/truncates to 5 (TOOL-015).
+    hole_count = len(hero_cards) if hero_cards else None
+    boards_dealt = sum(
+        1
+        for b in (payload.get("boards") or [])
+        if sum(1 for c in (b.get("cards") or []) if c is not None) >= 3
+    )
 
     frame = FrameState(
         board_a=board_a,
@@ -366,4 +426,13 @@ def map_payload(payload: dict) -> PokerNowFrame:
         physical_to_engine=physical_to_engine,
         bomb_pot=bool(payload.get("bombPot")),
         variant=str(payload.get("variant") or "unknown"),
+        hole_count=hole_count,
+        boards_dealt=boards_dealt,
+        has_hero=any(s.get("isHero") for s in ordered),
+        collector=(str(payload["collector"]) if payload.get("collector") else None),
+        gap=max(0, int(payload.get("gap") or 0)) if _is_count(payload.get("gap")) else 0,
     )
+
+
+def _is_count(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)

@@ -1,0 +1,18 @@
+{
+  "name": "plo5-minimal-rev2",
+  "members": [
+    ["t3ent07", "checkpoints/t3ent07.pt"],
+    ["vMin2_150", "checkpoints/vMin2_150.pt"],
+    ["vMin3_150", "checkpoints/vMin3_150.pt"],
+    ["vMin3_200", "checkpoints/vMin3_200.pt"],
+    ["vMin3_239", "checkpoints/vMin3_239.pt"],
+    ["call", "baseline:call"],
+    ["pot", "baseline:pot"],
+    ["random", "baseline:random"]
+  ],
+  "deals": 512,
+  "configs_per_tier": 4,
+  "seed": 0,
+  "modes": ["argmax", "sampled"],
+  "ev_samples": 64
+}

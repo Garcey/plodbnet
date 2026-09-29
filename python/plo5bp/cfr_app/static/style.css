@@ -14,8 +14,11 @@
   --raise: #d45a3c;
   --allin: #b44dff;
   --radius: 10px;
-  --font: "IBM Plex Sans", system-ui, sans-serif;
-  --mono: "IBM Plex Mono", ui-monospace, monospace;
+  /* (TOOL-056) System fonts: an offline desktop window must not fetch its look
+     from the internet (nor phone home on every launch). Segoe UI / Cascadia on
+     Windows, the platform UI font elsewhere. */
+  --font: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  --mono: "Cascadia Mono", "Cascadia Code", Consolas, ui-monospace, "SF Mono", Menlo, monospace;
 }
 
 * { box-sizing: border-box; }
@@ -208,6 +211,34 @@ input:focus, select:focus, textarea:focus {
 
 .hint { color: var(--muted); font-size: 0.75rem; margin: 0.35rem 0 0; }
 .hint code { font-family: var(--mono); color: var(--accent); }
+/* One line under a field that says what its value means right now. */
+.field-hint { color: var(--muted); font-size: 0.7rem; font-weight: 400; line-height: 1.3; }
+.field-hint:empty { display: none; }
+
+/* (TOOL-032) Validate's answer: the ranges, then what the solve will need. */
+.validate-result {
+  margin-top: 0.6rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent2);
+  border-radius: 7px;
+  padding: 0.5rem 0.65rem;
+  font-size: 0.76rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+.validate-result.warn { border-left-color: var(--warn); }
+.validate-result.bad { border-left-color: var(--danger); }
+.validate-result .vr-head { font-weight: 600; color: var(--text); }
+.validate-result .vr-row { display: flex; justify-content: space-between; gap: 0.6rem; color: var(--muted); }
+.validate-result .vr-row b { color: var(--text); font-family: var(--mono); font-weight: 600; text-align: right; }
+.validate-result .vr-msg { color: var(--muted); line-height: 1.35; }
+.validate-result.bad .vr-msg { color: var(--danger); }
+.mem-meter { height: 4px; border-radius: 2px; background: var(--bg3); overflow: hidden; margin: 0.1rem 0 0.15rem; }
+.mem-meter > span { display: block; height: 100%; background: var(--accent); }
+.validate-result.warn .mem-meter > span { background: var(--warn); }
+.validate-result.bad .mem-meter > span { background: var(--danger); }
 .muted { color: var(--muted); }
 .divider { height: 1px; background: var(--border); margin: 0.85rem 0; }
 .hidden { display: none !important; }
@@ -814,6 +845,15 @@ tbody tr.selected { background: #152033; }
 .hand-detail .bar-fill { height: 100%; }
 .hand-detail .act-name { width: 52px; font-family: var(--mono); font-size: 0.78rem; }
 .hand-detail .act-pct { width: 48px; text-align: right; font-family: var(--mono); font-size: 0.78rem; }
+/* (TOOL-035) EV / equity of the selected hand or class */
+.hand-detail .ev-line {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  color: var(--text);
+  margin: -0.3rem 0 0.6rem;
+  cursor: help;
+}
+#hand-table th.num, #hand-table td.num { text-align: right; font-family: var(--mono); white-space: nowrap; }
 
 .pager {
   display: flex;
@@ -851,21 +891,54 @@ tbody tr.selected { background: #152033; }
 .toast.error { border-color: #8a3038; }
 .toast.ok { border-color: #1f6f55; }
 
-.line-tree {
-  max-height: 28vh;
-  overflow: auto;
-  font-family: var(--mono);
-  font-size: 0.75rem;
+/* (TOOL-053) the local server stopped answering */
+.conn-banner {
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  margin: 0;
+  padding: 0.6rem 1.1rem;
+  background: #3a1a1e;
+  border-bottom: 1px solid #7a3038;
+  color: #ffd9dc;
+  font-weight: 600;
+  font-size: 0.85rem;
 }
-.line-node {
-  padding: 0.15rem 0.2rem;
-  cursor: pointer;
-  border-radius: 3px;
-  display: flex;
-  justify-content: space-between;
-  gap: 0.35rem;
+/* (TOOL-053) the box a client-side check refused */
+input.invalid, select.invalid, textarea.invalid {
+  border-color: var(--danger) !important;
+  box-shadow: 0 0 0 2px rgba(240, 113, 120, 0.25);
 }
-.line-node:hover { background: var(--bg3); }
-.line-node.active { background: #152033; color: var(--accent); }
-.line-node .cnt { color: var(--muted); }
-.line-children { margin-left: 0.65rem; border-left: 1px solid var(--border); padding-left: 0.35rem; }
+
+/* Library kind tags (TOOL-055 / TOOL-031) */
+.kind-tag {
+  display: inline-block;
+  padding: 0.05rem 0.45rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 0.72rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.kind-tag.kind-warn { color: var(--warn); border-color: #7a5a20; }
+.kind-tag.kind-bad { color: var(--danger); border-color: #7a3038; }
+
+/* Diagnostics menu (TOOL-054) */
+.diag-menu { position: relative; }
+.diag-menu > summary { list-style: none; cursor: pointer; }
+.diag-menu > summary::-webkit-details-marker { display: none; }
+.diag-pop {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  z-index: 60;
+  width: 260px;
+  padding: 0.7rem;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+}
+.diag-pop .hint { margin: 0.5rem 0 0; }
+#cmp-path { width: 100%; }
+

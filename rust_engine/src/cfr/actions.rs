@@ -32,7 +32,11 @@ impl AbstractAction {
 /// `ALLIN` is the maximum legal raise, `max_raise_chips()`: the actor's whole
 /// stack, or — when the actor covers every live opponent — the raise that puts
 /// the deepest of them all-in.
-pub fn legal_actions(state: &PublicState, raise_sizes_pm: &[u32], allin_atom: bool) -> Vec<AbstractAction> {
+pub fn legal_actions(
+    state: &PublicState,
+    raise_sizes_pm: &[u32],
+    allin_atom: bool,
+) -> Vec<AbstractAction> {
     if state.is_terminal() {
         return vec![];
     }
@@ -227,10 +231,16 @@ mod tests {
             legal_actions(&s, &[], true),
             vec![AbstractAction::Fold, AbstractAction::AllIn]
         );
-        assert_eq!(apply_abstract(&mut s, AbstractAction::AllIn).unwrap(), 95_000);
+        assert_eq!(
+            apply_abstract(&mut s, AbstractAction::AllIn).unwrap(),
+            95_000
+        );
         assert!(s.all_in[1]);
         // BB calls too → betting closed, nobody left to act.
-        assert_eq!(apply_abstract(&mut s, AbstractAction::AllIn).unwrap(), 90_000);
+        assert_eq!(
+            apply_abstract(&mut s, AbstractAction::AllIn).unwrap(),
+            90_000
+        );
         assert!(s.actor.is_none());
         assert_eq!(s.pot, 15_000 + 100_000 + 95_000 + 90_000);
     }
@@ -256,7 +266,10 @@ mod tests {
                 AbstractAction::AllIn
             ]
         );
-        assert_eq!(apply_abstract(&mut s, AbstractAction::AllIn).unwrap(), 100_000);
+        assert_eq!(
+            apply_abstract(&mut s, AbstractAction::AllIn).unwrap(),
+            100_000
+        );
         assert_eq!(s.bet_to_call, 100_000);
     }
 
@@ -286,7 +299,12 @@ mod tests {
             }
             for i in 0..chips.len() {
                 for j in 0..i {
-                    assert_ne!(chips[i].1, chips[j].1, "twin actions {:?}", (chips[i], chips[j]));
+                    assert_ne!(
+                        chips[i].1,
+                        chips[j].1,
+                        "twin actions {:?}",
+                        (chips[i], chips[j])
+                    );
                 }
             }
         }

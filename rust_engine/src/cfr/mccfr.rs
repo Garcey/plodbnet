@@ -6,38 +6,26 @@ use crate::cards::Card;
 use crate::hand_eval::evaluate_nlh;
 
 use super::actions::{apply_abstract, legal_actions, AbstractAction};
-use super::infoset::{
-    Infoset, InfosetDump, InfosetKey, PRIV_CLASS, PRIV_COMBO,
-};
+use super::hashing::{actions_hash, history_key, InfosetMap};
+use super::infoset::{Infoset, InfosetDump, InfosetKey, PRIV_CLASS, PRIV_COMBO};
 use super::preflop::{deal_holes_hu, DealRng, PreflopHandClass, NUM_PREFLOP_CLASSES};
 use super::public_state::{PublicState, MAX_SEATS};
+use super::rng::CfrRng;
 use super::types::{InfosetStrategy, RootSpec, SolveConfig, SolveReport, Strategy, StreetRoot};
 use super::CfrError;
 
 /// Hash public history from action sequence **and** public board/street.
 /// Board + street must be in the key so multiway flop→turn runouts (and
 /// distinct boards after X/X) get distinct infosets — matches HU DCFR.
-fn history_hash(
-    actions: &[AbstractAction],
-    board: &[u8],
-    board_len: u8,
-    street: u8,
-) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    for a in actions {
-        a.label().hash(&mut h);
-    }
-    street.hash(&mut h);
-    board_len.hash(&mut h);
-    for i in 0..board_len as usize {
-        if i < board.len() {
-            board[i].hash(&mut h);
-        }
-    }
-    h.finish()
+/// (TOOL-027) numeric action codes through a fixed mixer: no String per step,
+/// and the same keys on every Rust toolchain (see hashing.rs).
+fn history_hash(actions: &[AbstractAction], board: &[u8], board_len: u8, street: u8) -> u64 {
+    let blen = (board_len as usize).min(board.len());
+    history_key(actions_hash(actions), &board[..blen], street)
 }
+
+/// The infoset table (deterministic fast hasher, TOOL-027).
+type Table = InfosetMap<InfosetKey, Infoset>;
 
 /// Preflop / pure-action hash (board empty, street 0). Used when public
 /// cards are not yet dealt.
@@ -49,12 +37,7 @@ fn history_hash_actions(actions: &[AbstractAction]) -> u64 {
 /// Hash from a live public state (postflop multiway / multi-street).
 #[inline]
 fn history_hash_state(actions: &[AbstractAction], state: &PublicState) -> u64 {
-    history_hash(
-        actions,
-        &state.board,
-        state.board_len,
-        state.street,
-    )
+    history_hash(actions, &state.board, state.board_len, state.street)
 }
 
 /// Human path label for push/fold trees: empty → "open", else "F" / "AI" joined by commas.
@@ -72,36 +55,6 @@ fn history_path_label(actions: &[AbstractAction]) -> String {
         })
         .collect::<Vec<_>>()
         .join(",")
-}
-
-struct Lcg {
-    state: u64,
-}
-
-impl Lcg {
-    fn new(seed: u64) -> Self {
-        Self {
-            state: seed.wrapping_add(0x9E3779B97F4A7C15),
-        }
-    }
-    fn next_u64(&mut self) -> u64 {
-        self.state ^= self.state >> 12;
-        self.state ^= self.state << 25;
-        self.state ^= self.state >> 27;
-        self.state.wrapping_mul(0x2545F4914F6CDD1D)
-    }
-    fn next_f64(&mut self) -> f64 {
-        (self.next_u64() >> 11) as f64 / ((1u64 << 53) as f64)
-    }
-}
-
-impl DealRng for Lcg {
-    fn gen_range(&mut self, n: usize) -> usize {
-        if n == 0 {
-            return 0;
-        }
-        (self.next_u64() as usize) % n
-    }
 }
 
 /// External-sampling step at a **non-traverser** node: accumulate the ACTING
@@ -124,10 +77,11 @@ impl DealRng for Lcg {
 /// RNG consumption is unchanged (exactly one `next_f64` per sampled node), so
 /// for a given seed the sampled deals/actions and the regrets are identical to
 /// the pre-fix solver; only the accumulated averages differ.
-fn es_sample_opponent_action(node: &mut Infoset, strategy: &[f64], rng: &mut Lcg) -> usize {
+fn es_sample_opponent_action(node: &mut Infoset, strategy: &[f64], rng: &mut CfrRng) -> usize {
     for (s, &p) in node.strategy_sum.iter_mut().zip(strategy.iter()) {
         *s += p;
     }
+    node.visits = node.visits.saturating_add(1); // TOOL-028
     let mut t = rng.next_f64();
     let mut idx = 0;
     for (i, &p) in strategy.iter().enumerate() {
@@ -141,7 +95,7 @@ fn es_sample_opponent_action(node: &mut Infoset, strategy: &[f64], rng: &mut Lcg
 }
 
 /// Sample a full 5-card board not colliding with hole cards.
-fn sample_board5(rng: &mut Lcg, blocked: &[u8]) -> [u8; 5] {
+fn sample_board5(rng: &mut CfrRng, blocked: &[u8]) -> [u8; 5] {
     let mut used = [false; 52];
     for &c in blocked {
         used[c as usize] = true;
@@ -217,18 +171,13 @@ pub(crate) fn mw_preflop_root(root: &RootSpec) -> Result<PublicState, CfrError> 
 /// Run-time refuse-to-OOM (review 2026-09-20 F14): sampled solvers cannot
 /// bound their table up front (it grows with what gets visited), so the loop
 /// stops with `early_stop=memory_budget` once the live table passes the budget.
-fn table_over_memory_budget(n_infosets: usize) -> bool {
-    n_infosets as u64 * super::memory::BYTES_PER_INFOSET_BASE
-        > super::memory::DEFAULT_RAM_BUDGET_BYTES
+fn table_over_memory_budget(n_infosets: usize, config: &SolveConfig) -> bool {
+    n_infosets as u64 * super::memory::BYTES_PER_INFOSET_BASE > config.ram_budget_bytes()
 }
 
 /// A root with nobody to act (everyone all-in from the posts) is not a game.
 /// It used to "solve" to 0 infosets and exploitability 0.0 (review 2026-09-20 E1).
-fn require_root_decision(
-    st: &PublicState,
-    raise_pm: &[u32],
-    allin: bool,
-) -> Result<(), CfrError> {
+fn require_root_decision(st: &PublicState, raise_pm: &[u32], allin: bool) -> Result<(), CfrError> {
     if st.actor.is_none() || legal_actions(st, raise_pm, allin).is_empty() {
         return Err(CfrError::InvalidRoot(
             "degenerate root: no seat has a decision (stacks do not cover the antes/blinds)".into(),
@@ -254,8 +203,8 @@ pub fn solve_preflop_mccfr(root: &RootSpec, config: &SolveConfig) -> Result<Solv
     // Faithful HU preflop: blinds in street_commit, BTN/SB (seat 1) first.
     // Built ONCE and validated (review 2026-09-20 E1) — see `hu_preflop_root`.
     let st = hu_preflop_root(root)?;
-    let mut infosets: HashMap<InfosetKey, Infoset> = HashMap::new();
-    let mut rng = Lcg::new(config.seed);
+    let mut infosets: Table = Table::default();
+    let mut rng = CfrRng::new(config.seed);
     let start = std::time::Instant::now();
     let mut stop_reason: Option<&'static str> = None;
     let mut iterations_run = 0u32;
@@ -266,6 +215,7 @@ pub fn solve_preflop_mccfr(root: &RootSpec, config: &SolveConfig) -> Result<Solv
     // Concrete holes for equity (not just class)
     let iter_limit = config.iter_limit();
     let poll = config.poll_every.max(1);
+    let mut path: Vec<AbstractAction> = Vec::with_capacity(32);
     for it in 1..=iter_limit {
         if let Some(why) = config.should_stop(start, it) {
             stop_reason = Some(why);
@@ -283,7 +233,7 @@ pub fn solve_preflop_mccfr(root: &RootSpec, config: &SolveConfig) -> Result<Solv
         for trav in 0..2 {
             mccfr_traverse(
                 &st,
-                &[],
+                &mut path,
                 classes,
                 holes,
                 board,
@@ -301,7 +251,7 @@ pub fn solve_preflop_mccfr(root: &RootSpec, config: &SolveConfig) -> Result<Solv
             }
         }
         iterations_run = it;
-        if it % poll == 0 && table_over_memory_budget(infosets.len()) {
+        if it % poll == 0 && table_over_memory_budget(infosets.len(), config) {
             stop_reason = Some("memory_budget");
             break;
         }
@@ -350,10 +300,26 @@ pub fn solve_preflop_mccfr(root: &RootSpec, config: &SolveConfig) -> Result<Solv
             let board = sample_board5(&mut rng, &[h0.0, h0.1, h1.0, h1.1]);
             for br_player in 0..2 {
                 let v = pf_avg_value(
-                    &infosets, &st, &[], classes, holes, board, br_player, &raise_pm, allin,
+                    &infosets,
+                    &st,
+                    &[],
+                    classes,
+                    holes,
+                    board,
+                    br_player,
+                    &raise_pm,
+                    allin,
                 );
                 let brv = pf_br_value(
-                    &infosets, &st, &[], classes, holes, board, br_player, &raise_pm, allin,
+                    &infosets,
+                    &st,
+                    &[],
+                    classes,
+                    holes,
+                    board,
+                    br_player,
+                    &raise_pm,
+                    allin,
                 );
                 total += (brv - v).max(0.0);
             }
@@ -379,7 +345,11 @@ pub fn solve_preflop_mccfr(root: &RootSpec, config: &SolveConfig) -> Result<Solv
         format!(
             "algorithm={} discount={}",
             config.algorithm,
-            if discount_dcfr { "dcfr_every_10_iters" } else { "none" }
+            if discount_dcfr {
+                "dcfr_every_10_iters"
+            } else {
+                "none"
+            }
         ),
         "avg_strategy=own_reach (accumulated at sampled opponent nodes)".into(),
         format!("expl_kind=mc_br_proxy samples=32 mc_br_proxy_bb={expl}"),
@@ -433,16 +403,17 @@ pub fn solve_multiway_preflop_mccfr(
     // Validation already rejects empty menu without allin_atom — no silent default.
     let raise_pm = root.raise_sizes_pm.clone();
     let allin = root.allin_atom;
-    let mut infosets: HashMap<InfosetKey, Infoset> = HashMap::new();
+    let mut infosets: Table = Table::default();
     // history_hash → human path label ("open", "F", "AI", "F,F", …)
     let mut path_labels: HashMap<u64, String> = HashMap::new();
-    let mut rng = Lcg::new(config.seed);
+    let mut rng = CfrRng::new(config.seed);
     let start = std::time::Instant::now();
     let mut stop_reason: Option<&'static str> = None;
     let mut iterations_run = 0u32;
     let iter_limit = config.iter_limit();
     let poll = config.poll_every.max(1);
 
+    let mut path: Vec<AbstractAction> = Vec::with_capacity(32);
     for it in 1..=iter_limit {
         if let Some(why) = config.should_stop(start, it) {
             stop_reason = Some(why);
@@ -476,7 +447,7 @@ pub fn solve_multiway_preflop_mccfr(
         for trav in 0..n {
             mw_preflop_traverse(
                 &st,
-                &[],
+                &mut path,
                 &classes,
                 &holes,
                 board,
@@ -489,7 +460,7 @@ pub fn solve_multiway_preflop_mccfr(
             );
         }
         iterations_run = it;
-        if it % poll == 0 && table_over_memory_budget(infosets.len()) {
+        if it % poll == 0 && table_over_memory_budget(infosets.len(), config) {
             stop_reason = Some("memory_budget");
             break;
         }
@@ -579,11 +550,11 @@ pub fn solve_multiway_preflop_mccfr(
 }
 
 fn mw_preflop_mc_expl(
-    infosets: &HashMap<InfosetKey, Infoset>,
+    infosets: &Table,
     raise_pm: &[u32],
     allin: bool,
     root_state: &PublicState,
-    rng: &mut Lcg,
+    rng: &mut CfrRng,
     samples: u32,
 ) -> f64 {
     let n = root_state.n();
@@ -629,7 +600,7 @@ fn mw_preflop_mc_expl(
             );
             let br = mw_br(
                 infosets,
-                &st,
+                st,
                 &[],
                 &classes,
                 &holes,
@@ -645,18 +616,19 @@ fn mw_preflop_mc_expl(
     (total / samples as f64) / n as f64 / bb as f64
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mw_preflop_traverse(
     state: &PublicState,
-    history: &[AbstractAction],
+    history: &mut Vec<AbstractAction>,
     classes: &[u32],
     holes: &[(u8, u8)],
     board: [u8; 5],
     traverser: usize,
     raise_pm: &[u32],
     allin: bool,
-    infosets: &mut HashMap<InfosetKey, Infoset>,
+    infosets: &mut Table,
     path_labels: &mut HashMap<u64, String>,
-    rng: &mut Lcg,
+    rng: &mut CfrRng,
 ) -> f64 {
     if state.is_terminal() || state.actor.is_none() {
         return multi_terminal_real(state, holes, board, traverser);
@@ -672,19 +644,21 @@ fn mw_preflop_traverse(
         .entry(hhash)
         .or_insert_with(|| history_path_label(history));
     let key = InfosetKey::new(actor as u8, hhash, classes[actor]);
-    if !infosets.contains_key(&key) {
-        let raw = super::range::cards_to_combo(holes[actor].0, holes[actor].1) as u32;
-        let dump = InfosetDump::from_state(
-            state,
-            history,
-            PRIV_CLASS,
-            classes[actor],
-            Some(raw),
-            None,
-        );
-        infosets.insert(key, Infoset::new_with_dump(acts.clone(), dump));
-    }
-    let strategy = infosets.get(&key).unwrap().current_strategy();
+    let strategy = infosets
+        .entry(key)
+        .or_insert_with(|| {
+            let raw = super::range::cards_to_combo(holes[actor].0, holes[actor].1) as u32;
+            let dump = InfosetDump::from_state(
+                state,
+                history,
+                PRIV_CLASS,
+                classes[actor],
+                Some(raw),
+                None,
+            );
+            Infoset::new_with_dump(acts.clone(), dump)
+        })
+        .current_strategy();
     if actor == traverser {
         let mut utils = vec![0.0; acts.len()];
         let mut node_util = 0.0;
@@ -693,11 +667,10 @@ fn mw_preflop_traverse(
             if apply_abstract(&mut child, act).is_err() {
                 continue;
             }
-            let mut h2 = history.to_vec();
-            h2.push(act);
+            history.push(act);
             utils[i] = mw_preflop_traverse(
                 &child,
-                &h2,
+                history,
                 classes,
                 holes,
                 board,
@@ -708,6 +681,7 @@ fn mw_preflop_traverse(
                 path_labels,
                 rng,
             );
+            history.pop();
             node_util += strategy[i] * utils[i];
         }
         // Regrets only at traverser nodes; the average strategy is accumulated
@@ -721,11 +695,10 @@ fn mw_preflop_traverse(
         let idx = es_sample_opponent_action(infosets.get_mut(&key).unwrap(), &strategy, rng);
         let mut child = state.clone();
         let _ = apply_abstract(&mut child, acts[idx]);
-        let mut h2 = history.to_vec();
-        h2.push(acts[idx]);
-        mw_preflop_traverse(
+        history.push(acts[idx]);
+        let v = mw_preflop_traverse(
             &child,
-            &h2,
+            history,
             classes,
             holes,
             board,
@@ -735,15 +708,22 @@ fn mw_preflop_traverse(
             infosets,
             path_labels,
             rng,
-        )
+        );
+        history.pop();
+        v
     }
 }
 
 /// Multiway postflop MCCFR: real hole cards, side-pot showdown, ES sampling.
 /// Supports unequal stacks via `root.stacks_bb` when non-empty.
-pub fn solve_multiway_mccfr(root: &RootSpec, config: &SolveConfig) -> Result<SolveReport, CfrError> {
+pub fn solve_multiway_mccfr(
+    root: &RootSpec,
+    config: &SolveConfig,
+) -> Result<SolveReport, CfrError> {
     if root.num_seats < 3 {
-        return Err(CfrError::InvalidRoot("multiway needs num_seats >= 3".into()));
+        return Err(CfrError::InvalidRoot(
+            "multiway needs num_seats >= 3".into(),
+        ));
     }
     root.validate_for_solve()?;
     config.validate()?;
@@ -761,8 +741,8 @@ pub fn solve_multiway_mccfr(root: &RootSpec, config: &SolveConfig) -> Result<Sol
     let st = PublicState::postflop_root(root.num_seats, pot0, &stacks, &board, bb, street)?;
     require_root_decision(&st, &root.raise_sizes_pm, root.allin_atom)?;
 
-    let mut infosets: HashMap<InfosetKey, Infoset> = HashMap::new();
-    let mut rng = Lcg::new(config.seed);
+    let mut infosets: Table = Table::default();
+    let mut rng = CfrRng::new(config.seed);
     // Empty raise_sizes + allin_atom = pure jam/check or push/fold menu.
     // Validation rejects empty menu without allin_atom — no silent default.
     let raise_pm = root.raise_sizes_pm.clone();
@@ -772,6 +752,7 @@ pub fn solve_multiway_mccfr(root: &RootSpec, config: &SolveConfig) -> Result<Sol
     let iter_limit = config.iter_limit();
     let poll = config.poll_every.max(1);
 
+    let mut path: Vec<AbstractAction> = Vec::with_capacity(32);
     for it in 1..=iter_limit {
         if let Some(why) = config.should_stop(start, it) {
             stop_reason = Some(why);
@@ -813,7 +794,7 @@ pub fn solve_multiway_mccfr(root: &RootSpec, config: &SolveConfig) -> Result<Sol
         for trav in 0..n {
             multi_traverse_es(
                 &st,
-                &[],
+                &mut path,
                 &holes,
                 full,
                 trav,
@@ -825,7 +806,7 @@ pub fn solve_multiway_mccfr(root: &RootSpec, config: &SolveConfig) -> Result<Sol
             );
         }
         iterations_run = it;
-        if it % poll == 0 && table_over_memory_budget(infosets.len()) {
+        if it % poll == 0 && table_over_memory_budget(infosets.len(), config) {
             stop_reason = Some("memory_budget");
             break;
         }
@@ -877,9 +858,7 @@ pub fn solve_multiway_mccfr(root: &RootSpec, config: &SolveConfig) -> Result<Sol
     }
     out.sort_by(|a, b| a.infoset_id.cmp(&b.infoset_id));
 
-    let mut notes = vec![
-        format!("wall_secs={:.1}", start.elapsed().as_secs_f64()),
-    ];
+    let mut notes = vec![format!("wall_secs={:.1}", start.elapsed().as_secs_f64())];
     if let Some(why) = stop_reason {
         notes.push(format!("early_stop={why}"));
     }
@@ -920,17 +899,18 @@ pub fn solve_multiway_mccfr(root: &RootSpec, config: &SolveConfig) -> Result<Sol
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mccfr_traverse(
     state: &PublicState,
-    history: &[AbstractAction],
+    history: &mut Vec<AbstractAction>,
     classes: [u32; 2],
     holes: [(u8, u8); 2],
     board: [u8; 5],
     traverser: usize,
     raise_pm: &[u32],
     allin: bool,
-    infosets: &mut HashMap<InfosetKey, Infoset>,
-    rng: &mut Lcg,
+    infosets: &mut Table,
+    rng: &mut CfrRng,
 ) -> f64 {
     if state.is_terminal() || (state.actor.is_none() && !state.needs_runout()) {
         return preflop_terminal_real(state, holes, board, traverser);
@@ -946,19 +926,21 @@ fn mccfr_traverse(
         return preflop_terminal_real(state, holes, board, traverser);
     }
     let key = InfosetKey::new(actor as u8, history_hash_actions(history), classes[actor]);
-    if !infosets.contains_key(&key) {
-        let raw = super::range::cards_to_combo(holes[actor].0, holes[actor].1) as u32;
-        let dump = InfosetDump::from_state(
-            state,
-            history,
-            PRIV_CLASS,
-            classes[actor],
-            Some(raw),
-            None,
-        );
-        infosets.insert(key, Infoset::new_with_dump(acts.clone(), dump));
-    }
-    let strategy = infosets.get(&key).unwrap().current_strategy();
+    let strategy = infosets
+        .entry(key)
+        .or_insert_with(|| {
+            let raw = super::range::cards_to_combo(holes[actor].0, holes[actor].1) as u32;
+            let dump = InfosetDump::from_state(
+                state,
+                history,
+                PRIV_CLASS,
+                classes[actor],
+                Some(raw),
+                None,
+            );
+            Infoset::new_with_dump(acts.clone(), dump)
+        })
+        .current_strategy();
 
     if actor == traverser {
         let mut utils = vec![0.0; acts.len()];
@@ -968,11 +950,11 @@ fn mccfr_traverse(
             if apply_abstract(&mut child, act).is_err() {
                 continue;
             }
-            let mut h2 = history.to_vec();
-            h2.push(act);
+            history.push(act);
             utils[i] = mccfr_traverse(
-                &child, &h2, classes, holes, board, traverser, raise_pm, allin, infosets, rng,
+                &child, history, classes, holes, board, traverser, raise_pm, allin, infosets, rng,
             );
+            history.pop();
             node_util += strategy[i] * utils[i];
         }
         // Regrets only here; average strategy accumulates at the sampled
@@ -988,25 +970,27 @@ fn mccfr_traverse(
         let act = acts[idx];
         let mut child = state.clone();
         let _ = apply_abstract(&mut child, act);
-        let mut h2 = history.to_vec();
-        h2.push(act);
-        mccfr_traverse(
-            &child, &h2, classes, holes, board, traverser, raise_pm, allin, infosets, rng,
-        )
+        history.push(act);
+        let v = mccfr_traverse(
+            &child, history, classes, holes, board, traverser, raise_pm, allin, infosets, rng,
+        );
+        history.pop();
+        v
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn multi_traverse_es(
     state: &PublicState,
-    history: &[AbstractAction],
+    history: &mut Vec<AbstractAction>,
     holes: &[(u8, u8)],
     board: [u8; 5],
     traverser: usize,
     raise_pm: &[u32],
     allin: bool,
     use_combo_view: bool,
-    infosets: &mut HashMap<InfosetKey, Infoset>,
-    rng: &mut Lcg,
+    infosets: &mut Table,
+    rng: &mut CfrRng,
 ) -> f64 {
     if state.needs_runout() {
         let idx = state.board_len as usize;
@@ -1041,13 +1025,19 @@ fn multi_traverse_es(
         PreflopHandClass::from_cards(holes[actor].0, holes[actor].1).id()
     };
     let key = InfosetKey::new(actor as u8, history_hash_state(history, state), private);
-    if !infosets.contains_key(&key) {
-        let raw = super::range::cards_to_combo(holes[actor].0, holes[actor].1) as u32;
-        let kind = if use_combo_view { PRIV_COMBO } else { PRIV_CLASS };
-        let dump = InfosetDump::from_state(state, history, kind, private, Some(raw), None);
-        infosets.insert(key, Infoset::new_with_dump(acts.clone(), dump));
-    }
-    let strategy = infosets.get(&key).unwrap().current_strategy();
+    let strategy = infosets
+        .entry(key)
+        .or_insert_with(|| {
+            let raw = super::range::cards_to_combo(holes[actor].0, holes[actor].1) as u32;
+            let kind = if use_combo_view {
+                PRIV_COMBO
+            } else {
+                PRIV_CLASS
+            };
+            let dump = InfosetDump::from_state(state, history, kind, private, Some(raw), None);
+            Infoset::new_with_dump(acts.clone(), dump)
+        })
+        .current_strategy();
 
     if actor == traverser {
         let mut utils = vec![0.0; acts.len()];
@@ -1057,11 +1047,10 @@ fn multi_traverse_es(
             if apply_abstract(&mut child, act).is_err() {
                 continue;
             }
-            let mut h2 = history.to_vec();
-            h2.push(act);
+            history.push(act);
             utils[i] = multi_traverse_es(
                 &child,
-                &h2,
+                history,
                 holes,
                 board,
                 traverser,
@@ -1071,6 +1060,7 @@ fn multi_traverse_es(
                 infosets,
                 rng,
             );
+            history.pop();
             node_util += strategy[i] * utils[i];
         }
         // Regrets only here; average strategy accumulates at the sampled
@@ -1085,11 +1075,10 @@ fn multi_traverse_es(
         let idx = es_sample_opponent_action(infosets.get_mut(&key).unwrap(), &strategy, rng);
         let mut child = state.clone();
         let _ = apply_abstract(&mut child, acts[idx]);
-        let mut h2 = history.to_vec();
-        h2.push(acts[idx]);
-        multi_traverse_es(
+        history.push(acts[idx]);
+        let v = multi_traverse_es(
             &child,
-            &h2,
+            history,
             holes,
             board,
             traverser,
@@ -1098,12 +1087,15 @@ fn multi_traverse_es(
             use_combo_view,
             infosets,
             rng,
-        )
+        );
+        history.pop();
+        v
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pf_avg_value(
-    infosets: &HashMap<InfosetKey, Infoset>,
+    infosets: &Table,
     state: &PublicState,
     history: &[AbstractAction],
     classes: [u32; 2],
@@ -1142,8 +1134,9 @@ fn pf_avg_value(
     v
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pf_br_value(
-    infosets: &HashMap<InfosetKey, Infoset>,
+    infosets: &Table,
     state: &PublicState,
     history: &[AbstractAction],
     classes: [u32; 2],
@@ -1316,14 +1309,15 @@ fn multi_terminal_real(
 const _: usize = MAX_SEATS;
 
 /// Multiway MC NashConv estimate with holes rebound per sample.
+#[allow(clippy::too_many_arguments)]
 fn multiway_mc_exploitability(
-    infosets: &HashMap<InfosetKey, Infoset>,
+    infosets: &Table,
     raise_pm: &[u32],
     allin: bool,
     root_state: &PublicState,
     board: &[u8],
     use_combo_view: bool,
-    rng: &mut Lcg,
+    rng: &mut CfrRng,
     samples: u32,
 ) -> f64 {
     let n = root_state.n();
@@ -1415,8 +1409,9 @@ fn multiway_mc_exploitability(
 /// 2026-09-20, found while fixing E1: the preflop evaluator used to walk into
 /// phantom 1-/2-card "streets" that the solver never trained, forcing jams
 /// under the push/fold menu whenever two covering stacks were still live.)
+#[allow(clippy::too_many_arguments)]
 fn mw_avg(
-    infosets: &HashMap<InfosetKey, Infoset>,
+    infosets: &Table,
     state: &PublicState,
     history: &[AbstractAction],
     privates: &[u32],
@@ -1451,7 +1446,11 @@ fn mw_avg(
     if acts.is_empty() {
         return multi_terminal_real(state, holes, board, player);
     }
-    let key = InfosetKey::new(actor as u8, history_hash_state(history, state), privates[actor]);
+    let key = InfosetKey::new(
+        actor as u8,
+        history_hash_state(history, state),
+        privates[actor],
+    );
     let strat = match infosets.get(&key) {
         Some(node) => node.average_strategy(),
         None => vec![1.0 / acts.len() as f64; acts.len()],
@@ -1481,8 +1480,9 @@ fn mw_avg(
     v
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mw_br(
-    infosets: &HashMap<InfosetKey, Infoset>,
+    infosets: &Table,
     state: &PublicState,
     history: &[AbstractAction],
     privates: &[u32],
@@ -1548,7 +1548,11 @@ fn mw_br(
             0.0
         }
     } else {
-        let key = InfosetKey::new(actor as u8, history_hash_state(history, state), privates[actor]);
+        let key = InfosetKey::new(
+            actor as u8,
+            history_hash_state(history, state),
+            privates[actor],
+        );
         let strat = match infosets.get(&key) {
             Some(node) => node.average_strategy(),
             None => vec![1.0 / acts.len() as f64; acts.len()],
@@ -1612,16 +1616,22 @@ mod tests {
         cfg.algorithm = "mccfr_es".into();
         let rep = solve_multiway_mccfr(&root, &cfg).unwrap();
         assert_eq!(rep.status, "ok");
-        assert!(rep.notes.iter().any(|n| n.contains("sidepot") || n.contains("showdown")));
+        assert!(rep
+            .notes
+            .iter()
+            .any(|n| n.contains("sidepot") || n.contains("showdown")));
         assert!(rep.notes.iter().any(|n| n.contains("mc_br_proxy")));
-        assert!(rep.notes.iter().any(|n| n.contains("infoset_key=actions+board+street")));
+        assert!(rep
+            .notes
+            .iter()
+            .any(|n| n.contains("infoset_key=actions+board+street")));
     }
 
     #[test]
     fn preflop_equity_aa_beats_72o() {
         // Direct terminal check: AA vs 72o on random board should favor AA
         let mut wins = 0;
-        let mut rng = Lcg::new(1);
+        let mut rng = CfrRng::new(1);
         // AA = ranks 12,12; 72o = 5,0
         let aa = (48u8, 49u8); // Ac Ad approx
         let weak = (0u8, 20u8); // 2c 7c if ranks work
@@ -1730,15 +1740,9 @@ mod tests {
     #[test]
     fn three_way_side_pot_payout() {
         // seats: short 10k committed, A 30k, B 30k; pot = 70k (dead 0)
-        let mut st = PublicState::postflop_root(
-            3,
-            70_000,
-            &[0, 0, 0],
-            &[0, 5, 10, 15, 20],
-            10_000,
-            3,
-        )
-        .unwrap();
+        let mut st =
+            PublicState::postflop_root(3, 70_000, &[0, 0, 0], &[0, 5, 10, 15, 20], 10_000, 3)
+                .unwrap();
         st.total_commit = [10_000, 30_000, 30_000, 0, 0, 0];
         st.stacks = [0, 0, 0, 0, 0, 0];
         st.all_in = [true, true, true, false, false, false];
@@ -1752,7 +1756,7 @@ mod tests {
             (4u8, 8u8),
         ];
         let board = [12u8, 16, 20, 24, 28]; // fixed board
-        // Recompute pot consistency: pot should equal sum commits for this unit test
+                                            // Recompute pot consistency: pot should equal sum commits for this unit test
         st.pot = 70_000;
         let u0 = multi_terminal_real(&st, &holes, board, 0);
         let u1 = multi_terminal_real(&st, &holes, board, 1);
@@ -1907,7 +1911,7 @@ mod tests {
     /// consistent, backward induction over reach-weighted deals) or the
     /// dumped average strategy. `w[d]` = chance × opponent average reach.
     fn toy_values(
-        infosets: &HashMap<InfosetKey, Infoset>,
+        infosets: &Table,
         game: &ToyGame,
         state: &PublicState,
         history: &[AbstractAction],
@@ -1927,7 +1931,13 @@ mod tests {
                 let mut child = state.clone();
                 child.deal_board_card(c);
                 let w2: Vec<f64> = (0..nd)
-                    .map(|d| if game.deals[d].board[idx] == c { w[d] } else { 0.0 })
+                    .map(|d| {
+                        if game.deals[d].board[idx] == c {
+                            w[d]
+                        } else {
+                            0.0
+                        }
+                    })
                     .collect();
                 let vals = toy_values(infosets, game, &child, history, player, best_response, &w2);
                 for d in 0..nd {
@@ -2003,7 +2013,10 @@ mod tests {
         // counterfactual value of the deals in that infoset.
         let mut groups: HashMap<(u8, u8), Vec<usize>> = HashMap::new();
         for d in 0..nd {
-            groups.entry(game.deals[d].holes[player]).or_default().push(d);
+            groups
+                .entry(game.deals[d].holes[player])
+                .or_default()
+                .push(d);
         }
         for members in groups.values() {
             let mut best_i = 0;
@@ -2023,7 +2036,7 @@ mod tests {
     }
 
     /// Exact exploitability (NashConv/2) in bb.
-    fn toy_exploitability_bb(infosets: &HashMap<InfosetKey, Infoset>, game: &ToyGame) -> f64 {
+    fn toy_exploitability_bb(infosets: &Table, game: &ToyGame) -> f64 {
         let w0 = vec![1.0 / game.deals.len() as f64; game.deals.len()];
         let mut nashconv = 0.0;
         for p in 0..2 {
@@ -2047,8 +2060,8 @@ mod tests {
         history: &[AbstractAction],
         deal: &ToyDeal,
         traverser: usize,
-        infosets: &mut HashMap<InfosetKey, Infoset>,
-        rng: &mut Lcg,
+        infosets: &mut Table,
+        rng: &mut CfrRng,
     ) -> f64 {
         let holes = &deal.holes;
         if state.needs_runout() {
@@ -2103,9 +2116,15 @@ mod tests {
     }
 
     /// Run `iters` ES-MCCFR iterations; returns exact expl at each checkpoint.
-    fn toy_run(game: &ToyGame, iters: u32, seed: u64, legacy: bool, checkpoints: &[u32]) -> Vec<f64> {
-        let mut infosets: HashMap<InfosetKey, Infoset> = HashMap::new();
-        let mut rng = Lcg::new(seed);
+    fn toy_run(
+        game: &ToyGame,
+        iters: u32,
+        seed: u64,
+        legacy: bool,
+        checkpoints: &[u32],
+    ) -> Vec<f64> {
+        let mut infosets: Table = Table::default();
+        let mut rng = CfrRng::new(seed);
         let mut out = Vec::new();
         for it in 1..=iters {
             let deal = game.deals[rng.gen_range(game.deals.len())];
@@ -2115,7 +2134,7 @@ mod tests {
                 } else {
                     multi_traverse_es(
                         &game.root,
-                        &[],
+                        &mut Vec::new(),
                         &deal.holes,
                         deal.board,
                         trav,
@@ -2177,7 +2196,7 @@ mod tests {
     /// exactly one unit (Σσ = 1) at every sampled opponent infoset.
     #[test]
     fn es_average_accumulates_only_at_non_traverser_nodes() {
-        fn check(infosets: &HashMap<InfosetKey, Infoset>, trav: usize, what: &str) {
+        fn check(infosets: &Table, trav: usize, what: &str) {
             let (mut own, mut opp) = (0, 0);
             for (key, node) in infosets {
                 let mass: f64 = node.strategy_sum.iter().sum();
@@ -2185,13 +2204,16 @@ mod tests {
                     assert_eq!(mass, 0.0, "{what}: traverser node got average mass");
                     own += 1;
                 } else {
-                    assert!((mass - 1.0).abs() < 1e-12, "{what}: opponent node mass {mass}");
+                    assert!(
+                        (mass - 1.0).abs() < 1e-12,
+                        "{what}: opponent node mass {mass}"
+                    );
                     opp += 1;
                 }
             }
             assert!(own > 0 && opp > 0, "{what}: own={own} opp={opp}");
         }
-        let mut rng = Lcg::new(3);
+        let mut rng = CfrRng::new(3);
 
         // HU preflop (`mccfr_traverse`).
         let root = RootSpec::preflop_hu(20.0, 10_000, 5_000, 5_000);
@@ -2203,10 +2225,18 @@ mod tests {
         ];
         let board = sample_board5(&mut rng, &[h0.0, h0.1, h1.0, h1.1]);
         for trav in 0..2 {
-            let mut infosets = HashMap::new();
+            let mut infosets = Table::default();
             mccfr_traverse(
-                &st, &[], classes, [h0, h1], board, trav, &root.raise_sizes_pm, true,
-                &mut infosets, &mut rng,
+                &st,
+                &mut Vec::new(),
+                classes,
+                [h0, h1],
+                board,
+                trav,
+                &root.raise_sizes_pm,
+                true,
+                &mut infosets,
+                &mut rng,
             );
             check(&infosets, trav, "mccfr_traverse");
         }
@@ -2223,24 +2253,41 @@ mod tests {
             .collect();
         let board = [8u8, 13, 26, 31, 50];
         for trav in 0..3 {
-            let mut infosets = HashMap::new();
+            let mut infosets = Table::default();
             let mut labels = HashMap::new();
             mw_preflop_traverse(
-                &st, &[], &classes, &holes, board, trav, &mw.raise_sizes_pm, true,
-                &mut infosets, &mut labels, &mut rng,
+                &st,
+                &mut Vec::new(),
+                &classes,
+                &holes,
+                board,
+                trav,
+                &mw.raise_sizes_pm,
+                true,
+                &mut infosets,
+                &mut labels,
+                &mut rng,
             );
             check(&infosets, trav, "mw_preflop_traverse");
         }
 
         // Multiway postflop (`multi_traverse_es`).
-        let st = PublicState::postflop_root(
-            3, 30_000, &[100_000, 100_000, 100_000], &board, 10_000, 3,
-        )
-        .unwrap();
+        let st =
+            PublicState::postflop_root(3, 30_000, &[100_000, 100_000, 100_000], &board, 10_000, 3)
+                .unwrap();
         for trav in 0..3 {
-            let mut infosets = HashMap::new();
+            let mut infosets = Table::default();
             multi_traverse_es(
-                &st, &[], &holes, board, trav, &[1000], true, true, &mut infosets, &mut rng,
+                &st,
+                &mut Vec::new(),
+                &holes,
+                board,
+                trav,
+                &[1000],
+                true,
+                true,
+                &mut infosets,
+                &mut rng,
             );
             check(&infosets, trav, "multi_traverse_es");
         }
@@ -2272,9 +2319,16 @@ mod tests {
         for is in sb_vs_jam {
             assert_eq!(is.actions, ["FOLD", "ALLIN"]);
             // Facing a jam to 10 bb with 0.5 bb posted: 9.5 bb to call, pot 11.5 bb.
-            assert_eq!(is.to_call_chips, Some(95_000), "UTG's ALLIN was not a raise");
+            assert_eq!(
+                is.to_call_chips,
+                Some(95_000),
+                "UTG's ALLIN was not a raise"
+            );
             assert_eq!(is.pot_chips, Some(115_000));
-            assert_eq!(is.stacks_chips.as_deref(), Some(&[200_000u64, 95_000, 90_000][..]));
+            assert_eq!(
+                is.stacks_chips.as_deref(),
+                Some(&[200_000u64, 95_000, 90_000][..])
+            );
         }
         // The evaluator plays the same (single-street) game the solver trained.
         assert!(rep.exploitability_bb.unwrap().is_finite());

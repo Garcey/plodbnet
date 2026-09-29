@@ -213,24 +213,51 @@ def _canon(bin_img: np.ndarray) -> np.ndarray:
     return binm
 
 
+def _features(bin_img: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.floating]:
+    """(canonical bits, centered bits, norm) — the per-image half of
+    `_shape_score`, computed once per glyph and once per template."""
+    g = _canon(bin_img).astype(np.float32) / 255.0
+    gf = g.ravel() - g.mean()
+    return g, gf, np.linalg.norm(gf)
+
+
+def _score_features(gfeat, tfeat) -> float:
+    g, gf, gn = gfeat
+    t, tf, tn = tfeat
+    inter = float(np.minimum(g, t).sum())
+    union = float(np.maximum(g, t).sum())
+    iou = inter / (union + 1e-9)
+    # Cosine on centered bits
+    cos = float(gf @ tf / (gn * tn + 1e-9))
+    return 0.5 * iou + 0.5 * cos
+
+
 def _shape_score(glyph: np.ndarray, tmpl: np.ndarray) -> float:
     """Score glyph vs template on canonical-size binary overlap.
 
     Blends IoU (overall agreement) with a penalty on filled-area disagreement,
     which helps separate visually similar ranks like 3/5/6/8.
     """
-    g = _canon(glyph).astype(np.float32) / 255.0
-    t = _canon(tmpl).astype(np.float32) / 255.0
-    inter = float(np.minimum(g, t).sum())
-    union = float(np.maximum(g, t).sum())
-    iou = inter / (union + 1e-9)
-    # Cosine on centered bits
-    gf = g.ravel() - g.mean()
-    tf = t.ravel() - t.mean()
-    gn = np.linalg.norm(gf)
-    tn = np.linalg.norm(tf)
-    cos = float(gf @ tf / (gn * tn + 1e-9))
-    return 0.5 * iou + 0.5 * cos
+    return _score_features(_features(glyph), _features(tmpl))
+
+
+# Canonical features of the loaded templates, keyed on the template dict
+# they were built from (tests reset `_RANK_TEMPLATES_CACHE` to reload).
+_TEMPLATE_FEATURES: tuple[int, dict[int, list[tuple]]] | None = None
+
+
+def _template_features(templates: dict[int, list[np.ndarray]]) -> dict[int, list[tuple]]:
+    """Per-rank template features, canonicalized ONCE (TOOL-014): scoring a
+    card used to re-resize the glyph and every one of ~116 templates — ~230
+    resizes per card, up to ~30 cards a frame. Same float32 math, so the
+    scores are bit-identical to scoring the images directly."""
+    global _TEMPLATE_FEATURES
+    if _TEMPLATE_FEATURES is None or _TEMPLATE_FEATURES[0] != id(templates):
+        _TEMPLATE_FEATURES = (
+            id(templates),
+            {rank: [_features(t) for t in tmpls] for rank, tmpls in templates.items()},
+        )
+    return _TEMPLATE_FEATURES[1]
 
 
 def classify_rank(card_bgr: np.ndarray) -> tuple[int | None, float]:
@@ -247,9 +274,10 @@ def classify_rank(card_bgr: np.ndarray) -> tuple[int | None, float]:
     glyph = _preprocess_rank_glyph(card_bgr)
     if glyph is None:
         return None, 0.0
+    gfeat = _features(glyph)
     per_rank: list[tuple[int, float]] = []
-    for rank, tmpls in templates.items():
-        best = max(_shape_score(glyph, t) for t in tmpls)
+    for rank, tfeats in _template_features(templates).items():
+        best = max(_score_features(gfeat, tf) for tf in tfeats)
         per_rank.append((rank, best))
     per_rank.sort(key=lambda kv: -kv[1])
     best_rank, best_score = per_rank[0]
@@ -333,10 +361,14 @@ def has_active_timer_bar(bgr: np.ndarray) -> bool:
     frames). The blue table felt at the same ROI when no bar is
     rendered scores H_median ≈ 100-106 — well outside the band.
     Active reads in the reference frames score ratio = 1.0; inactive
-    reads score 0.0. 0.25 leaves headroom for ROI drift and
-    anti-aliasing on the 26×2-pixel non-hero ROI; the gap to the 1.0
-    positive / 0.0 negative reference is wide enough that the lower
-    threshold doesn't compress the negative margin.
+    reads score 0.0.
+
+    The crop is a ~10 px BAND around the calibrated 2-4 px line
+    (`SeatROIs.timer_bar_band`, TOOL-012), so a few px of vertical drift
+    can't lose the bar: the seat is active when ANY single row of the band
+    is at least 60% yellow — the bar's signature is a horizontal run, which
+    scattered yellow (chips, text) above or below never fills. On a band
+    that is only the line itself this is the old full-coverage read.
     """
     if bgr.size == 0:
         return False
@@ -346,7 +378,11 @@ def has_active_timer_bar(bgr: np.ndarray) -> bool:
         np.array([15, 140, 140], dtype=np.uint8),
         np.array([35, 255, 255], dtype=np.uint8),
     )
-    return float(mask.sum() / 255) / mask.size > 0.25
+    return bool(float((mask > 0).mean(axis=1).max()) >= TIMER_ROW_YELLOW)
+
+
+#: Share of one band row that must be yellow for the timer bar to count.
+TIMER_ROW_YELLOW = 0.6
 
 
 def has_bet_banner(bgr: np.ndarray) -> bool:

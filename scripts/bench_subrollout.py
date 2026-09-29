@@ -34,10 +34,7 @@ import torch  # noqa: E402
 
 from plo5bp import rollout as R  # noqa: E402
 from plo5bp.config import GameConfig, TrainingConfig  # noqa: E402
-from plo5bp.network import (  # noqa: E402
-    build_actor_from_state_dict,
-    build_critic_from_state_dict,
-)
+from plo5bp.evaluation import load_actor, load_critic  # noqa: E402
 from plo5bp.selfplay import OpponentPool  # noqa: E402
 
 
@@ -72,12 +69,9 @@ def main() -> None:
     cfgd = dict(ck.get("config") or {})
     fields = {f.name for f in dataclasses.fields(TrainingConfig)}
     base_cfg = TrainingConfig(**{k: v for k, v in cfgd.items() if k in fields})
-    actor = build_actor_from_state_dict(
-        ck["model"], int(cfgd.get("hidden_dim", 128)), int(cfgd.get("num_layers", 2))
-    ).to(device).eval()
-    critic = build_critic_from_state_dict(ck["critic"]).to(device).eval()
-    for p in list(actor.parameters()) + list(critic.parameters()):
-        p.requires_grad_(False)
+    # Sizes and the critic's flags from the checkpoint (plo5bp.evaluation).
+    actor, _meta = load_actor(ck, device)
+    critic = load_critic(ck, device)
     pool = OpponentPool(capacity=args.pool, seed=args.seed)
     for i in range(args.pool):
         pool.snapshot(actor, tag=i)

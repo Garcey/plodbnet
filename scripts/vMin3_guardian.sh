@@ -19,7 +19,7 @@
 #   - CPUs pinned to the GPU's NUMA node (taskset): unpinned, the host's automatic
 #     NUMA balancing tripled the rollout's kernel time (flush 525 s vs 209 s of
 #     sys time per update); memory still spills to the other nodes.
-#   - entropy 0.07 (was 0.25): the 2026-09-24 hyperparameter tuning (CLAUDE.md,
+#   - entropy 0.07 (was 0.25): the 2026-09-24 hyperparameter tuning (docs/training-log.md,
 #     "Hyperparameter tuning"): lower entropy learned better moves in every tier
 #     (argmax vs argmax over u64-u79: 0.07 +0.38, 0.10 +0.29 bb/seat-hand over
 #     0.25), plays far stronger, and its sharpness settles (no collapse through
@@ -53,24 +53,28 @@ LOG=runs/vMin3.log
 MAX_RESTARTS=4          # crashes allowed within RESTART_WINDOW seconds
 RESTART_WINDOW=21600    # 6 h: a crash loop stops the run, rare one-off crashes over weeks do not
 POLL=300
+STALE_SECS=${STALE_SECS:-10800}   # heartbeat older than this = hung trainer -> killed, relaunched
 restart_times=()
+
+STEM=vMin3
+PY=.venv/bin/python
+# Ships together with scripts/guardian_lib.sh and python/plo5bp/train/ (one pull):
+# the lib refuses to run without its helper module.
+# shellcheck source=scripts/guardian_lib.sh
+. scripts/guardian_lib.sh
 
 log(){ echo "[vMin3-guardian $(date -u '+%m-%d %H:%M:%S')] $*" >> "$GLOG"; }
 train_pid(){ pgrep -f "python -u scripts/[t]rain.py .*--checkpoint checkpoints/vMin3.pt" | head -1; }
 other_trainer(){ pgrep -f "python -u scripts/[t]rain.py" | grep -v "^$(train_pid)\$" | head -1; }
 
 # The GPU's NUMA node's CPUs (fastest host<->GPU copies), else unpinned.
-numa_prefix(){
-  command -v taskset >/dev/null 2>&1 || return 0
-  local bus node
-  bus=$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader 2>/dev/null | head -1 | tr 'A-F' 'a-f')
-  node=$(cat "/sys/bus/pci/devices/${bus: -12}/numa_node" 2>/dev/null || echo -1)
-  if [ "$node" -ge 0 ] 2>/dev/null && [ -r "/sys/devices/system/node/node${node}/cpulist" ]; then
-    echo "taskset -c $(cat "/sys/devices/system/node/node${node}/cpulist")"
-  fi
-}
+numa_prefix(){ gl_numa_prefix; }
 
 launch(){
+  export TORCHINDUCTOR_CACHE_DIR="$(gl_inductor_cache)"
+  # Its own live-control file (train.py's per-stem default since 2026-09-28;
+  # before, vMin3 read the pod-wide runs/anneal_control.json).
+  export PLO5BP_ANNEAL_CONTROL="${PLO5BP_ANNEAL_CONTROL:-runs/vMin3.control.json}"
   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
   export PATH="$HOME/.cargo/bin:$PATH"
   export PLO5_RUST_ENCODER=1
@@ -104,28 +108,11 @@ launch(){
   disown 2>/dev/null || true
 }
 
-compatible_ckpt(){
-  [ -f "$1" ] || return 1
-  .venv/bin/python - "$1" <<'PY'
-import sys, torch
-try:
-    ck = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
-except Exception:
-    sys.exit(1)
-cfg = ck.get("config") or {}
-ok = (int(cfg.get("hidden_dim") or 0) == 32 and int(cfg.get("num_layers") or 0) == 3
-      and int(cfg.get("critic_hidden_dim") or 0) == 128)
-sys.exit(0 if ok else 1)
-PY
-}
-
 pick_warm(){
-  local f
-  for f in $(ls -t checkpoints/vMin3_*.pt 2>/dev/null); do
-    compatible_ckpt "$f" && { echo "$f"; return 0; }
-  done
-  [ -n "${WARM:-}" ] && compatible_ckpt "$WARM" && { echo "$WARM"; return 0; }
-  return 1
+  # The highest-numbered compatible vMin3_<N>.pt (not the newest by mtime),
+  # else $WARM (plo5bp/train/guardian.py).
+  gl_pick_warm --need hidden_dim=32 --need num_layers=3 --need critic_hidden_dim=128 \
+    ${WARM:+--also "$WARM"}
 }
 
 if [ -f "$STOPFLAG" ]; then
@@ -149,6 +136,7 @@ while true; do
   [ -f "$STOPFLAG" ] && { log "stop flag present -> exiting"; exit 0; }
   sleep "$POLL"
   PID=$(train_pid)
+  [ -n "$PID" ] && gl_check_heartbeat "$PID" && PID=""   # alive but hung
   if [ -z "$PID" ]; then
     sleep 15; PID=$(train_pid)
     if [ -z "$PID" ]; then

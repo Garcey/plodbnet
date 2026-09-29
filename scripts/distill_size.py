@@ -34,15 +34,16 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from plo5bp.network import ActorCriticV5, build_actor_from_state_dict
+from plo5bp.network import ActorCriticV5, actor_arch
+from plo5bp.evaluation import load_actor
+from plo5bp.train.checkpoint import derived_checkpoint
 from plo5bp.sizing import anchor_grid_torch
 
 
 def load_teacher(path, dev):
     ck = torch.load(path, map_location="cpu", weights_only=False)
-    cfg = ck.get("config") or {}
-    t = build_actor_from_state_dict(ck["model"], int(cfg["hidden_dim"]), int(cfg["num_layers"]))
-    return ck, t.to(dev).eval()
+    t, _meta = load_actor(ck, dev, check_rev=False)  # the states carry their own rev
+    return ck, t
 
 
 def heads(model, obs, gm, sizing):
@@ -152,13 +153,19 @@ def main() -> None:
             ev = evaluate(student)
             print(f"    epoch {ep + 1}: held-out gate KL {ev['gate_kl']:.5f}  anchor KL {ev['anchor_kl']:.5f}  "
                   f"refine KL {ev['refine_kl']:.5f}  total {ev['total']:.5f}  ({time.time() - t0:.0f}s)", flush=True)
-        out = dict(ck)
-        out["model"] = {k: v.detach().cpu() for k, v in student.state_dict().items()}
         cfg = dict(tcfg)
         cfg["hidden_dim"], cfg["num_layers"] = h, l
-        out["config"] = cfg
-        out["model_ema"] = None
-        out["distilled_from"] = {"teacher": args.teacher, "states": args.npz, "held_out": ev}
+        arch = {"actor": actor_arch(student)}
+        if isinstance(ck.get("arch"), dict) and "critic" in ck["arch"]:
+            arch["critic"] = ck["arch"]["critic"]
+        # The teacher's networks-describing keys, not its run's bookkeeping
+        # (ML-056): a warm start from a student is a new lineage.
+        out = derived_checkpoint(
+            ck, "distill", [args.teacher],
+            model={k: v.detach().cpu() for k, v in student.state_dict().items()},
+            config=cfg, arch=arch,
+            distilled_from={"teacher": args.teacher, "states": args.npz, "held_out": ev},
+        )
         path = out_dir / f"distill_{spec}.pt"
         torch.save(out, path)
         with open(args.log, "a", encoding="utf-8") as fh:

@@ -1,5 +1,8 @@
 #!/usr/bin/env python
-"""Train a GTO PolicyNet (Phase 1).
+"""Train a PolicyNet from the rule-based bootstrap (Phase 1) — NOT the GTO path.
+
+A net trained here is never badge-eligible. The CFR-teacher pipeline (solve →
+export → train → probe → serve) is docs/ops/GTO_PIPELINE.md.
 
 Default data path is the **rule-based bootstrap** (no PPO). The retired
 nlh1–nlh4 PPO lineage is not used. Optional ``--teacher`` remains for

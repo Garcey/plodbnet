@@ -17,7 +17,7 @@ from plo5bp.ocr import cards as card_mod
 from plo5bp.ocr import extract as extract_mod
 from plo5bp.ocr import rois as roi_mod
 from plo5bp.ocr import text as text_mod
-from plo5bp.ocr.extract import _read_seat, extract_frame_state
+from plo5bp.ocr.extract import extract_frame_state
 from plo5bp.ocr.types import Card, FrameState
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -122,6 +122,18 @@ def _fake_seat_rois(seat: int = 1) -> roi_mod.SeatROIs:
 
 def _blank_img() -> np.ndarray:
     return np.zeros((720, 1280, 3), dtype=np.uint8)
+
+
+def _read_seat(img, seat_rois, hero_hole):
+    """One seat read the way `extract_frame_state` does it, serially — so
+    the stubbed `text_mod` readers below apply (TOOL-037: the production
+    `_read_seat` was only ever used by these tests)."""
+    return extract_mod._build_seat_obs(
+        seat_rois, hero_hole,
+        text_mod.read_chip_amount(seat_rois.stack_label.crop(img)),
+        text_mod.read_seat_commit(seat_rois.committed_label.crop(img)),
+        seat_rois.cards_back.crop(img), seat_rois.timer_bar_band.crop(img),
+    )
 
 
 def _apply_stub_detectors(

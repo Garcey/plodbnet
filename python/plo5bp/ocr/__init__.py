@@ -1,8 +1,14 @@
-"""Offline OCR for ClubGG PLO5 double-board bomb-pot session screen recordings.
+"""Live table reading for the local study build: ClubGG pixel OCR + PokerNow.
 
-Phase 1 scope: stateless per-frame extractor that turns an image (BGR numpy
-array) into a `FrameState`. No timeline, no event diff, no UI wiring -- those
-are Phase 2+.
+* `extract` turns one ClubGG frame (BGR numpy array) into a `FrameState`
+  (cards, stacks, commits, button, pot, who is in the hand / to act);
+* `events.EventReconstructor` diffs successive FrameStates against the
+  engine and emits the actions / street reveals it can prove;
+* `pokernow` maps a PokerNow DOM snapshot to the same FrameState;
+* `live` captures the ClubGG window (Windows.Graphics.Capture).
+
+The session wiring (runners, hand-start machine, routes) is
+`plo5bp.ui.live`, mounted by the local build only.
 
 Public entry points:
     from plo5bp.ocr import extract_frame_state

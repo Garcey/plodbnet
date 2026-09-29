@@ -11,20 +11,39 @@ import numpy as np
 import pytest
 import torch
 
+# The tests live in area folders (engine/, training/, site/, homegame/, gto/,
+# ops/ — TEST-039); the helpers they share (bash_tools, cfr_fixtures,
+# hg_client_tools + hg_mini_dom.js) stay here, importable from every folder.
+_HERE = str(Path(__file__).resolve().parent)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
 # --- UI module (re)import isolation (review 2026-09-20 J3) -------------------
-# The public-build test modules must set env vars BEFORE `plo5bp.ui.server`
-# imports (public.py/homegame.py read PLO5BP_* at import time), so their
-# module-scoped fixtures purge and reimport the ui modules. Popping
-# `sys.modules` alone is NOT enough: `from plo5bp.ui import public` resolves
-# through the *package attribute* first, so a second reimport in the same
-# pytest process silently got the STALE `public` module (old DB, old
-# FREE_HANDS, old middleware) while `server` was fresh — 7 cross-file
-# failures. Both fixtures call this helper on setup AND teardown.
+# A fresh app no longer needs a fresh import: `server.create_app()` (BE-007)
+# builds one from the environment as it is at that moment — the public layer
+# and the home games read their settings when they are installed, and every
+# app gets its own database, caches and home-games context. `boot_public_server`
+# below does exactly that. This helper stays for a test that genuinely needs a
+# module's IMPORT re-executed (something still read at import: the home games'
+# lock checks / verifiable-shuffle switch / API rate spec, the trainer's session
+# lock timeout …). Popping `sys.modules` alone is NOT enough: `from plo5bp.ui
+# import public` resolves through the *package attribute* first, so a second
+# reimport in the same pytest process silently got the STALE `public` module
+# (old DB, old FREE_HANDS, old middleware) while `server` was fresh — 7
+# cross-file failures. Call it on setup AND teardown.
 UI_MODULES = (
     "plo5bp.ui.server",
     "plo5bp.ui.public",
     "plo5bp.ui.trainer",
     "plo5bp.ui.homegame",
+    # Local-build live capture: its modules bind the server's session /
+    # rebuild at import, so a reimported server must get fresh ones too.
+    "plo5bp.ui.live",
+    "plo5bp.ui.live.state",
+    "plo5bp.ui.live.tracking",
+    "plo5bp.ui.live.clubgg",
+    "plo5bp.ui.live.pokernow",
+    "plo5bp.ui.live.routes",
 )
 
 
@@ -45,8 +64,7 @@ def purge_ui_modules(names: tuple[str, ...] = UI_MODULES) -> None:
         db = getattr(pub, "DB", None)
         if db is not None:
             try:
-                with db._lock:
-                    db._conn.close()
+                db.close()  # the writer AND the per-thread read connections
             except Exception:  # noqa: BLE001 — best-effort cleanup
                 pass
     for name in names:
@@ -68,7 +86,7 @@ PUBLIC_TEST_ADMIN = "themilesgarcia@icloud.com"
 # The site is free-for-all by default (public.FREE_FOR_ALL, 2026-09-22). The
 # paywall / quota / Stripe code is still there and still has to work, so the
 # test session runs with the paywall ON unless a test opts into free mode
-# (tests/python/test_public_free_mode.py).
+# (tests/python/site/test_public_free_mode.py).
 os.environ.setdefault("PLO5BP_FREE_FOR_ALL", "0")
 # Home-game hands are graded by a background thread (one model forward per
 # decision). Off for the test session so hundreds of scripted hands do not
@@ -88,21 +106,29 @@ _PUBLIC_TEST_ENV = {
 
 
 @pytest.fixture(scope="module")
-def boot_public_server(tmp_path_factory, ui_purge):
-    """Factory: ``boot(**env) -> plo5bp.ui.server`` imported fresh in PUBLIC
-    mode against a temp sqlite DB (never ``data/``). Env is restored and the
-    ui modules purged again when the requesting test module finishes.
+def boot_public_server(tmp_path_factory):
+    """Factory: ``boot(**env) -> plo5bp.ui.server`` with a fresh PUBLIC app
+    built by ``server.create_app()`` (BE-007) against a temp sqlite DB (never
+    ``data/``), ``env`` on top of the public test environment. Until the
+    requesting test module finishes, that app is the current site:
+    ``server.app``, ``server.MODEL`` … name it, and ``plo5bp.ui.public`` /
+    ``plo5bp.ui.homegame`` serve it. Then it is closed (home-game workers
+    stopped, database closed), the environment restored and the previous site
+    — the LOCAL app the other test modules use — made current again. Nothing is
+    purged or re-imported.
 
-    ONE boot per test module: booting again purges (and closes the DB of)
-    the previous app, which module-scoped fixtures may still be holding."""
+    ONE boot per test module: the module-scoped fixtures hold on to the app."""
     import importlib
 
+    # Imported BEFORE the environment changes, so its import-time app — the
+    # previous site restored at the end — is the local build.
+    server = importlib.import_module("plo5bp.ui.server")
     saved: dict[str, str | None] = {}
-    booted: list[bool] = []
+    booted: list = []
 
     def boot(**extra_env: str):
         assert not booted, "boot_public_server: one boot per test module"
-        booted.append(True)
+        booted.append(server.current_site())
         tmp = tmp_path_factory.mktemp("public_app")
         env = {
             **_PUBLIC_TEST_ENV,
@@ -113,16 +139,21 @@ def boot_public_server(tmp_path_factory, ui_purge):
         for k, v in env.items():
             saved.setdefault(k, os.environ.get(k))
             os.environ[k] = v
-        ui_purge()
-        return importlib.import_module("plo5bp.ui.server")
+        booted.append(server.create_app().state.site)
+        return server
 
     yield boot
-    for k, v in saved.items():
-        if v is None:
-            os.environ.pop(k, None)
-        else:
-            os.environ[k] = v
-    ui_purge()
+    try:
+        if len(booted) == 2:
+            booted[1].close()
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        if booted:
+            server.use_site(booted[0])
 
 
 # Isolate trainer-stats persistence from the user's REAL

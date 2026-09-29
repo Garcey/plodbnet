@@ -14,7 +14,6 @@ from plo5bp.config import (
     VARIANT_PLO5,
     VARIANT_PLO6,
     GameConfig,
-    TrainingConfig,
 )
 from plo5bp.eval import (
     always_call_policy,
@@ -23,7 +22,7 @@ from plo5bp.eval import (
     random_legal_policy,
     run_match,
 )
-from plo5bp.network import build_actor_from_state_dict
+from plo5bp.evaluation import ObsRevMismatch, load_actor
 
 
 def _build_game_config(args: argparse.Namespace) -> GameConfig:
@@ -100,12 +99,13 @@ def main() -> None:
             f"Pass --variant {ckpt_variant} so the obs width and game rules "
             "match (an NLH net is 995-wide, PLO 991)."
         )
-    train_cfg_raw = ckpt.get("config", {})
-    hidden = int(train_cfg_raw.get("hidden_dim", TrainingConfig.hidden_dim))
-    num_layers = int(train_cfg_raw.get("num_layers", TrainingConfig.num_layers))
-    model = build_actor_from_state_dict(ckpt["model"], hidden, num_layers)
-    model.to(args.device)
-    model.eval()
+    # The size comes from the checkpoint itself (it used to fall back to
+    # TrainingConfig's 128x2 when the config lacked it), and the process's
+    # PLO5BP_OBS_REV must be the one the checkpoint trained on.
+    try:
+        model, _meta = load_actor(ckpt, args.device)
+    except ObsRevMismatch as e:
+        raise SystemExit(str(e)) from e
 
     game_cfg = _build_game_config(args)
     rng = np.random.default_rng(args.seed)

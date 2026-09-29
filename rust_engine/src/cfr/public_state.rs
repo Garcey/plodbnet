@@ -60,9 +60,7 @@ impl PublicState {
             )));
         }
         if pot_chips == 0 || stack_chips == 0 || bb == 0 {
-            return Err(CfrError::InvalidRoot(
-                "pot, stack, bb must be > 0".into(),
-            ));
+            return Err(CfrError::InvalidRoot("pot, stack, bb must be > 0".into()));
         }
         let mut seen = [false; 52];
         let mut board_arr = [0u8; 5];
@@ -119,7 +117,9 @@ impl PublicState {
     ) -> Result<Self, CfrError> {
         let n = num_seats as usize;
         if !(2..=MAX_SEATS).contains(&n) {
-            return Err(CfrError::InvalidRoot(format!("num_seats {n} out of 2..{MAX_SEATS}")));
+            return Err(CfrError::InvalidRoot(format!(
+                "num_seats {n} out of 2..{MAX_SEATS}"
+            )));
         }
         if stacks.len() != n {
             return Err(CfrError::InvalidRoot("stacks len != num_seats".into()));
@@ -175,9 +175,7 @@ impl PublicState {
             last_aggressor: None,
             street,
         };
-        for i in 0..n {
-            s.stacks[i] = stacks[i];
-        }
+        s.stacks[..n].copy_from_slice(&stacks[..n]);
         // A seat that arrives with no chips is already all-in (review 2026-09-20 E1).
         s.seal_root();
         Ok(s)
@@ -211,8 +209,10 @@ impl PublicState {
         if bb == 0 {
             return Err(CfrError::InvalidRoot("bb must be > 0".into()));
         }
-        if stacks.iter().any(|&s| s == 0) {
-            return Err(CfrError::InvalidRoot("preflop stacks must be > 0 chips".into()));
+        if stacks.contains(&0) {
+            return Err(CfrError::InvalidRoot(
+                "preflop stacks must be > 0 chips".into(),
+            ));
         }
         let (sb_seat, bb_seat, first, button) = if n == 2 {
             (1usize, 0usize, 1u8, 1u8)
@@ -423,9 +423,10 @@ impl PublicState {
     }
 
     pub fn apply_raise(&mut self, chips: u64) -> Result<(), CfrError> {
-        let actor = self.actor.ok_or_else(|| {
-            CfrError::InvalidConfig("raise on terminal".into())
-        })? as usize;
+        let actor = self
+            .actor
+            .ok_or_else(|| CfrError::InvalidConfig("raise on terminal".into()))?
+            as usize;
         let min = self.min_raise_chips();
         let max = self.max_raise_chips();
         if min == 0 || chips < min || chips > max {
@@ -697,8 +698,12 @@ mod tests {
     #[test]
     fn preflop_root_posts_blinds_and_flags_short_all_ins() {
         // HU 100bb, ante 0.5bb: seat 0 = BB, seat 1 = BTN/SB first to act.
-        let s = PublicState::preflop_root(&[1_000_000, 1_000_000], 10_000, 5_000, 5_000, 0).unwrap();
-        assert_eq!((s.actor, s.button, s.street, s.board_len), (Some(1), 1, 0, 0));
+        let s =
+            PublicState::preflop_root(&[1_000_000, 1_000_000], 10_000, 5_000, 5_000, 0).unwrap();
+        assert_eq!(
+            (s.actor, s.button, s.street, s.board_len),
+            (Some(1), 1, 0, 0)
+        );
         assert_eq!(s.pot, 25_000);
         assert_eq!(&s.stacks[..2], &[985_000, 990_000]);
         assert_eq!(&s.street_commit[..2], &[10_000, 5_000]);
@@ -719,15 +724,9 @@ mod tests {
     /// deal_board_card advances board_len and street on flop→turn.
     #[test]
     fn deal_board_advances_street() {
-        let mut s = PublicState::postflop_root(
-            2,
-            50_000,
-            &[200_000, 200_000],
-            &[0, 5, 10],
-            10_000,
-            1,
-        )
-        .unwrap();
+        let mut s =
+            PublicState::postflop_root(2, 50_000, &[200_000, 200_000], &[0, 5, 10], 10_000, 1)
+                .unwrap();
         assert_eq!(s.board_len, 3);
         assert_eq!(s.street, 1);
         s.deal_board_card(15);

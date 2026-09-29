@@ -1,9 +1,12 @@
 """ROI layout for ClubGG PLO5 double-board bomb-pot screenshots.
 
-Coordinates are stored as fractions of image width/height so layouts stay
-valid across small resolution variations (e.g. 1920x1080 vs 1920x1200).
-Reference frames used for tuning: `screenrecords/frames/frame_0060.png`
-and `screenrecords/frames/frame_0840.png` (both 1920x1080).
+Coordinates are stored as fractions of the frame's width/height, calibrated
+on a 1927x1391 ClubGG table window captured through WGC (`CALIBRATION_SIZE`).
+Fractions do NOT make the layout aspect-invariant: a window of another aspect
+ratio moves every ROI, and the card-glyph extractor uses absolute pixel floors.
+`frame_geometry` says what a capture needs: same aspect (within 2%) and size
+= use as is; same aspect, other size = rescale to the calibration size;
+another aspect = refuse (TOOL-003).
 
 Phase 1 hardcodes the 6-seat layout. Hero is always seat 0 (bottom-center).
 Seats 1..5 wrap physical-clockwise (poker convention) from hero's right:
@@ -19,6 +22,37 @@ pixel coordinates via `ROI.abs(W, H) -> (x1, y1, x2, y2)`.
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+#: (width, height) of the ClubGG table window the ROI table and the rank
+#: templates were calibrated on.
+CALIBRATION_SIZE = (1927, 1391)
+#: Relative aspect / size mismatch tolerated before a capture is refused or
+#: rescaled.
+GEOMETRY_TOLERANCE = 0.02
+
+
+def frame_geometry(width: int, height: int) -> tuple[str, str | None]:
+    """What a ``width`` x ``height`` capture needs before extraction.
+
+    Returns ``("ok", None)``, ``("rescale", note)`` (same aspect as the
+    calibration, other size: resize it to `CALIBRATION_SIZE` so ROIs, glyph
+    pixel floors and rank templates all see calibration-scale pixels) or
+    ``("refuse", message)`` (another aspect ratio: every ROI would land on
+    the wrong pixels, so nothing read from it can be trusted).
+    """
+    cw, ch = CALIBRATION_SIZE
+    if width <= 0 or height <= 0:
+        return "refuse", f"empty capture ({width}x{height})"
+    aspect, cal = width / height, cw / ch
+    if abs(aspect - cal) / cal > GEOMETRY_TOLERANCE:
+        return "refuse", (
+            f"the ClubGG window is {width}x{height} (aspect {aspect:.2f}); live "
+            f"capture is calibrated for {cw}x{ch} (aspect {cal:.2f}) — resize "
+            "the table window to that shape"
+        )
+    if abs(width - cw) / cw > GEOMETRY_TOLERANCE:
+        return "rescale", f"capture {width}x{height} rescaled to {cw}x{ch}"
+    return "ok", None
 
 
 @dataclass(frozen=True)
@@ -114,8 +148,30 @@ class SeatROIs:
     # below the active seat's plate. Bar depletes right-to-left, so the
     # leftmost ~10-15% stays solidly yellow until the timer is nearly
     # spent — that gives us a stable HSV-yellow signal for "this seat
-    # is the current actor" (see cards.has_active_timer_bar).
+    # is the current actor" (see cards.has_active_timer_bar). This is the
+    # calibrated LINE (2-4 px tall); detection reads `timer_bar_band`.
     timer_bar_left: ROI
+
+    @property
+    def timer_bar_band(self) -> ROI:
+        """The region the timer detector reads: `timer_bar_left` widened to
+        a `TIMER_BAND_H` band centred on the calibrated line (TOOL-012). The
+        villain lines are 1 px tall at 1080 and 2 px at 1391, so any vertical
+        drift made the detector miss the very read the timer-bar CHECK
+        depends on; `cards.has_active_timer_bar` accepts the band when any
+        single row of it is mostly yellow."""
+        return timer_band(self.timer_bar_left)
+
+
+#: Height of the timer-bar detection band: ~10 px at the calibration height.
+TIMER_BAND_H = 10 / CALIBRATION_SIZE[1]
+
+
+def timer_band(line: ROI) -> ROI:
+    """``line`` grown vertically to `TIMER_BAND_H`, same centre and width."""
+    h = max(line.h, TIMER_BAND_H)
+    cy = line.y + line.h / 2
+    return ROI(line.x, cy - h / 2, line.w, h)
 
 
 _SEATS_6: tuple[SeatROIs, ...] = (

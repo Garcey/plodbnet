@@ -33,6 +33,27 @@ LABELS_PATH = Path(__file__).parent / "fixtures" / "labels.json"
 FIXTURE_FRAMES_DIR = Path(__file__).parent / "fixtures" / "frames"
 
 
+#: Where pixel tests look for a frame by NAME, tracked folders first
+#: (TEST-027): tests/ocr/fixtures/frames/ (and rotation/), then the
+#: gitignored local capture folder screenrecords/frames/.
+FRAME_DIRS = (
+    FIXTURE_FRAMES_DIR,
+    Path(__file__).parent / "fixtures" / "rotation",
+    REPO_ROOT / "screenrecords" / "frames",
+)
+
+
+def find_frame(name: str) -> Path | None:
+    """A frame file by basename from `FRAME_DIRS`, or None. Put frames in
+    the TRACKED fixtures folder — `scripts/ocr_collect_fixtures.py` copies
+    every frame the tests name from an old capture folder."""
+    for d in FRAME_DIRS:
+        p = d / Path(name).name
+        if p.exists():
+            return p
+    return None
+
+
 def resolve_frame(rel: str) -> Path | None:
     """Resolve a labeled frame: the recorded repo-relative path first
     (screenrecords/ is gitignored — LOCAL-ONLY ground truth, and the
@@ -65,32 +86,49 @@ def frame_resolver():
 
 
 @pytest.fixture(scope="session")
-def rank_templates_bootstrapped(labels) -> bool:
-    """Build rank templates from labeled rows if they don't already exist."""
+def frame_finder():
+    """`find_frame` for test modules (they can't import this conftest)."""
+    return find_frame
+
+
+@pytest.fixture(scope="session")
+def rank_templates_bootstrapped(labels, tmp_path_factory):
+    """Rank templates for the session: the shipped ones plus any built from
+    the labeled rows — all in a TEMPORARY folder the classifier is pointed at
+    for the session (TEST-032: building into `plo5bp/ocr/templates/` changed
+    the source tree, and the classifier, on every test run)."""
     # `cards` / `label_cards` import OpenCV; skip only the requesting test.
     pytest.importorskip("cv2")
+    import shutil
+
     from plo5bp.ocr import cards as card_mod
     from plo5bp.ocr.tools import label_cards as labeler
 
-    groups = {
-        "board_a": "board_a",
-        "board_b": "board_b",
-        "hero_hole": "hero_hole",
-    }
-
-    for fx in labels:
-        frame_path = resolve_frame(fx["frame"])
-        if frame_path is None:
-            continue
-        state = fx["state"]
-        for group in groups:
-            labels_row = state[group]
-            rank_chars = [s[0] if s else "-" for s in labels_row]
-            try:
-                labeler.build_templates(frame_path, group, rank_chars, overwrite=False)
-            except Exception:
-                pass  # tolerate partial template builds
-    # Invalidate cache so subsequent tests re-read.
+    work = tmp_path_factory.mktemp("rank_templates")
+    shipped = card_mod.TEMPLATES_DIR
+    for p in shipped.glob("*.png"):
+        shutil.copy2(p, work / p.name)
+    card_mod.TEMPLATES_DIR = work
     card_mod._RANK_TEMPLATES_CACHE = None
-    templates = card_mod._load_templates()
-    return len(templates) >= 8
+    try:
+        for fx in labels:
+            frame_path = resolve_frame(fx["frame"])
+            if frame_path is None:
+                continue
+            state = fx["state"]
+            for group in ("board_a", "board_b", "hero_hole"):
+                labels_row = state[group]
+                rank_chars = [s[0] if s else "-" for s in labels_row]
+                try:
+                    labeler.build_templates(
+                        frame_path, group, rank_chars, overwrite=False, out_dir=work
+                    )
+                except Exception:
+                    pass  # tolerate partial template builds
+        # Invalidate cache so subsequent tests re-read.
+        card_mod._RANK_TEMPLATES_CACHE = None
+        templates = card_mod._load_templates()
+        yield len(templates) >= 8
+    finally:
+        card_mod.TEMPLATES_DIR = shipped
+        card_mod._RANK_TEMPLATES_CACHE = None

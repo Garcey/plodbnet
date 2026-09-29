@@ -44,6 +44,15 @@ pub enum StudyError {
     /// river (hero + placeholder holes + full boards). Was an index
     /// panic in the placeholder deal (review 2026-09-20 C4).
     TooManySeats,
+    /// The variant has no study mode here (the PLO study path deals PLO5;
+    /// NLH has its own constructor). Was reported as `WrongState` (ENG-024).
+    UnsupportedVariant,
+    /// The in-hand mask is the wrong length, leaves the hero out, or seats
+    /// fewer than two. Was reported as `SeatOutOfRange` (ENG-024).
+    BadMask,
+    /// `starting_stacks` does not have one entry per seat. Was reported as
+    /// `SeatOutOfRange` (ENG-024).
+    StackCountMismatch,
 }
 
 impl std::fmt::Display for StudyError {
@@ -54,6 +63,14 @@ impl std::fmt::Display for StudyError {
             StudyError::WrongState => write!(f, "operation not valid in current state"),
             StudyError::InvalidAmount => write!(f, "chip amount out of legal range"),
             StudyError::TooManySeats => write!(f, "too many seats for one deck"),
+            StudyError::UnsupportedVariant => write!(f, "this variant has no study mode"),
+            StudyError::BadMask => write!(
+                f,
+                "in-hand mask must have one entry per seat and include the hero and another seat"
+            ),
+            StudyError::StackCountMismatch => {
+                write!(f, "starting stacks must have one entry per seat")
+            }
         }
     }
 }
@@ -109,6 +126,52 @@ pub enum Variant {
 }
 
 impl Variant {
+    /// Every variant (the order errors list them in). What each one IS and
+    /// SUPPORTS is answered here and nowhere else (ENG-015): its name, card
+    /// counts, boards, betting structure, and which engine paths deal it.
+    pub const ALL: [Variant; 5] = [
+        Variant::Plo4DoubleBomb,
+        Variant::Plo5DoubleBomb,
+        Variant::Plo6DoubleBomb,
+        Variant::Plo67DoubleBomb,
+        Variant::NlhSingle,
+    ];
+
+    /// The name Python uses (`GameConfig.variant`, the bindings' `variant=`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Variant::Plo4DoubleBomb => "plo4_double_bomb",
+            Variant::Plo5DoubleBomb => "plo5_double_bomb",
+            Variant::Plo6DoubleBomb => "plo6_double_bomb",
+            Variant::Plo67DoubleBomb => "plo67_double_bomb",
+            Variant::NlhSingle => "nlh_single",
+        }
+    }
+
+    /// The variant [`Self::name`] calls `name`.
+    pub fn from_name(name: &str) -> Option<Variant> {
+        Variant::ALL.into_iter().find(|v| v.name() == name)
+    }
+
+    /// PLO hand rules: exactly 2 hole + 3 board cards per board, pot-limit
+    /// betting (every Omaha variant here); NLH plays any 5 of 7, no-limit.
+    pub fn is_plo(self) -> bool {
+        match self {
+            Variant::Plo4DoubleBomb
+            | Variant::Plo5DoubleBomb
+            | Variant::Plo6DoubleBomb
+            | Variant::Plo67DoubleBomb => true,
+            Variant::NlhSingle => false,
+        }
+    }
+
+    /// Dealt by the batched engine (the training / rollout path): its packers
+    /// lay every hole out at a fixed width, so a variant whose hands grow
+    /// mid-hand (PLO67's red burns) is serial only.
+    pub fn supports_batched(self) -> bool {
+        self.hole_slots() == self.hole_count()
+    }
+
     /// Hole cards each seat holds when the hand is DEALT (PLO67: 4, more
     /// arrive on red burns — see [`Self::hole_slots`]).
     pub fn hole_count(self) -> usize {
@@ -150,13 +213,7 @@ impl Variant {
     }
 
     pub fn pot_limit(self) -> bool {
-        matches!(
-            self,
-            Variant::Plo4DoubleBomb
-                | Variant::Plo5DoubleBomb
-                | Variant::Plo6DoubleBomb
-                | Variant::Plo67DoubleBomb
-        )
+        self.is_plo()
     }
 
     /// True when hands begin with a preflop betting round (blinds posted
@@ -221,13 +278,7 @@ impl GameConfig {
 
     /// Uniform-stack NLH constructor. `ante` is per player (every
     /// dealt-in seat posts it, dead, before the blinds).
-    pub fn new_nlh_uniform(
-        num_seats: usize,
-        stack: u64,
-        sb: u64,
-        bb: u64,
-        ante: u64,
-    ) -> Self {
+    pub fn new_nlh_uniform(num_seats: usize, stack: u64, sb: u64, bb: u64, ante: u64) -> Self {
         GameConfig {
             num_seats,
             starting_stacks: vec![stack; num_seats],
@@ -301,9 +352,12 @@ pub struct GameState {
     pub last_raise_size: u64,
     /// True iff the most recent aggression this street was a full (min-raise-
     /// sized or larger) raise. False after a short-all-in that was below the
-    /// PL min-raise floor. Informational/diagnostic only — raise-reopen
-    /// legality is per-seat via `street_level_acted`. Reset to true on
-    /// street transitions.
+    /// PL min-raise floor. Reset to true on street transitions.
+    ///
+    /// DIAGNOSTIC / TEST-ONLY (ENG-025): no engine logic and no observation
+    /// reads it — raise-reopen legality is per-seat via `street_level_acted`.
+    /// The engine keeps it current because the rules tests pin the short-shove
+    /// rule through it; do not start deciding anything from it.
     pub last_aggression_was_full_raise: bool,
     /// Street bet level (`bet_to_call`) as of each seat's most recent
     /// action this street; 0 if the seat hasn't acted yet. Drives the

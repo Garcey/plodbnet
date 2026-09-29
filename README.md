@@ -1,36 +1,52 @@
-# plo5bp — PLO5 Double-Board Bomb Pot Self-Play PPO
+# WrapGTO
 
-Phase 1 plumbing: Rust game engine (via PyO3) + Python PPO trainer for 6-max
-PLO5 double-board bomb pots, 20bb stacks, 3bb antes (ClubGG format).
+An AI for **PLO5 double-board bomb pots**, trained by self-play, and the website it
+powers — **[wrapgto.com](https://wrapgto.com)**: Study (enter any spot, see what the
+model plays and why), the Trainer (play hands against it and get graded), and private
+**home games** for clubs of friends (PLO5 / PLO6 / PLO67 tables with a verifiable
+shuffle and every decision graded after the hand).
 
-## Build
+**One project, several names:** WrapGTO is the product; this repository is `plodbnet`;
+the Python package is `plo5bp`; older notes call it `plodbbot`.
 
-```bash
-pip install maturin
-maturin develop                                # builds Rust engine, installs plo5bp
-cargo test --manifest-path rust_engine/Cargo.toml
-pytest tests/python
-python scripts/smoke_test.py
-python scripts/train.py
+## The parts
+
+| Part | Where | What |
+|---|---|---|
+| Engine | `rust_engine/` | the game in Rust — dealing, betting, double-board payouts, observation features, an NLH CFR solver — imported as `plo5bp._engine` |
+| Training | `python/plo5bp/`, `scripts/train.py` | self-play PPO (actor + centralized critic) on a RunPod GPU pod |
+| Website | `python/plo5bp/ui/` | the FastAPI app: Study, Trainer, home games; with `PLO5BP_PUBLIC=1` it is wrapgto.com (sign-in, admin) |
+| Local tools | `python/plo5bp/ocr/`, `tools/pokernow/`, `python/plo5bp/cfr_app/` | live-table study aids (ClubGG screen capture, a PokerNow userscript — never on the website) and the CFR Solver desktop app |
+| Operations | `ops/`, `scripts/deploy_prod.sh`, `.github/` | the production server's files, the deploy, CI |
+
+## Getting started
+
+```powershell
+py -3 -m venv .venv
+.venv\Scripts\pip install -e ".[dev,desktop]"
+.venv\Scripts\maturin develop --release            # builds the engine (from the repo root)
+.venv\Scripts\python -m uvicorn plo5bp.ui.server:app --port 8765    # the study tool
+bash scripts/check.sh                              # what CI runs (in Git Bash)
 ```
 
-## Layout
+Full setup — a Windows PC, the training pod — is in [SETUP.md](SETUP.md). Training
+always names the network size: `scripts/train.py --hidden-dim … --num-layers …`
+(see CLAUDE.md, "Training").
 
-- `rust_engine/` — Rust game engine (cards, hand eval, double-board payouts,
-  state machine, PyO3 bindings).
-- `python/plo5bp/` — Python package: Gym-style env, observation encoding,
-  actor-critic network, PPO, self-play, rollout, eval.
-- `scripts/` — `smoke_test.py` (10k random hands, correctness assertions),
-  `train.py` (stub PPO run), `evaluate.py` (checkpoint vs baselines).
-- `tests/python/` — pytest suites.
-- `rust_engine/tests/` — Rust integration tests.
+## Documentation
 
-## Chip units
+- [docs/README.md](docs/README.md) — the map of every document
+- [docs/ops/PRODUCTION.md](docs/ops/PRODUCTION.md) — running wrapgto.com (deploy, models, rollback, alerts)
+- [CLAUDE.md](CLAUDE.md) — the detailed working notes (current training run, invariants, subsystems)
+- [learn/](learn/README.md) — a course on how the model is trained, written for the owner
 
-1 bb = 100 chips. Starting stack = 2000 (20bb), ante = 300 (3bb).
-All chip math is integer; payouts sum to zero by construction.
+## Conventions worth knowing
 
-## Phase 1 scope
+- **Chips**: 1 big blind = 10,000 chips (cent precision at $20/bb); the default table
+  is 6 seats, 20 bb stacks (200,000), a 3 bb ante (30,000). All chip math is integer
+  and payouts sum to zero.
+- **Correctness first**: observations and engine state are bit-exact reproducible,
+  and the tests lean on parity and exactness.
+- **Live changes need the owner's OK** — code or model, every time.
 
-Correctness-first pipeline. Not a strength run. See
-`.claude/plans/i-m-starting-a-new-kind-dragonfly.md` for the approved plan.
+All rights reserved — see [LICENSE](LICENSE). Security issues: [SECURITY.md](SECURITY.md).

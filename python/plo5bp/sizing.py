@@ -6,8 +6,8 @@ refinement brackets. The same math runs in the network (torch), the
 rollout collectors and UI (numpy), and the tests — any drift between
 implementations breaks PPO's act/evaluate log-prob parity, so the
 numpy/torch twins are pinned bit-identical by
-tests/python/test_anchor_grid.py (PLO spec, incl. bit-exactness vs the
-pre-spec closed forms) and tests/python/test_anchor_grid_nlh.py.
+tests/python/training/test_anchor_grid.py (PLO spec, incl. bit-exactness vs the
+pre-spec closed forms) and tests/python/training/test_anchor_grid_nlh.py.
 
 Two specs exist:
 

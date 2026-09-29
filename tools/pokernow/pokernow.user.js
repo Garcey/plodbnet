@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         plodbbot PokerNow bridge
 // @namespace    plodbbot
-// @version      1.2.0
+// @version      1.3.0
 // @description  Streams PokerNow PLO5 double-board bomb-pot table state from the DOM to the local plodbbot study server.
 // @match        https://www.pokernow.com/games/*
 // @match        https://www.pokernow.club/games/*
@@ -9,6 +9,8 @@
 // @grant        GM_xmlhttpRequest
 // @connect      127.0.0.1
 // @connect      localhost
+// @updateURL    http://127.0.0.1:8765/pokernow/pokernow.user.js
+// @downloadURL  http://127.0.0.1:8765/pokernow/pokernow.user.js
 // ==/UserScript==
 
 /*
@@ -16,9 +18,17 @@
  *
  * PokerNow renders the entire table as DOM elements, so — unlike ClubGG, which
  * needs pixel OCR — we read game state directly and exactly. This script
- * snapshots the table on every change (MutationObserver, debounced), normalizes
+ * snapshots the table on every DOM change (one snapshot per MutationObserver
+ * batch — the browser already coalesces a burst of mutations into one batch;
+ * see "Observer" below for why there is no time-based throttle), normalizes
  * it into the `pokernow.v1` payload the server expects, and POSTs it to
- * http://127.0.0.1:8765/pokernow/ingest. The server maps each payload to a
+ * http://127.0.0.1:8765/pokernow/ingest.
+ *
+ * Install / update: with Tampermonkey installed, open
+ * http://127.0.0.1:8765/pokernow/pokernow.user.js while the local study server
+ * runs; Tampermonkey then updates the script from there by itself (@updateURL).
+ * Every payload names its version (`collector`) so the server can say when an
+ * older copy is still running. The server maps each payload to a
  * FrameState and runs it through the same reconstructor/Session pipeline ClubGG
  * OCR uses.
  *
@@ -36,6 +46,8 @@
   'use strict';
 
   const INGEST_URL = 'http://127.0.0.1:8765/pokernow/ingest';
+  // Keep in step with @version above (pinned by the tests).
+  const COLLECTOR_VERSION = '1.3.0';
   const HEARTBEAT_MS = 2000;
 
   // ---- DOM extraction (validated against a live PLO5 double-board table) ----
@@ -143,6 +155,7 @@
 
     return {
       schema: 'pokernow.v1',
+      collector: COLLECTOR_VERSION,
       // Identifies which PokerNow game this frame came from. The server locks
       // onto one game and ignores frames from any other tab/window, so a second
       // open table can't interleave its state into your live hand.
@@ -168,9 +181,11 @@
   });
   document.body.appendChild(badge);
   let sent = 0;
+  let droppedTotal = 0;
   function setBadge(state, color) {
     badge.style.borderLeft = `4px solid ${color}`;
-    badge.textContent = `plodbbot · ${state}\nframes sent: ${sent}`;
+    const lost = droppedTotal ? ` · ${droppedTotal} dropped` : '';
+    badge.textContent = `plodbbot · ${state}\nframes sent: ${sent}${lost}`;
   }
   setBadge('starting…', '#e0a000');
 
@@ -206,9 +221,16 @@
   }
 
   // Bound memory by dropping the OLDEST frames (only reachable if the server is
-  // badly stalled or offline for a long stretch).
+  // badly stalled or offline for a long stretch). Never silently: the next
+  // frame that goes out carries `gap` = how many frames were lost before it,
+  // so the server knows the hand in progress may be out of sync.
+  let droppedPending = 0;
   function trimQueue() {
-    while (queue.length > MAX_QUEUE) queue.shift();
+    while (queue.length > MAX_QUEUE) {
+      queue.shift();
+      droppedPending += 1;
+      droppedTotal += 1;
+    }
   }
 
   function scheduleRetry() {
@@ -234,6 +256,10 @@
 
   function doPost(payload, isHeartbeat) {
     inFlight = true;
+    if (!isHeartbeat && droppedPending > 0) {
+      payload.gap = (payload.gap || 0) + droppedPending;
+      droppedPending = 0;
+    }
     GM_xmlhttpRequest({
       method: 'POST',
       url: INGEST_URL,
@@ -310,6 +336,13 @@
   }
 
   // ---- Observer (re-attachable) ---------------------------------------------
+  //
+  // One snapshot per MutationObserver batch, deliberately NOT time-throttled:
+  // requestAnimationFrame never runs in a background tab and Chrome slows
+  // setTimeout there to once a second (once a minute after a while), so a
+  // throttle's trailing snapshot — the final state after a burst — could come
+  // late or never, and the server would miss an action. A batch costs one
+  // small DOM read plus a fingerprint; unchanged states are deduped below.
   //
   // PokerNow is a single-page app and can REPLACE the `.table` node. An
   // observer bound to the old, now-detached node never fires again, so the

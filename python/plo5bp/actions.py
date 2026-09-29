@@ -1,12 +1,14 @@
 """Discrete 8-action space (Rust mirror) + 3-way gate space for the
-hybrid continuous-sizing policy head.
+hybrid policy head.
 
-The discrete BetPctN enum is kept for UI/legacy tests; the training-time
-policy head now emits a 3-way gate (Fold/CheckCall/Raise) with a separate
-Beta-parameterised continuous chip amount for the Raise gate. Short
-shoves are routed through the Raise gate at u=1; the engine's
-`max_raise_chips` already clamps to stack, so a stack-bound shove is
-just a Raise to the clamped max.
+The discrete BetPctN enum is kept for the engine interface, the UI and legacy
+tests; the policy head emits a 3-way gate (Fold / CheckCall / Raise) and, for
+a Raise, a size on the pot-fraction anchor ladder (+ refinement; the ladder
+math is plo5bp/sizing.py). Short shoves go through the Raise gate: the
+engine's `max_raise_chips` already clamps to the stack, so a stack-bound shove
+is a Raise to the clamped max (a sub-min-raise all-in is redirected to the
+engine's AllIn arm -- env.step_hybrid / the batched collector's short-shove
+redirect).
 """
 
 from __future__ import annotations

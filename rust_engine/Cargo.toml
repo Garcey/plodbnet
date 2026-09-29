@@ -8,12 +8,38 @@ rust-version.workspace = true
 name = "plo5bp_engine"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# The hidden `bindings::bench_api` module the benchmarks in rust_engine/bench
+# drive (TEST-026). Never enabled for the Python module.
+bench = []
+
 [dependencies]
-pyo3 = { version = "0.23", features = ["extension-module", "abi3-py311"] }
-numpy = "0.23"
-rand = "0.8"
-rand_chacha = "0.3"
+# `extension-module` is deliberately NOT listed: maturin turns it on for the
+# extension build (`[tool.maturin] features` in the root pyproject.toml).
+# Hard-wired here it leaves `cargo test` binaries unlinked against libpython,
+# which fails to link on Linux (PyO3 FAQ) — ENG-007 / REPO-010.
+# 0.29 (ENG-035, from 0.23): the GIL-release call is `Python::detach` (was
+# `allow_threads`); still abi3 for Python >= 3.11.
+pyo3 = { version = "0.29", features = ["abi3-py311"] }
+numpy = "0.29"
+# Pinned EXACTLY (ENG-006): every seeded deal, study placeholder, EV runout and
+# opp-outcome MC draw is rand 0.8's shuffle / gen_range over rand_chacha 0.3's
+# ChaCha8 stream. An upgrade would silently change every seeded result while
+# every parity test still passed (both sides move together). The known answers
+# in cards.rs `seeded_streams_are_pinned` (and the golden digests in
+# bindings/golden_tests.rs) fail if anything under them moves.
+rand = "=0.8.6"
+rand_chacha = "=0.3.1"
 rayon = "1.8"
 
-[dev-dependencies]
-rand = "0.8"
+# `bash scripts/rust_check.sh` runs clippy with -D warnings (ENG-032). The two
+# lints turned off crate-wide say why below; everything else stays at clippy's
+# defaults, and a deliberate exception is a local, commented #[allow].
+[lints.clippy]
+# The numeric kernels index several parallel fixed-size tables with one loop
+# variable, which reads better than zipped iterators.
+needless_range_loop = "allow"
+# Config structs (the CFR solver's SolveConfig above all) are built by
+# overriding a few defaults, often conditionally or one per test; the
+# struct-update rewrite clippy asks for is not clearer there.
+field_reassign_with_default = "allow"
