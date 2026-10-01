@@ -88,6 +88,7 @@ def _stream_sig(t: LiveTable) -> tuple:
     return (
         t.epoch, t.rev, t.phase, t.hand_no, t.action_seq, len(t.requests),
         hg._runout_shown_len(t) if t.runout_active else 0,
+        hg._runout_settled_len(t) if t.runout_active else 0,  # (the equities follow it)
         hg._runout_award_index(t) if t.runout_active else 0,
         t.next_deal_mono is not None, t.bank_key, t.event_seq, t.reaction_seq, here,
     )

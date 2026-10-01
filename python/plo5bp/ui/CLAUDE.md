@@ -240,15 +240,46 @@ tested: `tests/python/conftest.py` defaults the test session to
 `PLO5BP_FREE_FOR_ALL=0`; `test_public_free_mode.py` boots production's way. Set
 the env var to `0` in `/etc/wrapgto/env` to bring the paywall back.
 
-**Workspace UI (2026-09-22):** Study / Trainer were re-skinned to sit next to the
-home games but stay a TOOL (flat panels, dense type, one accent). The card FACES
-are deliberately the old ones (owner's call) — do not swap in the home-games
-cards. Layout: slim `#top-bar` (mode tabs, format, units, account) + per-mode
-`#workbar` above the table (seats / $ per bb / ante / live controls / New Hand,
-trainer Settings / Repeat / New Hand) + `#side-rail` (Recommendation on top, the
-13 x 4 card matrix or the trainer stats under it). The redesign is the
-"WORKSPACE THEME v2" layer APPENDED to `style.css` — it wins by cascade order, so
-add new workspace styles after it. Card entry is continuous
+**Workspace UI (2026-09-22; the home games' table since 2026-10-01):** Study / Trainer
+sit next to the home games but stay a TOOL. Layout: slim `#top-bar` (mode tabs, format,
+units, account) + per-mode `#workbar` above the table (Study: players / your seat / ante
+/ live controls / Enter cards / Share / New hand; Trainer: Settings / Repeat / New hand)
++ the table + `#side-rail` (desktop: the Trainer's review on top, Recommendation, then the
+13 x 4 card matrix (Study) or History + stats (Trainer); a phone stacks them under the
+table). **ONE card face on the whole site — Study's** (owner, 2026-10-01: "use the
+study/trainer card faces in the home games for uniformity"; suit-colour fill, rank over
+suit top-left, big rank bottom-right, ten = "T").
+- **The table is the home games' (owner 2026-10-01: "bring the same look to the study and
+  trainer", each keeping its features; no buy-ins / rebuys / sitting there).**
+  `games.table.js` draws it and `games.felt.css` styles it (the table part of games.css,
+  split out and shared: section headers 1-8, loaded BEFORE the page's own stylesheet on
+  both pages). `app.table.js` is the adapter: `feltView(s)` turns a Study / Trainer state
+  into a home-games view (money in chips standing in for cents; seats named by position,
+  "Hero" / "You"; Study's boards as five PLACES `{slots}` — null = a card to enter — the
+  Trainer's as dealt streets; opponents face down unless tabled) and `renderTable` calls
+  `HG.table.render(view, prev)` (persistent nodes, diff animations — never rebuild it).
+  A shim defines `HG.core` / `HG.ui` (html/put, `fmtAmt` = `formatUnit`, seat click =
+  Study's seat menu). On top, Study's own: card places are `.slot-pick` (click / Enter
+  selects, double-click / Delete empties; `.slot-sel`, `.slot-next` = where the next card
+  goes), editable stacks, the draggable dealer button, "+" between seats (`#seat-adds`,
+  a mouse and < 6 players), what-if swaps in the Trainer's review (hero decisions only).
+  `#dock` (inside `#stage-wrap`, as on games.html) = the home games' action bar: actor
+  line, the Trainer's last grade, sizing (presets + Edit, slider, amount; a phone's first
+  Bet tap opens it), Fold / Check-Call / Bet-Raise (`.rec` + "Network" badge = the
+  network's choice on Hero's turn in Study), the status strip (hand over — the Trainer's
+  "Next hand" — cards missing, opponents acting), Undo / Redo (Study).
+- **Public build**: the /static mount refuses every `games.*` file, so for a signed-in
+  page `server._link_shared_table_assets` points index.html's two links at
+  `/games/static/<name>?v=<hash>` (signed out: the WGAPP strip drops them with the app).
+  `test_site_landing.py::test_signed_in_page_draws_the_home_games_table` pins the links,
+  their order and that every `$("id")` games.table.js looks up exists in index.html;
+  `test_site_app_js.py::test_the_table_reads_study_and_trainer_states` pins feltView.
+- `style.css` layers: base, "WORKSPACE THEME v2", "WORKSPACE v3", then "WORKSPACE v4"
+  (2026-10-01: the home games' palette on `:root`, the page around the table, the
+  Study/Trainer additions on the felt and dock, the phone column) — it wins by cascade
+  order, so add new workspace styles after it. A shared table rule goes in
+  `games.felt.css` (both pages), never in style.css.
+Card entry is continuous
 (`placeStudyCard` / `nextEmptySlot` in `app.table.js`): a placed card selects the next
 empty slot across groups (hole -> flop A -> flop B -> turn -> river), a card
 clicked with nothing selected fills the first empty slot, and cards can be typed
@@ -333,7 +364,7 @@ PLO6 tables (2026-09-26 — `tests/python/homegame/test_homegame_plo6.py`; owner
   transcripts and the store carry `hole`); a non-PLO5 `hand_id` ends in `:plo6`, so
   the seal names the game. `games.fair.js` maps slots by `s.hole_count` and refuses
   a transcript whose `hole` differs from the table's.
-- **Felt**: `#stage.h6` (games.css) + `ROW` (games.table.js) — a six-card row takes
+- **Felt**: `#stage.h6` (games.felt.css) + `ROW` (games.table.js) — a six-card row takes
   about a five-card row's room: hero cards 0.9x with 0.28 overlap, a tighter
   face-down fan (`--fov/--mid/--rot`), tabled rows from 0.4 overlap up to 0.6. Keep
   the two in step. Found with PLO6's 7-seat default and fixed for every table:
@@ -367,15 +398,36 @@ PLO67 tables (2026-09-27 — `tests/python/homegame/test_homegame_plo67.py`; own
   anything), and per seat `hole_seq` = a hand the viewer may see in DEAL order
   (the felt animates the card a red burn dealt — display order is sorted). While an
   all-in runout reveals, every hand shows what it held on the street shown
-  (`_hole_count_on`), and each street waits `BURN_SHOW_S` (1.2 s) longer
-  (`_street_pause`; the host's pause is 0.3–5 s, there is no instant runout). Equities per street =
-  `_compute_plo67_equities` (the Rust sampler, hands as they were then, shown
-  burns dead) — `board_equities`' per-board marginal does not apply.
+  (`_hole_count_on`). Equities per street = `_street_equities` → the Rust sampler
+  (whole runouts dealt the game's way, so the chance of the extra cards red burns
+  will still deal IS in them — checked against an independent simulation
+  2026-09-29; hands as they were then, shown burns dead) — `board_equities`'
+  per-board marginal does not apply.
+- **All-in runout timeline (every game; owner 2026-09-29: the showdown began before
+  the rivers had landed, and PLO67's burns + extra cards were "impossible to
+  track")**: `_make_runout_plan` (set in `_capture_rabbit`, `t.runout_plan`) =
+  when each street is REVEALED and when it is SETTLED (all its cards down). Street n
+  is revealed one host pause (`_street_pause`, 0.3–5 s) after street n−1 settles; a
+  PLO67 street presents its burn (`RUNOUT_BURN_S` 2.0 s), then — red — one card per
+  live hand, clockwise from the button (`RUNOUT_EXTRA_S` 0.6 s + 0.35 s a hand),
+  then the boards (`RUNOUT_BOARD_S`); other games settle at the reveal. The
+  showdown (`award_at`) starts `RUNOUT_AWARD_BEAT_S` after the river settles
+  (other games: `RUNOUT_BOARD_S` after its reveal). The view's `runout.shown_len` /
+  `settled_len` / `timing` (ms — PLO67 only; the felt animates with exactly these
+  numbers, so client and server never drift) come from the plan; equities and
+  made-hand labels follow `settled_len` — never ahead of the cards on the felt
+  (`_shared_key` and `_stream_sig` carry it).
 - Record: `burns` (the hand's), per seat `hole_seq` + `counts` [flop, turn,
   river]; `_hand_for_viewer` hides `hole_seq` with `hole` (counts are public).
   The replayer shows each seat's first `counts[street]` cards of `hole_seq` (face
   down: that many backs), the burns so far, and "turn · burn A♦ — everyone in gets
   a card" street lines (run-out streets included).
+- **Record v2 (every game)**: an all-in runout's `equities` {board length: {seat:
+  [board 1, board 2]}} for each street that still had cards to come + `runout_from`
+  (`_record_equities`); `_hand_for_viewer` keeps only seats whose cards the viewer
+  may see. The replayer (`openHand`) goes on after the last action — one step per
+  runout street with the equities under the plates, then the result — and the text
+  export prints an "All in · equity" line per street.
 - **Verified shuffle**: `SealedDeck(hole=7, burns=3)`; burn j = slot `7n+10+j`
   (`fairdeal.burn_slot`; transcripts carry `burns` only when nonzero — PLO5/PLO6
   unchanged); `hand_id` ends `:plo67`. The browser (`games.fair.js`) allows a hand
@@ -389,8 +441,12 @@ PLO67 tables (2026-09-27 — `tests/python/homegame/test_homegame_plo67.py`; own
   (a column took the side seats' tabled-row room), a row left of board 1 on a phone
   on its side. A new burn is shown big over the boards, flipped, captioned ("Red
   burn · everyone in gets a card" / "Black burn · no card"), then drops into its
-  slot (`BURN_MS`); a red one's cards fly to every live hand after it (`extraAt`)
-  and the street's board cards wait for both (`boardAt`). At a deal the four go out
+  slot (`BURN_MS`; in an all-in runout `runout.timing.burn_ms`, slower); a red one's
+  cards fly to every live hand after it (`extraAt`; in a runout one hand at a time,
+  clockwise from the button — `extraSlot`) and the street's board cards wait for
+  both (`boardAt`). The REAL felt renders in Node on `hg_mini_dom.js`
+  (`FELT_RUNOUT` in `test_homegame_plo67.py`: re-run games.table.js after
+  `boot()`, which stubs the renderer) — a crash in this path once passed every test. At a deal the four go out
   first, then the flop's burn, then (red) the fifth. A growing row keeps its cards
   (a face-up one slides them aside — FLIP with the translate property) instead of
   rebuilding. `#stage.h7`: hero cards 0.82x / 0.33 overlap, fans centred per seat
@@ -456,10 +512,13 @@ Premium tables pass (2026-09-21 — `tests/python/homegame/test_homegame_premium
   rebuild the table with innerHTML), `games.play.js` (dock: actions, sizing,
   pre-actions, status strip, hotkeys — built once, updated in place),
   `games.sound.js` (WebAudio synth, no audio files). `games.css` is laid out by
-  component (FE-009, 2026-09-28): a CONTENTS index at the top, 19 numbered sections,
+  component (FE-009, 2026-09-28): a CONTENTS index at the top, numbered sections,
   each with its own phone / landscape `@media` blocks right after its base rules, touch
   screens last — add a rule to its component's section, never a dated block at the
-  end (the reorder was checked computed-style-identical in the browser). On-felt sizes are
+  end (the reorder was checked computed-style-identical in the browser). The TABLE's
+  rules (stage, felt, cards, seats, bets, the dock) are `games.felt.css` since 2026-10-01,
+  shared with Study / Trainer and linked BEFORE games.css (also checked computed-style
+  identical); `test_homegame_client_layout.py` reads the two as one. On-felt sizes are
   multiples of `--u` (set by `layout()`); the felt insets in `computeGeom`
   and the seat geometry must stay in step. Player notes/tags and preferences
   are localStorage-only.
@@ -526,7 +585,7 @@ Premium tables pass (2026-09-21 — `tests/python/homegame/test_homegame_premium
   player 409; every buy-in / window amount must buy MORE than the ante.
 - Phone landscape = the `wide` geometry in `games.table.js` (boards side by
   side, hero plate beside the hero cards, no seats along the bottom edge) plus
-  the `(max-height: 480px) and (orientation: landscape)` block in `games.css`
+  the `(max-height: 480px) and (orientation: landscape)` block in `games.felt.css`
   that floats the dock over the felt's bottom corners — keep the two in step.
 - **Tracking (2026-09-23 — `tests/python/homegame/test_homegame_tracking.py`)**: every
   hand record (`homegame_hands.summary`) is REPLAYABLE (`actions` carry the

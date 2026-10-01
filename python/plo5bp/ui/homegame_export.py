@@ -72,6 +72,19 @@ def _visible(hole: Any) -> bool:
     return bool(hole) and all(isinstance(c, int) and c >= 0 for c in hole)
 
 
+def _equity_line(shares: dict[str, Any], name: dict[int, str]) -> str:
+    """"All in · equity, board 1 / board 2: Ann 62% / 41%, Bo 38% / 59%" — an
+    all-in runout's shares on one street (record v2 ``equities``)."""
+    def pct(x: Any) -> str:
+        return f"{round(float(x) * 100)}%" if x is not None else "–"
+
+    parts = [
+        f"{name.get(int(s), f'Seat {int(s) + 1}')} {pct(v[0])} / {pct(v[1])}"
+        for s, v in sorted(shares.items(), key=lambda kv: int(kv[0]))
+    ]
+    return "All in · equity, board 1 / board 2: " + ", ".join(parts)
+
+
 def hand_text(rec: dict[str, Any], game_label: str) -> str:
     """One hand, as the viewer may see it."""
     seats = sorted(rec.get("seats") or [], key=lambda s: int(s.get("seat", 0)))
@@ -96,6 +109,8 @@ def hand_text(rec: dict[str, Any], game_label: str) -> str:
         out.append(f"Dealt to {name[int(me['seat'])]}: {cards(first)}")
     actions = list(rec.get("actions") or [])
     held = PLO67_DEALT
+    equities = rec.get("equities") or {}
+    runout_from = int(rec.get("runout_from") or 6)
     for k, street in enumerate(STREETS):
         n = 3 + k
         if len(ba) < n:
@@ -120,7 +135,11 @@ def hand_text(rec: dict[str, Any], game_label: str) -> str:
             label = str(a.get("label") or "?")
             out.append(f"{name.get(seat, f'Seat {seat + 1}')}: {label[:1].lower() + label[1:]}"
                        + (" (on the clock)" if a.get("auto") else ""))
-    tabled = [s for s in seats if s.get("shown") and _visible(s.get("hole"))]
+        # everyone all in: each street still to be run out, the equities it showed
+        shares = equities.get(str(n)) if n >= runout_from else None
+        if shares:
+            out.append(_equity_line(shares, name))
+    tabled =[s for s in seats if s.get("shown") and _visible(s.get("hole"))]
     if rec.get("showdown") or tabled:
         out.append("*** SHOWDOWN ***" if rec.get("showdown") else "*** SHOWN ***")
         for s in tabled:

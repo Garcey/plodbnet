@@ -75,6 +75,14 @@
     try { rec = await C().j(`/games/api/tables/${gid}/hands/${no}`); } catch (e) { shell.close(null); return toast(e.message, "err"); }
     if (shell.closed) return;
     const N = (rec.actions || []).length;
+    // An all-in runout (record v2: `equities` per street, `runout_from`): after the last
+    // action the replay goes on street by street — each street's equities on the felt,
+    // then the result (owner, 2026-09-29).
+    const FROM = Number(rec.runout_from) || 0;
+    const R = rec.equities && FROM >= 3 ? Math.max(0, 5 - FROM) : 0;
+    const END = N + R;
+    const STREETS = ["flop", "turn", "river"];
+    const pct = (x) => (x == null ? "–" : Math.round(x * 100) + "%");
     const gradeAt = {};
     (rec.grades || []).forEach((g) => { gradeAt[g.i] = g; });
     const names = {};
@@ -92,7 +100,15 @@
     const q = (id) => body.querySelector("#" + id);
 
     function paint() {
-      const st = replayState(rec, k);
+      const st = replayState(rec, Math.min(k, N));
+      // all in: the street being run out and its equities (none on the result)
+      const j = R && k >= N ? k - N : -1;
+      let eqMap = null;
+      if (j >= 0) {
+        st.boardN = FROM + j;
+        st.over = j === R;
+        if (!st.over) eqMap = rec.equities[String(st.boardN)] || null;
+      }
       // seats around the felt, hero at the bottom (each one's place rides in data-vars:
       // --x / --y, games.css .rp-seat)
       const seats = rec.seats.map((x) => {
@@ -104,7 +120,9 @@
         const known = x.hole && x.hole.length && x.hole[0] >= 0;
         const cards = p.folded && !known ? "" : html`<span class="mini-cards" data-cards="${replayHole(x, rec, st.boardN).join(",")}"></span>`;
         const res = st.over ? html`<b class="num ${x.delta_cents > 0 ? "pos" : x.delta_cents < 0 ? "neg" : "muted"}">${x.delta_cents > 0 ? "+" : ""}${d2(x.delta_cents)}</b>` : "";
-        return html`<div class="rp-seat ${p.folded ? "folded" : ""} ${acting ? "acting" : ""}" data-vars="x:${px}%;y:${py}%">${cards}<div class="rp-plate">${avatar(x.name, x.name, "sm", x.avatar)}<div><b>${names[x.seat]}${x.seat === rec.button ? html` <i class="rp-d">D</i>` : ""}</b><span class="num">${d2(Math.max(0, p.stack))}</span></div></div>${p.bet > 0 ? html`<span class="rp-bet num">${d2(p.bet)}</span>` : ""}${res}</div>`;
+        const e = eqMap && eqMap[String(x.seat)];
+        const eq = e ? html`<span class="rp-eq num" title="${names[x.seat]}'s chance to win board 1 · board 2 from here"><span data-b="1">${pct(e[0])}</span><span data-b="2">${pct(e[1])}</span></span>` : "";
+        return html`<div class="rp-seat ${p.folded ? "folded" : ""} ${acting ? "acting" : ""}" data-vars="x:${px}%;y:${py}%">${cards}<div class="rp-plate">${avatar(x.name, x.name, "sm", x.avatar)}<div><b>${names[x.seat]}${x.seat === rec.button ? html` <i class="rp-d">D</i>` : ""}</b><span class="num">${d2(Math.max(0, p.stack))}</span></div></div>${eq}${p.bet > 0 ? html`<span class="rp-bet num">${d2(p.bet)}</span>` : ""}${res}</div>`;
       });
       // PLO67: the burns turned up by this street (a red one dealt everyone still in a card)
       const burns = (rec.burns || []).slice(0, Math.max(0, st.boardN - 2));
@@ -112,17 +130,25 @@
       put(felt, html`${seats}<div class="rp-center"><span class="rp-pot num">Pot ${d2(st.pot)}</span><span class="mini-cards" data-cards="${(rec.board_a || []).slice(0, st.boardN).join(",")}"></span><span class="mini-cards" data-cards="${(rec.board_b || []).slice(0, st.boardN).join(",")}"></span>${burns.length ? html`<span class="rp-burns" title="Burn cards, face up: a red one deals everyone still in the hand another card"><small>Burns</small><span class="mini-cards" data-cards="${burns.join(",")}"></span></span>` : ""}</div>`);
       fillMiniCards(felt);
       // banner: the action just played (with its verdict) and who is up
-      const last = st.last, g = last ? gradeAt[k - 1] : null;
-      put(q("rp-banner"), html`${last ? html`<span class="rp-act k-${kindOfAction(last)}"><b>${names[last.seat] || "?"}</b> ${last.label}${last.auto ? html` <small class="muted">(clock)</small>` : ""}</span>${gradeChip(g)}` : html`<span class="muted">Flop dealt — everyone anted ${d2(rec.ante_cents)}.</span>`}<span class="spacer"></span>${st.next ? html`<span class="muted">${String(st.street).toUpperCase()} · <b class="tx">${names[st.next.seat] || "?"}</b> to act</span>` : html`<span class="pill gold">Hand over</span>`}`);
-      q("rp-step").textContent = `${k} / ${N}`;
+      const last = st.last, g = last && j < 1 ? gradeAt[k - 1] : null;
+      const dealtNow = j >= 1 ? STREETS[st.boardN - 3] : null;  // (a street the runout just dealt)
+      const left = dealtNow
+        ? html`<span class="rp-act k-runout"><b>${dealtNow[0].toUpperCase() + dealtNow.slice(1)}</b> dealt${burnNote(rec, dealtNow)}</span>`
+        : last ? html`<span class="rp-act k-${kindOfAction(last)}"><b>${names[last.seat] || "?"}</b> ${last.label}${last.auto ? html` <small class="muted">(clock)</small>` : ""}</span>${gradeChip(g)}`
+        : html`<span class="muted">Flop dealt — everyone anted ${d2(rec.ante_cents)}.</span>`;
+      const right = st.next ? html`<span class="muted">${String(st.street).toUpperCase()} · <b class="tx">${names[st.next.seat] || "?"}</b> to act</span>`
+        : !st.over ? html`<span class="pill">All in · running it out</span>`
+        : html`<span class="pill gold">Hand over</span>`;
+      put(q("rp-banner"), html`${left}<span class="spacer"></span>${right}`);
+      q("rp-step").textContent = `${k} / ${END}`;
       q("rp-prev").disabled = q("rp-first").disabled = k === 0;
-      q("rp-next").disabled = q("rp-last").disabled = k === N;
+      q("rp-next").disabled = q("rp-last").disabled = k === END;
       body.querySelectorAll("#rp-list .log-row").forEach((r) => r.classList.toggle("on", Number(r.dataset.i) === k - 1));
       const cur = body.querySelector("#rp-list .log-row.on");
       if (cur) cur.scrollIntoView({ block: "nearest" });
       q("rp-result").hidden = !st.over;
     }
-    function go(to) { k = Math.max(0, Math.min(N, to)); paint(); }
+    function go(to) { k = Math.max(0, Math.min(END, to)); paint(); }
 
     // action list (click = jump to just after that action)
     const list = [];
@@ -131,11 +157,20 @@
       if (a2.street !== street) { street = a2.street; list.push(html`<div class="log-street">${street}${burnNote(rec, street)}</div>`); }
       list.push(html`<button type="button" class="log-row k-${kindOfAction(a2)}" data-i="${i}"><span class="nm">${names[a2.seat] || "?"}</span><span class="lb">${a2.label}</span>${gradeChip(gradeAt[i], true)}</button>`);
     });
-    // PLO67: a street run out with nobody to act still turned its burn up (and dealt the cards)
-    const seenStreets = new Set((rec.actions || []).map((x) => String(x.street).toLowerCase()));
-    ["flop", "turn", "river"].slice(0, (rec.burns || []).length).forEach((st) => {
-      if (!seenStreets.has(st)) list.push(html`<div class="log-street">${st}${burnNote(rec, st)}</div>`);
-    });
+    if (R) {
+      // all in: the runout's streets, each a step of its own (its equities on the felt)
+      for (let j = 1; j <= R; j++) {
+        const stName = STREETS[FROM - 3 + j];
+        list.push(html`<div class="log-street">${stName}${burnNote(rec, stName)}</div>`);
+        list.push(html`<button type="button" class="log-row k-runout" data-i="${N + j - 1}"><span class="nm">All in</span><span class="lb">${j < R ? "run out — the equities" : "run out — the result"}</span></button>`);
+      }
+    } else {
+      // PLO67: a street run out with nobody to act still turned its burn up (and dealt the cards)
+      const seenStreets = new Set((rec.actions || []).map((x) => String(x.street).toLowerCase()));
+      STREETS.slice(0, (rec.burns || []).length).forEach((st) => {
+        if (!seenStreets.has(st)) list.push(html`<div class="log-street">${st}${burnNote(rec, st)}</div>`);
+      });
+    }
     put(q("rp-list"), list.length ? html`${list}` : html`<div class="muted">No betting — everyone was all-in from the ante.</div>`);
     q("rp-list").addEventListener("click", (e) => { const r = e.target.closest(".log-row"); if (r) go(Number(r.dataset.i) + 1); });
     const awards = (rec.awards || []).map((w) => {
@@ -148,8 +183,8 @@
     q("rp-first").addEventListener("click", () => go(0));
     q("rp-prev").addEventListener("click", () => go(k - 1));
     q("rp-next").addEventListener("click", () => go(k + 1));
-    q("rp-last").addEventListener("click", () => go(N));
-    if (q("rp-study")) q("rp-study").addEventListener("click", () => askStudy(rec, k));
+    q("rp-last").addEventListener("click", () => go(END));
+    if (q("rp-study")) q("rp-study").addEventListener("click", () => askStudy(rec, Math.min(k, N)));
     // a link to this hand (FEAT-010): the table's page opens it for any club member,
     // with the usual reveal rules for the cards
     q("rp-link").addEventListener("click", async () => {
@@ -177,7 +212,7 @@
       if (e.key === "ArrowRight") { e.preventDefault(); go(k + 1); }
       else if (e.key === "ArrowLeft") { e.preventDefault(); go(k - 1); }
       else if (e.key === "Home") { e.preventDefault(); go(0); }
-      else if (e.key === "End") { e.preventDefault(); go(N); }
+      else if (e.key === "End") { e.preventDefault(); go(END); }
     };
     document.addEventListener("keydown", onKey);
     const graded = (rec.grades || []).length;

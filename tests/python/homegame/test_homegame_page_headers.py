@@ -14,7 +14,7 @@ from starlette.testclient import TestClient
 
 ADMIN_EMAIL = "admin@headers.example"
 STATIC = Path(__file__).resolve().parents[3] / "python" / "plo5bp" / "ui" / "static"
-CLIENT_FILES = [STATIC / "games.html", STATIC / "games.css", *sorted(STATIC.glob("games*.js"))]
+CLIENT_FILES = [STATIC / "games.html", *sorted(STATIC.glob("games*.css")), *sorted(STATIC.glob("games*.js"))]
 
 
 @pytest.fixture(scope="module")

@@ -15,15 +15,13 @@
 // shape a chart didn't expect) must not abort the rest and leave the table
 // half-drawn or the action buttons missing (review 2026-09-20 F5).
 const RENDER_STEPS = [
-  renderTopBar, renderSeats, renderBoards, renderHeroHole,
-  renderHeroHandLabels, renderDealerButton, renderPotLabel, renderActorBanner,
+  renderTopBar, renderTable, renderHeroHandLabels, renderActorBanner,
   renderActions, syncPresetPop, renderRecommendation, renderHistory,
   renderCardGrid, renderTrainer, renderTableChrome, syncCardPicker,
 ];
 
 function render(s) {
   if (!s) return;  // nothing to draw before the first state (review 2026-09-20 F17)
-  applyTableLayout();
   for (const step of RENDER_STEPS) {
     try { step(s); }
     catch (e) { console.error(`render: ${step.name} failed`, e); }
@@ -60,18 +58,14 @@ function stopWorking() {
   if (UI.workingText) setWorking(null);
 }
 
+// (the table keeps what it showed, dimmed, until the new state is drawn over it)
 function showLoadingState() {
-  applyTableLayout();
   const rec = document.getElementById("recommendation");
   if (rec) rec.innerHTML = '<p class="muted">Loading the table…</p>';
-  const pot = document.getElementById("pot-badge");
-  if (pot) pot.setAttribute("hidden", "");
-  for (const id of ["seats", "board-a", "board-b", "hero-hole", "hero-hand-labels"]) {
-    const g = document.getElementById(id);
-    if (g) g.innerHTML = "";
-  }
-  const dealer = document.getElementById("dealer-button");
-  if (dealer) dealer.style.display = "none";
+  const wrap = document.getElementById("stage-wrap");
+  if (wrap) wrap.classList.add("loading");
+  const labels = document.getElementById("hero-hand-labels");
+  if (labels) { labels.innerHTML = ""; labels.dataset.k = ""; }
   const lv = document.getElementById("last-verdict");
   if (lv) lv.hidden = true;
 }

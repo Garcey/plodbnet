@@ -196,3 +196,30 @@ def test_signed_in_page_loads_every_client_part(server):
         assert "immutable" in r.headers["cache-control"], name
         assert "WGLIVE" not in r.text and "pokernow" not in r.text.lower() and "/ocr/" not in r.text
     assert "/static/app." not in _anon(server).get("/").text
+
+
+def test_signed_in_page_draws_the_home_games_table(server):
+    """2026-10-01: Study and Trainer draw the home games' table. A signed-in page links
+    its stylesheet and renderer from their gated home, /games/static (the /static
+    mount refuses every games.* file), versioned, the stylesheet before style.css and
+    the renderer before the client; a signed-out page links neither. Every element the
+    renderer looks up is in the page."""
+    c = TestClient(server.app, raise_server_exceptions=False)
+    assert c.get("/auth/dev", params={"email": "felt@example.com"}).status_code == 200
+    html = c.get("/").text
+    css = re.search(r'<link rel="stylesheet" href="/games/static/games\.felt\.css\?v=([0-9a-f]+)"', html)
+    js = re.search(r'<script src="/games/static/games\.table\.js\?v=([0-9a-f]+)"></script>', html)
+    assert css and js
+    assert html.index("games.felt.css") < html.index("/static/style.css")
+    assert html.index("games.table.js") < html.index("/static/app.core.js")
+    for name, m in (("games.felt.css", css), ("games.table.js", js)):
+        assert c.get(f"/games/static/{name}?v={m.group(1)}").status_code == 200, name
+        assert c.get(f"/static/{name}").status_code == 404, name
+    anon = _anon(server).get("/").text
+    assert "games.felt.css" not in anon and "games.table.js" not in anon
+    renderer = (server.STATIC_DIR / "games.table.js").read_text(encoding="utf-8")
+    page = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    ids = sorted(set(re.findall(r'\$\("([a-z0-9-]+)"\)', renderer)))
+    assert len(ids) > 15
+    for el_id in ids:
+        assert f'id="{el_id}"' in page, el_id

@@ -58,16 +58,17 @@ function setupHistoryRewind() {
     const row = e.target.closest("[data-rewind]");
     if (row) rewindTo(parseInt(row.dataset.rewind, 10));
   });
-  const head = document.querySelector("#history-panel .panel-head-row");
-  if (head && !document.getElementById("redo-btn")) {
+  // Redo sits next to Undo, in the dock (2026-10-01)
+  const undo = document.getElementById("undo-btn");
+  if (undo && !document.getElementById("redo-btn")) {
     const redo = document.createElement("button");
     redo.id = "redo-btn";
     redo.type = "button";
-    redo.className = "study-only";
+    redo.className = "btn sm study-only";
     redo.textContent = "Redo";
     redo.hidden = true;
     redo.addEventListener("click", redoOne);
-    head.appendChild(redo);
+    undo.after(redo);
   }
 }
 

@@ -8,8 +8,9 @@ that uses a later one while it loads fails here. Then the money / label /
 card-order / spot-link helpers are checked on fixed inputs: number
 formatting in both units, bet-vs-raise labels as raise-TO totals, the
 street-commit walk (incl. preflop blinds), next-empty-slot order, preset
-chip labels, share-link encoding, error wording, and the Trainer → Study
-spot conversion. Skipped without Node.
+chip labels, share-link encoding, error wording, the Trainer → Study
+spot conversion, and the table both modes draw — the home games' felt
+(games.table.js), fed by app.table.js's feltView. Skipped without Node.
 """
 
 from __future__ import annotations
@@ -129,6 +130,22 @@ out.curve = run(`UI.unit = "bb"; const anchors = [0,1,2,3,4,5,6,7,8,9,10].map((k
   chips: 10000 + k * 20000, prob: [0.1, 0, 0, 0.3, 0, 0, 0.4, 0, 0, 0, 0.2][k]}));
   const svg = betCurveSVG({anchors, rec_anchor: 6, rec_chips: 130000, pot_ref_chips: 210000, gate_distribution: [0, 0.4, 0.6]}, S({actor: null, seats: []}), true);
   JSON.stringify({hits: (svg.match(/class="bc-hit"/g) || []).length, top: (svg.match(/data-top="([^"]*)"/) || [])[1]})`);
+// --- the home games' table, read from a Study / Trainer state (2026-10-01)
+out.felt = run(`UI.unit = "bb"; const fs = {format: "plo5_double_bomb", num_seats: 3, hero_seat: 0, button_seat: 2,
+  actor: 1, street: "flop", pot_chips: 110000, chip_scale: {bb_chips: 10000, ante_chips: 30000},
+  starting_stacks_chips: [170000, 170000, 170000],
+  card_spec: {hero_hole: [51, null, 39, null, 35], flop_a: [0, 4, 8], flop_b: [9, null, 13], turn: [null, null], river: [null, null]},
+  seats: [{seat: 0, position: "BTN", stack_chips: 170000},
+          {seat: 1, position: "SB", stack_chips: 150000, committed_this_street_chips: 20000, is_actor: true},
+          {seat: 2, position: "BB", stack_chips: 170000, hole: [1, 2, 3, 4, 5]}],
+  history: [{seat: 1, street: "flop", action: "BetPct50", chips: 20000}]};
+  const v = feltView(fs);
+  const t = feltView(Object.assign({}, fs, {trainer: {hand_no: 7},
+    card_spec: Object.assign({}, fs.card_spec, {hero_hole: [51, 47, 39, 43, 35], flop_b: [9, 12, 13]})}));
+  JSON.stringify({id: v.id, hole: v.seats[0].hole, names: v.seats.map((x) => x.name), av: v.seats.map((x) => x.av_text),
+    opp: v.seats[1].hole, tabled: v.seats[2].hole, boardA: v.board.a, boardB: v.board.b,
+    hist: v.history, money: [v.pot_cents, v.stakes.bb_cents, v.seats[1].stack_cents, v.seats[1].committed_this_street_cents],
+    trainer: {id: t.id, hand: t.hand_no, names: t.seats.map((x) => x.name), hole: t.seats[0].hole, boardA: t.board.a, boardB: t.board.b}})`);
 process.stdout.write(JSON.stringify(out));
 """
 
@@ -227,6 +244,28 @@ def test_bet_curve_reads_out_its_numbers(js):
     curve = json.loads(js["curve"])
     assert curve["hits"] == 11
     assert curve["top"] == "Top sizes: 60% pot 40% · 30% pot 30% · Pot 20%"
+
+
+def test_the_table_reads_study_and_trainer_states(js):
+    """2026-10-01: Study and Trainer draw the home games' table. feltView hands it
+    a home-games view: Study's places stay places (null = a card still to enter;
+    opponents face down), the Trainer's boards come as dealt streets, money in chips."""
+    f = json.loads(js["felt"])
+    assert f["id"] == "study:plo5_double_bomb"
+    assert f["hole"] == [51, None, 39, None, 35]              # Study: an empty place stays empty
+    assert f["names"] == ["Hero", "Small blind", "Big blind"]
+    assert f["av"] == ["BTN", "SB", "BB"]
+    assert f["opp"] == [-1] * 5                               # an opponent's cards: face down
+    assert f["tabled"] == [1, 2, 3, 4, 5]                     # tabled (the Trainer's showdown, its review)
+    assert f["boardA"] == {"slots": [0, 4, 8, None, None]}
+    assert f["boardB"] == {"slots": [9, None, 13, None, None]}
+    assert f["hist"] == [{"seat": 1, "street": "flop", "action": 2, "chips": 20000, "cents": 20000, "to_cents": 20000}]
+    assert f["money"] == [110000, 10000, 150000, 20000]       # (chips stand in for the home games' cents)
+    t = f["trainer"]
+    assert t["id"] == "trainer:plo5_double_bomb" and t["hand"] == 7
+    assert t["names"][0] == "You" and t["hole"] == [51, 47, 39, 43, 35]
+    assert t["boardA"] == {"flop": [0, 4, 8], "turn": None, "river": None}
+    assert t["boardB"] == {"flop": [9, 12, 13], "turn": None, "river": None}
 
 
 # --- the split client (FE-019) ------------------------------------------------------

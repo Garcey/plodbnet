@@ -13,9 +13,11 @@ PLO67 is never graded and keeps its own club numbers.
 """
 from __future__ import annotations
 
+import json
 import random
 import sys
 import time
+from pathlib import Path
 
 import pytest
 from starlette.testclient import TestClient
@@ -117,13 +119,18 @@ def _jam_out(cast, gid):
     raise AssertionError("hand did not end")
 
 
-def _runout_at(hg, gid, board_len):
-    """Wind an all-in runout's clock to the moment it shows ``board_len`` cards."""
+def _runout_at(hg, gid, board_len, *, down=False):
+    """Wind an all-in runout's clock to the moment it REVEALS ``board_len`` cards
+    (``down=True``: the moment that street's burn, extra cards and board cards are
+    all down — what the equities describe)."""
     t = hg.HUB.get(gid)
     with t.lock:
-        pause = hg._street_pause(t)
-        start = max(3, int(t.runout_start_len or 3))
-        t.runout_started_mono = time.monotonic() - pause * (board_len - start) - 0.05
+        at = hg._runout_plan(t)["settled" if down else "reveal"][board_len]
+        t.runout_started_mono = time.monotonic() - at - 0.05
+
+
+def _eqs(s, seats):
+    return {x["seat"]: (x["equity_a"], x["equity_b"]) for x in s["seats"] if x["seat"] in seats}
 
 
 def _finish_runout(hg, gid):
@@ -260,7 +267,18 @@ def test_an_all_in_runout_reveals_burn_by_burn_with_each_hand_as_it_was(cast, hg
     t = hg.HUB.get(gid)
     with t.lock:
         assert t.runout_active and t.runout_start_len == 3
-        assert abs(hg._street_pause(t) - (1.5 + hg.BURN_SHOW_S)) < 1e-9, "a runout street waits for its burn"
+        # the timeline: each street is revealed one pause after the last is DOWN; a
+        # red street presents its burn, one card per hand in turn, then the boards;
+        # the showdown only once the river is down (owner, 2026-09-29)
+        plan = hg._runout_plan(t)
+        extras = hg.RUNOUT_EXTRA_S + (plan["hands"] - 1) * hg.RUNOUT_EXTRA_GAP_S
+        red_street = hg.RUNOUT_BURN_S + extras + hg.RUNOUT_BOARD_S
+        assert plan["reveal"][4] == pytest.approx(1.5), "the turn comes one pause after the flop"
+        assert plan["settled"][4] - plan["reveal"][4] == pytest.approx(red_street)
+        assert plan["reveal"][5] - plan["settled"][4] == pytest.approx(1.5)
+        assert plan["settled"][5] - plan["reveal"][5] == pytest.approx(red_street)
+        assert plan["award_at"] - plan["settled"][5] == pytest.approx(hg.RUNOUT_AWARD_BEAT_S)
+        assert hg._street_pause(t) == pytest.approx(1.5), "the view reports the host's own setting"
         eq = dict(t.equity_by_len)
         payouts = list(t.last_deltas)
         commit = list(t.terminal_commit)
@@ -283,6 +301,9 @@ def test_an_all_in_runout_reveals_burn_by_burn_with_each_hand_as_it_was(cast, hg
         if x["seat"] in live:
             assert sorted(x["hole"]) == _hole(dealt, x["seat"], 4), "tabled as it was on the flop"
             assert x["equity_a"] is not None
+    flop_eq = _eqs(s, live)
+    assert flop_eq == {i: (eq[(3, 3)][i]["a"], eq[(3, 3)][i]["b"]) for i in live}
+    assert s["runout"]["timing"]["burn_ms"] == int(hg.RUNOUT_BURN_S * 1000), "the table animates by the plan"
     # turn shown: the red turn burn dealt everyone a fifth card
     _runout_at(hg, gid, 4)
     s = _state(p[0], gid)
@@ -290,13 +311,26 @@ def test_an_all_in_runout_reveals_burn_by_burn_with_each_hand_as_it_was(cast, hg
     for x in s["seats"]:
         if x["seat"] in live:
             assert sorted(x["hole"]) == _hole(dealt, x["seat"], 5)
-    # river: the sixth
+    # ... but until its burn, the extra cards and the board cards are DOWN, the
+    # equities are still the flop's: they never run ahead of what the table shows
+    assert s["runout"]["settled_len"] == 3 and _eqs(s, live) == flop_eq
+    _runout_at(hg, gid, 4, down=True)
+    s = _state(p[0], gid)
+    assert s["runout"]["settled_len"] == 4
+    assert _eqs(s, live) == {i: (eq[(4, 4)][i]["a"], eq[(4, 4)][i]["b"]) for i in live}
+    # river: the sixth — and no showdown until the river is down
     _runout_at(hg, gid, 5)
     s = _state(p[0], gid)
     assert len(s["burns"]) == 3
+    assert s["runout"]["award_index"] == -1 and s["runout"]["blocking"], "the showdown waits for the river"
     for x in s["seats"]:
         if x["seat"] in live:
             assert sorted(x["hole"]) == _hole(dealt, x["seat"], 6)
+    t = hg.HUB.get(gid)
+    with t.lock:
+        t.runout_started_mono = time.monotonic() - hg._runout_plan(t)["award_at"] - 0.05
+    s = _state(p[0], gid)
+    assert s["runout"]["award_index"] == 0, "the showdown starts once the river is down"
     # the award script pays exactly what the engine paid (six-card hands)
     for i in range(3):
         won = sum(int(a["shares"].get(str(i), 0)) for a in awards)
@@ -308,6 +342,15 @@ def test_an_all_in_runout_reveals_burn_by_burn_with_each_hand_as_it_was(cast, hg
     s = _state(p[0], gid)
     assert s["phase"] == "showdown" and not s["runout"]["blocking"]
     assert sum(r["net_cents"] for r in s["ledger"]) == 0
+    # the hand's record keeps the equities the table showed (the flop's with four
+    # cards a hand, the turn's with five), and the text history prints them
+    rec = p[0].get(f"/games/api/tables/{gid}/hands/{s['hand_no']}").json()
+    assert rec["runout_from"] == 3 and set(rec["equities"]) == {"3", "4"}
+    for nb in (3, 4):
+        assert rec["equities"][str(nb)] == {
+            str(i): [round(eq[(nb, nb)][i]["a"], 4), round(eq[(nb, nb)][i]["b"], 4)] for i in live}
+    txt = p[0].get(f"/games/api/tables/{gid}/hands/export", params={"format": "txt"}).text
+    assert sum(ln.startswith("All in · equity") for ln in txt.splitlines()) == 2
     assert _post(p[0], gid, "run", {"running": False}).status_code == 200
 
 
@@ -407,7 +450,6 @@ process.stdout.write(JSON.stringify(out));
 
 
 def test_the_browser_checks_plo67_cards_burns_and_counts(tmp_path):
-    import json
     import shutil
     import subprocess
 
@@ -458,6 +500,60 @@ def test_the_browser_checks_plo67_cards_burns_and_counts(tmp_path):
     assert out["count_ok"] is None
     assert out["count_bad"], "a hand that missed (or gained) a red burn's card is caught"
     assert out["count_rabbit"] is None, "a fold-out's rabbit burns dealt nobody a card"
+
+
+FELT_RUNOUT = r"""
+(async () => {
+  const B = boot(() => ({}));
+  // the REAL felt renderer (boot() stubs it out for the window tests)
+  vm.runInContext(fs.readFileSync(process.argv[2] + "/games.table.js", "utf8").replace(/\r\n/g, "\n"), B.ctx, { filename: "games.table.js" });
+  const game = { code: "plo67", label: "PLO67", name: "PLO67", hole: 7, dealt: 4, burns: 3, max_seats: 5, graded: false };
+  const holes = [[0, 5, 10, 15], [20, 25, 30, 35], [40, 45, 50, 3]], extra = [7, 11, 23];
+  const seat = (i, hole) => ({ seat: i, empty: false, name: "P" + i, user_id: i + 1, stack_cents: 0, in_hand: true, folded: false,
+    all_in: true, sitting_out: false, present: true, is_host: i === 0, avatar: null, hole, hole_seq: hole, hand_desc: ["Pair", "Pair"],
+    equity_a: 0.3, equity_b: 0.3 });
+  const at = (shown, settled, burns) => table({
+    variant: "plo67", hole_count: 7, game, num_seats: 3, my_seat: 0, hero_seat: 0, button_seat: 2, phase: "showdown", hand_no: 5,
+    street: "river", burns, burns_played: 3, pot_cents: 12000, history: [],
+    board: { a: { flop: [1, 2, 4], turn: 6, river: shown >= 5 ? 8 : null }, b: { flop: [9, 12, 13], turn: 14, river: shown >= 5 ? 24 : null } },
+    runout: { active: true, blocking: true, start_len: 3, shown_len: shown, settled_len: settled, pause_secs: 1.5, next_in_secs: 1,
+      timing: { burn_ms: 2000, extra_ms: 600, extra_gap_ms: 350, board_ms: 600 }, award_index: -1, award_count: 1, award_step: null },
+    seats: holes.map((h, i) => seat(i, (burns.length === 3 ? h.concat([extra[i]]) : h).slice().sort((a, b) => b - a))),
+  });
+  const out = {};
+  try {
+    const turn = at(4, 4, [16, 19]);            // two black burns: four cards a hand
+    B.HG.table.render(turn, null);
+    B.HG.table.render(at(5, 4, [16, 19, 22]), turn);  // the river's burn is red (22 = 7 of hearts)
+    const seats = B.W.doc.querySelectorAll(".seat");
+    out.rows = seats.map((e) => e.querySelectorAll(".seat-cards > *").length);
+    out.extra = seats.map((e) => e.querySelectorAll(".seat-cards > .deal-in").map((c) => [c.style.animationDelay, c.style.animationDuration]));
+    out.board = B.W.doc.querySelectorAll(".pop-in").map((c) => parseInt(c.style.animationDelay, 10));
+    out.ok = true;
+  } catch (e) { out.ok = false; out.err = String((e && e.stack) || e); }
+  console.log(JSON.stringify(out));
+})();
+"""
+
+
+def test_the_felt_deals_a_red_burns_cards_one_hand_at_a_time_in_an_all_in_runout(tmp_path):
+    """(owner, 2026-09-29: an all-in PLO67 runout was "impossible to track") The felt
+    presents a runout's red burn for the server's `burn_ms`, then deals its cards one
+    hand after another, clockwise from the button, `extra_gap_ms` apart, each flight
+    `extra_ms` long, and the street's board cards only after that. Rendered by the REAL
+    felt in Node: the first cut of this crashed the render ("i is not defined") the
+    moment a red burn grew a seat's row, and no test drew the felt then."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from hg_client_tools import STATIC, UI_BOOT, UI_FILES, node_exe, run_node
+
+    if node_exe() is None:
+        pytest.skip("node is not installed")
+    got = run_node(UI_BOOT + FELT_RUNOUT, STATIC, json.dumps(UI_FILES), tmp=tmp_path)
+    assert got["ok"], got.get("err")
+    assert got["rows"] == [5, 5, 5], "every hand still in got one more card"
+    # the button is seat 2: seat 0 first, then 1, then the button
+    assert got["extra"] == [[["2000ms", "600ms"]], [["2350ms", "600ms"]], [["2700ms", "600ms"]]]
+    assert got["board"] and min(got["board"]) >= 2000 + 600 + 2 * 350, "the river waits for the last extra card"
 
 
 # --- grading and the club --------------------------------------------------------------------

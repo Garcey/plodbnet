@@ -293,8 +293,14 @@ def matching(rules: list[Rule], path: list[El], media=()) -> list[Rule]:
     return out
 
 
+#: The home-games page's stylesheets, in the order games.html loads them: the table
+#: (games.felt.css — shared with Study / Trainer since 2026-10-01), then the page.
+GAMES_CSS_FILES = ("games.felt.css", "games.css")
+
+
 def games_css() -> str:
-    return (STATIC / "games.css").read_text(encoding="utf-8")
+    """Everything the home-games page styles itself with, in load order (one cascade)."""
+    return "\n".join((STATIC / name).read_text(encoding="utf-8") for name in GAMES_CSS_FILES)
 
 
 # ------------------------------------------------------------------ node

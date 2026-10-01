@@ -320,6 +320,64 @@ def test_grades_follow_the_cards_a_tabled_hand_yes_a_mucked_hand_no(cast, hg):
     assert st["graded"] >= 1 and st["accuracy"] is not None, "the hidden marks still count"
 
 
+def test_an_all_in_hand_keeps_its_equities_street_by_street(cast, hg):
+    """(owner, 2026-09-29) "I would like all in equities to be shown in the hand
+    histories": the record keeps the shares the table showed on every street that
+    still had cards to come (record v2), the text history prints them, and the
+    showdown waits until the river's card has landed."""
+    p = cast["p"]
+    gid = _table(cast, 2)
+    _post(p[0], gid, "run", {"running": True})
+    for _ in range(40):  # pot-limit: raise the pot until someone is all in, then call
+        cl, s = _actor(cast, gid)
+        if cl is None:
+            break
+        body = ({"gate": "raise", "raise_to_chips": s["raise_bounds"]["max_chips"] + s["street_commit_chips"]}
+                if s["legal"]["raise"] else {"gate": "check_call"})
+        assert _post(cl, gid, "act", body).status_code == 200
+    t = hg.HUB.get(gid)
+    with t.lock:
+        assert t.runout_active and t.runout_start_len == 3
+        plan = hg._runout_plan(t)
+        assert plan["settled"] == plan["reveal"], "PLO5: a street's cards land within the pause"
+        assert plan["award_at"] == pytest.approx(plan["reveal"][5] + hg.RUNOUT_BOARD_S), \
+            "the showdown starts once the river card has landed, not as it is revealed"
+        assert hg._runout_timing(t) is None, "only PLO67's runout is slowed down"
+        eq = dict(t.equity_by_len)
+        t.runout_started_mono -= 600.0  # (skip the reveal pauses)
+    rec = p[0].get(f"/games/api/tables/{gid}/hands/1").json()
+    assert rec["v"] >= 2 and rec["runout_from"] == 3
+    assert set(rec["equities"]) == {"3", "4"}, "the flop and the turn — the river has nothing to come"
+    for nb in (3, 4):
+        shares = rec["equities"][str(nb)]
+        assert shares == {str(i): [round(v["a"], 4), round(v["b"], 4)] for i, v in eq[(nb, nb)].items()}
+        for b in (0, 1):
+            assert sum(v[b] for v in shares.values()) == pytest.approx(1.0, abs=2e-4)
+    # a club member who wasn't at the table sees them too: both hands were tabled
+    assert p[3].get(f"/games/api/tables/{gid}/hands/1").json()["equities"] == rec["equities"]
+    txt = p[0].get(f"/games/api/tables/{gid}/hands/export", params={"format": "txt"}).text
+    lines = [ln for ln in txt.splitlines() if ln.startswith("All in · equity")]
+    assert len(lines) == 2, txt
+    assert "me " in lines[0] and "jeff " in lines[0] and "%" in lines[0]
+
+
+def test_equities_follow_the_cards_in_the_history(hg):
+    """A hand the viewer can't see never leaks through its equities (defence in
+    depth: at an all-in showdown every live hand is tabled)."""
+    rec = {
+        "seats": [{"seat": 0, "user_id": 7, "hole": [1, 2, 3, 4, 5], "shown": False},
+                  {"seat": 1, "user_id": 8, "hole": [6, 7, 8, 9, 10], "shown": True},
+                  {"seat": 2, "user_id": 9, "hole": [11, 12, 13, 14, 15], "shown": False}],
+        "equities": {"3": {"0": [0.5, 0.2], "1": [0.3, 0.5], "2": [0.2, 0.3]}},
+        "runout_from": 3, "grades": [],
+    }
+    mine = hg._hand_for_viewer(rec, 7)
+    assert mine["equities"] == {"3": {"0": [0.5, 0.2], "1": [0.3, 0.5]}}, "yours + the tabled hand"
+    other = hg._hand_for_viewer(rec, 99)
+    assert other["equities"] == {"3": {"1": [0.3, 0.5]}}
+    assert rec["equities"]["3"].keys() == {"0", "1", "2"}, "the stored record is untouched"
+
+
 def test_clock_actions_are_recorded_but_not_graded(cast, hg):
     p = cast["p"]
     gid = _table(cast, 2, decision_secs=10)

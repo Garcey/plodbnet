@@ -364,6 +364,10 @@ const UI = {
   raiseUserSet: false,
   raiseLastActor: null,
   raiseNodeKey: null,     // decision node the raise input's value belongs to
+  raiseTo: null,          // the dock's bet / raise-TO total, in chips
+  raiseCtx: null,         // that decision's window (renderRaiseSection)
+  raisePresets: null,     // the preset buttons' totals
+  sizingOpen: false,      // a phone: the sizing panel was opened by a first Bet / Raise tap
   // Mode/format context epoch: bumped on every mode or format switch. A
   // response requested under an older epoch is stale and must not be applied
   // (review 2026-09-20 F4).
@@ -664,7 +668,6 @@ async function postSeats(body) {
 // Best-effort: elements may be absent/re-rendered, so guard every lookup.
 function setActionsBusy(busy) {
   const ids = [
-    "raise-submit",
     "trainer-new-hand-btn", "trainer-repeat-btn",
     "review-next-hand", "review-repeat-hand",
   ];
@@ -672,13 +675,13 @@ function setActionsBusy(busy) {
     const el = document.getElementById(id);
     if (el) el.disabled = busy;
   }
-  const gate = document.getElementById("gate-buttons");
-  if (gate) {
-    gate.classList.toggle("busy", busy);
+  const btns = document.getElementById("act-btns");
+  if (btns) {
+    btns.classList.toggle("sending", busy);
     // Un-busy must not resurrect buttons that were rendered disabled (illegal
-    // gate / hero blocked on cards): renderActions records each button's
-    // legality in data-legal (review 2026-09-20 F2).
-    for (const b of gate.querySelectorAll("button")) {
+    // gate): renderActions records each button's legality in data-legal
+    // (review 2026-09-20 F2). The raise button is legal whenever it shows.
+    for (const b of btns.querySelectorAll("button.act")) {
       b.disabled = busy || b.dataset.legal === "0";
     }
   }
@@ -695,10 +698,11 @@ function resetRaiseEntry() {
 // Mode/format switch: the previous context's controls must not stay live
 // (or visible) while the new state is still loading (review 2026-09-20 F4).
 function clearActionControls() {
-  const gate = document.getElementById("gate-buttons");
-  if (gate) gate.innerHTML = "";
-  const raiseSection = document.getElementById("raise-section");
-  if (raiseSection) raiseSection.hidden = true;
+  const btns = document.getElementById("act-btns");
+  if (btns) btns.hidden = true;
+  const sizing = document.getElementById("sizing");
+  if (sizing) sizing.hidden = true;
+  UI.raiseCtx = null;
   closeBetPresetEditor();
 }
 async function postAction(body) {

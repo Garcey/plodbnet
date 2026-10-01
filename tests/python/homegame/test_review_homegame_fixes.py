@@ -334,9 +334,8 @@ def test_g11_nothing_in_the_payload_runs_ahead_of_the_runout(cast, hg, allin):
 def test_g11_award_steps_are_released_one_at_a_time(cast, hg, allin):
     gid = allin["gid"]
     t = _live(hg, gid)
-    with t.lock:  # jump to: river shown, first award step in progress
-        span = (5 - t.runout_start_len) * t.street_pause_secs
-        t.runout_started_mono = time.monotonic() - span - 0.2 * hg.AWARD_SECS
+    with t.lock:  # jump to: river down, first award step in progress
+        t.runout_started_mono = time.monotonic() - hg._runout_plan(t)["award_at"] - 0.2 * hg.AWARD_SECS
     s = _state(cast["p"][1], gid)
     assert s["runout"]["shown_len"] == 5 and s["runout"]["award_index"] == 0
     assert len(s["pot_awards"]) == 1 and s["runout"]["award_step"] == s["pot_awards"][0]

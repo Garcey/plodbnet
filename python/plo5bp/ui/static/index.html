@@ -30,12 +30,18 @@
     <!-- WGFONTS:START (replaced by the self-hosted fonts once static/fonts/ has them) -->
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400..700&family=Geist+Mono:wght@400..700&display=swap" rel="stylesheet" />
+    <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400..800&family=Geist+Mono:wght@400..700&display=swap" rel="stylesheet" />
     <!-- WGFONTS:END -->
+    <!-- WGAPP:START (the table's look, shared with the home games: signed-in pages only) -->
+    <link rel="stylesheet" href="/static/games.felt.css" />
+    <!-- WGAPP:END -->
     <link rel="stylesheet" href="/static/style.css" />
   </head>
   <body>
     <!-- WGAPP:START (public build: stripped server-side for signed-out visitors) -->
+    <svg class="sprite" width="0" height="0" aria-hidden="true">
+      <symbol id="i-mark" viewBox="0 0 96 96"><path d="M28 12H68Q84 12 84 28V68Q84 84 68 84H28Q12 84 12 68V44Q12 30 26 30H44Q56 30 56 42V46Q56 56 46 56" stroke-width="11" /></symbol>
+    </svg>
     <header id="top-bar">
       <a class="brand" href="/" aria-label="WrapGTO">
         <svg class="brand-logo" viewBox="0 0 96 96" aria-hidden="true">
@@ -172,105 +178,89 @@
             <button id="study-guide-close" type="button" class="guide-close" aria-label="Hide the guide">&#10005;</button>
           </div>
           <ol class="guide-steps">
-            <li><b>Set the table.</b> Choose <em>Your seat</em> and the number of players above; click any stack to change it, or use a seat&rsquo;s <span class="kbd-inline">&#8943;</span> menu.</li>
+            <li><b>Set the table.</b> Choose <em>Your seat</em> and the number of players above; click any stack to change it, or click a seat for its menu.</li>
             <li><b>Enter the cards.</b> Click cards in the grid &mdash; or type a rank then a suit, like <kbd>A</kbd><kbd>s</kbd>. They fill your hand, then the flops, turns and rivers, in order.</li>
             <li><b>Enter every action in order</b> &mdash; each player&rsquo;s Fold, Check/Call or Bet, yours included. Undo or click a history line to go back.</li>
             <li><b>Read the network&rsquo;s answer</b> in Recommendation on your turns: its top action, how often it takes each action, and the sizes it likes.</li>
           </ol>
         </div>
-        <div id="table-wrap">
+        <div id="stage-wrap" class="hg-felt">
           <p id="table-summary" class="sr-only"></p>
-          <svg id="table-svg" viewBox="0 0 800 560" xmlns="http://www.w3.org/2000/svg" role="group" aria-label="Poker table">
-            <title>Poker table</title>
-            <defs>
-              <radialGradient id="felt-gradient" cx="50%" cy="36%" r="70%">
-                <stop offset="0%" stop-color="#2c6e5c" />
-                <stop offset="50%" stop-color="#175044" />
-                <stop offset="100%" stop-color="#0a2b25" />
-              </radialGradient>
-              <linearGradient id="rim-gradient" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stop-color="#6e4c33" />
-                <stop offset="35%" stop-color="#4a3122" />
-                <stop offset="100%" stop-color="#221610" />
-              </linearGradient>
-              <linearGradient id="seat-gradient" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stop-color="#2b3442" />
-                <stop offset="100%" stop-color="#161b24" />
-              </linearGradient>
-              <radialGradient id="dealer-gradient" cx="35%" cy="30%" r="80%">
-                <stop offset="0%" stop-color="#ffffff" />
-                <stop offset="60%" stop-color="#ececef" />
-                <stop offset="100%" stop-color="#a8a8b0" />
-              </radialGradient>
-              <linearGradient id="pot-badge-gradient" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stop-color="rgba(18, 27, 36, 0.92)" />
-                <stop offset="100%" stop-color="rgba(7, 13, 20, 0.92)" />
-              </linearGradient>
-              <filter id="table-shadow" x="-10%" y="-10%" width="120%" height="120%">
-                <feGaussianBlur in="SourceAlpha" stdDeviation="6" />
-                <feOffset dx="0" dy="5" />
-                <feComponentTransfer><feFuncA type="linear" slope="0.55" /></feComponentTransfer>
-                <feMerge>
-                  <feMergeNode />
-                  <feMergeNode in="SourceGraphic" />
-                </feMerge>
-              </filter>
-              <filter id="card-shadow" x="-25%" y="-25%" width="150%" height="150%">
-                <feGaussianBlur in="SourceAlpha" stdDeviation="1.2" />
-                <feOffset dx="0" dy="1.5" />
-                <feComponentTransfer><feFuncA type="linear" slope="0.5" /></feComponentTransfer>
-                <feMerge>
-                  <feMergeNode />
-                  <feMergeNode in="SourceGraphic" />
-                </feMerge>
-              </filter>
-            </defs>
-
-            <ellipse id="felt-rim" cx="400" cy="260" rx="352" ry="202" class="table-rim" filter="url(#table-shadow)" />
-            <ellipse id="felt-edge" cx="400" cy="260" rx="340" ry="190" class="table-edge" />
-            <ellipse id="felt-line" cx="400" cy="260" rx="300" ry="153" class="table-line" />
-            <ellipse id="felt-glow" cx="400" cy="222" rx="266" ry="116" class="table-glow" />
-
-            <g id="board-a" transform="translate(280 207)"></g>
-            <g id="board-b" transform="translate(280 285)"></g>
-
-            <g id="pot-badge" transform="translate(400 170)" hidden>
-              <rect x="-80" y="-16" width="160" height="32" rx="16" class="pot-badge-rect" />
-              <text id="pot-label" x="0" y="5" text-anchor="middle" class="pot-label"></text>
-            </g>
-
-            <g id="seats"></g>
-            <g id="hero-hand-labels"></g>
-            <g id="hero-hole" transform="translate(400 500)"></g>
-            <!-- WGLIVE:START -->
-            <g id="ocr-rescan-group" style="display:none">
-              <foreignObject x="218" y="506" width="88" height="32">
-                <button xmlns="http://www.w3.org/1999/xhtml" id="ocr-rescan-hole-btn"
-                        class="rescan-btn" type="button"
-                        title="Re-OCR hero hole cards from the current frame">Rescan Hole</button>
-              </foreignObject>
-              <foreignObject x="494" y="506" width="88" height="32">
-                <button xmlns="http://www.w3.org/1999/xhtml" id="ocr-rescan-board-btn"
-                        class="rescan-btn" type="button"
-                        title="Re-OCR flop/turn/river from the current frame">Rescan Board</button>
-              </foreignObject>
-            </g>
-            <!-- WGLIVE:END -->
-            <g id="dealer-button"><title>Dealer button — drag it to another seat, or choose Your seat above</title><circle r="14" class="dealer-circle" /><circle r="24" class="dealer-hit" /><text class="dealer-text" text-anchor="middle" dy="5">D</text></g>
-            <g id="insert-icon" hidden>
-              <circle r="14" class="insert-icon-bg" />
-              <text class="insert-icon-plus" text-anchor="middle" dy="6">+</text>
-            </g>
-          </svg>
-          <div id="feedback-flash" hidden>
-            <span id="feedback-marks"></span>
-            <span id="feedback-text"></span>
-            <span id="feedback-sub"></span>
+          <div id="stage-box">
+            <div id="stage" role="group" aria-label="Poker table">
+              <div id="felt"><svg class="ico felt-mark" aria-hidden="true"><use href="#i-mark" /></svg></div>
+              <div id="center">
+                <div id="award-caption" class="award-caption" hidden></div>
+                <div id="pot-row">
+                  <div id="pot-total" hidden><small>Total</small><span id="pot-total-amt"></span></div>
+                  <div id="pot"><span class="chips" id="pot-chips"></span><small>Pot</small><span id="pot-amt"></span></div>
+                  <div id="live-pots" hidden></div>
+                  <div id="street-tag"></div>
+                </div>
+                <div id="pots" hidden></div>
+                <div id="boards">
+                  <div class="board" id="board-a"><span class="board-tag">1</span></div>
+                  <div class="board" id="board-b"><span class="board-tag">2</span></div>
+                  <div id="burns" hidden></div>
+                  <button type="button" id="rabbit-btn" hidden></button>
+                </div>
+              </div>
+              <div id="seats"></div>
+              <div id="bets"></div>
+              <div id="dealer-btn" hidden>D</div>
+              <div id="seat-adds"></div>
+              <div id="hero-zone" hidden>
+                <div id="hero-tag" hidden></div>
+                <div id="hero-hole"></div>
+              </div>
+              <div id="banner" hidden></div>
+              <div id="fx"></div>
+              <!-- WGLIVE:START -->
+              <div id="ocr-rescan-group" style="display:none">
+                <button id="ocr-rescan-hole-btn" class="rescan-btn" type="button"
+                        title="Re-OCR hero hole cards from the current frame">Rescan hole</button>
+                <button id="ocr-rescan-board-btn" class="rescan-btn" type="button"
+                        title="Re-OCR flop/turn/river from the current frame">Rescan board</button>
+              </div>
+              <!-- WGLIVE:END -->
+            </div>
+            <div id="feedback-flash" hidden>
+              <span id="feedback-marks"></span>
+              <span id="feedback-text"></span>
+              <span id="feedback-sub"></span>
+            </div>
+          </div>
+          <div id="hero-hand-labels"></div>
+          <div id="dock">
+            <div class="dock-side" id="dock-left">
+              <button id="undo-btn" class="btn sm study-only" type="button" disabled title="Take back the last action (Backspace in the action list)">Undo</button>
+            </div>
+            <div id="actbar">
+              <div id="actor-banner" class="actor-banner" hidden></div>
+              <div id="last-verdict" class="last-verdict" hidden></div>
+              <div id="sizing" hidden>
+                <div class="sz-row"><div class="sz-presets" id="raise-presets"></div></div>
+                <div class="sz-row">
+                  <button type="button" class="sz-step" id="sz-minus" aria-label="A smaller bet">&minus;</button>
+                  <input type="range" id="sz-slider" min="0" max="1000" step="1" aria-label="Bet size" />
+                  <button type="button" class="sz-step" id="sz-plus" aria-label="A bigger bet">+</button>
+                  <div class="money sz-amt" id="raise-amt-box"><input class="input" id="raise-input" type="text" inputmode="decimal" autocomplete="off" aria-label="Bet size" /></div>
+                </div>
+                <div class="sz-row sz-foot"><span class="sz-range" id="sz-range"></span><span class="sz-range" id="sz-pot"></span></div>
+              </div>
+              <div id="act-btns" hidden>
+                <button class="act fold" id="fold-btn" type="button" data-gate="fold"><kbd>F</kbd><span>Fold</span></button>
+                <button class="act call" id="check-btn" type="button" data-gate="check_call"><kbd>C</kbd><span id="call-lbl">Check</span><small id="call-amt"></small></button>
+                <button class="act raise" id="raise-go" type="button" data-gate="raise"><kbd>R</kbd><span id="raise-lbl">Bet</span><small id="raise-amt"></small></button>
+              </div>
+              <div id="status-strip" hidden></div>
+            </div>
+            <div class="dock-side right" id="dock-right"></div>
           </div>
         </div>
+      </section>
 
-        <div id="actor-banner" class="actor-banner" hidden></div>
-
+      <div id="side-rail">
         <div id="review-panel" class="panel" hidden>
           <div class="review-left">
             <svg class="score-ring" viewBox="0 0 64 64" width="64" height="64" aria-hidden="true">
@@ -302,36 +292,6 @@
             <button id="review-open-study" type="button" title="Open this spot in Study to explore other lines">Open in Study</button>
           </div>
         </div>
-
-        <div class="panels">
-          <div id="action-panel" class="panel">
-            <h3 id="action-title">Actions</h3>
-            <div id="last-verdict" class="last-verdict" hidden></div>
-            <div id="gate-buttons"></div>
-            <div id="raise-section" hidden>
-              <div class="raise-bounds muted" id="raise-bounds-label"></div>
-              <div class="raise-input-row">
-                <input id="raise-input" type="number" step="0.01" inputmode="decimal" aria-label="Bet size" aria-describedby="raise-bounds-label" />
-                <span id="raise-unit" class="raise-unit">bb</span>
-                <button id="raise-submit" class="primary" type="button">Raise</button>
-              </div>
-              <div id="raise-shortcuts" class="raise-shortcuts"></div>
-            </div>
-            <div id="terminal-pane" hidden>
-              <div id="terminal-message"></div>
-            </div>
-          </div>
-          <div id="history-panel" class="panel">
-            <div class="panel-head-row">
-              <h3>History</h3>
-              <button id="undo-btn" class="study-only" type="button" disabled title="Take back the last action (Backspace in the action list)">Undo</button>
-            </div>
-            <div id="history"></div>
-          </div>
-        </div>
-      </section>
-
-      <div id="side-rail">
         <div id="info-panel" class="panel">
           <div class="panel-head-row panel-head-top">
             <h3>Recommendation</h3>
@@ -356,6 +316,12 @@
         <div id="stats-lifetime" class="stats-block"></div>
         <div id="recent-hands" class="stats-block recent-hands" hidden></div>
       </aside>
+      <div id="history-panel" class="panel">
+        <div class="panel-head-row">
+          <h3>History</h3>
+        </div>
+        <div id="history"></div>
+      </div>
       </div>
     </main>
 
@@ -768,6 +734,7 @@
 
     <!-- The client: plain scripts that share one global scope, in this order
          (each file's header says what it holds; FE-019). -->
+    <script src="/static/games.table.js"></script>
     <script src="/static/app.core.js"></script>
     <script src="/static/app.table.js"></script>
     <script src="/static/app.play.js"></script>

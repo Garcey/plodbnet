@@ -310,7 +310,8 @@ def test_games_assets_are_hidden(players):
         assert hook in page.text, hook
     js = {n: a.get(f"/games/static/{n}").text for n in modules}
     ui = "\n".join(js[n] for n in ui_modules)
-    css = a.get("/games/static/games.css").text
+    # (the table's look is its own file since 2026-10-01 — Study / Trainer load it too)
+    css = a.get("/games/static/games.felt.css").text + a.get("/games/static/games.css").text
     # the wiring each module owns (names the server API it drives)
     assert "Number.isInteger(s.my_seat)" in js["games.js"]
     for api in ("auto_stack", "auto_topup", "auto_chips_self", "street_pause", "settings",

@@ -2718,6 +2718,28 @@ def _strip_local_only_scripts(html: str) -> str:
     )
 
 
+#: The poker table Study / Trainer draw with IS the home games' (2026-10-01, the
+#: owner: one look, one card face): its renderer and its stylesheet. index.html
+#: links them under /static (the local build serves them there); the public
+#: build serves the home-games client only from its gated /games/static/{name}
+#: route (signed in — and only a signed-in page carries the app), so its page
+#: points there, versioned the way the home-games page versions them.
+_SHARED_TABLE_ASSETS = ("games.felt.css", "games.table.js")
+
+
+def _shared_table_versions() -> tuple[str, ...]:
+    from plo5bp.ui import homegame as _hg
+
+    return tuple(_hg._asset_hash(STATIC_DIR, name) for name in _SHARED_TABLE_ASSETS)
+
+
+def _link_shared_table_assets(html: str, versions: tuple[str, ...]) -> str:
+    for name, v in zip(_SHARED_TABLE_ASSETS, versions):
+        url = f"/games/static/{name}" + (f"?v={v}" if v else "")
+        html = re.sub(rf'(\b(?:src|href)=")/static/{re.escape(name)}(")', rf"\g<1>{url}\g<2>", html)
+    return html
+
+
 #: Public build (SEC-014): the /static mount is an ALLOW-LIST. "strip" = text
 #: served with the WGLIVE regions removed; "serve" = served as is; every file
 #: under a directory of `_PUBLIC_STATIC_DIRS` is served as is. ANY other file —
@@ -2971,12 +2993,15 @@ def _install_pages(app: FastAPI, site: Site) -> None:
     app.mount("/static", site.static, name="static")
     pages = site.pages = _PageRenderer(site.static.versions)
 
-    def _index_transform(signed_in: bool, fonts: tuple[str, ...] | None = None) -> Any:
+    def _index_transform(signed_in: bool, fonts: tuple[str, ...] | None = None,
+                         table: tuple[str, ...] = ()) -> Any:
         def transform(html: str) -> str:
             if public:
                 html = _strip_local_only_scripts(_strip_wglive(html))
                 if not signed_in:
                     html = _strip_wgapp(html)
+                else:
+                    html = _link_shared_table_assets(html, table)
             html = _select_pricing_copy(html, public)
             html = _font_links(html, fonts)
             # The build mode, known to the client before first paint (the
@@ -3002,9 +3027,12 @@ def _install_pages(app: FastAPI, site: Site) -> None:
                 # public build) — fall back to sending the full markup.
                 signed_in = True
         fonts = _font_versions(pages.versions)
+        # (the shared table's versions: a new games.table.js / games.felt.css
+        # re-renders the page with the new links)
+        table = _shared_table_versions() if public and signed_in else ()
         html, etag, csp = pages.render(
-            "index.html", (public, signed_in, fonts),
-            _index_transform(signed_in, fonts),
+            "index.html", (public, signed_in, fonts, table),
+            _index_transform(signed_in, fonts, table),
         )
         return _page_response(request, html, etag, csp, private=public)
 

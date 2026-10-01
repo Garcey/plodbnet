@@ -583,7 +583,7 @@ def test_new_assets_are_gated(cast, server):
     unsigned = TestClient(server.app)
     for name in ("games.js", "games.table.js", "games.ui.js", "games.play.js",
                  "games.lobby.js", "games.history.js", "games.seat.js", "games.manage.js",
-                 "games.sound.js", "games.fair.js", "games.css"):
+                 "games.sound.js", "games.fair.js", "games.felt.css", "games.css"):
         assert unsigned.get(f"/games/static/{name}").status_code == 404
         assert unsigned.get(f"/static/{name}").status_code == 404
         assert cast["p"][0].get(f"/static/{name}").status_code == 404

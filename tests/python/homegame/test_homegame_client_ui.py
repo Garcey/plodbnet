@@ -193,7 +193,7 @@ def public_server(boot_public_server):
 def test_every_client_file_is_served_gated_and_loaded_in_order(public_server):
     from starlette.testclient import TestClient
     hg = sys.modules["plo5bp.ui.homegame"]
-    on_disk = sorted(p.name for p in STATIC.glob("games.*js")) + ["games.css"]
+    on_disk = sorted(p.name for p in STATIC.glob("games.*js")) + sorted(p.name for p in STATIC.glob("games*.css"))
     assert sorted(hg.GAMES_ASSETS) == sorted(on_disk)
     signed = TestClient(public_server.app, raise_server_exceptions=False)
     assert signed.get("/auth/dev", params={"email": "admin@clientui.example"}).status_code == 200

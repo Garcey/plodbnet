@@ -18,7 +18,12 @@ function makeWorld() {
   class El {
     constructor(tag) {
       this.tagName = String(tag).toUpperCase(); this.childNodes = []; this.parentNode = null; this.attrs = {};
-      this.style = { setProperty(k, v) { this[k] = v; }, cssText: "" }; this.classList = new ClassList(this);
+      this.style = {
+        setProperty(k, v) { this[k] = v; }, cssText: "",
+        removeProperty(k) { const v = this[k]; delete this[k]; return v == null ? "" : String(v); },
+        getPropertyValue(k) { return this[k] == null ? "" : String(this[k]); },
+      };
+      this.classList = new ClassList(this);
       this.listeners = {}; this._text = ""; this.value = ""; this.checked = false;
     }
     get nodeType() { return this.tagName === "#TEXT" ? 3 : 1; }
@@ -109,6 +114,9 @@ function makeWorld() {
     get offsetWidth() { return 0; }
     get offsetHeight() { return 0; }
     scrollIntoView() {}
+    // (the felt's FLIP slides: recorded, never run)
+    animate(frames, opts) { (this._anims = this._anims || []).push({ frames, opts }); return { finished: Promise.resolve(), cancel() {}, finish() {} }; }
+    getAnimations() { return []; }
   }
   function walk(n, f) { n.childNodes.forEach((c) => { if (c.nodeType === 1) { f(c); walk(c, f); } }); }
   function parseInto(parent, html) {

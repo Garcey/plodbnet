@@ -1,7 +1,8 @@
-// Study / Trainer client, part 2 of 7 — the table: seat geometry (wide and
-// phone layouts), seats, boards, hero cards, pot and dealer button; the
-// seat menu; the card picker and card grid; card entry by click and by
-// keyboard; dragging the dealer button and adding seats.
+// Study / Trainer client, part 2 of 7 — the table: the home games' table
+// renderer fed a view of the Study / Trainer state (seats, boards, hero cards,
+// pot, bets, dealer button); the seat menu and stack editor; adding seats and
+// dragging the dealer button; the card picker and card grid; card entry by
+// click and by keyboard.
 //
 // Plain scripts, no build step: index.html loads app.core.js, app.table.js,
 // app.play.js, app.study.js, app.trainer.js, app.topbar.js and app.js in
@@ -10,17 +11,10 @@
 // the files before it; everything else starts from init() in app.js.
 "use strict";
 
-// --- Table chrome: the undo button and the "add a seat" marker --------------
+// --- Table chrome: the undo button --------------------------------------------
 
 function renderTableChrome(s) {
   document.getElementById("undo-btn").disabled = !s.can_undo;
-  const insertIcon = document.getElementById("insert-icon");
-  if (s.num_seats >= 6 || s.trainer || tableLayout().name !== "wide") {
-    insertIcon.setAttribute("hidden", "");
-    insertIcon.style.display = "none";
-  } else {
-    insertIcon.style.display = "";
-  }
 }
 
 // --- Mobile card-picker sheet ------------------------------------------------
@@ -119,12 +113,11 @@ function setupCardPicker() {
   document.addEventListener("click", (e) => {
     if (e.target.closest("[data-open-picker]")) openPickerAtNextSlot();
   });
-  MOBILE_MQ.addEventListener("change", () => { if (UI.lastState) render(UI.lastState); });
-  TALL_MQ.addEventListener("change", () => {
+  MOBILE_MQ.addEventListener("change", () => {
     closeSeatMenu();
     const ed = document.getElementById("stack-edit-input");
     if (ed) ed.remove();
-    if (UI.lastState) { UI.lastStateKey = null; render(UI.lastState); }
+    if (UI.lastState) render(UI.lastState);
   });
 }
 
@@ -178,270 +171,292 @@ async function confirmHandReset(what, { clearsCards = false } = {}) {
   });
 }
 
-// --- Table geometry (MOB-006 / ST-004 / MOB-007) ----------------------------------
-// Two drawings of the same table. "wide" is the original 800 x 560 oval for
-// desktops, tablets and phones held sideways. "tall" is a portrait table for
-// phones held upright: the wide oval shrank to ~42% there, so stacks rendered
-// at ~5px and card slots at 13 x 18px. The tall table draws at ~90% of its
-// units on a 375px phone, with larger type, cards you can tap, and the
-// dealer button pinned to its seat.
-const TABLE_LAYOUTS = {
-  wide: {
-    name: "wide", w: 800, h: 560,
-    center: { x: 400, y: 260 }, seatRx: 310, seatRy: 170,
-    felt: {
-      rim: [400, 260, 352, 202], edge: [400, 260, 340, 190],
-      line: [400, 260, 300, 153], glow: [400, 222, 266, 116],
-    },
-    plate: { w: 92, h: 52, rx: 10, posY: -10, stackY: 6 },
-    board: { w: 44, h: 60, gap: 6 },
-    hole: { w: 32, h: 44, gap: 4 },
-    boardA: [280, 207], boardB: [280, 285], boardSingle: [280, 246],
-    heroHole: [400, 500],
-    labels: { y: 472, dy: 16 },
-    pot: [400, 170], potW: 160,
-    potKeepOut: { x1: 326, y1: 142, x2: 474, y2: 198 },
-    dealerOffset: 38, betOffset: 64,
-    mini: { w: 24, h: 33, gap: 3, rankY: 15, suitY: 28 },
-    menuDot: [38, -17],
-  },
-  tall: {
-    name: "tall", w: 400, h: 536,
-    center: { x: 200, y: 250 }, seatRx: 150, seatRy: 222,
-    felt: {
-      rim: [200, 250, 184, 236], edge: [200, 250, 176, 228],
-      line: [200, 250, 148, 196], glow: [200, 220, 122, 164],
-    },
-    plate: { w: 104, h: 48, rx: 10, posY: -6, stackY: 15 },
-    // Boards stay 182 units wide so seats at mid-height (4-handed) clear them.
-    board: { w: 34, h: 47, gap: 3 },
-    hole: { w: 36, h: 50, gap: 3 },
-    boardA: [109, 172], boardB: [109, 225], boardSingle: [109, 198],
-    heroHole: [200, 392],
-    // Made-hand labels go UNDER the hero's plate: there is no free band
-    // between the seats on a phone.
-    labels: { y: 514, dy: 16 },
-    pot: [200, 92], potLow: [200, 144], potW: 150,
-    potKeepOut: null,
-    dealerOffset: 0, betOffset: 0,
-    mini: { w: 18, h: 25, gap: 2, rankY: 12, suitY: 22 },
-    menuDot: [42, -12],
-  },
-};
-const TALL_MQ = window.matchMedia("(max-width: 560px) and (orientation: portrait)");
-function tableLayout() { return TALL_MQ.matches ? TABLE_LAYOUTS.tall : TABLE_LAYOUTS.wide; }
-const SVG_NS = "http://www.w3.org/2000/svg";
-function svgEl(tag, attrs, text) {
-  const el = document.createElementNS(SVG_NS, tag);
-  if (attrs) for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
-  if (text !== undefined) el.textContent = text;
+// --- The table (2026-10-01) ------------------------------------------------------
+// Study and Trainer draw on the home games' table — the owner: "bring the home
+// games' look to Study and Trainer", one card face everywhere. games.table.js
+// (loaded before this file) is that renderer: persistent seats, cards, chips
+// and pots that animate from one state to the next. It reads a home-games
+// table state, so feltView() turns the Study / Trainer state into one (money
+// in chips: its "cents" are chips here), and it calls a few helpers of the
+// home games' core (games.js) — FELT_HG.core below speaks Study's units and
+// markup instead. Study's own controls ride on the same elements: card places
+// (markSlots), the seat menu, the stack editor, the dealer button, "+" seats.
+const FELT_HG = (globalThis.HG = globalThis.HG || {});
+
+class FeltMarkup {
+  constructor(s) { this.s = s; }
+  toString() { return this.s; }
+}
+function feltMarkupOf(v) {
+  if (v instanceof FeltMarkup) return v.s;
+  if (Array.isArray(v)) return v.map(feltMarkupOf).join("");
+  return escapeHTML(v);
+}
+// The renderer writes markup ONLY through html`` (every value escaped) and put()
+// (markup as markup, anything else as text) — the home games' rules (FE-003).
+function feltHTML(strings, ...values) {
+  let out = strings[0];
+  for (let i = 0; i < values.length; i++) out += feltMarkupOf(values[i]) + strings[i + 1];
+  return new FeltMarkup(out);
+}
+function feltPut(el, content) {
+  if (content instanceof FeltMarkup) el.innerHTML = content.s;
+  else if (content && content.nodeType) { el.textContent = ""; el.appendChild(content); }
+  else el.textContent = content == null ? "" : String(content);
   return el;
 }
-
-// Applies the active layout to the static parts of the SVG (viewBox, felt).
-function applyTableLayout() {
-  const L = tableLayout();
-  const svg = document.getElementById("table-svg");
-  if (!svg || svg.dataset.layout === L.name) return;
-  svg.dataset.layout = L.name;
-  svg.setAttribute("viewBox", `0 0 ${L.w} ${L.h}`);
-  svg.classList.toggle("tall", L.name === "tall");
-  document.body.classList.toggle("table-tall", L.name === "tall");
-  const set = (id, [cx, cy, rx, ry]) => {
-    const e = document.getElementById(id);
-    if (e) { e.setAttribute("cx", cx); e.setAttribute("cy", cy); e.setAttribute("rx", rx); e.setAttribute("ry", ry); }
+const FELT_REDUCED_MOTION = window.matchMedia("(prefers-reduced-motion: reduce)");
+if (!FELT_HG.core) {
+  FELT_HG.core = {
+    G: { state: null, prefs: { anim: "auto", bubbles: false } },
+    html: feltHTML,
+    put: feltPut,
+    // money on this table is in chips; amounts read in the viewer's unit (bb / $)
+    fmtAmt: (chips, v) => formatUnit(chips, (v && v._src) || UI.lastState),
+    chipsToCents: (chips) => Number(chips) || 0,
+    actionKind: (x) => (x.action === 0 ? "fold" : x.action === 1 ? (x.chips > 0 ? "call" : "check") : x.action === 7 ? "allin" : "raise"),
+    motionOn: () => !FELT_REDUCED_MOTION.matches,
   };
-  set("felt-rim", L.felt.rim);
-  set("felt-edge", L.felt.edge);
-  set("felt-line", L.felt.line);
-  set("felt-glow", L.felt.glow);
-  const pot = document.getElementById("pot-badge");
-  if (pot) {
-    pot.setAttribute("transform", `translate(${L.pot[0]} ${L.pot[1]})`);
-    const r = pot.querySelector("rect");
-    if (r) { r.setAttribute("x", -L.potW / 2); r.setAttribute("width", L.potW); }
-  }
+}
+if (!FELT_HG.ui) {
+  FELT_HG.ui = {
+    openPlayer: (i) => onFeltSeat(i),
+    openSit() {}, openRequest() {}, onClock() {},
+    noteFor: () => ({ tag: "none" }),
+  };
 }
 
-function seatPositions(numSeats, heroSeat) {
-  const L = tableLayout();
-  const positions = new Array(numSeats);
-  for (let i = 0; i < numSeats; i++) {
-    const rel = (i - heroSeat + numSeats) % numSeats;
-    // Physical CW from hero: increasing seat index moves visually CW on
-    // screen, matching engine's (actor + 1) % n advancement and real-
-    // poker action order (SB is one CW step from BTN, etc.). In SVG
-    // (Y-down), visual CW corresponds to INCREASING theta from π/2.
-    const theta = Math.PI / 2 + (rel * 2 * Math.PI / numSeats);
-    const x = L.center.x + L.seatRx * Math.cos(theta);
-    const y = L.center.y + L.seatRy * Math.sin(theta);
-    positions[i] = { x, y, theta };
-  }
-  return positions;
+// The seats' discs show their positions, each in its own colour; the name line
+// spells it out ("Cutoff"), and says Hero (Study) / You (Trainer) at the hero.
+const POSITION_HUES = { BTN: 42, SB: 205, BB: 262, UTG: 150, "UTG+1": 122, MP: 95, LJ: 178, HJ: 318, CO: 12 };
+const POSITION_NAMES = {
+  BTN: "Button", SB: "Small blind", BB: "Big blind", UTG: "Under the gun", "UTG+1": "UTG+1",
+  MP: "Middle", LJ: "Lojack", HJ: "Hijack", CO: "Cutoff",
+};
+function seatHue(position, seat) {
+  return POSITION_HUES[position] ?? (seat * 57 + 20) % 360;
 }
 
-// Where a seat's bet chip sits, in seat-local coordinates, and which side
-// its amount goes. Wide: toward the table centre (GTO-Wizard style), sliding
-// past the pot badge. Tall: straight inward from the plate's side (the
-// top seat's goes under its plate, the hero's beside it).
-function betAnchor(L, p, label) {
-  if (L.name === "tall") {
-    const W = L.plate.w, H = L.plate.h;
-    const dxC = L.center.x - p.x;
-    const inward = dxC >= 0 ? 1 : -1;               // +1: the centre is to the right
-    if (p.y > L.center.y + L.seatRy * 0.8) {          // bottom (hero): beside the plate
-      return { x: W / 2 + 14, y: 0, labelLeft: false };
-    }
-    if (Math.abs(dxC) < 10) {                          // top centre: under the plate
-      return { x: -24, y: H / 2 + 14, labelLeft: false };
-    }
-    if (p.y < L.center.y - L.seatRy * 0.55 || Math.abs(p.y - L.center.y) < L.seatRy * 0.3) {
-      // the top pair (5-handed) and mid-height seats (4-handed): under the plate
-      return { x: inward * 10, y: H / 2 + 14, labelLeft: inward < 0 };
-    }
-    return { x: inward * (W / 2 + 14), y: 0, labelLeft: inward < 0 };   // sides: inward
+// One board as the table draws it. Study: its five PLACES (null = no card
+// entered yet — a card taken back leaves its own place empty). Trainer: the
+// cards dealt so far, flop then turn then river (they come in order, and the
+// renderer deals them in with a flip).
+function feltBoard(s, b) {
+  const spec = s.card_spec || {};
+  const flop = (b === 0 ? spec.flop_a : spec.flop_b) || [];
+  const street = (arr) => (arr && arr.length > b && arr[b] !== undefined ? arr[b] : null);
+  if (!s.trainer) {
+    return { slots: [flop[0] ?? null, flop[1] ?? null, flop[2] ?? null, street(spec.turn), street(spec.river)] };
   }
-  const dx = L.center.x - p.x;
-  const dy = L.center.y - p.y;
-  const len = Math.hypot(dx, dy) || 1;
-  let ax = p.x + (dx / len) * L.betOffset;
-  const ay = p.y + (dy / len) * L.betOffset;
-  // Label goes on the side of the chip facing the table center so it
-  // never runs back over the seat plate / dealer button.
-  let labelLeft = dx < -10;
-  const textW = label.length * 6.6;
-  // Keep-out around the pot badge: the top-center seat's ray lands on it —
-  // slide the block sideways past the badge edge, label facing away from it.
-  const POT = L.potKeepOut;
-  const bx1 = labelLeft ? ax - 12 - textW : ax - 10;
-  const bx2 = labelLeft ? ax + 10 : ax + 12 + textW;
-  if (POT && ay > POT.y1 && ay < POT.y2 && bx2 > POT.x1 && bx1 < POT.x2) {
-    if (p.x >= L.center.x) {
-      labelLeft = false;
-      ax = POT.x2 + 18;
-    } else {
-      labelLeft = true;
-      ax = POT.x1 - 18;
-    }
-  }
-  return { x: ax - p.x, y: ay - p.y, labelLeft };
+  return { flop: flop.filter((c) => c !== null && c !== undefined), turn: street(spec.turn), river: street(spec.river) };
 }
 
-// Committed-bet marker: a poker chip with the amount labeled beside it.
-// `p` is the seat's absolute table position; the returned group uses
-// seat-local coordinates (the caller's node is translated to `p`).
-function makeBetChip(chips, s, p) {
-  const L = tableLayout();
-  const label = formatUnit(chips, s);
-  const a = betAnchor(L, p, label);
-  const g = svgEl("g", { class: "bet-chip", transform: `translate(${a.x} ${a.y})` });
-  g.appendChild(svgEl("circle", { cy: 2.6, r: 8, class: "bet-chip-under" }));
-  g.appendChild(svgEl("circle", { r: 8, class: "bet-chip-base" }));
-  g.appendChild(svgEl("circle", { r: 8, class: "bet-chip-stripes" }));
-  g.appendChild(svgEl("circle", { r: 4.2, class: "bet-chip-inner" }));
-  g.appendChild(svgEl("text", {
-    x: a.labelLeft ? -13 : 13, y: 4,
-    "text-anchor": a.labelLeft ? "end" : "start",
-    class: "bet-chip-amount",
-  }, label));
-  return g;
+function feltSeat(x, s, holeN) {
+  const isHero = x.seat === s.hero_seat;
+  const spec = s.card_spec || {};
+  let hole;
+  if (isHero) {
+    // Study: the places of a hand being entered (null = still empty);
+    // Trainer: the hand dealt to you
+    hole = (spec.hero_hole || []).map((c) => (c === null || c === undefined ? (s.trainer ? -1 : null) : c));
+  } else if (Array.isArray(x.hole) && x.hole.length && x.hole.every((c) => c !== null && c >= 0)) {
+    hole = x.hole.slice();  // (Trainer: tabled at the end of a hand, and in the review)
+  } else {
+    hole = new Array(holeN).fill(-1);
+  }
+  const position = x.position || `Seat ${x.seat + 1}`;
+  return {
+    seat: x.seat,
+    empty: x.participant === false,
+    user_id: x.seat,
+    name: isHero ? (s.trainer ? "You" : "Hero") : (POSITION_NAMES[position] || position),
+    av_text: position,
+    hue: seatHue(position, x.seat),
+    position: "",
+    stack_cents: x.stack_chips,
+    in_hand: x.participant !== false,
+    folded: !!x.folded,
+    all_in: !!x.all_in,
+    is_actor: !!x.is_actor,
+    is_hero: isHero,
+    hole,
+    hand_desc: isHero && Array.isArray(s.hero_hand_desc) ? s.hero_hand_desc : null,
+    committed_this_street_cents: Number(x.committed_this_street_chips) || 0,
+    present: true,
+  };
 }
 
-function renderSeats(s) {
-  const L = tableLayout();
-  const g = document.getElementById("seats");
-  g.innerHTML = "";
-  const positions = seatPositions(s.num_seats, s.hero_seat);
+// The Study / Trainer state as the home games' table reads it.
+function feltView(s) {
+  const holeN = s.card_spec ? s.card_spec.hero_hole.length : 5;
+  const bb = (s.chip_scale && s.chip_scale.bb_chips) || 10000;
+  const walk = historyCommits(s);
+  const history = (s.history || []).map((h, i) => ({
+    seat: h.seat,
+    street: h.street,
+    action: h.action === "Fold" ? 0 : h.action === "CheckCall" ? 1 : h.action === "AllIn" ? 7 : 2,
+    chips: Number(h.chips) || 0,
+    cents: Number(h.chips) || 0,
+    to_cents: walk[i] ? walk[i].after : Number(h.chips) || 0,
+  }));
+  const t = s.trainer;
+  const over = !!s.terminal;
+  const rewards = t && over && Array.isArray(t.rewards_bb) ? t.rewards_bb : null;
+  return {
+    id: `${t ? "trainer" : "study"}:${s.format || ""}`,
+    num_seats: s.num_seats,
+    hero_seat: s.hero_seat,
+    my_seat: s.hero_seat,
+    my_user_id: -1,
+    hole_count: holeN,
+    game: { dealt: holeN, burns: 0 },
+    status: "open",
+    phase: over ? "showdown" : "in_hand",
+    hand_no: t ? t.hand_no : 1,
+    street: s.street,
+    actor: s.actor,
+    button_seat: s.button_seat,
+    seats: s.seats.map((x) => feltSeat(x, s, holeN)),
+    history,
+    pot_cents: Number(s.pot_chips) || 0,
+    settled_pot_chips: s.settled_pot_chips ?? s.pot_chips,
+    stakes: { bb_cents: bb, bb_chips: bb, ante_cents: (s.chip_scale && s.chip_scale.ante_chips) || 0 },
+    board: { a: feltBoard(s, 0), b: isSingleBoard(s) ? null : feltBoard(s, 1) },
+    runout: { active: false, blocking: false },
+    hand_deltas_cents: rewards ? rewards.map((r) => Math.round((Number(r) || 0) * bb)) : [],
+    decision_secs: 0,
+    _src: s,
+  };
+}
+
+let FELT_PREV = null;     // the view drawn last (the renderer animates prev -> next)
+let FELT_UNIT_KEY = null; // bb / $ and the rate it was drawn in
+
+function renderTable(s) {
+  if (!FELT_HG.table || !s.card_spec) return;
+  const v = feltView(s);
+  FELT_HG.core.G.state = v;
+  const unitKey = `${UI.unit}|${UI.unit === "$" ? dollarsPerBB(s) : ""}`;
+  const prev = FELT_PREV && FELT_PREV.id === v.id ? FELT_PREV : null;
+  const wrap = document.getElementById("stage-wrap");
+  wrap.classList.remove("loading");
+  wrap.classList.toggle("study-table", !s.trainer);
+  FELT_HG.table.render(v, prev, { unitChanged: FELT_UNIT_KEY !== null && FELT_UNIT_KEY !== unitKey });
+  FELT_PREV = v;
+  FELT_UNIT_KEY = unitKey;
+  const focus = focusedSlotKey();
+  markSlots(s);
+  restoreSlotFocus(focus);
+  markSeats(s);
+  placeSeatAdds(s);
+  const dealer = document.getElementById("dealer-btn");
+  dealer.classList.toggle("draggable", !s.trainer);
+  dealer.title = s.trainer ? "The dealer button" : "The dealer button — drag it to another seat, or choose Your seat above";
+  renderTableSummary(s);
+}
+
+// What a click on a seat does: Study opens its menu; the Trainer's seats are
+// the table's (nothing to change there).
+function onFeltSeat(i) {
+  const s = UI.lastState;
+  if (!s || s.trainer) return;
+  openSeatMenu(i);
+}
+
+// Study: every seat is a button (its menu); the stacks say they can be changed.
+function markSeats(s) {
   const study = !s.trainer;
   for (const seat of s.seats) {
-    if (seat.participant === false) continue;
-    const p = positions[seat.seat];
-    const node = svgEl("g", { transform: `translate(${p.x} ${p.y})` });
-    node.classList.add("seat-node");
-    node.dataset.seat = String(seat.seat);
-    if (seat.is_actor) node.classList.add("actor");
-    if (seat.is_hero) node.classList.add("hero");
-    if (seat.folded) node.classList.add("folded");
-    if (seat.all_in) node.classList.add("all-in");
-    if (s.trainer && s.trainer.anim_action && s.trainer.anim_action.seat === seat.seat) {
-      node.classList.add("acted");
+    const el = document.querySelector(`#seats .seat[data-seat="${seat.seat}"]`);
+    if (!el) continue;
+    el.classList.toggle("study-seat", study);
+    const stack = el.querySelector(".seat-stack");
+    if (stack) {
+      const editable = study && !seat.all_in;
+      stack.classList.toggle("editable", editable);
+      stack.title = editable ? "Change this stack" : "";
     }
-    const W = L.plate.w, H = L.plate.h;
-    const bg = svgEl("rect", { x: -W / 2, y: -H / 2, width: W, height: H, rx: L.plate.rx, class: "seat-bg" });
-    node.appendChild(bg);
-
-    const heroTag = seat.is_hero ? (s.trainer ? " · you" : " · hero") : "";
-    node.appendChild(svgEl("text", { y: L.plate.posY, class: "seat-position" }, seat.position + heroTag));
-
-    const editable = !seat.all_in && study;
-    const stackText = seat.all_in ? "all-in" : formatUnit(seat.stack_chips, s);
-    const stack = svgEl("text", { y: L.plate.stackY, class: editable ? "seat-stack editable" : "seat-stack" }, stackText);
-    if (editable) {
-      stack.addEventListener("click", (e) => {
-        e.stopPropagation();
-        openStackEditor(seat, s);
-      });
-    }
-    node.appendChild(stack);
-
-    // Study: the whole plate opens the seat menu (ST-009 / MOB-007) — a
-    // big tap target instead of a 7px red "x" nobody could identify.
-    if (study) {
-      node.classList.add("menu-seat");
-      node.setAttribute("tabindex", "0");
-      node.setAttribute("role", "button");
-      node.setAttribute("aria-haspopup", "menu");
-      node.setAttribute("aria-label",
-        `${seat.position}${seat.is_hero ? " (Hero)" : ""}, ${seat.all_in ? "all-in" : `stack ${stackText}`}. Seat options`);
-      const dot = svgEl("text", {
-        x: L.menuDot[0], y: L.menuDot[1], "text-anchor": "middle", class: "seat-more", "aria-hidden": "true",
-      }, "⋯");
-      node.appendChild(dot);
-      node.addEventListener("click", () => openSeatMenu(seat.seat));
-      node.addEventListener("keydown", (e) => {
-        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openSeatMenu(seat.seat); }
-      });
-    }
-
-    if (seat.committed_this_street_chips > 0) {
-      node.appendChild(makeBetChip(seat.committed_this_street_chips, s, p));
-    }
-
-    // Trainer: revealed opponent hole cards. Wide: drawn OUTSIDE the table
-    // (above the plate for top-half seats, below for bottom-half) so they
-    // never collide with the dealer button / bet chips on the inside ray.
-    // Tall: over the plate's lower half (there is no outside on a phone).
-    if (seat.hole && !seat.is_hero) {
-      const mini = svgEl("g", { class: "seat-hole" });
-      const { w: cw, h: ch, gap } = L.mini;
-      const total = seat.hole.length * cw + (seat.hole.length - 1) * gap;
-      let rowCenterX = 0;
-      let rowY;
-      if (L.name === "tall") {
-        rowY = -3;
-      } else {
-        // Keep the row on-canvas for far-left/right seats.
-        rowCenterX = Math.max(total / 2 + 4, Math.min(L.w - total / 2 - 4, p.x)) - p.x;
-        rowY = p.y < L.center.y ? -(H / 2 + 7 + ch) : H / 2 + 7;
-      }
-      const x0 = rowCenterX - total / 2;
-      for (let i = 0; i < seat.hole.length; i++) {
-        const card = cardToString(seat.hole[i]);
-        const x = x0 + i * (cw + gap);
-        const r = svgEl("rect", { x, y: rowY, width: cw, height: ch, rx: 3.5, class: "seat-hole-card" });
-        r.style.fill = card.color;
-        mini.appendChild(r);
-        mini.appendChild(svgEl("text", { x: x + cw / 2, y: rowY + L.mini.rankY, "text-anchor": "middle", class: "seat-hole-rank" }, card.rank));
-        mini.appendChild(svgEl("text", { x: x + cw / 2, y: rowY + L.mini.suitY, "text-anchor": "middle", class: "seat-hole-suit" }, card.glyph));
-      }
-      const t = svgEl("title");
-      t.textContent = `${seat.position}: ${seat.hole.map(cardName).join(", ")}`;
-      mini.appendChild(t);
-      node.appendChild(mini);
-    }
-
-    g.appendChild(node);
+    const main = el.querySelector(".seat-main");
+    if (main && study) {
+      main.setAttribute("aria-haspopup", "menu");
+      main.setAttribute("aria-label", `${seat.position}${seat.is_hero ? " (Hero)" : ""}, ${seat.all_in ? "all-in" : `stack ${formatUnit(seat.stack_chips, s)}`}. Seat options`);
+    } else if (main) main.removeAttribute("aria-haspopup");
   }
+}
+
+// --- Card places on the table -------------------------------------------------------
+// The hero's cards and the boards' places are buttons (A11Y-017): a click (or
+// Enter) selects one — Study: the card grid fills it; Trainer review: a what-if
+// swap — a double click (or Delete) empties it (Study). Each says what it holds.
+// With none selected, Study marks the place a card goes next (.slot-next).
+function slotAt(s, el, key, index, next) {
+  if (!el) return;
+  const spec = s.card_spec || {};
+  const arr = spec[key];
+  const value = arr ? arr[index] : undefined;
+  if (value === undefined) {
+    delete el.dataset.slot; delete el.dataset.index;
+    el.classList.remove("slot-pick", "slot-sel", "slot-next", "slot-mod");
+    el.removeAttribute("tabindex"); el.removeAttribute("role"); el.removeAttribute("aria-label");
+    return;
+  }
+  const has = value !== null;
+  const rv = s.trainer && s.trainer.review;
+  // (the Trainer's review: a what-if swap, at your own graded decisions only — onSlotClick)
+  const interactive = !s.trainer || (!!rv && has && !reviewNodeUngraded(rv.node_current));
+  const selected = !!UI.selectedSlot && UI.selectedSlot.key === key && UI.selectedSlot.index === index;
+  el.dataset.slot = key;
+  el.dataset.index = String(index);
+  el.classList.toggle("slot-pick", interactive);
+  el.classList.toggle("slot-sel", selected);
+  el.classList.toggle("slot-next", !!next && next.key === key && next.index === index);
+  el.classList.toggle("slot-mod", (s.modified_cards || []).some((m) => m.slot_key === key && m.index === index));
+  if (interactive) { el.tabIndex = 0; el.setAttribute("role", "button"); }
+  else { el.removeAttribute("tabindex"); el.removeAttribute("role"); }
+  const words = slotWords(s, key, index);
+  const Words = `${words[0].toUpperCase()}${words.slice(1)}`;
+  el.setAttribute("aria-label", `${Words}: ${has ? cardName(value) : "empty"}${selected ? ", selected" : ""}`);
+  if (selected) el.setAttribute("aria-pressed", "true"); else el.removeAttribute("aria-pressed");
+}
+
+function markSlots(s) {
+  const next = !s.trainer && !UI.selectedSlot ? nextEmptySlot(s, null) : null;
+  document.querySelectorAll("#hero-hole > .card").forEach((el, k) => slotAt(s, el, "hero_hole", k, next));
+  const boards = isSingleBoard(s) ? [["a", 0]] : [["a", 0], ["b", 1]];
+  for (const [k, b] of boards) {
+    document.querySelectorAll(`#board-${k} > .slot-card`).forEach((el, j) => {
+      if (j < 3) slotAt(s, el, b === 0 ? "flop_a" : "flop_b", j, next);
+      else slotAt(s, el, j === 3 ? "turn" : "river", b, next);
+    });
+  }
+}
+
+function focusedSlotKey() {
+  const a = document.activeElement;
+  return a && a.dataset && a.dataset.slot ? `${a.dataset.slot}:${a.dataset.index}` : null;
+}
+function restoreSlotFocus(key) {
+  if (!key) return;
+  const [slot, index] = key.split(":");
+  const el = document.querySelector(`#stage [data-slot="${slot}"][data-index="${index}"]`);
+  if (el) el.focus();
+}
+
+// Two made-hand labels ("1 a pair of 8s" / "2 ...") under the table, like the
+// home games' — so a stealth set or straight is hard to miss while deciding.
+function renderHeroHandLabels(s) {
+  const el = document.getElementById("hero-hand-labels");
+  if (!el) return;
+  const desc = s.hero_hand_desc || [];
+  const rows = [];
+  if (isSingleBoard(s)) {
+    if (desc[0]) rows.push([null, desc[0]]);  // one board — one label, no number
+  } else {
+    if (desc[0]) rows.push(["1", desc[0]]);
+    if (desc[1]) rows.push(["2", desc[1]]);
+  }
+  const html = rows.map(([tag, text]) => `<span class="hero-hand-label">${tag ? `<span class="hhl-tag">${tag}</span>` : ""}${escapeHTML(text)}</span>`).join("");
+  if (el.dataset.k !== html) { el.dataset.k = html; el.innerHTML = html; }
 }
 
 // --- Seat menu (ST-009 / MOB-007 / ST-015) ------------------------------------------
@@ -455,13 +470,17 @@ function onSeatMenuOutside(e) {
   if (pop && !pop.contains(e.target)) closeSeatMenu();
 }
 
+function seatMain(seatIdx) {
+  return document.querySelector(`#seats .seat[data-seat="${seatIdx}"] .seat-main`);
+}
+
 function openSeatMenu(seatIdx) {
   const already = document.getElementById("seat-pop");
   closeSeatMenu();
   const s = UI.lastState;
   if (!s || s.trainer || (already && already.dataset.seat === String(seatIdx))) return;
   const seat = s.seats[seatIdx];
-  const node = document.querySelector(`#seats .seat-node[data-seat="${seatIdx}"]`);
+  const node = seatMain(seatIdx);
   if (!seat || !node) return;
   const n = s.num_seats;
   const off = ((seat.seat - s.button_seat) % n + n) % n;
@@ -559,20 +578,16 @@ function insertSeat(a, s) {
   });
 }
 
+// The stack editor: a box over the seat's stack (Enter / clicking away saves,
+// Escape cancels).
 function openStackEditor(seat, s) {
   const existing = document.getElementById("stack-edit-input");
   if (existing) existing.remove();
   closeSeatMenu();
-
-  const svg = document.getElementById("table-svg");
-  const wrap = document.getElementById("table-wrap");
-  const L = tableLayout();
-  const positions = seatPositions(s.num_seats, s.hero_seat);
-  const p = positions[seat.seat];
-  const pt = svg.createSVGPoint();
-  pt.x = p.x; pt.y = p.y + L.plate.stackY - 4;
-  const screen = pt.matrixTransform(svg.getScreenCTM());
-  const wrapBox = wrap.getBoundingClientRect();
+  const box = document.getElementById("stage-box");
+  const stackEl = document.querySelector(`#seats .seat[data-seat="${seat.seat}"] .seat-stack`);
+  if (!box || !stackEl) return;
+  const r = stackEl.getBoundingClientRect(), b = box.getBoundingClientRect();
 
   const input = document.createElement("input");
   input.type = "number";
@@ -586,10 +601,9 @@ function openStackEditor(seat, s) {
   input.value = original;
   const width = 96;
   input.style.width = `${width}px`;
-  input.style.left = `${screen.x - wrapBox.left - width / 2}px`;
-  input.style.top = `${screen.y - wrapBox.top - 16}px`;
-  wrap.style.position = "relative";
-  wrap.appendChild(input);
+  input.style.left = `${r.left + r.width / 2 - b.left - width / 2}px`;
+  input.style.top = `${r.top + r.height / 2 - b.top - 16}px`;
+  box.appendChild(input);
   input.focus();
   input.select();
 
@@ -630,216 +644,6 @@ function openStackEditor(seat, s) {
     if (chips !== null && chips > 0) commit();
     else cancel();
   });
-}
-
-function renderBoards(s) {
-  const L = tableLayout();
-  const boardA = document.getElementById("board-a");
-  const boardB = document.getElementById("board-b");
-  const focus = focusedSlotKey();
-  boardA.innerHTML = "";
-  boardB.innerHTML = "";
-  // Single-board formats (flop_b === []) draw one vertically-centered row
-  // and skip board B entirely; the double-board layout is unchanged.
-  const single = isSingleBoard(s);
-  const [ax, ay] = single ? L.boardSingle : L.boardA;
-  boardA.setAttribute("transform", `translate(${ax} ${ay})`);
-  boardB.setAttribute("transform", `translate(${L.boardB[0]} ${L.boardB[1]})`);
-
-  renderSlotStrip(boardA, "flop_a", s.card_spec.flop_a, s, 0);
-  if (!single) renderSlotStrip(boardB, "flop_b", s.card_spec.flop_b, s, 0);
-
-  const step = L.board.w + L.board.gap;
-  renderSingleSlot(boardA, "turn", 0, s.card_spec.turn[0], s, 3 * step);
-  if (s.card_spec.turn.length > 1) {
-    renderSingleSlot(boardB, "turn", 1, s.card_spec.turn[1], s, 3 * step);
-  }
-  renderSingleSlot(boardA, "river", 0, s.card_spec.river[0], s, 4 * step);
-  if (s.card_spec.river.length > 1) {
-    renderSingleSlot(boardB, "river", 1, s.card_spec.river[1], s, 4 * step);
-  }
-  restoreSlotFocus(focus);
-}
-
-function renderSlotStrip(parent, key, values, s, x0) {
-  const geom = tableLayout().board;
-  for (let i = 0; i < values.length; i++) {
-    const x = x0 + i * (geom.w + geom.gap);
-    renderSlotRect(parent, key, i, values[i], s, x, 0, geom.w, geom.h);
-  }
-}
-function renderSingleSlot(parent, key, index, value, s, x) {
-  const geom = tableLayout().board;
-  renderSlotRect(parent, key, index, value, s, x, 0, geom.w, geom.h);
-}
-
-// Slots are keyboard buttons too (A11Y-017): Tab reaches them, Enter picks
-// one, Delete/Backspace clears it, and each says what it holds.
-function focusedSlotKey() {
-  const a = document.activeElement;
-  return a && a.classList && a.classList.contains("slot-rect") ? `${a.dataset.slot}:${a.dataset.index}` : null;
-}
-function restoreSlotFocus(key) {
-  if (!key) return;
-  const [slot, index] = key.split(":");
-  const el = document.querySelector(`#table-svg .slot-rect[data-slot="${slot}"][data-index="${index}"]`);
-  if (el) el.focus();
-}
-
-function renderSlotRect(parent, key, index, value, s, x, y, w, h) {
-  const rect = svgEl("rect", { x, y, width: w, height: h, rx: 5 });
-  let cls = "slot-rect" + (value === null ? " empty" : "");
-  const isSelected = UI.selectedSlot && UI.selectedSlot.key === key && UI.selectedSlot.index === index;
-  if (isSelected) cls += " selected";
-  rect.setAttribute("class", cls);
-  rect.dataset.slot = key;
-  rect.dataset.index = String(index);
-  const interactive = !s.trainer || (s.trainer.review && value !== null && value !== undefined);
-  if (interactive) {
-    rect.setAttribute("tabindex", "0");
-    rect.setAttribute("role", "button");
-  }
-  const has = value !== null && value !== undefined;
-  const words = slotWords(s, key, index);
-  rect.setAttribute("aria-label", has
-    ? `${words[0].toUpperCase()}${words.slice(1)}: ${cardName(value)}${isSelected ? ", selected" : ""}`
-    : `${words[0].toUpperCase()}${words.slice(1)}: empty${isSelected ? ", selected" : ""}`);
-  if (isSelected) rect.setAttribute("aria-pressed", "true");
-  rect.addEventListener("click", () => onSlotClick(key, index));
-  rect.addEventListener("dblclick", (e) => { e.preventDefault(); onSlotDoubleClick(key, index); });
-  parent.appendChild(rect);
-
-  if (has) {
-    const card = cardToString(value);
-    rect.style.fill = card.color;
-
-    const smallRankSize = Math.max(8, Math.round(h * 0.227));
-    const smallSuitSize = Math.max(8, Math.round(h * 0.25));
-    const bigRankSize = Math.max(14, Math.round(h * 0.50));
-    const pad = Math.max(3, Math.round(w * 0.12));
-    const common = { fill: "#ffffff", "aria-hidden": "true" };
-    parent.appendChild(svgEl("text", {
-      ...common, x: x + pad, y: y + smallRankSize + 2, class: "slot-corner-rank", "font-size": smallRankSize,
-    }, card.rank));
-    parent.appendChild(svgEl("text", {
-      ...common, x: x + pad, y: y + smallRankSize + smallSuitSize + 3, class: "slot-corner-suit", "font-size": smallSuitSize,
-    }, card.glyph));
-    parent.appendChild(svgEl("text", {
-      ...common, x: x + w - pad, y: y + h - Math.max(3, Math.round(h * 0.08)),
-      "text-anchor": "end", class: "slot-corner-bigrank", "font-size": bigRankSize,
-    }, card.rank));
-  }
-
-  const modified = (s.modified_cards || []).some(
-    (m) => m.slot_key === key && m.index === index
-  );
-  if (modified) {
-    parent.appendChild(svgEl("circle", { cx: x + w - 4, cy: y + 4, r: 3, class: "slot-modified-dot" }));
-  }
-}
-
-function renderHeroHole(s) {
-  const L = tableLayout();
-  const g = document.getElementById("hero-hole");
-  const focus = focusedSlotKey();
-  g.innerHTML = "";
-  g.setAttribute("transform", `translate(${L.heroHole[0]} ${L.heroHole[1]})`);
-  const geom = L.hole;
-  const count = s.card_spec.hero_hole.length;  // per-format: 5 (PLO) / 2 (NLH)
-  const totalWidth = count * geom.w + (count - 1) * geom.gap;
-  const x0 = -totalWidth / 2;
-  for (let i = 0; i < count; i++) {
-    const x = x0 + i * (geom.w + geom.gap);
-    renderSlotRect(g, "hero_hole", i, s.card_spec.hero_hole[i], s, x, 0, geom.w, geom.h);
-  }
-  restoreSlotFocus(focus);
-}
-
-// Two made-hand labels ("#1 a pair of 8s" / "#2 ...") in the
-// gap between the hero plate and the hero cards (wide) or under the boards
-// (tall), so a stealth set/straight is hard to miss while deciding.
-function renderHeroHandLabels(s) {
-  const L = tableLayout();
-  const g = document.getElementById("hero-hand-labels");
-  g.innerHTML = "";
-  const desc = s.hero_hand_desc || [];
-  const rows = [];
-  if (isSingleBoard(s)) {
-    // One board — a single unnumbered label (descB is always null).
-    if (desc[0]) rows.push([null, desc[0]]);
-  } else {
-    if (desc[0]) rows.push(["#1", desc[0]]);
-    if (desc[1]) rows.push(["#2", desc[1]]);
-  }
-  if (!rows.length) return;
-  rows.forEach(([tag, text], i) => {
-    const t = svgEl("text", {
-      x: L.center.x, y: L.labels.y + i * L.labels.dy, "text-anchor": "middle", class: "hero-hand-label",
-    });
-    if (tag) t.appendChild(svgEl("tspan", { class: "hhl-tag" }, tag + " "));
-    t.appendChild(document.createTextNode(text));
-    g.appendChild(t);
-  });
-}
-
-function renderDealerButton(s) {
-  const L = tableLayout();
-  const node = document.getElementById("dealer-button");
-  node.style.display = "";
-  if (UI.draggingButton) return;
-  const positions = seatPositions(s.num_seats, s.hero_seat);
-  const p = positions[s.button_seat];
-  let bx, by;
-  if (L.name === "tall") {
-    // On the plate's outer top corner, like a badge: nothing else fits
-    // beside a seat on a phone. The hero's goes left of the plate (its bet
-    // sits on the right, its cards just above).
-    if (p.y > L.center.y + L.seatRy * 0.8) {
-      bx = p.x - L.plate.w / 2 - 18;
-      by = p.y;
-    } else {
-      const side = p.x < L.center.x - 10 ? -1 : 1;
-      bx = p.x + side * (L.plate.w / 2 - 4);
-      by = p.y - L.plate.h / 2 + 4;
-    }
-  } else {
-    const dx = L.center.x - p.x;
-    const dy = L.center.y - p.y;
-    const len = Math.hypot(dx, dy) || 1;
-    bx = p.x + (dx / len) * L.dealerOffset;
-    by = p.y + (dy / len) * L.dealerOffset;
-  }
-  node.setAttribute("transform", `translate(${bx} ${by})`);
-  node.dataset.seat = String(s.button_seat);
-}
-
-// CPY-019: ONE pot badge. It shows the pot gathered from earlier streets and,
-// while bets are out on this street, how much more is in front of the
-// players — the two separate "Total Pot" / "Pot" badges confused newcomers.
-function renderPotLabel(s) {
-  const badge = document.getElementById("pot-badge");
-  const label = document.getElementById("pot-label");
-  badge.removeAttribute("hidden");
-  const L = tableLayout();
-  if (L.potLow) {
-    // Tall table: a pair of seats across the top (5-handed) sits where the
-    // pot normally goes — drop the pot to just above the boards.
-    const topPair = seatPositions(s.num_seats, s.hero_seat).some(
-      (p) => Math.abs(p.x - L.center.x) >= 10 && p.y < L.center.y - L.seatRy * 0.55);
-    const [px, py] = topPair ? L.potLow : L.pot;
-    badge.setAttribute("transform", `translate(${px} ${py})`);
-  }
-  const total = Number(s.pot_chips) || 0;
-  const settled = s.settled_pot_chips ?? total;
-  const live = Math.max(0, total - settled);
-  label.textContent = live > 0
-    ? `Pot ${formatUnit(settled, s)} + ${formatUnit(live, s)}`
-    : `Pot ${formatUnit(total, s)}`;
-  const t = badge.querySelector("title") || badge.appendChild(svgEl("title"));
-  t.textContent = live > 0
-    ? `${formatUnit(settled, s)} in the pot, plus ${formatUnit(live, s)} bet on this street (${formatUnit(total, s)} in all)`
-    : `${formatUnit(total, s)} in the pot`;
-  renderTableSummary(s);
 }
 
 // A plain-text summary of the table for screen readers (A11Y-017).
@@ -1166,14 +970,24 @@ function setupCardKeyboard() {
   });
 }
 
-// --- Table keyboard (A11Y-017) ---------------------------------------------------
-// Card slots are focusable buttons: Enter/Space selects one, Delete or
-// Backspace empties it (Study).
+// --- The table's own clicks and keys -----------------------------------------------
+// Card places: click / Enter selects one, a double click / Delete empties it
+// (Study). A Study stack: a click changes it (before the seat's own menu).
 function setupTableKeyboard() {
-  const svg = document.getElementById("table-svg");
-  svg.addEventListener("keydown", (e) => {
-    const slot = e.target.closest && e.target.closest(".slot-rect");
-    if (!slot) return;
+  const stage = document.getElementById("stage");
+  stage.addEventListener("click", (e) => {
+    const slot = e.target.closest("[data-slot]");
+    if (slot && slot.classList.contains("slot-pick")) onSlotClick(slot.dataset.slot, parseInt(slot.dataset.index, 10));
+  });
+  stage.addEventListener("dblclick", (e) => {
+    const slot = e.target.closest("[data-slot]");
+    if (!slot || !slot.classList.contains("slot-pick")) return;
+    e.preventDefault();
+    onSlotDoubleClick(slot.dataset.slot, parseInt(slot.dataset.index, 10));
+  });
+  stage.addEventListener("keydown", (e) => {
+    const slot = e.target.closest && e.target.closest("[data-slot]");
+    if (!slot || !slot.classList.contains("slot-pick")) return;
     const key = slot.dataset.slot;
     const index = parseInt(slot.dataset.index, 10);
     if (e.key === "Enter" || e.key === " ") {
@@ -1188,98 +1002,92 @@ function setupTableKeyboard() {
       onSlotDoubleClick(key, index);
     }
   });
+  // (capturing: it runs before the seat's own click, which opens its menu)
+  document.getElementById("seats").addEventListener("click", (e) => {
+    const stack = e.target.closest(".seat-stack.editable");
+    if (!stack) return;
+    const s = UI.lastState;
+    const seatEl = stack.closest(".seat");
+    if (!s || s.trainer || !seatEl) return;
+    e.stopPropagation();
+    const seat = s.seats[parseInt(seatEl.dataset.seat, 10)];
+    if (seat && !seat.all_in) openStackEditor(seat, s);
+  }, true);
 }
 
-// --- Dealer-button drag -----------------------------------------------------
-
-const UI_INSERT = { pairA: null, pairB: null };
-
-function svgPoint(svg, clientX, clientY) {
-  const pt = svg.createSVGPoint();
-  pt.x = clientX; pt.y = clientY;
-  return pt.matrixTransform(svg.getScreenCTM().inverse());
-}
-
-function ellipseAngle(px, py) {
-  const L = tableLayout();
-  return Math.atan2((py - L.center.y) / L.seatRy, (px - L.center.x) / L.seatRx);
-}
-
-function ellipseRadius(px, py) {
-  const L = tableLayout();
-  return Math.hypot((px - L.center.x) / L.seatRx, (py - L.center.y) / L.seatRy);
+// --- "+": add a player between two seats (Study, a mouse, fewer than 6) ------------
+// One "+" sits on the rail halfway between each pair of neighbouring seats; it
+// shows while the pointer is over the table (the Players control in the work
+// bar does the same on a touch screen — MOB-013).
+const FINE_POINTER = window.matchMedia("(hover: hover) and (pointer: fine)");
+function placeSeatAdds(s) {
+  const host = document.getElementById("seat-adds");
+  if (!host) return;
+  const want = !s.trainer && s.num_seats < 6 && FINE_POINTER.matches && FELT_HG.table && FELT_HG.table.seatCenter;
+  if (!want) { host.innerHTML = ""; host.dataset.k = ""; return; }
+  const stage = document.getElementById("stage");
+  const w = stage.offsetWidth, h = stage.offsetHeight;
+  if (!w || !h) return;
+  const n = s.num_seats;
+  const centers = [];
+  for (let i = 0; i < n; i++) centers.push(FELT_HG.table.seatCenter(i));
+  if (centers.some((c) => !c)) return;
+  const cx = w / 2, cy = h / 2;
+  const key = `${n}|${w}x${h}|${centers.map((c) => c.map(Math.round).join(",")).join(";")}`;
+  if (host.dataset.k === key) return;
+  host.dataset.k = key;
+  host.innerHTML = "";
+  for (let i = 0; i < n; i++) {
+    const a = centers[i], b = centers[(i + 1) % n];
+    // halfway round the rail: the midpoint, pushed out to the seats' distance
+    const mx = (a[0] + b[0]) / 2 - cx, my = (a[1] + b[1]) / 2 - cy;
+    const ra = Math.hypot(a[0] - cx, a[1] - cy), rb = Math.hypot(b[0] - cx, b[1] - cy);
+    const len = Math.hypot(mx, my) || 1, r = (ra + rb) / 2;
+    const x = cx + (mx / len) * r, y = cy + (my / len) * r;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "seat-add";
+    btn.dataset.after = String(i);
+    btn.textContent = "+";
+    btn.title = "Add a player here";
+    btn.setAttribute("aria-label", "Add a player between these seats");
+    btn.style.left = `${(x / w) * 100}%`;
+    btn.style.top = `${(y / h) * 100}%`;
+    host.appendChild(btn);
+  }
 }
 
 function setupInsertHover() {
-  const svg = document.getElementById("table-svg");
-  const icon = document.getElementById("insert-icon");
-  if (!icon) return;
-  const TWO_PI = 2 * Math.PI;
-  const THETA0 = Math.PI / 2;
-
-  svg.addEventListener("pointermove", (e) => {
-    const s = UI.lastState;
-    // Mouse-only affordance ("+" between two seats); touch screens use the
-    // Players control in the work bar (MOB-013).
-    if (!s || s.num_seats >= 6 || s.trainer || e.pointerType === "touch") {
-      icon.setAttribute("hidden", "");
-      return;
-    }
-    const pt = svgPoint(svg, e.clientX, e.clientY);
-    const r = ellipseRadius(pt.x, pt.y);
-    if (r < 0.55 || r > 1.25) { icon.setAttribute("hidden", ""); return; }
-
-    const N = s.num_seats;
-    const seatStep = TWO_PI / N;
-    const ma = ellipseAngle(pt.x, pt.y);
-    // seatPositions() lays seats out at THETA0 + rel·step (INCREASING theta =
-    // visual clockwise), so the gap index under the cursor must be measured
-    // the same way. Measuring THETA0 − ma walked the table the other way
-    // round: the "+" inserted into the mirror-image gap
-    // (review 2026-09-20 F16).
-    let rel = ma - THETA0;
-    while (rel < 0) rel += TWO_PI;
-    while (rel >= TWO_PI) rel -= TWO_PI;
-    const rawIdx = Math.min(N - 1, Math.floor(rel / seatStep));
-    const hero = s.hero_seat;
-    const pairA = (rawIdx + hero) % N;
-    const pairB = (rawIdx + 1 + hero) % N;
-
-    const midTheta = THETA0 + (rawIdx + 0.5) * seatStep;
-    const L = tableLayout();
-    const mx = L.center.x + L.seatRx * Math.cos(midTheta);
-    const my = L.center.y + L.seatRy * Math.sin(midTheta);
-    icon.setAttribute("transform", `translate(${mx} ${my})`);
-    icon.removeAttribute("hidden");
-    UI_INSERT.pairA = pairA;
-    UI_INSERT.pairB = pairB;
-  });
-
-  svg.addEventListener("mouseleave", () => { icon.setAttribute("hidden", ""); });
-
-  icon.addEventListener("click", async (e) => {
+  const host = document.getElementById("seat-adds");
+  if (!host) return;
+  host.addEventListener("click", async (e) => {
+    const btn = e.target.closest(".seat-add");
+    if (!btn) return;
     e.stopPropagation();
     const s = UI.lastState;
-    if (!s || s.num_seats >= 6) return;
-    if (UI_INSERT.pairA == null) return;
-    const pairA = UI_INSERT.pairA;
-    icon.setAttribute("hidden", "");
+    if (!s || s.trainer || s.num_seats >= 6) return;
     if (!(await confirmHandReset("Add a player"))) return;
-    insertSeat(pairA, s);
+    insertSeat(parseInt(btn.dataset.after, 10), s);
   });
+  // the felt lays itself out again when its box changes size: the "+" follow
+  if (window.ResizeObserver) {
+    new ResizeObserver(() => requestAnimationFrame(() => {
+      host.dataset.k = "";
+      if (UI.lastState && UI.lastState.card_spec) placeSeatAdds(UI.lastState);
+    })).observe(document.getElementById("stage-box"));
+  }
 }
 
+// --- Dealer-button drag (Study) ---------------------------------------------------
 function setupDealerDrag() {
-  const button = document.getElementById("dealer-button");
-  const svg = document.getElementById("table-svg");
-  const getSvgPoint = (evt) => {
-    const pt = svg.createSVGPoint();
-    pt.x = evt.clientX; pt.y = evt.clientY;
-    const ctm = svg.getScreenCTM();
-    return ctm ? pt.matrixTransform(ctm.inverse()) : { x: evt.clientX, y: evt.clientY };
+  const button = document.getElementById("dealer-btn");
+  const stage = document.getElementById("stage");
+  const at = (e) => {
+    const r = stage.getBoundingClientRect();
+    return [e.clientX - r.left, e.clientY - r.top];
   };
   button.addEventListener("pointerdown", (e) => {
-    if (UI.mode === "trainer") return;
+    if (UI.mode === "trainer" || !UI.lastState || UI.lastState.trainer) return;
     e.preventDefault();
     UI.draggingButton = true;
     button.classList.add("dragging");
@@ -1287,35 +1095,33 @@ function setupDealerDrag() {
   });
   button.addEventListener("pointermove", (e) => {
     if (!UI.draggingButton) return;
-    const p = getSvgPoint(e);
-    button.setAttribute("transform", `translate(${p.x} ${p.y})`);
+    const [x, y] = at(e);
+    button.style.left = `${(x / stage.offsetWidth) * 100}%`;
+    button.style.top = `${(y / stage.offsetHeight) * 100}%`;
   });
   const endDrag = (e) => {
     if (!UI.draggingButton) return;
     UI.draggingButton = false;
     button.classList.remove("dragging");
     try { button.releasePointerCapture(e.pointerId); } catch (_) {}
-    const p = getSvgPoint(e);
     const s = UI.lastState;
-    if (!s) return;
-    const positions = seatPositions(s.num_seats, s.hero_seat);
-    let bestSeat = 0, bestDist = Infinity;
+    if (!s || !FELT_HG.table) return;
+    const [x, y] = at(e);
+    let bestSeat = s.button_seat, bestDist = Infinity;
     for (let i = 0; i < s.num_seats; i++) {
-      const dx = positions[i].x - p.x;
-      const dy = positions[i].y - p.y;
-      const d2 = dx * dx + dy * dy;
+      if (s.seats[i] && s.seats[i].participant === false) continue;
+      const c = FELT_HG.table.seatCenter(i);
+      if (!c) continue;
+      const d2 = (c[0] - x) ** 2 + (c[1] - y) ** 2;
       if (d2 < bestDist) { bestDist = d2; bestSeat = i; }
     }
-    if (bestSeat !== s.button_seat) {
-      postSeats({ button_seat: bestSeat });
-    } else {
-      render(s);
-    }
+    if (bestSeat !== s.button_seat) postSeats({ button_seat: bestSeat });
+    else FELT_HG.table.layout();  // back to its place
   };
   button.addEventListener("pointerup", endDrag);
   button.addEventListener("pointercancel", () => {
     UI.draggingButton = false;
     button.classList.remove("dragging");
-    if (UI.lastState) render(UI.lastState);
+    if (FELT_HG.table) FELT_HG.table.layout();
   });
 }

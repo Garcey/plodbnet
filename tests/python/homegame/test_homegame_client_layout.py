@@ -10,8 +10,9 @@ the preview at 360-430 px phones, 375x667, 812x375, 768x1024 and desktop):
 - MOB-004: a phone on its side shows what you hold over your cards (#hero-tag);
 - FE-010: games.table.js is the one source of the felt's numbers (it publishes them as
   CSS variables); games.css no longer keeps copies.
-- FE-009: games.css is laid out by component (an index, 19 sections, each with its own
-  phone / landscape blocks) instead of dated blocks appended at the end.
+- FE-009: games.css is laid out by component (an index, numbered sections, each with its own
+  phone / landscape blocks) instead of dated blocks appended at the end; the table itself is
+  games.felt.css (2026-10-01, shared with Study / Trainer), laid out the same way.
 Node half skipped when Node is not installed."""
 from __future__ import annotations
 
@@ -230,25 +231,35 @@ def test_six_pots_the_side_rows_and_the_caption_keep_clear():
 
 
 # ------------------------------------------------------------------ FE-009
-def test_the_stylesheet_has_one_section_per_component():
+@pytest.mark.parametrize("name,sections", [("games.felt.css", 8), ("games.css", 13)])
+def test_the_stylesheet_has_one_section_per_component(name, sections):
     """FE-009: games.css grew by appending dated blocks that overrode earlier rules, so how a
     seat or a button looked depended on the whole file. It is laid out by component now: a
-    CONTENTS index, the 19 numbered sections in that order, each component's phone / landscape
+    CONTENTS index, the numbered sections in that order, each component's phone / landscape
     rules in its own section, touch screens last (it wins over every size it enlarges); the
     rules the audit found set twice are one rule each. (The reorder was checked in the browser:
-    every element's computed style is the same as before, at 12 window sizes.)"""
-    heads = re.findall(r"^/\* ========== (\d+)\. ([^=]+?) ========== \*/", CSS, re.M)
-    assert [int(n) for n, _ in heads] == list(range(1, 20))
-    contents = CSS[CSS.index("CONTENTS."):CSS.index("/* ========== 1.")]
-    for n in range(1, 20):
+    every element's computed style is the same as before, at 12 window sizes.) Since
+    2026-10-01 the TABLE is its own file, games.felt.css (Study / Trainer load it too), laid
+    out the same way; the move was checked the same way (in-hand, your turn, showdown, desktop
+    and both phone orientations: every computed style the same)."""
+    css = (STATIC / name).read_text(encoding="utf-8")
+    heads = re.findall(r"^/\* ========== (\d+)\. ([^=]+?) ========== \*/", css, re.M)
+    assert [int(n) for n, _ in heads] == list(range(1, sections + 1))
+    contents = css[css.index("CONTENTS."):css.index("/* ========== 1.")]
+    for n in range(1, sections + 1):
         assert re.search(rf"^\s+{n}\. \S", contents, re.M), n
-    for sel in ("#tbar .ttl", "#boards", ".av", "#stage.portrait #burns", "#stage.wide #burns"):
-        assert sum(1 for r in RULES if r.media is None and r.selector == sel) == 1, sel
-    assert computed(RULES, [root(), el("body"), el("div#boards")], "position") == "relative"  # (the rabbit is placed in it)
     # the touch section is the last one, and nothing but touch rules follow its header
-    tail = parse_css(CSS[CSS.index("/* ========== 19."):])
+    tail = parse_css(css[css.index(f"/* ========== {sections}."):])
     assert tail and all(r.media and "pointer: coarse" in r.media for r in tail)
     # every banner is a numbered section header: no "/* ====== Table UX round 2 (2026-09-22)"
     # block appended at the end any more
-    banners = re.findall(r"^/\* ={6,}.*$", CSS, re.M)
-    assert len(banners) == 19 and all(re.match(r"/\* ========== \d+\. .+ ========== \*/$", b.rstrip()) for b in banners)
+    banners = re.findall(r"^/\* ={6,}.*$", css, re.M)
+    assert len(banners) == sections and all(re.match(r"/\* ========== \d+\. .+ ========== \*/$", b.rstrip()) for b in banners)
+
+
+def test_the_rules_set_twice_are_one_rule_and_the_page_loads_the_table_first():
+    for sel in ("#tbar .ttl", "#boards", ".av", "#stage.portrait #burns", "#stage.wide #burns"):
+        assert sum(1 for r in RULES if r.media is None and r.selector == sel) == 1, sel
+    assert computed(RULES, [root(), el("body"), el("div#boards")], "position") == "relative"  # (the rabbit is placed in it)
+    page = (STATIC / "games.html").read_text(encoding="utf-8")
+    assert page.index("/games/static/games.felt.css") < page.index("/games/static/games.css")

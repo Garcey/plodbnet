@@ -4,8 +4,10 @@
       markers: stripped from the public build);
    2. "WORKSPACE THEME v2" (2026-09-22): the workspace re-skin;
    3. "WORKSPACE v3" (2026-09-28): account menu, units, help, dialogs, the
-      phone table and reflow, reduced motion — then the landing (v3) and
-      legal-page blocks. Add new workspace styles at the end. */
+      phone reflow, reduced motion — then the landing (v3) and legal-page blocks;
+   4. "WORKSPACE v4" (2026-10-01): Study / Trainer on the home games' table — the
+      table itself is games.felt.css (loaded before this file); v4 lays the page
+      out around it in the home games' palette. Add new workspace styles at the end. */
 :root {
   /* WrapGTO brand neutrals (branding/): monochrome-first, teal #18D2C3 as
      the scarce accent (--brand-accent; never large fills). */
@@ -169,112 +171,7 @@ main {
   display: flex; flex-direction: column; gap: 10px;
 }
 
-/* --- Table SVG --- */
-#table-wrap {
-  background:
-    radial-gradient(80% 90% at 50% 30%, #161d29 0%, #10151d 70%);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 10px;
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  box-shadow: var(--shadow-1);
-}
-#table-svg {
-  width: 100%;
-  height: 100%;
-  display: block;
-  max-width: none;
-}
-#table-svg text { font-family: var(--font); font-variant-numeric: tabular-nums; }
-.table-rim { fill: url(#rim-gradient); stroke: rgba(0, 0, 0, 0.6); stroke-width: 1; }
-.table-edge { fill: url(#felt-gradient); stroke: rgba(9, 48, 42, 0.9); stroke-width: 1.5; }
-.table-line {
-  fill: none; stroke: rgba(255, 255, 255, 0.07); stroke-width: 1.5;
-  pointer-events: none;
-}
-.table-glow {
-  fill: rgba(255, 255, 255, 0.035); stroke: none; pointer-events: none;
-}
-.pot-badge-rect {
-  fill: url(#pot-badge-gradient);
-  stroke: rgba(255, 255, 255, 0.12); stroke-width: 1;
-}
-.pot-label {
-  fill: var(--text-bright); font-size: 13.5px; font-weight: 700;
-  letter-spacing: 0.4px;
-}
-/* Hero made-hand labels ("#1 a pair of 8s") between plate and cards */
-.hero-hand-label {
-  fill: var(--text-bright); font-size: 11.5px; font-weight: 600;
-  letter-spacing: 0.2px;
-}
-.hero-hand-label .hhl-tag {
-  fill: var(--accent); font-weight: 700;
-}
-
-/* Board card slots inside SVG */
-.slot-rect {
-  fill: var(--slot); stroke: var(--slot-border); stroke-width: 1;
-  cursor: pointer;
-  filter: drop-shadow(0 1.5px 2px rgba(0, 0, 0, 0.45));
-  transition: stroke 0.12s ease;
-}
-.slot-rect:not(.empty) { stroke: rgba(255, 255, 255, 0.30); }
-.slot-rect.selected {
-  stroke: var(--slot-selected); stroke-width: 2.5;
-  filter: drop-shadow(0 0 6px rgba(24, 210, 195, 0.55));
-}
-.slot-rect.empty { stroke-dasharray: 3 3; }
-.slot-rect.empty:hover { stroke: var(--accent-2); }
-.slot-corner-rank { font-weight: 700; pointer-events: none; }
-.slot-corner-suit { pointer-events: none; }
-.slot-corner-bigrank { font-weight: 800; pointer-events: none; opacity: 0.92; }
-.slot-modified-dot { fill: var(--warn); }
-
-/* Seat nodes */
-.seat-node .seat-bg {
-  fill: url(#seat-gradient); stroke: rgba(255, 255, 255, 0.10); stroke-width: 1;
-  filter: drop-shadow(0 2px 3px rgba(0, 0, 0, 0.4));
-}
-.seat-node.hero .seat-bg { stroke: rgba(95, 229, 217, 0.35); }
-.seat-node.actor .seat-bg {
-  stroke: var(--accent); stroke-width: 2;
-  animation: actor-glow 1.8s ease-in-out infinite;
-}
-@keyframes actor-glow {
-  0%, 100% { filter: drop-shadow(0 0 3px rgba(24, 210, 195, 0.35)); }
-  50% { filter: drop-shadow(0 0 9px rgba(24, 210, 195, 0.8)); }
-}
-.seat-node.folded .seat-bg { opacity: 0.32; }
-.seat-node.folded text { opacity: 0.45; }
-/* Trainer animation: the seat whose action just landed */
-.seat-node.acted .seat-bg {
-  stroke: var(--warn); stroke-width: 2;
-  animation: acted-pop 0.4s ease;
-  filter: drop-shadow(0 0 8px rgba(240, 162, 60, 0.6));
-}
-@keyframes acted-pop {
-  0% { filter: drop-shadow(0 0 1px rgba(240, 162, 60, 0.2)); }
-  60% { filter: drop-shadow(0 0 12px rgba(240, 162, 60, 0.85)); }
-  100% { filter: drop-shadow(0 0 8px rgba(240, 162, 60, 0.6)); }
-}
-.seat-node .seat-position {
-  fill: var(--muted); font-size: 10.5px; text-anchor: middle;
-  text-transform: uppercase; letter-spacing: 0.7px; font-weight: 600;
-}
-.seat-node.actor .seat-position { fill: var(--accent-2); }
-.seat-node .seat-stack {
-  fill: var(--text-bright); font-size: 13px; font-weight: 700; text-anchor: middle;
-  letter-spacing: 0.2px;
-}
-.seat-node .seat-stack.editable {
-  text-decoration: underline dotted rgba(215, 221, 230, 0.35);
-  text-decoration-thickness: 1px;
-}
+/* Study: the stack editor laid over a seat's stack (app.table.js openStackEditor) */
 .stack-edit-input {
   position: absolute;
   z-index: 20;
@@ -291,53 +188,6 @@ main {
 }
 .stack-edit-input::-webkit-outer-spin-button,
 .stack-edit-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
-/* Committed-bet chip in front of the seat */
-.bet-chip { pointer-events: none; }
-.bet-chip-under { fill: #1d4ea8; stroke: rgba(0, 0, 0, 0.5); stroke-width: 0.75; }
-.bet-chip-base {
-  fill: #3573e0; stroke: rgba(0, 0, 0, 0.45); stroke-width: 0.75;
-  filter: drop-shadow(0 1.5px 2px rgba(0, 0, 0, 0.5));
-}
-.bet-chip-stripes {
-  fill: none; stroke: rgba(255, 255, 255, 0.9); stroke-width: 2.4;
-  stroke-dasharray: 2.4 4.0;
-}
-.bet-chip-inner {
-  fill: none; stroke: rgba(255, 255, 255, 0.55); stroke-width: 0.9;
-}
-.bet-chip-amount {
-  fill: var(--text-bright); font-size: 11.5px; font-weight: 700;
-  letter-spacing: 0.2px;
-  paint-order: stroke;
-  stroke: rgba(6, 10, 16, 0.75); stroke-width: 2.5px;
-}
-.seat-node.folded .bet-chip { opacity: 0.4; }
-.seat-node.all-in .seat-stack { fill: var(--warn); }
-
-/* Insert-between-seats icon */
-#insert-icon { cursor: pointer; }
-#insert-icon .insert-icon-bg {
-  fill: var(--panel); stroke: var(--accent); stroke-width: 2; opacity: 0.9;
-}
-#insert-icon:hover .insert-icon-bg { fill: var(--accent); }
-#insert-icon .insert-icon-plus {
-  fill: var(--accent); font-size: 20px; font-weight: 700; pointer-events: none;
-}
-#insert-icon:hover .insert-icon-plus { fill: #fff; }
-
-/* Dealer button */
-#dealer-button {
-  cursor: grab;
-  filter: drop-shadow(0 2px 3px rgba(0, 0, 0, 0.55));
-}
-#dealer-button.dragging { cursor: grabbing; }
-.dealer-circle {
-  fill: url(#dealer-gradient); stroke: rgba(0, 0, 0, 0.65); stroke-width: 1.5;
-}
-.dealer-text {
-  fill: #1c1206; font-weight: 800; font-size: 13px;
-  letter-spacing: 0.5px;
-}
 
 /* --- Actor banner --- */
 .actor-banner {
@@ -361,11 +211,6 @@ main {
 }
 
 /* --- Panels --- */
-.panels {
-  display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
-  height: 300px;
-  flex-shrink: 0;
-}
 .panel {
   background: var(--panel); border: 1px solid var(--border);
   border-radius: var(--radius); padding: 12px 14px;
@@ -386,46 +231,8 @@ main {
 }
 .muted { color: var(--muted); font-size: 12px; }
 
-/* Gate buttons */
-#gate-buttons {
-  display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px;
-}
-#gate-buttons button {
-  flex: 1; min-width: 80px; padding: 9px 10px;
-  background: var(--panel-2); color: var(--text);
-  border: 1px solid var(--border); border-radius: var(--radius-sm);
-  cursor: pointer; font-size: 13px; font-weight: 600;
-}
-#gate-buttons button:hover:not(:disabled) { background: var(--panel-3); border-color: var(--border-strong); }
-#gate-buttons button:disabled { opacity: 0.35; cursor: not-allowed; }
-#gate-buttons button.fold {
-  color: var(--danger); background: var(--danger-soft);
-  border-color: rgba(239, 86, 102, 0.35);
-}
-#gate-buttons button.fold:hover:not(:disabled) {
-  background: rgba(239, 86, 102, 0.22); border-color: var(--danger);
-}
-#gate-buttons button.call {
-  color: var(--ok); background: var(--ok-soft);
-  border-color: rgba(61, 196, 111, 0.35);
-}
-#gate-buttons button.call:hover:not(:disabled) {
-  background: rgba(61, 196, 111, 0.22); border-color: var(--ok);
-}
-
-/* Raise section */
-#raise-section { display: flex; flex-direction: column; gap: 8px; }
-.raise-bounds { font-variant-numeric: tabular-nums; }
-.raise-input-row { display: flex; gap: 7px; align-items: center; }
-#raise-input {
-  flex: 1; padding: 8px 10px;
-  background: var(--panel-2); color: var(--text);
-  border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: 13px;
-  font-variant-numeric: tabular-nums;
-}
-#raise-input:hover { border-color: var(--border-strong); }
-.raise-unit { color: var(--muted); font-size: 12px; width: 24px; }
-#raise-submit, .primary {
+/* Primary buttons (dialogs, the review's Next hand) */
+.primary {
   padding: 8px 16px;
   background: linear-gradient(180deg, var(--accent) 0%, #0FA89B 100%);
   color: var(--on-accent);
@@ -433,32 +240,9 @@ main {
   cursor: pointer; font-weight: 700; font-size: 13px;
   box-shadow: 0 2px 8px rgba(24, 210, 195, 0.25);
 }
-#raise-submit:hover, .primary:hover {
+.primary:hover {
   background: linear-gradient(180deg, var(--accent-2) 0%, var(--accent) 100%);
 }
-.raise-shortcuts { display: flex; gap: 5px; flex-wrap: wrap; }
-.raise-shortcut {
-  padding: 4px 11px; background: var(--panel-2); color: var(--muted);
-  border: 1px solid var(--border); border-radius: 999px;
-  cursor: pointer; font-size: 11px; font-weight: 600;
-}
-.raise-shortcut:hover:not(:disabled) {
-  background: var(--accent-soft); color: var(--accent-2);
-  border-color: rgba(24, 210, 195, 0.45);
-}
-.raise-shortcut:disabled { opacity: 0.35; cursor: not-allowed; }
-/* No-limit all-in prefill chip: a different KIND of action than the bNN
-   pot-fraction chips — carries the theme's all-in color (warn amber). */
-.raise-shortcut-allin {
-  color: var(--warn); background: rgba(240, 162, 60, 0.10);
-  border-color: rgba(240, 162, 60, 0.45); font-weight: 700;
-}
-.raise-shortcut-allin:hover:not(:disabled) {
-  background: rgba(240, 162, 60, 0.20); color: var(--warn);
-  border-color: var(--warn);
-}
-/* "+" chip: opens the preset editor popover */
-.raise-shortcut-edit { min-width: 26px; padding: 4px 9px; font-size: 12.5px; }
 
 /* Bet-size preset editor popover (fixed near the "+" chip, viewport-clamped) */
 .preset-pop {
@@ -511,16 +295,6 @@ main {
   text-decoration: underline dotted;
 }
 .preset-reset:hover { color: var(--text); }
-
-/* Terminal pane */
-#terminal-pane {
-  background: var(--panel-2);
-  border: 1px solid var(--border);
-  border-left: 3px solid var(--ok);
-  border-radius: var(--radius-sm);
-  padding: 10px 12px;
-}
-#terminal-message { font-size: 13px; line-height: 1.45; }
 
 /* Recommendation */
 #recommendation {
@@ -735,20 +509,7 @@ body.trainer-mode.trainer-pick #card-grid-panel {
 .cat-text-wrong { color: #e06b78; }
 .cat-text-blunder { color: var(--danger); }
 
-/* Trainer: revealed opponent hole mini-cards */
-.seat-hole-card {
-  stroke: rgba(255, 255, 255, 0.3); stroke-width: 0.75;
-  filter: drop-shadow(0 1px 1.5px rgba(0, 0, 0, 0.45));
-}
-.seat-hole-rank {
-  fill: #fff; font-size: 13px; font-weight: 800; pointer-events: none;
-}
-.seat-hole-suit {
-  fill: rgba(255, 255, 255, 0.92); font-size: 11px; pointer-events: none;
-}
-
 /* Feedback flash overlay */
-#table-wrap { position: relative; }
 #feedback-flash {
   position: absolute; left: 50%; top: 62%;
   transform: translate(-50%, -50%);
@@ -1083,8 +844,6 @@ body.trainer-mode.trainer-pick #card-grid-panel {
   body { min-height: 100vh; }
   main { display: block; min-height: 0; }
   #table-area { overflow: visible; padding: 10px; }
-  #table-wrap { border-radius: 8px; }
-  #table-svg { width: 100%; height: auto; display: block; }
 
   /* study card grid lives in the picker sheet on mobile — never as a sidebar
      (also overrides the trainer-pick sidebar swap) */
@@ -1097,7 +856,6 @@ body.trainer-mode.trainer-pick #card-grid-panel {
     padding: 0 10px 10px; overflow: visible;
   }
 
-  .panels { grid-template-columns: 1fr; height: auto; }
   .panel { overflow: visible; }
   /* bet curve: flex-grow collapses in an auto-height parent — pin a height */
   #recommendation { overflow: visible; }
@@ -1440,7 +1198,8 @@ body.ranges-mode .trainer-only { display: none !important; }
    Appended LAST on purpose: it re-skins Study / Trainer / Ranges / the landing
    page to sit next to the home-games design (same ink, same teal + gold, same
    type) while staying a TOOL — flat panels, dense type, one accent, nothing
-   decorative. The card faces are deliberately untouched.
+   decorative. (Since v4 the table and its cards are the home games': one card
+   face on the whole site, Study's.)
    Layout: a slim top bar (mode, format, account) + a per-mode work bar over
    the table; the right rail holds the OUTPUT (recommendation / stats) with the
    13 x 4 card matrix under it, solver-style.
@@ -1503,12 +1262,6 @@ kbd { font: 600 10.5px var(--mono); padding: 1px 5px; border-radius: 4px; border
 @media (min-width: 861px) {
   main { grid-template-columns: minmax(0, 1fr) clamp(340px, 29vw, 460px); }
   #table-area { padding: 10px 12px 12px; gap: 10px; }
-  /* The table is the workspace's anchor: it keeps its shape and a real minimum
-     size; the panels under it scroll, never the other way round. */
-  #table-wrap {
-    flex: none; width: 100%; aspect-ratio: 800 / 545; min-height: 300px; max-height: min(52vh, 760px);
-    padding: 4px; background: #0a0f16; border-radius: var(--radius);
-  }
   #side-rail {
     display: flex; flex-direction: column; min-height: 0; overflow-y: auto;
     background: var(--panel); border-left: 1px solid var(--border);
@@ -1522,8 +1275,6 @@ kbd { font: 600 10.5px var(--mono); padding: 1px 5px; border-radius: 4px; border
   }
   /* Trainer: nothing to show while a hand is live — don't reserve the space. */
   body.trainer-mode #side-rail > #info-panel { min-height: 0; }
-  .panels { grid-template-columns: minmax(0, 1fr); height: auto; min-height: 0; }
-  #action-panel { overflow: visible; }
   #history { max-height: 220px; overflow-y: auto; }
 
   /* 13 x 4 card matrix: ranks across (A -> 2), suits down. Same card faces. */
@@ -1558,24 +1309,10 @@ kbd { font: 600 10.5px var(--mono); padding: 1px 5px; border-radius: 4px; border
 .panel h3::before { width: 3px; height: 11px; border-radius: 1px; }
 .panel-head-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 6px; }
 .panel-head-row h3 { margin: 0; }
-#undo-btn {
-  height: 26px; padding: 0 10px; border-radius: var(--radius-sm); border: 1px solid var(--border);
-  background: var(--panel-2); color: var(--text); font-size: 12px; font-weight: 600; cursor: pointer;
-}
-#undo-btn:hover:not(:disabled) { background: var(--panel-3); border-color: var(--border-strong); }
-#undo-btn:disabled { opacity: 0.35; cursor: not-allowed; }
 .actor-banner { border-radius: var(--radius); background: var(--panel); box-shadow: none; }
 
-/* ---- actions: big, fixed-order, colour = meaning ---------------------------- */
-#gate-buttons { gap: 8px; margin-bottom: 12px; }
-#gate-buttons button { min-height: 44px; font-size: 14px; font-weight: 700; border-radius: var(--radius); letter-spacing: 0.2px; }
-#gate-buttons button.fold { background: rgba(242, 86, 106, 0.1); }
-#gate-buttons button.call { background: rgba(53, 200, 120, 0.12); }
-.raise-input-row { gap: 8px; }
-#raise-input { height: 40px; font-family: var(--mono); font-size: 15px; font-weight: 600; border-radius: var(--radius-sm); }
-#raise-submit, .primary { min-height: 40px; border-radius: var(--radius-sm); box-shadow: none; background: var(--accent); border: 0; font-weight: 700; }
-#raise-submit:hover, .primary:hover { background: var(--accent-2); }
-.raise-shortcut { height: 28px; border-radius: var(--radius-sm); font-family: var(--mono); }
+.primary { min-height: 40px; border-radius: var(--radius-sm); box-shadow: none; background: var(--accent); border: 0; font-weight: 700; }
+.primary:hover { background: var(--accent-2); }
 
 /* ---- recommendation: the output, so it reads first -------------------------- */
 #recommendation { gap: 10px; }
@@ -1586,10 +1323,6 @@ kbd { font: 600 10.5px var(--mono); padding: 1px 5px; border-radius: 4px; border
 .rec-dist-track { height: 9px; border-radius: 2px; background: rgba(255, 255, 255, 0.06); }
 .rec-dist-fill { border-radius: 2px; }
 .rec-dist-pct { font-family: var(--mono); font-weight: 700; }
-
-/* ---- table: calmer felt, thinner rim ----------------------------------------- */
-.table-rim { filter: none; }
-#table-svg text { font-family: var(--font); }
 
 /* ---- modals / toasts share the home-games chrome ---------------------------- */
 .gate-card { border-radius: 14px; border: 1px solid var(--border-strong); background: linear-gradient(180deg, #121a27, #0b111a); box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55); }
@@ -1752,10 +1485,6 @@ a.mode-tab { display: inline-flex; align-items: center; gap: 5px; text-decoratio
 }
 
 /* ---- actions + history -------------------------------------------------------- */
-#action-panel.villain-turn { border-color: rgba(240, 162, 60, 0.28); }
-#action-panel.villain-turn h3::before { background: var(--warn); }
-.gate-note { margin: 0 0 8px; flex-basis: 100%; }
-#gate-buttons button { max-width: 280px; }
 .last-verdict {
   display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px;
   margin: 0 0 10px; padding: 7px 10px; border-radius: var(--radius-sm);
@@ -1772,11 +1501,6 @@ a.mode-tab { display: inline-flex; align-items: center; gap: 5px; text-decoratio
 #history-panel { min-height: 0; }
 #history-panel .panel-head-row { margin-top: 0; }
 #history-panel .panel-head-row h3 { margin-right: auto; }
-#redo-btn {
-  height: 26px; padding: 0 10px; border-radius: var(--radius-sm); border: 1px solid var(--border);
-  background: var(--panel-2); color: var(--text); font-size: 12px; font-weight: 600; cursor: pointer;
-}
-#redo-btn:hover { background: var(--panel-3); border-color: var(--border-strong); }
 button.history-entry {
   width: 100%; border: 1px solid transparent; color: inherit; font: inherit; text-align: left; cursor: pointer;
 }
@@ -1785,12 +1509,6 @@ button.history-entry:hover, button.history-entry:focus-visible { border-color: v
 button.history-entry:hover .h-back, button.history-entry:focus-visible .h-back { opacity: 1; }
 .history-entry .h-pos.hero { color: var(--accent-2); }
 .history-entry .h-street { font-size: 11px; }
-@media (min-width: 1280px) {
-  /* CPY-017: wide screens put History beside Actions instead of stretching
-     Fold and Call into 700px bars. */
-  .panels { grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); align-items: start; }
-}
-
 /* ---- recommendation -------------------------------------------------------------- */
 .panel-head-top { margin: 0 0 10px; }
 .panel-head-top h3 { margin: 0; }
@@ -1877,7 +1595,7 @@ dialog.dlg .modal { width: 100%; max-width: none; max-height: 86vh; }
   background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
 }
 .btn-secondary:hover { background: var(--panel-3); }
-.primary.danger, #raise-submit.danger { background: var(--danger); color: #fff; }
+.primary.danger { background: var(--danger); color: #fff; }
 .primary.danger:hover { background: #ff6b7a; }
 a.btn-link { display: inline-flex; align-items: center; justify-content: center; text-decoration: none; padding: 0 18px; }
 .modal-buttons button, .modal-buttons a { min-height: 36px; }
@@ -1904,18 +1622,7 @@ a.btn-link { display: inline-flex; align-items: center; justify-content: center;
 }
 .toast-x:hover { color: var(--text-bright); background: var(--panel-3); }
 
-/* ---- table: seats, menus, phone table ----------------------------------------------- */
-.seat-node.menu-seat { cursor: pointer; }
-.seat-node.menu-seat:hover .seat-bg { stroke: rgba(255, 255, 255, 0.3); }
-.seat-node.menu-seat:focus { outline: none; }
-.seat-node.menu-seat:focus-visible .seat-bg { stroke: var(--accent-2); stroke-width: 2; }
-.seat-node .seat-more { fill: var(--muted); font-size: 15px; font-weight: 700; pointer-events: none; }
-.seat-node.menu-seat:hover .seat-more { fill: var(--text-bright); }
-.seat-node .seat-stack.editable { cursor: text; }
-.slot-rect:focus { outline: none; }
-.slot-rect:focus-visible { stroke: var(--accent-2); stroke-width: 2.5; }
-.dealer-hit { fill: transparent; }
-#dealer-button { touch-action: none; }   /* MOB-013: a drag moves the button, not the page */
+/* ---- table: the seat menu and the stack editor (Study) ------------------------------ */
 .seat-pop { width: auto; min-width: 210px; gap: 2px; padding: 8px; }
 .seat-pop-item {
   display: block; width: 100%; text-align: left; padding: 8px 10px; border-radius: 6px; cursor: pointer;
@@ -1924,18 +1631,6 @@ a.btn-link { display: inline-flex; align-items: center; justify-content: center;
 .seat-pop-item:hover, .seat-pop-item:focus-visible { background: var(--panel-3); color: var(--text-bright); outline: none; }
 .seat-pop-item.danger { color: var(--danger); }
 .stack-edit-input { font: 700 15px var(--mono); height: 32px; }
-
-/* The portrait table for upright phones (MOB-006 / ST-004): sizes in user
-   units — the drawing renders at ~0.9 on a 375px screen. */
-#table-svg.tall .seat-node .seat-position { font-size: 13px; letter-spacing: 0.4px; }
-#table-svg.tall .seat-node .seat-stack { font-size: 17px; }
-#table-svg.tall .bet-chip-amount { font-size: 15px; }
-#table-svg.tall .pot-label { font-size: 15px; }
-#table-svg.tall .hero-hand-label { font-size: 13.5px; }
-#table-svg.tall .seat-hole-rank { font-size: 11px; }
-#table-svg.tall .seat-hole-suit { font-size: 9px; }
-#table-svg.tall .seat-more { font-size: 16px; }
-#table-svg.tall .dealer-text { font-size: 12px; }
 
 /* ---- card grid: phone picker is the same 13 x 4 matrix (ST-003) ------------------- */
 dialog.dlg.sheet, #card-picker-modal.sheet {
@@ -1970,22 +1665,6 @@ dialog.dlg.sheet .picker-sheet { position: static; max-height: 88vh; overflow-y:
   #workbar .enter-cards-top { display: inline-flex; align-items: center; }
   .enter-cards-btn { display: inline-flex; align-items: center; }
   .guide-steps { gap: 6px; }
-  /* MOB-008: the network's answer sits right under the table, above the
-     action buttons and the history, instead of after all of them. */
-  #top-bar ~ main { display: flex !important; flex-direction: column; }
-  #table-area, #side-rail, .panels { display: contents; }
-  #workbar { order: 1; margin: 8px 8px 0; }
-  #study-guide { order: 2; margin: 8px 8px 0; }
-  #table-wrap { order: 3; margin: 8px 8px 0; }
-  #actor-banner { order: 4; margin: 8px 8px 0; }
-  #review-panel { order: 5; margin: 8px 8px 0; }
-  #info-panel { order: 6; margin: 8px 8px 0 !important; }
-  #action-panel { order: 7; margin: 8px 8px 0; }
-  #history-panel { order: 8; margin: 8px 8px 0; }
-  #card-grid-panel { order: 9; }
-  #trainer-stats-panel { order: 10; margin-top: 8px; }
-  #history { max-height: 190px; overflow-y: auto; }
-  #rg-view { order: 0; }
   .review-actions { width: 100%; }
   .review-actions button { flex: 1 1 auto; }
   .acct-menu { position: fixed; top: 54px; right: 8px; }
@@ -2009,17 +1688,12 @@ dialog.dlg.sheet .picker-sheet { position: static; max-height: 88vh; overflow-y:
   /* the ± control with its count speaks for itself; the label stays for screen readers */
   #seats-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 }
-/* The portrait table takes nearly the phone's width (MOB-006). */
-body.table-tall #table-wrap { padding: 2px; }
-body.table-tall #table-svg { max-height: none; }
-
 /* ---- reduced motion (A11Y-019) --------------------------------------------------------- */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important; animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important; scroll-behavior: auto !important;
   }
-  .seat-node.actor .seat-bg { filter: drop-shadow(0 0 5px rgba(24, 210, 195, 0.7)); }
 }
 
 /* ---- small print (A11Y-021): nothing under 11px, dim ticks still readable --------------- */
@@ -2180,8 +1854,6 @@ a.gate-google { display: inline-flex; text-decoration: none; padding: 12px 22px;
   .l-cta { width: 100%; }
 }
 
-/* the D button appears once the table has placed it (not at the SVG origin while loading) */
-#dealer-button:not([data-seat]) { display: none; }
 /* the workspace appears once app.js has applied the tab and table layout */
 body:not(.app-ready) #top-bar ~ main { visibility: hidden; }
 /* the table stays readable behind the phone card picker: you see the slot fill */
@@ -2258,4 +1930,335 @@ main.legal-main { display: block; padding: 34px 0 6px; min-height: 0; }
   .acct-settings #format-wrap { display: flex; flex-direction: column; align-items: stretch; gap: 6px; }
   .acct-settings #format-wrap .tb-label { display: block; font-size: 10px; letter-spacing: 0.6px; color: var(--muted); text-transform: uppercase; }
   .acct-settings #format-select { width: 100%; max-width: none; height: 40px; }
+}
+
+/* ==========================================================================
+   WORKSPACE v4 (2026-10-01) — Study and Trainer on the home games' table
+   (owner: "bring the same look to the study and trainer", each keeping its own
+   features). The TABLE is games.felt.css — shared with the home games, loaded
+   before this file, drawn by games.table.js through app.table.js's adapter —
+   with one card face on the whole site (Study's). This layer lays the page out
+   around it in the home games' palette (top bar, work bar, side rail, review)
+   and adds what only Study / Trainer have on the felt: card places to fill or
+   pick (Study; the Trainer's what-if), stacks to edit, the dealer button to
+   drag, "+" between seats, the network's choice on the action buttons.
+   ========================================================================== */
+
+/* ---- palette: the home games' (games.css :root) — page and table are one design ---- */
+:root {
+  --bg0: #05080d; --bg1: #0a0f16;
+  --panel: #101722; --panel-2: #151e2b; --panel-3: #1b2636;
+  --line: rgba(255, 255, 255, 0.07); --line-2: rgba(255, 255, 255, 0.13);
+  --border: var(--line); --border-strong: var(--line-2);
+  --tx: #e7ecf3; --tx-2: #9ba8ba; --tx-3: #7b889c; --bright: #ffffff;
+  --text: var(--tx); --muted: var(--tx-2); --text-bright: var(--bright);
+  --gold-2: #b58c35;
+  --ok: #35c878; --danger: #f2566a; --warn: #f5a742;
+  --hearts: var(--card-hearts); --diamonds: var(--card-diamonds);
+  --clubs: var(--card-clubs); --spades: var(--card-spades);
+  --felt-1: #2a9d78; --felt-2: #157a5a; --felt-3: #0a4a37;
+  --rail-1: #2b2f38; --rail-2: #14171d;
+  --shadow-lg: 0 24px 60px rgba(0, 0, 0, 0.55);
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+/* the app page (not the landing): the home games' backdrop */
+body:has(> #top-bar) {
+  background:
+    radial-gradient(1200px 700px at 50% -10%, #13202f 0%, transparent 60%),
+    radial-gradient(900px 600px at 100% 100%, #0c1a1c 0%, transparent 55%),
+    var(--bg0);
+  -webkit-font-smoothing: antialiased;
+}
+.sprite { position: absolute; }
+.hg-felt .ico { width: 18px; height: 18px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+
+/* ---- the home games' buttons and fields, for the dock (games.css section 2) ---------- */
+.hg-felt button { cursor: pointer; }
+.hg-felt button:disabled { cursor: not-allowed; }
+.hg-felt .btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  height: 38px; padding: 0 16px; border-radius: 10px;
+  border: 1px solid var(--line-2); background: var(--panel-2); color: var(--tx);
+  font-weight: 600; letter-spacing: 0.1px; white-space: nowrap;
+  transition: background 0.15s, border-color 0.15s, transform 0.08s, box-shadow 0.15s, opacity 0.15s;
+}
+.hg-felt .btn:hover:not(:disabled) { background: var(--panel-3); border-color: rgba(255, 255, 255, 0.2); }
+.hg-felt .btn:active:not(:disabled) { transform: translateY(1px) scale(0.99); }
+.hg-felt .btn:disabled { opacity: 0.45; }
+.hg-felt .btn.sm { height: 30px; padding: 0 11px; border-radius: 8px; font-size: 12.5px; }
+.hg-felt .btn.primary {
+  background: linear-gradient(180deg, #2be3d4 0%, #0fa99d 100%); color: var(--on-accent); border-color: rgba(255, 255, 255, 0.18);
+  box-shadow: 0 6px 18px rgba(24, 210, 195, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.35);
+}
+.hg-felt .btn.primary:hover:not(:disabled) { background: linear-gradient(180deg, #4df0e2 0%, #14b9ab 100%); }
+.hg-felt .input {
+  width: 100%; height: 40px; padding: 0 12px; border-radius: 10px;
+  border: 1px solid var(--line-2); background: rgba(0, 0, 0, 0.28); color: var(--bright);
+  font: inherit; outline: none; transition: border-color 0.15s, box-shadow 0.15s;
+}
+.hg-felt .input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(24, 210, 195, 0.16); }
+.hg-felt .money { position: relative; }
+.hg-felt .money::before { content: "$"; position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: var(--tx-3); font-family: var(--mono); pointer-events: none; }
+.hg-felt .money input { padding-left: 24px !important; font-family: var(--mono); }
+.hg-felt .money.unit-bb::before { content: "bb"; left: 10px; font-size: 11px; letter-spacing: 0.5px; }
+.hg-felt .money.unit-bb input { padding-left: 34px !important; }
+.hg-felt input[type="range"] { -webkit-appearance: none; appearance: none; width: 100%; height: 22px; margin: 0; background: transparent; cursor: pointer; }
+.hg-felt input[type="range"]::-webkit-slider-runnable-track { height: 6px; border-radius: 6px; background: linear-gradient(90deg, var(--accent) var(--fill, 0%), rgba(255, 255, 255, 0.13) var(--fill, 0%)); }
+.hg-felt input[type="range"]::-moz-range-track { height: 6px; border-radius: 6px; background: rgba(255, 255, 255, 0.13); }
+.hg-felt input[type="range"]::-moz-range-progress { height: 6px; border-radius: 6px; background: var(--accent); }
+.hg-felt input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 20px; height: 20px; margin-top: -7px; border-radius: 50%; background: #fff; border: 3px solid var(--accent); box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5); }
+.hg-felt input[type="range"]::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%; background: #fff; border: 3px solid var(--accent); }
+/* (this page's global kbd is a key cap; on an action button it is a quiet letter) */
+.hg-felt .act kbd { border: 0; background: none; padding: 0; margin: 0; color: inherit; }
+
+/* ---- the page: top bar, then the table column and the side rail ----------------------- */
+#top-bar { background: rgba(8, 12, 18, 0.92); border-bottom: 1px solid var(--line); }
+.seg { background: rgba(0, 0, 0, 0.3); border-color: var(--line); border-radius: 9px; }
+.seg button { border-radius: 6px; }
+.seg button.on { background: var(--panel-3); box-shadow: inset 0 0 0 1px var(--line-2), 0 2px 6px rgba(0, 0, 0, 0.35); }
+#format-select, .rate-btn { border-radius: 9px; }
+#table-area { padding: 0; gap: 0; }
+/* the work bar: the table's own controls, a slim strip under the top bar */
+#workbar {
+  gap: 8px 16px; padding: 8px 14px; border: 0; border-bottom: 1px solid var(--line);
+  border-radius: 0; background: rgba(8, 12, 18, 0.5);
+}
+#workbar .tb-label { font-size: 10.5px; letter-spacing: 1px; color: var(--tx-3); }
+#workbar button {
+  height: 32px; padding: 0 13px; border-radius: 9px; border: 1px solid var(--line-2);
+  background: var(--panel-2); color: var(--tx); font-size: 12.5px; font-weight: 600;
+  transition: background 0.15s, border-color 0.15s, transform 0.08s;
+}
+#workbar button:hover:not(:disabled) { background: var(--panel-3); border-color: rgba(255, 255, 255, 0.2); }
+#workbar button:active:not(:disabled) { transform: translateY(1px); }
+#workbar .icon-btn { width: 32px; padding: 0; border-radius: 50%; }
+#workbar #new-hand-btn, #workbar #trainer-new-hand-btn {
+  padding: 0 16px; color: var(--on-accent); font-weight: 700;
+  background: linear-gradient(180deg, #2be3d4 0%, #0fa99d 100%);
+  border-color: rgba(255, 255, 255, 0.18);
+  box-shadow: 0 6px 18px rgba(24, 210, 195, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.35);
+}
+#workbar #new-hand-btn:hover, #workbar #trainer-new-hand-btn:hover { background: linear-gradient(180deg, #4df0e2 0%, #14b9ab 100%); }
+#workbar select, #workbar .top-bar-item input[type="number"] {
+  height: 32px; border-radius: 9px; border: 1px solid var(--line-2); background: rgba(0, 0, 0, 0.28); color: var(--tx);
+}
+#workbar .top-bar-item input[type="number"] { font-family: var(--mono); }
+#workbar .seat-ctl { height: 32px; padding: 0 3px; gap: 2px; border-radius: 9px; border: 1px solid var(--line); background: rgba(0, 0, 0, 0.3); }
+#workbar .seat-ctl button { width: 26px; height: 26px; padding: 0; border: 0; border-radius: 7px; background: transparent; }
+#workbar .seat-ctl button:hover:not(:disabled) { background: rgba(255, 255, 255, 0.08); }
+#study-guide { margin: 10px 14px 0; border-radius: 12px; }
+/* the table and its dock fill the column */
+#stage-wrap { min-height: 460px; }
+#stage-wrap.loading #stage-box { opacity: 0.55; transition: opacity 0.2s; }
+/* the side rail, the home games' panel: the Trainer's review of a hand on top (beside the
+   felt it steps through), the network's answer, then the cards (Study) or what was played
+   and the stats (Trainer) */
+@media (min-width: 861px) {
+  #side-rail { background: rgba(9, 13, 20, 0.78); border-left: 1px solid var(--line); }
+  #side-rail > #review-panel { order: 0; }
+  #side-rail > #info-panel { order: 1; }
+  #side-rail > #card-grid-panel { order: 2; }
+  #side-rail > #trainer-stats-panel { order: 3; }
+  #side-rail > #history-panel { order: 4; }
+  body.trainer-mode #side-rail > #history-panel { order: 2; }
+  #side-rail > #info-panel, #side-rail > #history-panel { border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: none; padding: 14px; }
+  #side-rail > #history-panel { flex: none; overflow: visible; }
+  #side-rail > #card-grid-panel, body.trainer-mode #side-rail > #trainer-stats-panel { border-bottom: 1px solid var(--line); }
+  #history { max-height: 260px; }
+  /* the review heads the rail */
+  #side-rail > #review-panel {
+    flex: none; margin: 0; padding: 14px; border: 0; border-bottom: 1px solid var(--line); border-radius: 0;
+    background: rgba(24, 210, 195, 0.035); box-shadow: none;
+  }
+}
+
+/* ---- panels, history, stats, the review: the home games' surfaces ------------------- */
+.panel { background: rgba(255, 255, 255, 0.025); border: 1px solid var(--line); border-radius: 14px; }
+.panel h3, .card-grid-header, .stats-title { font-size: 10.5px; letter-spacing: 1.4px; color: var(--tx-3); }
+.panel h3::before { display: none; }
+#history-panel .panel-head-row { margin-bottom: 8px; }
+.history-entry { background: transparent; border-radius: 8px; padding: 4px 6px; }
+button.history-entry:hover, button.history-entry:focus-visible { background: rgba(255, 255, 255, 0.05); border-color: var(--line-2); }
+.stats-block { background: rgba(255, 255, 255, 0.025); border: 1px solid var(--line); border-radius: 12px; }
+#review-panel {
+  padding: 12px 16px; border-radius: 14px; border: 1px solid var(--line-2);
+  background: rgba(13, 19, 28, 0.92); box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+}
+/* the review (the rail's head on a desktop, under the table on a phone): the score ring beside
+   the verdict, then the stepper and the decisions, then the buttons */
+#review-panel { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 10px 14px; align-items: start; }
+#review-panel .review-left { grid-column: 1; grid-row: 1; }
+#review-panel #review-detail { grid-column: 2; grid-row: 1; min-width: 0; align-self: center; }
+#review-panel .review-mid { grid-column: 1 / -1; grid-row: 2; min-width: 0; }
+#review-panel .review-step-row { gap: 6px; }
+#review-panel #review-step-label { flex: 1 1 auto; min-width: 0; }
+#review-panel #review-chips { max-width: none; }
+#review-panel .review-actions { grid-column: 1 / -1; grid-row: 3; flex-direction: row; flex-wrap: wrap; align-self: start; }
+.review-step-row button { width: 28px; height: 28px; border-radius: 9px; background: var(--panel-2); border: 1px solid var(--line-2); }
+.review-step-row button:hover:not(:disabled) { background: var(--panel-3); }
+.review-chip { background: rgba(255, 255, 255, 0.04); border-color: var(--line-2); }
+#review-open-study, #review-repeat-hand { height: 36px; padding: 0 14px; border-radius: 10px; background: var(--panel-2); border: 1px solid var(--line-2); }
+#review-open-study:hover, #review-repeat-hand:hover { background: var(--panel-3); border-color: rgba(255, 255, 255, 0.2); }
+/* buttons that say "go" (dialogs, Next hand): the home games' primary */
+.primary {
+  border-radius: 10px; color: var(--on-accent); border: 1px solid rgba(255, 255, 255, 0.18);
+  background: linear-gradient(180deg, #2be3d4 0%, #0fa99d 100%);
+  box-shadow: 0 6px 18px rgba(24, 210, 195, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.35);
+}
+.primary:hover { background: linear-gradient(180deg, #4df0e2 0%, #14b9ab 100%); }
+#review-next-hand { height: 36px; min-height: 36px; }
+.primary.danger { box-shadow: none; border-color: transparent; }
+.btn-secondary { border-color: var(--line-2); border-radius: 10px; }
+.modal-buttons button, .modal-buttons a { border-radius: 10px; }
+/* dialogs and pop-overs: the home games' */
+.modal { border-radius: 18px; background: linear-gradient(180deg, #131c2a, #0c121b); border: 1px solid var(--line-2); box-shadow: var(--shadow-lg); }
+.preset-pop { border-radius: 14px; background: #121a27; border: 1px solid var(--line-2); box-shadow: var(--shadow-lg); }
+.seat-pop { padding: 6px; }
+.seat-pop .preset-pop-title { padding: 8px 10px 6px; font-size: 10.5px; letter-spacing: 1.3px; color: var(--tx-3); }
+.seat-pop-item { height: 38px; padding: 0 10px; border-radius: 9px; }
+.seat-pop-item:hover, .seat-pop-item:focus-visible { background: rgba(255, 255, 255, 0.07); }
+.seat-pop-item.danger { color: #ff9aa6; }
+.toast { border-radius: 12px; background: rgba(16, 23, 34, 0.96); border: 1px solid var(--line-2); border-left: 3px solid var(--danger); box-shadow: var(--shadow-lg); }
+.toast-info { border-left-color: var(--accent); }
+
+/* ---- the table: what only Study / Trainer have on it ---------------------------------- */
+/* (no empty chairs to sit in: a Study / Trainer table seats exactly its players) */
+.hg-felt .seat.is-empty { display: none; }
+/* the Trainer's seats are the table's: there is nothing to open on them */
+.hg-felt:not(.study-table) .seat:not(.is-empty) .seat-main { cursor: default; }
+/* Study: a seat opens its menu, a stack changes in place (a click on the amount) */
+.study-table .seat.study-seat .seat-main:hover .seat-plate { border-color: rgba(255, 255, 255, 0.3); }
+.study-table .seat.study-seat.is-hero .seat-main:hover .seat-plate { border-color: rgba(24, 210, 195, 0.8); }
+.seat-stack.editable { cursor: text; text-decoration: underline dotted rgba(236, 201, 119, 0.55); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+.seat-stack.editable:hover { color: #ffe9b0; }
+.stack-edit-input { z-index: 20; height: 32px; border-radius: 9px; border: 1px solid var(--accent); background: #0c121b; color: var(--bright); box-shadow: 0 0 0 3px rgba(24, 210, 195, 0.16), var(--shadow-lg); }
+/* card places: Study fills them (click one, then a card); the Trainer's review swaps one (what-if) */
+#hero-hole .card.slot-pick, .board .slot-card.slot-pick { pointer-events: auto; cursor: pointer; }
+#hero-hole .card.slot-pick { border-radius: calc(var(--cw) * 0.11); }
+/* (Hero's empty places overlap like real cards: a solid felt-dark fill, so they stack instead of darkening) */
+#hero-hole .card.is-empty { background: #0f5a43; background: color-mix(in srgb, var(--felt-2) 70%, #04080c); }
+#hero-hole .card.slot-pick:not(.slot-sel):hover { transform: translateY(calc(var(--cw) * -0.07)); }
+.board .slot-card.slot-pick:empty { border: 1.5px dashed rgba(255, 255, 255, 0.34); background: rgba(4, 8, 12, 0.28); transition: border-color 0.15s, background 0.15s; }
+.board .slot-card.slot-pick:empty:hover, #hero-hole .card.is-empty.slot-pick:hover { border-color: rgba(24, 210, 195, 0.8); }
+.board .slot-card.slot-pick:empty:hover { background: rgba(24, 210, 195, 0.1); }
+/* the place the next card goes: lifted, ringed in the accent */
+#hero-hole .card.slot-sel { z-index: 3; transform: translateY(calc(var(--cw) * -0.14)); box-shadow: 0 0 0 2px var(--accent), 0 0 calc(var(--cw) * 0.45) rgba(24, 210, 195, 0.55); }
+#hero-hole .card.is-empty.slot-sel { border-style: solid; border-color: var(--accent); }
+#hero-hole .card.is-empty.slot-sel, #hero-hole .card.is-empty.slot-next, #hero-hole .card.is-empty.slot-pick:hover { background: #126354; background: color-mix(in srgb, #18d2c3 14%, color-mix(in srgb, var(--felt-2) 70%, #04080c)); }
+.board .slot-card.slot-sel { border-radius: calc(var(--cw) * 0.11); outline: 2px solid var(--accent); outline-offset: 1px; box-shadow: 0 0 calc(var(--cw) * 0.45) rgba(24, 210, 195, 0.5); }
+.board .slot-card.slot-sel:empty { border-color: transparent; background: rgba(24, 210, 195, 0.14); }
+/* (none selected) the place the next card goes: its outline in the accent, breathing */
+#hero-hole .card.is-empty.slot-next, .board .slot-card.slot-next:empty { border: 2px solid rgba(24, 210, 195, 0.85); animation: slot-next 1.8s ease-in-out infinite; }
+.board .slot-card.slot-next:empty { background: rgba(24, 210, 195, 0.1); }
+@keyframes slot-next { 50% { box-shadow: 0 0 calc(var(--cw) * 0.35) rgba(24, 210, 195, 0.45); } }
+/* a what-if card (the Trainer's review): a dot in its corner */
+.card.slot-mod::after, .slot-card.slot-mod::after {
+  content: ""; position: absolute; top: -4px; right: -4px; z-index: 4; width: 10px; height: 10px;
+  border-radius: 50%; background: var(--warn); box-shadow: 0 0 0 2px rgba(10, 14, 20, 0.95);
+}
+/* Study: the dealer button moves where it is dragged */
+#dealer-btn.draggable { cursor: grab; touch-action: none; }   /* (MOB-013: a drag moves the button, not the page) */
+#dealer-btn.draggable:hover { box-shadow: 0 2px 0 #8d97a6, 0 5px 12px rgba(0, 0, 0, 0.55), 0 0 0 3px rgba(24, 210, 195, 0.5); }
+#dealer-btn.dragging { cursor: grabbing; transition: none; z-index: 12; }
+/* Study, with a mouse: "+" between two seats adds a player there (shown while over the table) */
+#seat-adds { position: absolute; inset: 0; z-index: 6; pointer-events: none; }
+.seat-add {
+  position: absolute; transform: translate(-50%, -50%); width: 26px; height: 26px; padding: 0;
+  display: flex; align-items: center; justify-content: center; border-radius: 50%;
+  border: 1.5px dashed rgba(24, 210, 195, 0.7); background: rgba(4, 8, 12, 0.8); color: var(--accent);
+  font: 700 17px/1 var(--font); cursor: pointer; pointer-events: auto; opacity: 0;
+  transition: opacity 0.15s, transform 0.15s var(--ease), background 0.15s;
+}
+#stage-box:hover .seat-add, .seat-add:focus-visible { opacity: 0.9; }
+.seat-add:hover { opacity: 1; transform: translate(-50%, -50%) scale(1.15); border-style: solid; background: rgba(24, 210, 195, 0.22); color: #fff; }
+/* the Trainer's grade, flashed over the table after your move */
+#feedback-flash {
+  top: 50%; z-index: 25; padding: 16px 28px; border-radius: 18px;
+  background: rgba(4, 8, 12, 0.8); border: 1px solid var(--line-2); box-shadow: var(--shadow-lg);
+  -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
+}
+
+/* ---- the dock: what Study / Trainer add to the home games' action bar ---------------- */
+/* who acts — in Study, whose action the buttons enter: one line over them */
+#dock .actor-banner {
+  justify-content: center; gap: 8px; min-height: 22px; padding: 0 10px; text-align: center;
+  border: 0; border-radius: 0; background: none; box-shadow: none;
+  font-size: 12.5px; font-weight: 600; color: var(--tx-2);
+}
+#dock .actor-banner:not(.error) { display: block; line-height: 1.45; }   /* (a wrapped line keeps its dot beside its first word) */
+#dock .actor-banner::before { display: inline-block; width: 7px; height: 7px; margin: 0 8px 1px 0; vertical-align: middle; }
+#dock .actor-banner.hero { color: var(--tx); }
+#dock .actor-banner.villain { color: #ffd59a; }
+#dock .actor-banner.error { color: #ffd3d9; }
+#dock .banner-btn { margin-left: 4px; height: 26px; border-radius: 8px; }
+/* the Trainer's grade of your last move, until your next one */
+#dock .last-verdict { margin: 0; justify-content: center; text-align: center; padding: 5px 12px; border-radius: 10px; background: rgba(255, 255, 255, 0.035); font-size: 12.5px; }
+#dock .last-verdict .lv-label { width: auto; font-size: 10px; letter-spacing: 1px; }
+/* only the actions there are: two buttons when there is no bet to make */
+#act-btns.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+/* Study: the network's choice on Hero's turn (Recommendation says how sure it is) */
+.act.rec { overflow: visible; box-shadow: 0 0 0 2px var(--accent), 0 0 22px rgba(24, 210, 195, 0.4); }
+.act.rec::before {
+  content: "Network"; position: absolute; left: 50%; top: -9px; transform: translateX(-50%);
+  padding: 0 7px; border-radius: 99px; background: var(--accent); color: var(--on-accent);
+  font: 800 9.5px/16px var(--mono); letter-spacing: 0.7px; text-transform: uppercase; white-space: nowrap; pointer-events: none;
+}
+/* (Study has no action keys: F / C / R are the Trainer's) */
+body:not(.trainer-mode) .act kbd { display: none; }
+.sz-presets button.allin { color: #ff9aa6; border-color: rgba(242, 86, 106, 0.45); }
+.sz-presets .preset-edit { flex: 0 0 auto; padding: 0 10px; color: var(--tx-2); background: transparent; border-style: dashed; }
+/* the one-row sizing panel of a desktop (games.felt.css): the presets take the width their
+   labels need (no-limit has eight: "150%" and "All-in" were cut to "15…"); the slider and
+   the amount take the rest, or drop under them when that is too little */
+@media (min-width: 761px) and (min-height: 701px) {
+  #sizing { flex-wrap: wrap; }
+  #sizing > .sz-row:first-child { flex: 0 1 auto; }
+  #sizing .sz-presets { flex: 0 1 auto; }
+  #sizing .sz-presets button { flex: 0 1 auto; min-width: 38px; padding: 0 9px; }
+  #sizing > .sz-row:nth-child(2) { flex: 1 1 220px; }
+}
+.sz-presets .preset-edit:hover { color: var(--tx); border-style: solid; }
+#status-strip .btn { margin-left: 4px; }
+/* Undo / Redo: by the buttons; a phone shows them under them */
+@media (max-width: 760px) {
+  body.trainer-mode #dock-left { display: none; }   /* (the Trainer has nothing there) */
+}
+@media (max-width: 760px) and (max-height: 620px) and (orientation: portrait) {
+  body:not(.trainer-mode) #dock-left { display: flex; }   /* (Study's Undo stays on a short phone) */
+}
+
+/* ---- phones and small tablets: one column that scrolls -------------------------------
+   The work bar, then the table with its dock (sized so both fit the screen under the
+   bars), then the Trainer's review, the network's answer, the history and the stats.
+   (The card matrix is the picker sheet there.) */
+@media (max-width: 860px) {
+  #top-bar ~ main { display: flex !important; flex-direction: column; }
+  #table-area, #side-rail { display: contents; }
+  #rg-view { order: 0; }
+  #workbar { order: 1; padding: 6px 8px; }
+  #study-guide { order: 2; margin: 8px 8px 0; }
+  #stage-wrap { order: 3; flex: none; min-height: 0; height: max(440px, calc(100vh - 140px)); height: max(440px, calc(100svh - 140px)); }
+  body.trainer-mode #stage-wrap { height: max(440px, calc(100vh - 100px)); height: max(440px, calc(100svh - 100px)); }
+  #review-panel { order: 4; margin: 0 8px 8px; }
+  #info-panel { order: 5; margin: 0 8px 8px !important; }
+  #history-panel { order: 6; margin: 0 8px 8px; }
+  #trainer-stats-panel { order: 7; }
+  #card-grid-panel { order: 8; }
+  #history { max-height: 190px; overflow-y: auto; }
+}
+/* a phone on its side: the felt takes the screen, the dock floats over its corners (games.felt.css) */
+@media (max-width: 860px) and (max-height: 480px) and (orientation: landscape) {
+  #stage-wrap, body.trainer-mode #stage-wrap { height: max(280px, calc(100vh - 8px)); height: max(280px, calc(100svh - 8px)); }
+  #dock .actor-banner, #dock .last-verdict { padding: 4px 10px; border-radius: 10px; background: rgba(8, 12, 18, 0.84); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); font-size: 12px; }
+}
+
+/* WGLIVE:START */
+/* live capture (local build): rescan buttons over the table's corner */
+#ocr-rescan-group { position: absolute; right: 8px; bottom: 8px; z-index: 12; display: flex; gap: 6px; }
+#ocr-rescan-group .rescan-btn { width: auto; height: 28px; padding: 0 10px; border-radius: 8px; background: rgba(4, 8, 12, 0.82); }
+/* WGLIVE:END */
+
+/* ---- reduced motion: the table's own moves too (A11Y-019) ---------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  #hero-hole .card.slot-pick:not(.slot-sel):hover { transform: none; }
 }

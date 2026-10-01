@@ -147,27 +147,24 @@ function renderActorBanner(s) {
   }
 }
 
-// Fold / Check-Call are built ONCE and updated in place (A11Y-016): rebuilding
-// them on every render threw keyboard focus back to the top of the page
-// after each action and could eat a click that landed mid-rebuild.
-function ensureGateButtons() {
-  const gate = document.getElementById("gate-buttons");
-  if (gate.querySelector('button[data-gate="fold"]')) return gate;
-  gate.innerHTML = "";
-  const note = document.createElement("p");
-  note.className = "muted gate-note";
-  note.hidden = true;
-  gate.appendChild(note);
-  for (const [slug, cls] of [["fold", "fold"], ["check_call", "call"]]) {
-    const b = document.createElement("button");
-    b.type = "button";
-    b.dataset.gate = slug;
-    b.className = cls;
-    b.addEventListener("click", () => postAction({ gate: slug }));
-    gate.appendChild(b);
-  }
-  return gate;
+// --- The dock (2026-10-01): the home games' action bar ------------------------------
+// Three big buttons — Fold · Check / Call · Bet / Raise — and the sizing panel
+// over them (presets, slider, amount). Built ONCE in index.html and updated in
+// place (A11Y-016): rebuilding them every render threw keyboard focus back to
+// the top of the page after each action and could eat a click mid-rebuild.
+// Study enters ANY player's action with them (the bar says whose); the
+// Trainer, yours.
+function dockEls() {
+  const $ = (id) => document.getElementById(id);
+  return {
+    dock: $("dock"), btns: $("act-btns"), sizing: $("sizing"), strip: $("status-strip"),
+    fold: $("fold-btn"), call: $("check-btn"), callLbl: $("call-lbl"), callAmt: $("call-amt"),
+    raise: $("raise-go"), raiseLbl: $("raise-lbl"), raiseAmt: $("raise-amt"),
+  };
 }
+// The sizing panel floats over the buttons on a phone or a short window, and
+// opens with a first tap on Bet / Raise (the second bets) — as on the home games.
+const COMPACT_DOCK_MQ = window.matchMedia("(max-width: 760px), (max-height: 700px)");
 
 // End-of-hand line. The Trainer builds it from the hand's result in the
 // active unit, in the second person (ST-013 / ST-023 / CPY-013); it also
@@ -188,146 +185,106 @@ function terminalText(s) {
 }
 
 function renderActions(s) {
-  const gate = ensureGateButtons();
-  const note = gate.querySelector(".gate-note");
-  const btns = [...gate.querySelectorAll("button[data-gate]")];
-  const raiseSection = document.getElementById("raise-section");
-  const terminalPane = document.getElementById("terminal-pane");
-  const title = document.getElementById("action-title");
-  const panel = document.getElementById("action-panel");
-  panel.classList.remove("villain-turn");
-  const onlyNote = (text) => {
-    note.textContent = text;
-    note.hidden = !text;
-    for (const b of btns) b.hidden = true;
-    raiseSection.hidden = true;
+  const d = dockEls();
+  d.dock.classList.remove("villain-turn", "hero-turn");
+  for (const b of [d.fold, d.call, d.raise]) b.classList.remove("rec");
+  // A line in place of the buttons: the hand is over, someone else is acting,
+  // the cards for the next street are missing…
+  const note = (markup) => {
+    d.btns.hidden = true;
+    d.sizing.hidden = true;
+    d.strip.hidden = !markup;
+    d.strip.innerHTML = markup || "";
   };
-
+  // (the Trainer: the next hand is one click away, where your hand was)
+  const nextHand = s.trainer ? ' <button type="button" class="btn sm primary" data-trainer-next>Next hand</button>' : "";
   if (s.terminal) {
-    onlyNote("");
-    terminalPane.hidden = false;
-    title.textContent = "Hand over";
-    document.getElementById("terminal-message").textContent = terminalText(s);
+    note(`<b>Hand over</b><span>${escapeHTML(terminalText(s))}</span>${nextHand}`);
     return;
   }
-  terminalPane.hidden = true;
-
   // Trainer review reconstruction: the hand is over; this state is a
   // replayed decision node. Show the choice, don't allow acting.
   if (s.trainer && !s.trainer.hand_active) {
-    title.textContent = "Review";
-    onlyNote("The hand is over — step through it above, or deal the next hand.");
+    note(`The hand is over — step through it in the review, or deal the next one.${nextHand}`);
     return;
   }
-
   // Trainer animation frame: an opponent is acting.
   if (s.trainer && s.actor !== null && s.actor !== undefined && s.actor !== s.hero_seat) {
-    title.textContent = "Your action";
-    onlyNote("Opponents are acting…");
+    note("Opponents are acting…");
     return;
   }
-
   if (s.actor === null || s.actor === undefined) {
-    title.textContent = "Actions";
     const st = s.awaiting_next_street;
-    onlyNote(st ? `Betting is closed — enter the ${st} cards to continue.` : "No action to take right now.");
+    note(st ? `Betting is closed — enter the <b>${escapeHTML(st)}</b> cards to continue.` : "No action to take right now.");
     return;
   }
-
   const isHero = s.actor === s.hero_seat;
   const actorSeat = s.seats[s.actor];
   // ST-017: say whose action the buttons enter. Study records every player's
-  // action, so an opponent's turn gets its own title and tint.
-  if (s.trainer) title.textContent = "Your action";
-  else if (isHero) title.textContent = `Hero's action (${actorSeat.position})`;
-  else {
-    title.textContent = `Enter ${actorSeat.position}'s action`;
-    panel.classList.add("villain-turn");
-  }
+  // action: an opponent's turn gets its own tint, Hero's the accent.
+  if (!s.trainer) d.dock.classList.add(isHero ? "hero-turn" : "villain-turn");
   const holeCount = s.card_spec ? s.card_spec.hero_hole.length : 5;
-  const BLOCK_TOOLTIPS = {
-    hole:  `Place your ${holeCount} hole cards to act`,
+  const BLOCK_NOTES = {
+    hole:  `Place Hero's ${holeCount} hole cards to act`,
     flop:  "Place the flop cards to act",
     turn:  "Place the turn cards to act",
     river: "Place the river cards to act",
   };
-  const heroBlocked = isHero && s.hero_blocking_reason != null;
-  const tooltip = heroBlocked ? BLOCK_TOOLTIPS[s.hero_blocking_reason] : "";
-  note.hidden = !heroBlocked;
-  note.textContent = heroBlocked ? `${tooltip}.` : "";
-
-  const setBtn = (b, label, enabled, hint) => {
-    b.hidden = false;
-    b.textContent = label;
-    // data-legal lets setActionsBusy(false) restore exactly this state; a
-    // button painted while a POST is outstanding starts out busy-disabled
-    // (review 2026-09-20 F2).
+  if (isHero && s.hero_blocking_reason != null) {
+    note(`${escapeHTML(BLOCK_NOTES[s.hero_blocking_reason] || "Place the cards to act")}.`
+      + ' <button type="button" class="btn sm enter-cards-btn" data-open-picker>Enter cards</button>');
+    return;
+  }
+  d.strip.hidden = true;
+  d.btns.hidden = false;
+  // data-legal lets setActionsBusy(false) restore exactly this state; a button
+  // painted while a POST is outstanding starts out busy-disabled
+  // (review 2026-09-20 F2).
+  const setBtn = (b, enabled, hint) => {
     b.dataset.legal = enabled ? "1" : "0";
     b.disabled = !enabled || UI.actionInFlight;
-    b.title = tooltip || hint || "";
+    b.title = hint || "";
   };
   const trainerKeys = !!s.trainer;
-  setBtn(btns[0], "Fold", s.legal.fold && !heroBlocked,
-    trainerKeys ? "Fold (F)" : (s.legal.fold ? "" : "Nothing to fold to — checking is free"));
-  setBtn(btns[1], s.to_call_chips > 0 ? `Call ${formatUnit(s.to_call_chips, s)}` : "Check",
-    s.legal.check_call && !heroBlocked, trainerKeys ? "Check or call (C)" : "");
-
-  if (s.legal.raise && !heroBlocked) {
-    raiseSection.hidden = false;
-    renderRaiseSection(s, actorSeat);
-  } else {
-    raiseSection.hidden = true;
+  setBtn(d.fold, s.legal.fold, trainerKeys ? "Fold (F)" : (s.legal.fold ? "" : "Nothing to fold to — checking is free"));
+  const calling = s.to_call_chips > 0;
+  d.callLbl.textContent = calling ? "Call" : "Check";
+  d.callAmt.textContent = calling ? formatUnit(s.to_call_chips, s) : "";
+  setBtn(d.call, s.legal.check_call, trainerKeys ? "Check or call (C)" : "");
+  const canRaise = !!s.legal.raise;
+  d.raise.hidden = !canRaise;
+  setBtn(d.raise, canRaise, trainerKeys ? "Bet or raise (R)" : "");
+  d.btns.classList.toggle("two", !canRaise);
+  if (canRaise) renderRaiseSection(s, actorSeat);
+  else d.sizing.hidden = true;
+  // Study: the network's answer on Hero's turn is the button it would press
+  const rec = !s.trainer && isHero ? s.recommendation : null;
+  if (rec) {
+    const b = rec.gate === "fold" ? d.fold : rec.gate === "check_call" ? d.call : rec.gate === "raise" ? d.raise : null;
+    if (b && !b.hidden) {
+      b.classList.add("rec");
+      b.title = `${b.title ? b.title + " · " : ""}The network's choice`;
+    }
   }
 }
 
+// The size on the Bet / Raise button is a raise-TO total (what the player's
+// street commitment becomes); the engine takes the raise-BY delta on top of
+// what they already put in this street (ac). Arithmetic stays in chips;
+// amounts are formatted at the edge, in the viewer's unit.
 function renderRaiseSection(s, actorSeat) {
+  const d = dockEls();
   const minChips = s.raise_bounds.min_chips;
   const maxChips = s.raise_bounds.max_chips;
-  // Engine bounds are raise-BY deltas; the UI shows raise-TO totals.
-  // total = delta + ac. Arithmetic stays in chips; format only at the edge.
   const ac = actorCommitChips(s);
-  const input = document.getElementById("raise-input");
-  const inputRow = input.parentElement;
-  const unitLabel = document.getElementById("raise-unit");
-  const boundsLabel = document.getElementById("raise-bounds-label");
-  const submit = document.getElementById("raise-submit");
-  const shortcuts = document.getElementById("raise-shortcuts");
-  unitLabel.textContent = unitSuffix();
+  const minTotal = minChips + ac, maxTotal = maxChips + ac;
   // ST-024: "Bet" when nothing is in front, "Raise" otherwise — the same verb
   // the history and the recommendation use.
   const verb = aggVerb(s.to_call_chips, s.street);
+  const maxIsAllIn = isAllInDelta(actorSeat, maxChips);
+  const input = document.getElementById("raise-input");
+  document.getElementById("raise-amt-box").classList.toggle("unit-bb", UI.unit === "bb");
   input.setAttribute("aria-label", `${verb} size, in ${UI.unit === "bb" ? "big blinds" : "dollars"}`);
-
-  // Degenerate range (min == max): only one legal raise amount — render as
-  // a single button. Hides the slider/input/shortcuts. Two regimes:
-  //  - actor-is-short: maxChips == actor's full stack → "All-in $X"
-  //  - cover-short: actor is deep, max collapses to short opp's reach →
-  //    "Bet/Raise $X" (actor still has chips left)
-  if (minChips === maxChips && maxChips > 0) {
-    boundsLabel.textContent = "";
-    inputRow.querySelectorAll("input, .raise-unit").forEach(el => el.style.display = "none");
-    shortcuts.innerHTML = "";
-    // maxChips is a raise-BY delta → all-in iff it takes the remaining stack
-    // (review 2026-09-20 F8).
-    const isAllIn = isAllInDelta(actorSeat, maxChips);
-    // Display the raise-TO total (delta + ac); still post the DELTA.
-    submit.textContent = isAllIn
-      ? `All-in ${formatUnit(maxChips + ac, s)}`
-      : `${verb} ${formatUnit(maxChips + ac, s)}`;
-    submit.onclick = () => postAction({ gate: "raise", chips: maxChips });
-    return;
-  }
-  inputRow.querySelectorAll("input, .raise-unit").forEach(el => el.style.display = "");
-  submit.textContent = verb;
-
-  // Bounds shown as raise-TO totals (delta + ac).
-  const minDisp = chipsToCurrentUnit(minChips + ac, s);
-  const maxDisp = chipsToCurrentUnit(maxChips + ac, s);
-  boundsLabel.textContent = `${verb === "Bet" ? "Bet" : "Raise to"} `
-    + `${formatUnit(minChips + ac, s)} – ${formatUnit(maxChips + ac, s)}`;
-  input.min = String(Math.floor(minDisp * 100) / 100);
-  input.max = String(Math.ceil(maxDisp * 100) / 100);
-  input.step = UI.unit === "bb" ? "0.1" : "0.01";
 
   // A typed/preset total belongs to ONE decision node. A new node (hand,
   // street, history length or actor changed) drops it even while the input
@@ -341,46 +298,40 @@ function renderRaiseSection(s, actorSeat) {
     UI.raiseUserSet = false;
     UI.raiseLastActor = s.actor;
     UI.raiseNodeKey = nodeKey;
+    UI.sizingOpen = false;
   }
+  UI.raiseCtx = { s, minTotal, maxTotal, ac, verb, maxIsAllIn, minChips, maxChips };
+
+  // Degenerate range (min == max): only one legal amount — the button IS the
+  // bet, no sizing panel. "All-in X" when it takes the stack, else "Bet X"
+  // (a deep player capped by a short opponent's reach).
+  if (minChips === maxChips && maxChips > 0) {
+    d.sizing.hidden = true;
+    UI.raiseTo = maxTotal;
+    paintRaise(maxTotal, "fixed");
+    d.raise.title = s.trainer ? "Bet or raise (R)" : "";
+    return;
+  }
+  d.sizing.hidden = COMPACT_DOCK_MQ.matches && !UI.sizingOpen;
+  d.raise.title = s.trainer ? "Bet or raise (R)" : "";
 
   const userTyping = document.activeElement === input && !newNode;
-  const userActive = userTyping || UI.raiseUserSet;
-  if (!userActive) {
+  if (!userTyping && !UI.raiseUserSet) {
+    // the network's size (Study, Hero's turn), else the minimum
     let preset = minChips;
     const rec = s.recommendation;
     if (rec && rec.gate === "raise" && rec.chips !== null && rec.chips !== undefined) {
       preset = Math.max(minChips, Math.min(maxChips, rec.chips));
     }
-    // preset is a DELTA; display it as a raise-TO total.
-    input.value = unitInputValue(preset + ac, s);
+    UI.raiseTo = preset + ac;
   } else if (!userTyping) {
-    // The input holds a TOTAL; clamp in delta space, redisplay as total.
-    const curTotal = parseToChips(input.value, s);
-    if (curTotal !== null) {
-      const curDelta = curTotal - ac;
-      if (curDelta < minChips || curDelta > maxChips) {
-        const clampedDelta = Math.max(minChips, Math.min(maxChips, curDelta));
-        input.value = unitInputValue(clampedDelta + ac, s);
-      }
-    }
+    UI.raiseTo = Math.max(minTotal, Math.min(maxTotal, UI.raiseTo || minTotal));
   }
 
-  submit.onclick = () => {
-    // The user typed a raise-TO total; convert to the engine's raise-BY delta.
-    const total = parseToChips(input.value, s);
-    if (total === null) { showToast("Enter a bet size."); input.focus(); return; }
-    const delta = total - ac;
-    const clamped = Math.max(minChips, Math.min(maxChips, delta));
-    UI.raiseUserSet = false;
-    postAction({ gate: "raise", chips: clamped });
-  };
-
-  shortcuts.innerHTML = "";
-  // Returns the UNCLAMPED raise-TO total (matches the now-total-space input). A
-  // pot-fraction bet means: call (toCall) then raise BY mult*(pot+toCall) on
-  // top, so the final commitment is ac + toCall + extra. (The input is total
-  // and submit subtracts ac, so the commitment equals this exactly — this also
-  // fixes the old over-commit where a total was posted as a delta.)
+  // Presets: % of the pot after the call (the potSize formula); a preset the
+  // legal range clamps is labelled by where it lands — "Min", or "All-in"
+  // ("Max" when the cap keeps chips behind) — and presets landing on the same
+  // amount are one chip (review 2026-09-20 F9).
   const potSize = (mult) => {
     const toCall = s.to_call_chips;
     const extra = Math.round(mult * (s.pot_chips + toCall));
@@ -389,14 +340,6 @@ function renderRaiseSection(s, actorSeat) {
   const potLimit = isPotLimit(s);
   // The 33% preset has always meant a THIRD of pot (mult 1/3, not 0.33) — keep exact.
   const presetMult = (n) => (n === 33 ? 1 / 3 : n / 100);
-  // A chip's label must describe the chips it prefills: a preset that the
-  // legal range clamps is labelled by where it lands — "Min", or "All-in"
-  // ("Max" when the cap is a cover-short clamp and the actor keeps chips
-  // behind) — never by its nominal pot-%. Presets collapsing onto the same
-  // amount dedupe to one chip (review 2026-09-20 F9).
-  const minTotal = minChips + ac;
-  const maxTotal = maxChips + ac;
-  const maxIsAllIn = isAllInDelta(actorSeat, maxChips);
   const items = [];
   const seenTotals = new Set();
   const addItem = (label, chips, cls) => {
@@ -408,37 +351,88 @@ function renderRaiseSection(s, actorSeat) {
     const raw = potSize(presetMult(n));
     if (raw <= minTotal) addItem("Min", minTotal);
     else if (raw > maxTotal || (raw === maxTotal && maxIsAllIn)) {
-      addItem(maxIsAllIn ? "All-in" : "Max", maxTotal, "raise-shortcut-allin");
+      addItem(maxIsAllIn ? "All-in" : "Max", maxTotal, "allin");
     } else addItem(presetChipLabel(n), raw);
   }
-  if (!potLimit) {
-    // No-limit only: an all-in prefill chip (in pot-limit the pot chip IS the
-    // cap). Prefills the max raise-TO total; the user still clicks Raise.
-    addItem(maxIsAllIn ? "All-in" : "Max", maxTotal, "raise-shortcut-allin");
+  // No-limit only: an all-in chip (in pot-limit the pot chip IS the cap).
+  if (!potLimit) addItem(maxIsAllIn ? "All-in" : "Max", maxTotal, "allin");
+  UI.raisePresets = items;
+  const presets = document.getElementById("raise-presets");
+  const key = items.map((it) => `${it.label}:${it.chips}`).join("|") + `|${UI.unit}|${dollarsPerBB(s)}`;
+  if (presets.dataset.k !== key) {
+    presets.dataset.k = key;
+    presets.innerHTML = items.map((it, i) => {
+      const amount = formatUnit(it.chips, s);
+      const title = `${verb === "Bet" ? "Bet" : "Raise to"} ${amount}${s.trainer && i < 9 ? ` (${i + 1})` : ""}`;
+      return `<button type="button" data-i="${i}" class="${it.cls || ""}" title="${escapeHTML(title)}" `
+        + `aria-label="${escapeHTML(`${it.label}: ${verb === "Bet" ? "bet" : "raise to"} ${amount}`)}">${escapeHTML(it.label)}</button>`;
+    }).join("")
+      + '<button type="button" id="preset-edit-btn" class="preset-edit" title="Edit the bet-size buttons" aria-haspopup="dialog">Edit</button>';
+    presets.dataset.cap = potLimit ? "pl" : "nl";
   }
-  items.forEach((it, i) => {
-    const b = document.createElement("button");
-    b.type = "button";
-    b.className = "raise-shortcut" + (it.cls ? ` ${it.cls}` : "");
-    b.textContent = it.label;
-    const amount = formatUnit(it.chips, s);
-    b.title = `${verb === "Bet" ? "Bet" : "Raise to"} ${amount}${s.trainer && i < 9 ? ` (${i + 1})` : ""}`;
-    b.setAttribute("aria-label", `${it.label}: ${verb === "Bet" ? "bet" : "raise to"} ${amount}`);
-    b.addEventListener("click", () => {
-      input.value = unitInputValue(it.chips, s);
-      UI.raiseUserSet = true;
-    });
-    shortcuts.appendChild(b);
+  document.getElementById("sz-range").textContent =
+    `${verb === "Bet" ? "Bet" : "Raise to"} ${formatUnit(minTotal, s)} – ${formatUnit(maxTotal, s)}`;
+  document.getElementById("sz-pot").textContent = `Pot ${formatUnit(s.pot_chips, s)}`;
+  paintRaise(UI.raiseTo, userTyping ? "input" : null);
+}
+
+// Show a raise-TO total everywhere it appears: the slider (and its fill), the
+// amount box, the Bet / Raise button, the preset it matches.
+function paintRaise(total, from) {
+  const c = UI.raiseCtx;
+  if (!c) return;
+  const d = dockEls();
+  const s = c.s;
+  const shown = Math.max(c.minTotal, Math.min(c.maxTotal, Math.round(total)));
+  const span = c.maxTotal - c.minTotal;
+  const slider = document.getElementById("sz-slider");
+  const frac = span > 0 ? (shown - c.minTotal) / span : 1;
+  if (from !== "slider") slider.value = String(Math.round(frac * 1000));
+  slider.style.setProperty("--fill", `${frac * 100}%`);
+  slider.setAttribute("aria-valuetext", formatUnit(shown, s));
+  slider.title = `${formatUnit(c.minTotal, s)} – ${formatUnit(c.maxTotal, s)}`;
+  if (from !== "input") document.getElementById("raise-input").value = unitInputValue(shown, s);
+  const allIn = shown >= c.maxTotal && c.maxIsAllIn;
+  d.raiseLbl.textContent = allIn ? "All-in" : c.verb === "Bet" ? "Bet" : "Raise to";
+  d.raiseAmt.textContent = formatUnit(shown, s);
+  d.raise.classList.toggle("allin", allIn);
+  document.querySelectorAll("#raise-presets button[data-i]").forEach((b) => {
+    const it = (UI.raisePresets || [])[Number(b.dataset.i)];
+    b.classList.toggle("on", !!it && it.chips === shown);
   });
-  const plus = document.createElement("button");
-  plus.id = "preset-edit-btn";
-  plus.type = "button";
-  plus.className = "raise-shortcut raise-shortcut-edit";
-  plus.textContent = "Edit";
-  plus.title = "Edit the bet-size buttons";
-  plus.setAttribute("aria-haspopup", "dialog");
-  plus.addEventListener("click", () => toggleBetPresetEditor(plus, potLimit));
-  shortcuts.appendChild(plus);
+}
+
+// Set the raise-TO total from a control (keeps it inside the legal window).
+function setRaiseTotal(total, from) {
+  const c = UI.raiseCtx;
+  if (!c) return;
+  UI.raiseUserSet = true;
+  UI.raiseTo = Math.max(c.minTotal, Math.min(c.maxTotal, Math.round(total)));
+  paintRaise(UI.raiseTo, from);
+}
+
+// Bet / Raise: on a phone the first tap opens the sizing panel, the second
+// bets; anywhere else it bets the amount shown.
+function submitRaise() {
+  const c = UI.raiseCtx;
+  const d = dockEls();
+  if (!c || d.raise.disabled || d.raise.hidden) return;
+  if (d.sizing.hidden && c.minChips !== c.maxChips && COMPACT_DOCK_MQ.matches && !UI.sizingOpen) {
+    UI.sizingOpen = true;
+    d.sizing.hidden = false;
+    return;
+  }
+  const input = document.getElementById("raise-input");
+  // A typed raise-TO total that hasn't been read yet (Enter right after typing)
+  if (document.activeElement === input) {
+    const typed = parseToChips(input.value, c.s);
+    if (typed === null) { showToast("Enter a bet size."); input.focus(); return; }
+    UI.raiseTo = typed;
+  }
+  const delta = Math.max(c.minChips, Math.min(c.maxChips, Math.round(UI.raiseTo - c.ac)));
+  UI.raiseUserSet = false;
+  UI.sizingOpen = false;
+  postAction({ gate: "raise", chips: delta });
 }
 
 // --- Bet-size preset chips ---------------------------------------------------
@@ -625,7 +619,7 @@ function syncPresetPop(s) {
   const pop = document.getElementById("preset-pop");
   if (!pop) return;
   const plus = document.getElementById("preset-edit-btn");
-  const section = document.getElementById("raise-section");
+  const section = document.getElementById("sizing");
   const capNow = isPotLimit(s) ? "pl" : "nl";
   if (!plus || !section || section.hidden || pop.dataset.cap !== capNow) {
     closeBetPresetEditor();
@@ -1260,21 +1254,61 @@ function renderHistory(s) {
   renderRedo(s);
 }
 
-// --- Raise input -------------------------------------------------------------
-// Typing a size marks it as the player's own (re-renders keep it); Enter
-// bets it.
+// --- The dock's controls --------------------------------------------------------
+// Fold / Check-Call post their gate; Bet / Raise bets the size shown (a phone:
+// opens the sizing panel first). In the sizing panel: presets, the slider,
+// ± one big blind, and the amount box — typing marks the size as the player's
+// own (re-renders keep it); Enter bets it.
 function setupRaiseInput() {
+  const d = dockEls();
+  d.fold.addEventListener("click", () => postAction({ gate: "fold" }));
+  d.call.addEventListener("click", () => postAction({ gate: "check_call" }));
+  d.raise.addEventListener("click", submitRaise);
   const input = document.getElementById("raise-input");
-  input.addEventListener("input", () => { UI.raiseUserSet = true; });
+  input.addEventListener("input", () => {
+    const c = UI.raiseCtx;
+    if (!c) return;
+    UI.raiseUserSet = true;
+    const total = parseToChips(input.value, c.s);
+    if (total !== null) { UI.raiseTo = total; paintRaise(total, "input"); }
+  });
   input.addEventListener("focus", () => {
     setTimeout(() => input.select(), 0);
+  });
+  input.addEventListener("change", () => {
+    // clicking away: the box shows the size that will be bet (inside the window)
+    const c = UI.raiseCtx;
+    if (c) setRaiseTotal(UI.raiseTo || c.minTotal, null);
   });
   input.addEventListener("keydown", (e) => {
     if (e.key !== "Enter") return;
     e.preventDefault();
-    const submit = document.getElementById("raise-submit");
-    const section = document.getElementById("raise-section");
-    if (submit.disabled || section.hidden) return;
-    submit.click();
+    if (d.raise.disabled || d.sizing.hidden) return;
+    submitRaise();
   });
+  const slider = document.getElementById("sz-slider");
+  slider.addEventListener("input", () => {
+    const c = UI.raiseCtx;
+    if (!c) return;
+    setRaiseTotal(c.minTotal + (Number(slider.value) / 1000) * (c.maxTotal - c.minTotal), "slider");
+  });
+  const step = (dir) => {
+    const c = UI.raiseCtx;
+    if (!c) return;
+    const bb = (c.s.chip_scale && c.s.chip_scale.bb_chips) || 10000;
+    setRaiseTotal((UI.raiseTo || c.minTotal) + dir * bb, null);
+  };
+  document.getElementById("sz-minus").addEventListener("click", () => step(-1));
+  document.getElementById("sz-plus").addEventListener("click", () => step(1));
+  document.getElementById("raise-presets").addEventListener("click", (e) => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    if (b.id === "preset-edit-btn") {
+      toggleBetPresetEditor(b, document.getElementById("raise-presets").dataset.cap !== "nl");
+      return;
+    }
+    const it = (UI.raisePresets || [])[Number(b.dataset.i)];
+    if (it) setRaiseTotal(it.chips, null);
+  });
+  COMPACT_DOCK_MQ.addEventListener("change", () => { UI.sizingOpen = false; if (UI.lastState) render(UI.lastState); });
 }

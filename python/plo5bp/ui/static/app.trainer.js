@@ -673,23 +673,26 @@ function onTrainerKey(e) {
   if (UI.animating || UI.actionInFlight) return;
   const heroTurn = s.actor !== null && s.actor !== undefined && s.actor === s.hero_seat;
   if (!heroTurn) return;
-  const gate = document.getElementById("gate-buttons");
-  if (lower === "f") { done(); clickIfEnabled(gate.querySelector('button[data-gate="fold"]')); return; }
+  if (lower === "f") { done(); clickIfEnabled(document.getElementById("fold-btn")); return; }
   if (lower === "c" || (k === " " && !(t && t.tagName === "BUTTON"))) {
-    done(); clickIfEnabled(gate.querySelector('button[data-gate="check_call"]')); return;
+    done(); clickIfEnabled(document.getElementById("check-btn")); return;
   }
-  const section = document.getElementById("raise-section");
-  if ((lower === "r" || lower === "b") && section && !section.hidden) {
+  const raise = document.getElementById("raise-go");
+  const sizing = document.getElementById("sizing");
+  if ((lower === "r" || lower === "b") && raise && !raise.hidden) {
     done();
+    // the size box when it shows (type a size, Enter bets it); otherwise the
+    // button itself — on a phone its first press opens the sizing panel
     const input = document.getElementById("raise-input");
-    if (input && input.offsetParent !== null) input.focus();
-    else clickIfEnabled(document.getElementById("raise-submit"));
+    if (sizing && !sizing.hidden && input && input.offsetParent !== null) input.focus();
+    else clickIfEnabled(raise);
     return;
   }
-  if (/^[1-9]$/.test(k) && section && !section.hidden) {
-    const chip = document.querySelectorAll("#raise-shortcuts .raise-shortcut:not(.raise-shortcut-edit)")[Number(k) - 1];
+  if (/^[1-9]$/.test(k) && raise && !raise.hidden) {
+    const chip = document.querySelectorAll("#raise-presets button[data-i]")[Number(k) - 1];
     if (chip) {
       done();
+      if (sizing && sizing.hidden) clickIfEnabled(raise);  // (a phone: open the panel)
       chip.click();
       const input = document.getElementById("raise-input");
       if (input && input.offsetParent !== null) input.focus();
@@ -723,6 +726,10 @@ function setupTrainerControls() {
   document.getElementById("trainer-new-hand-btn").addEventListener("click", newHand);
   document.getElementById("trainer-repeat-btn").addEventListener("click", repeatHand);
   document.getElementById("review-next-hand").addEventListener("click", newHand);
+  // the dock's "Next hand" at the end of a hand (app.play.js renderActions)
+  document.getElementById("status-strip").addEventListener("click", (e) => {
+    if (e.target.closest("[data-trainer-next]") && !UI.actionInFlight) newHand();
+  });
   document.getElementById("review-repeat-hand").addEventListener("click", repeatHand);
   document.getElementById("review-open-study").addEventListener("click", () => openReviewInStudy());
   document.getElementById("review-first").addEventListener("click", () => {

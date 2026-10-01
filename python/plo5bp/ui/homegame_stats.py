@@ -76,6 +76,13 @@ def _hand_for_viewer(
         grades = [g for g in grades if int(g.get("seat", -1)) in keep]
     out["grades"] = grades
     out["grades_public"] = bool(show_all_grades)
+    # an all-in runout's equities: only for hands this viewer can see (at an all-in
+    # showdown that is every live hand; the rule is the cards', never looser)
+    if rec.get("equities"):
+        out["equities"] = {
+            n: {k: v for k, v in shares.items() if int(k) in seen}
+            for n, shares in rec["equities"].items()
+        }
     return out
 
 

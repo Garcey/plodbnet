@@ -232,6 +232,53 @@ def test_a_hand_link_opens_its_table_and_the_replayer(node, tmp_path):
     assert got["opened"] == [["T1", 7]]
 
 
+def test_the_replayer_runs_an_all_in_out_street_by_street_with_its_equities(node, tmp_path):
+    """(owner, 2026-09-29) "I would like all in equities to be shown in the hand
+    histories": after the last action the replayer steps through the runout — each
+    street's equities under the players' plates, then the result — and the action list
+    has a row per runout street."""
+    got = _run(tmp_path, r"""
+(async () => {
+  const seat = (i, name, delta) => ({ seat: i, name, is_me: i === 0, start_cents: 20000, delta_cents: delta,
+    hole: [20 + 5 * i, 21 + 5 * i, 22 + 5 * i, 23 + 5 * i, 24 + 5 * i], shown: true, folded: false });
+  const rec = { v: 2, hand_no: 9, variant: "plo5", hole_count: 5, button: 0, num_seats: 6, bb_cents: 100, ante_cents: 300,
+    pot_cents: 40000, showdown: true, board_a: [0, 4, 8, 12, 16], board_b: [1, 5, 9, 13, 17], burns: [],
+    equities: { "3": { "0": [0.62, 0.41], "1": [0.38, 0.59] }, "4": { "0": [0.9, 0.2], "1": [0.1, 0.8] } }, runout_from: 3,
+    actions: [{ seat: 1, street: "flop", action: 2, label: "Raise to $12.00", cents: 1200 },
+              { seat: 0, street: "flop", action: 9, label: "All-in $197.00", cents: 19700 },
+              { seat: 1, street: "flop", action: 1, label: "Call $185.00", cents: 18500 }],
+    seats: [seat(0, "Host", 19700), seat(1, "Dana", -19700)], awards: [], flows: [], grades: [] };
+  const B = boot((url) => (url.includes("/hands/9") ? rec : table()));
+  B.HG.cards.cardEl = () => B.W.doc.createElement("span");
+  B.HG.core.G.state = table(); B.HG.core.G.gameId = "T1";
+  await B.HG.ui.openHand("T1", 9); await flush();
+  const m = () => B.W.doc.querySelectorAll("#modal-root .modal").slice(-1)[0];
+  const look = () => [m().querySelector("#rp-step").textContent, m().querySelectorAll(".rp-eq").map((e) => e.textContent),
+    m().querySelector("#rp-banner").textContent, m().querySelector("#rp-result").hidden];
+  const out = { start: look() };
+  out.rows = m().querySelectorAll("#rp-list .log-row.k-runout").map((r) => r.textContent);
+  m().querySelectorAll("#rp-list .log-row")[2].click();  // just after the call: all in on the flop
+  out.allin = look();
+  m().querySelectorAll("#rp-list .log-row.k-runout")[0].click();
+  out.turn = look();
+  m().querySelector("#rp-last").click();
+  out.end = look();
+  out.nextOff = m().querySelector("#rp-next").disabled;
+  console.log(JSON.stringify(out));
+})();
+""")
+    assert got["start"][0] == "0 / 5" and got["start"][1] == []
+    assert got["rows"] == ["All inrun out — the equities", "All inrun out — the result"]
+    step, eqs, banner, hidden = got["allin"]
+    assert step == "3 / 5" and eqs == ["62%41%", "38%59%"]
+    assert "Call $185.00" in banner and "running it out" in banner and hidden is True
+    step, eqs, banner, hidden = got["turn"]
+    assert step == "4 / 5" and eqs == ["90%20%", "10%80%"] and "Turn dealt" in banner
+    step, eqs, banner, hidden = got["end"]
+    assert step == "5 / 5" and eqs == [] and "River dealt" in banner and "Hand over" in banner
+    assert hidden is False and got["nextOff"] is True
+
+
 def test_private_notes_back_up_and_come_back(node, tmp_path):
     """FEAT-014: Preferences saves the notes to a file and restores them (a backup's note
     replaces this browser's for the same player; anything else is refused)."""

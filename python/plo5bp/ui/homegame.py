@@ -238,10 +238,20 @@ try:  # PLO67 needs an engine that plays it (face-up burns, extra hole cards)
     PLO67_ON = hasattr(_engine_mod, "plo67_runout_equities")
 except Exception:  # noqa: BLE001
     PLO67_ON = False
-#: PLO67 all-in runout: extra seconds per street shown, so the burn can be
-#: presented (and, if it is red, a card dealt to every hand) before the board
-#: cards come.
-BURN_SHOW_S = 1.2
+#: All-in runouts are paced by what each street SHOWS (owner, 2026-09-29: the
+#: showdown began before the river was down, and a PLO67 runout — burn, extra
+#: hole cards, board cards — went by too fast to follow). A street is revealed,
+#: then PRESENTED — PLO67: its burn shown big, flipped and captioned, then (red)
+#: one more card to each hand still in, one hand after another, then the boards'
+#: cards; the other games deal a street's cards within the host's pause — and held
+#: for the host's runout pause before the next one. The showdown waits until the
+#: river is down. The table animates with exactly these durations (the view sends
+#: them as ``runout.timing``), so the two never drift apart (``_runout_plan``).
+RUNOUT_BURN_S = 2.0          # PLO67: a burn shown big, flipped, captioned, dropped into its slot
+RUNOUT_EXTRA_S = 0.6         # PLO67: one extra card's flight to a hand
+RUNOUT_EXTRA_GAP_S = 0.35    # PLO67: from one hand's extra card to the next one's
+RUNOUT_BOARD_S = 0.6         # a street's board cards landing
+RUNOUT_AWARD_BEAT_S = 0.3    # PLO67: after the river is down, before the showdown
 #: Monte-Carlo runouts behind each street's PLO67 all-in equities (Rust, ~10 ms).
 PLO67_EQ_SAMPLES = 3000
 FAIR_REVEAL_S = 3.0        # a locked device has this long to reveal its number
@@ -266,6 +276,8 @@ GAMES_ASSETS: dict[str, str] = {
     "games.play.js": "text/javascript; charset=utf-8",
     "games.sound.js": "text/javascript; charset=utf-8",
     "games.fair.js": "text/javascript; charset=utf-8",
+    # the table's look (felt, cards, seats, bets, the dock) — Study / Trainer load it too
+    "games.felt.css": "text/css; charset=utf-8",
     "games.css": "text/css; charset=utf-8",
 }
 # Hub eviction: nobody polling for this long => drop the in-memory table
@@ -499,6 +511,10 @@ class HandState:
     runout_active: bool = False
     runout_start_len: int = 3
     runout_started_mono: float | None = None
+    # When each street is revealed / fully shown and when the showdown starts,
+    # seconds after runout_started_mono (``_make_runout_plan``; fixed at the start,
+    # so the host changing the pause mid-runout never makes a street jump).
+    runout_plan: dict[str, Any] = field(default_factory=dict)
     leftover_stacks: list[int] = field(default_factory=list)
     terminal_pot: int = 0
     terminal_commit: list[int] = field(default_factory=list)
@@ -2818,38 +2834,104 @@ MIN_STREET_PAUSE_S = 0.3
 
 
 def _street_pause(t: LiveTable) -> float:
-    """Seconds between the streets of an all-in runout: the host's setting,
-    plus the burn's moment in PLO67. Never below MIN_STREET_PAUSE_S."""
+    """The host's runout pause: how long each street of an all-in runout stays up
+    once its cards are down (0.3–5 s). Never below MIN_STREET_PAUSE_S."""
     pause = float(t.street_pause_secs if t.street_pause_secs is not None else 1.5)
     if not (math.isfinite(pause) and pause >= MIN_STREET_PAUSE_S):
         pause = MIN_STREET_PAUSE_S
-    return pause + (BURN_SHOW_S if t.burns else 0.0)
+    return pause
+
+
+def _street_present_s(t: LiveTable, n: int, hands: int) -> float:
+    """Seconds street ``n`` (board length) takes to come down once revealed.
+    PLO67: its burn, then — red — one more card to each of the ``hands`` hands
+    still in, one after another, then the boards' cards. The other games: 0 (their
+    street's cards land within the host's pause, as they always did)."""
+    if not t.burns:
+        return 0.0
+    burns = list(t.rabbit_burns)
+    j = n - 3  # this street's burn: 0 flop, 1 turn, 2 river
+    red = 0 <= j < len(burns) and _is_red_card(int(burns[j]))
+    extra = RUNOUT_EXTRA_S + (hands - 1) * RUNOUT_EXTRA_GAP_S if (red and hands > 0) else 0.0
+    return RUNOUT_BURN_S + extra + RUNOUT_BOARD_S
+
+
+def _is_red_card(c: int) -> bool:
+    """A red card (hearts or diamonds — the engine's suits 1 and 2): a red burn
+    deals every hand still in one more card (PLO67)."""
+    return int(c) % 4 in (1, 2)
+
+
+def _make_runout_plan(t: LiveTable, hands: int) -> dict[str, Any]:
+    """The all-in runout's timeline, in seconds after it starts: when each street
+    is REVEALED (``reveal``), when its cards are all DOWN (``settled`` — what the
+    equities on the table describe) and when the showdown starts (``award_at``).
+    Street n+1 is revealed one host pause after street n is down; the showdown
+    comes once the river is down (the other games: once its card has landed —
+    it used to start the moment the river was revealed)."""
+    base = _street_pause(t)
+    start = max(3, min(5, int(t.runout_start_len or 3)))
+    reveal = {start: 0.0}
+    settled = {start: 0.0}
+    for n in range(start + 1, 6):
+        reveal[n] = settled[n - 1] + base
+        settled[n] = reveal[n] + _street_present_s(t, n, hands)
+    if start >= 5:
+        award_at = 0.0  # all in on the river: every card is already on the table
+    else:
+        award_at = settled[5] + (RUNOUT_AWARD_BEAT_S if t.burns else RUNOUT_BOARD_S)
+    return {"base": base, "hands": int(hands), "reveal": reveal, "settled": settled,
+            "award_at": award_at}
+
+
+def _runout_plan(t: LiveTable) -> dict[str, Any]:
+    if not t.runout_plan:  # (a runout always sets one at its start; this is a safety net)
+        first = next(iter(t.equity_by_len.values()), {}) if t.equity_by_len else {}
+        t.runout_plan = _make_runout_plan(t, max(2, len(first)))
+    return t.runout_plan
+
+
+def _runout_elapsed(t: LiveTable) -> float:
+    started = t.runout_started_mono if t.runout_started_mono is not None else time.monotonic()
+    return max(0.0, time.monotonic() - started)
 
 
 def _runout_shown_len(t: LiveTable) -> int:
+    """The board length an all-in runout has REVEALED so far (5 when none runs)."""
     if not t.runout_active:
         return 5
-    start = max(3, int(t.runout_start_len or 3))
-    pause = _street_pause(t)
-    started = t.runout_started_mono if t.runout_started_mono is not None else time.monotonic()
-    extra = int((time.monotonic() - started) / pause)
-    return min(5, start + extra)
+    el = _runout_elapsed(t)
+    return max(n for n, at in _runout_plan(t)["reveal"].items() if at <= el)
+
+
+def _runout_settled_len(t: LiveTable) -> int:
+    """The board length whose cards are all DOWN on the table — a revealed PLO67
+    street is still being presented (burn, extra cards, board cards) until then.
+    The equities shown describe this street, so they never run ahead of what the
+    players can see (owner, 2026-09-29: "the all-in equities seem off")."""
+    if not t.runout_active:
+        return 5
+    el = _runout_elapsed(t)
+    return max(n for n, at in _runout_plan(t)["settled"].items() if at <= el)
 
 
 def _runout_award_index(t: LiveTable) -> int:
     n = len(t.pot_awards or [])
     if not t.runout_active:
         return n
-    if _runout_shown_len(t) < 5:
-        return -1
-    pause = _street_pause(t)
-    start = max(3, int(t.runout_start_len or 3))
-    river_at = (5 - start) * pause
-    elapsed = time.monotonic() - (t.runout_started_mono or time.monotonic())
-    into = elapsed - river_at
+    into = _runout_elapsed(t) - _runout_plan(t)["award_at"]
     if into < 0:
         return -1
     return min(n, int(into / AWARD_SECS))
+
+
+def _runout_timing(t: LiveTable) -> dict[str, int] | None:
+    """What the table animates a PLO67 all-in runout with (ms) — the same numbers
+    the plan paces it by. None for the other games and outside a runout."""
+    if not (t.runout_active and t.burns):
+        return None
+    return {"burn_ms": int(RUNOUT_BURN_S * 1000), "extra_ms": int(RUNOUT_EXTRA_S * 1000),
+            "extra_gap_ms": int(RUNOUT_EXTRA_GAP_S * 1000), "board_ms": int(RUNOUT_BOARD_S * 1000)}
 
 
 def _runout_blocking(t: LiveTable) -> bool:
@@ -2926,6 +3008,7 @@ def _shared_key(t: LiveTable) -> tuple:
     return (
         t.epoch, t.rev, t.phase, t.hand_no, t.action_seq, t.num_seats,
         _runout_shown_len(t) if t.runout_active else 0,
+        _runout_settled_len(t) if t.runout_active else 0,  # (the equities follow it)
         _runout_award_index(t) if t.runout_active else -2,
     )
 
@@ -3088,7 +3171,10 @@ def _shared_seat_rows(t: LiveTable, sh: _Shared) -> list[dict[str, Any]]:
     raw, n = sh.raw, t.num_seats
     settled = t.phase != "in_hand" and not sh.runout_live
     in_hand_set = {j for j, m in enumerate(sh.in_hand) if m} if any(sh.in_hand) else None
-    eq_map = (t.equity_by_len.get((len(sh.ba_src), len(sh.bb_src))) or {}) if t.runout_active else {}
+    # the equities of the street whose cards are all DOWN — a revealed PLO67 street
+    # is still presenting its burn / extra cards / board cards (``_runout_settled_len``)
+    n_eq = _runout_settled_len(t) if t.runout_active else 0
+    eq_map = (t.equity_by_len.get((n_eq, n_eq)) or {}) if t.runout_active else {}
     rows: list[dict[str, Any]] = []
     for i in range(n):
         p = t.seats[i]
@@ -3168,7 +3254,17 @@ def _seat_rows(t: LiveTable, sh: _Shared, viewer_id: int, holes: list, seqs: lis
         row["hole"] = hole
         row["hole_seq"] = seqs[i] if i < len(seqs) else None
         if hole and hole[0] >= 0:
-            row["hand_desc"] = [describe_made_hand(hole, sh.ba_src), describe_made_hand(hole, sh.bb_src)]
+            ba, bb, held = sh.ba_src, sh.bb_src, hole
+            if t.runout_active:
+                # a PLO67 street still coming down (its burn, extra cards, board cards):
+                # label what is ON the table, never the hand the river is about to make
+                n_down = _runout_settled_len(t)
+                seq = seqs[i] if i < len(seqs) else None
+                if n_down < len(ba):
+                    ba, bb = ba[:n_down], bb[:n_down]
+                    if t.burns and seq:
+                        held = list(seq)[: _hole_count_on(t, i, max(3, n_down) - 2)]
+            row["hand_desc"] = [describe_made_hand(held, ba), describe_made_hand(held, bb)]
         row["is_hero"] = viewer_seat is not None and i == viewer_seat
         if p is not None and p.user_id == viewer_id:  # your own queued chips only
             row["queued_topup_cents"] = int(p.queued_topup_cents or 0)
@@ -3232,11 +3328,11 @@ def _runout_view(t: LiveTable, sh: _Shared) -> dict[str, Any]:
         shown_awards = list(t.pot_awards[: max(0, award_idx + 1)])
     else:
         shown_awards = list(t.pot_awards or [])
-    pause = _street_pause(t)
+    pause = _street_pause(t)  # the host's setting (Manage shows it)
     shown_len = _runout_shown_len(t) if t.runout_active else 0
-    elapsed = (time.monotonic() - t.runout_started_mono
-               if t.runout_active and t.runout_started_mono is not None else 0.0)
-    next_in = pause - (elapsed % pause) if (t.runout_active and shown_len < 5 and pause > 0) else 0.0
+    next_in = 0.0
+    if t.runout_active and shown_len < 5:
+        next_in = max(0.0, _runout_plan(t)["reveal"][shown_len + 1] - _runout_elapsed(t))
     return {
         "pot_chips": pot_chips,
         "pot_cents": chips_to_cents(pot_chips, t.bb_cents),
@@ -3247,8 +3343,10 @@ def _runout_view(t: LiveTable, sh: _Shared) -> dict[str, Any]:
             "active": bool(t.runout_active),
             "start_len": max(3, int(t.runout_start_len or 3)),
             "shown_len": shown_len,
+            "settled_len": _runout_settled_len(t) if t.runout_active else 0,
             "pause_secs": pause,
             "next_in_secs": round(next_in, 2),
+            "timing": _runout_timing(t),
             "award_index": award_idx,
             "award_count": n_awards,
             "award_step": award_step,
@@ -3738,6 +3836,22 @@ def _finish_hand_locked(t: LiveTable) -> None:
     _fair_prepare_locked(t)
 
 
+def _record_equities(t: LiveTable) -> dict[str, Any]:
+    """The record's ``equities`` / ``runout_from`` for an all-in runout: each street
+    that still had cards to come, each live seat's share of board 1 and board 2
+    (the numbers the table showed). Nothing for a hand without one."""
+    if not (t.runout_active and t.equity_by_len):
+        return {}
+    eq = {
+        str(n): {str(seat): [round(float(v["a"]), 4), round(float(v["b"]), 4)] for seat, v in sorted(shares.items())}
+        for (n, _), shares in sorted(t.equity_by_len.items())
+        if n < 5 and shares
+    }
+    if not eq:
+        return {}
+    return {"equities": eq, "runout_from": int(t.runout_start_len)}
+
+
 def _record_hand_locked(
     t: LiveTable, raw: dict[str, Any], payouts: list[int], folded: list[bool]
 ) -> None:
@@ -3826,6 +3940,9 @@ def _record_hand_locked(
             "board_a": full_a[:n_board],
             "board_b": full_b[:n_board],
             "burns": played_burns,
+            # an all-in runout's equities, street by street, as the table showed them
+            # (the replayer and the text history show them too; owner, 2026-09-29)
+            **_record_equities(t),
             "actions": actions,
             "ante_chips": int(t.ante_chips),
             "bb_chips": BB_CHIPS,
@@ -4169,6 +4286,9 @@ def _capture_rabbit(t: LiveTable, played_len: int) -> None:
     t.runout_active = True
     t.runout_start_len = max(3, min(int(played_len), len(full_a) or 5))
     t.runout_started_mono = time.monotonic()
+    # (PLO67: the plan needs this hand's burns — captured above — and how many
+    # hands a red one deals to)
+    t.runout_plan = _make_runout_plan(t, len(alive))
     all_holes = t.env.all_hole_cards() if t.env is not None else []
     holes: list[list[int] | None] = [None] * t.num_seats
     for i in alive:
