@@ -279,6 +279,9 @@ suit top-left, big rank bottom-right, ten = "T").
   Study/Trainer additions on the felt and dock, the phone column) — it wins by cascade
   order, so add new workspace styles after it. A shared table rule goes in
   `games.felt.css` (both pages), never in style.css.
+- The landing page's product picture (`.shot` in index.html, its rules in style.css) is
+  the Trainer's review drawn in plain HTML + CSS in this look — signed-out visitors don't
+  load games.felt.css, so it carries its own copy: keep it in step when the UI changes.
 Card entry is continuous
 (`placeStudyCard` / `nextEmptySlot` in `app.table.js`): a placed card selects the next
 empty slot across groups (hole -> flop A -> flop B -> turn -> river), a card

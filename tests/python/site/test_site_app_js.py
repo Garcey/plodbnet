@@ -125,6 +125,12 @@ out.terminal = run(`UI.unit = "bb"; [
   terminalText({terminal: "showdown", hero_seat: 0, seats: [{folded: false}], trainer: {rewards_bb: [12.5]}, chip_scale: {bb_chips: 10000}}),
   terminalText({terminal: "fold_out", hero_seat: 0, seats: [{folded: true}], trainer: {rewards_bb: [-3]}, chip_scale: {bb_chips: 10000}}),
   terminalText({terminal: "fold_out", hero_seat: 1, seats: [{}, {folded: false}], trainer: {rewards_bb: [0, 7]}, chip_scale: {bb_chips: 10000}})]`);
+// --- the Trainer's review: the result on every step (2026-10-01)
+out.review_result = run(`UI.unit = "bb"; [
+  reviewResultText({hero_seat: 1, trainer: {rewards_bb: [-31, 31]}, chip_scale: {bb_chips: 10000}}),
+  reviewResultText({hero_seat: 0, trainer: {rewards_bb: [-3.5, 3.5]}, chip_scale: {bb_chips: 10000}}),
+  reviewResultText({hero_seat: 0, trainer: {rewards_bb: [0, 0]}, chip_scale: {bb_chips: 10000}}),
+  reviewResultText({hero_seat: 0, trainer: {}, chip_scale: {bb_chips: 10000}})]`);
 // --- bet-size curve numbers (FEAT-022)
 out.curve = run(`UI.unit = "bb"; const anchors = [0,1,2,3,4,5,6,7,8,9,10].map((k) => ({k, frac: k / 10, label: k === 0 ? "min" : k === 10 ? "pot" : (k * 10) + "%",
   chips: 10000 + k * 20000, prob: [0.1, 0, 0, 0.3, 0, 0, 0.4, 0, 0, 0, 0.2][k]}));
@@ -237,6 +243,13 @@ def test_trainer_result_line(js):
         "Showdown — you won 12.5bb.",
         "You folded — you lost 3bb.",
         "Everyone else folded — you won 7bb.",
+    ]
+
+
+def test_review_says_how_the_hand_ended(js):
+    assert js["review_result"] == [
+        "You won 31bb.", "You lost 3.5bb.", "You broke even.",
+        "Step through it in the review, or deal the next one.",
     ]
 
 

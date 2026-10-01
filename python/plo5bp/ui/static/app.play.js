@@ -184,6 +184,16 @@ function terminalText(s) {
   return `Showdown — ${res}.`;
 }
 
+// A replayed decision of a finished hand (the Trainer's review): how the hand
+// ended for you — the step shown may come before the end, so no "Showdown".
+function reviewResultText(s) {
+  const r = s.trainer && s.trainer.rewards_bb;
+  const net = Array.isArray(r) ? r[s.hero_seat] : null;
+  if (typeof net !== "number") return "Step through it in the review, or deal the next one.";
+  const amt = fmtBBValue(Math.abs(net), s);
+  return net > 0 ? `You won ${amt}.` : net < 0 ? `You lost ${amt}.` : "You broke even.";
+}
+
 function renderActions(s) {
   const d = dockEls();
   d.dock.classList.remove("villain-turn", "hero-turn");
@@ -205,7 +215,7 @@ function renderActions(s) {
   // Trainer review reconstruction: the hand is over; this state is a
   // replayed decision node. Show the choice, don't allow acting.
   if (s.trainer && !s.trainer.hand_active) {
-    note(`The hand is over — step through it in the review, or deal the next one.${nextHand}`);
+    note(`<b>Hand over</b><span>${escapeHTML(reviewResultText(s))}</span>${nextHand}`);
     return;
   }
   // Trainer animation frame: an opponent is acting.
