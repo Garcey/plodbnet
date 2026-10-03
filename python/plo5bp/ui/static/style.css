@@ -576,6 +576,11 @@ body.trainer-mode.trainer-pick #card-grid-panel {
 .stat-cat-row .rec-dist-track { height: 7px; }
 .stat-cat-label { width: 76px; flex: none; font-size: 11px; color: var(--muted); }
 .stats-ev { font-variant-numeric: tabular-nums; }
+/* the bottom line: EV lost on the left, the hands' real result on the right (2026-10-03) */
+.stats-foot { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 2px 10px; }
+.stats-net { margin-left: auto; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
+.stats-net.pos { color: var(--ok); }
+.stats-net.neg { color: var(--danger); }
 
 /* Review panel */
 #review-panel {
@@ -807,7 +812,8 @@ body.trainer-mode.trainer-pick #card-grid-panel {
 .stats-block.collapsed .stats-chev { transform: rotate(-90deg); }
 .stats-block.collapsed .stats-top,
 .stats-block.collapsed .stat-cat-row,
-.stats-block.collapsed .stats-ev { display: none; }
+.stats-block.collapsed .stats-ev,
+.stats-block.collapsed .stats-foot { display: none; }
 
 /* --- Mobile card-picker sheet ---------------------------------------------- */
 #card-picker-modal { position: fixed; inset: 0; z-index: 1100; }

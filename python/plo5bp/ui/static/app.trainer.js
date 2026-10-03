@@ -142,6 +142,22 @@ function statsBlockHTML(title, st, scope, s) {
   const evHand = st.ev_loss_per_hand_bb;
   const evLine = `EV lost ${fmtBBValue(evTotal, s)}` +
     ((evHand !== null && evHand !== undefined) ? ` · ${fmtBBValue(evHand, s)} a hand` : "");
+  // the hands' real results, opposite the EV lost (owner, 2026-10-03: "results oriented …
+  // fun to see"); absent until a hand with a result is counted
+  const net = st.net_total_bb, netHand = st.net_per_hand_bb;
+  let netLine = "";
+  if (net !== null && net !== undefined && Number.isFinite(Number(net))) {
+    const n = Number(net);
+    const cls = n > 0 ? "pos" : n < 0 ? "neg" : "muted";
+    const verb = n > 0 ? "Won" : n < 0 ? "Lost" : "Even";
+    const each = (n !== 0 && netHand !== null && netHand !== undefined)
+      ? ` · ${fmtBBValue(Math.abs(Number(netHand)), s)} a hand` : "";
+    // (a lifetime from before 2026-10-03 has hands without a result: say how many count)
+    const counted = Number(st.net_hands) || 0;
+    const over = counted ? `over ${fmtNum(counted, 0)} hand${counted === 1 ? "" : "s"} ` : "";
+    netLine = `<span class="stats-net ${cls}" title="Your results ${over}— the cards that came, not the EV">`
+      + `${verb}${n !== 0 ? ` ${fmtBBValue(Math.abs(n), s)}` : ""}${each}</span>`;
+  }
   return `
     <div class="stats-title" role="button" tabindex="0" aria-expanded="${statsCollapsed(scope) ? "false" : "true"}">
       <span><span class="stats-chev" aria-hidden="true">&#9662;</span>${title}</span>
@@ -153,7 +169,7 @@ function statsBlockHTML(title, st, scope, s) {
       <div><span class="stats-num stats-score">${score}</span><span class="stats-cap">accuracy</span></div>
     </div>
     ${rows}
-    <div class="stats-ev muted">${evLine}</div>
+    <div class="stats-foot"><span class="stats-ev muted">${evLine}</span>${netLine}</div>
   `;
 }
 

@@ -602,6 +602,38 @@ def test_abandoned_hand_contributes_nothing(trainer_factory, play_to_terminal):
     assert ts.session_stats.hands == completed + 1
 
 
+def test_stats_track_the_hands_real_results(T, trainer_factory, play_to_terminal):
+    """(owner, 2026-10-03) "the session and lifetime stats also track your profit/loss": the
+    completed hands' real results at your seat, in both blocks — never a Repeat's, like
+    every other stat — and a stats file from before has hands but no results, so it shows
+    none until one is counted (its average divides by the hands that have one)."""
+    ts = trainer_factory(
+        model_cls=ActorCriticV2, seats_mode="fixed", seats_fixed=3, mc_rollouts=0, stack_bb=100.0,
+    )
+    nets = []
+    for _ in range(4):
+        ts.new_hand()
+        if not ts.hand.terminal:
+            play_to_terminal(ts)
+        nets.append(ts.hand.rewards_bb[ts.hand.hero_seat])
+    for block in (ts.session_stats, ts.lifetime_stats):
+        assert block.net_hands == 4 and block.net_sum_bb == pytest.approx(sum(nets))
+    shown = ts.session_stats.project()
+    assert shown["net_total_bb"] == round(sum(nets), 2)
+    assert shown["net_per_hand_bb"] == round(sum(nets) / 4, 3)
+    assert shown["net_hands"] == 4
+    assert T.StatsBlock.from_dict(json.loads(json.dumps(ts.session_stats.to_dict()))) == ts.session_stats
+
+    ts.new_hand(repeat=True)  # a Repeat counts in nothing
+    if not ts.hand.terminal:
+        play_to_terminal(ts)
+    assert ts.session_stats.net_hands == 4 and ts.session_stats.net_sum_bb == pytest.approx(sum(nets))
+
+    old = T.StatsBlock.from_dict({"hands": 10, "moves": 30, "score_sum": 2400.0})
+    assert old.net_hands == 0 and old.project()["net_total_bb"] is None
+    assert old.project()["net_per_hand_bb"] is None and old.project()["net_hands"] == 0
+
+
 # --- F5 / F7: mc_rollouts cap + lock scope -------------------------------------------
 
 

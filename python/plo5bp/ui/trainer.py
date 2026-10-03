@@ -972,6 +972,12 @@ class StatsBlock:
     ev_loss_sum_bb: float = 0.0
     ev_loss_signed_sum_bb: float = 0.0
     ev_loss_n: int = 0
+    # Profit / loss (2026-10-03, owner: "the session and lifetime stats also track your
+    # profit/loss. It's kind of a results oriented thing, but … fun to see"): the real
+    # results of the completed hands that recorded one — `net_hands` of them (stats files
+    # from before have hands but no results).
+    net_sum_bb: float = 0.0
+    net_hands: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -982,6 +988,8 @@ class StatsBlock:
             "ev_loss_sum_bb": self.ev_loss_sum_bb,
             "ev_loss_signed_sum_bb": self.ev_loss_signed_sum_bb,
             "ev_loss_n": self.ev_loss_n,
+            "net_sum_bb": self.net_sum_bb,
+            "net_hands": self.net_hands,
         }
 
     @classmethod
@@ -998,6 +1006,8 @@ class StatsBlock:
             ev_loss_sum_bb=max(0.0, _finite(d.get("ev_loss_sum_bb", 0.0))),
             ev_loss_signed_sum_bb=_finite(d.get("ev_loss_signed_sum_bb", 0.0)),
             ev_loss_n=int(d.get("ev_loss_n", 0)),
+            net_sum_bb=_finite(d.get("net_sum_bb", 0.0)),
+            net_hands=max(0, int(d.get("net_hands", 0))),
         )
 
     @property
@@ -1025,6 +1035,10 @@ class StatsBlock:
             "cat_counts": dict(self.cat_counts),
             "ev_loss_total_bb": round(total, 2),
             "ev_loss_per_hand_bb": round(per_hand, 3) if per_hand is not None else None,
+            # (None until a hand with a result is counted)
+            "net_total_bb": round(self.net_sum_bb, 2) if self.net_hands else None,
+            "net_per_hand_bb": round(self.net_sum_bb / self.net_hands, 3) if self.net_hands else None,
+            "net_hands": self.net_hands,
         }
 
 
@@ -1870,8 +1884,13 @@ class TrainerSession:
         if h.stats_committed:
             return
         h.stats_committed = True
+        rewards = h.rewards_bb or []
+        net = _finite(rewards[h.hero_seat], math.nan) if 0 <= h.hero_seat < len(rewards) else math.nan
         for block in (self.session_stats, self.lifetime_stats):
             block.hands += 1
+            if math.isfinite(net):  # (the hand's real result: profit / loss)
+                block.net_sum_bb += net
+                block.net_hands += 1
             for d in h.decisions:
                 block.add_decision(d)
 
