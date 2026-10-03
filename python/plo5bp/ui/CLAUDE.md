@@ -268,6 +268,24 @@ suit top-left, big rank bottom-right, ten = "T").
   Bet tap opens it), Fold / Check-Call / Bet-Raise (`.rec` + "Network" badge = the
   network's choice on Hero's turn in Study), the status strip (hand over — the Trainer's
   "Next hand" — cards missing, opponents acting), Undo / Redo (Study).
+- **The table never changes size with the turn (owner, 2026-10-02: "the addition and
+  removal of the betting options slightly resizes the whole table")** — on all three
+  pages. The felt gets what `#stage-wrap` leaves after the dock, so every part of the
+  dock holds ONE height per layout: `#act-slot` (both pages: sizing + buttons / pre-actions
+  / status strip) has `min-height: var(--slot-h)` = the one-row sizing panel (`--sz-h`,
+  forced to exactly that height) + 8 + the buttons on a desktop, the buttons' height on a
+  compact layout (the sizing panel floats there), 0 where the dock floats (phone on its
+  side); the compact status strip wraps its words BESIDE its buttons (two lines fit), never
+  under them; `#hero-hand-labels` is one line (a long label ends in "…", `.hhl-txt`).
+  Study / Trainer (style.css): the actor line and the Trainer's "Your last move" line are
+  single lines that keep their place when empty (`[hidden]` → `visibility: hidden`, with
+  `!important` against the page's global `[hidden]` rule); no-limit's sizing panel is
+  ALWAYS two rows on a desktop (`body.fmt-nl`, set by `renderActions`: `--sz-h` 92 px),
+  pot-limit's one; small buttons on the felt are 30 px (`.primary`'s old 40 px min-height
+  made "Next hand" taller than the buttons). The status strip is one message
+  (`.strip-msg`) + its buttons (`note(msg, btns)`). A new dock line or state must keep
+  this: check with `tools/games_preview/measure_dock.js` (one `#stage-box` size per window
+  size, every state) at desktop, short-window, tablet and phone sizes.
 - **Public build**: the /static mount refuses every `games.*` file, so for a signed-in
   page `server._link_shared_table_assets` points index.html's two links at
   `/games/static/<name>?v=<hash>` (signed out: the WGAPP strip drops them with the app).

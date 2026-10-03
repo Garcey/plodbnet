@@ -196,26 +196,30 @@ function reviewResultText(s) {
 
 function renderActions(s) {
   const d = dockEls();
+  // (no-limit's sizing panel is two rows on a desktop, pot-limit's one — set before any
+  // decision, so the dock is that height from the first state on: style.css)
+  document.body.classList.toggle("fmt-nl", !isPotLimit(s));
   d.dock.classList.remove("villain-turn", "hero-turn");
   for (const b of [d.fold, d.call, d.raise]) b.classList.remove("rec");
   // A line in place of the buttons: the hand is over, someone else is acting,
-  // the cards for the next street are missing…
-  const note = (markup) => {
+  // the cards for the next street are missing… ONE message, then its buttons: on a
+  // phone the words wrap beside the buttons, at the buttons' height (games.felt.css).
+  const note = (msg, btns) => {
     d.btns.hidden = true;
     d.sizing.hidden = true;
-    d.strip.hidden = !markup;
-    d.strip.innerHTML = markup || "";
+    d.strip.hidden = !msg;
+    d.strip.innerHTML = msg ? `<span class="strip-msg">${msg}</span>${btns || ""}` : "";
   };
   // (the Trainer: the next hand is one click away, where your hand was)
-  const nextHand = s.trainer ? ' <button type="button" class="btn sm primary" data-trainer-next>Next hand</button>' : "";
+  const nextHand = s.trainer ? '<button type="button" class="btn sm primary" data-trainer-next>Next hand</button>' : "";
   if (s.terminal) {
-    note(`<b>Hand over</b><span>${escapeHTML(terminalText(s))}</span>${nextHand}`);
+    note(`<b>Hand over</b> ${escapeHTML(terminalText(s))}`, nextHand);
     return;
   }
   // Trainer review reconstruction: the hand is over; this state is a
   // replayed decision node. Show the choice, don't allow acting.
   if (s.trainer && !s.trainer.hand_active) {
-    note(`<b>Hand over</b><span>${escapeHTML(reviewResultText(s))}</span>${nextHand}`);
+    note(`<b>Hand over</b> ${escapeHTML(reviewResultText(s))}`, nextHand);
     return;
   }
   // Trainer animation frame: an opponent is acting.
@@ -241,8 +245,8 @@ function renderActions(s) {
     river: "Place the river cards to act",
   };
   if (isHero && s.hero_blocking_reason != null) {
-    note(`${escapeHTML(BLOCK_NOTES[s.hero_blocking_reason] || "Place the cards to act")}.`
-      + ' <button type="button" class="btn sm enter-cards-btn" data-open-picker>Enter cards</button>');
+    note(`${escapeHTML(BLOCK_NOTES[s.hero_blocking_reason] || "Place the cards to act")}.`,
+      '<button type="button" class="btn sm enter-cards-btn" data-open-picker>Enter cards</button>');
     return;
   }
   d.strip.hidden = true;

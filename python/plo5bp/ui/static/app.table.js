@@ -455,7 +455,7 @@ function renderHeroHandLabels(s) {
     if (desc[0]) rows.push(["1", desc[0]]);
     if (desc[1]) rows.push(["2", desc[1]]);
   }
-  const html = rows.map(([tag, text]) => `<span class="hero-hand-label">${tag ? `<span class="hhl-tag">${tag}</span>` : ""}${escapeHTML(text)}</span>`).join("");
+  const html = rows.map(([tag, text]) => `<span class="hero-hand-label" title="${escapeHTML(text)}">${tag ? `<span class="hhl-tag">${tag}</span>` : ""}<span class="hhl-txt">${escapeHTML(text)}</span></span>`).join("");
   if (el.dataset.k !== html) { el.dataset.k = html; el.innerHTML = html; }
 }
 

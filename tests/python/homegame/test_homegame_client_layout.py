@@ -106,15 +106,86 @@ def test_touch_screens_get_fingertip_sized_targets_without_moving_the_table():
 
 # ------------------------------------------------------------------ HGT-035
 def test_the_desktop_dock_keeps_only_what_a_one_row_sizing_panel_needs():
-    bar = [root(), el("body"), el("div#dock"), el("div#actbar")]
-    assert computed(RULES, bar, "min-height") == "114px"
-    sizing = [root(), el("body"), el("div#actbar"), el("div#sizing")]
+    dock = [root(), el("body"), el("div#dock")]
+    assert computed(RULES, dock, "--sz-h") == "50px"
+    # 114 px: the one-row panel, a gap, the buttons (the action slot holds it — 2026-10-02)
+    assert computed(RULES, dock, "--slot-h") == "calc(var(--sz-h) + 8px + 56px)"
+    slot = [*dock, el("div#actbar"), el("div#act-slot")]
+    assert computed(RULES, slot, "min-height") == "var(--slot-h)"
+    sizing = [*slot, el("div#sizing")]
+    assert computed(RULES, sizing, "height", (DESK,)) == "var(--sz-h)"  # (exactly: the slot is ONE height)
     assert computed(RULES, sizing, "flex-direction", (DESK,)) == "row"
     assert computed(RULES, sizing, "flex-direction") == "column"  # (the floating panel of phones / short windows)
     for spec in ("button.sz-step", "div.sz-row.sz-foot"):
         assert computed(RULES, [*sizing, el(spec)], "display", (DESK,)) == "none", spec
     play = (STATIC / "games.play.js").read_text(encoding="utf-8")
     assert '$("sz-slider").title =' in play  # (the range and the pot, where the foot line was)
+
+
+# ------------------------------------------------------------------ 2026-10-02
+COMPACT = "(max-width: 760px), (max-height: 700px)"
+NARROW = "(max-width: 760px)"
+SHORT_UPRIGHT = "(max-width: 760px) and (max-height: 700px) and (orientation: portrait)"
+LOW_SIDEWAYS = "(max-height: 560px) and (orientation: landscape)"
+#: Study / Trainer's page: the shared table's stylesheet, then its own (index.html's order)
+STUDY_RULES = parse_css("\n".join((STATIC / n).read_text(encoding="utf-8") for n in ("games.felt.css", "style.css")))
+
+
+def test_the_table_keeps_its_size_whatever_the_dock_shows():
+    """(owner, 2026-10-02) "when it's your turn vs not your turn, the addition and removal
+    of the betting options slightly resizes the whole table": the felt gets what the dock
+    leaves, so every part of the dock is ONE height per layout whatever it shows — the
+    action slot (sizing + buttons, the pre-actions or the status line) the buttons' height,
+    the hand labels one line, and on Study / Trainer the actor line and the Trainer's "last
+    move" line keep their place when empty. Measured on all three pages at desktop, short
+    window, tablet and phone sizes with tools/games_preview/measure_dock.js."""
+    dock = [root(), el("body"), el("div#dock")]
+    act = [*dock, el("div#actbar"), el("div#act-slot"), el("div#act-btns"), el("button.act")]
+    for media, h in (((COMPACT,), "56px"), ((COMPACT, NARROW), "52px"),
+                     ((COMPACT, NARROW, SHORT_UPRIGHT), "46px"), ((COMPACT, LOW_SIDEWAYS), "42px")):
+        assert computed(RULES, dock, "--slot-h", media) == h, media
+        assert computed(RULES, act, "height", media) == h, media  # (the buttons fill it)
+    # a phone on its side floats the dock over the felt: it moves nothing, so it holds nothing
+    assert computed(RULES, dock, "--slot-h", (COMPACT, LOW_SIDEWAYS, SIDEWAYS)) == "0px"
+    # the status line stands where the buttons stand: its words wrap BESIDE its buttons
+    strip = [*dock, el("div#actbar"), el("div#act-slot"), el("div#status-strip")]
+    assert computed(RULES, strip, "flex-wrap", (COMPACT,)) == "nowrap"
+    assert computed(RULES, strip, "min-height", (COMPACT,)) == "var(--slot-h)"
+    assert computed(RULES, [*strip, el("button.btn.sm")], "flex", (COMPACT,)) == "none"
+    # one line of hand labels: a long one ends in "…"
+    labels = [root(), el("body"), el("div#stage-wrap"), el("div#hero-hand-labels")]
+    assert computed(RULES, labels, "flex-wrap") == "nowrap"
+    assert computed(RULES, [*labels, el("span.hero-hand-label"), el("span.hhl-txt")], "text-overflow") == "ellipsis"
+    # both pages build the slot the same way, and the labels' words in their own span
+    play = (STATIC / "games.play.js").read_text(encoding="utf-8")
+    assert '<div id="act-slot"><div id="sizing" hidden>' in play
+    assert '<div id="status-strip" hidden></div></div>`' in play and 'class="hhl-txt"' in play
+    page = (STATIC / "index.html").read_text(encoding="utf-8")
+    slot = page.split('<div id="act-slot">', 1)[1].split('<div class="dock-side right"', 1)[0]
+    assert all(f'id="{x}"' in slot for x in ("sizing", "act-btns", "status-strip"))
+    assert 'class="hhl-txt"' in (STATIC / "app.table.js").read_text(encoding="utf-8")
+
+    # Study / Trainer: the actor line and the Trainer's "last move" line keep their place
+    # (the page hides with `[hidden] { display: none !important }`: these win over it)
+    bar = [root(), el("body.trainer-mode"), el("div#stage-wrap.hg-felt"), el("div#dock"), el("div#actbar")]
+    gone = [*bar, el("div#actor-banner.actor-banner", hidden="")]
+    assert computed(STUDY_RULES, gone, "display") == "block" and computed(STUDY_RULES, gone, "visibility") == "hidden"
+    line = [*bar, el("div#actor-banner.actor-banner")]
+    assert computed(STUDY_RULES, line, "white-space") == "nowrap" and computed(STUDY_RULES, line, "height") == "22px"
+    verdict = [*bar, el("div#last-verdict.last-verdict", hidden="")]
+    assert computed(STUDY_RULES, verdict, "display") == "flex" and computed(STUDY_RULES, verdict, "visibility") == "hidden"
+    assert computed(STUDY_RULES, [*bar[:-1], el("div#actbar"), el("div#last-verdict.last-verdict")], "height") == "29px"
+    study_verdict = [root(), el("body"), el("div#dock"), el("div#actbar"), el("div#last-verdict.last-verdict", hidden="")]
+    assert computed(STUDY_RULES, study_verdict, "display") == "none"  # (Study grades nothing)
+    # floating over a sideways phone's felt they move nothing: gone when empty
+    assert computed(STUDY_RULES, gone, "display", (COMPACT, LOW_SIDEWAYS, SIDEWAYS, "(max-width: 860px) and (max-height: 480px) and (orientation: landscape)")) == "none"
+    # no-limit's sizing panel is ALWAYS two rows on a desktop, pot-limit's one
+    assert computed(STUDY_RULES, [root(), el("body.fmt-nl"), el("div#dock")], "--sz-h", (DESK,)) == "92px"
+    assert computed(STUDY_RULES, [root(), el("body"), el("div#dock")], "--sz-h", (DESK,)) == "50px"
+    assert 'document.body.classList.toggle("fmt-nl", !isPotLimit(s));' in (STATIC / "app.play.js").read_text(encoding="utf-8")
+    # "Next hand" is a small button like the others (the old .primary min-height made it 40 px)
+    nxt = [*bar[:-1], el("div#actbar"), el("div#act-slot"), el("div#status-strip"), el("button.btn.sm.primary")]
+    assert computed(STUDY_RULES, nxt, "min-height") == "0" and computed(STUDY_RULES, nxt, "height") == "30px"
 
 
 # ------------------------------------------------------------------ MOB-004

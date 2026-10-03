@@ -238,22 +238,24 @@
             <div id="actbar">
               <div id="actor-banner" class="actor-banner" hidden></div>
               <div id="last-verdict" class="last-verdict" hidden></div>
-              <div id="sizing" hidden>
-                <div class="sz-row"><div class="sz-presets" id="raise-presets"></div></div>
-                <div class="sz-row">
-                  <button type="button" class="sz-step" id="sz-minus" aria-label="A smaller bet">&minus;</button>
-                  <input type="range" id="sz-slider" min="0" max="1000" step="1" aria-label="Bet size" />
-                  <button type="button" class="sz-step" id="sz-plus" aria-label="A bigger bet">+</button>
-                  <div class="money sz-amt" id="raise-amt-box"><input class="input" id="raise-input" type="text" inputmode="decimal" autocomplete="off" aria-label="Bet size" /></div>
+              <div id="act-slot">
+                <div id="sizing" hidden>
+                  <div class="sz-row"><div class="sz-presets" id="raise-presets"></div></div>
+                  <div class="sz-row">
+                    <button type="button" class="sz-step" id="sz-minus" aria-label="A smaller bet">&minus;</button>
+                    <input type="range" id="sz-slider" min="0" max="1000" step="1" aria-label="Bet size" />
+                    <button type="button" class="sz-step" id="sz-plus" aria-label="A bigger bet">+</button>
+                    <div class="money sz-amt" id="raise-amt-box"><input class="input" id="raise-input" type="text" inputmode="decimal" autocomplete="off" aria-label="Bet size" /></div>
+                  </div>
+                  <div class="sz-row sz-foot"><span class="sz-range" id="sz-range"></span><span class="sz-range" id="sz-pot"></span></div>
                 </div>
-                <div class="sz-row sz-foot"><span class="sz-range" id="sz-range"></span><span class="sz-range" id="sz-pot"></span></div>
+                <div id="act-btns" hidden>
+                  <button class="act fold" id="fold-btn" type="button" data-gate="fold"><kbd>F</kbd><span>Fold</span></button>
+                  <button class="act call" id="check-btn" type="button" data-gate="check_call"><kbd>C</kbd><span id="call-lbl">Check</span><small id="call-amt"></small></button>
+                  <button class="act raise" id="raise-go" type="button" data-gate="raise"><kbd>R</kbd><span id="raise-lbl">Bet</span><small id="raise-amt"></small></button>
+                </div>
+                <div id="status-strip" hidden></div>
               </div>
-              <div id="act-btns" hidden>
-                <button class="act fold" id="fold-btn" type="button" data-gate="fold"><kbd>F</kbd><span>Fold</span></button>
-                <button class="act call" id="check-btn" type="button" data-gate="check_call"><kbd>C</kbd><span id="call-lbl">Check</span><small id="call-amt"></small></button>
-                <button class="act raise" id="raise-go" type="button" data-gate="raise"><kbd>R</kbd><span id="raise-lbl">Bet</span><small id="raise-amt"></small></button>
-              </div>
-              <div id="status-strip" hidden></div>
             </div>
             <div class="dock-side right" id="dock-right"></div>
           </div>

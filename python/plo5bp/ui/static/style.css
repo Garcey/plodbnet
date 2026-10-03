@@ -2108,7 +2108,9 @@ body:has(> #top-bar) {
 .hg-felt .btn:hover:not(:disabled) { background: var(--panel-3); border-color: rgba(255, 255, 255, 0.2); }
 .hg-felt .btn:active:not(:disabled) { transform: translateY(1px) scale(0.99); }
 .hg-felt .btn:disabled { opacity: 0.45; }
-.hg-felt .btn.sm { height: 30px; padding: 0 11px; border-radius: 8px; font-size: 12.5px; }
+/* (min-height 0: the old `.primary { min-height: 40px }` made the status line's "Next hand" the
+   one small button 40 px tall — the line grew round it on a small phone and moved the table) */
+.hg-felt .btn.sm { height: 30px; min-height: 0; padding: 0 11px; border-radius: 8px; font-size: 12.5px; }
 .hg-felt .btn.primary {
   background: linear-gradient(180deg, #2be3d4 0%, #0fa99d 100%); color: var(--on-accent); border-color: rgba(255, 255, 255, 0.18);
   box-shadow: 0 6px 18px rgba(24, 210, 195, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.35);
@@ -2308,15 +2310,25 @@ button.history-entry:hover, button.history-entry:focus-visible { background: rgb
   border: 0; border-radius: 0; background: none; box-shadow: none;
   font-size: 12.5px; font-weight: 600; color: var(--tx-2);
 }
-#dock .actor-banner:not(.error) { display: block; line-height: 1.45; }   /* (a wrapped line keeps its dot beside its first word) */
+/* ONE line, there in every state (2026-10-02: a turn line that came and went, or wrapped to
+   two, moved the table): a long one ends in "…", an empty one keeps its place */
+#dock .actor-banner:not(.error) { display: block; height: 22px; line-height: 22px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#dock .actor-banner[hidden]:not(.error) { display: block !important; visibility: hidden; }
 #dock .actor-banner::before { display: inline-block; width: 7px; height: 7px; margin: 0 8px 1px 0; vertical-align: middle; }
 #dock .actor-banner.hero { color: var(--tx); }
 #dock .actor-banner.villain { color: #ffd59a; }
 #dock .actor-banner.error { color: #ffd3d9; }
 #dock .banner-btn { margin-left: 4px; height: 26px; border-radius: 8px; }
 /* the Trainer's grade of your last move, until your next one */
-#dock .last-verdict { margin: 0; justify-content: center; text-align: center; padding: 5px 12px; border-radius: 10px; background: rgba(255, 255, 255, 0.035); font-size: 12.5px; }
+#dock .last-verdict { margin: 0; justify-content: center; align-items: center; text-align: center; padding: 0 12px; border-radius: 10px; background: rgba(255, 255, 255, 0.035); font-size: 12.5px; }
 #dock .last-verdict .lv-label { width: auto; font-size: 10px; letter-spacing: 1px; }
+/* the Trainer keeps its line in EVERY state — before your first move of a hand too — and on
+   one line (the details shorten first: the review has them all), so it never moves the table */
+body.trainer-mode #dock .last-verdict { flex-wrap: nowrap; white-space: nowrap; overflow: hidden; height: 29px; }
+body.trainer-mode #dock .last-verdict[hidden] { display: flex !important; visibility: hidden; }
+#dock .last-verdict .lv-label { flex: none; }
+#dock .last-verdict .lv-main { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+#dock .last-verdict .lv-sub { flex: 0 1000 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 /* only the actions there are: two buttons when there is no bet to make */
 #act-btns.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 /* Study: the network's choice on Hero's turn (Recommendation says how sure it is) */
@@ -2330,15 +2342,14 @@ button.history-entry:hover, button.history-entry:focus-visible { background: rgb
 body:not(.trainer-mode) .act kbd { display: none; }
 .sz-presets button.allin { color: #ff9aa6; border-color: rgba(242, 86, 106, 0.45); }
 .sz-presets .preset-edit { flex: 0 0 auto; padding: 0 10px; color: var(--tx-2); background: transparent; border-style: dashed; }
-/* the one-row sizing panel of a desktop (games.felt.css): the presets take the width their
-   labels need (no-limit has eight: "150%" and "All-in" were cut to "15…"); the slider and
-   the amount take the rest, or drop under them when that is too little */
+/* the sizing panel of a desktop (games.felt.css) is one row: pot-limit's presets share it with
+   the slider. No-limit has eight ("150%" and "All-in" were cut to "15…" there), so they get a
+   row of their own over the slider — ALWAYS, not when they happen to overflow: the panel is
+   one height whatever the spot, and so is the dock (2026-10-02) */
 @media (min-width: 761px) and (min-height: 701px) {
-  #sizing { flex-wrap: wrap; }
-  #sizing > .sz-row:first-child { flex: 0 1 auto; }
-  #sizing .sz-presets { flex: 0 1 auto; }
-  #sizing .sz-presets button { flex: 0 1 auto; min-width: 38px; padding: 0 9px; }
-  #sizing > .sz-row:nth-child(2) { flex: 1 1 220px; }
+  body.fmt-nl #dock { --sz-h: 92px; }
+  body.fmt-nl #sizing { flex-wrap: wrap; align-content: center; }
+  body.fmt-nl #sizing > .sz-row:first-child, body.fmt-nl #sizing > .sz-row:nth-child(2) { flex: 1 0 100%; }
 }
 .sz-presets .preset-edit:hover { color: var(--tx); border-style: solid; }
 #status-strip .btn { margin-left: 4px; }
@@ -2373,6 +2384,9 @@ body:not(.trainer-mode) .act kbd { display: none; }
 @media (max-width: 860px) and (max-height: 480px) and (orientation: landscape) {
   #stage-wrap, body.trainer-mode #stage-wrap { height: max(280px, calc(100vh - 8px)); height: max(280px, calc(100svh - 8px)); }
   #dock .actor-banner, #dock .last-verdict { padding: 4px 10px; border-radius: 10px; background: rgba(8, 12, 18, 0.84); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); font-size: 12px; }
+  /* (floating over the felt they move nothing: their own height, and gone when empty) */
+  #dock .actor-banner:not(.error), body.trainer-mode #dock .last-verdict { height: auto; line-height: 1.4; }
+  #dock .actor-banner[hidden]:not(.error), body.trainer-mode #dock .last-verdict[hidden] { display: none !important; }
 }
 
 /* WGLIVE:START */
