@@ -11,9 +11,10 @@
 optional package | could not import '(cv2|pytesseract|stripe|fastapi|torch|mss|pygetwindow|windows_capture|PIL|webview|httpx)'
 optional package | No module named '(cv2|pytesseract|stripe|mss|pygetwindow|windows_capture|PIL|webview|httpx)'
 
-# Tools outside Python.
+# Tools outside Python (and Windows-only features: the CFR app's desktop shortcuts —
+# skipped on Linux CI).
 tool | node is not installed
-tool | no bash|needs (git|a GNU bash|git and bash|git and a GNU bash)|needs Windows PowerShell
+tool | no bash|needs (git|a GNU bash|git and bash|git and a GNU bash)|needs Windows PowerShell|Windows shortcuts
 tool | no GPU here|needs a CUDA learner|CUDA (is )?not available
 
 # An engine built before a feature (a rebuild fixes it; CI builds fresh and turns
