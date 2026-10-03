@@ -151,6 +151,12 @@
 .card.win { transform: translateY(calc(var(--cw) * -0.16)); z-index: 2; }
 .card.win .card-f { box-shadow: 0 0 0 2px var(--gold), 0 0 calc(var(--cw) * 0.5) rgba(236, 201, 119, 0.7); }
 .card.lose { filter: brightness(0.45) saturate(0.6); }
+/* hovering a board (or its made-hand label): the two hole cards you play on it and its
+   three that play with them stand out, the rest dim (games.table.js applyBoardFocus) */
+#boards .board { pointer-events: auto; } /* (#center lets clicks through; a board takes the hover) */
+#stage.board-focus #hero-hole .card:not(.plays), #stage.board-focus .board .card:not(.plays) { filter: brightness(0.42) saturate(0.6); }
+.card.plays { transform: translateY(calc(var(--cw) * -0.12)); z-index: 2; }
+.card.plays .card-f { box-shadow: 0 0 0 2px var(--accent), 0 0 calc(var(--cw) * 0.45) rgba(24, 210, 195, 0.55); }
 .card.deal-in { animation: dealin 0.42s var(--ease) backwards; }
 @keyframes dealin { from { transform: translate(var(--fx, 0), var(--fy, -60px)) rotate(-25deg) scale(0.6); opacity: 0; } }
 .card.muck { animation: muck 0.45s var(--ease) forwards; }

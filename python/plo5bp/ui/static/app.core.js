@@ -764,6 +764,8 @@ async function postTrainer(path, body) {
 // Play the per-action frames the trainer returns (one snapshot per
 // opponent action), then settle on the authoritative final state. Any
 // applyState from elsewhere bumps animSeq and cancels the playback.
+// `opts.ms`: the pause between frames (default: the Trainer setting); `opts.hold`:
+// pause after the last frame too (the drill's replay narrates every action).
 async function animateTrainerResponse(data, opts) {
   stopWorking();   // the answer is here: the banner narrates from now on
   const frames = data.frames || [];
@@ -812,7 +814,9 @@ async function animateTrainerResponse(data, opts) {
     for (let i = 0; i < frames.length; i++) {
       if (UI.animSeq !== seq) { aborted = true; break; }
       render(frames[i]);
-      if (i < frames.length - 1) await sleep(trainerPrefs.animMs);
+      if (i < frames.length - 1 || (opts && opts.hold && frames.length > 1)) {
+        await sleep(opts && Number.isFinite(opts.ms) ? opts.ms : trainerPrefs.animMs);
+      }
     }
     if (UI.animSeq !== seq) aborted = true;
   } finally {

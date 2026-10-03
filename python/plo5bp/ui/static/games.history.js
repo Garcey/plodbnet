@@ -110,7 +110,7 @@
       <div class="rp-banner" id="rp-banner"></div>
       <div class="rp-ctl"><button type="button" class="btn sm" id="rp-first" title="Start of the hand (Home)" aria-label="Start of the hand">⏮</button><button type="button" class="btn" id="rp-prev" title="Back one action (←)" aria-label="Back one action">◀</button><span class="rp-step num" id="rp-step" aria-live="polite"></span><button type="button" class="btn primary" id="rp-next" title="Play the next action (→)" aria-label="Next action">▶</button><button type="button" class="btn sm" id="rp-last" title="End of the hand (End)" aria-label="End of the hand">⏭</button>
       <span class="spacer"></span>${o.noLink ? "" : html`<button class="btn sm" id="rp-link" type="button" title="Copy a link to this hand — club members open it with the same reveal rules">${icon("i-link", "sm")}<span>Copy link</span></button>`}${rec.fair && HG.fair && !o.noLink ? html`<button class="btn sm" id="rp-fair" title="Re-check this hand's sealed deck, its cut and every card you can see">${icon("i-shield", "sm")}<span>Check shuffle</span></button>` : ""}${studyable(rec) ? html`<button class="btn gold sm" id="rp-study" title="Send this exact spot to the Study tab">${icon("i-chart", "sm")}Open in Study</button>` : ""}</div></div>
-      <div class="rp-side"><div class="rsec flush-top"><h4>Action</h4><div id="rp-list" class="rp-list"></div></div><div id="rp-result"></div></div>`);
+      <div class="rp-side"><div class="rsec flush-top rp-net" id="rp-net" hidden><h4>The network's choice</h4><div id="rp-net-body" aria-live="polite"></div></div><div class="rsec flush-top"><h4>Action</h4><div id="rp-list" class="rp-list"></div></div><div id="rp-result"></div></div>`);
     const q = (id) => body.querySelector("#" + id);
 
     function paint() {
@@ -161,6 +161,7 @@
       const cur = body.querySelector("#rp-list .log-row.on");
       if (cur) cur.scrollIntoView({ block: "nearest" });
       q("rp-result").hidden = !st.over;
+      paintNet(j < 1 ? k - 1 : -1);
       const sb = q("rp-study");
       if (sb && rec.study_upto != null) {
         const past = Math.min(k, N) > rec.study_upto;
@@ -169,6 +170,51 @@
       }
     }
     function go(to) { k = Math.max(0, Math.min(END, to)); paint(); }
+
+    // The network's choice at the decision just played (owner, 2026-10-03: "click on the
+    // decision node and see the network's choice … without having to put it in the study
+    // mode"): what Study would say there, asked once per decision (a forward on the
+    // server) — only where the actor's cards are known (yours, or a hand shown down).
+    const net = {};  // decision index -> "…" (asked) | {ok} | {err}
+    let netAt = -1;
+    function netAsks(i) {
+      const a = (rec.actions || [])[i];
+      if (!a || a.auto || !studyable(rec)) return false;
+      if (rec.study_upto != null && i >= rec.study_upto) return false;
+      const x = rec.seats.find((s) => s.seat === a.seat);
+      return !!(x && x.hole && x.hole.length && x.hole[0] >= 0);
+    }
+    const choiceUrl = (i) => (o.url ? `${o.url}/choice?i=${i}` : `/games/api/tables/${encodeURIComponent(gid)}/hands/${Number(no)}/choice?i=${i}`);
+    function paintNet(i) {
+      netAt = i;
+      const box = q("rp-net");
+      if (i < 0 || !netAsks(i)) { box.hidden = true; return; }
+      box.hidden = false;
+      if (net[i] === undefined) {
+        net[i] = "…";
+        C().j(choiceUrl(i)).then((r) => { net[i] = { ok: r }; }, (e) => { net[i] = { err: e.message }; })
+          .then(() => { if (netAt === i && !shell.closed) paintNet(i); });
+      }
+      put(q("rp-net-body"), netHtml(i, net[i]));
+    }
+    function netHtml(i, got) {
+      if (!got || got === "…") return html`<div class="muted small">Asking the network…</div>`;
+      if (got.err) return html`<div class="muted small">${got.err}</div>`;
+      const r = got.ok, a = rec.actions[i];
+      if (!r || !r.pick || !r.probs || !r.legal) return html`<div class="muted small">The network's choice isn't available here.</div>`;
+      const facing = r.to_call_cents > 0;
+      const size = (x) => `${facing ? "Raise to" : "Bet"} ${d2(x.to_cents)}${x.all_in ? " (all in)" : ""}`;
+      const pick = r.pick.gate === "fold" ? "Fold" : r.pick.gate === "call" ? (facing ? `Call ${d2(r.to_call_cents)}` : "Check") : size(r.pick);
+      const pct = (x) => Math.round(x * 100);
+      const segs = [["f", "Fold", r.probs.fold, r.legal.fold], ["c", facing ? "Call" : "Check", r.probs.call, r.legal.call], ["r", facing ? "Raise" : "Bet", r.probs.raise, r.legal.raise]]
+        .filter((s) => s[3]);
+      const sizes = (r.sizes || []).map((x) => html`<span>${size(x)} <b>${pct(x.p)}%</b></span>`);
+      return html`<div class="nc-pick"><small>It plays</small><b>${pick}</b></div>
+        <div class="nc-bar" role="img" aria-label="${segs.map((s) => `${s[1]} ${pct(s[2])}%`).join(", ")}">${segs.map((s) => html`<span class="nc-seg nc-${s[0]}" data-vars="w:${(s[2] * 100).toFixed(1)}%"></span>`)}</div>
+        <div class="nc-legend">${segs.map((s) => html`<span class="nc-${s[0]}">${s[1]} <b>${pct(s[2])}%</b></span>`)}</div>
+        ${r.probs.raise >= 0.005 && sizes.length ? html`<div class="nc-sizes"><small>Its sizes</small>${sizes}</div>` : ""}
+        <div class="nc-you"><span><b>${names[a.seat] || "?"}</b> ${a.label}</span>${gradeChip(gradeAt[i], true)}</div>`;
+    }
 
     // action list (click = jump to just after that action)
     const list = [];

@@ -989,6 +989,7 @@
     [/^a pair of (\S+)$/i, "Pair of $1"],
     [/^two pair, (\S+) and (\S+)$/i, "Two pair $1 & $2"],
     [/^three of a kind, (\S+)$/i, "Three $1"],
+    [/^a royal flush$/i, "Royal flush"],
     [/^a straight flush, (\S+)$/i, "Straight flush $1"],
     [/^a straight (\S+)$/i, "Straight $1"],
     [/^a flush (\S+) high$/i, "$1-high flush"],
@@ -1627,6 +1628,124 @@
     });
   }
 
+  // ------------------------------------------------------------- board focus
+  // Hovering a board — or its made-hand label under your cards — lights up the two hole
+  // cards you play on it and the three board cards they play with; everything else on
+  // the table dims (owner, 2026-10-03: "hover over each board and have it highlight the
+  // two hole cards that I'm playing on that board" — the home games, the Trainer and
+  // Study alike: this felt draws all three). A phone has no hover: a tap on the label
+  // shows it for a few seconds. PLO: exactly two of yours and three of the board — the
+  // same choice as hand_describe.best_combo (a tie takes the lowest cards), pinned by
+  // tests/python/homegame/test_homegame_board_focus_js.py; one board (NLH): the best five of seven,
+  // as few of your cards as the hand needs.
+  function eval5(cards) {
+    const ranks = cards.map((c) => (c / 4) | 0).sort((a, b) => b - a);
+    const flush = cards.every((c) => c % 4 === cards[0] % 4);
+    const cnt = new Map();
+    ranks.forEach((r) => cnt.set(r, (cnt.get(r) || 0) + 1));
+    const groups = [...cnt.entries()].sort((a, b) => b[1] - a[1] || b[0] - a[0]).map((g) => g[0]);
+    const counts = [...cnt.values()].sort((a, b) => b - a);
+    const uniq = [...new Set(ranks)].sort((a, b) => a - b);
+    let high = null;
+    if (uniq.length === 5) {
+      if (uniq[4] - uniq[0] === 4) high = uniq[4];
+      else if (uniq.join() === "0,1,2,3,12") high = 3;  // (A-2-3-4-5: the ace plays low)
+    }
+    if (high !== null && flush) return [8, high];
+    if (counts[0] === 4) return [7, groups[0], groups[1]];
+    if (counts[0] === 3 && counts[1] >= 2) return [6, groups[0], groups[1]];
+    if (flush) return [5, ...ranks];
+    if (high !== null) return [4, high];
+    if (counts[0] === 3) return [3, ...groups];
+    if (counts[0] === 2 && counts[1] === 2) return [2, ...groups];
+    if (counts[0] === 2) return [1, ...groups];
+    return [0, ...ranks];
+  }
+  const lexCmp = (a, b) => {
+    for (let i = 0; i < Math.min(a.length, b.length); i++) if (a[i] !== b[i]) return a[i] - b[i];
+    return a.length - b.length;
+  };
+  function combos(list, k) {
+    const out = [];
+    const walk = (from, acc) => {
+      if (acc.length === k) { out.push(acc.slice()); return; }
+      for (let i = from; i < list.length; i++) { acc.push(list[i]); walk(i + 1, acc); acc.pop(); }
+    };
+    walk(0, []);
+    return out;
+  }
+  // {hole, board}: the cards that play — or null (fewer than 2 + 3 cards known)
+  function bestPlay(hole, board, anyFive) {
+    const hs = (hole || []).filter((c) => c != null && c >= 0).sort((a, b) => a - b);
+    const bs = (board || []).filter((c) => c != null && c >= 0).sort((a, b) => a - b);
+    if (hs.length < 2 || bs.length < 3) return null;
+    let best = null;
+    const consider = (h, b) => {
+      const v = eval5([...h, ...b]);
+      const c = best ? lexCmp(v, best.v) : 1;
+      // (a tie: PLO takes the lowest cards, like best_combo; one board, the fewest of yours)
+      if (c > 0 || (c === 0 && (h.length - best.hole.length || lexCmp(h, best.hole) || lexCmp(b, best.board)) < 0)) {
+        best = { v, hole: h, board: b };
+      }
+    };
+    if (anyFive) {
+      for (let n = 0; n <= Math.min(2, hs.length); n++) {
+        for (const h of combos(hs, n)) for (const b of combos(bs, 5 - n)) if (b.length === 5 - n) consider(h, b);
+      }
+    } else {
+      for (const h of combos(hs, 2)) for (const b of combos(bs, 3)) consider(h, b);
+    }
+    return best && { hole: best.hole, board: best.board };
+  }
+  function boardFocus(k) {
+    T.boardFocus = k;
+    applyBoardFocus();
+  }
+  function applyBoardFocus() {
+    const k = T.boardFocus;
+    const heroEls = T.heroCards || [];
+    const boardEls = (b) => Array.from($("board-" + b).querySelectorAll(".card"));
+    const val = (ce) => (ce.dataset.c === "" || ce.dataset.c == null ? NaN : Number(ce.dataset.c));
+    let play = null;
+    if (k && !$("board-" + k).hidden) {
+      const single = $("boards").classList.contains("single");
+      const hole = heroEls.map(val).filter((c) => c >= 0);
+      play = hole.length === heroEls.length ? bestPlay(hole, boardEls(k).map(val), single && hole.length === 2) : null;
+    }
+    const lit = new Set(play ? [...play.hole, ...play.board] : []);
+    $("stage").classList.toggle("board-focus", !!play);
+    [...heroEls, ...boardEls("a"), ...boardEls("b")].forEach((ce) => ce.classList.toggle("plays", !!play && lit.has(val(ce))));
+  }
+  function wireBoardFocus() {
+    for (const k of ["a", "b"]) {
+      const host = $("board-" + k);
+      host.addEventListener("pointerenter", (e) => { if (e.pointerType !== "touch") boardFocus(k); });
+      host.addEventListener("pointerleave", (e) => { if (e.pointerType !== "touch" && T.boardFocus === k) boardFocus(null); });
+    }
+    // the made-hand labels under your cards ("1 a straight 10-A"): Study / Trainer and the
+    // home games both draw them as .hero-hand-label (one board: no number = board 1)
+    const labels = $("hero-hand-labels");
+    if (!labels) return;
+    const labelOf = (e) => (e.target && e.target.closest ? e.target.closest(".hero-hand-label") : null);
+    const boardOf = (l) => { const t = l.querySelector(".hhl-tag"); return t && t.textContent.trim() === "2" ? "b" : "a"; };
+    labels.addEventListener("pointerover", (e) => { if (e.pointerType === "touch") return; const l = labelOf(e); if (l) boardFocus(boardOf(l)); });
+    labels.addEventListener("pointerout", (e) => {
+      if (e.pointerType === "touch") return;
+      const l = labelOf(e);
+      if (l && !(e.relatedTarget && l.contains(e.relatedTarget))) boardFocus(null);
+    });
+    labels.addEventListener("pointerup", (e) => {
+      if (e.pointerType !== "touch") return;
+      const l = labelOf(e);
+      if (!l) return;
+      clearTimeout(T.boardFocusTimer);
+      const k = boardOf(l);
+      if (T.boardFocus === k) { boardFocus(null); return; }
+      boardFocus(k);
+      T.boardFocusTimer = setTimeout(() => boardFocus(null), 3500);
+    });
+  }
+
   // Four or more pots are wider than the gap between the seats beside them on
   // a phone (the outer pills went under those seats' plates): drop the chip
   // icons, then shrink the row until it fits. (The pots of a live hand share
@@ -1776,6 +1895,7 @@
     if (!T.ready) {
       T.ready = true;
       wirePotFocus();
+      wireBoardFocus();
       if (globalThis.ResizeObserver) { T.ro = new ResizeObserver(() => { layout(); if (HG.core.G.state) placeRabbit(HG.core.G.state); }); T.ro.observe($("stage-box")); }
       else globalThis.addEventListener("resize", layout);
     }
@@ -1822,6 +1942,7 @@
     placeRabbit(s);
     fitSeats();
     applyPotFocus();  // (fresh players for the pot under the pointer; rebuilt pills keep the focus)
+    applyBoardFocus();  // (cards drawn again under a board still hovered keep their light)
     syncTimer(s);
 
     // chat bubbles + reactions over the seats
@@ -1839,5 +1960,5 @@
     });
   }
 
-  HG.table = { render, layout, EMOTES, EMOTE_NAMES, shortHand, seatCenter: (i) => (T.seats[i] ? [T.seats[i].x, T.seats[i].y] : null) };
+  HG.table = { render, layout, EMOTES, EMOTE_NAMES, shortHand, bestPlay, seatCenter: (i) => (T.seats[i] ? [T.seats[i].x, T.seats[i].y] : null) };
 })();

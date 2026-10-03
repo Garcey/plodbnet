@@ -2045,8 +2045,8 @@ main.legal-main { display: block; padding: 34px 0 6px; min-height: 0; }
 .tab-short { display: none; }
 .acct-settings { display: none; }
 @media (max-width: 560px) {
-  #tab-games .tab-long, #tab-games .ext-arrow { display: none; }
-  #tab-games .tab-short { display: inline; }
+  #tab-games .tab-long, #tab-games .ext-arrow, #tab-review .tab-long, #tab-review .ext-arrow { display: none; }
+  #tab-games .tab-short, #tab-review .tab-short { display: inline; }
   .acct-chev { display: none; }
   #mode-tabs .mode-tab { padding: 0 8px; }
   body.multi-format .acct-settings { display: block; margin: 0 6px 6px; }
@@ -2398,4 +2398,41 @@ body:not(.trainer-mode) .act kbd { display: none; }
 /* ---- reduced motion: the table's own moves too (A11Y-019) ---------------------------- */
 @media (prefers-reduced-motion: reduce) {
   #hero-hole .card.slot-pick:not(.slot-sel):hover { transform: none; }
+}
+
+/* ---- the mistakes drill (Hand review, 2026-10-03): its part of the Trainer's work bar ---- */
+.drill-only { display: none !important; }
+body.trainer-mode.drill-mode .drill-only { display: flex !important; }
+#drill-bar { gap: 9px; min-width: 0; }
+.drill-tag {
+  display: inline-flex; align-items: center; height: 24px; padding: 0 10px; border-radius: 99px; white-space: nowrap;
+  background: rgba(236, 201, 119, 0.14); border: 1px solid rgba(236, 201, 119, 0.4); color: #ffe3a3;
+  font-size: 11px; font-weight: 800; letter-spacing: 0.9px; text-transform: uppercase;
+}
+.drill-where { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 12.5px; }
+.drill-prio { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; cursor: pointer; color: var(--text); font-size: 12.5px; font-weight: 600; }
+.drill-prio input { width: 15px; height: 15px; margin: 0; accent-color: var(--accent); }
+@media (max-width: 480px) {
+  .drill-where { display: none; }
+}
+/* (the dock's drill line on a compact dock: two lines beside ONE button — Try again is in
+   the work bar — so the dock keeps its height; app.trainer.js drillNoteHTML) */
+@media (max-width: 760px), (max-height: 700px) {
+  #status-strip .dn-extra, #status-strip [data-drill-again] { display: none; }
+}
+
+/* ---- the top bar on a phone (2026-10-03): with Hand review beside Home games the tabs
+   no longer fitted a 375 px phone (the account chip went off the screen and the page
+   scrolled sideways) — the tabs scroll inside their own strip instead ---- */
+@media (max-width: 480px) {
+  #top-bar { gap: 8px; }
+  #mode-tabs { flex: 1 1 auto; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+  #mode-tabs::-webkit-scrollbar { display: none; }
+  #mode-tabs .mode-tab { flex: none; padding: 0 6px; }
+}
+@media (max-width: 400px) {
+  #top-bar { gap: 6px; padding: 0 10px; }
+  #mode-tabs { gap: 0; }
+  #mode-tabs .mode-tab { padding: 0 5px; font-size: 12.5px; }
+  #top-bar .seg button { min-width: 26px; padding: 0 6px; }
 }

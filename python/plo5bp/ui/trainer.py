@@ -856,6 +856,11 @@ class HandRecord:
     # projection of the finished hand — the act response, GET /trainer/state
     # polls — reuses it instead of replaying and re-running the networks.
     review_cache: dict[str, Any] | None = None
+    # The mistakes drill (Hand review, 2026-10-03): the spot — its hand record,
+    # decision, place in the round, original mark — or None for a dealt hand.
+    # `drill_done`: its one decision was played (nothing else happens in it).
+    drill: dict[str, Any] | None = None
+    drill_done: bool = False
 
 
 def _ev_display(x: float | None) -> float | None:
@@ -1384,6 +1389,145 @@ class TrainerSession:
             self._advance(frames)
         return frames
 
+    # -- the mistakes drill (see set_drill_hooks) -----------------------------------
+
+    def load_drill(self, spot: dict[str, Any], practice: bool = False,
+                   replay: bool = True) -> list[dict[str, Any]]:
+        """Put the session at one spot of the mistakes drill (``spot`` = the store's
+        ``drill_next``: the hand record, the decision, its place in the round): every
+        action of the hand before that decision is replayed — the real ones, from the
+        record — and the hand stops at the decision. ``replay``: a frame per action
+        (the flop, then each action narrated, as the Trainer animates opponents), else
+        the decision only. ``practice``: the same spot again — graded, never counted."""
+        from plo5bp.ui import handreview as hr
+
+        if self.variant != VARIANT_PLO5:
+            raise HTTPException(status_code=409, detail="The mistakes drill is PLO5 — switch the format to PLO5 first.")
+        self._refresh_format_model()
+        rec = spot["record"]
+        i = int(spot["i"])
+        hero = int((rec.get("actions") or [])[i]["seat"]) if 0 <= i < len(rec.get("actions") or []) else -1
+        drill = {**{k: v for k, v in spot.items() if k not in ("node", "result")}, "practice": bool(practice)}
+        log: list[dict[str, int]] = []
+        frames: list[dict[str, Any]] = []
+        prev_hand, prev_no = self.hand, self.hand_no
+
+        def on_step(env: BombPotEnv, obs: np.ndarray, info: StepInfo, entry: dict[str, int] | None,
+                    to_call: int) -> None:
+            h = self.hand
+            if h is None or h.drill is not drill:  # (the flop: the spot's hand starts here)
+                holes = env.all_hole_cards()
+                self.hand_no = prev_no + 1
+                self.hand = h = HandRecord(
+                    hand_no=self.hand_no,
+                    seed=0,
+                    button=int(rec["button"]),
+                    hero_seat=hero,
+                    config=env.config,
+                    env=env,
+                    action_log=log,
+                    # (the other hands are placeholders: never revealed — a drill spot never ends)
+                    all_holes=[sorted(x, reverse=True) for x in holes],
+                    all_holes_dealt=holes,
+                    is_repeat=True,
+                    drill=drill,
+                )
+            h.last_obs, h.last_info = obs, info
+            if not replay:
+                return
+            frame = self.project_state()
+            frame["trainer"]["drill_replay"] = True
+            if entry is not None:
+                seat = int(entry["seat"])
+                frame["trainer"]["anim_action"] = {
+                    "seat": seat,
+                    "position": self._position_of(seat),
+                    "is_hero": seat == hero,
+                    "auto": False,
+                    "gate": GATE_SLUGS[int(entry["gate"])],
+                    "chips": int(entry["chips"]),
+                    "to_call": int(to_call),
+                    "street": STREET_NAMES.get(int(entry["street"]), str(entry["street"])),
+                }
+            frames.append(frame)
+
+        try:
+            env, obs, info, actor = hr.spot_env(rec, i, log=log, on_step=on_step)
+        except Exception:
+            self.hand, self.hand_no = prev_hand, prev_no  # (nothing was dealt)
+            raise
+        h = self.hand
+        assert h is not None and h.drill is drill and int(actor) == hero
+        h.last_obs, h.last_info = obs, info
+        # (the response's state is the decision itself, after the frames)
+        return frames or [self.project_state()]
+
+    def repeat_drill(self) -> list[dict[str, Any]]:
+        """The drill's Try again: the same spot, as practice — straight to the decision."""
+        h = self.hand
+        assert h is not None and h.drill is not None
+        return self.load_drill(h.drill, practice=True, replay=False)
+
+    def _drill_answer(self, decision: DecisionRecord) -> list[dict[str, Any]]:
+        """The drill spot's one decision: graded (by the caller), recorded for its
+        priority unless it is practice — and the spot is over."""
+        h = self.hand
+        assert h is not None and h.drill is not None
+        h.decisions.append(decision)
+        # (the move joins the log — the engine stays at the decision — so the spot's
+        # node view below reads it like a review node)
+        h.action_log.append({"seat": int(h.hero_seat), "gate": int(decision.user_gate),
+                             "chips": int(decision.user_chips), "street": int(decision.street)})
+        h.drill_done = True
+        try:
+            h.drill["node"] = self._node_view(len(h.action_log) - 1, h.last_obs, h.last_info)
+        except Exception:  # noqa: BLE001 — the side panel's detail only
+            logger.exception("trainer: could not build a drill spot's node view")
+            h.drill["node"] = None
+        learn = None
+        if _DRILL_RECORD is not None and not h.drill.get("practice"):
+            try:
+                learn = _DRILL_RECORD(str(h.drill["key"]), int(h.drill["i"]), decision.category)
+            except Exception:  # noqa: BLE001 — the grade stands even if its bookkeeping failed
+                logger.exception("trainer: could not record a drill result")
+        h.drill["result"] = learn
+        return [self.project_state()]
+
+    def _drill_payload(self, h: HandRecord) -> dict[str, Any]:
+        """The drill block of the state: where the spot comes from and, once played,
+        how it went (the original mark is shown only then — before, it would be a hint)."""
+        d = h.drill or {}
+        rec = d.get("record") or {}
+        out: dict[str, Any] = {
+            "key": d.get("key"), "i": d.get("i"),
+            "round": d.get("round"), "pos": d.get("pos"), "size": d.get("size"),
+            "total": d.get("total"), "prioritize": bool(d.get("prioritize", True)),
+            "practice": bool(d.get("practice")),
+            "played_at": rec.get("played_at"), "table_name": rec.get("table_name"),
+            "bb_cents": rec.get("bb_cents"), "sb_cents": rec.get("sb_cents"),
+            "done": bool(h.drill_done),
+            "learn": d.get("learn"),
+        }
+        if h.drill_done:
+            from plo5bp.actions import CHECK_CALL, FOLD
+
+            dec = h.decisions[-1] if h.decisions else None
+            orig = dict(d.get("orig") or {})
+            acts = rec.get("actions") or []
+            if d.get("i") is not None and 0 <= int(d["i"]) < len(acts):
+                # (what you did in the hand, for the client to word in the viewer's unit)
+                a = acts[int(d["i"])]
+                kind = int(a.get("action", CHECK_CALL))
+                orig["gate"] = GATE_SLUGS[GATE_FOLD if kind == FOLD else GATE_CHECK_CALL if kind == CHECK_CALL else GATE_RAISE]
+                orig["chips"] = int(a.get("chips") or 0) if orig["gate"] == GATE_SLUGS[GATE_RAISE] else None
+            out["orig"] = orig
+            out["result"] = d.get("result")
+            # the network's answer for the side panel (a review node's shape)
+            out["node"] = d.get("node")
+            if dec is not None:
+                out["probs"] = {k: round(float(p), 4) for k, p in zip(("fold", "call", "raise"), dec.gate_probs)}
+        return out
+
     def _opp_seed(self, h: HandRecord) -> int:
         return _stable_seed(h.seed, len(h.action_log), 0x5DEECE66D)
 
@@ -1639,6 +1783,8 @@ class TrainerSession:
             raise HTTPException(status_code=409, detail="no active hand")
         if h.terminal:
             raise HTTPException(status_code=400, detail="hand is over")
+        if h.drill_done:
+            raise HTTPException(status_code=400, detail="This spot is over — deal the next one.")
         info = h.last_info
         assert info is not None and h.last_obs is not None
         if info.actor != h.hero_seat:
@@ -1704,6 +1850,10 @@ class TrainerSession:
             backend=str(dist.get("backend", "ppo")),
         )
 
+        if h.drill is not None:
+            # A drill spot ends with its one decision: no EV estimate (it would replay a
+            # deal that doesn't exist) and nothing steps.
+            return self._drill_answer(decision)
         street = int(raw["street"])
         # (BE-004) The Monte-Carlo EV estimate runs BEFORE the live engine is
         # stepped (it replays the recorded prefix, which is exactly the log so
@@ -1752,7 +1902,7 @@ class TrainerSession:
         moot auto-check) — the state an interrupted `_advance` leaves behind.
         Returns True when it advanced. Safe to call any time."""
         h = self.hand
-        if h is None or h.terminal or h.last_info is None:
+        if h is None or h.terminal or h.last_info is None or h.drill is not None:
             return False
         actor = h.last_info.actor
         if actor is None:
@@ -2024,6 +2174,9 @@ class TrainerSession:
         the returned obs is that actor's observation."""
         h = self.hand
         assert h is not None
+        if h.drill is not None:
+            # (a drill spot was never dealt from a seed: there is no hand to replay)
+            raise HTTPException(status_code=409, detail="A drill spot has no review — deal the next one.")
         env = BombPotEnv(h.config)
         obs, info = env.reset(h.seed, h.button)
         for a in h.action_log[:node_idx]:
@@ -2102,7 +2255,7 @@ class TrainerSession:
         # hole cards), built with the EXACT training convention via the
         # canonical rollout helpers so the number is meaningful.
         value_true_bb: float | None = None
-        if self.critic is not None and dist["head_version"] >= 2:
+        if self.critic is not None and dist["head_version"] >= 2 and h.drill is None:
             holes = np.asarray(h.all_holes_dealt, dtype=np.uint8)  # (S, 5)
             opp = _rotate_opp_holes(holes, actor)[None]            # (1, 5, 5)
             # Match the critic's trained obs width (full / prefix / minimal).
@@ -2383,6 +2536,8 @@ class TrainerSession:
         modified card spec. Returns a full state dict (review projection
         with the modified cards on the table)."""
         h = self.hand
+        if h is not None and h.drill is not None:
+            raise HTTPException(status_code=409, detail="A drill spot has no review — deal the next one.")
         d = self._decision_for(req.decision)
         assert h is not None
         spec = self._original_card_spec(d)
@@ -2558,17 +2713,24 @@ class TrainerSession:
 
         # The table half (seats, pot, buttons, raise window, history, chip
         # scale) is the Study's own: `common.table_state` (BE-008). Nobody
-        # acts at a terminal node.
+        # acts at a terminal node — nor at a drill spot once it is played.
+        # A drill spot shows the real hand's stakes.
+        drill_over = live and h.drill is not None and h.drill_done
+        dollars_per_bb = self.settings.dollars_per_bb
+        if h.drill is not None and (h.drill.get("record") or {}).get("bb_cents"):
+            dollars_per_bb = int(h.drill["record"]["bb_cents"]) / 100.0
         table = _table_state(
             raw,
             cfg,
             button_seat=h.button,
             hero_seat=h.hero_seat,
-            info=info if (info is not None and not info.terminal) else None,
-            dollars_per_bb=self.settings.dollars_per_bb,
+            info=info if (info is not None and not info.terminal and not drill_over) else None,
+            dollars_per_bb=dollars_per_bb,
             position_of=self._position_of,
             hole_of=hole_of,
         )
+        if drill_over:
+            table["actor"] = None
 
         is_nlh = _engine_variant(self.variant) == VARIANT_NLH
         if card_spec_override is not None:
@@ -2654,7 +2816,7 @@ class TrainerSession:
                 # (32 in the public build) so the client can bound its input.
                 "mc_rollouts_max": mc_rollouts_cap(),
                 "hand_no": h.hand_no,
-                "hand_active": not h.terminal,
+                "hand_active": not (h.terminal or h.drill_done),
                 "rewards_bb": h.rewards_bb,
                 # Last hero decision's flash. Built per projection (not
                 # stored) so the EV-loss number is withheld in every frame
@@ -2698,6 +2860,8 @@ class TrainerSession:
                 # POST /trainer/hands/open).
                 "recent": self.recent_summaries(),
                 "review": review,
+                # The mistakes drill's spot (Hand review), or None.
+                "drill": self._drill_payload(h) if h.drill is not None else None,
             },
         }
         return state
@@ -2831,6 +2995,39 @@ _SESSION_RESOLVER: Callable[[], "TrainerSession | None"] | None = None
 def set_session_resolver(fn: Callable[[], "TrainerSession | None"] | None) -> None:
     global _SESSION_RESOLVER
     _SESSION_RESOLVER = fn
+
+
+# --- The mistakes drill (Hand review, 2026-10-03) ----------------------------------
+# Hand review's "Drill your mistakes" deals the player's own graded mistakes back as
+# Trainer spots: the exact decision, rebuilt Study-style (`handreview.spot_env`: your
+# cards, the boards as they were, every action before it, replayed on the table one by
+# one — the other hands are placeholders the actor's observation never reads, so the
+# network sees exactly what it graded). You act ONCE: the move is graded like any Trainer move and the spot is
+# over — no opponents, no EV estimate, no review, nothing in the Trainer's stats (all
+# of those replay a deal that doesn't exist). Which spot comes next, and what an
+# attempt does to its priority, is the store's (`handreview_store.drill_next` /
+# `drill_result`), plugged in here by its install(); without it (the local build)
+# POST /trainer/drill/next is a 404.
+
+#: (prioritize) -> the next spot (a dict: record, i, round info, orig, learn) or None.
+_DRILL_NEXT: Callable[[bool], dict[str, Any] | None] | None = None
+#: (hand key, decision index, category) -> the spot's new learning state.
+_DRILL_RECORD: Callable[[str, int, str], dict[str, Any] | None] | None = None
+
+
+def set_drill_hooks(
+    next_spot: Callable[[bool], dict[str, Any] | None] | None = None,
+    record: Callable[[str, int, str], dict[str, Any] | None] | None = None,
+) -> None:
+    global _DRILL_NEXT, _DRILL_RECORD
+    _DRILL_NEXT, _DRILL_RECORD = next_spot, record
+
+
+class DrillRequest(BaseModel):
+    #: Worst first (the default) or every spot equally often.
+    prioritize: bool = True
+    #: Show the spot already dealt if it hasn't been played (a reload), else the next.
+    resume: bool = False
 
 
 def create_trainer_router(
@@ -2968,8 +3165,44 @@ def create_trainer_router(
         with _locked(ts):
             if ts.hand is None:
                 raise HTTPException(status_code=400, detail="no hand to repeat")
-            frames = ts.new_hand(repeat=True)
+            if ts.hand.drill is not None:
+                frames = ts.repeat_drill()  # (the drill's Try again: practice)
+            else:
+                frames = ts.new_hand(repeat=True)
             return {"state": ts.project_state(), "frames": frames}
+
+    @router.post("/drill/next")
+    def trainer_drill_next(req: DrillRequest) -> dict[str, Any]:
+        """The mistakes drill's next spot (see `set_drill_hooks`): 409 `no_mistakes`
+        when there are none to deal."""
+        if _DRILL_NEXT is None:
+            raise HTTPException(status_code=404, detail="Not Found")
+        ts = _ts()
+        if req.resume:
+            with _locked(ts):
+                h = ts.hand
+                if h is not None and h.drill is not None and not h.drill_done:
+                    return {"state": ts.project_state(), "frames": []}
+        if ts.variant != VARIANT_PLO5:
+            raise HTTPException(status_code=409, detail="The mistakes drill is PLO5 — switch the format to PLO5 first.")
+        from plo5bp.ui.handreview import HandError
+
+        for _attempt in range(3):
+            spot = _DRILL_NEXT(bool(req.prioritize))  # (the store's database work: outside the lock)
+            if spot is None:
+                raise HTTPException(status_code=409, detail={
+                    "error": "no_mistakes",
+                    "message": "No mistakes to drill yet — upload hands in Hand review: the decisions "
+                               "the network grades a wrong move or a blunder come back here.",
+                })
+            with _locked(ts):
+                try:
+                    frames = ts.load_drill(spot)
+                except HandError:
+                    logger.warning("trainer drill: spot %s/%s can't be rebuilt", spot.get("key"), spot.get("i"))
+                    continue
+                return {"state": ts.project_state(), "frames": frames}
+        raise HTTPException(status_code=409, detail="Those spots can't be rebuilt right now — try again.")
 
     @router.post("/act")
     def trainer_act(req: TrainerActRequest) -> dict[str, Any]:

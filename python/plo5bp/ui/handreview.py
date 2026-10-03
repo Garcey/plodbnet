@@ -898,3 +898,156 @@ def build_upload(data: bytes, filename: str = "") -> UploadResult:
         hands=sorted(built.values(), key=lambda b: (b.parsed.ts, b.parsed.hand_id)),
         files=len(files), skipped=skipped, other_games=other, examples=examples,
     )
+
+
+# --- the network's choice at one decision (2026-10-03) -------------------------------------
+# One spot of any hand record (Hand review's or a home game's), rebuilt the way Study
+# rebuilds a spot: the acting player's own cards, the boards as they were, every action
+# before it. The other hands are placeholders the actor's observation never reads, so
+# the network sees exactly what it saw when the decision was graded. Shared by the
+# replayer's "the network's choice" and the Trainer's mistakes drill.
+
+
+def spot_env(rec: dict[str, Any], i: int, log: list[dict[str, int]] | None = None,
+             on_step: Any = None) -> tuple[Any, Any, Any, int]:
+    """``(env, obs, info, actor)`` at the decision of ``rec["actions"][i]``. Raises
+    ``HandError`` when the actor's cards aren't in the record (another player's
+    mucked hand) or the trained bet rule can't follow the line (a raise ClubGG allowed
+    after a short all-in). A raise is clamped into the engine's range — its excess
+    came back uncalled, the same bet (the grader and Open in Study do the same).
+    ``log`` collects the engine steps in the Trainer's action-log shape; ``on_step(env,
+    obs, info, entry, to_call)`` sees the table once before anyone acts (``entry`` None)
+    and after every action (the next street's cards already down) — the drill's replay."""
+    from plo5bp.actions import CHECK_CALL, FOLD
+    from plo5bp.env import BombPotEnv
+    from plo5bp.ui import homegame as hg
+    from plo5bp.ui.common import to_call_chips
+
+    acts = rec.get("actions") or []
+    if not 0 <= int(i) < len(acts):
+        raise HandError("no_decision", f"there is no action {i}")
+    if (rec.get("variant") or "plo5") != "plo5":
+        raise HandError("other_game", "the network plays PLO5")
+    actor = int(acts[i]["seat"])
+    seats = {int(s["seat"]): s for s in rec.get("seats") or []}
+    me = seats.get(actor) or {}
+    hole = [int(c) for c in (me.get("hole") or []) if c is not None and int(c) >= 0]
+    if len(hole) != 5:
+        raise HandError("hidden_cards", "that player's cards aren't in this hand's history")
+    n = int(rec.get("num_seats") or len(seats))
+    bb_cents = int(rec.get("bb_cents") or 2000)
+    bb_chips = int(rec.get("bb_chips") or hg.BB_CHIPS)
+
+    def start_chips(s: dict[str, Any]) -> int:
+        if s.get("start_chips") is not None:
+            return int(s["start_chips"])
+        return hg._div_half_up(int(s.get("start_cents") or 0) * bb_chips, bb_cents)
+
+    stacks = [start_chips(seats[k]) if k in seats else 0 for k in range(n)]
+    mask = [k in seats for k in range(n)]
+    ante = rec.get("ante_chips")
+    if ante is None:
+        ante = hg._div_half_up(int(rec.get("ante_cents") or 0) * bb_chips, bb_cents)
+    cfg = GameConfig(num_seats=n, starting_stack=0, starting_stacks=tuple(stacks), ante=int(ante),
+                     bb=bb_chips, variant=VARIANT_PLO5)
+    env = BombPotEnv(cfg, ev_runout_samples=0)
+    ba = [int(c) for c in rec.get("board_a") or []]
+    bbd = [int(c) for c in rec.get("board_b") or []]
+    if len(ba) < 3 or len(bbd) < 3:
+        raise HandError("no_board", "the flops aren't in this hand's history")
+    obs, info = env.reset_study(int(rec["button"]), actor, hole, ba[:3], bbd[:3], mask)
+
+    def feed() -> None:
+        nonlocal obs, info
+        while True:
+            aw = env.awaiting_next_street()
+            if aw == 2 and len(ba) > 3 and len(bbd) > 3:
+                obs, info = env.set_turn(ba[3], bbd[3])
+            elif aw == 3 and len(ba) > 4 and len(bbd) > 4:
+                obs, info = env.set_river(ba[4], bbd[4])
+            else:
+                return
+
+    if on_step is not None:
+        on_step(env, obs, info, None, 0)
+    for k in range(int(i)):
+        feed()
+        a = acts[k]
+        if info is None or info.actor is None or int(info.actor) != int(a["seat"]):
+            raise HandError("replay_diverged", f"action {k + 1}")
+        kind = int(a.get("action", 1))
+        if kind == FOLD:
+            gate, chips = GATE_FOLD, 0
+        elif kind == CHECK_CALL:
+            gate, chips = GATE_CHECK_CALL, 0
+        else:
+            gate, chips = GATE_RAISE, int(a.get("chips") or 0)
+            lo, hi = int(info.min_raise_chips), int(info.max_raise_chips)
+            if hi > 0:
+                chips = max(lo, min(chips, hi))
+            elif not bool(info.legal_mask[ALL_IN]):
+                gate = GATE_CHECK_CALL  # (everyone else is all in: the raise is a call)
+        street = int(info.raw_obs["street"])
+        to_call = int(to_call_chips(info.raw_obs, int(a["seat"])))
+        try:
+            obs, _r, _d, info = env.step_hybrid(gate, chips)
+        except Exception as e:  # noqa: BLE001 — the trained rule refuses this line
+            raise HandError("replay_refused", f"action {k + 1}") from e
+        entry = {"seat": int(a["seat"]), "gate": int(gate), "chips": int(chips), "street": street}
+        if log is not None:
+            log.append(entry)
+        feed()
+        if on_step is not None:
+            on_step(env, obs, info, dict(entry), to_call)
+    feed()
+    if info is None or info.actor is None or int(info.actor) != actor:
+        raise HandError("replay_diverged", "the decision")
+    return env, obs, info, actor
+
+
+def network_choice(rec: dict[str, Any], i: int, model: Any) -> dict[str, Any]:
+    """What the network plays at ``rec["actions"][i]``: how often it folds / calls /
+    raises, its pick, and its most likely raise sizes (as raise-TO amounts, in cents)."""
+    from plo5bp.sizing import PLO_ANCHOR_SPEC
+    from plo5bp.ui import homegame as hg
+    from plo5bp.ui import trainer as tr
+
+    env, obs, info, actor = spot_env(rec, i)
+    device = next(model.parameters()).device
+    spec = getattr(model, "anchor_spec", PLO_ANCHOR_SPEC)
+    dist = tr.attach_unclamped_brackets(tr.compute_node_distribution(model, device, obs, info), info, spec)
+    raw = env.observation_dict()
+    bb_cents = int(rec.get("bb_cents") or 2000)
+    commit = int(raw["street_commit"][actor])
+    behind = int(raw["stacks"][actor])
+    to_call = int(tr._to_call_chips(raw, actor))
+    cents = lambda chips: hg.chips_to_cents(int(chips), bb_cents)  # noqa: E731
+
+    def size(chips: int) -> dict[str, Any]:
+        out: dict[str, Any] = {"to_cents": cents(commit + int(chips))}
+        if int(chips) >= behind:
+            out["all_in"] = True
+        return out
+
+    probs = [float(p) for p in dist["gate_probs"]]
+    sizes: list[dict[str, Any]] = []
+    a_probs, a_chips, a_legal = dist.get("anchor_probs"), dist.get("anchor_chips"), dist.get("anchor_legal")
+    if a_probs is not None and a_chips is not None and a_legal is not None:
+        legal = [k for k in range(len(a_probs)) if a_legal[k]]
+        tot = sum(float(a_probs[k]) for k in legal) or 1.0
+        merged: dict[int, float] = {}
+        for k in legal:  # (two anchors that clamp to the same chips are one size)
+            merged[int(a_chips[k])] = merged.get(int(a_chips[k]), 0.0) + float(a_probs[k]) / tot
+        for chips, p in sorted(merged.items(), key=lambda kv: -kv[1])[:3]:
+            sizes.append({**size(chips), "p": round(p, 4)})
+    rec_gate = int(dist["rec_gate"])
+    return {
+        "i": int(i), "seat": actor,
+        "probs": {"fold": round(probs[0], 4), "call": round(probs[1], 4), "raise": round(probs[2], 4)},
+        "legal": {"fold": bool(info.gate_mask[GATE_FOLD]), "call": bool(info.gate_mask[GATE_CHECK_CALL]),
+                  "raise": bool(info.gate_mask[GATE_RAISE])},
+        "to_call_cents": cents(to_call),
+        "pick": {"gate": ("fold", "call", "raise")[rec_gate],
+                 **(size(int(dist["rec_chips"])) if rec_gate == GATE_RAISE else {})},
+        "sizes": sizes if probs[GATE_RAISE] > 0 else [],
+    }

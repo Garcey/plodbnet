@@ -96,6 +96,17 @@ def test_wording_spot_checks():
         [_c(8, 0), _c(9, 0), _c(10, 0)],                         # 10c,Jc,Qc
     ) == "a straight flush, 9-K"
 
+    # the ace-high straight flush is a royal flush (owner, 2026-10-03 — it read
+    # "a straight flush, 10-A"); the wheel stays a straight flush
+    assert describe_made_hand(
+        [_c(9, 2), _c(8, 2), _c(9, 3), _c(8, 3), _c(7, 0)],     # Jh,10h,Js,10s,9c
+        [_c(12, 2), _c(11, 2), _c(10, 2)],                       # Ah,Kh,Qh
+    ) == "a royal flush"
+    assert describe_made_hand(
+        [_c(12, 1), _c(0, 1), _c(5, 0), _c(6, 0), _c(7, 3)],     # Ad,2d
+        [_c(1, 1), _c(2, 1), _c(3, 1)],                          # 3d,4d,5d
+    ) == "a straight flush, A-5"
+
 
 def test_too_few_cards_returns_none():
     assert describe_made_hand([_c(6, 0), _c(6, 1)], [_c(2, 0), _c(4, 1)]) is None

@@ -428,9 +428,14 @@ def test_hand_review_is_paid_even_while_the_site_is_free(server, pub):
     assert page.status_code == 200 and "text/html" in page.headers["content-type"]
 
 
-def test_signed_out_the_page_and_its_api_are_hidden(server):
+def test_signed_out_a_link_signs_you_in_and_the_api_stays_hidden(server):
     c = TestClient(server.app, raise_server_exceptions=False)
+    page = c.get("/games/review", headers={"Accept": "text/html"})
+    assert page.status_code == 200 and "Hand review" in page.text and "Sign in" in page.text
+    assert "/games/review" in page.text  # (sign-in comes straight back here)
+    assert c.get("/games/review", headers={"Accept": "application/json"}).status_code == 404
     assert c.get("/games/api/review/summary").status_code in (401, 404)
+    assert c.get("/games/static/games.review.js").status_code == 404
 
 
 def test_upload_numbers_list_and_record(server, pub, store):
@@ -511,3 +516,393 @@ def test_account_export_and_deletion_include_the_hand_histories(server, pub, sto
     assert len(exported["hand_review"]["hands"]) == 1
     store._account_anonymize(uid)
     assert pub.DB.one("SELECT COUNT(*) n FROM review_hands WHERE user_id=?", (uid,))["n"] == 0
+
+
+# --- the network's choice in the replayer, and the mistakes drill (2026-10-03) ------------------
+
+
+def _model():
+    from plo5bp.ui.server import current_site
+
+    return current_site().formats["plo5_double_bomb"]["model"]
+
+
+def _uid(pub, email):
+    return int(pub.DB.one("SELECT id FROM users WHERE email=?", (email,))["id"])
+
+
+def _hero_moves(rec):
+    hero = next(s["seat"] for s in rec["seats"] if s["is_me"])
+    return hero, [i for i, a in enumerate(rec["actions"]) if a["seat"] == hero and i < rec["study_upto"]]
+
+
+def test_a_spot_rebuilt_from_the_record_is_the_node_the_grader_scored(server, monkeypatch):
+    """The replayer's "network's choice" and the drill rebuild a decision from the hand
+    record (``spot_env``: Study's way, the other hands placeholders); the grader replayed
+    the dealt deck. The network must see the SAME observation in both, bit for bit."""
+    import numpy as np
+
+    from plo5bp.ui import homegame as hg
+    from plo5bp.ui import trainer as tr
+
+    model = _model()
+    seen: list = []
+    real = tr.compute_node_distribution
+
+    def spy(m, device, obs, info):
+        seen.append(np.array(obs, copy=True))
+        return real(m, device, obs, info)
+
+    monkeypatch.setattr(tr, "compute_node_distribution", spy)
+    checked = 0
+    for text in (FOLD_OUT, SIDE_POT, DEAD_MONEY, SHORT_ALLIN_RAISE):
+        b = hr.build_hand(hr.parse_hand(text))
+        seen.clear()
+        grades = hg.grade_hand(b.job, model)
+        assert len(grades) == len(seen) >= 1
+        for g, obs in zip(grades, seen):
+            log: list = []
+            _env, o2, info, actor = hr.spot_env(b.record, g["i"], log=log)
+            assert actor == g["seat"] and int(info.actor) == actor
+            assert np.array_equal(o2, obs), (text[:40], g)
+            assert [x["seat"] for x in log] == [a["seat"] for a in b.record["actions"][:g["i"]]]
+            checked += 1
+    assert checked >= 6
+
+
+def test_the_network_choice_at_your_decisions(server, pub, store, monkeypatch):
+    import torch
+
+    from plo5bp.ui import homegame as hg
+    from plo5bp.ui import trainer as tr
+
+    model = _model()
+    monkeypatch.setattr(hg, "_grading_model", lambda: model)
+    email = "chooser@example.com"
+    c = _login(server, email)
+    _comp(pub, email)
+    _upload(c, store, {"h.txt": "\n\n".join((FOLD_OUT, SIDE_POT, SHORT_ALLIN_RAISE))})
+    keys = {r["hand_id"]: r["key"] for r in c.get("/games/api/review/hands").json()["hands"]}
+
+    side = keys["ring_9000000002"]
+    rec = c.get(f"/games/api/review/hands/{side}").json()
+    hero, mine = _hero_moves(rec)
+    for i in mine:
+        r = c.get(f"/games/api/review/hands/{side}/choice", params={"i": i})
+        assert r.status_code == 200, r.text
+        ch = r.json()
+        assert ch["i"] == i and ch["seat"] == hero
+        assert abs(sum(ch["probs"].values()) - 1.0) < 1e-3
+        assert all(ch["legal"][g] or ch["probs"][g] < 1e-6 for g in ("fold", "call", "raise"))
+        # = the network's own forward at the rebuilt node
+        _env, obs, info, _a = hr.spot_env(rec, i)
+        d = tr.compute_node_distribution(model, torch.device("cpu"), obs, info)
+        assert ch["pick"]["gate"] == ("fold", "call", "raise")[d["rec_gate"]]
+        assert ch["probs"]["raise"] == round(d["gate_probs"][2], 4)
+        if ch["pick"]["gate"] == "raise":
+            assert ch["pick"]["to_cents"] > 0
+    # a showdown shows every hand: the network can be asked about the others' decisions too
+    other = next(i for i, a in enumerate(rec["actions"]) if a["seat"] != hero)
+    assert c.get(f"/games/api/review/hands/{side}/choice", params={"i": other}).status_code == 200
+
+    fold_out = keys["ring_9000000001"]
+    r = c.get(f"/games/api/review/hands/{fold_out}/choice", params={"i": 1})  # (a villain's bet, never shown)
+    assert r.status_code == 400 and "weren't shown" in r.json()["detail"]
+    assert c.get(f"/games/api/review/hands/{fold_out}/choice", params={"i": 99}).status_code == 400
+    # past where the network's rules follow ClubGG (the raise after a short all-in)
+    short = keys["ring_9000000004"]
+    r = c.get(f"/games/api/review/hands/{short}/choice", params={"i": 4})
+    assert r.status_code == 400 and "short all-in" in r.json()["detail"]
+    # nobody else's hands, no subscription, no network
+    other_user = _login(server, "nosub@example.com")
+    assert other_user.get(f"/games/api/review/hands/{side}/choice", params={"i": mine[0]}).status_code == 402
+    monkeypatch.setattr(hg, "_grading_model", lambda: None)
+    assert c.get(f"/games/api/review/hands/{side}/choice", params={"i": mine[0]}).status_code == 503
+
+
+def test_drill_rounds_put_the_worst_first_most_often_and_fixed_spots_less_often():
+    import random
+
+    from plo5bp.ui import handreview_store as st
+
+    spots = [{"key": "k:1", "i": 0, "score": 0.0, "weight": 1.0},
+             {"key": "k:2", "i": 0, "score": 12.0, "weight": 1.0},
+             {"key": "k:3", "i": 0, "score": 28.0, "weight": 1.0}]
+    rng = random.Random(7)
+    first: dict = {}
+    orders = set()
+    for _ in range(6000):
+        o = st.drill_order(spots, True, rng)
+        assert sorted(o) == [("k:1", 0), ("k:2", 0), ("k:3", 0)]  # (every unfixed spot, every round)
+        first[o[0][0]] = first.get(o[0][0], 0) + 1
+        orders.add(tuple(k for k, _ in o))
+    assert first["k:1"] > first["k:2"] > first["k:3"] > 0  # (the worst most likely first, ...
+    assert first["k:1"] < 5400  # ... but not always)
+    assert {("k:1", "k:2", "k:3"), ("k:2", "k:1", "k:3"), ("k:1", "k:3", "k:2")} <= orders
+    # equal priority: every spot equally likely first
+    first = {}
+    for _ in range(6000):
+        o = st.drill_order(spots, False, rng)
+        first[o[0][0]] = first.get(o[0][0], 0) + 1
+    assert all(1800 < v < 2200 for v in first.values())
+    # a fixed spot (weight 1/8) sits most rounds out; a struggling one is in every round
+    fixed = [dict(spots[0], weight=0.125), dict(spots[1], weight=4.0)]
+    shown = sum(("k:1", 0) in st.drill_order(fixed, True, rng) for _ in range(4000))
+    assert 350 < shown < 650
+    # never the same spot twice in a row across rounds
+    for _ in range(200):
+        assert st.drill_order(spots, True, rng, last=("k:1", 0))[0] != ("k:1", 0)
+
+
+def _graded_mistakes(pub, store, c, email, scores):
+    """Upload three hands and mark one hero decision of each a mistake (synthetic marks)."""
+    _upload(c, store, {"h.txt": "\n\n".join((FOLD_OUT, SIDE_POT, DEAD_MONEY))})
+    uid = _uid(pub, email)
+    marked = {}
+    rows = pub.DB.q("SELECT hand_key FROM review_hands WHERE user_id=? ORDER BY hand_key", (uid,))
+    for row, score in zip(rows, scores):
+        key = row["hand_key"]
+        rec = c.get(f"/games/api/review/hands/{key}").json()
+        hero, mine = _hero_moves(rec)
+        i = mine[-1]
+        store.store_grades(uid, key, [{"i": i, "seat": hero, "score": score,
+                                       "cat": "blunder" if score < 10 else "wrong"}])
+        marked[key] = (i, rec)
+    return uid, marked
+
+
+def _play(c, ts, move):
+    """Act in the drill spot: the network's own choice ("best") or its least likely legal gate."""
+    h = ts.hand
+    d = ts._node_dist(h.last_obs, h.last_info)
+    if move == "best":
+        gate = d["rec_gate"]
+    else:
+        legal = [g for g in range(3) if h.last_info.gate_mask[g]]
+        gate = min(legal, key=lambda g: d["gate_probs"][g])
+    body = {"gate": ("fold", "check_call", "raise")[gate]}
+    if gate == 2:
+        body["chips"] = int(d["rec_chips"]) if move == "best" else int(h.last_info.min_raise_chips)
+    return c.post("/trainer/act", json=body)
+
+
+def test_the_mistakes_drill_deals_your_spots_and_learns_from_each_attempt(server, pub, store):
+    email = "driller@example.com"
+    c = _login(server, email)
+    _comp(pub, email)
+    uid, marked = _graded_mistakes(pub, store, c, email, [4.0, 18.0, 27.0])
+    s = c.get("/games/api/review/summary").json()
+    assert s["drill"] == {"mistakes": 3, "fixed": 0, "struggling": 0, "attempts": 0}
+
+    r = c.post("/trainer/drill/next", json={"prioritize": True})
+    assert r.status_code == 200, r.text
+    ts = pub._REGISTRY.peek(uid).trainer
+    st = r.json()["state"]
+    d = st["trainer"]["drill"]
+    key, i = d["key"], d["i"]
+    assert (key in marked) and marked[key][0] == i and d["done"] is False and "orig" not in d
+    assert d["pos"] == 1 and d["size"] == 3 and st["trainer"]["hand_active"] is True
+    rec = marked[key][1]
+    me = next(x for x in rec["seats"] if x["is_me"])
+    assert st["actor"] == st["hero_seat"] == rec["actions"][i]["seat"]
+    assert sorted(st["card_spec"]["hero_hole"], reverse=True) == me["hole"]
+    assert st["card_spec"]["flop_a"] == rec["board_a"][:3] and st["card_spec"]["flop_b"] == rec["board_b"][:3]
+
+    # the network's own play: fixed, and the spot comes up less often
+    r = _play(c, ts, "best")
+    assert r.status_code == 200, r.text
+    st = r.json()["state"]
+    d = st["trainer"]["drill"]
+    assert st["trainer"]["hand_active"] is False and d["done"] is True and st["actor"] is None
+    assert d["result"]["outcome"] == "fixed" and d["result"]["weight"] == 0.5
+    assert d["orig"]["cat"] in ("wrong", "blunder") and d["orig"]["gate"] in ("fold", "check_call", "raise")
+    assert abs(sum(d["probs"].values()) - 1.0) < 1e-3
+    assert st["trainer"]["feedback"]["category"] == "best"
+    assert _play(c, ts, "best").status_code == 400  # (the spot is over)
+    # (a drill spot has no dealt hand to review or what-if: it never ends)
+    assert c.get("/trainer/review").status_code == 400
+    assert c.post("/trainer/whatif", json={"decision": 0}).status_code == 409
+    row = pub.DB.one("SELECT weight, fixed, missed FROM review_mistakes WHERE user_id=? AND hand_key=? AND idx=?",
+                     (uid, key, i))
+    assert (row["weight"], row["fixed"], row["missed"]) == (0.5, 1, 0)
+
+    # Try again = practice: graded, never counted
+    r = c.post("/trainer/repeat")
+    d = r.json()["state"]["trainer"]["drill"]
+    assert (d["key"], d["i"], d["practice"], d["done"]) == (key, i, True, False)
+    st = _play(c, ts, "worst").json()["state"]
+    assert st["trainer"]["drill"]["done"] is True and st["trainer"]["drill"]["result"] is None
+    row2 = pub.DB.one("SELECT weight, fixed, missed FROM review_mistakes WHERE user_id=? AND hand_key=? AND idx=?",
+                      (uid, key, i))
+    assert dict(row2) == dict(row)
+
+    # the round's next spot: another one; the least likely move learns the other way
+    st = c.post("/trainer/drill/next", json={"prioritize": True}).json()["state"]
+    d2 = st["trainer"]["drill"]
+    assert (d2["key"], d2["i"]) != (key, i) and d2["pos"] == 2
+    st = _play(c, ts, "worst").json()["state"]
+    cat = st["trainer"]["feedback"]["category"]
+    res = st["trainer"]["drill"]["result"]
+    want = {"best": "fixed", "correct": "fixed", "wrong": "missed", "blunder": "missed"}.get(cat, "close")
+    assert res["outcome"] == want
+    assert res["weight"] == {"fixed": 0.5, "missed": 1.5, "close": 1.0}[want]
+
+    # the drill never touches the Trainer's own numbers
+    assert ts.session_stats.hands == 0 and ts.lifetime_stats.moves == 0 and ts.recent_hands == []
+    s = c.get("/games/api/review/summary").json()["drill"]
+    assert s["mistakes"] == 3 and s["attempts"] == 2 and s["fixed"] >= 1
+
+    # equal priority: a new round, every spot in it
+    seen = set()
+    for _ in range(3):
+        st = c.post("/trainer/drill/next", json={"prioritize": False}).json()["state"]
+        d = st["trainer"]["drill"]
+        assert d["prioritize"] is False and d["size"] == 3
+        seen.add((d["key"], d["i"]))
+    assert len(seen) == 3
+    # a reload shows the spot dealt (not played yet) instead of skipping it
+    again = c.post("/trainer/drill/next", json={"prioritize": False, "resume": True}).json()["state"]
+    assert (again["trainer"]["drill"]["key"], again["trainer"]["drill"]["i"]) == (d["key"], d["i"])
+    # a dealt hand leaves the drill
+    st = c.post("/trainer/new_hand").json()["state"]
+    assert st["trainer"]["drill"] is None
+
+
+def test_a_missed_spot_comes_back_later_in_the_same_round(server, pub, store):
+    import random
+
+    email = "misser@example.com"
+    c = _login(server, email)
+    _comp(pub, email)
+    uid, _marked = _graded_mistakes(pub, store, c, email, [3.0, 9.0, 20.0])
+    first = store.drill_next(uid, True, rng=random.Random(3))
+    res = store.drill_result(uid, first["key"], first["i"], "blunder")
+    assert res["outcome"] == "missed" and res["weight"] == 1.5 and res["again"] is True
+    rest = [store.drill_next(uid, True, rng=random.Random(3)) for _ in range(3)]
+    assert [x["pos"] for x in rest] == [2, 3, 4] and rest[-1]["size"] == 4
+    assert (first["key"], first["i"]) in {(x["key"], x["i"]) for x in rest[1:]}  # (not straight after)
+    assert (rest[0]["key"], rest[0]["i"]) != (first["key"], first["i"])
+    # missed again: x1.5 up to 4; fixed: halves down to 1/8; close: no change
+    for want in (2.25, 3.375, 4.0, 4.0):
+        assert store.drill_result(uid, first["key"], first["i"], "wrong")["weight"] == want
+    for want in (2.0, 1.0, 0.5, 0.25, 0.125, 0.125):
+        assert store.drill_result(uid, first["key"], first["i"], "best")["weight"] == want
+    assert store.drill_result(uid, first["key"], first["i"], "inaccuracy")["weight"] == 0.125
+
+
+def test_mistakes_follow_the_grades_and_leave_with_the_hands(server, pub, store):
+    email = "mover@example.com"
+    c = _login(server, email)
+    _comp(pub, email)
+    uid, marked = _graded_mistakes(pub, store, c, email, [5.0, 15.0, 25.0])
+    key = sorted(marked)[0]
+    i, rec = marked[key]
+    store.drill_result(uid, key, i, "best")
+    # graded again (a new model): a decision that is still a mistake keeps what it
+    # learned, one that no longer is leaves the drill
+    seat = rec["actions"][i]["seat"]
+    store.store_grades(uid, key, [{"i": i, "seat": seat, "score": 2.0, "cat": "blunder"}])
+    row = pub.DB.one("SELECT score, weight FROM review_mistakes WHERE user_id=? AND hand_key=?", (uid, key))
+    assert (row["score"], row["weight"]) == (2.0, 0.5)
+    store.store_grades(uid, key, [{"i": i, "seat": seat, "score": 71.0, "cat": "correct"}])
+    assert pub.DB.one("SELECT COUNT(*) n FROM review_mistakes WHERE user_id=? AND hand_key=?", (uid, key))["n"] == 0
+    # the migration's backfill finds the mistakes of hands graded before the drill existed
+    pub.DB.q("DELETE FROM review_mistakes WHERE user_id=?", (uid,))
+    with pub.DB.transaction():
+        store._backfill_mistakes(pub.DB._conn)
+    assert pub.DB.one("SELECT COUNT(*) n FROM review_mistakes WHERE user_id=?", (uid,))["n"] == 2
+    # deleting the hands deletes the drill; the Trainer then has nothing to deal
+    assert c.post("/games/api/review/delete", json={"confirm": True}).status_code == 200
+    r = c.post("/trainer/drill/next", json={"prioritize": True})
+    assert r.status_code == 409 and r.json()["detail"]["error"] == "no_mistakes"
+    # and without a subscription there is no drill
+    assert _login(server, "nodrill@example.com").post("/trainer/drill/next", json={}).status_code == 402
+
+
+def test_the_next_spot_comes_from_another_hand():
+    """(owner, 2026-10-03: "the next hand button brings you to the next mistake you made in
+    a different hand") — a hand with several mistakes never deals two of them in a row
+    while another hand can go between, in either mode, across rounds too."""
+    import random
+
+    from plo5bp.ui import handreview_store as st
+
+    # (three mistakes in one hand, one in each of three others: always possible to keep
+    # them apart, even right after a round that ended on that hand)
+    spots = [{"key": "h:1", "i": 1, "score": 0.0, "weight": 1.0},
+             {"key": "h:1", "i": 4, "score": 2.0, "weight": 1.0},
+             {"key": "h:1", "i": 6, "score": 5.0, "weight": 1.0},
+             {"key": "h:2", "i": 0, "score": 25.0, "weight": 1.0},
+             {"key": "h:3", "i": 2, "score": 20.0, "weight": 1.0},
+             {"key": "h:4", "i": 3, "score": 29.0, "weight": 1.0}]
+    rng = random.Random(11)
+    for prioritize in (True, False):
+        last = None
+        for _ in range(500):
+            o = st.drill_order(spots, prioritize, rng, last=last)
+            keys = ([last[0]] if last else []) + [k for k, _i in o]
+            assert all(a != b for a, b in zip(keys, keys[1:])), keys
+            last = o[-1]
+    # one hand only: nothing to put between them, every spot still dealt
+    only = [s for s in spots if s["key"] == "h:1"]
+    assert sorted(st.drill_order(only, True, rng)) == [("h:1", 1), ("h:1", 4), ("h:1", 6)]
+
+
+def test_a_drill_spot_replays_the_hand_to_the_decision_and_ends_there(server, pub, store):
+    """(owner, 2026-10-03) "replay all the actions up until your decision node … you make
+    your decision, get graded, and the hand should end right there. Since opponent hands
+    are unknown, the network cannot play them." A TURN mistake: the flop's actions and the
+    turn's before it are replayed — the real ones, one frame each — the river never comes,
+    nobody else acts, the other hands stay face down."""
+    email = "replayer@example.com"
+    c = _login(server, email)
+    _comp(pub, email)
+    _upload(c, store, {"h.txt": DEAD_MONEY})
+    uid = _uid(pub, email)
+    key = pub.DB.one("SELECT hand_key FROM review_hands WHERE user_id=?", (uid,))["hand_key"]
+    rec = c.get(f"/games/api/review/hands/{key}").json()
+    hero, mine = _hero_moves(rec)
+    i = mine[-1]
+    assert rec["actions"][i]["street"] == "turn" and i == 5  # (the hero's turn bet)
+    store.store_grades(uid, key, [{"i": i, "seat": hero, "score": 3.0, "cat": "blunder"}])
+    ts_tr = sys.modules["plo5bp.ui.trainer"]
+
+    r = c.post("/trainer/drill/next", json={"prioritize": True})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    frames, st = body["frames"], body["state"]
+    # the replay: the flop before anyone acts, then one frame per action before the decision
+    assert len(frames) == 1 + i and all(f["trainer"]["drill_replay"] for f in frames)
+    assert "anim_action" not in frames[0]["trainer"]
+    for k, f in enumerate(frames[1:]):
+        a, want = f["trainer"]["anim_action"], rec["actions"][k]
+        assert a["seat"] == want["seat"] and a["is_hero"] == (want["seat"] == hero)
+        assert a["gate"] == {0: "fold", 1: "check_call"}.get(want["action"], "raise")
+        assert len(f["history"]) == k + 1
+    assert [len(x) for x in (frames[0]["card_spec"]["turn"],)] == [2] and frames[0]["card_spec"]["turn"] == [None, None]
+    assert frames[4]["card_spec"]["turn"] == [rec["board_a"][3], rec["board_b"][3]]  # (with the flop's last call)
+    # the decision: every earlier action in the history, the turn down, no river, the hero to act
+    assert len(st["history"]) == i and "drill_replay" not in st["trainer"]
+    assert [h["seat"] for h in st["history"]] == [a["seat"] for a in rec["actions"][:i]]
+    assert st["card_spec"]["turn"] == [rec["board_a"][3], rec["board_b"][3]]
+    assert st["card_spec"]["river"] == [None, None]
+    assert st["actor"] == st["hero_seat"] == hero and st["trainer"]["hand_active"] is True
+    hidden = [s for k, s in enumerate(st["seats"]) if k != hero]
+    assert hidden and all(not s.get("hole") for s in hidden)
+
+    # the decision, graded — and the hand ends right there: nobody acts, no river
+    ts = pub._REGISTRY.peek(uid).trainer
+    r = _play(c, ts, "best")
+    assert r.status_code == 200, r.text
+    after = r.json()
+    st2 = after["state"]
+    assert len(after["frames"]) == 1  # (no opponent moves)
+    assert st2["trainer"]["drill"]["done"] is True and st2["trainer"]["hand_active"] is False
+    assert st2["trainer"]["feedback"]["category"] in ts_tr.CATEGORIES
+    assert len(st2["history"]) == i and st2["card_spec"]["river"] == [None, None]
+    assert st2["actor"] is None and all(not s.get("hole") for k, s in enumerate(st2["seats"]) if k != hero)
+    assert ts.hand.env.observation_dict()["street"] == 2  # (the engine never left the turn)
+    # Try again goes straight to the decision (no replay)
+    again = c.post("/trainer/repeat").json()
+    assert len(again["frames"]) == 1 and again["state"]["trainer"]["drill"]["practice"] is True
+    assert len(again["state"]["history"]) == i

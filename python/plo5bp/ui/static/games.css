@@ -792,6 +792,24 @@ body.in-lobby.has-joinreq #toast-root { top: 64px; }
 .rp-list .log-row { width: 100%; border: 0; background: transparent; color: inherit; text-align: left; padding: 5px 8px; border-radius: 8px; cursor: pointer; }
 .rp-list .log-row:hover { background: rgba(255, 255, 255, 0.05); }
 .rp-list .log-row.on { background: rgba(24, 210, 195, 0.12); box-shadow: inset 2px 0 0 var(--accent); }
+/* the network's choice at the decision just played (2026-10-03): its pick, its fold / call /
+   raise mix (each segment's width = --w, set by games.history.js), its likeliest sizes, and
+   the move that was made */
+.rp-net { padding: 10px 12px 9px; border-radius: 12px; background: rgba(24, 210, 195, 0.05); border: 1px solid rgba(24, 210, 195, 0.24); }
+.rp-net h4 { margin-bottom: 6px; }
+.nc-pick { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.nc-pick small, .nc-sizes small { color: var(--tx-3); font-size: 10.5px; letter-spacing: 0.9px; text-transform: uppercase; }
+.nc-pick b { color: var(--bright); font-size: 15px; }
+.nc-bar { display: flex; height: 8px; margin: 8px 0 6px; border-radius: 99px; overflow: hidden; background: rgba(255, 255, 255, 0.06); }
+.nc-seg { width: var(--w); flex: none; }
+.nc-seg.nc-f { background: #6f7b8e; } .nc-seg.nc-c { background: #5b95ff; } .nc-seg.nc-r { background: var(--gold); }
+.nc-legend, .nc-sizes { display: flex; flex-wrap: wrap; align-items: baseline; gap: 3px 12px; font-size: 12px; color: var(--tx-2); }
+.nc-legend b, .nc-sizes b { color: var(--bright); font-family: var(--mono); font-weight: 700; }
+.nc-legend span::before { content: ""; display: inline-block; width: 8px; height: 8px; margin-right: 5px; border-radius: 2px; vertical-align: 0; }
+.nc-legend .nc-f::before { background: #6f7b8e; } .nc-legend .nc-c::before { background: #5b95ff; } .nc-legend .nc-r::before { background: var(--gold); }
+.nc-sizes { margin-top: 6px; }
+.nc-you { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; padding-top: 7px; border-top: 1px solid var(--line); font-size: 12.5px; color: var(--tx-2); }
+.nc-you b { color: var(--bright); }
 .grade { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px; border-radius: 99px; font-weight: 800; font-size: 12.5px; letter-spacing: 0.5px; border: 1px solid transparent; white-space: nowrap; }
 .grade em { font-style: normal; font-weight: 600; letter-spacing: 0; }
 .grade b { font-family: var(--mono); font-weight: 700; opacity: 0.85; }
@@ -879,6 +897,13 @@ body.in-lobby.has-joinreq #toast-root { top: 64px; }
 .rv-feats li .ico { color: var(--gold); flex: none; margin-top: 2px; }
 .rv-feats b { color: var(--bright); }
 .rv-pay-cta { display: flex; flex-direction: column; justify-content: center; gap: 10px; }
+/* the mistakes drill's way in (to the Trainer) */
+.rv-drill { display: flex; align-items: center; gap: 14px; margin-top: 12px; padding: 14px 16px; border-radius: 14px; background: linear-gradient(90deg, rgba(236, 201, 119, 0.1), rgba(236, 201, 119, 0.03)); border: 1px solid rgba(236, 201, 119, 0.32); }
+.rv-drill-ico { display: inline-flex; align-items: center; justify-content: center; width: 42px; height: 42px; border-radius: 12px; background: rgba(236, 201, 119, 0.14); color: var(--gold); flex: none; }
+.rv-drill-txt { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1 1 auto; }
+.rv-drill-txt b { color: var(--bright); font-size: 15px; }
+.rv-drill-txt small { color: var(--tx-2); font-size: 12.5px; }
+.rv-drill .btn { flex: none; }
 @media (max-width: 760px) {
   .rp { grid-template-columns: minmax(0, 1fr); }
   .rv-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -893,6 +918,10 @@ body.in-lobby.has-joinreq #toast-root { top: 64px; }
   .rv-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .rv-drop { padding: 14px; gap: 10px; }
   .rv-drop-ico { width: 38px; height: 38px; }
+  .rv-drill { flex-wrap: wrap; padding: 12px 14px; gap: 10px; }
+  .rv-drill-ico { width: 38px; height: 38px; }
+  .rv-drill-txt { flex-basis: calc(100% - 52px); }
+  .rv-drill .btn { width: 100%; justify-content: center; }
   /* a row's cards (yours + both boards) take the whole width; the result and the grade under them */
   .rv-row { grid-template-columns: minmax(0, 1fr) auto; }
   .rv-row .hr-cards { grid-column: 1 / -1; }

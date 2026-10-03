@@ -246,7 +246,9 @@ before) and `/me` carries `paid` (`public._paid`: admin / comp / live subscripti
 
 **Workspace UI (2026-09-22; the home games' table since 2026-10-01):** Study / Trainer
 sit next to the home games but stay a TOOL. Layout: slim `#top-bar` (mode tabs, format,
-units, account) + per-mode `#workbar` above the table (Study: players / your seat / ante
+units, account) — on a phone (<= 480 px) the mode tabs scroll inside their own strip and
+Home games / Hand review show short names (2026-10-03: the two links pushed the account chip
+off a 375 px screen) + per-mode `#workbar` above the table (Study: players / your seat / ante
 / live controls / Enter cards / Share / New hand; Trainer: Settings / Repeat / New hand)
 + the table + `#side-rail` (desktop: the Trainer's review on top, Recommendation, then the
 13 x 4 card matrix (Study) or History + stats (Trainer); a phone stacks them under the
@@ -272,6 +274,14 @@ suit top-left, big rank bottom-right, ten = "T").
   Bet tap opens it), Fold / Check-Call / Bet-Raise (`.rec` + "Network" badge = the
   network's choice on Hero's turn in Study), the status strip (hand over — the Trainer's
   "Next hand" — cards missing, opponents acting), Undo / Redo (Study).
+- **Board focus (2026-10-03; owner: "hover over each board and have it highlight the two hole
+  cards that I'm playing on that board", all three tabs)**: hovering a board — or its made-hand
+  label under your cards (a phone: tap the label, 3.5 s) — lights the two hole cards you play
+  there and its three board cards (`.card.plays`), the rest of the felt's cards dim
+  (`#stage.board-focus`); `games.table.js` `bestPlay` / `applyBoardFocus` (re-applied after
+  every render). PLO picks exactly what `hand_describe.best_combo` picks (pinned by
+  `test_homegame_board_focus_js.py`); one board (NLH): the best five of seven, fewest hole cards.
+  The ace-high straight flush reads "a royal flush" (felt short form "Royal flush").
 - **The table never changes size with the turn (owner, 2026-10-02: "the addition and
   removal of the betting options slightly resizes the whole table")** — on all three
   pages. The felt gets what `#stage-wrap` leaves after the dock, so every part of the
@@ -559,6 +569,45 @@ against the network so that you can easily find your worst played hands"):
   model — a placeholder never grades; `PLO5BP_REVIEW_GRADING`, off in the tests). ~35 ms a
   hand to read (the exact equities), grading ~2 s for 350 hands. "Download my data" lists
   the hands; "Delete my account" deletes them (`ACCOUNT_HOOKS["hand_review"]`).
+- **The network's choice in the replayer** (2026-10-03; owner: "click on the decision node and
+  see the network's choice in the hand history without having to put it in the study mode"):
+  `openHand` asks `GET …/choice?i=` about the decision just played — Hand review's
+  `/games/api/review/hands/{key}/choice` (paid) or a home game's
+  `/games/api/tables/{gid}/hands/{no}/choice` (club members with Study's access,
+  `public._entitled`) — once per decision, and draws it in the side panel (`#rp-net`: the
+  pick, the fold / call / raise mix, the three likeliest sizes, the move that was made).
+  `handreview.spot_env` rebuilds the spot Study's way from the record (the actor's cards, the
+  boards, every action before it, raises clamped like the grader) — only where the viewer may
+  see the actor's cards (else 400) — and `network_choice` runs the served PLO5 model
+  (`hg._grading_model()`; 503 without one). The observation is the grader's, bit for bit
+  (`test_a_spot_rebuilt_from_the_record_is_the_node_the_grader_scored`).
+- **The mistakes drill** (2026-10-03; owner: the Trainer puts you back in the spots you got
+  wrong, the biggest blunders most likely first but in a semi-random order, a spot you play
+  right comes up less, one you miss again more — and a switch for equal priority):
+  `review_mistakes` (migration 2, backfilled from the stored grades; `store_grades` keeps it
+  in step and a regrade keeps a spot's learning state while it is still a mistake) = one row
+  per decision graded wrong / blunder, `weight` = its learning multiplier. Hand review's
+  "Start the drill" = `/?mode=trainer&drill=1` → `POST /trainer/drill/next {prioritize,
+  resume}` → the store's `drill_next` (the round, in memory: `CTX.drill`) →
+  `TrainerSession.load_drill` (the spot via `spot_env`; the other hands are placeholders,
+  never shown). Worst first: weight = severity (score 0 → 1, the top of "wrong" → 0.25) x
+  multiplier; a round = a weighted shuffle (Efraimidis-Spirakis); a spot under 1 sits a round
+  out with probability 1 − multiplier; best / correct halves it (down to 1/8), wrong /
+  blunder → max(m, 1) x 1.5 (up to 4) and the spot comes back later in the same round,
+  inaccuracy changes nothing. Equal priority: every spot every round, uniformly shuffled.
+  Either way the next spot is from ANOTHER hand whenever one is left (`_spread`). A spot
+  replays the hand's real actions up to the decision (owner: "replay all the actions up until
+  your decision node"): one frame per action, narrated like the Trainer's opponents (yours
+  too: "You check"), `drill_replay` on each, <= 700 ms apart (`DRILL_REPLAY_MS`). Then it is
+  ONE decision: graded like any Trainer move, then over (`drill_done`) — the engine stays
+  there, no EV estimate, no opponents ("opponent hands are unknown, the network cannot play
+  them"), no review / what-if, nothing in the Trainer's stats or recent hands (all of those
+  replay a deal that doesn't exist); `resume()` never moves it. Try again (`/trainer/repeat`)
+  = practice, straight to the decision, never recorded. Client (`app.trainer.js`): `body.drill-mode`
+  shows the drill bar in the work bar (Worst first, remembered per browser; Exit drill), New
+  hand → "Next spot", Repeat → "Try again"; the dock's line (`drillNoteHTML`: how it went, the
+  network's play and how often it makes it, what you did in the hand — a compact dock keeps
+  two lines beside one button) and the Recommendation panel = the spot's node view.
 
 Premium tables pass (2026-09-21 — `tests/python/homegame/test_homegame_premium.py`):
 

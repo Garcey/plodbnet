@@ -21,6 +21,7 @@ function renderTrainer(s) {
   renderFeedbackFlash(s);
   renderTrainerStats(s);
   renderReviewPanel(s);
+  renderDrill(s);
 }
 
 function cancelTrainerPick() {
@@ -700,36 +701,196 @@ function onTrainerKey(e) {
   }
 }
 
+// A deal (new hand, repeat). One in-flight guard for all of them: the public build's
+// free-tier middleware counts every POST /trainer/new_hand, so an unguarded
+// double-click burns 2 of 5 daily hands while showing one. `postTrainer` never
+// rejects (its own try/catch), so clearing in `.finally` is always reached.
+function dealTrainer(path) {
+  if (UI.actionInFlight) return Promise.resolve(false);
+  cancelTrainerPick();
+  UI.reviewNode = null;
+  UI.selectedSlot = null;
+  UI.actionInFlight = true;
+  setActionsBusy(true);
+  startWorking("Dealing…");
+  return postTrainer(path).finally(() => {
+    stopWorking();
+    UI.actionInFlight = false;
+    setActionsBusy(false);
+  });
+}
+
+// --- The mistakes drill (Hand review, 2026-10-03) ------------------------------------
+// `/?mode=trainer&drill=1` (Hand review's "Start the drill"): the Trainer deals your own
+// mistakes back — the exact spots of your uploaded hands the network graded a wrong move
+// or a blunder — one decision at a time (POST /trainer/drill/next). Worst first (the
+// default, remembered here): the worst come up most often, a spot you fix comes up less
+// and one you miss again more; off, every spot equally often. Next spot / Try again
+// (practice: it changes nothing) / Exit drill. The server keeps the round and each
+// spot's priority (handreview_store); a spot ends with your decision.
+const DRILL_PRIO_KEY = "plo5bp-drill-prio";
+// A spot replays every action of the hand before it: at most this pause between them.
+const DRILL_REPLAY_MS = 700;
+UI.drill = null;         // {prioritize} while drilling
+UI.drillOffAt = 0;       // the hand number the drill was left at (an older state can't re-enter it)
+
+function drillRequested() {
+  try { return new URLSearchParams(location.search).get("drill") === "1"; } catch (_) { return false; }
+}
+function drillPrioritize() { return lsGet(DRILL_PRIO_KEY) !== "off"; }
+function syncDrillUrl(on) {
+  try {
+    const url = new URL(location.href);
+    if ((url.searchParams.get("drill") === "1") === on) return;
+    if (on) url.searchParams.set("drill", "1"); else url.searchParams.delete("drill");
+    history.replaceState(history.state, "", url.pathname + url.search + url.hash);
+  } catch (_) { /* old browser: the drill still works */ }
+}
+
+async function startDrill() {
+  UI.drill = { prioritize: drillPrioritize() };
+  syncDrillUrl(true);
+  renderDrill(UI.lastState);
+  return dealDrill(true);
+}
+
+// The next spot (`resume`: the one dealt before, if it wasn't played — a reload).
+async function dealDrill(resume) {
+  const body = { prioritize: UI.drill ? UI.drill.prioritize : true, resume: !!resume };
+  if (UI.actionInFlight) return false;
+  cancelTrainerPick();
+  UI.reviewNode = null;
+  UI.selectedSlot = null;
+  UI.actionInFlight = true;
+  setActionsBusy(true);
+  startWorking("Finding your next mistake…");
+  try {
+    let data;
+    try {
+      data = await postJSON("/trainer/drill/next", body);
+    } catch (e) {
+      if (!(e && e.status === 409 && /PLO5/.test(e.message))) throw e;
+      // the drill deals PLO5 spots: switch the format (both tabs follow one game), again
+      await postJSON("/study/format", { format: "plo5_double_bomb" });
+      const sel = document.getElementById("format-select");
+      if (sel) sel.value = "plo5_double_bomb";
+      data = await postJSON("/trainer/drill/next", body);
+    }
+    await animateTrainerResponse(data, { ms: Math.min(trainerPrefs.animMs, DRILL_REPLAY_MS), hold: true });
+    return true;
+  } catch (e) {
+    if (e && e.message === GATE_HANDLED) return false;
+    if (e && e.status === 409 && /No mistakes/i.test(e.message)) {
+      exitDrill(false);
+      showToast(e.message, "info");
+      if (!UI.lastState) fetchState();
+      return false;
+    }
+    if (!UI.lastState) showLoadError(e.message);
+    else showToast(e.message);
+    return false;
+  } finally {
+    stopWorking();
+    UI.actionInFlight = false;
+    setActionsBusy(false);
+  }
+}
+
+function exitDrill(deal) {
+  UI.drillOffAt = (UI.lastState && UI.lastState.trainer && UI.lastState.trainer.hand_no) || 0;
+  UI.drill = null;
+  syncDrillUrl(false);
+  renderDrill(UI.lastState);
+  if (deal) dealTrainer("new_hand");
+}
+
+// The drill bar (in the workbar) and the deal buttons' words. A state holding a drill
+// spot puts the page in the drill (a reload without ?drill=1, the Study tab and back).
+function renderDrill(s) {
+  const d = s && s.trainer ? s.trainer.drill : null;
+  if (d && !UI.drill && s.trainer.hand_no > UI.drillOffAt) {
+    UI.drill = { prioritize: d.prioritize !== false };
+    syncDrillUrl(true);
+  }
+  const on = !!UI.drill && UI.mode === "trainer";
+  document.body.classList.toggle("drill-mode", on);
+  const nb = document.getElementById("trainer-new-hand-btn");
+  const rb = document.getElementById("trainer-repeat-btn");
+  if (nb) {
+    nb.textContent = on ? "Next spot" : "New hand";
+    nb.title = on ? "Deal the next of your mistakes (N)" : "Deal a new hand (N)";
+  }
+  if (rb) {
+    rb.textContent = on ? "Try again" : "Repeat";
+    rb.title = on ? "Play this spot again — practice: it doesn't change how often the spot comes up"
+      : "Deal the same hand again (not counted in your stats)";
+  }
+  const prio = document.getElementById("drill-prioritize");
+  if (prio) prio.checked = UI.drill ? !!UI.drill.prioritize : drillPrioritize();
+  const where = document.getElementById("drill-where");
+  if (!where) return;
+  if (!on || !d) { where.textContent = ""; return; }
+  const parts = [];
+  if (d.pos && d.size) parts.push(`Spot ${d.pos} of ${d.size}`);
+  if (d.played_at) parts.push(`your hand of ${String(d.played_at).slice(0, 10)}`);
+  if (d.bb_cents) parts.push(`${fmtCents(d.sb_cents || d.bb_cents / 2)}/${fmtCents(d.bb_cents)}`);
+  if (d.practice) parts.push("practice");
+  where.textContent = parts.join(" · ");
+}
+function fmtCents(c) {
+  const v = Number(c) / 100;
+  return "$" + (Number.isInteger(v) ? String(v) : v.toFixed(2));
+}
+
+// The dock's line once a drill spot is played: how it went, the network's play (and how
+// often it makes it), what you did in the hand. On a phone or a short window only the
+// first two fit beside the button (`.dn-extra` hides: style.css) — the table never
+// changes size with the dock.
+function drillNoteHTML(s) {
+  const t = s.trainer, d = t.drill, fb = t.feedback;
+  if (!fb) return "";
+  const v = verdictParts(s, fb);
+  const kind = (d.result && d.result.outcome)
+    || ({ best: "fixed", correct: "fixed", wrong: "missed", blunder: "missed" }[fb.category] || "close");
+  const head = { fixed: "✓ Fixed", missed: "✗ Still a mistake", close: "~ Close" }[kind];
+  const cls = { fixed: "best", missed: "blunder", close: "inaccuracy" }[kind];
+  const p = d.probs ? d.probs[{ fold: "fold", check_call: "call", raise: "raise" }[fb.rec_gate]] : null;
+  const netPart = v.best
+    ? `The network: ${v.best}${typeof p === "number" ? ` (${Math.round(p * 100)}%)` : ""}`
+    : "The network plays it the same way";
+  const o = d.orig;
+  const was = o && o.gate
+    ? gateActionLabel(o.gate, o.chips, fb.to_call_chips, s, fb.actor_commit_chips, fb.street)
+    : (o && o.label) || "";
+  const extra = `${was ? ` · in the hand: ${was}` : ""}${d.practice ? " · practice" : ""}`;
+  return `<b class="cat-text-${cls}">${head}</b> ${escapeHTML(netPart)}`
+    + (extra ? `<span class="dn-extra">${escapeHTML(extra)}</span>` : "");
+}
+
 function setupTrainerControls() {
   document.getElementById("tab-study").addEventListener("click", () => setMode("study"));
   document.getElementById("tab-trainer").addEventListener("click", () => setMode("trainer"));
-  // Both share the in-flight guard: the public build's free-tier middleware
-  // counts every POST /trainer/new_hand, so an unguarded double-click burns
-  // 2 of 5 daily hands while showing one. `postTrainer` never rejects
-  // (its own try/catch), so clearing in `.finally` is always reached.
-  const dealGuarded = (path) => {
-    if (UI.actionInFlight) return;
-    cancelTrainerPick();
-    UI.reviewNode = null;
-    UI.selectedSlot = null;
-    UI.actionInFlight = true;
-    setActionsBusy(true);
-    startWorking("Dealing…");
-    postTrainer(path).finally(() => {
-      stopWorking();
-      UI.actionInFlight = false;
-      setActionsBusy(false);
-    });
-  };
-  const newHand = () => dealGuarded("new_hand");
-  const repeatHand = () => dealGuarded("repeat");
+  const newHand = () => (UI.drill ? dealDrill(false) : dealTrainer("new_hand"));
+  const repeatHand = () => dealTrainer("repeat");
   document.getElementById("trainer-new-hand-btn").addEventListener("click", newHand);
   document.getElementById("trainer-repeat-btn").addEventListener("click", repeatHand);
   document.getElementById("review-next-hand").addEventListener("click", newHand);
-  // the dock's "Next hand" at the end of a hand (app.play.js renderActions)
+  // the dock's "Next hand" at the end of a hand (app.play.js renderActions); in the
+  // drill, "Next spot" and "Try again"
   document.getElementById("status-strip").addEventListener("click", (e) => {
-    if (e.target.closest("[data-trainer-next]") && !UI.actionInFlight) newHand();
+    if (UI.actionInFlight) return;
+    if (e.target.closest("[data-trainer-next]")) newHand();
+    else if (e.target.closest("[data-drill-again]")) repeatHand();
   });
+  const prio = document.getElementById("drill-prioritize");
+  if (prio) prio.addEventListener("change", () => {
+    lsSet(DRILL_PRIO_KEY, prio.checked ? "on" : "off");
+    if (UI.drill) UI.drill.prioritize = prio.checked;
+    showToast(prio.checked ? "Worst first: your worst mistakes come up most, the ones you've fixed less."
+      : "Equal priority: every spot comes up as often as the others.", "info");
+  });
+  const exit = document.getElementById("drill-exit");
+  if (exit) exit.addEventListener("click", () => { if (!UI.actionInFlight) exitDrill(true); });
   document.getElementById("review-repeat-hand").addEventListener("click", repeatHand);
   document.getElementById("review-open-study").addEventListener("click", () => openReviewInStudy());
   document.getElementById("review-first").addEventListener("click", () => {

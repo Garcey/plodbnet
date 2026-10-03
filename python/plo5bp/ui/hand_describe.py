@@ -5,7 +5,7 @@ hands) and a board's dealt community-card indices (3-5), enumerate the
 exactly-2-hole + 3-board PLO
 combinations, pick the best 5-card hand, and format it the way ClubGG
 labels it ("three of a kind, Qs", "a straight 10-A", "a flush A high",
-"a pair of 8s", "four of a kind, 8s", "a straight flush, 9-K").
+"a pair of 8s", "four of a kind, 8s", "a straight flush, 9-K", "a royal flush").
 
 Card index convention matches the engine: ``rank = idx // 4`` (0='2' ..
 12='A'), ``suit = idx % 4``. Category ordering matches rust_engine
@@ -124,7 +124,10 @@ def _fmt(info: tuple) -> str:
     if kind == "quads":
         return f"four of a kind, {d[info[1]]}s"
     if kind == "sf":
-        return "a straight flush, A-5" if info[2] else f"a straight flush, {d[info[1] - 4]}-{d[info[1]]}"
+        if info[2]:
+            return "a straight flush, A-5"
+        # (owner, 2026-10-03: the ace-high one is a royal flush — "a straight flush, 10-A" before)
+        return "a royal flush" if info[1] == 12 else f"a straight flush, {d[info[1] - 4]}-{d[info[1]]}"
     return f"{d[info[1]]} high"
 
 

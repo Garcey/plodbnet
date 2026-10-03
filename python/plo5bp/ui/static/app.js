@@ -147,6 +147,7 @@ async function init() {
   initFormats();
   const spot = new URLSearchParams(location.search).get("spot");
   if (spot) await openSharedSpot(spot);
+  else if (UI.mode === "trainer" && drillRequested()) await startDrill();  // (Hand review's mistakes drill)
   else await fetchState();
   if (window.__wgLiveInit) window.__wgLiveInit();
 }

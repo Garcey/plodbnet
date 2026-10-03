@@ -43,6 +43,7 @@ CASES = [
     (("fh", 9, 2), "Js full of 4s"),
     (("quads", 0), "Four 2s"),
     (("sf", 8, False), "Straight flush 6-10"),
+    (("sf", 12, False), "Royal flush"),
     (("sf", 3, True), "Straight flush A-5"),
     (("high", 12), "A high"),
 ]

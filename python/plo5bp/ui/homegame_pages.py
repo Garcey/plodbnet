@@ -133,7 +133,8 @@ PAGE_HEADERS: dict[str, str] = {
 # signed out answers with a small page (no scripts) naming what it is and a
 # "Sign in with Google" button that comes straight back to the same link.
 
-_SIGNIN_PATH = re.compile(r"^/games(?:/t/([A-Za-z0-9_-]{1,40})|/join/([A-Za-z0-9_-]{6,40}))?$")
+# (/games/review = Hand review, 2026-10-03: a signed-out link to it gets the sign-in page too)
+_SIGNIN_PATH = re.compile(r"^/games(?:/t/([A-Za-z0-9_-]{1,40})|/join/([A-Za-z0-9_-]{6,40})|/(review))?$")
 INVITE_HEADERS: dict[str, str] = {
     "Cache-Control": "no-store, must-revalidate",
     "Content-Security-Policy": "; ".join((
@@ -227,8 +228,16 @@ def _invite_response(request: Request, path: str, user: Any) -> Response | None:
     if m is None:
         return None
     esc = html_mod.escape
-    game_id, code = m.group(1), m.group(2)
-    if game_id:
+    game_id, code, review = m.group(1), m.group(2), m.group(3)
+    if review:
+        html = hg._signin_html(
+            "Hand review",
+            "Upload the hand histories ClubGG exports and see your results beside your all-in EV, "
+            "every hand replayed and every decision checked against the network. Sign in with Google "
+            "to open it — you'll come straight back here.",
+            path,
+        )
+    elif game_id:
         table = pub.DB.one(
             "SELECT g.name, g.status, g.variant, g.host_user_id, c.name AS club_name FROM homegames g "
             "LEFT JOIN homegame_clubs c ON c.id=g.club_id WHERE g.id=?",

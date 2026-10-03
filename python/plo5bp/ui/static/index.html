@@ -158,7 +158,15 @@
         </span>
       </div>
       <!-- WGLIVE:END -->
+      <div class="top-bar-item drill-only" id="drill-bar">
+        <span class="drill-tag">Mistakes drill</span>
+        <span id="drill-where" class="drill-where" aria-live="polite"></span>
+      </div>
       <div class="top-bar-item top-bar-spacer"></div>
+      <div class="top-bar-item drill-only">
+        <label class="drill-prio" title="On: your worst mistakes come up most often, and a spot you've fixed comes up less. Off: every spot equally often."><input type="checkbox" id="drill-prioritize" checked /> Worst first</label>
+        <button id="drill-exit" type="button" title="Leave the drill and deal random hands again">Exit drill</button>
+      </div>
       <div class="top-bar-item trainer-only">
         <button id="trainer-help-btn" class="icon-btn" type="button" aria-label="Help and keyboard shortcuts" title="Help and keyboard shortcuts (?)">?</button>
         <button id="trainer-settings-btn" type="button" title="Trainer settings">Settings</button>

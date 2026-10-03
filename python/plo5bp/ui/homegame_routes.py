@@ -48,7 +48,7 @@ __all__ = (
     "api_club_create", "api_club_decide", "api_club_invite_reset", "api_club_leave",
     "api_club_member", "api_club_nickname", "api_club_request", "api_club_settings",
     "api_clubs", "api_community", "api_create", "api_deal", "api_exclude", "api_fair_commit",
-    "api_fair_reveal", "api_fair_transcript", "api_get", "api_hand", "api_hands",
+    "api_fair_reveal", "api_fair_transcript", "api_get", "api_hand", "api_hand_choice", "api_hands",
     "api_hands_export", "api_health", "api_host_fold", "api_host_prefs", "api_invite",
     "api_invite_join", "api_kick", "api_leave", "api_list", "api_move", "api_my_hands",
     "api_my_name", "api_my_series", "api_my_stats", "api_player_hands", "api_player_series",
@@ -121,6 +121,7 @@ API_COST: dict[str, float] = {
     "/games/api/players/{player_id}/stats": 5.0, "/games/api/players/{player_id}/hands": 3.0,
     "/games/api/tables/{game_id}/hands/export": 20.0, "/games/api/tables/{game_id}/hands": 2.0,
     "/games/api/my/series": 3.0, "/games/api/players/{player_id}/series": 3.0,
+    "/games/api/tables/{game_id}/hands/{hand_no}/choice": 3.0,
 }
 #: Join requests (each pops a toast at the club's open tables): 5, then one every 2 minutes.
 JOIN_RATE = RateLimiter(rate=1 / 120.0, burst=5)
@@ -622,6 +623,21 @@ def api_receipt(game_id: str, user_id: int):
 @router.get("/games/api/tables/{game_id}/hands/{hand_no}")
 def api_hand(game_id: str, hand_no: int):
     return hg._in_table(game_id, lambda t, uid: hg._hand_detail(t, uid, hand_no), view=False)
+
+
+@router.get("/games/api/tables/{game_id}/hands/{hand_no}/choice")
+def api_hand_choice(game_id: str, hand_no: int, i: int):
+    """What the network plays at decision ``i`` of a stored hand (2026-10-03): the
+    replayer shows it without a trip to Study. Only where the viewer may see the
+    actor's cards (the replayer's own rule: your hands, hands shown down), and with
+    Study's access (``public._entitled``)."""
+    from plo5bp.ui import handreview_store as hrs
+
+    rec = hg._in_table(game_id, lambda t, uid: hg._hand_detail(t, uid, hand_no), view=False)
+    if not pub._entitled(pub._user_by_id(hg._uid())):
+        raise HTTPException(status_code=402, detail={
+            "error": "subscription_required", "message": "The network's choice needs a subscription, like Study."})
+    return hrs.choice(rec, i)
 
 
 @router.post("/games/api/tables/{game_id}/sit_out_player")

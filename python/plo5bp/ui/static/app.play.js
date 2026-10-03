@@ -67,15 +67,18 @@ function animActionText(s) {
   const a = s.trainer.anim_action;
   const seat = s.seats[a.seat];
   if (animIsHeroAuto(a)) return "You check (automatic)";
-  if (a.gate === "fold") return `${a.position} folds`;
+  // (the mistakes drill replays YOUR earlier moves in the hand too: "You bet $40")
+  const you = a.is_hero === true;
+  const who = you ? "You" : a.position;
+  if (a.gate === "fold") return `${who} ${you ? "fold" : "folds"}`;
   if (a.gate === "check_call") {
-    return a.to_call > 0 ? `${a.position} calls` : `${a.position} checks`;
+    return a.to_call > 0 ? `${who} ${you ? "call" : "calls"}` : `${who} ${you ? "check" : "checks"}`;
   }
   const committed = seat ? seat.committed_this_street_chips : a.chips;
-  const verb = seat && seat.all_in ? "is all-in"
-    : aggVerb(a.to_call, a.street) === "Raise" ? "raises to" : "bets";
+  const verb = seat && seat.all_in ? (you ? "are all-in" : "is all-in")
+    : aggVerb(a.to_call, a.street) === "Raise" ? (you ? "raise to" : "raises to") : (you ? "bet" : "bets");
   const amt = committed > 0 ? ` ${formatUnit(committed, s)}` : "";
-  return `${a.position} ${verb}${amt}`;
+  return `${who} ${verb}${amt}`;
 }
 
 function renderActorBanner(s) {
@@ -93,8 +96,15 @@ function renderActorBanner(s) {
   // opponent's, or the hero's own automatic check (styled as the hero's).
   if (s.trainer && s.trainer.anim_action) {
     banner.hidden = false;
-    banner.classList.toggle("hero", animIsHeroAuto(s.trainer.anim_action));
+    banner.classList.toggle("hero", s.trainer.anim_action.is_hero === true);
     banner.textContent = animActionText(s);
+    return;
+  }
+  // The mistakes drill's replay starts on the flop, before anyone acts.
+  if (s.trainer && s.trainer.drill_replay) {
+    banner.hidden = false;
+    banner.classList.remove("hero");
+    banner.textContent = "Your hand, replayed up to the decision…";
     return;
   }
   // Trainer review: the state is a mid-hand reconstruction, not a live turn.
@@ -138,7 +148,9 @@ function renderActorBanner(s) {
   // ST-017: say whose action this is, by position — never an internal seat
   // number that appears nowhere on the table.
   if (s.trainer) {
-    banner.textContent = isHero ? `Your turn (${seat.position})` : `${seat.position} is thinking…`;
+    banner.textContent = !isHero ? `${seat.position} is thinking…`
+      : s.trainer.drill ? `Your mistake, again (${seat.position}) — find the network's play`
+        : `Your turn (${seat.position})`;
   } else if (isHero) {
     banner.textContent = `Hero to act (${seat.position}) — the network's answer is in Recommendation`;
   } else {
@@ -214,6 +226,17 @@ function renderActions(s) {
   const nextHand = s.trainer ? '<button type="button" class="btn sm primary" data-trainer-next>Next hand</button>' : "";
   if (s.terminal) {
     note(`<b>Hand over</b> ${escapeHTML(terminalText(s))}`, nextHand);
+    return;
+  }
+  // The mistakes drill: the hand's actions replay up to the decision (nobody acts here)
+  if (s.trainer && s.trainer.drill_replay) {
+    note("Replaying the hand up to your decision…");
+    return;
+  }
+  // The mistakes drill: the spot is played — how it went, then the next one (or again)
+  if (s.trainer && s.trainer.drill && s.trainer.drill.done) {
+    note(drillNoteHTML(s), '<button type="button" class="btn sm" data-drill-again>Try again</button>'
+      + '<button type="button" class="btn sm primary" data-trainer-next>Next spot</button>');
     return;
   }
   // Trainer review reconstruction: the hand is over; this state is a
@@ -1023,8 +1046,8 @@ function evChipsHTML(ownBB, trueBB, s) {
     + `EV ${escapeHTML(own ?? "—")} · <span class="rec-value-true">all cards ${escapeHTML(tru)}</span></span>`;
 }
 
-function renderTrainerReviewRecommendation(s, el) {
-  const rv = s.trainer.review;
+function renderTrainerReviewRecommendation(s, el, rvOverride) {
+  const rv = rvOverride || s.trainer.review;
   const cur = rv.node_current || rv.current;
   const whatif = rv.whatif;
   const callName = cur.to_call_chips > 0 ? "Call" : "Check";
@@ -1083,6 +1106,12 @@ function listJoin(names) {
 function renderRecommendation(s) {
   const el = document.getElementById("recommendation");
   if (s.trainer) {
+    // the mistakes drill: once the spot is played, the network's answer there
+    const dr = s.trainer.drill;
+    if (dr && dr.done && dr.node) {
+      renderTrainerReviewRecommendation(s, el, { node_current: dr.node, nodes: [], node: 0 });
+      return;
+    }
     if (s.trainer.review && (s.trainer.review.node_current || s.trainer.review.current)) {
       renderTrainerReviewRecommendation(s, el);
       return;

@@ -571,3 +571,32 @@ def test_a_bet_is_capped_at_the_pot_and_what_nobody_matched_comes_back(cast, hg)
     assert hg.wait_for_grading(30.0), "the grader never finished"
     raw = _stored(hg, gid, 1)
     assert {g["i"] for g in raw["grades"]} == set(range(len(raw["actions"])))
+
+
+def test_the_replayer_asks_the_network_about_a_decision_you_may_see(cast, hg, server):
+    """(owner, 2026-10-03) "click on the decision node and see the network's choice in the
+    hand history without having to put it in the study mode": your own decisions and hands
+    shown down — never a mucked hand — with Study's access."""
+    p = cast["p"]
+    gid = _table(cast, 3)
+    _post(p[0], gid, "run", {"running": True})
+    _bet_and_fold_out(cast, gid)
+    raw = _stored(hg, gid, 1)
+    for n in NAMES[:2]:  # (the tests run with the paywall on: two subscribers, one not)
+        hg.pub.DB.q("UPDATE users SET sub_status='active', sub_source='comp' WHERE email=?", (f"{n}@example.com",))
+    for i in (0, 1):
+        mine = [j for j, a in enumerate(raw["actions"]) if a["seat"] == i]
+        theirs = [j for j, a in enumerate(raw["actions"]) if a["seat"] != i]
+        r = p[i].get(f"/games/api/tables/{gid}/hands/1/choice", params={"i": mine[0]})
+        assert r.status_code == 200, r.text
+        ch = r.json()
+        assert ch["seat"] == i and abs(sum(ch["probs"].values()) - 1.0) < 1e-3
+        assert ch["pick"]["gate"] in ("fold", "call", "raise")
+        # nobody showed down: another player's cards stay hidden, and so does the network's view
+        r = p[i].get(f"/games/api/tables/{gid}/hands/1/choice", params={"i": theirs[0]})
+        assert r.status_code == 400 and "weren't shown" in r.json()["detail"]
+    mine = [j for j, a in enumerate(raw["actions"]) if a["seat"] == 2]
+    assert p[2].get(f"/games/api/tables/{gid}/hands/1/choice", params={"i": mine[0]}).status_code == 402
+    stranger = TestClient(server.app, raise_server_exceptions=False)
+    assert stranger.get("/auth/dev", params={"email": "stranger@example.com"}).status_code == 200
+    assert stranger.get(f"/games/api/tables/{gid}/hands/1/choice", params={"i": 0}).status_code == 403

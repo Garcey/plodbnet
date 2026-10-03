@@ -11,9 +11,14 @@ module keeps them:
   the duplicate check: a hand already stored is counted and skipped, whichever
   upload or file brings it again.
 - ``review_uploads`` — each upload's progress and report.
+- ``review_mistakes`` — every decision of the player's the network graded a wrong
+  move or a blunder, with its learning state: the Trainer's mistakes drill deals them
+  back (``drill_next`` / ``drill_result``, plugged in by ``trainer.set_drill_hooks``).
 - One IMPORT worker (uploads are read one at a time, site-wide, off the request)
   and one GRADER (the home games' ``grade_hand`` with the served PLO5 model; the
   player's own decisions only — other players' cards are never known).
+- The network's choice at any decision of a stored hand (``choice``: the replayer
+  asks; home-game hands too, through ``homegame_routes.api_hand_choice``).
 
 The one PAID page of the site, even while ``public.FREE_FOR_ALL`` opens the rest:
 it keeps your hand histories on the server. Every API route needs ``public._paid``
@@ -80,6 +85,44 @@ REVIEW_MIGRATIONS: list[Any] = [
     )),
 ]
 
+#: The grades the mistakes drill deals back (a "wrong move" or a "blunder").
+MISTAKE_CATS = ("wrong", "blunder")
+
+
+def _mistake_rows(uid: int, key: str, ts: int, grades: list[dict[str, Any]] | None) -> list[tuple]:
+    return [(int(uid), key, int(g["i"]), float(g["score"]), str(g["cat"]), int(ts))
+            for g in grades or [] if g.get("cat") in MISTAKE_CATS]
+
+
+_MISTAKE_UPSERT = (
+    "INSERT INTO review_mistakes(user_id, hand_key, idx, score, cat, played_ts) VALUES(?,?,?,?,?,?)"
+    " ON CONFLICT(user_id, hand_key, idx) DO UPDATE SET score=excluded.score, cat=excluded.cat"
+)
+
+
+def _backfill_mistakes(conn: Any) -> None:
+    """Migration 2: the mistakes of the hands graded before the drill existed."""
+    for uid, key, ts, record in conn.execute(
+        "SELECT user_id, hand_key, played_ts, record FROM review_hands WHERE mistakes > 0"
+    ).fetchall():
+        for row in _mistake_rows(uid, key, ts, json.loads(record).get("grades")):
+            conn.execute(_MISTAKE_UPSERT, row)
+
+
+REVIEW_MIGRATIONS.append(
+    # The mistakes drill (2026-10-03): one row per mistake of yours (a decision graded
+    # "wrong" or "blunder") with its learning state — `weight` goes down when you play
+    # the spot right in the Trainer and back up when you miss it again.
+    pub.Migration(2, "mistakes drill", statements=(
+        "CREATE TABLE IF NOT EXISTS review_mistakes ("
+        " user_id INTEGER NOT NULL, hand_key TEXT NOT NULL, idx INTEGER NOT NULL,"
+        " score REAL NOT NULL, cat TEXT NOT NULL, played_ts INTEGER NOT NULL DEFAULT 0,"
+        " weight REAL NOT NULL DEFAULT 1.0, fixed INTEGER NOT NULL DEFAULT 0,"
+        " missed INTEGER NOT NULL DEFAULT 0, last_cat TEXT, last_at TEXT,"
+        " PRIMARY KEY (user_id, hand_key, idx))",
+    ), fn=_backfill_mistakes),
+)
+
 
 class Review:
     """The workers of ONE app (``install`` makes a fresh one current)."""
@@ -92,6 +135,7 @@ class Review:
         self.grade_wake = threading.Event()
         self.lock = threading.Lock()
         self.busy_users: set[int] = set()  # an upload queued or being read
+        self.drill: dict[int, dict[str, Any]] = {}  # user -> the mistakes drill's round
 
 
 CTX = Review()
@@ -330,7 +374,7 @@ def grade_one(uid: int, key: str, job_json: str, model: Any) -> list[dict[str, A
 def store_grades(uid: int, key: str, grades: list[dict[str, Any]] | None) -> None:
     """The hand's marks land in its record and its numbers — and its job is done."""
     with pub.DB.transaction():
-        row = pub.DB.one("SELECT record FROM review_hands WHERE user_id=? AND hand_key=?", (uid, key))
+        row = pub.DB.one("SELECT record, played_ts FROM review_hands WHERE user_id=? AND hand_key=?", (uid, key))
         if row is None:
             return
         rec = json.loads(row["record"])
@@ -338,13 +382,22 @@ def store_grades(uid: int, key: str, grades: list[dict[str, Any]] | None) -> Non
         if grades is None:
             rec["grades_note"] = "could not be graded"
         scores = [float(g["score"]) for g in rec["grades"]]
-        mistakes = sum(1 for g in rec["grades"] if g.get("cat") in ("wrong", "blunder"))
+        found = _mistake_rows(uid, key, int(row["played_ts"]), rec["grades"])
         pub.DB.q(
             "UPDATE review_hands SET record=?, job=NULL, acc_sum=?, acc_n=?, worst=?, mistakes=?, graded_at=?"
             " WHERE user_id=? AND hand_key=?",
             (json.dumps(rec, separators=(",", ":")), float(sum(scores)) if scores else None,
-             len(scores) or None, min(scores) if scores else None, mistakes, pub._now(), uid, key),
+             len(scores) or None, min(scores) if scores else None, len(found), pub._now(), uid, key),
         )
+        # (the drill's spots: a decision that is no longer a mistake leaves it; one that
+        # still is keeps its learning state)
+        keep = [r[2] for r in found]
+        pub.DB.q(
+            f"DELETE FROM review_mistakes WHERE user_id=? AND hand_key=? AND idx NOT IN ({','.join('?' * len(keep))})",
+            (uid, key, *keep),
+        )
+        for r in found:
+            pub.DB.q(_MISTAKE_UPSERT, r)
 
 
 # --- the numbers -----------------------------------------------------------------------------
@@ -379,6 +432,7 @@ def summary(uid: int) -> dict[str, Any]:
         "first_ts": r["first_ts"], "last_ts": r["last_ts"], "stakes": stakes,
         "uploads": uploads, "max_hands": MAX_HANDS_PER_USER,
         "max_upload_mb": hr.MAX_UPLOAD_BYTES // (1024 * 1024),
+        "drill": drill_summary(uid),
     }
 
 
@@ -498,7 +552,238 @@ def delete_all(uid: int) -> dict[str, Any]:
         n = int(pub.DB.one("SELECT COUNT(*) n FROM review_hands WHERE user_id=?", (uid,))["n"])
         pub.DB.q("DELETE FROM review_hands WHERE user_id=?", (uid,))
         pub.DB.q("DELETE FROM review_uploads WHERE user_id=?", (uid,))
+        pub.DB.q("DELETE FROM review_mistakes WHERE user_id=?", (uid,))
+    with CTX.lock:
+        CTX.drill.pop(uid, None)
     return {"deleted": n}
+
+
+# --- the network's choice at a decision ------------------------------------------------------
+
+_CHOICE_WHY = {
+    "hidden_cards": "That player's cards weren't shown, so the network can't be asked about this decision.",
+    "replay_refused": "The network's rules can't follow this hand to here (ClubGG allowed a raise after a "
+                      "short all-in that they don't).",
+    "replay_diverged": "The network's rules can't follow this hand to here.",
+    "other_game": "The network plays PLO5 only.",
+    "no_decision": "There's no decision there.",
+    "no_board": "This hand's flops aren't in its history.",
+}
+
+
+def served_model() -> Any:
+    """The served PLO5 network (the grader's) — 503 while there is none."""
+    from plo5bp.ui import homegame as hg
+
+    model = hg._grading_model()
+    if model is None:
+        raise HTTPException(status_code=503, detail="The network isn't loaded on the server right now — try again in a minute.")
+    return model
+
+
+def choice(rec: dict[str, Any], i: int) -> dict[str, Any]:
+    """What the network plays at decision ``i`` of a hand record (Hand review's or a
+    home game's): its fold / call / raise mix, its pick and its likeliest sizes — 400
+    with the reason when the spot can't be rebuilt (cards not shown, another game, a
+    line the network's rules don't follow)."""
+    acts = rec.get("actions") or []
+    if not 0 <= int(i) < len(acts):
+        raise HTTPException(status_code=400, detail=_CHOICE_WHY["no_decision"])
+    upto = rec.get("study_upto")
+    if upto is not None and int(i) >= int(upto):
+        raise HTTPException(status_code=400, detail=_CHOICE_WHY["replay_refused"])
+    if acts[int(i)].get("auto"):
+        raise HTTPException(status_code=400, detail="The clock acted there, not the player.")
+    model = served_model()
+    try:
+        return hr.network_choice(rec, int(i), model)
+    except hr.HandError as e:
+        raise HTTPException(status_code=400, detail=_CHOICE_WHY.get(e.reason, "The network can't rebuild this spot.")) from e
+
+
+# --- the mistakes drill ----------------------------------------------------------------------
+# The Trainer deals your own mistakes back — every decision the network graded "wrong" or
+# "blunder" (``review_mistakes``) — one spot at a time, in ROUNDS through them:
+# - Worst first (the default): a spot's weight = how bad the mistake was x its learning
+#   multiplier, and a round deals its spots in a weighted random order (Efraimidis-Spirakis
+#   keys u^(1/w): the worst usually first, never one fixed order). Playing a spot right
+#   (best / correct) halves its multiplier, down to 1/8, and a spot under 1 sits a round
+#   out with probability 1 - multiplier: a fixed mistake comes back less often, but it
+#   comes back. Missing it again (wrong / blunder) puts the multiplier back to at least 1,
+#   x1.5 (up to 4), and deals it once more later in the same round. Close (an inaccuracy)
+#   changes nothing.
+# - Equal priority: every spot every round, in a uniformly shuffled order (the results
+#   still count, for when you switch back).
+# Either way the next spot comes from a DIFFERENT hand whenever there is one (a hand
+# with two mistakes never deals them back to back — `_spread`).
+# The round lives in memory (``CTX.drill``; a restart starts a new one); the learning
+# state is in the database.
+
+DRILL_FIXED = 0.5
+DRILL_MISSED = 1.5
+DRILL_MIN = 0.125
+DRILL_MAX = 4.0
+DRILL_FIXED_CATS = ("best", "correct")
+
+
+def mistakes(uid: int) -> list[dict[str, Any]]:
+    """Every mistake spot of the account with its learning state, worst first."""
+    return [dict(r) for r in pub.DB.q(
+        "SELECT hand_key AS key, idx AS i, score, cat, weight, fixed, missed FROM review_mistakes"
+        " WHERE user_id=? ORDER BY score, played_ts DESC, hand_key, idx", (uid,))]
+
+
+def severity(score: float) -> float:
+    """How bad a mistake was: 1 for a blunder scored 0 down to 0.25 at the top of the
+    "wrong move" band (scores 0-30, ``trainer.SCORING``) — the worst one comes up about
+    three times as often as the mildest."""
+    from plo5bp.ui.trainer import SCORING
+
+    top = float(SCORING["inaccuracy_min"])
+    return 0.25 + 0.75 * (top - min(max(float(score), 0.0), top)) / top
+
+
+def _spread(order: list[tuple[str, int]], last_key: str | None) -> list[tuple[str, int]]:
+    """``order`` with no two spots of one hand in a row (nor first the hand dealt just
+    before, ``last_key``) whenever that can be done, otherwise in its own order: each
+    place takes the earliest spot of another hand than the one before — except, near a
+    round's end, the hand that needs every other remaining place (more than half of
+    what is left) goes first."""
+    rest = list(order)
+    counts: dict[str, int] = {}
+    for k, _i in rest:
+        counts[k] = counts.get(k, 0) + 1
+    top = max(counts.values(), default=0)
+    out: list[tuple[str, int]] = []
+    prev = last_key
+    while rest:
+        n = len(rest)
+        pick = None
+        if 2 * top >= n:  # (only then can one hand need every other place)
+            hand, c = max(counts.items(), key=lambda kv: kv[1])
+            if c > n // 2 and hand != prev:
+                pick = next(j for j, s in enumerate(rest) if s[0] == hand)
+        if pick is None:
+            pick = next((j for j, s in enumerate(rest) if s[0] != prev), 0)
+        s = rest.pop(pick)
+        counts[s[0]] -= 1
+        out.append(s)
+        prev = s[0]
+    return out
+
+
+def drill_order(spots: list[dict[str, Any]], prioritize: bool, rng: Any,
+                last: tuple[str, int] | None = None) -> list[tuple[str, int]]:
+    """One round of the drill: the spots it deals, in order (see the comment above)."""
+    if not spots:
+        return []
+    if prioritize:
+        chosen = [s for s in spots if float(s["weight"]) >= 1.0 or rng.random() < float(s["weight"])]
+        if not chosen:  # (every spot fixed and none drawn: the likeliest one)
+            chosen = [max(spots, key=lambda s: severity(s["score"]) * float(s["weight"]))]
+        keyed = [(rng.random() ** (1.0 / (severity(s["score"]) * float(s["weight"]))), s) for s in chosen]
+        keyed.sort(key=lambda kv: kv[0], reverse=True)
+        chosen = [s for _k, s in keyed]
+    else:
+        chosen = list(spots)
+        rng.shuffle(chosen)
+    order = [(str(s["key"]), int(s["i"])) for s in chosen]
+    return _spread(order, last[0] if last is not None else None)
+
+
+def drill_next(uid: int, prioritize: bool, rng: Any = None) -> dict[str, Any] | None:
+    """The next mistake spot to deal — None when the account has no mistakes (yet)."""
+    import random
+
+    _require_paid(uid)
+    rng = rng or random.Random()
+    for _attempt in range(4):
+        with CTX.lock:
+            st = CTX.drill.get(uid)
+            if st is None or st["prioritize"] != bool(prioritize):  # (a new round in the new mode)
+                st = CTX.drill[uid] = {
+                    "queue": [], "round": st["round"] if st else 0, "size": 0, "total": 0,
+                    "last": st["last"] if st else None, "prioritize": bool(prioritize), "again": set(),
+                }
+            fresh = not st["queue"]
+        spots = mistakes(uid) if fresh else None
+        with CTX.lock:
+            if spots is not None and not st["queue"]:
+                st["queue"] = drill_order(spots, bool(prioritize), rng, st["last"])
+                st.update(round=st["round"] + 1, size=len(st["queue"]), total=len(spots), again=set())
+            if not st["queue"]:
+                return None
+            key, i = st["queue"].pop(0)
+            st["last"] = (key, i)
+            meta = {"round": st["round"], "pos": st["size"] - len(st["queue"]), "size": st["size"],
+                    "total": st["total"], "prioritize": bool(prioritize)}
+        m = pub.DB.one("SELECT score, cat, weight, fixed, missed FROM review_mistakes"
+                       " WHERE user_id=? AND hand_key=? AND idx=?", (uid, key, i))
+        row = pub.DB.one("SELECT record FROM review_hands WHERE user_id=? AND hand_key=?", (uid, key))
+        if m is None or row is None:
+            continue  # (deleted meanwhile: the next one)
+        rec = json.loads(row["record"])
+        acts = rec.get("actions") or []
+        if not 0 <= i < len(acts):
+            continue
+        return {
+            "key": key, "i": i, "record": rec, **meta,
+            "orig": {"cat": m["cat"], "score": round(float(m["score"]), 1), "label": acts[i].get("label") or ""},
+            "learn": {"weight": round(float(m["weight"]), 3), "fixed": int(m["fixed"]), "missed": int(m["missed"])},
+        }
+    return None
+
+
+def drill_result(uid: int, key: str, i: int, category: str) -> dict[str, Any] | None:
+    """One attempt at a spot (not a practice repeat): right = its multiplier halves; a
+    miss puts it back up and deals it once more later in this round."""
+    import random
+
+    if category in DRILL_FIXED_CATS:
+        outcome = "fixed"
+    elif category in MISTAKE_CATS:
+        outcome = "missed"
+    else:
+        outcome = "close"
+    with pub.DB.transaction():
+        m = pub.DB.one("SELECT weight FROM review_mistakes WHERE user_id=? AND hand_key=? AND idx=?",
+                       (uid, key, int(i)))
+        if m is None:
+            return None
+        w = float(m["weight"])
+        if outcome == "fixed":
+            w = max(DRILL_MIN, w * DRILL_FIXED)
+        elif outcome == "missed":
+            w = min(DRILL_MAX, max(1.0, w) * DRILL_MISSED)
+        pub.DB.q(
+            "UPDATE review_mistakes SET weight=?, fixed=fixed+?, missed=missed+?, last_cat=?, last_at=?"
+            " WHERE user_id=? AND hand_key=? AND idx=?",
+            (w, int(outcome == "fixed"), int(outcome == "missed"), category, pub._now(), uid, key, int(i)),
+        )
+        m = pub.DB.one("SELECT fixed, missed FROM review_mistakes WHERE user_id=? AND hand_key=? AND idx=?",
+                       (uid, key, int(i)))
+    again = False
+    if outcome == "missed":
+        with CTX.lock:
+            st = CTX.drill.get(uid)
+            spot = (key, int(i))
+            if st is not None and st["prioritize"] and st["queue"] and spot not in st["again"]:
+                st["again"].add(spot)
+                st["queue"].insert(random.randint(1, len(st["queue"])), spot)
+                st["queue"] = _spread(st["queue"], key)  # (not straight after its own hand)
+                st["size"] += 1
+                again = True
+    return {"outcome": outcome, "weight": round(w, 3), "fixed": int(m["fixed"]), "missed": int(m["missed"]),
+            "again": again}
+
+
+def drill_summary(uid: int) -> dict[str, Any]:
+    r = pub.DB.one(
+        "SELECT COUNT(*) n, COALESCE(SUM(weight < 1.0), 0) fixed, COALESCE(SUM(weight > 1.0), 0) tough,"
+        " COALESCE(SUM(fixed + missed), 0) tries FROM review_mistakes WHERE user_id=?", (uid,),
+    )
+    return {"mistakes": int(r["n"]), "fixed": int(r["fixed"]), "struggling": int(r["tough"]),
+            "attempts": int(r["tries"])}
 
 
 # --- the API -----------------------------------------------------------------------------------
@@ -559,6 +844,14 @@ def api_hand(key: str):
     return hand(uid, key)
 
 
+@router.get("/games/api/review/hands/{key}/choice")
+def api_hand_choice(key: str, i: int):
+    """What the network plays at decision ``i`` of one of your hands (the replayer)."""
+    uid = _uid()
+    _require_paid(uid)
+    return choice(hand(uid, key), i)
+
+
 @router.post("/games/api/review/delete")
 def api_delete(body: dict = Body(...)):
     """Delete every hand (and upload report) of the account — ``{"confirm": true}``.
@@ -593,6 +886,9 @@ def _account_anonymize(uid: int) -> None:
     with pub.DB.transaction():
         pub.DB.q("DELETE FROM review_hands WHERE user_id=?", (int(uid),))
         pub.DB.q("DELETE FROM review_uploads WHERE user_id=?", (int(uid),))
+        pub.DB.q("DELETE FROM review_mistakes WHERE user_id=?", (int(uid),))
+    with CTX.lock:
+        CTX.drill.pop(int(uid), None)
 
 
 _hooks = getattr(pub, "ACCOUNT_HOOKS", None)
@@ -644,6 +940,15 @@ def install(app: FastAPI, *, static_dir: Any) -> None:
     CTX = Review()
     pub.DB.migrate("handreview", REVIEW_MIGRATIONS)
     pub._BODY_LIMITS["/games/api/review/upload"] = hr.MAX_UPLOAD_BYTES
+    # (each answer is a forward of the network)
+    hg.API_COST.setdefault("/games/api/review/hands/{key}/choice", 3.0)
+    # The Trainer's mistakes drill reads its spots from here (trainer.set_drill_hooks).
+    from plo5bp.ui import trainer as tr
+
+    tr.set_drill_hooks(
+        next_spot=lambda prioritize: drill_next(_uid(), prioritize),
+        record=lambda key, i, category: drill_result(_uid(), key, i, category),
+    )
 
     @app.get("/games/review")
     def review_page():

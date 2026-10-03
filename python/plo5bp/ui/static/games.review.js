@@ -160,7 +160,17 @@
       <div><b class="${tone(luck)}">${amount(luck)}</b><small>${luck >= 0 ? "Above" : "Below"} EV · ${plural(s.allin_hands, "all-in")}</small></div>
       <div><b>${s.accuracy == null ? "–" : Math.round(s.accuracy) + "%"}</b><small>Accuracy · ${accTip}</small></div>
       <div><b class="${s.mistakes ? "neg" : ""}">${Number(s.mistakes).toLocaleString()}</b><small>Mistakes (wrong moves and blunders)</small></div>
-    </div>${s.grading_pending ? html`<div class="rv-note">${icon("i-bolt", "sm")} Checking your decisions against the network — ${plural(s.grading_pending, "hand")} to go.</div>` : ""}`);
+    </div>${s.grading_pending ? html`<div class="rv-note">${icon("i-bolt", "sm")} Checking your decisions against the network — ${plural(s.grading_pending, "hand")} to go.</div>` : ""}${drillCard(s.drill)}`);
+  }
+
+  // The mistakes drill (2026-10-03): the Trainer deals the exact spots you got wrong,
+  // the worst most often — a spot you fix comes back less, one you miss again more.
+  function drillCard(d) {
+    if (!d || !d.mistakes) return "";
+    const done = [d.fixed ? `${Number(d.fixed).toLocaleString()} fixed` : "", d.struggling ? `${Number(d.struggling).toLocaleString()} still tricky` : ""].filter(Boolean).join(" · ");
+    return html`<div class="rv-drill"><span class="rv-drill-ico">${icon("i-cards")}</span>
+      <div class="rv-drill-txt"><b>Drill your mistakes</b><small>The Trainer puts you back in the ${plural(d.mistakes, "spot")} you got wrong — the worst ones most often.${done ? ` ${done}.` : ""}</small></div>
+      <a class="btn gold" id="rv-drill" href="/?mode=trainer&amp;drill=1">Start the drill</a></div>`;
   }
 
   // ------------------------------------------------------------------ upload

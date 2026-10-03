@@ -273,6 +273,7 @@ HEAVY_COST = {
     "/trainer/new_hand": 2.0,
     "/trainer/repeat": 2.0,
     "/trainer/whatif": 2.0,
+    "/trainer/drill/next": 2.0,
 }
 # Free-tier metering (see AccessMiddleware): the explicit deal route, plus
 # the trainer routes that deal IMPLICITLY when the session has no live hand.
