@@ -394,14 +394,19 @@ def board_equities(
     *,
     samples: int = 250,
     seed: int = 0,
+    dead: list[int] | tuple[int, ...] = (),
+    digits: int | None = 4,
 ) -> dict[int, dict[str, float]]:
     """Per-seat share of each board (0..1), given known holes and boards.
 
     ``holes`` must be the ALIVE contenders only (never "whatever a viewer can
     see" — a folded viewer's own cards are not in the race). Dead cards =
-    those holes + the dealt part of both boards; folded/unknown hole cards
-    stay in the stub. Each board is evaluated on its own marginal (see the
-    block comment above): exact for <= 2 missing cards, sampled beyond.
+    those holes + the dealt part of both boards + ``dead`` (cards known to be
+    out of the deck that are not in the race — e.g. a side pot's equities:
+    the all-in hand that can't win it still holds its cards); folded/unknown
+    hole cards stay in the stub. Each board is evaluated on its own marginal
+    (see the block comment above): exact for <= 2 missing cards, sampled
+    beyond. ``digits`` rounds the shares (None = exact floats).
     """
     seats = sorted(holes)
     if not seats:
@@ -411,10 +416,10 @@ def board_equities(
     }
     ba = [int(c) for c in board_a if c is not None and int(c) >= 0]
     bb = [int(c) for c in board_b if c is not None and int(c) >= 0]
-    dead = set(ba) | set(bb)
+    out_of_deck = set(ba) | set(bb) | {int(c) for c in dead if c is not None and int(c) >= 0}
     for h in clean.values():
-        dead.update(h)
-    deck = [c for c in range(52) if c not in dead]
+        out_of_deck.update(h)
+    deck = [c for c in range(52) if c not in out_of_deck]
     contenders = [s for s in seats if len(clean[s]) >= 2]
     pairs = {s: list(combinations(clean[s], 2)) for s in contenders}
     rng = random.Random(int(seed) & 0xFFFFFFFF)
@@ -422,7 +427,7 @@ def board_equities(
     for key, board in (("a", ba), ("b", bb)):
         shares = _board_shares(contenders, pairs, board, deck, samples, rng)
         for s, v in shares.items():
-            out[s][key] = round(v, 4)
+            out[s][key] = round(v, digits) if digits is not None else float(v)
     return out
 
 

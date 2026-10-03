@@ -272,6 +272,7 @@ GAMES_ASSETS: dict[str, str] = {
     # (the UI's feature modules, split out of games.ui.js — FE-005)
     "games.lobby.js": "text/javascript; charset=utf-8",
     "games.history.js": "text/javascript; charset=utf-8",
+    "games.review.js": "text/javascript; charset=utf-8",  # (Hand review: handreview_store)
     "games.seat.js": "text/javascript; charset=utf-8",
     "games.manage.js": "text/javascript; charset=utf-8",
     "games.play.js": "text/javascript; charset=utf-8",

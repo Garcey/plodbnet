@@ -532,6 +532,7 @@ function renderAccountChip() {
     el.innerHTML = "";
     stopActivePoll();
     syncHomeGamesTab(null);
+    syncReviewTab(null);
     return;
   }
   const wasOpen = !!document.querySelector("#acct-menu:not([hidden])");
@@ -618,6 +619,7 @@ function renderAccountChip() {
   if (me.is_admin) { startActivePoll(); syncActiveBadge(); }
   else stopActivePoll();
   syncHomeGamesTab(me);
+  syncReviewTab(me);
   placeFormatPicker();
   if (wasOpen) toggleAccountMenu(true, false);
 }
@@ -800,6 +802,31 @@ function syncHomeGamesTab(me) {
   const short = /^home games$/i.test(link.label) ? "Games" : link.label;
   tab.innerHTML = `<span class="tab-long">${escapeHTML(link.label)}</span>`
     + `<span class="tab-short">${escapeHTML(short)}</span><svg class="ext-arrow" viewBox="0 0 12 12" aria-hidden="true">`
+    + '<path d="M4 3h5v5M9 3 3.5 8.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+}
+
+// Hand review (2026-10-03): /me carries {href, label} for the paid page of uploaded
+// hand histories (beside Home games, a real link like it).
+function syncReviewTab(me) {
+  const tabs = document.getElementById("mode-tabs");
+  if (!tabs) return;
+  let tab = document.getElementById("tab-review");
+  const info = me && me.review;
+  const href = info && typeof info.href === "string" ? info.href : "";
+  if (!/^\/(?!\/)/.test(href) || href.includes("\\")) {
+    if (tab) tab.remove();
+    return;
+  }
+  const label = typeof info.label === "string" && info.label.trim() ? info.label.trim() : "Hand review";
+  if (!tab) {
+    tab = document.createElement("a");
+    tab.id = "tab-review";
+    tab.className = "mode-tab mode-link";
+    tabs.appendChild(tab);
+  }
+  tab.href = href;
+  tab.innerHTML = `<span class="tab-long">${escapeHTML(label)}</span>`
+    + `<span class="tab-short">Review</span><svg class="ext-arrow" viewBox="0 0 12 12" aria-hidden="true">`
     + '<path d="M4 3h5v5M9 3 3.5 8.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 }
 

@@ -25,8 +25,9 @@
 
   function replayState(rec, k) {
     const seats = {};
-    rec.seats.forEach((x) => { seats[x.seat] = { stack: x.start_cents - rec.ante_cents, bet: 0, folded: false }; });
-    let pot = rec.ante_cents * rec.seats.length, street = "flop";
+    // (a Hand review record may carry dead money: a missed blind posted into the pot)
+    rec.seats.forEach((x) => { seats[x.seat] = { stack: x.start_cents - rec.ante_cents - (x.dead_cents || 0), bet: 0, folded: false }; });
+    let pot = rec.ante_cents * rec.seats.length + (rec.dead_cents || 0), street = "flop";
     const clearBets = () => Object.values(seats).forEach((p) => { p.bet = 0; });
     for (let i = 0; i < k; i++) {
       const a = rec.actions[i];
@@ -75,14 +76,17 @@
   }
   // Opens at once with "Loading…" and fills in when the hand lands (HGH-002: on a slow
   // phone the button looked dead, and a second tap opened a second copy).
-  async function openHand(gid, no) {
-    const key = `${gid}:${no}`;
+  // `opts.url` = where the record comes from (Hand review: the player's uploaded hands);
+  // `opts.noLink` = a hand with no table to link to or shuffle to check.
+  async function openHand(gid, no, opts) {
+    const o = opts || {};
+    const key = o.url || `${gid}:${no}`;
     if (U.openingHand && U.openingHand.key === key && !U.openingHand.api.closed) return;
-    const shell = openModal({ title: `Hand #${Number(no)}`, body: loading(), wide: true, autofocus: false, buttons: [{ label: "Close", cls: "primary" }] });
+    const shell = openModal({ title: o.url ? "Hand" : `Hand #${Number(no)}`, body: loading(), wide: true, autofocus: false, buttons: [{ label: "Close", cls: "primary" }] });
     shell.modal.classList.add("xwide");
     U.openingHand = { key, api: shell };
     let rec;
-    try { rec = await C().j(`/games/api/tables/${gid}/hands/${no}`); } catch (e) { shell.close(null); return toast(e.message, "err"); }
+    try { rec = await C().j(o.url || `/games/api/tables/${gid}/hands/${no}`); } catch (e) { shell.close(null); return toast(e.message, "err"); }
     if (shell.closed) return;
     const N = (rec.actions || []).length;
     // An all-in runout (record v2: `equities` per street, `runout_from`): after the last
@@ -105,7 +109,7 @@
     put(body, html`<div class="rp-main"><div class="rp-felt" id="rp-felt"></div>
       <div class="rp-banner" id="rp-banner"></div>
       <div class="rp-ctl"><button type="button" class="btn sm" id="rp-first" title="Start of the hand (Home)" aria-label="Start of the hand">⏮</button><button type="button" class="btn" id="rp-prev" title="Back one action (←)" aria-label="Back one action">◀</button><span class="rp-step num" id="rp-step" aria-live="polite"></span><button type="button" class="btn primary" id="rp-next" title="Play the next action (→)" aria-label="Next action">▶</button><button type="button" class="btn sm" id="rp-last" title="End of the hand (End)" aria-label="End of the hand">⏭</button>
-      <span class="spacer"></span><button class="btn sm" id="rp-link" type="button" title="Copy a link to this hand — club members open it with the same reveal rules">${icon("i-link", "sm")}<span>Copy link</span></button>${rec.fair && HG.fair ? html`<button class="btn sm" id="rp-fair" title="Re-check this hand's sealed deck, its cut and every card you can see">${icon("i-shield", "sm")}<span>Check shuffle</span></button>` : ""}${studyable(rec) ? html`<button class="btn gold sm" id="rp-study" title="Send this exact spot to the Study tab">${icon("i-chart", "sm")}Open in Study</button>` : ""}</div></div>
+      <span class="spacer"></span>${o.noLink ? "" : html`<button class="btn sm" id="rp-link" type="button" title="Copy a link to this hand — club members open it with the same reveal rules">${icon("i-link", "sm")}<span>Copy link</span></button>`}${rec.fair && HG.fair && !o.noLink ? html`<button class="btn sm" id="rp-fair" title="Re-check this hand's sealed deck, its cut and every card you can see">${icon("i-shield", "sm")}<span>Check shuffle</span></button>` : ""}${studyable(rec) ? html`<button class="btn gold sm" id="rp-study" title="Send this exact spot to the Study tab">${icon("i-chart", "sm")}Open in Study</button>` : ""}</div></div>
       <div class="rp-side"><div class="rsec flush-top"><h4>Action</h4><div id="rp-list" class="rp-list"></div></div><div id="rp-result"></div></div>`);
     const q = (id) => body.querySelector("#" + id);
 
@@ -157,6 +161,12 @@
       const cur = body.querySelector("#rp-list .log-row.on");
       if (cur) cur.scrollIntoView({ block: "nearest" });
       q("rp-result").hidden = !st.over;
+      const sb = q("rp-study");
+      if (sb && rec.study_upto != null) {
+        const past = Math.min(k, N) > rec.study_upto;
+        sb.disabled = past;
+        sb.title = past ? "Study can't follow this hand past here: ClubGG allowed a raise after a short all-in that the network's rules don't" : "Send this exact spot to the Study tab";
+      }
     }
     function go(to) { k = Math.max(0, Math.min(END, to)); paint(); }
 
@@ -197,7 +207,7 @@
     if (q("rp-study")) q("rp-study").addEventListener("click", () => askStudy(rec, Math.min(k, N)));
     // a link to this hand (FEAT-010): the table's page opens it for any club member,
     // with the usual reveal rules for the cards
-    q("rp-link").addEventListener("click", async () => {
+    if (q("rp-link")) q("rp-link").addEventListener("click", async () => {
       const url = `${location.origin}/games/t/${encodeURIComponent(gid)}?hand=${Number(no)}`;
       try { await navigator.clipboard.writeText(url); toast("Link to this hand copied — send it to the club", "ok"); }
       catch (_) { toast(url, "", 9000); }
@@ -227,7 +237,7 @@
     document.addEventListener("keydown", onKey);
     const graded = (rec.grades || []).length;
     const api = shell;
-    api.setTitle(`Hand #${rec.hand_no}${rec.table_name ? " · " + rec.table_name : ""}`,
+    api.setTitle(rec.kind === "review" ? `${rec.played_at || "Hand"}${rec.table_name ? " · " + rec.table_name : ""}` : `Hand #${rec.hand_no}${rec.table_name ? " · " + rec.table_name : ""}`,
       `${gameOf(rec.variant).label} · Pot ${d2(rec.pot_cents)} · ante ${d2(rec.ante_cents)} · ${rec.showdown ? "showdown" : "won without showdown"}` +
         (!gameOf(rec.variant).graded ? ` · ${gameOf(rec.variant).label} isn't graded yet` : rec.grades == null ? " · accuracy is still being worked out" : graded ? "" : " · no graded decisions") +
         (hasKeys() ? " · use ← → to step" : " · tap ◀ ▶ to step"));

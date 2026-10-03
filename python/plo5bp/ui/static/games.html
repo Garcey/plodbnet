@@ -54,6 +54,8 @@
       <symbol id="i-swap" viewBox="0 0 24 24"><path d="M7 8h12l-3-3M17 16H5l3 3" /></symbol>
       <symbol id="i-send" viewBox="0 0 24 24"><path d="M4 12l16-8-6 16-3-7-7-1z" /></symbol>
       <symbol id="i-down" viewBox="0 0 24 24"><path d="M6 9.5l6 6 6-6" /></symbol>
+      <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 15V4M7.5 8.5L12 4l4.5 4.5" /><path d="M4 14v5a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-5" /></symbol>
+      <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4.5h6V7M6.5 7l1 13h9l1-13" /><path d="M10 11v5.5M14 11v5.5" /></symbol>
       <symbol id="i-mark" viewBox="0 0 96 96"><path d="M28 12H68Q84 12 84 28V68Q84 84 68 84H28Q12 84 12 68V44Q12 30 26 30H44Q56 30 56 42V46Q56 56 46 56" stroke-width="11" /></symbol>
     </svg>
 
@@ -65,6 +67,7 @@
           <span>WrapGTO</span><small>Home games</small>
         </a>
         <span class="spacer"></span>
+        <a class="btn ghost sm" href="/games/review" id="lb-review" title="Your ClubGG hand histories: profit, all-in EV and every decision checked"><span class="lg-only">Hand review</span><span class="sm-only">Review</span></a>
         <a class="btn ghost sm" href="/" title="Study &amp; Trainer"><span class="lg-only">Study &amp; Trainer</span><span class="sm-only">Study</span></a>
         <button class="userchip" id="userchip" type="button" title="Your picture"></button>
         <form class="bar-form" method="post" action="/auth/logout">
@@ -143,6 +146,21 @@
           <div id="lb-sessions"></div>
         </section>
       </main>
+    </div>
+
+    <!-- ===================== HAND REVIEW (games.review.js) ===================== -->
+    <!-- the site's one paid page: a player's uploaded ClubGG hand histories -->
+    <div id="review-view" class="view" hidden>
+      <header class="lb-top">
+        <a class="brand" href="/games" id="rv-brand">
+          <svg class="ico brand-logo"><use href="#i-mark" /></svg>
+          <span>WrapGTO</span><small>Hand review</small>
+        </a>
+        <span class="spacer"></span>
+        <a class="btn ghost sm" href="/games" id="rv-games"><span class="lg-only">Home games</span><span class="sm-only">Games</span></a>
+        <a class="btn ghost sm" href="/" title="Study &amp; Trainer"><span class="lg-only">Study &amp; Trainer</span><span class="sm-only">Study</span></a>
+      </header>
+      <main class="lb-main rv-main" id="rv-main" aria-live="polite"></main>
     </div>
 
     <!-- ===================== TABLE ===================== -->
@@ -249,6 +267,7 @@
     <script src="/games/static/games.ui.js"></script>
     <script src="/games/static/games.lobby.js"></script>
     <script src="/games/static/games.history.js"></script>
+    <script src="/games/static/games.review.js"></script>
     <script src="/games/static/games.seat.js"></script>
     <script src="/games/static/games.manage.js"></script>
     <script src="/games/static/games.play.js"></script>

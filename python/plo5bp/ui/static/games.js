@@ -656,7 +656,19 @@ function lobbyTick() {
   });
 }
 
+// Hand review (2026-10-03, games.review.js): the page of the player's uploaded hand
+// histories — no table, no lobby poll.
+function showReview(push) {
+  stopLive();
+  G.gameId = null;
+  G.state = null;
+  if (G.lobbyPoll) { clearInterval(G.lobbyPoll); G.lobbyPoll = null; }
+  if (push && location.pathname !== "/games/review") history.pushState(null, "", "/games/review");
+  if (HG.ui && HG.ui.showReview) HG.ui.showReview();
+}
+
 async function route() {
+  if (location.pathname === "/games/review") { showReview(false); return; }
   const m = location.pathname.match(/^\/games\/t\/([^/]+)$/);
   if (m) {
     // a link to one hand (the replayer's "Copy link"): the table, then that hand on top
@@ -733,7 +745,7 @@ function applyPrefs() {
 HG.core = {
   G, $, j, post, act, deal, tablePost, refreshNow, fmtAmt, dollars, toCents, readAmount, esc, html, raw, isHTML, put, applyVars, chipsToCents, centsToChips, actionKind,
   potBetTo, clampRaiseTo, raiseBoundsTo, myTurn, inHandAlive, heroToCallCents, setPreAction, savePrefs,
-  applyPrefs, motionOn, reloadForUpdate, openTable, showLobby, loadLobby, showErr, startLive, stopLive, setClub,
+  applyPrefs, motionOn, reloadForUpdate, openTable, showLobby, showReview, loadLobby, showErr, startLive, stopLive, setClub,
 };
 
 // Who is signed in. A hiccup — the server restarting during a deploy, a flaky phone

@@ -172,7 +172,7 @@ def test_the_felt_reads_the_effective_motion():
 
 
 # --------------------------------------------------------------- FE-005 (the UI modules)
-UI_MODULES = ["games.ui.js", "games.lobby.js", "games.history.js", "games.seat.js", "games.manage.js"]
+UI_MODULES = ["games.ui.js", "games.lobby.js", "games.history.js", "games.review.js", "games.seat.js", "games.manage.js"]
 
 LOAD_HARNESS = r"""
 const fs = require("fs"), vm = require("vm");

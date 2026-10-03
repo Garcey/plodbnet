@@ -15,7 +15,7 @@
     5. Table: top bar and page layout
     6. Side panel, Manage drawer and their building blocks
     7. Dialogs, menus, toasts and page notices
-    8. Hand history, replayer, stats and the profit graph
+    8. Hand history, replayer, stats, the profit graph and Hand review
     9. Verified shuffle
    10. PLO67: the burn cards
    11. Money: settling up, receipts
@@ -584,7 +584,10 @@ table.ledger tr.gone td { opacity: 0.55; }
 .dr-body { flex: 1; min-height: 0; overflow: auto; padding: 18px; display: flex; flex-direction: column; gap: 18px; }
 .dr-foot { padding: 14px 18px calc(14px + env(safe-area-inset-bottom)); border-top: 1px solid var(--line); display: flex; gap: 10px; flex: none; }
 .dr-foot .btn { flex: 1; }
-.layer { position: absolute; inset: 0; } /* a dialog's or the drawer's layer (games.ui.js openModal, games.manage.js) */
+.layer { position: absolute; inset: 0; isolation: isolate; } /* a dialog's or the drawer's layer (games.ui.js openModal, games.manage.js) */
+/* (isolate: each layer is its own stacking context, so a dialog opened later covers ALL of an
+   earlier one — the replayer's seats (.rp-seat z-index 2) used to show through "Open this
+   spot in Study?") */
 .dr-note { margin: -6px 0 0; color: var(--tx-3); font-size: 12px; text-align: center; }
 /* a setting that saved itself (games.ui.js savedFlash) */
 .field.saved > span::after, .setrow.saved > div > b::after { content: "Saved"; margin-left: 8px; padding: 1px 7px; border-radius: 99px; background: rgba(53, 200, 120, 0.16); color: #7dffb3; font: 700 10px var(--font); letter-spacing: 0.4px; text-transform: none; vertical-align: 1px; animation: savedin 0.25s var(--ease); } /* (fades in; games.ui.js takes it away after 1.6 s) */
@@ -753,7 +756,7 @@ body.in-lobby.has-joinreq #toast-root { top: 64px; }
   body.in-lobby.has-joinreq .joinreq.updcard { bottom: calc(150px + env(safe-area-inset-bottom)); }
 }
 
-/* ========== 8. Hand history, replayer, stats and the profit graph ========== */
+/* ========== 8. Hand history, replayer, stats, the profit graph and Hand review ========== */
 .modal.xwide { width: min(1080px, 100%); }
 .rp { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 16px; }
 .rp-main { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
@@ -832,13 +835,68 @@ body.in-lobby.has-joinreq #toast-root { top: 64px; }
 .rp-center .rp-burns .mini-cards { --cw: 20px; min-height: 28px; }
 .log-street .burn-note { text-transform: none; letter-spacing: 0; font-weight: 600; color: var(--tx-3); }
 .log-street .burn-note.red { color: #ff9aa6; }
+/* Hand review (games.review.js — the paid page of a player's uploaded ClubGG hands): the
+   drop zone, the numbers, the two-line results graph (net won + all-in EV) and the rows */
+#review-view { overflow: auto; } /* (a page of its own, like #lobby: the body never scrolls) */
+.rv-main { display: flex; flex-direction: column; gap: 16px; }
+.rv-hero { display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap; }
+.rv-hero h1 { margin: 0 0 6px; font-size: 30px; line-height: 1.12; letter-spacing: -0.6px; color: var(--bright); }
+.rv-hero h1 em { font-style: normal; background: linear-gradient(90deg, var(--gold), #fff2c4); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.rv-hero p { margin: 0; color: var(--tx-2); max-width: 640px; }
+.rv-drop { display: flex; align-items: center; gap: 14px; padding: 18px 20px; border-radius: 14px; border: 1.5px dashed rgba(236, 201, 119, 0.45); background: rgba(236, 201, 119, 0.05); cursor: pointer; transition: border-color 0.15s, background 0.15s; }
+.rv-drop:hover, .rv-drop.over, .rv-drop:focus-within { border-color: var(--gold); background: rgba(236, 201, 119, 0.1); }
+.rv-drop-ico { display: inline-flex; align-items: center; justify-content: center; width: 46px; height: 46px; border-radius: 12px; background: rgba(236, 201, 119, 0.14); color: var(--gold); flex: none; }
+.rv-drop-txt { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.rv-drop-txt b { color: var(--bright); font-size: 15px; }
+.rv-drop-txt small { color: var(--tx-3); font-size: 12.5px; }
+.rv-up { position: relative; display: flex; align-items: center; gap: 10px; padding: 10px 14px 12px; border-radius: 12px; background: rgba(255, 255, 255, 0.035); border: 1px solid var(--line); font-size: 13px; overflow: hidden; }
+.rv-bar { position: absolute; left: 0; bottom: 0; height: 3px; width: var(--w, 0%); background: var(--accent); transition: width 0.3s var(--ease); } /* (--w: games.review.js) */
+.rv-note { display: flex; align-items: center; gap: 8px; padding: 9px 13px; border-radius: 12px; background: rgba(255, 255, 255, 0.035); border: 1px solid var(--line); font-size: 13px; color: var(--tx-2); }
+.rv-note.ok { border-color: rgba(53, 200, 120, 0.35); }
+.rv-note.err { border-color: rgba(242, 86, 106, 0.45); color: #ffb3bd; }
+.rv-stats { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+.rv-stats b.pos { color: var(--ok); }
+.rv-stats b.neg { color: var(--danger); }
+.rv-stats small { color: var(--tx-3); font-size: 11px; }
+.rv-graph .pg-box { height: 220px; }
+.rv-line { fill: none; stroke-width: 2.2; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+.rv-line.net { stroke: var(--ok); }
+.rv-line.ev { stroke: var(--gold); stroke-dasharray: 6 4; }
+.pg-dot.ev { box-shadow: 0 0 0 3px rgba(236, 201, 119, 0.45); }
+.rv-legend { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.rv-legend i { display: inline-block; width: 14px; height: 3px; border-radius: 2px; }
+.rv-legend i.lg-net { background: var(--ok); }
+.rv-legend i.lg-ev { background: var(--gold); margin-left: 10px; }
+.rv-list-sec { display: flex; flex-direction: column; gap: 10px; }
+.rv-row { grid-template-columns: minmax(0, 1fr) auto auto; }
+.rv-row .who { grid-column: 1 / -1; }
+.rv-res { display: flex; flex-direction: column; align-items: flex-end; gap: 1px; }
+.rv-res small { font-size: 11px; color: var(--tx-3); }
+.rv-grade { min-width: 78px; text-align: right; }
+.rv-pay { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(260px, 1fr); gap: 22px; padding: 22px; border-radius: 16px; background: var(--panel); border: 1px solid var(--line); }
+.rv-feats { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 14px; }
+.rv-feats li { display: flex; gap: 12px; align-items: flex-start; color: var(--tx-2); }
+.rv-feats li .ico { color: var(--gold); flex: none; margin-top: 2px; }
+.rv-feats b { color: var(--bright); }
+.rv-pay-cta { display: flex; flex-direction: column; justify-content: center; gap: 10px; }
 @media (max-width: 760px) {
   .rp { grid-template-columns: minmax(0, 1fr); }
+  .rv-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .rv-pay { grid-template-columns: minmax(0, 1fr); }
   .rp-felt { margin: 22px 30px 30px; aspect-ratio: 1.5 / 1; }
   .rp-list { max-height: 180px; }
 }
 @media (max-width: 520px) {
   .pg-box { height: 108px; }
+  .rv-graph .pg-box { height: 160px; }
+  .rv-hero h1 { font-size: 25px; }
+  .rv-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .rv-drop { padding: 14px; gap: 10px; }
+  .rv-drop-ico { width: 38px; height: 38px; }
+  /* a row's cards (yours + both boards) take the whole width; the result and the grade under them */
+  .rv-row { grid-template-columns: minmax(0, 1fr) auto; }
+  .rv-row .hr-cards { grid-column: 1 / -1; }
+  .rv-res { flex-direction: row; align-items: baseline; gap: 8px; justify-self: start; }
   /* the hand replayer on a phone: a rounder felt (the seats get vertical room), smaller
    cards and plates, and the second row of controls wraps ("Open in Study" fell off) */
   .rp-felt { margin: 30px 6px 40px; aspect-ratio: 1 / 1.08; }

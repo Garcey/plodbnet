@@ -238,7 +238,11 @@ carries `free_for_all`, the account chip says FREE ACCESS and the landing page
 says so. Sign-in stays. The paywall / quota / Stripe code is untouched and still
 tested: `tests/python/conftest.py` defaults the test session to
 `PLO5BP_FREE_FOR_ALL=0`; `test_public_free_mode.py` boots production's way. Set
-the env var to `0` in `/etc/wrapgto/env` to bring the paywall back.
+the env var to `0` in `/etc/wrapgto/env` to bring the paywall back. **One exception
+(2026-10-03): Hand review** (below) is paid even while FREE_FOR_ALL — it keeps a
+player's hand histories on the server — so `/billing/checkout` stays open (it 409'd
+before) and `/me` carries `paid` (`public._paid`: admin / comp / live subscription;
+`_entitled` = FREE_FOR_ALL or `_paid`).
 
 **Workspace UI (2026-09-22; the home games' table since 2026-10-01):** Study / Trainer
 sit next to the home games but stay a TOOL. Layout: slim `#top-bar` (mode tabs, format,
@@ -505,6 +509,56 @@ is smaller"):
   chips into the replay's `[min_raise_chips, max_raise_chips]` before scoring, and
   `openInStudy` clamps into Study's `raise_bounds` — a bet above what anyone can call is
   the same bet as the capped one (its excess comes back), so nothing is mis-graded.
+
+Hand review (2026-10-03 — `tests/python/site/test_public_hand_review.py`; owner: "create a page,
+and this should be the one thing that is paywalled because it uses server storage, where you
+can drop the zip folder in … checks for duplicate hands … graph your profit and loss along side
+your all-in ev … [which] needs to take side pots into account … a hand history list similar to
+in the home games where you can pull up a spot into study mode … check all your decision nodes
+against the network so that you can easily find your worst played hands"):
+
+- **The page** `/games/review` (`handreview_store.install`, after the home games: the games
+  page, client and `/games/api` guard) = a third view of games.html (`#review-view`,
+  `games.review.js`, routed by `games.js route()`; links from the lobby's top bar and the
+  Study / Trainer tabs via `/me.review`). Every `/games/api/review/*` route needs
+  `public._paid` (402 `subscription_required` otherwise); the page itself shows what the
+  subscription buys and starts checkout with `{"next": "/games/review"}` (the success page
+  confirms it). Deleting your hands is allowed without a subscription.
+- **Reading** (`handreview.py`, pure): ClubGG exports GG-network text, one `.txt` per
+  session, in a `.zip` (`read_upload`: no extraction to disk, entry / size caps, every read
+  capped too — a zip's declared sizes can lie). PLO5 double-board bomb pots only
+  (`parse_hand`; other games are skipped with a reason). GG prints each street's betting
+  ONCE PER BOARD under each board's header — one round, the copies must agree; the
+  `*** SHOWDOWN ***` blocks are board 1 then board 2, one `collected` line per pot (main
+  first); the summary's "won ($X)" leaves side pots out (never read it). Opponents are
+  ClubGG's anonymous ids (shown as "Player AA11"); the uploader is `Hero`.
+- **The money is ClubGG's**: `ledger()` (antes, missed blinds = dead money, bets, the
+  uncalled bet, what each collected; a pot that doesn't add up is refused). **All-in EV**
+  (`allin_ev`): when nobody acted on a later street and 2+ hands reached the showdown,
+  every pot LAYER (`runout.pot_layers`) is worth half x share on each board, `share` = the
+  hero's chance on that board against THAT LAYER'S players (`board_equities(dead=…,
+  digits=None)` — the all-in hand that can't win a side pot keeps its cards dead; exact over
+  the missing cards). Checked against a brute force of both boards' joint runouts paid by
+  `build_awards` (2026-10-03: 65 real all-ins, every turn all-in to the cent).
+- **The record** (`make_record`) is the home games' hand record built from ClubGG's
+  numbers (`kind` "review", `dead_cents` per seat, `study_upto`, `net_cents`,
+  `ev_net_cents`, `allin_ev`), so `openHand(…, {url, noLink})` replays it and
+  `openInStudy` copies any spot. **The engine replay** (`engine_replay`, the home games' bet
+  rule) checks it and becomes the grading job (the HERO's decisions only — other players'
+  cards are unknown, and the actor's observation never uses them): dead money is cut from
+  the poster's engine stack (the pot is that much short — noted), and it stops at the one
+  rule ClubGG doesn't share — a player who CHECKED may raise a short all-in there (the
+  engine keeps the TDA rule: call or fold) — so decisions before it are graded and Study
+  stops there (`study_upto`; the replayer disables the button past it).
+- **Store** (`handreview_store.py`, component "handreview"): `review_hands` (PRIMARY KEY
+  (user_id, hand_key) = the duplicate check; the record, the sortable numbers, the job
+  until graded, the hand's text zlib'd for re-reading later) and `review_uploads` (progress
+  + report). ONE import worker site-wide (`queue_upload`: one upload per user at a time, a
+  short queue, body limit `MAX_UPLOAD_BYTES` 25 MB, `MAX_HANDS_PER_USER`
+  `$PLO5BP_REVIEW_MAX_HANDS` 200k) and one grader (`homegame.grade_hand` with the served
+  model — a placeholder never grades; `PLO5BP_REVIEW_GRADING`, off in the tests). ~35 ms a
+  hand to read (the exact equities), grading ~2 s for 350 hands. "Download my data" lists
+  the hands; "Delete my account" deletes them (`ACCOUNT_HOOKS["hand_review"]`).
 
 Premium tables pass (2026-09-21 — `tests/python/homegame/test_homegame_premium.py`):
 

@@ -66,7 +66,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import quote, urlsplit
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import Headers
@@ -1255,12 +1255,26 @@ def _entitlement_needs_stripe(user: sqlite3.Row | None) -> bool:
 
 
 def _entitled(user: sqlite3.Row | None) -> bool:
-    """Full access: admin, comp grant, or active stripe subscription.
+    """Full access: everyone signed in while ``FREE_FOR_ALL``, else a paid account
+    (``_paid``).
 
     May block on Stripe (see ``_entitlement_needs_stripe``)."""
     if user is None:
         return False
-    if FREE_FOR_ALL or _is_admin(user):
+    if FREE_FOR_ALL:
+        return True
+    return _paid(user)
+
+
+def _paid(user: sqlite3.Row | None) -> bool:
+    """A PAID account: admin, comp grant, or active stripe subscription — what
+    the site's server-side storage (Hand review, 2026-10-03) needs even while
+    ``FREE_FOR_ALL`` opens everything else to every signed-in user.
+
+    May block on Stripe when a re-validation is due: call it off the event loop."""
+    if user is None:
+        return False
+    if _is_admin(user):
         return True
     if user["sub_status"] != "active":
         return False
@@ -2501,6 +2515,10 @@ def install(
         # those literals to every visitor (review 2026-09-20 F1).
         if _homegame_access(user):
             payload["homegame"] = {"href": "/games", "label": "Home games"}
+            # Hand review (2026-10-03): the one paid page, even while FREE_FOR_ALL —
+            # it keeps your uploaded hand histories on the server.
+            payload["review"] = {"href": "/games/review", "label": "Hand review"}
+        payload["paid"] = _paid(user)
         return payload
 
     # --- Account self-service (ACC-009 / SEC-017 / SEC-016) --------------------------------
@@ -2569,15 +2587,18 @@ def install(
             DB.kv_set("stripe_price_id", price["id"])
             return price["id"]
 
+    #: Pages a checkout may come back to (``next``); anything else = the Study page.
+    _CHECKOUT_RETURN = ("/", "/games/review")
+
     @app.post("/billing/checkout")
-    def billing_checkout(request: Request):
-        if FREE_FOR_ALL:
-            # Nobody should be able to start paying for something that is free.
-            raise HTTPException(
-                status_code=409,
-                detail="WrapGTO is free while the models are in development — there is nothing to buy right now.",
-            )
+    def billing_checkout(request: Request, body: dict | None = Body(default=None)):
+        # (2026-10-03) While FREE_FOR_ALL the subscription still buys the one paid
+        # thing — Hand review, which keeps your hand histories on the server — so
+        # checkout stays open; everything else is free either way.
         user = _require_user(request)
+        back = str((body or {}).get("next") or "/")
+        if back not in _CHECKOUT_RETURN:
+            back = "/"
         if not STRIPE_SECRET_KEY:
             raise HTTPException(
                 status_code=503,
@@ -2590,8 +2611,8 @@ def install(
         kwargs: dict[str, Any] = {
             "mode": "subscription",
             "line_items": [{"price": _price_id(), "quantity": 1}],
-            "success_url": f"{BASE_URL}/?checkout=success&session_id={{CHECKOUT_SESSION_ID}}",
-            "cancel_url": f"{BASE_URL}/?checkout=cancel",
+            "success_url": f"{BASE_URL}{back}?checkout=success&session_id={{CHECKOUT_SESSION_ID}}",
+            "cancel_url": f"{BASE_URL}{back}?checkout=cancel",
             "client_reference_id": str(user["id"]),
             "allow_promotion_codes": True,
         }
@@ -3160,8 +3181,12 @@ def install(
     )
 
     from plo5bp.ui import homegame as _homegame
+    from plo5bp.ui import handreview_store as _review
 
     _homegame.install(app, static_dir=static_dir)
+    # Hand review (2026-10-03): the paid page of uploaded hand histories — on the
+    # home games' page, client and API guard, so installed after them.
+    _review.install(app, static_dir=static_dir)
 
     logger.info(
         "PUBLIC service installed: base=%s db=%s admins=%s oauth=%s email=%s stripe=%s"

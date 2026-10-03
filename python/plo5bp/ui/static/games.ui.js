@@ -928,6 +928,7 @@
 
   function showLobby() {
     $("lobby").hidden = false; $("table-view").hidden = true; document.body.classList.add("in-lobby");
+    if ($("review-view")) $("review-view").hidden = true;
     U.updLater = false;
     if (UI.closeDrawer) UI.closeDrawer();
     U.lobbySig = "";
@@ -935,6 +936,7 @@
   }
   function showTable() {
     $("lobby").hidden = true; $("table-view").hidden = false;
+    if ($("review-view")) $("review-view").hidden = true;
     if ($("updcard")) $("updcard").hidden = true;  // (the table offers it in the dock)
     document.body.classList.remove("in-lobby");
     U.eventSeen = null; U.chatSig = ""; U.logSig = ""; U.ledgerSig = ""; U.hands = null; U.handsFor = null; U.unread = 0;

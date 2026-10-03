@@ -52,10 +52,13 @@ def test_study_is_unlocked(server):
     assert c.get("/formats").status_code == 200
 
 
-def test_checkout_is_closed_while_the_site_is_free(server):
+def test_checkout_stays_open_for_the_one_paid_page(server):
+    # (2026-10-03) The subscription still buys Hand review — your hand histories on
+    # the server — so checkout is open while everything else is free. No Stripe key
+    # in the tests: "not configured", never "it's free".
     c = _login(server, "wallet@example.com")
     r = c.post("/billing/checkout")
-    assert r.status_code == 409 and "free" in r.json()["detail"].lower()
+    assert r.status_code == 503 and "not configured" in r.json()["detail"].lower()
 
 
 def test_signed_out_visitors_still_have_to_sign_in(server):
