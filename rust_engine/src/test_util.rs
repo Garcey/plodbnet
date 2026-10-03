@@ -34,6 +34,7 @@ pub(crate) fn plo(variant: Variant, stacks: &[u64], ante: u64, bb: u64) -> GameC
         bb,
         sb: 0,
         variant,
+        reach_cap: true,
     }
 }
 
@@ -46,6 +47,7 @@ pub(crate) fn nlh(stacks: &[u64], ante: u64, sb: u64, bb: u64) -> GameConfig {
         bb,
         sb,
         variant: Variant::NlhSingle,
+        reach_cap: true,
     }
 }
 

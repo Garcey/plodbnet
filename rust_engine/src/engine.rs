@@ -1213,20 +1213,35 @@ impl GameState {
     /// chips are dead money under side-pot rules. Pot-limit variants cap
     /// at the PL total; no-limit variants have no size cap of their own
     /// (the actor's stack is applied by `max_raise_chips`).
+    ///
+    /// With `config.reach_cap` off (the home games) the opponents' reach caps
+    /// nothing — only the PL total (no-limit: the actor's own stack) — as long
+    /// as somebody can still put in more than the current bet; when nobody
+    /// can, it still caps there, so no bet or raise is legal (there would be
+    /// nobody to call it).
     pub fn max_bet_total(&self) -> u64 {
         let actor = match self.actor {
             Some(a) => a,
             None => return 0,
         };
         let reachable = self.max_other_reachable_total();
+        let uncapped = !self.config.reach_cap && reachable > self.bet_to_call;
         if !self.config.variant.pot_limit() {
-            return reachable;
+            return if uncapped {
+                self.street_commit[actor] + self.stacks[actor]
+            } else {
+                reachable
+            };
         }
         let current_commit = self.street_commit[actor];
         let stack = self.stacks[actor];
         let to_call = self.bet_to_call.saturating_sub(current_commit).min(stack);
         let pl_total = self.bet_to_call + self.pot + to_call;
-        pl_total.min(reachable)
+        if uncapped {
+            pl_total
+        } else {
+            pl_total.min(reachable)
+        }
     }
 
     /// True when the current actor is locked out of raising by the
@@ -1257,6 +1272,7 @@ impl GameState {
     /// alive opponent can reach, the floor collapses to that effective
     /// cap. Result: `min == max == cap_delta`, a single-amount raise
     /// (covering the short opponent, sub-1BB but legal in real poker).
+    /// Not with `config.reach_cap` off (the home games): the floor stays.
     pub fn min_raise_chips(&self) -> u64 {
         let actor = match self.actor {
             Some(a) => a,
@@ -1281,6 +1297,11 @@ impl GameState {
         if max_other <= self.bet_to_call {
             return 0;
         }
+        if !self.config.reach_cap {
+            // (the home games) no covering bet: the floor stays the floor, and
+            // what a short caller cannot match comes back to the bettor
+            return if delta > stack { 0 } else { delta };
+        }
         let cap_delta = max_other.saturating_sub(current_commit);
         if cap_delta == 0 {
             return 0;
@@ -1296,8 +1317,9 @@ impl GameState {
     }
 
     /// Largest chip delta the current actor can add as a raise/bet,
-    /// capped by the PL maximum, the actor's stack, and the deepest
-    /// alive opponent's reachable total. Zero when no raise is legal.
+    /// capped by the PL maximum, the actor's stack, and (`config.reach_cap`,
+    /// on everywhere but the home games) the deepest alive opponent's
+    /// reachable total. Zero when no raise is legal.
     ///
     /// In the cover-short regime (`min_bet_total > max_other_reachable`)
     /// this returns the effective-cap delta — `min_raise_chips` clamps
@@ -3353,6 +3375,7 @@ mod tests {
             bb: 10_000,
             sb: 5_000,
             variant: Variant::NlhSingle,
+            reach_cap: true,
         };
         let mut g = GameState::new_hand(cfg, 9, 0);
         assert_eq!(g.street_commit[2], 3_000, "short post");
@@ -5196,5 +5219,151 @@ mod plo67_tests {
             all.dedup();
             assert_eq!(all.len(), len, "{tag}: duplicate card");
         }
+    }
+}
+
+#[cfg(test)]
+mod reach_cap_off_tests {
+    //! The home games' betting rule (`GameConfig::reach_cap == false`, owner
+    //! 2026-10-02): a bet is capped at the pot limit and the bettor's own stack,
+    //! never at what the shorter stacks can call — and what nobody matches comes
+    //! back to the bettor (it is no pot).
+    use super::review_2026_09_20_tests::{assert_settlement, play_random_hand};
+    use super::*;
+    use crate::test_util::{nlh, plo};
+    use rand::Rng;
+    use rand_chacha::rand_core::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
+
+    const BB: u64 = 10;
+
+    /// The owner's example: 200 / 150 / 100 behind after the antes, 180 in the pot.
+    fn three_way(reach_cap: bool) -> GameState {
+        let mut cfg = plo(Variant::Plo5DoubleBomb, &[260, 210, 160], 60, BB);
+        cfg.reach_cap = reach_cap;
+        GameState::new_hand(cfg, 7, 2)
+    }
+
+    #[test]
+    fn a_bet_is_capped_at_the_pot_not_at_what_the_shorter_stacks_can_call() {
+        let capped = three_way(true);
+        assert_eq!(capped.actor, Some(0));
+        assert_eq!(capped.pot, 180);
+        assert_eq!(capped.stacks, vec![200, 150, 100]);
+        assert_eq!(
+            capped.max_raise_chips(),
+            150,
+            "the trained rule: the 150 stack's reach"
+        );
+        let g = three_way(false);
+        assert_eq!(g.min_raise_chips(), BB);
+        assert_eq!(g.max_raise_chips(), 180, "the home games: the pot");
+        assert!(
+            g.legal_action_mask()[Action::BetPct100 as usize],
+            "a pot-sized bet"
+        );
+    }
+
+    #[test]
+    fn what_the_short_caller_cannot_match_comes_back() {
+        let mut g = three_way(false);
+        g.apply_raise_chips(180).expect("a pot-sized bet");
+        g.apply(Action::Fold); // the 150 stack
+        g.apply(Action::CheckCall); // the 100 stack: all in
+        assert!(g.is_terminal());
+        assert_eq!(g.total_commit, vec![240, 60, 160]);
+        assert_settlement(&g, "the owner's example");
+        let p = g.payouts();
+        assert_eq!(p[1], -60, "the fold loses its ante");
+        // the bettor risks the 100 the short stack matched (and the ante): the
+        // other 80 was never called and comes back, whoever wins
+        assert!((-160..=220).contains(&p[0]), "bettor {p:?}");
+        assert_eq!(p[0] + p[2], 60);
+    }
+
+    #[test]
+    fn the_floor_stays_the_floor_against_a_stack_under_one_bb() {
+        // HU after the antes: 75 (under 1bb) vs 1700, 600 in the pot; the deep seat acts.
+        let mut cfg = plo(Variant::Plo5DoubleBomb, &[375, 2000], 300, 100);
+        cfg.reach_cap = false;
+        let mut g = GameState::new_hand(cfg, 0, 0);
+        assert_eq!(g.actor, Some(1));
+        assert_eq!(g.min_raise_chips(), 100, "no 75-chip covering bet");
+        assert_eq!(g.max_raise_chips(), 600, "the pot");
+        g.apply_raise_chips(100).unwrap();
+        g.apply(Action::CheckCall); // all in for 75
+        assert!(g.is_terminal());
+        assert_settlement(&g, "a caller under 1bb");
+        let p = g.payouts();
+        assert!((-375..=375).contains(&p[0]), "{p:?}"); // 25 of the 100 come back
+    }
+
+    #[test]
+    fn nothing_to_bet_into_when_nobody_can_put_in_more() {
+        // HU: the short seat acts first and shoves; the deep seat may call or
+        // fold — a raise nobody could call is not offered, capped or not.
+        for reach_cap in [true, false] {
+            let mut cfg = plo(Variant::Plo5DoubleBomb, &[1300, 350], 300, 100);
+            cfg.reach_cap = reach_cap;
+            let mut g = GameState::new_hand(cfg, 3, 0);
+            assert_eq!(g.actor, Some(1));
+            g.apply(Action::AllIn);
+            assert_eq!(g.actor, Some(0));
+            assert_eq!(
+                (g.min_raise_chips(), g.max_raise_chips()),
+                (0, 0),
+                "reach_cap {reach_cap}"
+            );
+            let m = g.legal_action_mask();
+            assert!(m[Action::Fold as usize] && m[Action::CheckCall as usize]);
+            assert!(
+                m.iter().skip(2).all(|&b| !b),
+                "reach_cap {reach_cap}: {m:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn random_hands_settle_exactly_without_the_cap() {
+        let mut rng = ChaCha8Rng::seed_from_u64(0x2026_1002);
+        let variants = [
+            Variant::Plo5DoubleBomb,
+            Variant::Plo5DoubleBomb,
+            Variant::Plo6DoubleBomb,
+            Variant::Plo67DoubleBomb,
+            Variant::NlhSingle,
+        ];
+        let mut overbets = 0;
+        for hand in 0..3_000u64 {
+            let variant = variants[rng.gen_range(0..variants.len())];
+            let n = rng.gen_range(2..=variant.max_seats().min(6));
+            let stacks: Vec<u64> = (0..n)
+                .map(|_| match rng.gen_range(0..3) {
+                    0 => rng.gen_range(1..=3 * BB),
+                    1 => rng.gen_range(3 * BB..=40 * BB),
+                    _ => rng.gen_range(40 * BB..=400 * BB),
+                })
+                .collect();
+            let mut cfg = if variant == Variant::NlhSingle {
+                nlh(&stacks, BB / 2, BB / 2, BB)
+            } else {
+                plo(variant, &stacks, BB, BB)
+            };
+            cfg.reach_cap = false;
+            let seed = rng.gen::<u64>();
+            let button = rng.gen_range(0..n);
+            let tag =
+                format!("hand {hand} {variant:?} stacks {stacks:?} seed {seed} button {button}");
+            let g = play_random_hand(cfg, seed, button, None, &mut rng, &tag);
+            assert_settlement(&g, &tag);
+            // a bet above every other seat's whole stake (the cap would have
+            // stopped it) — counted so the test knows it saw the new rule at work
+            let mut commits = g.total_commit.clone();
+            commits.sort_unstable();
+            if commits[n - 1] > commits[n - 2] && !g.folded.iter().all(|&f| f) {
+                overbets += 1;
+            }
+        }
+        assert!(overbets > 100, "only {overbets} hands had an uncalled bet");
     }
 }

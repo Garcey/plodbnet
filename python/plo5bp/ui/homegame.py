@@ -130,6 +130,7 @@ from plo5bp.ui.common import STREET_NAMES, position_name
 from plo5bp.ui.hand_describe import describe_made_hand
 from plo5bp.ui.runout import (
     AWARD_SECS, board_equities, build_awards, display_pots, money_flows, plo67_equities,
+    uncalled_bet,
 )
 from plo5bp.ui import fairdeal
 from plo5bp.ui import homegame_export
@@ -520,6 +521,9 @@ class HandState:
     terminal_commit: list[int] = field(default_factory=list)
     pot_awards: list[dict[str, Any]] = field(default_factory=list)
     pots: list[dict[str, Any]] = field(default_factory=list)  # named layers, deepest first
+    # The bet nobody matched (seat -> chips): it went back to its owner when the
+    # betting closed — no pot, no award (``runout.uncalled_bet``; owner, 2026-10-02).
+    uncalled: dict[int, int] = field(default_factory=dict)
     # (len_a, len_b) -> {seat: {"a": share, "b": share}}, computed ONCE per
     # all-in hand from the alive seats' holes (review 2026-09-20 G3).
     equity_by_len: dict[tuple[int, int], dict[int, dict[str, float]]] = field(default_factory=dict)
@@ -3355,6 +3359,10 @@ def _runout_view(t: LiveTable, sh: _Shared) -> dict[str, Any]:
         "pot_awards": shown_awards,
         "pots": list(t.pots or []) if t.runout_active else [],
         "live_pots": sh.live_pots,
+        # the bet nobody matched, back with its owner (seat -> cents): the table slides
+        # those chips home instead of into the pot
+        "returned": ({str(s): chips_to_cents(c, t.bb_cents) for s, c in t.uncalled.items()}
+                     if t.phase == "showdown" else {}),
     }
 
 
@@ -3714,6 +3722,9 @@ def _deal_now_locked(t: LiveTable) -> None:
         ante=t.ante_chips,
         bb=BB_CHIPS,
         variant=t.game["variant"],
+        # (owner, 2026-10-02) a bet is capped at the pot and the bettor's own stack —
+        # never at what the shorter stacks can call; what nobody matches comes back
+        reach_cap=False,
     )
     env = _make_env(cfg)
     nxt = t.fair_next if FAIR_ON else None
@@ -3910,7 +3921,12 @@ def _record_hand_locked(
                 seats[-1]["counts"] = [_hole_count_on(t, i, st) for st in (1, 2, 3)]
             if delta > 0:
                 winners.append((name, hand_cents.get(i, 0)))
-        pot_cents = chips_to_cents(sum(commit), t.bb_cents)
+        # the bet nobody matched went back to its owner: it was never in the pot (v3)
+        uncalled_rec = None
+        for u_seat, u_chips in t.uncalled.items():  # (one seat at most)
+            uncalled_rec = {"seat": int(u_seat), "cents": chips_to_cents(u_chips, t.bb_cents)}
+        returned = sum(int(c) for c in t.uncalled.values())
+        pot_cents = chips_to_cents(sum(commit) - returned, t.bb_cents)
         actions = _history_entries(raw, t.bb_cents)
         for k, a in enumerate(actions):  # who decided: the player, or the clock
             if k < len(t.hand_actions):
@@ -3936,6 +3952,7 @@ def _record_hand_locked(
             "bb_cents": int(t.bb_cents),
             "ante_cents": int(t.ante_cents),
             "pot_cents": pot_cents,
+            **({"uncalled": uncalled_rec} if uncalled_rec else {}),
             "showdown": bool(t.showdown_reveal),
             "board_a": full_a[:n_board],
             "board_b": full_b[:n_board],
@@ -4160,6 +4177,13 @@ def grade_hand(job: dict[str, Any], model: Any = None) -> list[dict[str, Any]]:
             break
         if int(info.actor) != int(seat):
             raise RuntimeError(f"replay diverged at action {k}: actor {info.actor} != {seat}")
+        # The table caps a bet at the pot and the bettor's stack only (``reach_cap``
+        # off); the network knows the rule it was trained on, where a bet also stops at
+        # what the deepest opponent can still put in. A bigger bet IS that bet — the
+        # rest came back uncalled — so it is replayed and graded as that.
+        chips = int(chips)
+        if int(gate) == GATE_RAISE and int(info.max_raise_chips) > 0:
+            chips = max(int(info.min_raise_chips), min(chips, int(info.max_raise_chips)))
         if by_player:
             dist = tr.attach_unclamped_brackets(
                 tr.compute_node_distribution(model, device, obs, info), info, spec
@@ -4269,6 +4293,19 @@ def _capture_rabbit(t: LiveTable, played_len: int) -> None:
     t.pots = []
     t.equity_by_len = {}
     t.runout_active = False
+    # The bet nobody matched goes back now, the way any card room does it: the
+    # bettor's stack has it from here on, the pot never had it, and no award pays it
+    # (it used to be a one-player "side pot" the bettor won at the showdown).
+    t.uncalled = {}
+    unc = uncalled_bet(t.terminal_commit)
+    if unc is not None:
+        u_seat, u_chips = unc
+        t.uncalled = {int(u_seat): int(u_chips)}
+        if u_seat < len(t.leftover_stacks):
+            t.leftover_stacks[u_seat] += int(u_chips)
+        t.terminal_pot = max(0, t.terminal_pot - int(u_chips))
+        _emit(t, "uncalled", f"Uncalled {_fmt_cents(chips_to_cents(u_chips, t.bb_cents))} "
+              f"returned to {_seat_name(t, u_seat)}")
     if len(alive) <= 1:
         if len(alive) == 1 and len(full_a) > played_len:
             # Host can switch rabbit hunting off: the undealt streets then
@@ -4300,6 +4337,8 @@ def _capture_rabbit(t: LiveTable, played_len: int) -> None:
     commit = list(t.terminal_commit)
     if len(commit) < t.num_seats:
         commit.extend([0] * (t.num_seats - len(commit)))
+    for u_seat, u_chips in t.uncalled.items():  # (returned above: not in any pot)
+        commit[u_seat] -= u_chips
     t.pot_awards = build_awards(
         holes,
         folded_full,

@@ -51,6 +51,7 @@ pub fn game_state_from_solver_root(
         bb,
         sb: bb / 2,
         variant: Variant::NlhSingle,
+        reach_cap: true,
     };
 
     // new_hand deals + posts; we rebuild fields after.

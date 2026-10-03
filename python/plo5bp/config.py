@@ -53,6 +53,13 @@ class GameConfig:
     ``variant`` selects the game; ``sb`` is the small blind in chips and
     only meaningful for blind variants (0 for bomb pots). ``ante`` is
     per player in both variants.
+
+    ``reach_cap`` (default True — the rule every network trains on, and Study /
+    the Trainer serve): a bet is also capped at what the deepest opponent can
+    still put in. False = the home games' rule (owner, 2026-10-02): only the pot
+    limit and the bettor's own stack cap it, and what nobody matches comes back
+    (the engine's ``GameConfig::reach_cap``). The batched training engine plays
+    the capped rule only.
     """
 
     num_seats: int = 6
@@ -62,6 +69,7 @@ class GameConfig:
     starting_stacks: tuple[int, ...] | None = None
     sb: int = 0
     variant: str = VARIANT_PLO5
+    reach_cap: bool = True
 
     def __post_init__(self) -> None:
         if self.variant not in _VARIANTS:

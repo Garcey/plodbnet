@@ -255,6 +255,17 @@ pub struct GameConfig {
     /// (`variant.has_preflop()`); 0 for bomb pots.
     pub sb: u64,
     pub variant: Variant,
+    /// `true` (every constructor): a bet or raise is also capped at what the
+    /// deepest alive opponent can still put in (chips above it have no caller),
+    /// and a 1bb floor that no opponent can reach collapses to a covering bet —
+    /// the rules every network is trained on and Study / the Trainer serve.
+    /// `false` (the home games, 2026-10-02 — the owner: "capped at the pot or
+    /// your own stack size, whichever is smaller"): only the variant's cap (pot
+    /// limit) and the actor's stack bound a bet, the floor is the floor, and what
+    /// nobody matches is refunded at the end (`double_board_payout`'s one-seat
+    /// layer). Either way a bet needs somebody able to put in more than the
+    /// current bet. See `GameState::max_bet_total` / `min_raise_chips`.
+    pub reach_cap: bool,
 }
 
 impl GameConfig {
@@ -273,6 +284,7 @@ impl GameConfig {
             bb,
             sb: 0,
             variant: Variant::Plo5DoubleBomb,
+            reach_cap: true,
         }
     }
 
@@ -286,6 +298,7 @@ impl GameConfig {
             bb,
             sb,
             variant: Variant::NlhSingle,
+            reach_cap: true,
         }
     }
 }

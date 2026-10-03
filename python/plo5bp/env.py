@@ -125,6 +125,7 @@ class BombPotEnv:
             starting_stacks=stacks,
             variant=self.config.variant,
             sb=self.config.sb,
+            reach_cap=bool(self.config.reach_cap),
             **_engine_obs_rev_kwargs(_RustGameState),
         )
         # Per-variant observation layout: PLO full 1171 / minimal 796, NLH 995.

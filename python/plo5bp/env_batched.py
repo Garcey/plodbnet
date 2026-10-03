@@ -86,6 +86,14 @@ class BatchedStep:
     actors: np.ndarray          # (N,) int8 — -1 for terminal
 
 
+def _require_reach_cap(config: GameConfig) -> None:
+    """The batched engine plays the rule every network trains on — bets capped at
+    what the deepest opponent can still put in. ``reach_cap=False`` is the home
+    games' table rule (``GameConfig.reach_cap``), never a training config."""
+    if not config.reach_cap:
+        raise ValueError("the batched engine plays the reach-capped rule only (reach_cap=True)")
+
+
 class BatchedBombPotEnv:
     def __init__(
         self,
@@ -97,6 +105,7 @@ class BatchedBombPotEnv:
     ):
         self.n = int(num_envs)
         self.config = config or GameConfig()
+        _require_reach_cap(self.config)
         mode = str(obs_mode or "full").strip().lower()
         if mode not in ("full", "minimal"):
             raise ValueError(
@@ -256,6 +265,7 @@ class BatchedBombPotEnv:
         zeroing the observation rows -- for a caller that resets every env
         right away (the reset re-encodes every row from scratch).
         """
+        _require_reach_cap(config)
         if not self.can_reconfigure(config):
             raise ValueError(
                 f"cannot reconfigure: seats/variant/hole mismatch "

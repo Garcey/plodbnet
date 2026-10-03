@@ -39,7 +39,17 @@
     const next = rec.actions[k] || null;
     if (next && String(next.street).toLowerCase() !== street) { street = String(next.street).toLowerCase(); clearBets(); }
     const over = !next;
-    if (over) clearBets();
+    if (over) {
+      clearBets();
+      // the bet nobody matched goes back to its owner, as at the table (2026-10-02): what
+      // the biggest stake put in beyond every other seat's whole stake is no pot
+      const put = rec.seats.map((x) => [x.seat, x.start_cents - seats[x.seat].stack]).sort((a, b) => b[1] - a[1]);
+      if (put.length > 1 && put[0][1] > put[1][1]) {
+        const back = put[0][1] - put[1][1];
+        seats[put[0][0]].stack += back;
+        pot -= back;
+      }
+    }
     const boardN = over ? Math.max(3, (rec.board_a || []).length) : street === "river" ? 5 : street === "turn" ? 4 : 3;
     return { seats, pot, street, next, over, boardN, last: k > 0 ? rec.actions[k - 1] : null };
   }
@@ -299,11 +309,17 @@
         num_seats: order.length, button_seat: Math.max(0, order.indexOf(rec.button)),
         starting_stacks: order.map((seat) => { const x = rec.seats.find((y) => y.seat === seat); return x.start_chips != null ? x.start_chips : toChips(x.start_cents); }), stacks_are_starting: true,
       });
-      await post("/cards", cards);
+      let st2 = ((await post("/cards", cards)) || {}).state || null;
       for (let i = 0; i < k; i++) {
         const a2 = rec.actions[i];
         const gate = a2.action === 0 ? "fold" : a2.action === 1 ? "check_call" : "raise";
-        await post("/action", gate === "raise" ? { gate, chips: a2.chips } : { gate });
+        // (the table caps a bet at the pot and the bettor's stack; Study also stops it
+        // at what the deepest opponent can still put in — the same bet: the rest came
+        // back uncalled)
+        let chips = a2.chips;
+        const rb = st2 && st2.raise_bounds;
+        if (gate === "raise" && rb && rb.max_chips > 0) chips = Math.max(rb.min_chips || 0, Math.min(chips, rb.max_chips));
+        st2 = ((await post("/action", gate === "raise" ? { gate, chips } : { gate })) || {}).state || st2;
       }
       if (btn) btn.disabled = false;
       if (tab && !tab.closed) { try { tab.opener = null; } catch (_) { /* fine */ } tab.location.replace("/?mode=study"); toast("Opened in Study (new tab)", "ok"); }

@@ -281,6 +281,7 @@ fn stk10_pot_at_flop_skips_sitting_out_seats() {
         bb: 10_000,
         sb: 0,
         variant: Variant::Plo5DoubleBomb,
+        reach_cap: true,
     };
     let mask = vec![true, true, false, true, false, false];
     let mut g = GameState::new_hand_with_mask(config.clone(), 5, 0, Some(mask));
@@ -310,6 +311,7 @@ fn obs_rev_switches_the_gated_dims_only() {
         bb: 10_000,
         sb: 0,
         variant: Variant::Plo5DoubleBomb,
+        reach_cap: true,
     };
     let g = (0..6)
         .map(|button| GameState::new_hand(config.clone(), 123, button))

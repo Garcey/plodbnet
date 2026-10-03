@@ -1310,12 +1310,19 @@
       newBets.push(cents);
       streetSum += cents;
     }
-    // 1. bets that went away -> collected into the pot
+    // 1. bets that went away -> collected into the pot; a bet nobody matched slides
+    //    back to its owner instead (the hand's `returned`, 2026-10-02: it is no pot)
     let collected = false;
+    const back = (s.phase === "showdown" && s.returned) || {};
     for (let i = 0; i < T.n; i++) {
       const b = T.bets[i];
       if (b.cents > 0 && newBets[i] < b.cents && newBets[i] === 0) {
-        if (ctx.animate) flyChips([T.seats[i].bx, T.seats[i].by], potCenter(), { cls: chipColor(b.cents, s), count: 3 });
+        const home = Math.min(b.cents, Number(back[i]) || 0);
+        if (ctx.animate) {
+          const from = [T.seats[i].bx, T.seats[i].by];
+          if (b.cents > home) flyChips(from, potCenter(), { cls: chipColor(b.cents - home, s), count: 3 });
+          if (home > 0) flyChips(from, [T.seats[i].x, T.seats[i].y], { cls: chipColor(home, s), count: 2, duration: 520 });
+        }
         collected = true;
       }
     }

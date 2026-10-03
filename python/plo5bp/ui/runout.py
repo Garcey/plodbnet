@@ -82,6 +82,23 @@ def display_pots(
     return [g for g in pot_groups(total_commit, folded) if g["chips"] > 0 and g["eligible"]]
 
 
+def uncalled_bet(total_commit: list[int]) -> tuple[int, int] | None:
+    """The bet nobody matched, as ``(seat, chips)``: what the biggest contributor put
+    in beyond every other seat's whole stake (a folded seat's included — its chips
+    were matched). It is no pot — it goes back to its owner when the betting closes,
+    exactly as the engine pays it (a one-seat layer) — so the table returns it
+    instead of showing a "side pot" the bettor wins from themselves (owner,
+    2026-10-02). ``None`` when the two biggest stakes are equal."""
+    c = [max(0, int(x)) for x in total_commit]
+    if len(c) < 2:
+        return None
+    order = sorted(range(len(c)), key=lambda i: c[i], reverse=True)
+    top, second = c[order[0]], c[order[1]]
+    if top <= second:
+        return None
+    return order[0], top - second
+
+
 def _distribute(amount: int, winners: list[int], button: int, n: int) -> dict[int, int]:
     if amount <= 0 or not winners:
         return {}

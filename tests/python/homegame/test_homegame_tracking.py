@@ -499,3 +499,75 @@ def test_admin_can_take_a_test_session_out_of_the_record_and_put_it_back(cast, h
     assert _post(adm, gid, "exclude", {"on": False}).status_code == 200
     assert hands_in(p[0]) == 1
     assert p[0].get("/games/api/my/stats").json()["hands"] == before
+
+
+# --- the betting cap and the bet nobody matched (owner, 2026-10-02) ----------------------
+
+
+def test_uncalled_bet_is_what_the_biggest_stake_put_in_beyond_every_other():
+    from plo5bp.ui.runout import uncalled_bet
+
+    assert uncalled_bet([2_400, 600, 1_600]) == (0, 800)
+    assert uncalled_bet([600, 1_600, 1_600]) is None, "matched: no uncalled bet"
+    assert uncalled_bet([600, 2_000, 900]) == (1, 1_100), "a folded stake counts as matched"
+    assert uncalled_bet([500]) is None
+
+
+def test_a_bet_is_capped_at_the_pot_and_what_nobody_matched_comes_back(cast, hg):
+    """(owner, 2026-10-02) "Bet sizes should be capped at the pot or your own stack size,
+    whichever is smaller, rather than trying to cater to shorter stacks" — and the part of
+    a bet nobody matched goes back to its owner instead of becoming a "side pot" the bettor
+    wins at the showdown. The owner's example: $200 / $150 / $100 behind, $180 in the pot
+    (a $60 ante): the $200 stack may bet the whole pot (it used to stop at the $150 stack's
+    $150), the $150 folds, the $100 calls all in — and $80 comes back."""
+    p = cast["p"]
+    body = {"name": "uncalled", "sb_cents": 50, "bb_cents": 100, "ante_cents": 6000,
+            "default_buyin_cents": 21000}
+    gid = p[0].post("/games/api/tables", json=body).json()["id"]
+    assert _post(p[1], gid, "sit", {"seat": 1, "buyin_cents": 26000}).status_code == 200
+    assert _post(p[2], gid, "sit", {"seat": 2, "buyin_cents": 16000}).status_code == 200
+    assert _post(p[0], gid, "run", {"running": True}).status_code == 200
+
+    def chips(cents):  # 1 bb = $1 = 10,000 engine chips
+        return cents * 100
+
+    s = _state(p[1], gid)
+    assert s["phase"] == "in_hand" and s["actor"] == 1, "first hand: button on seat 0"
+    assert [x["stack_cents"] for x in s["seats"][:3]] == [15000, 20000, 10000] and s["pot_cents"] == 18000
+    assert s["raise_bounds"]["max_chips"] == chips(18000), "the pot — not the $150 stack's reach"
+    assert _post(p[1], gid, "act", {"gate": "raise", "raise_to_chips": chips(18000)}).status_code == 200
+    assert _state(p[2], gid)["actor"] == 2
+    assert _post(p[2], gid, "act", {"gate": "check_call"}).status_code == 200  # all in for $100
+    assert _state(p[0], gid)["actor"] == 0
+    assert _post(p[0], gid, "act", {"gate": "fold"}).status_code == 200
+
+    t = hg.HUB.get(gid)
+    with t.lock:
+        assert t.runout_active
+        assert t.uncalled == {1: chips(8000)}
+        assert [pt["label"] for pt in t.pots] == ["Main pot"], "no one-player side pot"
+        assert all(a["eligible"] != [1] for a in t.pot_awards)
+        assert sum(a["chips"] for a in t.pot_awards) == chips(38000)
+    v = _state(p[0], gid)
+    assert v["returned"] == {"1": 8000}
+    assert v["seats"][1]["stack_cents"] == 10000, "$20 behind + the $80 back, from the start"
+    assert v["pot_cents"] == 38000
+    assert any(e["kind"] == "uncalled" and e["text"] == "Uncalled $80.00 returned to jeff"
+               for e in v["events"])
+
+    with t.lock:
+        t.runout_started_mono -= 600.0  # (skip the reveal)
+    rec = p[0].get(f"/games/api/tables/{gid}/hands/1").json()
+    assert rec["v"] >= 3 and rec["pot_cents"] == 38000
+    assert rec["uncalled"] == {"seat": 1, "cents": 8000}
+    assert sum(a["cents"] for a in rec["awards"]) == 38000
+    assert sum(x["delta_cents"] for x in rec["seats"]) == 0
+    bettor = next(x for x in rec["seats"] if x["seat"] == 1)
+    assert -16000 <= bettor["delta_cents"] <= 22000, "it risked only the $100 that was matched"
+    txt = p[0].get(f"/games/api/tables/{gid}/hands/export", params={"format": "txt"}).text
+    assert "Uncalled bet ($80.00) returned to jeff" in txt and "Total pot $380.00" in txt, txt
+    # the grader replays it under the network's own rule — the $180 bet is the $150 reach
+    # there, the same bet — and grades every decision
+    assert hg.wait_for_grading(30.0), "the grader never finished"
+    raw = _stored(hg, gid, 1)
+    assert {g["i"] for g in raw["grades"]} == set(range(len(raw["actions"])))

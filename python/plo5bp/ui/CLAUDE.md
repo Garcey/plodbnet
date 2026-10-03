@@ -458,6 +458,36 @@ PLO67 tables (2026-09-27 — `tests/python/homegame/test_homegame_plo67.py`; own
   History rows tuck 6-7 card hands (`.mini-cards.many`).
 - Club numbers: nothing new — `GAMES` drives the per-game switch / stats.
 
+The bet cap and the uncalled bet (2026-10-02 — `test_homegame_tracking.py`,
+`test_homegame_client_windows.py`, `tests/python/engine/test_reach_cap.py`; owner: "I don't
+want the bet sizes clipped at all … capped at the pot or your own stack size, whichever
+is smaller"):
+
+- **Bet cap**: the home games deal `GameConfig(reach_cap=False)` (`_deal_now_locked`) —
+  a bet or raise is capped by the pot (pot limit) and the bettor's stack only, never by
+  what the shorter stacks can call, and the floor is never clamped down to cover a short
+  stack (`rust_engine/CLAUDE.md`, "Config surface"). Study, the Trainer, training and the
+  CFR solver keep the trained rule (`reach_cap=True`, the default everywhere else).
+- **The uncalled bet goes back** (it used to be a one-player "Side pot" the bettor
+  "won" at the showdown): `runout.uncalled_bet(total_commit)` = the top stake beyond the
+  second one (folded stakes count — they were matched). `_capture_rabbit` returns it at
+  once — the bettor's `leftover_stacks` (so `display_stacks` all runout long), out of
+  `terminal_pot`, `t.uncalled` {seat: chips}, an "Uncalled $X returned to NAME" event
+  line — and takes it out of the commits `build_awards` / `display_pots` see, so no pot
+  and no award step carries it (the engine's payout already refunds it as a one-seat
+  layer: deltas and flows are unchanged). It exists only once betting is over (nobody
+  matched the top bet ⇒ everyone else still in is all in), so `live_pots` never sees it.
+  The view's `returned` {seat: cents} (showdown phase only) makes `updateMoney` slide
+  that part of the bettor's collected bet back to the seat instead of into the pot.
+- **Record v3** (`HAND_RECORD_VERSION`): `uncalled` {seat, cents} and `pot_cents`
+  without it; the text export prints "Uncalled bet ($X) returned to NAME" after the
+  last street's actions; the replayer's `replayState` refunds it at the end (any record
+  version — the stacks say what was put in).
+- **Grading / Open in Study** stay on the trained rule: the grader clamps a raise's
+  chips into the replay's `[min_raise_chips, max_raise_chips]` before scoring, and
+  `openInStudy` clamps into Study's `raise_bounds` — a bet above what anyone can call is
+  the same bet as the capped one (its excess comes back), so nothing is mis-graded.
+
 Premium tables pass (2026-09-21 — `tests/python/homegame/test_homegame_premium.py`):
 
 - **The SERVER deals** (`_auto_deal_tick_locked`, table setting
@@ -838,7 +868,7 @@ Premium tables pass (2026-09-21 — `tests/python/homegame/test_homegame_premium
     this street's bets stay in front of the players until the round closes, as
     on any site). Same names and order as `t.pots` (`_named_pots`), so the
     runout takes over in place; an uncalled excess only exists once betting is
-    over, so it never shows mid-hand. Two or more pots take the pot pill's place
+    over (and is returned then, never a pot — 2026-10-02), so it never shows mid-hand. Two or more pots take the pot pill's place
     in `#pot-row` (`#live-pots`, `renderLivePots`; `#pot.split` hides the pill;
     bets fly into `potAnchor()`; the bet spots are re-placed when the row changes
     shape; `fitPots` leaves room for the street total on both sides). Hovering

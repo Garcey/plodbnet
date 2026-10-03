@@ -108,6 +108,9 @@ def hand_text(rec: dict[str, Any], game_label: str) -> str:
         first = seq[:PLO67_DEALT] if (seq and counts) else list(me["hole"])
         out.append(f"Dealt to {name[int(me['seat'])]}: {cards(first)}")
     actions = list(rec.get("actions") or [])
+    # the bet nobody matched (record v3): back to its owner once the betting is over
+    uncalled = rec.get("uncalled") or None
+    last_street = actions[-1].get("street") if actions else None
     held = PLO67_DEALT
     equities = rec.get("equities") or {}
     runout_from = int(rec.get("runout_from") or 6)
@@ -135,6 +138,10 @@ def hand_text(rec: dict[str, Any], game_label: str) -> str:
             label = str(a.get("label") or "?")
             out.append(f"{name.get(seat, f'Seat {seat + 1}')}: {label[:1].lower() + label[1:]}"
                        + (" (on the clock)" if a.get("auto") else ""))
+        if uncalled and street == last_street:
+            who = int(uncalled.get("seat", -1))
+            out.append(f"Uncalled bet ({money(uncalled.get('cents'))}) returned to "
+                       f"{name.get(who, f'Seat {who + 1}')}")
         # everyone all in: each street still to be run out, the equities it showed
         shares = equities.get(str(n)) if n >= runout_from else None
         if shares:

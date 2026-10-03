@@ -279,6 +279,41 @@ def test_the_replayer_runs_an_all_in_out_street_by_street_with_its_equities(node
     assert hidden is False and got["nextOff"] is True
 
 
+def test_the_replayer_gives_back_the_bet_nobody_matched(node, tmp_path):
+    """(owner, 2026-10-02) $200 bets the $180 pot, $150 folds, $100 calls all in: the
+    $80 nobody matched goes back to the bettor when the betting closes — the replay
+    ends with a $380 pot, never a $460 one the bettor partly "wins" from themselves."""
+    got = _run(tmp_path, r"""
+(async () => {
+  const seat = (i, name, start, delta, folded) => ({ seat: i, name, is_me: i === 1, start_cents: start, delta_cents: delta,
+    hole: [20 + 5 * i, 21 + 5 * i, 22 + 5 * i, 23 + 5 * i, 24 + 5 * i], shown: !folded, folded });
+  const rec = { v: 3, hand_no: 4, variant: "plo5", hole_count: 5, button: 2, num_seats: 3, bb_cents: 100, ante_cents: 6000,
+    pot_cents: 38000, uncalled: { seat: 0, cents: 8000 }, showdown: true,
+    board_a: [0, 4, 8, 12, 16], board_b: [1, 5, 9, 13, 17], burns: [],
+    actions: [{ seat: 0, street: "flop", action: 2, label: "Bet $180.00", cents: 18000 },
+              { seat: 1, street: "flop", action: 0, label: "Fold", cents: 0 },
+              { seat: 2, street: "flop", action: 1, label: "Call $100.00", cents: 10000 }],
+    seats: [seat(0, "Dana", 26000, 22000, false), seat(1, "Host", 21000, -6000, true), seat(2, "Rico", 16000, -16000, false)],
+    awards: [], flows: [], grades: [] };
+  const B = boot((url) => (url.includes("/hands/4") ? rec : table()));
+  B.HG.cards.cardEl = () => B.W.doc.createElement("span");
+  B.HG.core.G.state = table(); B.HG.core.G.gameId = "T1";
+  await B.HG.ui.openHand("T1", 4); await flush();
+  const m = () => B.W.doc.querySelectorAll("#modal-root .modal").slice(-1)[0];
+  const look = () => ({ pot: m().querySelector(".rp-pot").textContent,
+    stacks: m().querySelectorAll(".rp-plate .num").map((e) => e.textContent),
+    bets: m().querySelectorAll(".rp-bet").map((e) => e.textContent) });
+  m().querySelectorAll("#rp-list .log-row")[1].click();  // Dana bet, Host folded
+  const out = { before: look() };
+  m().querySelector("#rp-last").click();
+  out.end = look();
+  console.log(JSON.stringify(out));
+})();
+""")
+    assert got["before"] == {"pot": "Pot $360.00", "stacks": ["$20.00", "$150.00", "$100.00"], "bets": ["$180.00"]}
+    assert got["end"] == {"pot": "Pot $380.00", "stacks": ["$100.00", "$150.00", "$0.00"], "bets": []}
+
+
 def test_private_notes_back_up_and_come_back(node, tmp_path):
     """FEAT-014: Preferences saves the notes to a file and restores them (a backup's note
     replaces this browser's for the same player; anything else is refused)."""

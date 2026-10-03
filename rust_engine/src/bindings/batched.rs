@@ -239,6 +239,7 @@ impl PyBatchedEngine {
             bb,
             sb,
             variant,
+            reach_cap: true,
         };
         Ok(PyBatchedEngine::with_config(
             config,

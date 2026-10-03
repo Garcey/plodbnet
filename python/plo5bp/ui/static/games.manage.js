@@ -256,7 +256,7 @@
     const steps = [
       [html`Everyone antes, no blinds`, html`Every player dealt in puts in the ante (${ante}) — that is the pot the hand starts with.`],
       [html`${G.burns ? `${G.dealt}+ cards` : `${G.hole} cards`}, two boards`, cards],
-      [html`Pot-limit betting`, html`The most you can bet is the size of the pot. Bet or Raise shows the sizes.`],
+      [html`Pot-limit betting`, html`The most you can bet is the size of the pot (or all your chips, if that is less). Bet or Raise shows the sizes. Any part of a bet nobody calls comes straight back to you.`],
       [html`Each board wins half`, html`At the showdown the best hand on each board takes half the pot — always exactly <b>two</b> of your cards and <b>three</b> from that board. Win both to scoop.`],
     ];
     return html`<ol class="guide">${steps.map(([t, d]) => html`<li><b>${t}</b><span>${d}</span></li>`)}</ol>${G.graded ? "" : html`<p class="rules">${G.label} decisions are not graded — there is no ${G.label} network yet.</p>`}`;

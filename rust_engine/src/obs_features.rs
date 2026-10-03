@@ -886,6 +886,7 @@ mod outcome_mc_p1_tests {
             bb: 10_000,
             sb: 0,
             variant,
+            reach_cap: true,
         }
     }
 

@@ -200,7 +200,9 @@ def _v1_columns_added_before_versioning(conn: Any) -> None:
 #: 2 (2026-09-29): an all-in runout's equities per street (``equities``: board
 #: length -> seat -> [board 1, board 2] share) and ``runout_from`` (the board
 #: length the players were all in on). Absent = no all-in runout (or an older record).
-HAND_RECORD_VERSION = 2
+#: 3 (2026-10-02): ``uncalled`` {"seat", "cents"} — the bet nobody matched, returned
+#: to its owner — and ``pot_cents`` without it (it was never in a pot). Absent = none.
+HAND_RECORD_VERSION = 3
 
 #: The home games' schema steps (OPS-018), tracked per component in
 #: ``schema_migrations`` (``public.Db.migrate``). APPEND ONLY, never renumber;

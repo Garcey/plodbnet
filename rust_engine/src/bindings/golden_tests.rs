@@ -393,6 +393,7 @@ fn config(variant: Variant, stacks: &[u64], ante: u64, bb: u64, sb: u64) -> Game
         bb,
         sb,
         variant,
+        reach_cap: true,
     }
 }
 

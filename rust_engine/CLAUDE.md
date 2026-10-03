@@ -162,4 +162,22 @@ stacks, 2-6 seats — the multi-config tiers). The sizing head keeps its full
 anchor grid even when some sizes collapse to all-in at shallow stacks (the
 engine's dup-masking drops them there; they are distinct deeper).
 
+`GameConfig.reach_cap` (2026-10-02; Python `GameConfig(reach_cap=...)`, the
+serial `PyGameState(reach_cap=)` kwarg + getter) picks the bet ceiling.
+`true` (every constructor's default) = the rule every network is trained on and
+Study / the Trainer / the CFR solver play: `max_bet_total` is also capped at what
+the deepest alive opponent can still put in, and `min_raise_chips` clamps the floor
+down to cover a shorter opponent. `false` = the home games' rule (owner: "capped at
+the pot or your own stack size, whichever is smaller"): pot limit (NL: own stack)
+only, the floor stays the floor, and what nobody matches comes back through the
+payout's one-seat layer. Either way a bet needs an alive opponent able to put in
+more than `bet_to_call` (else min = max = 0 and the mask is fold / call), so the
+legal mask, AllIn and `max_raise` stay consistent. The two rules are strategically
+equivalent (an overbet's excess is refunded), which is why the home games' grader
+replays a hand under the capped rule with the raise chips clamped into
+`[min_raise_chips, max_raise_chips]`. The batched engine (`env_batched`) refuses
+`false`; default-path numerics, golden digests and `exactness_check --recipe all`
+are unchanged. Tests: `reach_cap_off_tests` (engine.rs),
+`tests/python/engine/test_reach_cap.py`.
+
 ---

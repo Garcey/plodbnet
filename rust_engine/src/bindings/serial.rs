@@ -18,8 +18,11 @@ pub struct PyGameState {
 
 #[pymethods]
 impl PyGameState {
+    /// `reach_cap=False`: the home games' betting rule — a bet is capped at the
+    /// pot limit and the bettor's own stack only, never at what the shorter
+    /// stacks can call (`GameConfig::reach_cap`; every network trains with it on).
     #[new]
-    #[pyo3(signature = (num_seats=6, starting_stack=200000, ante=30000, bb=10000, starting_stacks=None, variant="plo5_double_bomb", sb=0, obs_rev=None))]
+    #[pyo3(signature = (num_seats=6, starting_stack=200000, ante=30000, bb=10000, starting_stacks=None, variant="plo5_double_bomb", sb=0, obs_rev=None, reach_cap=true))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         num_seats: usize,
@@ -30,6 +33,7 @@ impl PyGameState {
         variant: &str,
         sb: u64,
         obs_rev: Option<u8>,
+        reach_cap: bool,
     ) -> PyResult<Self> {
         let variant = parse_variant(variant)?;
         validate_table(num_seats, variant, bb)?;
@@ -44,9 +48,17 @@ impl PyGameState {
                 bb,
                 sb,
                 variant,
+                reach_cap,
             },
             obs_rev,
         })
+    }
+
+    /// Whether bets are also capped at what the deepest opponent can still put
+    /// in (`True`, the trained rule) or only at the pot limit and the bettor's
+    /// stack (`False`, the home games).
+    fn reach_cap(&self) -> bool {
+        self.config.reach_cap
     }
 
     /// Observation-semantics revision this state was constructed under.
