@@ -158,6 +158,29 @@ Key invariants (documented in the module docstring — don't break):
 - Lifetime stats + settings persist to `checkpoints/trainer_stats.json`
   (override with `PLO5BP_TRAINER_STATS`); session stats are in-memory.
 
+- **My tables (2026-10-03; owner: deal "based on the individual user's hand histories … typical
+  stack sizes for opponents and for themselves", represented — "I would prefer that you
+  represent over pulling exact configurations")**: `TrainerSettings.tables` = "custom" (the
+  default, the seat / stack / ante fields) or "mine": `_my_table` draws from the player's
+  PROFILE — Hand review's `my_tables` (`handreview_store`, plugged in by
+  `set_my_tables_hook`): `handreview.table_profile` of their latest `PROFILE_HANDS` (5,000)
+  hands = players (shares of 2-6), ante (shares) and TWO stack distributions, the player's
+  own (with auto top-up it rarely starts below the buy-in) and everyone else's; each = the
+  exact amounts that recur (>= 2% and >= 5 times: a buy-in, a top-up target) as point
+  masses + 101 quantiles of the rest, drawn log-uniformly between neighbours (never outside
+  what the hands held); `draw_table` draws every seat on its own, so no real table comes
+  back. Cached per player until an upload / deletion (`_profile_stale`). Without a usable
+  profile (no subscription — it is part of Hand review —, under `PROFILE_MIN_HANDS` (50)
+  hands, the local build, a store error): TYPICAL ClubGG tables = the training tier
+  `clubgg_real` (plo5bp/train/tiers.py, ~950 real hands at $10/$20, up to 350bb), ante 3bb,
+  your stack drawn like everyone's. PLO5 only (NLH ignores it). `GET /trainer/my_tables`
+  (`my_tables_view`) says which and why, with the numbers the settings dialog shows (never
+  the quantiles). Client: the "Tables" row of the settings dialog (hides Players / Stacks /
+  Ante; `#ts-tables-help` = the profile in five lines) and the work bar's "My tables" toggle
+  (`toggleMyTables`, hidden in the mistakes drill; narrow phones slim the row's buttons to
+  keep it one line at 360-400 px). `test_trainer_my_tables.py` + the store half in
+  `test_public_hand_review.py`.
+
 Tests: `tests/python/test_trainer_*.py`, `test_all_hole_cards.py`
 (shape parity with the study `_state_dict` is pinned). The table half of
 both payloads (seats, pot, buttons, raise window, history, chip scale) is

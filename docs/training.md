@@ -101,6 +101,20 @@ anchor` = v2 (head_version 2), `logistic` = v4 (3), `mixture` = v5 (4).
   re-deal hands that are terminal at deal (bounded) instead of spinning.
   Advantage normalization under `--mix-configs` is PER CONFIG (each
   sub-rollout is unit-normalized first; the pooled renorm is a no-op).
+- **Table tiers** (`plo5bp/train/tiers.py`; the evaluation tools draw from the same
+  functions): production mixes `clubgg`, `clubgg_deep` and `deep` (1/3 each, seats
+  uniform 2-6 — `--seats-dist` is not passed). **`clubgg_real` (2026-10-03, default
+  off)** = the owner's own ClubGG tables measured from their hand histories (953 hands,
+  $10/$20, 3bb ante): per-seat stack bands with the 20bb buy-in spike AND the real seat
+  counts (6/5/4/3/2-handed 41.5/31.2/20.9/5.2/1.2%, carried by the tier). The real
+  tables differ from the production mix: median stack 43bb (mix 71), median flop SPR
+  2.5 (5.3), 58% of hands mix a <=25bb and a >=100bb seat (10%), 2-3 handed 6% (40%).
+  Use it with `--mix-tiers clubgg_real` (training) / `h2h_x.py --tiers clubgg_real`
+  (scoring, side worktree). Pinned by `test_tiers_clubgg_real.py` (the old tiers'
+  draws are digest-identical). Round R (2026-10-03, on the pod from vSix7_1767) tests
+  it; its result goes in training-log.md. The site's
+  Trainer deals it too ("My tables" for a player without a profile of their own:
+  `python/plo5bp/ui/CLAUDE.md`), so a change to the tier changes those deals.
 - **Checkpoints**: writes are atomic (`<name>.pt.tmp` + `os.replace`). Adam
   moments + the L2-init reference live in ONE rolling sidecar
   `<stem>.optim.pt` (never prune it; `--no-optimizer-sidecar` opts out);

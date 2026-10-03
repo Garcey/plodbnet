@@ -15,6 +15,7 @@ numbers, the hand list, a hand's record, deletion, and account export / deletion
 
 from __future__ import annotations
 
+import collections
 import io
 import json
 import sys
@@ -750,7 +751,8 @@ def test_the_mistakes_drill_deals_your_spots_and_learns_from_each_attempt(server
     # the drill never touches the Trainer's own numbers
     assert ts.session_stats.hands == 0 and ts.lifetime_stats.moves == 0 and ts.recent_hands == []
     s = c.get("/games/api/review/summary").json()["drill"]
-    assert s["mistakes"] == 3 and s["attempts"] == 2 and s["fixed"] >= 1
+    # (attempts = the fixed + missed ones: a "close" try leaves a spot's learning state alone)
+    assert s["mistakes"] == 3 and s["attempts"] == 1 + (want != "close") and s["fixed"] >= 1
 
     # equal priority: a new round, every spot in it
     seen = set()
@@ -906,3 +908,94 @@ def test_a_drill_spot_replays_the_hand_to_the_decision_and_ends_there(server, pu
     again = c.post("/trainer/repeat").json()
     assert len(again["frames"]) == 1 and again["state"]["trainer"]["drill"]["practice"] is True
     assert len(again["state"]["history"]) == i
+
+
+# --- My tables: the Trainer deals like the tables in your hands (2026-10-03) ----------------------
+
+
+def _fold_out(k: int, hero: float, others: list[float]) -> str:
+    """A synthetic hand: the first to act bets $60 and everyone else folds (stacks in $)."""
+    n = 1 + len(others)
+    names = ["Hero"] + [f"{k:04x}{j:04x}" for j in range(n - 1)]
+    stacks = [hero, *others]
+    at = k % n  # (where Hero sits)
+    seats = [(no, names[(no - 1 - at) % n], stacks[(no - 1 - at) % n]) for no in range(1, n + 1)]
+    button = (k // n) % n + 1
+    first = button % n  # (the seat left of the button, as an index into seats 1..n)
+    acts = [(seats[first][1], "bets", 60, False)] + [
+        (seats[(first + j) % n][1], "folds", None, False) for j in range(1, n)]
+    return gg_hand(hid=str(9200000000 + k), button=button, seats=seats, deal={"Hero": "Kh Jd Td 8d 2s"},
+                   board_a="6h 6c Qc", board_b="9c 5c 4d", streets={"flop": acts},
+                   when=f"2026/10/01 {k // 60:02d}:{k % 60:02d}:00")
+
+
+def _session_of(c, settings):
+    st = c.get("/trainer/state").json()["state"]
+    r = c.post("/trainer/settings", json={**st["trainer"]["settings"], **settings})
+    assert r.status_code == 200, r.text
+    return r.json()["state"]
+
+
+def test_my_tables_deal_like_the_tables_in_your_hands(server, pub, store, monkeypatch):
+    """(owner) "automatically updates the seat and stack size distributions based on the
+    individual user's hand histories … typical stack sizes for opponents and for
+    themselves": the store's profile of YOUR latest hands — your stack ($400 with auto
+    top-up, more when you won) apart from your opponents' — is what My tables deals from;
+    it follows every upload and deletion; without a subscription it's typical tables."""
+    import random
+
+    email = "regular@example.com"
+    c = _login(server, email)
+    _comp(pub, email)
+    rng = random.Random(3)
+    mine_cfg = []
+    texts = []
+    for k in range(60):
+        n = rng.choice([4, 5, 6, 6])
+        hero = 400 if rng.random() < 0.6 else rng.choice([420, 515.5, 760, 1320.25])
+        others = [rng.choice([400, 150, 233.4, 512, 880, 2400]) for _ in range(n - 1)]
+        mine_cfg.append((n, hero, others))
+        texts.append(_fold_out(k, hero, others))
+    assert _upload(c, store, {"s.txt": "\n\n".join(texts)})["added"] == 60
+    uid = _uid(pub, email)
+    prof = store.my_tables(uid)
+    assert prof["paid"] is True and prof["hands"] == 60 and prof["min_hands"] == store.PROFILE_MIN_HANDS
+    assert prof["antes"] == [[3.0, 1.0]]
+    want_seats = collections.Counter(n for n, _h, _o in mine_cfg)
+    assert {n: p for n, p in prof["seats"]} == {n: round(c_ / 60, 4) for n, c_ in want_seats.items()}
+    assert dict(map(tuple, prof["hero"]["atoms"]))[20.0] == round(sum(h == 400 for _n, h, _o in mine_cfg) / 60, 4)
+    v = c.get("/trainer/my_tables").json()
+    assert v["source"] == "mine" and v["hands"] == 60 and v["hero"]["median"] == prof["hero"]["median"]
+
+    drawn = []
+    real_draw = hr.draw_table
+
+    def spy(p, r):
+        drawn.append(p["hands"])
+        return real_draw(p, r)
+
+    monkeypatch.setattr(hr, "draw_table", spy)
+    _session_of(c, {"tables": "mine"})
+    ts = pub._REGISTRY.peek(uid).trainer
+    for _ in range(25):
+        assert c.post("/trainer/new_hand").status_code == 200
+        cfg, h = ts.hand.config, ts.hand.hero_seat
+        hero_bb = cfg.starting_stacks[h] / 10000
+        assert 20.0 <= hero_bb <= 1320.25 / 20 and cfg.ante == 3 * 10000 and cfg.num_seats in (4, 5, 6)
+        assert all(7.5 <= s / 10000 <= 120 for i, s in enumerate(cfg.starting_stacks) if i != h)
+    assert drawn and set(drawn) == {60}
+
+    # new hands change it; deleting them takes it away
+    more = [_fold_out(100 + k, 400, [400, 400]) for k in range(10)]
+    _upload(c, store, {"more.txt": "\n\n".join(more)})
+    assert store.my_tables(uid)["hands"] == 70
+    assert c.post("/games/api/review/delete", json={"confirm": True}).status_code == 200
+    v = c.get("/trainer/my_tables").json()
+    assert v["source"] == "typical" and v["paid"] is True and v["hands"] == 0
+
+    # someone without a subscription: typical tables, and the dialog says why
+    free = _login(server, "trialist@example.com")
+    v = free.get("/trainer/my_tables").json()
+    assert v == {"source": "typical", "review": True, "paid": False, "hands": 0, "min_hands": store.PROFILE_MIN_HANDS}
+    _session_of(free, {"tables": "mine"})
+    assert free.post("/trainer/new_hand").status_code == 200

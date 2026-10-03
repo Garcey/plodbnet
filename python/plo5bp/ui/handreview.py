@@ -20,14 +20,19 @@ grader work on them unchanged. It is pure: no database, no request — the store
    result is what ClubGG paid (to the cent, apart from dead money the engine has
    no slot for), then builds the record, the all-in EV (side pots included) and
    the grading job (the player's own decisions only).
+4. ``table_profile`` / ``draw_table`` — the Trainer's "My tables": a smoothed picture
+   of the tables in a player's hands (players, ante, their own stack, everyone
+   else's) and a table drawn from it.
 """
 
 from __future__ import annotations
 
 import io
+import math
 import re
 import zipfile
 from calendar import timegm
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -1051,3 +1056,120 @@ def network_choice(rec: dict[str, Any], i: int, model: Any) -> dict[str, Any]:
                  **(size(int(dist["rec_chips"])) if rec_gate == GATE_RAISE else {})},
         "sizes": sizes if probs[GATE_RAISE] > 0 else [],
     }
+
+
+# --- your tables: the Trainer's "My tables" (2026-10-03) -------------------------------------
+# Owner: the Trainer should deal "based on the individual user's hand histories … typical
+# stack sizes for opponents and for themselves" — represented, never copied ("I would
+# prefer that you represent over pulling exact configurations"). A profile is a smoothed
+# picture of the tables in a player's hands: how many were dealt in, the ante, and TWO
+# stack distributions — the player's own stack and everyone else's (with auto top-up your
+# own stack rarely starts below the buy-in; an opponent's often does). Each is the amounts
+# that recur exactly (a buy-in, an auto top-up's target) as point masses, plus quantiles of
+# every other stack in log space, drawn between them. A drawn table takes each seat's
+# stack on its own, so no real table comes back.
+
+#: An exact amount this common (a share of the stacks) and seen this often is a point mass.
+PROFILE_ATOM_SHARE = 0.02
+PROFILE_ATOM_MIN = 5
+#: Quantiles kept of the other stacks (0%, 1%, … 100%).
+PROFILE_KNOTS = 101
+#: Antes rarer than this are left out (the most common one always stays).
+PROFILE_ANTE_SHARE = 0.05
+
+
+def _quantile(sorted_vals: list[float], q: float) -> float:
+    pos = q * (len(sorted_vals) - 1)
+    i = int(pos)
+    j = min(i + 1, len(sorted_vals) - 1)
+    return sorted_vals[i] + (pos - i) * (sorted_vals[j] - sorted_vals[i])
+
+
+def stack_profile(values_bb: list[float]) -> dict[str, Any]:
+    """The distribution of some starting stacks (in big blinds): ``atoms`` [[bb, share]]
+    = the exact amounts that recur, ``knots`` = PROFILE_KNOTS quantiles of the rest (bb;
+    log-spaced draws between neighbours), and a few numbers to show (median, p10, p90,
+    all stacks)."""
+    vals = sorted(round(float(v), 2) for v in values_bb if v > 0)
+    n = len(vals)
+    if not n:
+        return {"n": 0, "atoms": [], "knots": [], "median": None, "p10": None, "p90": None}
+    counts = Counter(vals)
+    atoms = sorted((v, c / n) for v, c in counts.items()
+                   if c >= PROFILE_ATOM_MIN and c / n >= PROFILE_ATOM_SHARE)
+    point = {v for v, _p in atoms}
+    logs = [math.log(v) for v in vals if v not in point]
+    knots = [round(math.exp(_quantile(logs, k / (PROFILE_KNOTS - 1))), 2)
+             for k in range(PROFILE_KNOTS)] if logs else []
+    return {
+        "n": n, "atoms": [[v, round(p, 4)] for v, p in atoms], "knots": knots,
+        "median": round(_quantile(vals, 0.5), 2), "p10": round(_quantile(vals, 0.1), 2),
+        "p90": round(_quantile(vals, 0.9), 2),
+    }
+
+
+def table_profile(hands: list[tuple[int, int, list[tuple[int, bool]]]]) -> dict[str, Any]:
+    """The profile of some hands, each ``(bb_cents, ante_cents, [(start_cents, is_me) per
+    player dealt in])``: ``seats`` [[players, share]], ``antes`` [[bb, share]] and the
+    stacks — ``hero`` (yours) and ``opponents`` (``stack_profile``)."""
+    seats: Counter = Counter()
+    antes: Counter = Counter()
+    mine: list[float] = []
+    theirs: list[float] = []
+    for bb, ante, players in hands:
+        if bb <= 0 or not 2 <= len(players) <= 6:
+            continue
+        seats[len(players)] += 1
+        antes[round(ante / bb * 20) / 20] += 1  # (to 0.05bb)
+        for start, is_me in players:
+            (mine if is_me else theirs).append(start / bb)
+    n = sum(seats.values())
+    if not n:
+        return {"hands": 0, "seats": [], "antes": [], "hero": stack_profile([]), "opponents": stack_profile([])}
+    kept = {a: c for a, c in antes.items() if c / n >= PROFILE_ANTE_SHARE} or dict(antes.most_common(1))
+    tot = sum(kept.values())
+    return {
+        "hands": n,
+        "seats": [[k, round(c / n, 4)] for k, c in sorted(seats.items())],
+        "antes": [[a, round(c / tot, 4)] for a, c in sorted(kept.items())],
+        "hero": stack_profile(mine),
+        "opponents": stack_profile(theirs),
+    }
+
+
+def _pick(pairs: list[list[float]], rng: Any) -> float:
+    r = float(rng.random())
+    for v, p in pairs:
+        if r < p:
+            return v
+        r -= p
+    return pairs[-1][0]
+
+
+def draw_stack(dist: dict[str, Any], rng: Any) -> float:
+    """One stack (bb) from a ``stack_profile``: a recurring amount with its share, else
+    a point between two neighbouring quantiles (log-uniform) — never outside what the
+    hands held."""
+    r = float(rng.random())
+    for v, p in dist["atoms"]:
+        if r < p:
+            return float(v)
+        r -= p
+    knots = dist["knots"]
+    if not knots:  # (every stack was a recurring amount: rounding left a sliver)
+        return float(dist["atoms"][-1][0])
+    if len(knots) == 1:
+        return float(knots[0])
+    u = float(rng.random()) * (len(knots) - 1)
+    i = min(int(u), len(knots) - 2)
+    lo, hi = math.log(knots[i]), math.log(knots[i + 1])
+    return round(math.exp(lo + (u - i) * (hi - lo)), 2)
+
+
+def draw_table(profile: dict[str, Any], rng: Any) -> tuple[int, float, list[float], float]:
+    """A table from a ``table_profile``: (players, your stack, the others' stacks, ante),
+    in big blinds — every seat drawn on its own."""
+    n = int(_pick(profile["seats"], rng))
+    ante = float(_pick(profile["antes"], rng))
+    hero = draw_stack(profile["hero"], rng)
+    return n, hero, [draw_stack(profile["opponents"], rng) for _ in range(n - 1)], ante

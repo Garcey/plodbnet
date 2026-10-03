@@ -644,6 +644,10 @@ def _stable_seed(*parts: int) -> int:
 
 
 class TrainerSettings(BaseModel):
+    # "mine" (2026-10-03) = My tables: players, ante and stacks drawn like the tables in
+    # YOUR hand histories (`_my_table`), the seat / stack / ante fields below unused;
+    # "custom" = those fields (the default).
+    tables: Literal["custom", "mine"] = "custom"
     seats_mode: Literal["random", "fixed"] = "random"
     seats_fixed: int = Field(6, ge=2, le=6)
     seats_min: int = Field(2, ge=2, le=6)
@@ -702,6 +706,18 @@ RECENT_HANDS_MAX = 20
 RECENT_HANDS_SHOWN = 12
 # Drill filter: deals tried before settling for the last one (site FEAT-018).
 SPOT_MAX_DEALS = 30
+
+# My tables (2026-10-03, `TrainerSettings.tables == "mine"`; owner: deal "based on the
+# individual user's hand histories … typical stack sizes for opponents and for
+# themselves"): the profile of the tables in the hands you uploaded to Hand review
+# (`set_my_tables_hook`; handreview.table_profile / draw_table — players, ante, YOUR stack
+# and your opponents' stacks, each its own distribution: with auto top-up yours rarely
+# starts below the buy-in). Without one (no subscription, fewer hands than the store's
+# minimum, the local build): TYPICAL ClubGG tables — the training tier `clubgg_real`
+# (seat counts and stacks of ~950 real hands at $10/$20), a 3bb ante, your stack drawn
+# like everyone's.
+TYPICAL_ANTE_BB = 3.0
+TYPICAL_MAX_BB = 350.0  # (the deepest real stack seen; training clips at 300)
 
 
 def mc_rollouts_cap() -> int:
@@ -1267,6 +1283,26 @@ class TrainerSession:
 
     # -- dealing ---------------------------------------------------------------
 
+    def _my_table(self) -> tuple[int, int, list[int], int]:
+        """A table for My tables, in chips: (players, your stack, the others' stacks,
+        ante) — drawn from your profile (`my_tables_profile`), else a typical ClubGG
+        table (the training tier `clubgg_real` itself: what the network trains on)."""
+        profile = my_tables_profile()
+        if profile is not None:
+            from plo5bp.ui.handreview import draw_table
+
+            n, hero, others, ante = draw_table(profile, self.rng)
+            chips = [max(1, int(round(x * BB_CHIPS))) for x in (hero, *others)]
+            return n, chips[0], chips[1:], int(round(ante * BB_CHIPS))
+        from plo5bp.train.tiers import _sample_game_config
+
+        cfg, _ = _sample_game_config(
+            (2, 3, 4, 5, 6), 1.0, TYPICAL_MAX_BB, BB_CHIPS,
+            int(round(TYPICAL_ANTE_BB * BB_CHIPS)), self.rng, stack_dist="clubgg_real",
+        )
+        stacks = [int(x) for x in cfg.starting_stacks]
+        return int(cfg.num_seats), stacks[0], stacks[1:], int(cfg.ante)
+
     def _draw_stacks(self, n: int, hero_seat: int = 0) -> tuple[int, ...]:
         s = self.settings
         if s.stacks_mode == "fixed":
@@ -1337,7 +1373,11 @@ class TrainerSession:
             seed, button = self.hand.seed, self.hand.button
             hero_seat, config = self.hand.hero_seat, self.hand.config
         else:
-            if s.seats_mode == "fixed":
+            eng = _engine_variant(self.variant)
+            mine = s.tables == "mine" and eng == VARIANT_PLO5
+            if mine:
+                n, hero_stack, other_stacks, ante = self._my_table()
+            elif s.seats_mode == "fixed":
                 n = s.seats_fixed
             else:
                 n = int(self.rng.integers(s.seats_min, s.seats_max + 1))
@@ -1347,17 +1387,32 @@ class TrainerSession:
                 button = (hero_seat - k) % n
             else:
                 button = int(self.rng.integers(0, n))
-            eng = _engine_variant(self.variant)
-            config = GameConfig(
-                num_seats=n,
-                starting_stack=int(round(s.stack_bb * BB_CHIPS)),
-                ante=int(round(s.ante_bb * BB_CHIPS)),
-                bb=BB_CHIPS,
-                starting_stacks=self._draw_stacks(n, hero_seat),
-                # NLH: the 5/10 structure — sb = bb/2, live preflop.
-                sb=BB_CHIPS // 2 if eng == VARIANT_NLH else 0,
-                variant=eng,
-            )
+            if mine:
+                # yours at your seat, the others' around the table from your left
+                stacks = [0] * n
+                stacks[hero_seat] = hero_stack
+                for j, st in enumerate(other_stacks, start=1):
+                    stacks[(hero_seat + j) % n] = st
+                config = GameConfig(
+                    num_seats=n,
+                    starting_stack=stacks[0],
+                    ante=ante,
+                    bb=BB_CHIPS,
+                    starting_stacks=tuple(stacks),
+                    sb=0,
+                    variant=eng,
+                )
+            else:
+                config = GameConfig(
+                    num_seats=n,
+                    starting_stack=int(round(s.stack_bb * BB_CHIPS)),
+                    ante=int(round(s.ante_bb * BB_CHIPS)),
+                    bb=BB_CHIPS,
+                    starting_stacks=self._draw_stacks(n, hero_seat),
+                    # NLH: the 5/10 structure — sb = bb/2, live preflop.
+                    sb=BB_CHIPS // 2 if eng == VARIANT_NLH else 0,
+                    variant=eng,
+                )
             seed = int(self.rng.integers(0, 2**63 - 1))
 
         env = BombPotEnv(config)
@@ -3023,6 +3078,61 @@ def set_drill_hooks(
     _DRILL_NEXT, _DRILL_RECORD = next_spot, record
 
 
+# --- My tables (2026-10-03) ------------------------------------------------------------
+# The profile of the player's own tables comes from Hand review (`handreview_store.
+# my_tables`: the hands they uploaded), plugged in here by its install(); without it
+# (the local build) My tables deals typical ClubGG tables.
+
+#: () -> the signed-in player's table profile (paid, hands, min_hands, the profile) or None.
+_MY_TABLES: Callable[[], dict[str, Any] | None] | None = None
+
+
+def set_my_tables_hook(fn: Callable[[], dict[str, Any] | None] | None) -> None:
+    global _MY_TABLES
+    _MY_TABLES = fn
+
+
+def _my_tables_raw() -> dict[str, Any] | None:
+    if _MY_TABLES is None:
+        return None
+    try:
+        return _MY_TABLES()
+    except Exception:  # noqa: BLE001 — a store hiccup deals typical tables, never an error
+        logger.exception("trainer: the My tables profile failed")
+        return None
+
+
+def _usable(raw: dict[str, Any] | None) -> bool:
+    return bool(raw and raw.get("paid") and int(raw.get("hands") or 0) >= max(1, int(raw.get("min_hands") or 0)))
+
+
+def my_tables_profile() -> dict[str, Any] | None:
+    """The profile My tables deals from right now, or None (typical ClubGG tables)."""
+    raw = _my_tables_raw()
+    return raw if _usable(raw) else None
+
+
+def my_tables_view() -> dict[str, Any]:
+    """What My tables deals from, for the settings dialog and the work bar's toast:
+    ``source`` "mine" (your tables: the numbers to show) or "typical", and why
+    (``review`` = Hand review exists here, ``paid``, ``hands`` / ``min_hands``)."""
+    raw = _my_tables_raw()
+    out: dict[str, Any] = {
+        "source": "mine" if _usable(raw) else "typical",
+        "review": _MY_TABLES is not None,
+        "paid": bool(raw and raw.get("paid")),
+        "hands": int((raw or {}).get("hands") or 0),
+        "min_hands": int((raw or {}).get("min_hands") or 0),
+    }
+    if raw is not None and out["source"] == "mine":
+        def show(d: dict[str, Any]) -> dict[str, Any]:
+            return {k: d.get(k) for k in ("median", "p10", "p90", "atoms")}
+
+        out.update(seats=raw["seats"], antes=raw["antes"], hero=show(raw["hero"]),
+                   opponents=show(raw["opponents"]))
+    return out
+
+
 class DrillRequest(BaseModel):
     #: Worst first (the default) or every spot equally often.
     prioritize: bool = True
@@ -3151,6 +3261,12 @@ def create_trainer_router(
             ts._persist()
             _ensure_hand(ts)
             return {"state": ts.project_state()}
+
+    @router.get("/my_tables")
+    def trainer_my_tables() -> dict[str, Any]:
+        """What My tables deals from for you (`my_tables_view`)."""
+        _ts()  # (signed in, like every trainer route)
+        return my_tables_view()
 
     @router.post("/new_hand")
     def trainer_new_hand() -> dict[str, Any]:

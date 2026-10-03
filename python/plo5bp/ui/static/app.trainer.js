@@ -22,6 +22,7 @@ function renderTrainer(s) {
   renderTrainerStats(s);
   renderReviewPanel(s);
   renderDrill(s);
+  renderMyTablesToggle(s);
 }
 
 function cancelTrainerPick() {
@@ -405,13 +406,19 @@ function clampMcRollouts(n, s) {
 }
 
 function syncSettingsVisibility() {
+  // My tables (2026-10-03): the table's players, stacks and ante come from your own
+  // tables, so their rows step aside
+  const mine = _tsVal("ts-tables") === "mine";
+  for (const id of ["ts-row-seats", "ts-row-stacks", "ts-row-ante"]) _tsShow(id, !mine);
+  _tsShow("ts-tables-help", mine);
+  if (mine) fillMyTablesHelp();
   const seatsMode = _tsVal("ts-seats-mode");
   _tsShow("ts-seats-fixed-wrap", seatsMode === "fixed");
   _tsShow("ts-seats-range-wrap", seatsMode === "random");
   const stacksMode = _tsVal("ts-stacks-mode");
   _tsShow("ts-stack-fixed-wrap", stacksMode === "fixed");
   _tsShow("ts-stack-range-wrap", stacksMode === "random");
-  _tsShow("ts-per-seat-wrap", stacksMode === "per_seat");
+  _tsShow("ts-per-seat-wrap", stacksMode === "per_seat" && !mine);
   _tsShow("ts-hero-kth-wrap", _tsVal("ts-hero-mode") === "kth");
 }
 
@@ -432,6 +439,9 @@ function openTrainerSettings() {
   const s = UI.lastState;
   const t = s && s.trainer ? s.trainer.settings : null;
   if (!t) return;
+  document.getElementById("ts-tables").value = t.tables === "mine" ? "mine" : "custom";
+  _tsShow("ts-row-tables", myTablesFormat(s));
+  UI.myTables = null;  // (asked again: an upload may have changed it)
   document.getElementById("ts-seats-mode").value = t.seats_mode;
   document.getElementById("ts-seats-fixed").value = t.seats_fixed;
   document.getElementById("ts-seats-min").value = t.seats_min;
@@ -500,23 +510,24 @@ function settingsError(msg, input) {
 function validateTrainerSettings(body) {
   const q = (id) => document.getElementById(id);
   const inRange = (v, lo, hi) => Number.isFinite(v) && v >= lo && v <= hi;
-  if (body.seats_mode === "fixed" && !inRange(body.seats_fixed, 2, 6)) {
+  const mine = body.tables === "mine";  // (its players / stacks / ante rows are unused, and hidden)
+  if (!mine && body.seats_mode === "fixed" && !inRange(body.seats_fixed, 2, 6)) {
     return ["Players must be between 2 and 6.", q("ts-seats-fixed")];
   }
-  if (body.seats_mode === "random") {
+  if (!mine && body.seats_mode === "random") {
     if (!inRange(body.seats_min, 2, 6)) return ["Players must be between 2 and 6.", q("ts-seats-min")];
     if (!inRange(body.seats_max, 2, 6)) return ["Players must be between 2 and 6.", q("ts-seats-max")];
     if (body.seats_min > body.seats_max) return ["The fewest players can't be more than the most.", q("ts-seats-min")];
   }
-  if (body.stacks_mode === "fixed" && !inRange(body.stack_bb, 1, 1000)) {
+  if (!mine && body.stacks_mode === "fixed" && !inRange(body.stack_bb, 1, 1000)) {
     return ["Stacks must be between 1 and 1,000bb.", q("ts-stack-bb")];
   }
-  if (body.stacks_mode === "random") {
+  if (!mine && body.stacks_mode === "random") {
     if (!inRange(body.stack_min_bb, 1, 1000)) return ["Stacks must be between 1 and 1,000bb.", q("ts-stack-min-bb")];
     if (!inRange(body.stack_max_bb, 1, 1000)) return ["Stacks must be between 1 and 1,000bb.", q("ts-stack-max-bb")];
     if (body.stack_min_bb > body.stack_max_bb) return ["The smallest stack can't be larger than the largest.", q("ts-stack-min-bb")];
   }
-  if (body.stacks_mode === "per_seat") {
+  if (!mine && body.stacks_mode === "per_seat") {
     for (let i = 0; i < 6; i++) {
       const [lo, hi] = body.stacks_per_seat_bb[i];
       const loEl = document.querySelector(`.ts-ps-lo[data-i="${i}"]`);
@@ -526,7 +537,7 @@ function validateTrainerSettings(body) {
       if (lo > hi) return [`${perSeatLabel(i)}: the smallest stack can't be larger than the largest.`, loEl];
     }
   }
-  if (!inRange(body.ante_bb, 0, 100)) return ["The ante must be between 0 and 100bb.", q("ts-ante-bb")];
+  if (!mine && !inRange(body.ante_bb, 0, 100)) return ["The ante must be between 0 and 100bb.", q("ts-ante-bb")];
   if (!Number.isFinite(body.mc_rollouts) || body.mc_rollouts < 0) {
     return ["EV-loss samples must be 0 or more.", q("ts-mc-rollouts")];
   }
@@ -542,6 +553,7 @@ async function saveTrainerSettings() {
   }
   const cur = UI.lastState && UI.lastState.trainer ? UI.lastState.trainer.settings : null;
   const body = {
+    tables: _tsVal("ts-tables") === "mine" && myTablesFormat(UI.lastState) ? "mine" : "custom",
     seats_mode: _tsVal("ts-seats-mode"),
     seats_fixed: _tsInt("ts-seats-fixed"),
     seats_min: _tsInt("ts-seats-min"),
@@ -867,6 +879,93 @@ function drillNoteHTML(s) {
     + (extra ? `<span class="dn-extra">${escapeHTML(extra)}</span>` : "");
 }
 
+// --- My tables (2026-10-03) ------------------------------------------------------------
+// One click in the work bar: the next hands are dealt like the tables in YOUR hand
+// histories — players, the ante, your own stack and your opponents' stacks, each from its
+// own distribution (the profile Hand review keeps of your latest hands; GET
+// /trainer/my_tables says which). Without enough hands of yours: typical ClubGG tables.
+// The setting lives in the Trainer settings ("Tables"); PLO5 only.
+function myTablesFormat(s) {
+  return !!s && s.format !== "nlh_single";
+}
+function renderMyTablesToggle(s) {
+  const b = document.getElementById("trainer-mytables-btn");
+  if (!b) return;
+  const t = s && s.trainer ? s.trainer.settings : null;
+  b.hidden = !t || !myTablesFormat(s) || !!UI.drill;
+  const on = !!t && t.tables === "mine";
+  b.setAttribute("aria-pressed", on ? "true" : "false");
+  b.classList.toggle("on", on);
+}
+async function fetchMyTables() {
+  if (!UI.myTables) UI.myTables = await getJSON("/trainer/my_tables");
+  return UI.myTables;
+}
+const mtBB = (v) => `${fmtNum(v, v >= 100 ? 0 : 1)}bb`;
+const mtPct = (p) => `${Math.round(p * 100)}%`;
+function myTablesText(v) {
+  const typical = "typical ClubGG tables (players and stacks from real $10/$20 games, a 3bb ante)";
+  if (!v) return "Players, stacks and the ante like the tables in your own hand histories.";
+  if (v.source === "mine") {
+    // (one line each; #ts-tables-help keeps the line breaks)
+    const seats = v.seats.slice().sort((a, b) => b[0] - a[0]).filter(([, p]) => p >= 0.005)
+      .map(([n, p]) => `${n}: ${mtPct(p)}`).join(" · ");
+    const stacks = (d) => {
+      const top = (d.atoms || []).slice().sort((a, b) => b[1] - a[1])[0];
+      return `usually ${mtBB(d.p10).slice(0, -2)}–${mtBB(d.p90)}, median ${mtBB(d.median)}`
+        + (top ? `; exactly ${mtBB(top[0])} in ${mtPct(top[1])} of hands` : "");
+    };
+    const ante = v.antes.map(([a]) => mtBB(a)).join(" or ");
+    return [
+      `Dealt like your last ${v.hands.toLocaleString()} hands:`,
+      `Players — ${seats}`,
+      `Your stack — ${stacks(v.hero)}`,
+      `Opponents — ${stacks(v.opponents)}`,
+      `Ante ${ante}. Each seat is drawn on its own (no real table comes back); new uploads update it.`,
+    ].join("\n");
+  }
+  if (!v.review) return `For now, ${typical}. Your own tables come from your hand histories in Hand review on the site.`;
+  if (!v.paid) {
+    return `For now, ${typical}. With a subscription, upload your ClubGG hand histories in Hand review `
+      + "and My tables deals tables like yours: your stack and your opponents'.";
+  }
+  return `You have ${v.hands.toLocaleString()} hand${v.hands === 1 ? "" : "s"} in Hand review; My tables uses `
+    + `your own tables from ${v.min_hands}. Until then, ${typical}.`;
+}
+async function fillMyTablesHelp() {
+  const el = document.getElementById("ts-tables-help");
+  if (!el) return;
+  try {
+    el.textContent = myTablesText(await fetchMyTables());
+  } catch (_e) {
+    el.textContent = myTablesText(null);
+  }
+}
+async function toggleMyTables() {
+  const s = UI.lastState;
+  const cur = s && s.trainer ? s.trainer.settings : null;
+  if (!cur || UI.actionInFlight) return;
+  const on = cur.tables !== "mine";
+  try {
+    const data = await postJSON("/trainer/settings", { ...cur, tables: on ? "mine" : "custom" });
+    await animateTrainerResponse(data);
+    if (!on) {
+      showToast("My tables off: players and stacks from your settings, from the next hand.", "info");
+      return;
+    }
+    UI.myTables = null;
+    let v = null;
+    try { v = await fetchMyTables(); } catch (_e) { /* (the toast says it plainly) */ }
+    showToast(v && v.source === "mine"
+      ? `My tables on: from the next hand, tables like your last ${v.hands.toLocaleString()} hands.`
+      : (v && v.review && v.paid
+        ? `My tables on: typical ClubGG tables until Hand review has ${v.min_hands} of your hands (${v.hands} so far).`
+        : "My tables on: typical ClubGG tables for now — Hand review reads your own (Settings says more)."), "info");
+  } catch (e) {
+    if (e.message !== GATE_HANDLED) showToast(e.message);
+  }
+}
+
 function setupTrainerControls() {
   document.getElementById("tab-study").addEventListener("click", () => setMode("study"));
   document.getElementById("tab-trainer").addEventListener("click", () => setMode("trainer"));
@@ -889,6 +988,9 @@ function setupTrainerControls() {
     showToast(prio.checked ? "Worst first: your worst mistakes come up most, the ones you've fixed less."
       : "Equal priority: every spot comes up as often as the others.", "info");
   });
+  const myTables = document.getElementById("trainer-mytables-btn");
+  if (myTables) myTables.addEventListener("click", toggleMyTables);
+  document.getElementById("ts-tables").addEventListener("change", syncSettingsVisibility);
   const exit = document.getElementById("drill-exit");
   if (exit) exit.addEventListener("click", () => { if (!UI.actionInFlight) exitDrill(true); });
   document.getElementById("review-repeat-hand").addEventListener("click", repeatHand);

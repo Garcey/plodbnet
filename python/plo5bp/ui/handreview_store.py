@@ -19,6 +19,10 @@ module keeps them:
   player's own decisions only — other players' cards are never known).
 - The network's choice at any decision of a stored hand (``choice``: the replayer
   asks; home-game hands too, through ``homegame_routes.api_hand_choice``).
+- The Trainer's "My tables" (``my_tables``, plugged in by ``trainer.set_my_tables_hook``):
+  the profile of the tables in the player's latest hands — players, ante, their own
+  stack and their opponents' (``handreview.table_profile``) — cached until their hands
+  change.
 
 The one PAID page of the site, even while ``public.FREE_FOR_ALL`` opens the rest:
 it keeps your hand histories on the server. Every API route needs ``public._paid``
@@ -54,6 +58,10 @@ MAX_HANDS_PER_USER = int(os.environ.get("PLO5BP_REVIEW_MAX_HANDS", "200000"))
 UPLOAD_QUEUE_MAX = 6
 #: Hands inserted per transaction (the writer lock is shared with the whole site).
 INSERT_BATCH = 100
+#: "My tables" (the Trainer) reads your latest hands — at most this many (the tables you
+#: play NOW) — and needs at least PROFILE_MIN_HANDS (fewer: typical ClubGG tables).
+PROFILE_HANDS = 5000
+PROFILE_MIN_HANDS = 50
 #: The profit graph's points at most (a long history is thinned, its last point kept).
 SERIES_MAX_POINTS = 1500
 GRADE_BATCH = 40
@@ -136,6 +144,8 @@ class Review:
         self.lock = threading.Lock()
         self.busy_users: set[int] = set()  # an upload queued or being read
         self.drill: dict[int, dict[str, Any]] = {}  # user -> the mistakes drill's round
+        self.profiles: dict[int, dict[str, Any]] = {}  # user -> "My tables" profile (cached)
+        self.profile_gen: dict[int, int] = {}  # user -> bumped whenever their hands change
 
 
 CTX = Review()
@@ -233,6 +243,7 @@ def _import_loop(ctx: Review) -> None:
         finally:
             with ctx.lock:
                 ctx.busy_users.discard(uid)
+            _profile_stale(uid)  # (a failed upload may have stored some of its hands)
             ctx.import_q.task_done()
 
 
@@ -315,6 +326,7 @@ def run_import(upload_id: int, uid: int, data: bytes, filename: str) -> dict[str
     if batch:
         flush()
     added, dups = n["added"], n["dups"]
+    _profile_stale(uid)
     _set_upload(
         upload_id, status="done", read=len(texts), added=added, duplicates=dups,
         skipped=sum(skipped.values()), skipped_detail=json.dumps(skipped) if skipped else None,
@@ -555,7 +567,51 @@ def delete_all(uid: int) -> dict[str, Any]:
         pub.DB.q("DELETE FROM review_mistakes WHERE user_id=?", (uid,))
     with CTX.lock:
         CTX.drill.pop(uid, None)
+    _profile_stale(uid)
     return {"deleted": n}
+
+
+# --- "My tables": the profile of your tables (the Trainer deals from it) ---------------------
+
+
+def _profile_stale(uid: int) -> None:
+    with CTX.lock:
+        CTX.profiles.pop(int(uid), None)
+        CTX.profile_gen[int(uid)] = CTX.profile_gen.get(int(uid), 0) + 1
+
+
+def my_tables(uid: int) -> dict[str, Any]:
+    """The profile of the tables in the account's latest ``PROFILE_HANDS`` hands
+    (``hr.table_profile``: players, ante, the account's own stack and its opponents'),
+    with ``paid`` and ``min_hands``. Part of Hand review: an account that doesn't pay
+    gets ``{"paid": False, "hands": 0}``. Cached until the account's hands change."""
+    uid = int(uid)
+    if not pub._paid(pub._user_by_id(uid)):
+        return {"paid": False, "hands": 0, "min_hands": PROFILE_MIN_HANDS}
+    with CTX.lock:
+        prof = CTX.profiles.get(uid)
+        gen = CTX.profile_gen.get(uid, 0)
+    if prof is None:
+        rows = pub.DB.q(
+            "SELECT bb_cents, json_extract(record, '$.ante_cents') AS ante, json_extract(record, '$.seats') AS seats"
+            " FROM review_hands WHERE user_id=? ORDER BY played_ts DESC, hand_key DESC LIMIT ?",
+            (uid, PROFILE_HANDS),
+        )
+        prof = hr.table_profile([
+            (int(r["bb_cents"]), int(r["ante"] or 0),
+             [(int(s["start_cents"]), bool(s.get("is_me"))) for s in json.loads(r["seats"] or "[]")])
+            for r in rows
+        ])
+        with CTX.lock:
+            if CTX.profile_gen.get(uid, 0) == gen:  # (no upload / deletion landed meanwhile)
+                CTX.profiles[uid] = prof
+    return {"paid": True, "min_hands": PROFILE_MIN_HANDS, **prof}
+
+
+def _my_tables_now() -> dict[str, Any] | None:
+    """The signed-in player's ``my_tables`` (the Trainer's hook), None signed out."""
+    uid = pub._CURRENT_USER_ID.get()
+    return None if uid is None else my_tables(int(uid))
 
 
 # --- the network's choice at a decision ------------------------------------------------------
@@ -889,6 +945,7 @@ def _account_anonymize(uid: int) -> None:
         pub.DB.q("DELETE FROM review_mistakes WHERE user_id=?", (int(uid),))
     with CTX.lock:
         CTX.drill.pop(int(uid), None)
+    _profile_stale(uid)
 
 
 _hooks = getattr(pub, "ACCOUNT_HOOKS", None)
@@ -949,6 +1006,8 @@ def install(app: FastAPI, *, static_dir: Any) -> None:
         next_spot=lambda prioritize: drill_next(_uid(), prioritize),
         record=lambda key, i, category: drill_result(_uid(), key, i, category),
     )
+    # ... and "My tables" deals like the tables in your hands (trainer.set_my_tables_hook).
+    tr.set_my_tables_hook(_my_tables_now)
 
     @app.get("/games/review")
     def review_page():

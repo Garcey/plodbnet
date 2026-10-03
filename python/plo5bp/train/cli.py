@@ -686,7 +686,11 @@ def build_parser() -> argparse.ArgumentParser:
         "(1-20:2%%, 20-30:6%%, 30-40:16%%, 40-50:22%%, 50-65:25%%, 65-80:22%%, 80-120:7%%); "
         "'clubgg_mix' picks 50/50 between clubgg and clubgg_deep per config; "
         "'deep' samples each seat uniformly in 100-250bb (ignores --stack-range); "
-        "'full_mix' picks 1/3 each between clubgg, clubgg_deep, and deep per config.",
+        "'full_mix' picks 1/3 each between clubgg, clubgg_deep, and deep per config; "
+        "'clubgg_real' = the owner's own ClubGG tables measured from their hand histories "
+        "(2026-10-03): per-seat bands with the 20bb buy-in spike, clipped to --stack-range, "
+        "AND the real seat counts (6:41.5/5:31.2/4:20.9/3:5.2/2:1.2 %%, --seats-dist does "
+        "not apply to it).",
     )
     parser.add_argument(
         "--mix-configs",

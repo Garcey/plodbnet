@@ -169,6 +169,7 @@
       </div>
       <div class="top-bar-item trainer-only">
         <button id="trainer-help-btn" class="icon-btn" type="button" aria-label="Help and keyboard shortcuts" title="Help and keyboard shortcuts (?)">?</button>
+        <button id="trainer-mytables-btn" class="mytables-toggle" type="button" aria-pressed="false" title="My tables: players, stacks and the ante like the tables in your own hand histories — your stack and your opponents'">My tables</button>
         <button id="trainer-settings-btn" type="button" title="Trainer settings">Settings</button>
         <button id="trainer-repeat-btn" type="button" title="Deal the same hand again (not counted in your stats)">Repeat</button>
         <button id="trainer-new-hand-btn" type="button" title="Deal a new hand (N)">New hand</button>
@@ -338,7 +339,15 @@
     <dialog id="trainer-settings-modal" class="dlg" aria-labelledby="ts-title">
       <form class="modal" method="dialog" id="ts-form" novalidate>
         <h3 id="ts-title">Trainer settings</h3>
-        <div class="ts-row">
+        <div class="ts-row" id="ts-row-tables">
+          <label for="ts-tables">Tables</label>
+          <select id="ts-tables">
+            <option value="custom">Set below</option>
+            <option value="mine">My tables</option>
+          </select>
+          <span class="ts-help muted" id="ts-tables-help">Players, stacks and the ante like the tables in your own hand histories.</span>
+        </div>
+        <div class="ts-row" id="ts-row-seats">
           <label for="ts-seats-mode">Players</label>
           <select id="ts-seats-mode">
             <option value="random">Random range</option>
@@ -352,7 +361,7 @@
             <input id="ts-seats-max" type="number" min="2" max="6" step="1" inputmode="numeric" aria-label="Most players" />
           </span>
         </div>
-        <div class="ts-row">
+        <div class="ts-row" id="ts-row-stacks">
           <label for="ts-stacks-mode">Stacks (bb)</label>
           <select id="ts-stacks-mode">
             <option value="fixed">Same for everyone</option>
@@ -399,7 +408,7 @@
           </select>
           <span class="ts-help muted">Deals until your first decision is this kind of spot.</span>
         </div>
-        <div class="ts-row">
+        <div class="ts-row" id="ts-row-ante">
           <label for="ts-ante-bb">Ante (bb)</label>
           <input id="ts-ante-bb" type="number" min="0" max="100" step="0.5" inputmode="decimal" />
         </div>

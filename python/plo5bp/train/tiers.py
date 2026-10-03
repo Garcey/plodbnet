@@ -17,6 +17,7 @@ from plo5bp.train.control import _warn_once
 
 _VALID_STACK_DISTS = (
     "uniform", "clubgg", "clubgg_deep", "clubgg_mix", "deep", "full_mix",
+    "clubgg_real",
 )
 # Every name `_sample_game_config` implements (the --stack-dist choices).
 # --mix-tiers is validated against this, and the sampler itself raises on
@@ -62,6 +63,39 @@ _CLUBGG_SEAT_WEIGHTS: dict[int, float] = {
     4: 0.25,
     3: 0.15,
     2: 0.10,
+}
+
+# "clubgg_real" (2026-10-03): the owner's OWN ClubGG tables, measured from their hand
+# histories — 953 hands of PLO5 double-board bomb pots at $10/$20, 3bb ante, 6-max
+# (aggregates only: nothing about any player is kept). Each seat's starting stack:
+# 20bb is the buy-in / top-up point (14% of seats sit right on it, 10% are below
+# it), with a long tail to ~350bb (clipped to --stack-range, default 300bb). The
+# seat count comes with the tier (_CLUBGG_REAL_SEAT_WEIGHTS: the real tables are
+# mostly 5-6 handed; --seats-dist does not apply to it), and every seat is drawn
+# independently, which reproduces how the real tables MIX short and deep stacks: 58%
+# of the real hands have a <=25bb seat and a >=100bb seat at once (the clubgg /
+# clubgg_deep / deep mix: 10%). Median stack 43bb (that mix: 71bb); median
+# stack-to-pot on the flop 2.5 (that mix: 5.3).
+_CLUBGG_REAL_STACK_BANDS: tuple[tuple[float, float, float], ...] = (
+    (1.0, 10.0, 0.012),
+    (10.0, 19.5, 0.097),
+    (19.5, 20.5, 0.136),   # the 20bb buy-in / top-up
+    (20.5, 30.0, 0.127),
+    (30.0, 40.0, 0.102),
+    (40.0, 50.0, 0.080),
+    (50.0, 65.0, 0.086),
+    (65.0, 80.0, 0.073),
+    (80.0, 100.0, 0.064),
+    (100.0, 150.0, 0.114),
+    (150.0, 250.0, 0.075),
+    (250.0, 350.0, 0.034),
+)
+_CLUBGG_REAL_SEAT_WEIGHTS: dict[int, float] = {
+    6: 0.415,
+    5: 0.312,
+    4: 0.209,
+    3: 0.052,
+    2: 0.012,
 }
 
 def _sample_clubgg_stack_bb(
@@ -123,7 +157,10 @@ def _sample_game_config(
     variant: str = VARIANT_PLO5,
     sb: int = 0,
 ) -> tuple[GameConfig, str]:
-    if seats_dist == "clubgg":
+    if stack_dist == "clubgg_real":
+        # (the real tables' seat counts come with their stacks)
+        n_seats = _sample_clubgg_seats(seats_choices, rng, weights=_CLUBGG_REAL_SEAT_WEIGHTS)
+    elif seats_dist == "clubgg":
         n_seats = _sample_clubgg_seats(seats_choices, rng)
     else:
         n_seats = int(rng.choice(seats_choices))
@@ -157,6 +194,15 @@ def _sample_game_config(
             )
         if effective_stack_dist == "deep":
             return rng.uniform(100.0, 250.0, size=n_seats)
+        if effective_stack_dist == "clubgg_real":
+            return np.array(
+                [
+                    _sample_clubgg_stack_bb(
+                        stack_lo_bb, stack_hi_bb, rng, bands=_CLUBGG_REAL_STACK_BANDS
+                    )
+                    for _ in range(n_seats)
+                ]
+            )
         if stack_lo_bb == stack_hi_bb:
             return np.full(n_seats, stack_lo_bb)
         return rng.uniform(stack_lo_bb, stack_hi_bb, size=n_seats)

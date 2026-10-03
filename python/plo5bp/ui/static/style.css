@@ -2436,3 +2436,19 @@ body.trainer-mode.drill-mode .drill-only { display: flex !important; }
   #mode-tabs .mode-tab { padding: 0 5px; font-size: 12.5px; }
   #top-bar .seg button { min-width: 26px; padding: 0 6px; }
 }
+
+/* ---- My tables (2026-10-03): the Trainer's work-bar toggle ------------------------------- */
+#workbar .mytables-toggle[hidden] { display: none; }
+#ts-tables-help { white-space: pre-line; }
+#workbar .mytables-toggle.on {
+  border-color: rgba(236, 201, 119, 0.6); background: rgba(236, 201, 119, 0.14); color: #ffe3a3;
+}
+#workbar .mytables-toggle.on:hover:not(:disabled) { background: rgba(236, 201, 119, 0.22); border-color: rgba(236, 201, 119, 0.8); }
+/* (the toggle made the Trainer's row ~380 px: narrow phones get slimmer buttons, one row kept) */
+@media (max-width: 400px) {
+  #workbar .trainer-only button:not(.icon-btn) { padding: 0 9px; }
+}
+@media (max-width: 370px) {
+  #workbar .trainer-only button:not(.icon-btn) { padding: 0 6px; }
+  #workbar .trainer-only { gap: 4px; }
+}
