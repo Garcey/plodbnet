@@ -4164,7 +4164,7 @@ def grade_hand(job: dict[str, Any], model: Any = None) -> list[dict[str, Any]]:
     cfg = GameConfig(
         num_seats=job["num_seats"], starting_stack=0,
         starting_stacks=tuple(job["stacks"]), ante=job["ante"], bb=BB_CHIPS,
-        variant=VARIANT_PLO5,
+        variant=VARIANT_PLO5, cover_short_bets=True,  # (a bet into a sub-1bb stack: GameConfig)
     )
     env = BombPotEnv(cfg, ev_runout_samples=0)  # FULL observation (not "minimal")
     if job.get("deck"):

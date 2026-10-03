@@ -542,6 +542,18 @@ is smaller"):
   chips into the replay's `[min_raise_chips, max_raise_chips]` before scoring, and
   `openInStudy` clamps into Study's `raise_bounds` — a bet above what anyone can call is
   the same bet as the capped one (its excess comes back), so nothing is mis-graded.
+- **The covering bet into a short stack's last chips (2026-10-03; owner: "in a real poker
+  app, I would be able to bet $20+ and the opponent just calls for their remaining
+  chips")**: under the trained rule, against opponents with less than 1bb behind the only
+  bet is the COVER (min = max = what they have left), which the Raise gate's dust screen
+  used to hide — Study / the Trainer offered only Check. Every table the site builds
+  (`common.default_game_config` for Study, the Trainer's three, the home-game grader and
+  Hand review's grader) sets `GameConfig.cover_short_bets=True`: the dock shows "Bet X"
+  (titled "Puts them all in — a bigger bet would come back uncalled"); only dust under
+  bb/100 stays screened. Training keeps the screen (the default; the batched engine refuses
+  the flag) and the observation is identical either way, so the network's raise logit
+  here is its generalization from nearby spots — training never offered it. Tests:
+  `tests/python/engine/test_cover_short_bets.py`, `tests/python/site/test_site_cover_short_bets.py`.
 
 Hand review (2026-10-03 — `tests/python/site/test_public_hand_review.py`; owner: "create a page,
 and this should be the one thing that is paywalled because it uses server storage, where you

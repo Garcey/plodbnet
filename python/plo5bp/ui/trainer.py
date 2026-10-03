@@ -1401,6 +1401,7 @@ class TrainerSession:
                     starting_stacks=tuple(stacks),
                     sb=0,
                     variant=eng,
+                    cover_short_bets=True,  # (GameConfig: the site's covering bet)
                 )
             else:
                 config = GameConfig(
@@ -1412,6 +1413,7 @@ class TrainerSession:
                     # NLH: the 5/10 structure — sb = bb/2, live preflop.
                     sb=BB_CHIPS // 2 if eng == VARIANT_NLH else 0,
                     variant=eng,
+                    cover_short_bets=True,  # (GameConfig: the site's covering bet)
                 )
             seed = int(self.rng.integers(0, 2**63 - 1))
 
@@ -1773,6 +1775,7 @@ class TrainerSession:
             starting_stacks=tuple(int(x) for x in c["starting_stacks"]),
             sb=int(c["sb"]),
             variant=str(c["variant"]),
+            cover_short_bets=True,  # (as the hand was dealt: GameConfig)
         )
         env = BombPotEnv(config)
         obs, info = env.reset(int(rec["seed"]), int(rec["button"]))

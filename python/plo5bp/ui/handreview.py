@@ -954,7 +954,7 @@ def spot_env(rec: dict[str, Any], i: int, log: list[dict[str, int]] | None = Non
     if ante is None:
         ante = hg._div_half_up(int(rec.get("ante_cents") or 0) * bb_chips, bb_cents)
     cfg = GameConfig(num_seats=n, starting_stack=0, starting_stacks=tuple(stacks), ante=int(ante),
-                     bb=bb_chips, variant=VARIANT_PLO5)
+                     bb=bb_chips, variant=VARIANT_PLO5, cover_short_bets=True)
     env = BombPotEnv(cfg, ev_runout_samples=0)
     ba = [int(c) for c in rec.get("board_a") or []]
     bbd = [int(c) for c in rec.get("board_b") or []]

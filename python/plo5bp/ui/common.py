@@ -14,6 +14,7 @@ trainer.py, and fixes had to be applied to every copy.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 from typing import Any, Callable, Mapping
@@ -463,14 +464,17 @@ def format_defaults(fmt_id: str) -> dict[str, float]:
 def default_game_config(fmt_id: str, bb: int = 10_000) -> GameConfig:
     """The table a fresh Study session opens for a format."""
     d = format_defaults(fmt_id)
+    # (cover_short_bets: the site offers the covering bet into a short stack's last
+    # chips — GameConfig; owner, 2026-10-03)
     if engine_variant(fmt_id) == VARIANT_NLH:
-        return GameConfig.nlh_default(
+        return dataclasses.replace(GameConfig.nlh_default(
             num_seats=int(d["num_seats"]),
             starting_stack=int(round(d["stack_bb"] * bb)),
-        )
+        ), cover_short_bets=True)
     return GameConfig(
         num_seats=int(d["num_seats"]),
         starting_stack=int(round(d["stack_bb"] * bb)),
         ante=int(round(d["ante_bb"] * bb)),
         bb=bb,
+        cover_short_bets=True,
     )

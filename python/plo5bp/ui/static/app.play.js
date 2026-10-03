@@ -346,7 +346,10 @@ function renderRaiseSection(s, actorSeat) {
     d.sizing.hidden = true;
     UI.raiseTo = maxTotal;
     paintRaise(maxTotal, "fixed");
-    d.raise.title = s.trainer ? "Bet or raise (R)" : "";
+    // (capped by a short opponent — even one with under 1bb left: the bet covering
+    // what they have, the same bet as any bigger one, whose rest would come back)
+    const cover = maxIsAllIn ? "" : "Puts them all in — a bigger bet would come back uncalled";
+    d.raise.title = [cover, s.trainer ? "Bet or raise (R)" : ""].filter(Boolean).join(" · ");
     return;
   }
   d.sizing.hidden = COMPACT_DOCK_MQ.matches && !UI.sizingOpen;

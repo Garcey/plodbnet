@@ -60,6 +60,17 @@ class GameConfig:
     limit and the bettor's own stack cap it, and what nobody matches comes back
     (the engine's ``GameConfig::reach_cap``). The batched training engine plays
     the capped rule only.
+
+    ``cover_short_bets`` (default False — training): when every opponent who can
+    still put chips in has less than one big blind behind, the capped rule's only
+    bet is the covering bet (min = max = what they have left — the engine's
+    cover-short clamp), and the Raise gate's dust screen hides it
+    (``actions.gate_mask_from_bounds``): the deep player could only check. True =
+    the website (Study, the Trainer, the graders; owner, 2026-10-03: "in a real
+    poker app I would be able to bet $20+ and the opponent just calls for their
+    remaining chips"): that bet is offered; only true dust (under bb/100, the
+    engine's dust guard) stays screened. The observation is unchanged either way.
+    The batched training engine refuses it.
     """
 
     num_seats: int = 6
@@ -70,6 +81,7 @@ class GameConfig:
     sb: int = 0
     variant: str = VARIANT_PLO5
     reach_cap: bool = True
+    cover_short_bets: bool = False
 
     def __post_init__(self) -> None:
         if self.variant not in _VARIANTS:

@@ -413,7 +413,10 @@ class BombPotEnv:
         mask = np.asarray(self._rs.legal_action_mask(), dtype=bool)
         min_raise = int(raw.get("min_raise", 0))
         max_raise = int(raw.get("max_raise", 0))
-        gate_mask = gate_mask_from_bounds(mask, max_raise, self.config.bb)
+        # (the website offers the covering bet into a short stack's last chips — only
+        # dust under bb/100 stays screened; training screens anything under 1bb)
+        screen = max(1, self.config.bb // 100) if self.config.cover_short_bets else self.config.bb
+        gate_mask = gate_mask_from_bounds(mask, max_raise, screen)
         actor = raw["actor"]
         if actor is not None:
             raw["hero_category_a"] = int(self._rs.hero_category(actor, 0))
