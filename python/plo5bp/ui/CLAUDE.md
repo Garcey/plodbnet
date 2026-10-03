@@ -283,7 +283,15 @@ off a 375 px screen) + per-mode `#workbar` above the table (Study: players / you
 / live controls / Enter cards / Share / New hand; Trainer: Settings / Repeat / New hand)
 + the table + `#side-rail` (desktop: the Trainer's review on top, Recommendation, then the
 13 x 4 card matrix (Study) or History + stats (Trainer); a phone stacks them under the
-table). **ONE card face on the whole site — Study's** (owner, 2026-10-01: "use the
+table). The Trainer's desktop rail never moves as a hand goes on (owner, 2026-10-03): the
+hand's History fills the room between the Recommendation and the Session / Lifetime stats
+and scrolls inside it, the stats are pinned at the bottom (sticky) with a "Previous hands
+(N) ▾" tab (`#ph-tab`) under them, and the tab — or scrolling down over anything but the
+History — slides `#prev-hands` (a child of `<main>` laid over the rail's own grid cell;
+`#recent-hands` lives in it) up over the whole rail; Back, Esc or scrolling up at the list's
+top slides it away (`setPrevHands` / `setupPreviousHands`, app.trainer.js; body.hands-open).
+A phone lists the previous hands under the stats. Pinned by `test_trainer_rail.py`.
+**ONE card face on the whole site — Study's** (owner, 2026-10-01: "use the
 study/trainer card faces in the home games for uniformity"; suit-colour fill, rank over
 suit top-left, big rank bottom-right, ten = "T").
 - **The table is the home games' (owner 2026-10-01: "bring the same look to the study and

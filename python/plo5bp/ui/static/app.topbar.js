@@ -919,6 +919,7 @@ async function handleCheckoutReturn() {
 function applyModeUI() {
   const trainer = UI.mode === "trainer";
   document.body.classList.toggle("trainer-mode", trainer);
+  if (!trainer) document.body.classList.remove("hands-open");  // (the Trainer's previous hands)
   for (const [id, on] of [["tab-study", !trainer], ["tab-trainer", trainer]]) {
     const tab = document.getElementById(id);
     tab.classList.toggle("active", on);

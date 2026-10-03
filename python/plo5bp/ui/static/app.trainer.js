@@ -218,7 +218,13 @@ function renderRecentHands(s) {
   if (!el) return;
   const list = (s.trainer && Array.isArray(s.trainer.recent)) ? s.trainer.recent : [];
   el.hidden = !list.length;
-  if (!list.length) { el.innerHTML = ""; return; }
+  // the tab under the pinned stats (a desktop): how many there are to look back at
+  const tab = document.getElementById("ph-tab");
+  if (tab) {
+    tab.hidden = !list.length;
+    document.getElementById("ph-count").textContent = list.length ? `(${list.length})` : "";
+  }
+  if (!list.length) { el.innerHTML = ""; setPrevHands(false); return; }
   const rows = list.map((r) => {
     const net = typeof r.net_bb === "number" ? fmtSignedValue(r.net_bb, s) : "";
     const cls = r.net_bb > 0 ? "pos" : r.net_bb < 0 ? "neg" : "";
@@ -232,7 +238,60 @@ function renderRecentHands(s) {
       + `<span class="rh-net ${cls}">${escapeHTML(net)}</span>`
       + `<span class="rh-score" title="Accuracy">${score}</span></button>`;
   });
-  el.innerHTML = `<div class="stats-title stats-title-static"><span>Recent hands</span></div>${rows.join("")}`;
+  el.innerHTML = `<div class="stats-title stats-title-static"><span>Previous hands</span></div>${rows.join("")}`;
+}
+
+// --- Previous hands over the side rail (2026-10-03, owner: "pin the session and lifetime
+// stats to the bottom of the right panel … a little tab at the bottom … 'Previous hands'
+// … pressing that little tab or scrolling down pulls the hand history up into the full
+// right panel"). A desktop's rail is the recommendation, the hand's actions (they fill the
+// room and scroll inside it) and the stats pinned at the bottom, so nothing moves as a
+// hand goes on; the tab — or scrolling down past the stats — slides the list up over the
+// whole rail. Back, Esc, or scrolling up at the list's top slides it away. (A phone lists
+// the hands under the stats: style.css.)
+const RAIL_SHEET_MQ = window.matchMedia("(min-width: 861px)");
+function prevHandsOpen() { return document.body.classList.contains("hands-open"); }
+function setPrevHands(open, focus = false) {
+  const want = !!open && RAIL_SHEET_MQ.matches && document.body.classList.contains("trainer-mode");
+  if (want === prevHandsOpen()) return;
+  document.body.classList.toggle("hands-open", want);
+  UI.handsToggledAt = performance.now();
+  const tab = document.getElementById("ph-tab");
+  if (tab) tab.setAttribute("aria-expanded", want ? "true" : "false");
+  if (focus) (want ? document.getElementById("ph-back") : tab)?.focus();
+}
+
+function setupPreviousHands() {
+  const $ = (id) => document.getElementById(id);
+  const tab = $("ph-tab"), sheet = $("prev-hands"), rail = $("side-rail"), list = $("recent-hands");
+  if (!tab || !sheet || !rail || !list) return;
+  tab.addEventListener("click", () => setPrevHands(true, true));
+  $("ph-back").addEventListener("click", () => setPrevHands(false, true));
+  sheet.addEventListener("click", (e) => {
+    const row = e.target.closest("[data-recent]");
+    if (!row) return;
+    setPrevHands(false);
+    onRecentHandClick(row);
+  });
+  // one wheel gesture flips the rail once (a trackpad's flick sends many events)
+  const settled = () => performance.now() - (UI.handsToggledAt || 0) > 500;
+  rail.addEventListener("wheel", (e) => {
+    if (e.deltaY <= 0 || prevHandsOpen() || tab.hidden || !settled()) return;
+    if (e.target.closest("#history")) return;  // (reading the hand's actions never flips it)
+    if (rail.scrollTop + rail.clientHeight < rail.scrollHeight - 2) return;  // (a short window scrolls first)
+    setPrevHands(true);
+  }, { passive: true });
+  sheet.addEventListener("wheel", (e) => {
+    if (e.deltaY >= 0 || !prevHandsOpen() || list.scrollTop > 0 || !settled()) return;
+    setPrevHands(false);
+  }, { passive: true });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && prevHandsOpen() && !document.querySelector("dialog[open]")) {
+      e.preventDefault();
+      setPrevHands(false, true);
+    }
+  });
+  RAIL_SHEET_MQ.addEventListener("change", () => { if (!RAIL_SHEET_MQ.matches) setPrevHands(false); });
 }
 
 async function onRecentHandClick(btn) {

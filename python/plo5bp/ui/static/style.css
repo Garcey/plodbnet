@@ -2197,6 +2197,73 @@ body:has(> #top-bar) {
   }
 }
 
+/* ---- the Trainer's rail: the stats pinned at the bottom (2026-10-03) ---------------------
+   Owner: "pin the session and lifetime stats to the bottom of the right panel … a little tab
+   … 'Previous hands' … pressing that little tab or scrolling down pulls the hand history up
+   into the full right panel". The hand's actions fill the room between the recommendation
+   and the stats and scroll inside it, so nothing below them moves as a hand goes on (nor
+   when the review opens at its end); the tab under the stats, or scrolling down past them,
+   slides the previous hands up over the whole rail (app.trainer.js setPrevHands). A phone
+   keeps its one column: the hands under the stats. */
+#prev-hands { display: none; }
+.ph-tab { display: none; }
+@media (min-width: 861px) {
+  body.trainer-mode #table-area { grid-column: 1; grid-row: 1; }
+  body.trainer-mode #side-rail { grid-column: 2; grid-row: 1; }
+  body.trainer-mode #side-rail > #history-panel { flex: 1 1 auto; min-height: 150px; display: flex; flex-direction: column; }
+  body.trainer-mode #side-rail #history { flex: 1 1 0; min-height: 0; max-height: none; overscroll-behavior: contain; }
+  /* (sticky: a short window that has to scroll the rail still keeps the stats in sight) */
+  body.trainer-mode #side-rail > #trainer-stats-panel {
+    position: sticky; bottom: 0; z-index: 2; flex: none; padding-bottom: 12px;
+    background: linear-gradient(rgba(9, 13, 20, 0.78), rgba(9, 13, 20, 0.78)), var(--bg);
+    border-top: 1px solid var(--line); border-bottom: 0;
+  }
+  body.trainer-mode .ph-tab:not([hidden]) {
+    display: flex; align-items: center; justify-content: center; gap: 6px; width: 100%;
+    padding: 7px 10px; border-radius: 10px; border: 1px solid var(--line);
+    background: rgba(255, 255, 255, 0.035); color: var(--tx-2);
+    font: 600 12px var(--font); cursor: pointer; transition: background 0.15s, color 0.15s, border-color 0.15s;
+  }
+  .ph-tab:hover, .ph-tab:focus-visible { color: var(--tx); border-color: var(--line-2); background: rgba(255, 255, 255, 0.06); }
+  .ph-tab .ph-count { color: var(--tx-3); font-weight: 500; }
+  .ph-tab .ph-arrow { font-size: 11px; }
+  /* the sheet: the rail's own grid cell, above it; closed, it waits below the cell (clipped) */
+  body.trainer-mode #prev-hands {
+    display: block; grid-column: 2; grid-row: 1; position: relative; z-index: 6;
+    overflow: hidden; pointer-events: none;
+  }
+  #prev-hands .ph-sheet {
+    position: absolute; inset: 0; display: flex; flex-direction: column; pointer-events: auto;
+    background: linear-gradient(rgba(9, 13, 20, 0.78), rgba(9, 13, 20, 0.78)), var(--bg);
+    border-left: 1px solid var(--line);
+    transform: translateY(100%); visibility: hidden;
+    transition: transform 0.32s var(--ease), visibility 0s linear 0.32s;
+  }
+  body.hands-open #prev-hands .ph-sheet { transform: none; visibility: visible; transition: transform 0.32s var(--ease); }
+  #prev-hands .ph-head { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+  #prev-hands .ph-head h3 {
+    margin: 0 auto 0 0; font-size: 10.5px; font-weight: 700; letter-spacing: 1.4px;
+    text-transform: uppercase; color: var(--tx-3);
+  }
+  /* the rail's small pill, like the stats' Reset (not the felt's .btn) */
+  #prev-hands .ph-back {
+    display: inline-flex; align-items: center; gap: 4px; height: 24px; padding: 0 10px;
+    border-radius: 999px; border: 1px solid var(--border); background: transparent; color: var(--muted);
+    font: 600 11px var(--font); cursor: pointer; transition: color 0.15s, border-color 0.15s, background 0.15s;
+  }
+  #prev-hands .ph-back:hover, #prev-hands .ph-back:focus-visible {
+    color: var(--tx); border-color: var(--line-2); background: rgba(255, 255, 255, 0.05);
+  }
+  #prev-hands #recent-hands {
+    flex: 1 1 0; min-height: 0; overflow-y: auto; margin: 0; padding: 10px 14px 14px;
+    border: 0; border-radius: 0; background: none;  /* (the sheet is the box) */
+  }
+  #prev-hands #recent-hands > .stats-title { display: none; }  /* (the head says it) */
+}
+@media (prefers-reduced-motion: reduce) {
+  #prev-hands .ph-sheet, body.hands-open #prev-hands .ph-sheet { transition: none; }
+}
+
 /* ---- panels, history, stats, the review: the home games' surfaces ------------------- */
 .panel { background: rgba(255, 255, 255, 0.025); border: 1px solid var(--line); border-radius: 14px; }
 .panel h3, .card-grid-header, .stats-title { font-size: 10.5px; letter-spacing: 1.4px; color: var(--tx-3); }
@@ -2377,6 +2444,9 @@ body:not(.trainer-mode) .act kbd { display: none; }
   #info-panel { order: 5; margin: 0 8px 8px !important; }
   #history-panel { order: 6; margin: 0 8px 8px; }
   #trainer-stats-panel { order: 7; }
+  /* the Trainer's previous hands: right under the stats (a desktop slides them over its rail) */
+  body.trainer-mode #prev-hands { display: block; order: 7; padding: 0 10px 10px; }
+  #prev-hands .ph-head { display: none; }
   #card-grid-panel { order: 8; }
   #history { max-height: 190px; overflow-y: auto; }
 }

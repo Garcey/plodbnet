@@ -104,6 +104,7 @@ async function init() {
   setupInsertHover();
   setupRaiseInput();
   setupTrainerControls();
+  setupPreviousHands();
   setupCardPicker();
   setupTableKeyboard();
   setupHistoryRewind();
