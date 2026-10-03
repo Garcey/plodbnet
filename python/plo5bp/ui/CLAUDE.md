@@ -123,9 +123,17 @@ Key invariants (documented in the module docstring — don't break):
   prefix length)` — behavior is a pure function of the action prefix.
   trainer.py is the ONLY consumer of torch's global RNG in the UI
   process (study path is always `deterministic=True`).
-- Scoring (`score_move` + the `SCORING` dict): gate-probability ratio ×
-  Beta-PDF size quality → 0-100 score → best/correct/inaccuracy/wrong/
-  blunder. EV loss = paired Monte-Carlo rollouts (common random
+- Scoring (`score_move(_v2)` → `_grade`, the `SCORING` dict; 2026-10-03, owner: a flop
+  fold the network mixed at 23% next to 40/37 was graded an inaccuracy): r = P(your gate)
+  / P(its favourite gate), on a LOG scale — an entropy-regularised policy plays about
+  exp(EV / temperature), so log(1/r) is the EV-loss proxy, not 1 - r. score = 100 ×
+  (1 - log(1/r) / SCORE_SPAN), 10 at r = 1/50; a raise's size (anchor ratio × Beta pdf
+  ratio) adds its own log-ratio × 0.6, at most 1.9 (a good move with an odd size is an
+  inaccuracy at worst). Categories: best r ≥ 3/4 (near-ties too, not only the argmax),
+  correct ≥ 1/4, inaccuracy ≥ 1/10, wrong ≥ 1/50, blunder rarer or P(gate) < 2%; the
+  score bands (`best_min` …) are derived and Hand review's mistake severity reads
+  `inaccuracy_min`. The Trainer's "How moves are graded" help says the same in words.
+  Every grader shares it (the Trainer, home games, Hand review). EV loss = paired Monte-Carlo rollouts (common random
   numbers) of user action vs the deterministic rec; `mc_rollouts`
   default 16 keeps a deviating `/trainer/act` under ~1s on CPU with the
   2048×4 net (matching actions skip MC entirely). v2+ scoring inverts the

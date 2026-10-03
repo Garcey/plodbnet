@@ -691,8 +691,8 @@ def mistakes(uid: int) -> list[dict[str, Any]]:
 
 def severity(score: float) -> float:
     """How bad a mistake was: 1 for a blunder scored 0 down to 0.25 at the top of the
-    "wrong move" band (scores 0-30, ``trainer.SCORING``) — the worst one comes up about
-    three times as often as the mildest."""
+    "wrong move" band (scores below ``trainer.SCORING["inaccuracy_min"]``) — the worst
+    one comes up about three times as often as the mildest."""
     from plo5bp.ui.trainer import SCORING
 
     top = float(SCORING["inaccuracy_min"])

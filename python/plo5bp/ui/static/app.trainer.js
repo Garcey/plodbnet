@@ -604,13 +604,13 @@ const HELP = {
   grading: {
     title: "How moves are graded",
     html: `
-      <p>Each of your moves is compared with what the network does in the same spot. The score is how much the network likes your action next to its favourite: <b>100%</b> means you picked its top action. For bets and raises it also counts how close your size is to the sizes it prefers.</p>
+      <p>Each of your moves is compared with what the network does in the same spot: how often it plays your move next to its favourite. The score counts that on a log scale, the way the network weighs its choices &mdash; <b>100%</b> is its favourite, a move it plays half as often scores about 84%, a third as often 75%, a tenth as often 47%. When it mixes several moves the spot is close, so every move in its mix grades well. For bets and raises it also counts how close your size is to the sizes it prefers (the right move with an odd size is an inaccuracy at worst).</p>
       <ul class="help-bands">
-        <li><b class="cat-text-best">Best move</b> 85% or more, and the network's top action</li>
-        <li><b class="cat-text-correct">Correct</b> 60% or more</li>
-        <li><b class="cat-text-inaccuracy">Inaccuracy</b> 30&ndash;60%</li>
-        <li><b class="cat-text-wrong">Wrong move</b> 10&ndash;30%</li>
-        <li><b class="cat-text-blunder">Blunder</b> below 10%, or an action the network takes less than 2% of the time</li>
+        <li><b class="cat-text-best">Best move</b> its favourite, or a move it plays at least &frac34; as often (93% or more)</li>
+        <li><b class="cat-text-correct">Correct</b> at least a quarter as often &mdash; part of its mix (68% or more)</li>
+        <li><b class="cat-text-inaccuracy">Inaccuracy</b> at least a tenth as often (47&ndash;68%)</li>
+        <li><b class="cat-text-wrong">Wrong move</b> at least a fiftieth as often (10&ndash;47%)</li>
+        <li><b class="cat-text-blunder">Blunder</b> rarer than that, or an action the network takes less than 2% of the time</li>
       </ul>
       <p><b>Accuracy</b> is your average score. <b>EV loss</b> estimates what a move cost against the network's choice by simulating run-outs; it is noisy on one hand and settles over many.</p>
       <p class="muted">The network approximates game-theory-optimal play through self-play &mdash; it is not a solver, so read it as a very strong player's opinion.</p>`,

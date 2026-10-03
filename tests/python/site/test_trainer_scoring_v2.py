@@ -14,7 +14,7 @@ import pytest
 
 from plo5bp.actions import GATE_CHECK_CALL, GATE_FOLD, GATE_RAISE
 from plo5bp.network import ActorCriticV2
-from plo5bp.ui.trainer import SCORING, score_move_v2
+from plo5bp.ui.trainer import SCORE_SPAN, SCORING, score_move_v2
 
 
 def _dist(
@@ -116,7 +116,8 @@ def test_anchor_prob_ratio_drives_size_q():
     d = _dist(anchor_probs=probs)
     sc = score_move_v2(d, GATE_RAISE, d["anchor_chips"][7])
     assert sc["size_q"] == pytest.approx(0.5)
-    expected = 100.0 * (SCORING["size_floor"] + (1 - SCORING["size_floor"]) * 0.5)
+    # (the size's log-ratio at its weight, on the score's log scale — trainer._grade)
+    expected = 100.0 * (1 - SCORING["size_weight"] * math.log(2.0) / SCORE_SPAN)
     assert sc["score"] == pytest.approx(expected)
 
 

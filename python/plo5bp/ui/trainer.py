@@ -171,18 +171,65 @@ CATEGORY_MARKS = {
     "blunder": "✗✗",
 }
 
-# All scoring tunables in one place. Categories are score bands except
-# the absolute-probability blunder override; `best` additionally
-# requires picking the argmax gate.
+# All scoring tunables in one place (2026-10-03). A move is graded by how much less often
+# the network plays it than its favourite — on a LOG scale: a policy trained with an
+# entropy bonus plays an action about in proportion to exp(EV / temperature), so the log
+# of that ratio, not the ratio, follows the EV an action gives up. 23% against the
+# favourite's 40% is then a regular part of a mixed strategy, not a mistake; 2% against
+# 90% is. (Owner: a flop fold the network mixed at 23% next to 40% call / 37% raise was an
+# "inaccuracy" under the old linear ratio, 57.5 < 60.) Categories by the ratio r =
+# P(your move) / P(its favourite), the size's part included:
 SCORING = {
-    "size_floor": 0.4,         # raise-size quality floor in size_factor
-    "best_min": 85.0,
-    "correct_min": 60.0,
-    "inaccuracy_min": 30.0,
-    "wrong_min": 10.0,         # below -> blunder
-    "blunder_gate_prob": 0.02, # P[user gate] below -> blunder regardless
+    "best_ratio": 0.75,          # a near-tie with its favourite (or the favourite)
+    "correct_ratio": 0.25,       # a regular part of its mix
+    "inaccuracy_ratio": 0.10,    # an occasional play
+    "wrong_ratio": 0.02,         # a rare one; rarer -> blunder
+    "blunder_gate_prob": 0.02,   # P[your gate] below -> blunder regardless
+    # A raise's size counts in the same log units at this weight, at most this much: a
+    # move of the right kind with a size the network rarely uses is an inaccuracy at worst.
+    "size_weight": 0.6,
+    "size_cap": 1.9,
     "u_eps": 1e-4,
 }
+#: score = 100 * (1 - log(1/r) / SCORE_SPAN): 100 for its favourite, 10 at `wrong_ratio`
+SCORE_SPAN = math.log(1.0 / SCORING["wrong_ratio"]) / 0.9
+
+
+def _score_of(log_ratio: float) -> float:
+    return 100.0 * max(0.0, 1.0 - log_ratio / SCORE_SPAN)
+
+
+# The score bands the categories mean (accuracy stats, the mistakes drill's severity).
+SCORING.update({
+    "best_min": _score_of(math.log(1.0 / SCORING["best_ratio"])),
+    "correct_min": _score_of(math.log(1.0 / SCORING["correct_ratio"])),
+    "inaccuracy_min": _score_of(math.log(1.0 / SCORING["inaccuracy_ratio"])),
+    "wrong_min": _score_of(math.log(1.0 / SCORING["wrong_ratio"])),  # below -> blunder
+})
+
+
+def _grade(p_user: float, p_best: float, size_q: float, raising: bool) -> tuple[float, str]:
+    """(score, category) of a move the network plays with gate probability `p_user`
+    against its favourite gate's `p_best`; `size_q` in (0, 1] is how much less it likes a
+    raise's size than its favourite size (1 = that size, or no size to choose)."""
+    if p_user <= 0.0 or p_best <= 0.0:
+        return 0.0, "blunder"
+    log_ratio = max(0.0, math.log(p_best / p_user))
+    if raising and size_q < 1.0:
+        size_lr = math.inf if size_q <= 0.0 else -math.log(size_q)
+        log_ratio += min(SCORING["size_cap"], SCORING["size_weight"] * size_lr)
+    score = _score_of(log_ratio)
+    if p_user < SCORING["blunder_gate_prob"] or score < SCORING["wrong_min"]:
+        category = "blunder"
+    elif score < SCORING["inaccuracy_min"]:
+        category = "wrong"
+    elif score < SCORING["correct_min"]:
+        category = "inaccuracy"
+    elif score < SCORING["best_min"]:
+        category = "correct"
+    else:
+        category = "best"
+    return score, category
 
 
 def score_move(
@@ -201,7 +248,7 @@ def score_move(
     density at the user's normalized size relative to the density at the
     mode (normalization constants cancel). Degenerate ranges — short
     shove (min==0) or single-point (min==max) — have no size choice, so
-    size_q is 1.
+    size_q is 1. Score and category: `_grade` (the log scale, SCORING).
     """
     g_star = max(range(len(gate_probs)), key=lambda i: gate_probs[i])
     p_user = float(gate_probs[user_gate])
@@ -227,20 +274,7 @@ def score_move(
 
         size_q = min(1.0, math.exp(logpdf(u) - logpdf(ref)))
 
-    size_factor = SCORING["size_floor"] + (1.0 - SCORING["size_floor"]) * size_q
-    score = 100.0 * gate_ratio * (size_factor if user_gate == GATE_RAISE else 1.0)
-    score = max(0.0, min(100.0, score))
-
-    if p_user < SCORING["blunder_gate_prob"] or score < SCORING["wrong_min"]:
-        category = "blunder"
-    elif score < SCORING["inaccuracy_min"]:
-        category = "wrong"
-    elif score < SCORING["correct_min"]:
-        category = "inaccuracy"
-    elif user_gate == g_star and score >= SCORING["best_min"]:
-        category = "best"
-    else:
-        category = "correct"
+    score, category = _grade(p_user, p_best, size_q, user_gate == GATE_RAISE)
     return {
         "score": score,
         "category": category,
@@ -432,8 +466,7 @@ def score_move_v2(
     where the pdf ratio compares the user anchor's Beta density at the
     user's position on the UNCLAMPED bracket vs at its mean. Atoms,
     short-shove and collapsed brackets have no within-anchor size choice
-    → pdf ratio 1. Categories, the size floor, and the blunder override
-    match v1.
+    → pdf ratio 1. Score and category: `_grade`, as v1.
 
     (review 2026-09-20 H1) Playing EXACTLY the recommendation's chips is
     the recommended (anchor, u) by definition — full size credit, no
@@ -472,20 +505,7 @@ def score_move_v2(
             anchor_ratio = (p_ku / p_kb) if p_kb > 0 else 0.0
             size_q = anchor_ratio * pdf_ratio
 
-    size_factor = SCORING["size_floor"] + (1.0 - SCORING["size_floor"]) * size_q
-    score = 100.0 * gate_ratio * (size_factor if user_gate == GATE_RAISE else 1.0)
-    score = max(0.0, min(100.0, score))
-
-    if p_user < SCORING["blunder_gate_prob"] or score < SCORING["wrong_min"]:
-        category = "blunder"
-    elif score < SCORING["inaccuracy_min"]:
-        category = "wrong"
-    elif score < SCORING["correct_min"]:
-        category = "inaccuracy"
-    elif user_gate == g_star and score >= SCORING["best_min"]:
-        category = "best"
-    else:
-        category = "correct"
+    score, category = _grade(p_user, p_best, size_q, user_gate == GATE_RAISE)
     return {
         "score": score,
         "category": category,

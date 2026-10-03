@@ -1,4 +1,8 @@
-"""Pure scoring-rubric tests for trainer.score_move (no model, no env)."""
+"""Pure scoring-rubric tests for trainer.score_move (no model, no env).
+
+Since 2026-10-03 a move is graded on a LOG scale of how much less often the network plays
+it than its favourite (`trainer._grade`): best = at least 3/4 as often, correct = 1/4,
+inaccuracy = 1/10, wrong = 1/50, blunder = rarer or under 2% outright."""
 
 from __future__ import annotations
 
@@ -7,7 +11,7 @@ import math
 import pytest
 
 from plo5bp.actions import GATE_CHECK_CALL, GATE_FOLD, GATE_RAISE
-from plo5bp.ui.trainer import SCORING, score_move
+from plo5bp.ui.trainer import SCORE_SPAN, SCORING, score_move
 
 
 def test_pure_fold_is_best():
@@ -16,7 +20,16 @@ def test_pure_fold_is_best():
     assert r["score"] == pytest.approx(100.0)
 
 
-def test_mixed_check_bet_user_bets_well_sized_is_correct():
+def test_the_owners_mixed_flop_fold_is_correct():
+    # (owner, 2026-10-03) the network mixed fold 23 / call 40 / raise 37 on the flop; the
+    # fold was an "inaccuracy" under the old linear ratio (57.5 < 60). It is part of the mix.
+    r = score_move([0.23, 0.40, 0.37], 1.5, 1.5, 0, 0, GATE_FOLD, 0)
+    assert r["category"] == "correct"
+    assert r["score"] == pytest.approx(100 * (1 - math.log(0.40 / 0.23) / SCORE_SPAN))
+    assert score_move([0.23, 0.40, 0.37], 1.5, 1.5, 0, 0, GATE_RAISE, 0)["category"] == "best"
+
+
+def test_mixed_check_bet_user_bets_well_sized_is_a_near_tie():
     # Network mixes check 55 / bet 45; user bets at the Beta mode.
     alpha, beta = 3.0, 5.0
     mode = (alpha - 1) / (alpha + beta - 2)
@@ -25,8 +38,8 @@ def test_mixed_check_bet_user_bets_well_sized_is_correct():
     r = score_move([0.0, 0.55, 0.45], alpha, beta, lo, hi, GATE_RAISE, chips)
     assert r["gate_ratio"] == pytest.approx(0.45 / 0.55, rel=1e-6)
     assert r["size_q"] == pytest.approx(1.0, abs=1e-3)
-    assert r["score"] == pytest.approx(100 * 0.45 / 0.55, rel=1e-2)
-    assert r["category"] == "correct"  # second-best line, well sized
+    assert r["score"] == pytest.approx(100 * (1 - math.log(0.55 / 0.45) / SCORE_SPAN), rel=1e-2)
+    assert r["category"] == "best"  # second-best line at 45 vs 55, well sized: a near-tie
 
 
 def test_call_into_pure_fold_is_blunder():
@@ -41,9 +54,9 @@ def test_right_gate_wrong_size_drags_score():
     lo, hi = 10_000, 100_000
     r_tail = score_move([0.05, 0.15, 0.80], alpha, beta, lo, hi, GATE_RAISE, hi)
     assert r_tail["size_q"] < 0.05
-    # Floor keeps it near 100 * size_floor.
-    assert r_tail["score"] == pytest.approx(100 * SCORING["size_floor"], rel=0.15)
-    assert r_tail["category"] in ("inaccuracy", "wrong")
+    # The size's part is capped: the right kind of move is an inaccuracy at worst.
+    assert r_tail["score"] == pytest.approx(100 * (1 - SCORING["size_cap"] / SCORE_SPAN))
+    assert r_tail["category"] == "inaccuracy"
     # Same gate at the mode scores ~100 / best.
     chips_mode = round(lo + (alpha - 1) / (alpha + beta - 2) * (hi - lo))
     r_mode = score_move([0.05, 0.15, 0.80], alpha, beta, lo, hi, GATE_RAISE, chips_mode)
@@ -87,18 +100,24 @@ def test_category_bands():
         return score_move([p_best, p_user, max(rest, 0.0)], 1.5, 1.5, 0, 0,
                           GATE_CHECK_CALL, 0)
 
-    assert cat(0.90)["category"] == "correct"   # high score but not argmax
-    assert cat(0.62)["category"] == "correct"
-    assert cat(0.45)["category"] == "inaccuracy"
-    assert cat(0.20)["category"] == "wrong"
-    assert cat(0.05)["category"] == "blunder"
+    assert cat(0.90)["category"] == "best"      # a near-tie with the favourite
+    assert cat(0.76)["category"] == "best"
+    assert cat(0.74)["category"] == "correct"
+    assert cat(0.30)["category"] == "correct"   # a regular part of the mix
+    assert cat(0.24)["category"] == "inaccuracy"
+    assert cat(0.11)["category"] == "inaccuracy"
+    assert cat(0.09)["category"] == "wrong"
+    assert cat(0.05)["category"] == "wrong"     # (2.5%: rare, not under 2%)
+    assert cat(0.03)["category"] == "blunder"   # (1.5%: under 2% outright)
+    # the score bands are the ratios on the log scale
+    assert SCORING["best_min"] == pytest.approx(100 * (1 - math.log(4 / 3) / SCORE_SPAN))
+    assert SCORING["wrong_min"] == pytest.approx(10.0)
 
 
-def test_tied_argmax_is_not_best():
-    # Ratio 1.0 against a tied gate still isn't "best" unless it IS argmax.
+def test_a_tie_with_the_favourite_is_best():
     r = score_move([0.45, 0.45, 0.10], 1.5, 1.5, 0, 0, GATE_CHECK_CALL, 0)
     assert r["score"] == pytest.approx(100.0)
-    assert r["category"] == "correct"
+    assert r["category"] == "best"
 
 
 def test_low_probability_overrides_to_blunder():
