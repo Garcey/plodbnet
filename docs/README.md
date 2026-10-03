@@ -21,6 +21,7 @@ sessions are [CLAUDE.md](../CLAUDE.md); these are the longer documents.
 |---|---|
 | [../learn/](../learn/README.md) | the course (master document + plain-English concepts), checked against the code on 2026-07-23 — see its "what changed since" box |
 | [TRAINING_UPDATE_WALKTHROUGH.md](TRAINING_UPDATE_WALKTHROUGH.md) | one PPO update step by step (memory, CPU vs GPU) as of July — see its "what changed since" box |
+| [training-what-works.md](training-what-works.md) | current (2026-09-29) — what has and hasn't worked in training experiments, the best recipe so far, and how to test a change; evidence in [training-log.md](training-log.md) |
 
 ## Design history (newest first)
 

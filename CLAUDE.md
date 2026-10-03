@@ -50,19 +50,34 @@ bit-exact reproducible; tests lean heavily on parity.
 | NLH CFR solver, GTO labels / PolicyNet, CFR Solver app | `python/plo5bp/gto/CLAUDE.md` |
 | Training: PPO, rollout, env, encoding, flags, runs, guardians | **`docs/training.md`** — read it before touching training code |
 | Training history: runs, sweeps, tuning, diagnoses | `docs/training-log.md` |
+| Training: what has and hasn't worked, the current best recipe, how to test a change | `docs/training-what-works.md` — read it before planning a training change |
 | Production: deploy, promote a model, roll back, restore, alerts | `docs/ops/PRODUCTION.md`, `ops/SERVER_SETUP.md` |
 | Setting up this PC / the training pod | `SETUP.md` |
 | Improvement backlog (local only) | `docs/improvements/README.md` |
 
-## Current state (2026-09-28)
+## Current state (2026-09-30)
 
-- **Main run: `vSix6`** (actor 1024x3, 1536x2 SiLU critic, ~164M rows/update) —
-  resumed after a stall on entropy 0.045 / lambda 0.8 / lr 7.5e-5. Guardian
-  `scripts/vSix6_guardian.sh`, stop file `runs/vSix6.stop`, live control
-  `runs/vSix6.control.json`. The pod's `/workspace` is a ~20 GB quota — a full
-  volume silently kills trainers.
-- **Live site model: `vSix6_1300`** (since 2026-09-26). Candidate
-  `avg_1380_1389` awaits the owner's OK. Full detail: `docs/training.md`.
+- **Main run: `vSix7`** (started 2026-09-29 on the owner's /goal) = r8c's recipe
+  (all-actions gate term + KL magnet + entropy 0.025, actor 1024x3, SiLU critic
+  1536x2) + the new obs-X inputs `line,run` (1246 dims; +~0.02 bb/seat-hand over
+  r8c, `docs/design/OBS_X_DIMS_2026-09-29.md`). Since 2026-09-30 08:09 UTC (u1645,
+  owner: "absolute maximum rollout") it runs at the host-RAM maximum: 1.76M envs,
+  136M-row target = **~148.6M rows/update**, ~36.5 min/update, a checkpoint every
+  update, peak RSS 207 GiB of the 233.8 GiB container (sizing in
+  `docs/training-what-works.md`, "Pod lessons"). It runs from the
+  pod's LOCAL disk (`/root/plx`, code = the side worktree
+  `C:\Users\themi\plodbnet-exp`: all-actions + obs-X, NOT the main code): guardian
+  `/root/plx/vx_guardian_local.sh` (STEM=vSix7; v2 backs the rollout off 8% if the
+  trainer is ever OOM-killed), memory every 10 s in `/root/plx/runs/vSix7_mem.log`.
+  To stop: `touch /root/plx/runs/vSix7.stop`, then kill the trainer right after a
+  numbered save (`switch_vsix7_max.sh` shows how). The local disk is wiped if the pod
+  restarts; a desktop loop copies checkpoints to `checkpoints/vSix7/`. The pod's `/workspace` (~20 GB
+  quota) has hung on reads since 2026-09-28 ~16:40 UTC; the old `vSix6` guardian
+  there is stopped. A vSix7 checkpoint can't go live until the site's encoder
+  and the main code get the obs-X tail + all-actions option.
+- **Live site model: `vSix6_1300`** (since 2026-09-26). Candidate `r8c_1460`
+  (vs live +0.34–0.38 sampled / +0.23 argmax on two deal seeds; supersedes
+  `avg_1380_1389`) awaits the owner's OK. Full detail: `docs/training.md`.
 
 ## Environment
 
@@ -212,10 +227,12 @@ python/plo5bp/
     public.py, homegame.py    public service layer, private home games
     homegame_*.py             the home games' parts (schema, people, clubs,
                               stats, pages, routes, export) — see HGB-006
+    handreview.py, handreview_store.py  Hand review (the paid page): ClubGG
+                              hand-history zips -> records, all-in EV, grading
     runout.py, hand_describe.py, common.py
     static/                   index.html, app{.core,.table,.play,.study,.trainer,
                               .topbar,}.js, ranges.js, landing.js, admin.html,
-                              games.html/.css + games{,.table,.play,.ui,.sound}.js
+                              games.html/.css + games{,.table,.play,.ui,.sound,.review}.js
 
 tests/
   conftest.py                 markers per file, STALE ENGINE check, skip report

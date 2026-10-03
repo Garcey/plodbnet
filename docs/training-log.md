@@ -294,3 +294,129 @@ History, newest last. The rules and the reference these runs produced are in `do
     recipe's last 43 updates gave +0.03 / +0.006. vSix6_1395 (6 new-recipe
     updates, the last 3 with 90 setups; 24 min per update vs 21) +0.091 +-
     0.022 / +0.049 +- 0.013, every tier positive.
+- **Keep-climbing rounds 6-8 (2026-09-28/29, owner: "test ways to keep it climbing
+  ... report the best steps forward")**:
+  - Setup: every run starts from vSix6_1401 (the /workspace volume degraded ~16:40
+    UTC — some reads never return — so 1405 and the sidecar were unreadable): cold
+    Adam + `--lr-warmup-updates 3`, the same seeded pool (1374..1401) and random
+    stream (common random numbers), the vSix6 recipe (entropy 0.045, lambda 0.8,
+    lr 7.5e-5) at 220k envs / 15M rows per update, 24 updates, on the pod's LOCAL
+    disk (`/root/plx`: system python3.12 + PYTHONPATH, engine rebuilt with
+    `cargo build --release --offline`; the local disk is wiped if the pod
+    restarts). Scored vs 1401 with h2h_cross (seed 7, 61,440 pairs, sampled /
+    argmax) at +4..+24; means are over those checkpoints. File `<stem>_<1400+k>`
+    = k updates in. Single checkpoints swing +-0.03-0.05 (a double-strength run:
+    -0.003 to +0.197 in 8 updates) — read means and trends, never one checkpoint.
+  - Round 6 (slowing the random walk): control (the production recipe) peaks at
+    +12 (+0.043 / +0.096) and slides (+24 +0.043 / +0.060; mean +0.032 / +0.071);
+    lr halved after 8 and 16 holds (mean +0.035 / +0.087); KL magnet
+    (`--kl-anchor-coef 0.1 --kl-anchor-ema 0.9`, EMA per UPDATE) alone too slow;
+    entropy 0.045 -> 0.025 alone lowers argmax; magnet + entropy steps
+    (0.045/.038/.031/.025 after 6/12/18) is the only run still rising at +24
+    (+0.085 / +0.101).
+  - **All-actions gate term (`--aa-coef`, NEW, default off = bit-exact)**: the
+    gate policy also follows the critic's pooled Q for fold / call / raise at every
+    row — the expected policy gradient sum_a pi(a) (Q(a) - sum_b pi(b) Q(b)), per
+    config scaled by 1/std of its raw advantages. r7a (coef 1.0): +0.135 / +0.114
+    at +4, then FLAT (no slide) through +32: mean +0.127 / +0.110 over 8
+    checkpoints, every tier positive, deep tier most (~+0.2). As a control
+    variate (`--aa-cv`: same expected gradient, less noise) no gain: the benefit
+    is the critic's extra signal, not noise reduction. Coef 2.0 (r8d): mean
+    +0.146 / +0.111 over 6 checkpoints (= 1.0 in argmax), far more volatile, and
+    the gate entropy keeps falling (Hg 0.45 -> 0.30 by +20 vs 1.0's steady
+    0.38-0.41; KL/update 2x) — use 1.0.
+  - AA + lr halving (r8b) = AA alone (+12..+24 means +0.125 / +0.117 vs +0.120 /
+    +0.109). lr + magnet + entropy without AA (r8a) worse than either alone
+    (+0.068 / +0.069 at +24).
+  - **AA + magnet + entropy steps (r8c) = the one that keeps climbing**: slow
+    start (+0.041 / +0.075 at +4); argmax .075 .081 .105 .110 .129 .131 .140 then
+    ~.12 (+32 .112, +36 .119); sampled .041 .112 .065 .092 .084 .128 and —
+    continued past the schedule with entropy HELD at 0.025 — .150 .185 .187 at
+    +28/+32/+36 (AA alone at +28/+32: .119/.150). Gate entropy 0.47 -> 0.37 by +24,
+    then FLAT (0.36-0.38) through +36, so the late sampled gain is better mixing
+    frequencies, not sharpening. KL per update ~0.0013 (the magnet damps the
+    random walk; AA alone ~0.002, AA 2.0 ~0.004). Continued again to +60
+    (same recipe, entropy 0.025): +40..+60 sampled .159 .170 .199 .183 .186
+    .220, argmax .138 .156 .137 .171 .151 .171. Means by thirds (+4..+20 /
+    +24..+40 / +44..+60): sampled +0.079 / +0.162 / +0.192, argmax +0.100 /
+    +0.128 / +0.157 — still ~+0.03 per 20 updates at the end, where AA alone
+    had levelled at ~+0.127 / +0.110. DIRECT (seed 9, fresh deals): r8c_1460 vs
+    r8c_1436 +0.055 (z 3.2) / +0.050 (z 4.1) — the last 24 updates are a real
+    gain; r8c_1460 vs r7a_1432 (AA alone, levelled) +0.036 (z 2.1) / +0.023
+    (z 1.9). vs the live vSix6_1300: r8c_1436 seed 7 +0.419 / +0.255, seed 8
+    +0.373 / +0.237; r8c_1460 seed 7 +0.379 / +0.231, seed 8 +0.344 / +0.226
+    (equal within noise vs THAT reference — judge climbs head-to-head).
+  - Rows per update: 45M (r7e, 8 updates = the data of 24 x 15M) made the SAME
+    progress per update as 15M (so 3x the time per step for nothing); 5M (r8e,
+    AA) nearly the same per update as 15M (mean +0.115 / +0.097 vs +0.124 /
+    +0.112 over +4..+24; +24 +0.143 / +0.137) at half the time per update
+    (6.8M rows incl. the drain). Production's 164M rows/update buys nothing per
+    update over 15M.
+  - No gain: 3 extra critic epochs (r7c +16 +0.016 / +0.070 = control; r8f with
+    AA at 5M = r8e). Production's ORIGINAL l2-init anchor (the r2b student's
+    weights, r7d) vs re-anchoring at the start: argmax the same, sampled -0.03 —
+    re-anchor at a restart.
+  - vs the LIVE vSix6_1300 (seed 7, sampled / argmax): r7a_1416 +0.338 / +0.280,
+    r8e_1424 +0.344 / +0.252, r8b_1424 +0.383 / +0.200, r8c_1424 +0.371 / +0.292
+    (every tier: clubgg +0.23, clubgg_deep +0.29, deep +0.36 argmax). Weight
+    average of the six AA finals (`soup_aa6` = r7a_1432 + r8b..r8f_1424, from one
+    start so one basin): vs 1401 +0.136 / +0.147 (its members' mean +0.145 /
+    +0.125 — averaging helps the argmax), vs live +0.387 / +0.252.
+  - Recommended recipe (the owner decides; production stays paused until then):
+    r8c's — `--aa-coef 1.0 --kl-anchor-coef 0.1 --kl-anchor-ema 0.9`, entropy
+    0.045 stepped to 0.025 (0.038 / 0.031 / 0.025 every 6 updates), lambda 0.8,
+    lr 7.5e-5, 15M rows per update (NOT 164M — contradicts "longer rollouts are
+    always better"; the owner's call), re-anchored l2-init at the start; watch
+    the gate entropy (Hg) — a steady slide toward ~0.30 (as with AA 2.0) means
+    it is turning one-sided. r8g = r8c's recipe from r8c_1436 at 5M
+    rows/update (24 updates, ~half the time each; its numbered files are
+    `r8g_<1435+k>`, final = r8g_1459): sampled .146 .140 .165 .145 .202 .168,
+    argmax .130 .135 .160 .144 .157 .157 (means +0.161 / +0.147 vs r8c's +0.179 /
+    +0.151 over the same updates) — the recipe works at 5M rows too. Resume
+    files (checkpoint + optimizer sidecar, sha256-checked) for r8c (u1461) and
+    r8g: `checkpoints/round8/resume/` on the desktop.
+  - Code: `--aa-coef` / `--aa-cv` exist only in the worktree
+    `C:\Users\themi\plodbnet-exp` (HEAD 80048a0 + the patch: rollout.py Batch
+    `adv_std` / `adv_scale_rows`, ppo.py `aa_gate_terms`, config.py, train.py,
+    `tests/python/test_aa_gate_terms.py`) and on the pod in `/root/plx`; the
+    default path was digest-identical to HEAD (33 checkpoint + 95 sidecar
+    tensors). Porting it into the refactored main copy needs
+    `scripts/exactness_check.py --recipe all`.
+- **Obs-X rounds — new observation dims on top of r8c (2026-09-29, owner /goal
+  "brainstorm new DIMs, test them and mixtures, start training r8c with the best")**:
+  full write-up `docs/design/OBS_X_DIMS_2026-09-29.md`. A 75-dim optional tail after
+  the 1171 (`--obs-x-groups`; Rust encoder; zero-padded warm starts = exact A/B):
+  `run` (all-in equity with the turn / river dealt vs 1 and 2 random hands), `range`
+  (current hand vs the top 50/20/5% of holdings, nut density), `line` (per-player
+  raises / calls / checks per street), `pos` (who still acts after hero). Rounds X1
+  (one group each) and X2 (mixtures + M1 = training on the site's 1024-sample
+  opp-outcome features), 32 updates from r8c u1461 at 5M rows, each vs the control
+  at the same update. Result at +32 over 3 seeds (sampled / top): `line,run` +0.021 /
+  +0.025 (all six positive) = the pick; all four +0.014 / +0.030; `run` +0.011 /
+  +0.025 (4 seeds); `line,range,pos` +0.007 / +0.023; `line` alone −0.009 / −0.014;
+  M1 ≈ 0. Cost: `run` ~+60% time per update. **Method lesson**: one seed's 30 table
+  setups moved results by 0.02–0.05 (seed 7 alone ranked `line` first, `run` flat;
+  seeds 11/13/17 reversed it) — confirm small effects on 2–3 seeds with 150 setups.
+  **Production `vSix7`** = r8c recipe + `line,run`, 15M rows/update, from x2c (u1493),
+  pod local disk, guardian `/root/plx/vx_guardian_local.sh`, started 2026-09-29.
+- **vSix7 switched to the maximum rollout (2026-09-30, owner: "keep r8c or the new
+  dims? ... regardless, train at absolute maximum rollout length")**: recommendation
+  = keep vSix7 (r8c + `line,run`: +~0.02 per update on every deal set; at ~37 min per
+  update each update's gain matters more). Sizing: vSix6's old memory log
+  (`/root/vsix6_mem.log`, 150M target at 1.76M envs, 30 setups: 199 GiB after the first
+  update, 205 GiB after ~8 h) + obs-X's +150 B/row stored (+10 B/row pool) put 150M
+  at ~229 GiB of the 233.8 GiB container, too close; 136M predicted ~207 GiB first,
+  ~213 GiB after drift. Switched at a save boundary (`switch_vsix7_max.sh`: waits
+  for `vSix7_1645.pt` + its sidecar, stops the 15M guardian/trainer, starts guardian
+  v2 with NUM_ENVS 1760000, ROLLOUT_LENGTH 136000000, CKPT_EVERY 1, MICRO_ROWS
+  500000, CPU_THREADS 24 — vSix6's production scale settings; recipe lines unchanged).
+  Adam moments, l2-init refs and the EMA magnet restored from u1645; 6 of 8 pool
+  members refilled from the snapshot grid (the 4-update checkpoints never held
+  them). First update: **148,589,597 rows**, rollout 1,820 s (82k rows/s vs 60k at
+  220k envs) + PPO 370 s = 2,190 s; peak RSS 207.0 GiB (201.5 at the end of the
+  rollout), GPU 39.3 GiB allocated / 43.7 reserved; kl 0.0020, Hg 0.29, v 2.16
+  (normal). Guardian v2 adds an OOM back-off (ROLLOUT_LENGTH x 92% on an
+  oom_kill, at most 6 times, floor 60M). A relaunched run saves its first numbered
+  checkpoint after its SECOND update (`update > 0` in train.py). The desktop keeps
+  45 numbered files on the pod (the pool's members), copies all of them to
+  `checkpoints/vSix7/`.
