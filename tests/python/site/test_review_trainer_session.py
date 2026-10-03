@@ -668,6 +668,26 @@ def test_public_settings_endpoint_clamps(T, tmp_path, monkeypatch):
         T.set_session_resolver(None)
 
 
+def test_the_admin_exemption_and_a_failing_check(T, monkeypatch):
+    """The public cap spares the site's admins (public.install plugs the check in); a check
+    that fails keeps the safe cap (2026-10-03)."""
+    monkeypatch.setenv("PLO5BP_PUBLIC", "1")
+    saved = T._UNCAPPED_USER
+    try:
+        T.set_uncapped_user_hook(lambda: True)
+        assert T.mc_rollouts_cap() == T.MC_ROLLOUTS_MAX == 256
+
+        def boom() -> bool:
+            raise RuntimeError("database is locked")
+
+        T.set_uncapped_user_hook(boom)
+        assert T.mc_rollouts_cap() == T.MC_ROLLOUTS_PUBLIC_CAP
+        T.set_uncapped_user_hook(None)
+        assert T.mc_rollouts_cap() == T.MC_ROLLOUTS_PUBLIC_CAP
+    finally:
+        T.set_uncapped_user_hook(saved)
+
+
 def _reference_rollout_ev(
     T, ts, h, prefix, gate, chips, n, node_seed, model=None
 ) -> float:

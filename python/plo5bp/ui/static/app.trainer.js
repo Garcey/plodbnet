@@ -520,6 +520,8 @@ function openTrainerSettings() {
   const mcMax = trainerMcRolloutsMax(s);
   if (mcMax !== null) mcInput.max = String(mcMax);
   mcInput.value = mcMax !== null ? Math.min(t.mc_rollouts, mcMax) : t.mc_rollouts;
+  // (say the ceiling: a bigger number used to come back as the cap without a word)
+  document.getElementById("ts-mc-max").textContent = mcMax !== null ? ` At most ${mcMax}.` : "";
   document.getElementById("ts-anim-ms").value = String(trainerPrefs.animMs);
   document.getElementById("ts-anim-ms-range").value = String(
     Math.min(trainerPrefs.animMs, 4000)

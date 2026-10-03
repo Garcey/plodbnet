@@ -890,6 +890,18 @@ def _is_admin(user: sqlite3.Row | None) -> bool:
     return True
 
 
+def current_user_is_admin() -> bool:
+    """Whether the request being served is an admin's (the Trainer's EV-loss cap spares
+    them: trainer.set_uncapped_user_hook). The middleware's user cache first."""
+    uid = _CURRENT_USER_ID.get()
+    if uid is None:
+        return False
+    row = _cached_user(int(uid))
+    if row is _MISS:
+        row = _user_by_id(int(uid))
+    return _is_admin(row)
+
+
 def _homegame_access(user: sqlite3.Row | None) -> bool:
     """The home-games pages. Independent of subscription.
 
@@ -2171,6 +2183,12 @@ def install(
 
     set_study_resolver(_study_for_request)
     set_trainer_resolver(_trainer_for_request)
+    # The Trainer's EV-loss samples are capped for everyone but the site's admins
+    # (2026-10-03, owner: "as the site admin/owner, I should be able to set this to
+    # whatever I want for myself").
+    from plo5bp.ui import trainer as _trainer_mod
+
+    _trainer_mod.set_uncapped_user_hook(current_user_is_admin)
 
     def _route_exists(scope: dict) -> bool:
         probe = {**scope, "type": "http"}

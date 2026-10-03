@@ -149,7 +149,12 @@ Key invariants (documented in the module docstring — don't break):
   accumulate the SIGNED estimate, clamping only the displayed aggregate.
   `_rollout_ev` holds `_TORCH_RNG_LOCK` only around seed→sample regions
   (env work happens outside it); the public build caps `mc_rollouts` at
-  32. `POST /trainer/act` with no live hand is a 409 (never auto-deals).
+  32 for players — not for its admins (2026-10-03, owner: "as the site admin/owner, I
+  should be able to set this to whatever I want for myself"): `public.install` plugs
+  `current_user_is_admin` into `trainer.set_uncapped_user_hook`, so `mc_rollouts_cap()`
+  is 256 (`MC_ROLLOUTS_MAX`, the local build's) for an admin's requests; a failing check
+  keeps 32. The settings window shows the ceiling ("At most N."; `mc_rollouts_max`).
+  `POST /trainer/act` with no live hand is a 409 (never auto-deals).
 - What-if card swaps replay through `reset_study` — an unmodified
   what-if reproduces the original node's observation bit-exactly
   (pinned by `test_trainer_review.py`). What-if stays hero-only.

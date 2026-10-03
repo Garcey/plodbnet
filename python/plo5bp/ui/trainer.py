@@ -740,9 +740,34 @@ TYPICAL_ANTE_BB = 3.0
 TYPICAL_MAX_BB = 350.0  # (the deepest real stack seen; training clips at 300)
 
 
+#: The local build's ceiling (= TrainerSettings.mc_rollouts' own `le`), and the public
+#: build's for its admins.
+MC_ROLLOUTS_MAX = 256
+
+#: () -> True when the signed-in player may go past the public cap — the site's admins
+#: (2026-10-03, owner: "as the site admin/owner, I should be able to set this to whatever I
+#: want for myself"); plugged in by public.install. Unset or failing: the public cap.
+_UNCAPPED_USER: Callable[[], bool] | None = None
+
+
+def set_uncapped_user_hook(fn: Callable[[], bool] | None) -> None:
+    global _UNCAPPED_USER
+    _UNCAPPED_USER = fn
+
+
 def mc_rollouts_cap() -> int:
-    """Largest `mc_rollouts` the running build honours."""
-    return MC_ROLLOUTS_PUBLIC_CAP if _public_mode() else 256
+    """Largest `mc_rollouts` the running build honours for the player asking: the local
+    build's ceiling, or in the public build MC_ROLLOUTS_PUBLIC_CAP — unless they are an
+    admin (`set_uncapped_user_hook`)."""
+    if not _public_mode():
+        return MC_ROLLOUTS_MAX
+    if _UNCAPPED_USER is not None:
+        try:
+            if _UNCAPPED_USER():
+                return MC_ROLLOUTS_MAX
+        except Exception:  # noqa: BLE001 — a lookup hiccup keeps the safe cap
+            logger.exception("trainer: the admin check for the EV-loss cap failed")
+    return MC_ROLLOUTS_PUBLIC_CAP
 
 
 def _cap_settings(settings: TrainerSettings) -> TrainerSettings:

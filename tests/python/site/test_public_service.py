@@ -334,3 +334,18 @@ def test_homegames_are_open_to_signed_in_users_and_the_admin_switch_is_the_main_
     assert a.get("/games").status_code == 200  # (still has the home games — just not that club)
     assert adm.get("/games").status_code == 200
     assert adm.get("/me").json().get("homegame") == HOMEGAME_ME
+
+
+def test_the_ev_loss_cap_spares_the_admin(server, clients):
+    """(owner, 2026-10-03) "as the site admin/owner, I should be able to set this to whatever
+    I want for myself": a player's EV-loss samples stay capped at 32, an admin's go to the
+    local build's 256 — and the settings window is told which (`mc_rollouts_max`)."""
+    _a, _b, adm = clients
+    carol = TestClient(server.app)  # (a fresh player: the free hands of A and B are spent)
+    assert carol.get("/auth/dev", params={"email": "carol@example.com"}).status_code == 200
+    for who, c, cap, kept in (("player", carol, 32, 32), ("admin", adm, 256, 200)):
+        tr = c.get("/trainer/state").json()["state"]["trainer"]
+        assert tr["mc_rollouts_max"] == cap, who
+        r = c.post("/trainer/settings", json={**tr["settings"], "mc_rollouts": 200})
+        assert r.status_code == 200, (who, r.text)
+        assert r.json()["state"]["trainer"]["settings"]["mc_rollouts"] == kept, who
