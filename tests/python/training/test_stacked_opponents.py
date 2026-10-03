@@ -8,7 +8,8 @@ one `act()` per snapshot. Pinned here:
   bit-identical after the split),
 - the stacked forward gives every snapshot its own head outputs (up to float
   reassociation in the batched matmul),
-- greedy (deterministic) actions equal each snapshot's own `act()`,
+- greedy (deterministic) actions equal each snapshot's own `act()` (the size within
+  a hair: the refine head's u carries the same float reassociation),
 - pools the stack cannot hold fall back to per-snapshot calls,
 - a real rollout with a populated pool goes through the stacked path only
   when `batched_opponents` is on, and produces a sane batch either way.
@@ -97,8 +98,10 @@ def test_stacked_forward_gives_each_snapshot_its_own_heads(cls, kw) -> None:
         for k, m in enumerate(models):
             rows = (g == k).nonzero().squeeze(-1)
             own = m.forward(obs[rows], gm[rows])
+            # (float reassociation depends on the CPU's matmul kernels: CI's Linux runner
+            # was 1.2e-5 off on one element of 781, 2026-10-03 — a wrong snapshot is ~1 off)
             for h_stack, h_own in zip(heads, own):
-                torch.testing.assert_close(h_stack[k, j[rows]], h_own, rtol=1e-5, atol=1e-5)
+                torch.testing.assert_close(h_stack[k, j[rows]], h_own, rtol=1e-4, atol=1e-4)
 
 
 @pytest.mark.parametrize("cls,kw", _ARCHS)
@@ -117,7 +120,14 @@ def test_greedy_actions_equal_each_snapshots_own_act(cls, kw) -> None:
             own = m.act(obs[rows], gm[rows], sizing[rows], deterministic=True)
             assert torch.equal(out.gate[rows], own.gate)
             assert torch.equal(out.anchor[rows], own.anchor)
-            assert torch.equal(out.chips[rows], own.chips)
+            # The size inside the bracket is u = a / (a + b) of the refine head, so the
+            # forward's reassociation (above) moves it a hair: chips = floor(to_call + frac *
+            # (pot + to_call) + 0.5) can then land a few chips away in a big pot (CI's Linux
+            # runner, 2026-10-03). Within a chip + 1e-4 of the pot is the same bet; a wrong
+            # snapshot is a different anchor or a size far outside it.
+            torch.testing.assert_close(out.refine_u[rows], own.refine_u, rtol=1e-4, atol=1e-4)
+            base = (sizing[rows, 2] + sizing[rows, 3]).double()
+            assert ((out.chips[rows] - own.chips).abs().double() <= 1 + 1e-4 * base).all()
             torch.testing.assert_close(out.log_prob[rows], own.log_prob, rtol=1e-4, atol=1e-4)
 
 
