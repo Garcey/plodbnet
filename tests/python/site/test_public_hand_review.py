@@ -10,7 +10,8 @@ Covered: the parser (every line kind of the export, the per-board copies), the m
 it and becomes the grading job (including the corner where ClubGG's rules differ), the
 all-in EV against a brute-force enumeration of BOTH boards together, the zip reader's
 limits, and the store / API: the paywall (even while the site is free), duplicates, the
-numbers, the hand list, a hand's record, deletion, and account export / deletion.
+numbers, the hand list, the order hands were played in, date ranges, a hand's record,
+deletion, and account export / deletion.
 """
 
 from __future__ import annotations
@@ -460,6 +461,82 @@ def test_upload_numbers_list_and_record(server, pub, store):
     # the same zip again: every hand is a duplicate
     again = _upload(c, store, {"one.txt": FOLD_OUT + "\n\n" + SIDE_POT})
     assert again["added"] == 0 and again["duplicates"] == 2
+
+
+def _dated(hid: str, when: str, players: int) -> str:
+    """A fold-out played at `when` (the hand's own clock): Hero opens for $60 and the other
+    `players - 1` fold, so Hero nets everyone's $60 ante — a different amount per table size."""
+    names = ["Hero"] + [f"{int(hid) % 65536:04x}{j:04x}" for j in range(players - 1)]
+    seats = [(no, names[no - 1], 400) for no in range(1, players + 1)]
+    acts = [("Hero", "bets", 60, False)] + [(nm, "folds", None, False) for nm in names[1:]]
+    return gg_hand(hid=hid, button=players, seats=seats, deal={"Hero": "Kh Jd Td 8d 2s"},
+                   board_a="6h 6c Qc", board_b="9c 5c 4d", streets={"flop": acts}, when=when)
+
+
+def test_the_graph_runs_in_the_order_the_hands_were_played(server, pub, store):
+    """(owner, 2026-10-04) "make sure the hand histories graph is always in chronological
+    order": by the time printed in each hand whatever order the files came in, and within
+    one second by the hand NUMBER (ring_999 before ring_1000, which sorts first as text) --
+    the graph, its points' times and the list's Date sort agree."""
+    email = "chrono@example.com"
+    c = _login(server, email)
+    _comp(pub, email)
+    # (the later hands are uploaded first)
+    _upload(c, store, {"late.txt": _dated("1000", "2026/09/30 21:00:05", 2) + "\n\n" + _dated("999", "2026/09/30 21:00:05", 3)})
+    _upload(c, store, {"early.txt": _dated("5000", "2026/09/29 08:00:00", 4) + "\n\n" + _dated("4000", "2026/09/30 20:59:59", 5)})
+    played = ["5000", "4000", "999", "1000"]  # (the time first: 5000 was played before 4000)
+    nets = {"5000": 18000, "4000": 24000, "999": 12000, "1000": 6000}
+    sr = c.get("/games/api/review/series").json()
+    assert [p[1] for p in sr["points"]] == [0, 18000, 42000, 54000, 60000]
+    when = [hr.parse_hand(_dated("1", w, 2)).ts for w in ("2026/09/29 08:00:00", "2026/09/30 20:59:59", "2026/09/30 21:00:05")]
+    assert [p[5] for p in sr["points"]] == [when[0], when[0], when[1], when[2], when[2]]
+    up = c.get("/games/api/review/hands?sort=time&dir=asc").json()["hands"]
+    assert [h["hand_id"] for h in up] == [f"ring_{x}" for x in played]
+    assert [h["net_cents"] for h in up] == [nets[x] for x in played]
+    down = c.get("/games/api/review/hands?sort=time&dir=desc").json()["hands"]
+    assert [h["hand_id"] for h in down] == [f"ring_{x}" for x in reversed(played)]
+
+
+def test_a_date_range_narrows_the_numbers_the_graph_and_the_list(server, pub, store):
+    """(owner, 2026-10-04) "filter to specific date ranges of hands": start / end are whole
+    days on the hands' own clock, both included, either may be left out; the graph starts
+    at 0 on the first day; the summary also says every hand's count and dates."""
+    email = "dates@example.com"
+    c = _login(server, email)
+    _comp(pub, email)
+    hands = {"7001": ("2026/09/28 23:59:59", 2), "7002": ("2026/09/29 00:00:00", 3),
+             "7003": ("2026/09/30 12:00:00", 4), "7004": ("2026/10/01 00:00:01", 5)}
+    _upload(c, store, {"d.txt": "\n\n".join(_dated(k, w, n) for k, (w, n) in hands.items())})
+    net = {k: 6000 * (n - 1) for k, (_w, n) in hands.items()}
+
+    def got(q):
+        s = c.get(f"/games/api/review/summary?{q}").json()
+        sr = c.get(f"/games/api/review/series?{q}").json()
+        lst = c.get(f"/games/api/review/hands?sort=time&dir=asc&{q}").json()
+        ids = [h["hand_id"].removeprefix("ring_") for h in lst["hands"]]
+        assert s["hands"] == sr["hands"] == lst["total"] == len(ids)
+        assert s["net_cents"] == sum(net[k] for k in ids) == sr["points"][-1][1]
+        assert sr["points"][0][1] == 0 and s["all_hands"] == 4
+        return ids, s
+
+    ids, s = got("start=2026-09-29&end=2026-09-30")
+    assert ids == ["7002", "7003"] and s["range"] == {"start": "2026-09-29", "end": "2026-09-30"}
+    assert s["first_ts"] == hr.parse_hand(_dated("1", hands["7002"][0], 2)).ts
+    assert s["all_first_ts"] == hr.parse_hand(_dated("1", hands["7001"][0], 2)).ts
+    assert got("start=2026-09-30")[0] == ["7003", "7004"]
+    assert got("end=2026-09-28")[0] == ["7001"]
+    assert got("start=2026-09-29&end=2026-09-29")[0] == ["7002"]  # (one day)
+    ids, s = got("start=2026-10-02")
+    assert ids == [] and s["hands"] == 0 and s["first_ts"] is None
+    ids, _s = got("")
+    assert ids == ["7001", "7002", "7003", "7004"]
+    # a filter and a sort work inside the dates
+    lst = c.get("/games/api/review/hands?sort=net&dir=desc&filter=won&start=2026-09-29&end=2026-09-30").json()
+    assert [h["hand_id"] for h in lst["hands"]] == ["ring_7003", "ring_7002"]
+    # dates the server can't read, or the wrong way round
+    for q in ("start=2026-13-01", "end=yesterday", "start=2026-09-30&end=2026-09-29"):
+        for path in ("summary", "series", "hands"):
+            assert c.get(f"/games/api/review/{path}?{q}").status_code == 400, (path, q)
 
 
 def test_graded_hands_sort_worst_first(server, pub, store):

@@ -41,6 +41,8 @@ import re
 import threading
 import time
 import zlib
+from calendar import timegm
+from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Request
@@ -414,8 +416,40 @@ def store_grades(uid: int, key: str, grades: list[dict[str, Any]] | None) -> Non
 
 # --- the numbers -----------------------------------------------------------------------------
 
+#: Hands in the order they were played: the time printed in the hand (to the second), and
+#: within one second the hand number (ClubGG numbers rise with time; a key's digits
+#: compare as a number when the shorter key comes first — "ring_99" before "ring_100").
+CHRONO = "played_ts {d}, length(hand_key) {d}, hand_key {d}"
 
-def summary(uid: int) -> dict[str, Any]:
+
+def _day_ts(day: str) -> int:
+    """'YYYY-MM-DD' -> its first second, on the hands' own clock (read like played_ts)."""
+    try:
+        return timegm(datetime.strptime(day.strip(), "%Y-%m-%d").timetuple())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Dates are YYYY-MM-DD.") from None
+
+
+def _range_sql(start: str = "", end: str = "") -> tuple[str, tuple]:
+    """The SQL condition and its parameters for the hands played from `start` through
+    `end` (inclusive days, 'YYYY-MM-DD', on the clock the hands print — ClubGG's is the
+    player's own); either may be empty (no bound)."""
+    clause, params = "", []
+    lo = _day_ts(start) if start else None
+    hi = _day_ts(end) + 86_400 if end else None
+    if lo is not None and hi is not None and lo >= hi:
+        raise HTTPException(status_code=400, detail="The start date is after the end date.")
+    if lo is not None:
+        clause += " AND played_ts >= ?"
+        params.append(lo)
+    if hi is not None:
+        clause += " AND played_ts < ?"
+        params.append(hi)
+    return clause, tuple(params)
+
+
+def summary(uid: int, start: str = "", end: str = "") -> dict[str, Any]:
+    rng, rp = _range_sql(start, end)
     r = pub.DB.one(
         "SELECT COUNT(*) n, COALESCE(SUM(net_cents),0) net, COALESCE(SUM(ev_net_cents),0) ev,"
         " COALESCE(SUM(allin),0) allins, COALESCE(SUM(showdown),0) showdowns,"
@@ -424,11 +458,15 @@ def summary(uid: int) -> dict[str, Any]:
         " COALESCE(SUM(CASE WHEN job IS NOT NULL THEN 1 ELSE 0 END),0) pending,"
         " COALESCE(SUM(net_cents * 1.0 / bb_cents),0) net_bb, COALESCE(SUM(ev_net_cents * 1.0 / bb_cents),0) ev_bb,"
         " MIN(played_ts) first_ts, MAX(played_ts) last_ts"
-        " FROM review_hands WHERE user_id=?", (uid,),
+        f" FROM review_hands WHERE user_id=?{rng}", (uid, *rp),
+    )
+    every = pub.DB.one(
+        "SELECT COUNT(*) n, MIN(played_ts) first_ts, MAX(played_ts) last_ts FROM review_hands WHERE user_id=?",
+        (uid,),
     )
     stakes = [dict(x) for x in pub.DB.q(
-        "SELECT bb_cents, COUNT(*) hands FROM review_hands WHERE user_id=? GROUP BY bb_cents ORDER BY hands DESC",
-        (uid,),
+        f"SELECT bb_cents, COUNT(*) hands FROM review_hands WHERE user_id=?{rng} GROUP BY bb_cents ORDER BY hands DESC",
+        (uid, *rp),
     )]
     uploads = [_upload_view(x) for x in pub.DB.q(
         "SELECT * FROM review_uploads WHERE user_id=? ORDER BY id DESC LIMIT 6", (uid,),
@@ -442,6 +480,9 @@ def summary(uid: int) -> dict[str, Any]:
         "accuracy": round(float(r["acc_sum"]) / int(r["acc_n"]), 1) if int(r["acc_n"]) else None,
         "mistakes": int(r["mistakes"]), "grading_pending": int(r["pending"]),
         "first_ts": r["first_ts"], "last_ts": r["last_ts"], "stakes": stakes,
+        # the date range asked for, and every hand's (the page's bounds and its empty state)
+        "range": {"start": start or None, "end": end or None},
+        "all_hands": int(every["n"]), "all_first_ts": every["first_ts"], "all_last_ts": every["last_ts"],
         "uploads": uploads, "max_hands": MAX_HANDS_PER_USER,
         "max_upload_mb": hr.MAX_UPLOAD_BYTES // (1024 * 1024),
         "drill": drill_summary(uid),
@@ -458,17 +499,22 @@ def _upload_view(r: Any) -> dict[str, Any]:
     }
 
 
-def series(uid: int) -> dict[str, Any]:
-    """The running net and the running all-in EV result, hand by hand (oldest
-    first), in dollars-and-cents and in big blinds — thinned to at most
-    ``SERIES_MAX_POINTS`` points (the last one kept: it IS the totals)."""
+def series(uid: int, start: str = "", end: str = "") -> dict[str, Any]:
+    """The running net and the running all-in EV result, hand by hand in the order the
+    hands were PLAYED (`CHRONO` — whatever order they were uploaded in), from `start`
+    through `end` when given (the running sums start at 0 there), in dollars-and-cents
+    and in big blinds, with each point's time — thinned to at most ``SERIES_MAX_POINTS``
+    points (the last one kept: it IS the totals). Point = [hand, net, ev, net bb, ev bb,
+    played_ts]."""
+    rng, rp = _range_sql(start, end)
     rows = pub.DB.q(
-        "SELECT net_cents, ev_net_cents, bb_cents FROM review_hands WHERE user_id=? ORDER BY played_ts, hand_key",
-        (uid,),
+        f"SELECT net_cents, ev_net_cents, bb_cents, played_ts FROM review_hands WHERE user_id=?{rng}"
+        f" ORDER BY {CHRONO.format(d='ASC')}",
+        (uid, *rp),
     )
     n = len(rows)
     step = max(1, -(-n // SERIES_MAX_POINTS))
-    pts = [[0, 0, 0, 0.0, 0.0]]
+    pts = [[0, 0, 0, 0.0, 0.0, int(rows[0]["played_ts"]) if rows else None]]
     net = ev = 0
     net_bb = ev_bb = 0.0
     hi = lo = 0
@@ -480,12 +526,12 @@ def series(uid: int) -> dict[str, Any]:
         ev_bb += int(r["ev_net_cents"]) / bb
         hi, lo = max(hi, net, ev), min(lo, net, ev)
         if k % step == 0 or k == n:
-            pts.append([k, net, ev, round(net_bb, 2), round(ev_bb, 2)])
+            pts.append([k, net, ev, round(net_bb, 2), round(ev_bb, 2), int(r["played_ts"])])
     return {"hands": n, "points": pts, "net_cents": net, "ev_net_cents": ev, "high_cents": hi, "low_cents": lo}
 
 
 _SORTS = {
-    "time": "played_ts {d}, hand_key {d}",
+    "time": CHRONO,
     "net": "net_cents {d}, played_ts DESC",
     "pot": "pot_cents {d}, played_ts DESC",
     "luck": "(net_cents - ev_net_cents) {d}, played_ts DESC",
@@ -503,7 +549,8 @@ _FILTERS = {
 }
 
 
-def hands(uid: int, sort: str, direction: str, offset: int, limit: int, filt: str) -> dict[str, Any]:
+def hands(uid: int, sort: str, direction: str, offset: int, limit: int, filt: str,
+          start: str = "", end: str = "") -> dict[str, Any]:
     if sort not in _SORTS:
         raise HTTPException(status_code=400, detail="unknown sort")
     if filt not in _FILTERS:
@@ -514,13 +561,14 @@ def hands(uid: int, sort: str, direction: str, offset: int, limit: int, filt: st
         d = "DESC" if d == "ASC" else "ASC"
     limit = max(1, min(int(limit), 100))
     offset = max(0, int(offset))
-    where = "user_id=?" + _FILTERS[filt]
-    total = int(pub.DB.one(f"SELECT COUNT(*) n FROM review_hands WHERE {where}", (uid,))["n"])
+    rng, rp = _range_sql(start, end)
+    where = "user_id=?" + _FILTERS[filt] + rng
+    total = int(pub.DB.one(f"SELECT COUNT(*) n FROM review_hands WHERE {where}", (uid, *rp))["n"])
     rows = pub.DB.q(
         f"SELECT hand_key, played_at, played_ts, table_name, net_cents, ev_net_cents, allin, pot_cents, showdown,"
         f" decisions, acc_sum, acc_n, worst, mistakes, job IS NOT NULL AS pending, record"
         f" FROM review_hands WHERE {where} ORDER BY {_SORTS[sort].format(d=d)} LIMIT ? OFFSET ?",
-        (uid, limit, offset),
+        (uid, *rp, limit, offset),
     )
     out = []
     for r in rows:
@@ -846,10 +894,12 @@ def drill_summary(uid: int) -> dict[str, Any]:
 
 
 @router.get("/games/api/review/summary")
-def api_summary():
+def api_summary(start: str = "", end: str = ""):
+    """The numbers — of the hands played from `start` through `end` (YYYY-MM-DD,
+    inclusive, both optional) — plus every hand's count and first / last time."""
     uid = _uid()
     _require_paid(uid)
-    return summary(uid)
+    return summary(uid, start, end)
 
 
 @router.post("/games/api/review/upload")
@@ -880,17 +930,18 @@ def api_upload_status(upload_id: int):
 
 
 @router.get("/games/api/review/series")
-def api_series():
+def api_series(start: str = "", end: str = ""):
     uid = _uid()
     _require_paid(uid)
-    return series(uid)
+    return series(uid, start, end)
 
 
 @router.get("/games/api/review/hands")
-def api_hands(sort: str = "time", dir: str = "desc", offset: int = 0, limit: int = 40, filter: str = ""):
+def api_hands(sort: str = "time", dir: str = "desc", offset: int = 0, limit: int = 40, filter: str = "",
+              start: str = "", end: str = ""):
     uid = _uid()
     _require_paid(uid)
-    return hands(uid, sort, dir, offset, limit, filter)
+    return hands(uid, sort, dir, offset, limit, filter, start, end)
 
 
 @router.get("/games/api/review/hands/{key}")

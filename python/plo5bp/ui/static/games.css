@@ -904,6 +904,16 @@ body.in-lobby.has-joinreq #toast-root { top: 64px; }
 .rv-drill-txt b { color: var(--bright); font-size: 15px; }
 .rv-drill-txt small { color: var(--tx-2); font-size: 12.5px; }
 .rv-drill .btn { flex: none; }
+#rv-drill-slot .rv-drill { margin-top: 0; }
+.rv-main > div:empty { display: none; } /* (an empty progress / drill / graph slot leaves no gap) */
+/* the dates the numbers, the graph and the list are about: a period, or From / to days */
+.rv-range { display: flex; align-items: center; gap: 8px 12px; flex-wrap: wrap; }
+.rv-dates { display: inline-flex; align-items: center; gap: 8px; }
+.rv-date { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--tx-3); }
+.rv-date .input { width: auto; height: 38px; padding: 0 8px 0 10px; font-family: var(--mono); font-size: 13px; color-scheme: dark; }
+.rv-range-note { font-size: 12.5px; color: var(--tx-3); }
+.rv-range-note b { color: var(--bright); }
+.rv-axis { display: flex; justify-content: space-between; gap: 12px; font-size: 11px; color: var(--tx-3); }
 @media (max-width: 760px) {
   .rp { grid-template-columns: minmax(0, 1fr); }
   .rv-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -922,6 +932,11 @@ body.in-lobby.has-joinreq #toast-root { top: 64px; }
   .rv-drill-ico { width: 38px; height: 38px; }
   .rv-drill-txt { flex-basis: calc(100% - 52px); }
   .rv-drill .btn { width: 100%; justify-content: center; }
+  /* the date bar: the periods in two even rows, then From / to sharing one line */
+  .rv-periods { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); width: 100%; }
+  .rv-dates { display: flex; width: 100%; }
+  .rv-date { flex: 1 1 0; min-width: 0; }
+  .rv-date .input { flex: 1 1 auto; min-width: 0; width: 100%; }
   /* a row's cards (yours + both boards) take the whole width; the result and the grade under them */
   .rv-row { grid-template-columns: minmax(0, 1fr) auto; }
   .rv-row .hr-cards { grid-column: 1 / -1; }

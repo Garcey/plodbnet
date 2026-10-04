@@ -625,6 +625,20 @@ against the network so that you can easily find your worst played hands"):
   model — a placeholder never grades; `PLO5BP_REVIEW_GRADING`, off in the tests). ~35 ms a
   hand to read (the exact equities), grading ~2 s for 350 hands. "Download my data" lists
   the hands; "Delete my account" deletes them (`ACCOUNT_HOOKS["hand_review"]`).
+- **Order and dates (2026-10-04; owner: "make sure the hand histories graph is always in
+  chronological order … filter to specific date ranges of hands")**: hands go in the order
+  they were PLAYED — `CHRONO` = `played_ts` (the time printed in the hand, ClubGG's clock =
+  the player's own, read as if UTC), then the hand number as a NUMBER (`length(hand_key)`,
+  `hand_key`: ring_999 before ring_1000) — whatever order they were uploaded in; the graph
+  (`series`) and the list's Date sort share it. `summary` / `series` / `hands` take `start` /
+  `end` (YYYY-MM-DD, whole days on that same clock, both included, either optional; 400 on a
+  bad date or start > end); the summary adds every hand's `all_hands` / `all_first_ts` /
+  `all_last_ts` and the `range`; a series point is [hand, net, ev, net bb, ev bb,
+  played_ts] and its sums start at 0 on the first day. Client: the date bar above the
+  numbers (`paintRange`: All time / 7 days / 30 days / This month / Last month / This year,
+  counted back from the browser's today, or From / to date boxes = "custom"; remembered in
+  `hg.review.range.v1`) narrows the numbers, the graph (dated tooltip, first / last day under
+  it) and the list; the hero line, Delete all and the drill card stay about every hand.
 - **The network's choice in the replayer** (2026-10-03; owner: "click on the decision node and
   see the network's choice in the hand history without having to put it in the study mode"):
   `openHand` asks `GET …/choice?i=` about the decision just played — Hand review's

@@ -13,15 +13,36 @@
   const GRADE_POLL_MS = 5000;
   // one page's state; `epoch` changes whenever the view is (re)opened, so a poll from an
   // earlier visit never paints over this one
-  const R = { epoch: 0, sort: "time", dir: "desc", filter: "", offset: 0, rows: [], total: 0, summary: null, bb: 2000, unit: "usd" };
+  const R = { epoch: 0, sort: "time", dir: "desc", filter: "", offset: 0, rows: [], total: 0, summary: null, bb: 2000, unit: "usd",
+    range: { p: "all", start: "", end: "" } };
   const UNIT_KEY = "hg.review.unit.v1";
   try { R.unit = localStorage.getItem(UNIT_KEY) === "bb" ? "bb" : "usd"; } catch (_) { /* private mode */ }
+  // The dates the numbers, the graph and the list are about (owner, 2026-10-04: "filter to
+  // specific date ranges of hands"): a period counted back from today, or From / to dates
+  // ("custom") — whole days on the clock the hands print (ClubGG prints the player's own),
+  // remembered in this browser.
+  const RANGE_KEY = "hg.review.range.v1";
+  const PERIODS = [["all", "All time"], ["7d", "7 days"], ["30d", "30 days"], ["month", "This month"], ["lastmonth", "Last month"], ["year", "This year"]];
+  const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+  try {
+    const v = JSON.parse(localStorage.getItem(RANGE_KEY) || "null");
+    if (v && (PERIODS.some((x) => x[0] === v.p) || v.p === "custom")) {
+      R.range = { p: v.p, start: DAY_RE.test(v.start || "") ? v.start : "", end: DAY_RE.test(v.end || "") ? v.end : "" };
+    }
+  } catch (_) { /* private mode, or nothing saved */ }
 
   const signed = (c) => (c > 0 ? "+" : "") + d2(c);
   const tone = (c) => (c > 0 ? "pos" : c < 0 ? "neg" : "muted");
   const bbOf = (c) => `${c > 0 ? "+" : ""}${(c / (R.bb || 2000)).toFixed(1)} bb`;
   const amount = (c) => (R.unit === "bb" ? bbOf(c) : signed(c));
   const plural = (n, w) => `${Number(n).toLocaleString()} ${w}${n === 1 ? "" : "s"}`;
+  // dates on the hands' own clock: the server reads a hand's printed time as if it were UTC
+  const sameYear = (d) => d.getUTCFullYear() === new Date().getFullYear();
+  const dayOf = (ts) => { const d = new Date(Number(ts) * 1000); return d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: sameYear(d) ? undefined : "numeric", timeZone: "UTC" }); };
+  const whenOf = (ts) => { const d = new Date(Number(ts) * 1000); return d.toLocaleString(undefined, { day: "numeric", month: "short", year: sameYear(d) ? undefined : "numeric", hour: "2-digit", minute: "2-digit", timeZone: "UTC" }); };
+  const isoDay = (ts) => new Date(Number(ts) * 1000).toISOString().slice(0, 10);
+  const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  const dayLabel = (s) => dayOf(Date.UTC(+s.slice(0, 4), +s.slice(5, 7) - 1, +s.slice(8, 10)) / 1000);
   const REASONS = {
     other_game: "not PLO5 bomb pots", not_a_bomb_pot: "not bomb pots", not_double_board: "single-board hands",
     no_hero_cards: "hands without your cards", hero_not_dealt: "hands you weren't dealt into",
@@ -45,16 +66,17 @@
     put(main, loading());
     await checkoutReturn();
     let s;
-    try { s = await C().j(`${API}/summary`); }
+    try { s = await C().j(`${API}/summary${rangeQuery("?")}`); }
     catch (e) {
       if (ep !== R.epoch) return;
       if (e.status === 402) return paintPaywall(e.detail || {});
+      if (e.status === 400 && rangeQuery()) { setRange({ p: "all" }); return load(); }  // (dates this server refuses)
       put(main, html`<div class="rv-note err">${e.message}</div>`);
       return;
     }
     if (ep !== R.epoch) return;
     R.summary = s;
-    R.bb = (s.stakes && s.stakes[0] && s.stakes[0].bb_cents) || 2000;
+    R.bb = (s.stakes && s.stakes[0] && s.stakes[0].bb_cents) || R.bb || 2000;
     paint(s);
     if (s.grading_pending) gradePoll(ep);
     const busy = (s.uploads || []).find((u) => u.status === "queued" || u.status === "reading");
@@ -107,11 +129,14 @@
   // ------------------------------------------------------------------ the page
   function paint(s) {
     const main = $("rv-main");
-    const empty = !s.hands;
+    // (the hero line counts EVERY hand; the date bar narrows the numbers, graph and list)
+    const all = s.all_hands != null ? s.all_hands : s.hands;
+    const first = s.all_hands != null ? s.all_first_ts : s.first_ts, last = s.all_hands != null ? s.all_last_ts : s.last_ts;
+    const empty = !all;
     put(main, html`<section class="rv-hero"><div>
         <h1>Hand <em>review</em></h1>
         <p>${empty ? "Drop the zip of hand histories ClubGG exports and see how you really ran: your results beside your all-in EV, and every decision checked against the network."
-          : html`${plural(s.hands, "hand")} of PLO5 double-board bomb pots${s.first_ts ? html` · ${dateOf(s.first_ts)} – ${dateOf(s.last_ts)}` : ""}.`}</p>
+          : html`${plural(all, "hand")} of PLO5 double-board bomb pots${first ? html` · ${dayOf(first)} – ${dayOf(last)}` : ""}.`}</p>
       </div><span class="spacer"></span>
       <div class="lb-actions">${empty ? "" : html`<button class="btn sm ghost" id="rv-unit" type="button" title="Show money in dollars or big blinds">${R.unit === "bb" ? "Show $" : "Show bb"}</button><button class="btn sm ghost" id="rv-delete" type="button" title="Delete every hand you uploaded">${icon("i-trash", "sm")}<span>Delete all</span></button>`}</div></section>
       <label class="rv-drop" id="rv-drop" for="rv-file">
@@ -120,7 +145,7 @@
         <span class="rv-drop-txt"><b>${empty ? "Drop your ClubGG hand-history zip here" : "Add more hands"}</b><small>or click to choose the file — no need to unzip it · up to ${s.max_upload_mb || 25} MB · hands already here are skipped</small></span>
       </label>
       <div id="rv-progress"></div>
-      ${empty ? "" : html`<div id="rv-stats"></div><div id="rv-graph"></div>
+      ${empty ? "" : html`<div id="rv-drill-slot"></div><div class="rv-range" id="rv-range"></div><div id="rv-stats"></div><div id="rv-graph"></div>
       <section class="rv-list-sec">
         <div class="db-bar">${segHtml("rv-sort", [["time", "Date"], ["worst", "Worst played"], ["net", "Profit / loss"], ["luck", "Luck"], ["pot", "Pot size"]], R.sort)}
           <button type="button" class="btn sm" id="rv-dir"></button></div>
@@ -129,8 +154,9 @@
       </section>`}`);
     wireDrop();
     if (empty) return;
+    segWire(main);  // (before the date bar: its period switch has its own click handler)
+    paintRange(s);
     paintStats(s);
-    segWire(main);
     $("rv-sort").addEventListener("pick", (e) => { R.sort = e.detail; R.dir = "desc"; loadList(true); });
     $("rv-filter").addEventListener("pick", (e) => { R.filter = e.detail; loadList(true); });
     $("rv-dir").addEventListener("click", () => { R.dir = R.dir === "desc" ? "asc" : "desc"; loadList(true); });
@@ -145,14 +171,90 @@
     loadList(true);
   }
 
-  function dateOf(ts) {
-    const d = new Date(Number(ts) * 1000);
-    return d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: d.getUTCFullYear() === new Date().getFullYear() ? undefined : "numeric", timeZone: "UTC" });
+  // ------------------------------------------------------------------ the dates
+  // [start, end] ("YYYY-MM-DD", "" = open) of a period, counted back from today
+  function periodDates(p) {
+    const now = new Date(), y = now.getFullYear(), m = now.getMonth(), d = now.getDate();
+    switch (p) {
+      case "7d": return [ymd(new Date(y, m, d - 6)), ymd(now)];
+      case "30d": return [ymd(new Date(y, m, d - 29)), ymd(now)];
+      case "month": return [ymd(new Date(y, m, 1)), ymd(now)];
+      case "lastmonth": return [ymd(new Date(y, m - 1, 1)), ymd(new Date(y, m, 0))];
+      case "year": return [ymd(new Date(y, 0, 1)), ymd(now)];
+      default: return ["", ""];
+    }
+  }
+  const rangeDates = () => (R.range.p === "custom" ? [R.range.start, R.range.end] : periodDates(R.range.p));
+  // the API's start / end for the chosen dates ("" = every hand), after `lead` ("?" / "&")
+  function rangeQuery(lead) {
+    const [a, b] = rangeDates();
+    const q = [a ? `start=${a}` : "", b ? `end=${b}` : ""].filter(Boolean).join("&");
+    return q ? (lead || "") + q : "";
+  }
+  function setRange(r) {
+    R.range = { p: r.p, start: r.start || "", end: r.end || "" };
+    try { localStorage.setItem(RANGE_KEY, JSON.stringify(R.range)); } catch (_) { /* private mode: this visit only */ }
+  }
+  function paintRange(s) {
+    const host = $("rv-range");
+    if (!host) return;
+    const [a, b] = rangeDates();
+    const lo = s.all_first_ts ? isoDay(s.all_first_ts) : "", hi = s.all_last_ts ? isoDay(s.all_last_ts) : "";
+    const p = R.range.p, ranged = !!(a || b);
+    put(host, html`<div class="seg rv-periods" id="rv-period" role="group" aria-label="Dates">${PERIODS.map(([k, label]) => html`<button type="button" data-p="${k}" class="${k === p ? "on" : ""}" aria-pressed="${k === p}">${label}</button>`)}</div>
+      <div class="rv-dates">
+        <label class="rv-date"><span>From</span><input type="date" class="input" id="rv-start" value="${a || lo}" aria-label="From (the first day)"/></label>
+        <label class="rv-date"><span>to</span><input type="date" class="input" id="rv-end" value="${b || hi}" aria-label="To (the last day)"/></label>
+      </div>
+      ${ranged ? html`<span class="rv-range-note"><b>${Number(s.hands).toLocaleString()}</b> of ${plural(s.all_hands, "hand")}</span>` : ""}`);
+    $("rv-period").addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-p]");
+      if (!btn || (btn.dataset.p === R.range.p && R.range.p !== "custom")) return;
+      setRange({ p: btn.dataset.p });
+      refresh();
+    });
+    // a date typed or picked = From / to dates; an emptied box = no limit on that side
+    const pick = () => {
+      let x = $("rv-start").value, y = $("rv-end").value;
+      if (x && y && x > y) [x, y] = [y, x];
+      setRange(x || y ? { p: "custom", start: x, end: y } : { p: "all" });
+      refresh();
+    };
+    $("rv-start").addEventListener("change", pick);
+    $("rv-end").addEventListener("change", pick);
+  }
+  // new dates: the numbers, the graph and the list again (the newest choice wins)
+  let sseq = 0;
+  async function refresh() {
+    const seq = ++sseq, ep = R.epoch;
+    let s;
+    try { s = await C().j(`${API}/summary${rangeQuery("?")}`); }
+    catch (e) {
+      if (e.status === 402) return load();
+      if (e.status === 400) { toast(e.message, "err"); setRange({ p: "all" }); return refresh(); }
+      toast(e.message, "err");
+      return;
+    }
+    if (seq !== sseq || ep !== R.epoch) return;
+    R.summary = s;
+    R.bb = (s.stakes && s.stakes[0] && s.stakes[0].bb_cents) || R.bb;
+    paintRange(s);
+    paintStats(s);
+    loadGraph();
+    loadList(true);
   }
 
   function paintStats(s) {
     const luck = s.net_cents - s.ev_net_cents;
     const accTip = s.graded ? `${plural(s.graded, "decision")} graded` : s.grading_pending ? "being checked…" : "no decisions graded yet";
+    const slot = $("rv-drill-slot");
+    if (slot) put(slot, drillCard(s.drill));  // (the drill is every mistake, whatever the dates)
+    if (!s.hands) {
+      const [a, b] = rangeDates();
+      put($("rv-stats"), html`<div class="rv-note">${icon("i-info", "sm")} <span>No hands ${a && b ? `from ${dayLabel(a)} to ${dayLabel(b)}` : a ? `since ${dayLabel(a)}` : `up to ${dayLabel(b)}`}. <button type="button" class="linkish" id="rv-alltime">Show all time</button></span></div>`);
+      $("rv-alltime").addEventListener("click", () => { setRange({ p: "all" }); refresh(); });
+      return;
+    }
     put($("rv-stats"), html`<div class="pcard-stats rv-stats">
       <div><b>${Number(s.hands).toLocaleString()}</b><small>Hands</small></div>
       <div><b class="${tone(s.net_cents)}">${amount(s.net_cents)}</b><small>Net won${R.unit === "bb" ? "" : html` · ${bbOf(s.net_cents)}`}</small></div>
@@ -160,7 +262,7 @@
       <div><b class="${tone(luck)}">${amount(luck)}</b><small>${luck >= 0 ? "Above" : "Below"} EV · ${plural(s.allin_hands, "all-in")}</small></div>
       <div><b>${s.accuracy == null ? "–" : Math.round(s.accuracy) + "%"}</b><small>Accuracy · ${accTip}</small></div>
       <div><b class="${s.mistakes ? "neg" : ""}">${Number(s.mistakes).toLocaleString()}</b><small>Mistakes (wrong moves and blunders)</small></div>
-    </div>${s.grading_pending ? html`<div class="rv-note">${icon("i-bolt", "sm")} Checking your decisions against the network — ${plural(s.grading_pending, "hand")} to go.</div>` : ""}${drillCard(s.drill)}`);
+    </div>${s.grading_pending ? html`<div class="rv-note">${icon("i-bolt", "sm")} Checking your decisions against the network — ${plural(s.grading_pending, "hand")} to go.</div>` : ""}`);
   }
 
   // The mistakes drill (2026-10-03): the Trainer deals the exact spots you got wrong,
@@ -235,8 +337,10 @@
     setTimeout(async () => {
       if (ep !== R.epoch || document.hidden) { if (ep === R.epoch) gradePoll(ep); return; }
       let s;
-      try { s = await C().j(`${API}/summary`); } catch (_) { gradePoll(ep); return; }
+      const seq = sseq;
+      try { s = await C().j(`${API}/summary${rangeQuery("?")}`); } catch (_) { gradePoll(ep); return; }
       if (ep !== R.epoch) return;
+      if (seq !== sseq) { gradePoll(ep); return; }  // (new dates in the meantime: refresh() painted them)
       const was = R.summary ? R.summary.grading_pending : 0;
       R.summary = s;
       paintStats(s);
@@ -246,7 +350,7 @@
   }
 
   async function deleteAll() {
-    const n = R.summary ? R.summary.hands : 0;
+    const n = R.summary ? (R.summary.all_hands != null ? R.summary.all_hands : R.summary.hands) : 0;  // (every hand, whatever the dates)
     const ok = await confirmDialog({ title: "Delete every hand?", text: `All ${plural(n, "hand")} you uploaded and their grades are deleted from our server. Your ClubGG export is untouched — you can upload it again.`, okLabel: "Delete them", danger: true });
     if (!ok) return;
     try {
@@ -257,14 +361,16 @@
   }
 
   // ------------------------------------------------------------------ the graph
-  // Two running lines from the first hand to the last: what you won (green) and your
-  // all-in EV result (gold) — the gap between them is luck. Point at it (or drag a
-  // finger along it) for the hand and both numbers there.
+  // Two running lines from the first hand to the last, in the order the hands were PLAYED
+  // (the time printed in each hand, then its hand number — whatever order they were
+  // uploaded in): what you won (green) and your all-in EV result (gold) — the gap between
+  // them is luck. Point at it (or drag a finger along it) for the hand, when it was played
+  // and both numbers there; the first and last days are under it.
   let gseq = 0;
   async function loadGraph() {
     const seq = ++gseq, ep = R.epoch;
     let sr;
-    try { sr = await C().j(`${API}/series`); } catch (_) { return; }
+    try { sr = await C().j(`${API}/series${rangeQuery("?")}`); } catch (_) { return; }
     if (seq !== gseq || ep !== R.epoch) return;
     drawGraph($("rv-graph"), sr);
   }
@@ -289,7 +395,8 @@
       <div class="pg-box rv-box"><svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true">
         <line class="pg-zero" x1="0" x2="${W}" y1="${zero.toFixed(1)}" y2="${zero.toFixed(1)}"/>
         <path class="rv-line ev" d="${path(2)}"/><path class="rv-line net" d="${path(1)}"/>
-      </svg><i class="pg-dot" hidden></i><i class="pg-dot ev" hidden></i><span class="pg-tip num" hidden></span></div></figure>`);
+      </svg><i class="pg-dot" hidden></i><i class="pg-dot ev" hidden></i><span class="pg-tip num" hidden></span></div>
+      ${pts[0][5] != null && last[5] != null ? html`<div class="rv-axis"><span>${dayOf(pts[0][5])}</span><span>${dayOf(last[5])}</span></div>` : ""}</figure>`);
     const box = host.querySelector(".pg-box"), dots = host.querySelectorAll(".pg-dot"), tip = host.querySelector(".pg-tip");
     const show = (e) => {
       const r = box.getBoundingClientRect();
@@ -302,7 +409,7 @@
       tip.hidden = false;
       tip.style.left = px + "%";
       tip.classList.toggle("flip", px > 66);
-      tip.textContent = `${best[0] ? `Hand ${best[0].toLocaleString()}` : "Start"} · net ${fmt(best, 1)} · EV ${fmt(best, 2)}`;
+      tip.textContent = `${best[0] ? `Hand ${best[0].toLocaleString()}` : "Start"}${best[0] && best[5] != null ? ` · ${whenOf(best[5])}` : ""} · net ${fmt(best, 1)} · EV ${fmt(best, 2)}`;
     };
     box.addEventListener("pointermove", show);
     box.addEventListener("pointerdown", show);
@@ -315,7 +422,7 @@
     const seq = ++lseq, ep = R.epoch;
     if (reset) { R.offset = 0; R.rows = []; }
     let d;
-    try { d = await C().j(`${API}/hands?sort=${R.sort}&dir=${R.dir}&filter=${R.filter}&limit=40&offset=${R.offset}`); }
+    try { d = await C().j(`${API}/hands?sort=${R.sort}&dir=${R.dir}&filter=${R.filter}&limit=40&offset=${R.offset}${rangeQuery("&")}`); }
     catch (e) { if (e.status === 402) return load(); toast(e.message, "err"); return; }
     if (seq !== lseq || ep !== R.epoch) return;
     R.rows = R.rows.concat(d.hands);
@@ -336,7 +443,7 @@
     const worstFirst = R.sort === "worst";
     $("rv-dir").textContent = R.sort === "time" ? (R.dir === "desc" ? "Newest first" : "Oldest first")
       : worstFirst ? (R.dir === "desc" ? "Worst first" : "Best first") : (R.dir === "desc" ? "↓ High to low" : "↑ Low to high");
-    put(host, R.rows.length ? "" : html`<div class="muted empty-note">${R.filter ? "No hands match." : "No hands yet."}</div>`);
+    put(host, R.rows.length ? "" : html`<div class="muted empty-note">${R.filter ? "No hands match." : rangeQuery() ? "No hands in these dates." : "No hands yet."}</div>`);
     R.rows.forEach((x) => {
       const luck = x.net_cents - x.ev_net_cents;
       const row = h("button", { class: "hand-row rv-row", type: "button" },
