@@ -518,6 +518,115 @@ impl GameState {
         };
         nlh_opp_outcome_for(&self.hole_cards[hero_seat], &self.board_a).to_vec()
     }
+
+    /// The obs-X RUN group (the vSix7 lineage's extra inputs, 2026-09-29 experiment; served
+    /// since 2026-10-05 -- `bindings/obs_x.rs`): the acting seat's all-in equity with the
+    /// UNDEALT board cards dealt at random, against one and against two random 5-card
+    /// opponents (uniform over the unseen deck). Returns
+    /// `[eq1_a, eq1_b, scoop1, scooped1, eq2_a, eq2_b, scoop2]`: eq = the hero's share of
+    /// that board's pot (ties split), scoop = the hero ALONE best on both boards, scooped1 =
+    /// the one opponent alone best on both. Deterministic: seeded from the same inputs as
+    /// [`outcome_mc_seed`] (a separate stream). All-zero with no actor or before both flops.
+    ///
+    /// The training worktree's function verbatim (its pinned reference body, whose numbers the
+    /// network was trained on): the same draws, the same ranks, the same sums in the same
+    /// order -- the served values are the trained ones bit for bit
+    /// (tests/python/engine/test_obs_x_serving.py checks the whole tail against the trainer's).
+    pub fn x_runout_equity(&self, samples: usize) -> [f32; 7] {
+        let mut out = [0.0f32; 7];
+        let Some(hero_seat) = self.actor else {
+            return out;
+        };
+        if samples == 0 || self.board_a.len() < 3 || self.board_b.len() < 3 {
+            return out;
+        }
+        let hero_hole = &self.hole_cards[hero_seat];
+        let mut used = [false; 52];
+        for c in hero_hole
+            .iter()
+            .chain(self.board_a.iter())
+            .chain(self.board_b.iter())
+        {
+            used[c.index() as usize] = true;
+        }
+        let mut deck: Vec<Card> = (0..52u8)
+            .filter(|&i| !used[i as usize])
+            .map(Card::from_index)
+            .collect();
+        let n = deck.len();
+        let (la, lb) = (self.board_a.len(), self.board_b.len());
+        let (need_a, need_b) = (5 - la, 5 - lb);
+        let draws = need_a + need_b + 10;
+        if n < draws {
+            return out;
+        }
+        let seed = outcome_mc_seed(self.street, hero_hole, &self.board_a, &self.board_b)
+            ^ 0x5851_F42D_4C95_7F2D;
+        use rand_chacha::rand_core::{RngCore, SeedableRng};
+        use rand_chacha::ChaCha8Rng;
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let mut full_a = [Card::from_index(0); 5];
+        let mut full_b = [Card::from_index(0); 5];
+        full_a[..la].copy_from_slice(&self.board_a);
+        full_b[..lb].copy_from_slice(&self.board_b);
+        // The hero's rank on a board with nothing left to deal is fixed.
+        let fixed_a = (need_a == 0).then(|| crate::hand_eval::evaluate_plo(hero_hole, &full_a));
+        let fixed_b = (need_b == 0).then(|| crate::hand_eval::evaluate_plo(hero_hole, &full_b));
+        let share3 = |h: u32, x: u32, y: u32| -> f64 {
+            let best = h.max(x).max(y);
+            if h < best {
+                0.0
+            } else {
+                1.0 / (1 + (x == best) as u32 + (y == best) as u32) as f64
+            }
+        };
+        let s = |h: u32, o: u32| -> f64 {
+            if h > o {
+                1.0
+            } else if h == o {
+                0.5
+            } else {
+                0.0
+            }
+        };
+        let mut acc = [0.0f64; 7];
+        for _ in 0..samples {
+            // Partial Fisher-Yates: the first `draws` slots become this sample
+            // (uniform from any starting permutation).
+            for i in 0..draws {
+                let j = i + (rng.next_u32() as usize) % (n - i);
+                deck.swap(i, j);
+            }
+            full_a[la..].copy_from_slice(&deck[..need_a]);
+            full_b[lb..].copy_from_slice(&deck[need_a..need_a + need_b]);
+            let p = need_a + need_b;
+            let (o1, o2) = (&deck[p..p + 5], &deck[p + 5..p + 10]);
+            let ha = fixed_a.unwrap_or_else(|| crate::hand_eval::evaluate_plo(hero_hole, &full_a));
+            let hb = fixed_b.unwrap_or_else(|| crate::hand_eval::evaluate_plo(hero_hole, &full_b));
+            let o1a = crate::hand_eval::evaluate_plo(o1, &full_a);
+            let o1b = crate::hand_eval::evaluate_plo(o1, &full_b);
+            let o2a = crate::hand_eval::evaluate_plo(o2, &full_a);
+            let o2b = crate::hand_eval::evaluate_plo(o2, &full_b);
+            acc[0] += s(ha, o1a);
+            acc[1] += s(hb, o1b);
+            if ha > o1a && hb > o1b {
+                acc[2] += 1.0;
+            }
+            if o1a > ha && o1b > hb {
+                acc[3] += 1.0;
+            }
+            acc[4] += share3(ha, o1a, o2a);
+            acc[5] += share3(hb, o1b, o2b);
+            if ha > o1a.max(o2a) && hb > o1b.max(o2b) {
+                acc[6] += 1.0;
+            }
+        }
+        let inv = 1.0 / samples as f64;
+        for k in 0..7 {
+            out[k] = (acc[k] * inv) as f32;
+        }
+        out
+    }
 }
 
 /// Seed of the opp-outcome MC (`GameState::outcome_features_mc`) and its

@@ -964,7 +964,9 @@ def obs_adapter(model: nn.Module):
         OBS_DIM_MINIMAL,
         OBS_DIM_V1,
         OBS_DIM_V2,
+        OBS_X_DIM,
         downgrade_obs_to_v1,
+        obs_x_column_mask,
         project_obs_minimal,
     )
 
@@ -972,27 +974,39 @@ def obs_adapter(model: nn.Module):
     lin = first[0] if isinstance(first, nn.Sequential) else first
     w = int(lin.in_features)
     # PLO full layouts, oldest first — each a pure tail append of the last
-    # (991 v2/v4, 1020 v5/v6 obs-v2 tail, OBS_DIM current). Historical
-    # constants: a checkpoint's trained width never changes.
-    plo_layouts = (OBS_DIM_V2, 1020, OBS_DIM)
+    # (991 v2/v4, 1020 v5/v6 obs-v2 tail, OBS_DIM current, then the obs-X
+    # tail of the vSix7 lineage, 2026-10-05). Historical constants: a
+    # checkpoint's trained width never changes.
+    x_width = OBS_DIM + OBS_X_DIM
+    plo_layouts = (OBS_DIM_V2, 1020, OBS_DIM, x_width)
     spec = getattr(model, "anchor_spec", None)
     is_nlh = spec is not None and spec.name == NLH_ANCHOR_SPEC.name
     project = None
     supersets: tuple[int, ...] = ()
+    own = None  # (an obs-X model: its own width, the columns of its trained groups)
     if is_nlh:
         pass  # no NLH layout history yet: its own width only
     elif w == OBS_DIM_MINIMAL:
         project, supersets = project_obs_minimal, plo_layouts
     elif w == OBS_DIM_V1:
         project, supersets = downgrade_obs_to_v1, plo_layouts
-    elif OBS_DIM_V2 <= w < OBS_DIM:
+    elif OBS_DIM_V2 <= w <= OBS_DIM:
         project = lambda obs: np.ascontiguousarray(obs[..., :w])  # noqa: E731
         supersets = tuple(x for x in plo_layouts if x > w)
+    elif w == x_width:
+        # An obs-X model reads only the tail groups it was trained with
+        # (`model.obs_x_groups`, set by its loader from the checkpoint): any
+        # other group's columns are zeroed, as in training.
+        groups = getattr(model, "obs_x_groups", None)
+        if groups is not None:
+            keep = obs_x_column_mask(int(groups))
+            if not keep.all():
+                own = lambda obs: np.where(keep, obs, np.float32(0.0)).astype(np.float32)  # noqa: E731
 
     def adapt(obs):
         n = int(obs.shape[-1])
         if n == w:
-            return obs
+            return own(obs) if own is not None else obs
         if n in supersets:
             return project(obs)
         raise ValueError(

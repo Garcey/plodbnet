@@ -1349,6 +1349,11 @@ def _network_obs() -> np.ndarray | None:
     in_hand = sorted(session.hand_in_hand_mask) if session.hand_in_hand_mask else None
     if not in_hand or len(in_hand) == cfg.num_seats:
         return session.last_obs
+    if _encoding.serving_obs_x():
+        # (2026-10-05) The compressed view goes through the numpy encoder, which has no
+        # obs-X tail: a network that reads it gets the env's own observation (the folded
+        # seats included) -- live capture only; the site deals every seat in.
+        return session.last_obs
 
     hero = int(session.hero_seat)
     if hero not in session.hand_in_hand_mask:
@@ -3377,6 +3382,7 @@ def create_app(settings: SiteSettings | None = None) -> FastAPI:
     site = Site(settings)
     # The served models: actor + critic from ONE read of each checkpoint.
     site.formats = {fmt: _models.build_entry(fmt, _format_ckpt_path(fmt)) for fmt in _SERVED_FORMATS}
+    _models.sync_serving_obs_x(site.formats)  # (an obs-X network: its envs encode the tail)
     site.device = next(site.formats[VARIANT_PLO5]["model"].parameters()).device
     site.model_admin = _models.ModelAdmin(site.formats)
     previous = _activate(site)

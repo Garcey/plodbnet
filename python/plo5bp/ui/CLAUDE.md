@@ -77,7 +77,17 @@ The local UI loads its models at start, so restart it to pick up new weights
 The UI serves every checkpoint generation: the head class is sniffed
 (`anchor_head.weight` → v2, `raise_head.weight` → v1, …) and so is the trained obs
 width (older widths get the exact downgrade projection via `network.obs_adapter`;
-the encoder always emits the current width, OBS_DIM 1171). v2+ recommendations carry
+the encoder emits the current width, OBS_DIM 1171). **The obs-X tail (2026-10-05)**: the
+vSix7 lineage was trained with 75 more inputs (groups RUN + LINE, `checkpoint["obs_x_groups"]`
+= 5; the training worktree's batched encoder). `models.actor_from_checkpoint` reads the
+groups (a 1246-wide actor without them, or with groups this engine can't compute, is
+refused = placeholder), `sync_serving_obs_x` (at start and every swap) turns them on for the
+site's single-table envs (`encoding.set_serving_obs_x`; `BombPotEnv` reads it at every
+decision, PLO5 full layout only; Rust `bindings/obs_x.rs` through `encode_game_state`), an
+older network takes the 1171 prefix and the critic shares its actor's width. Bit for bit the
+trainer's (`tests/python/engine/test_obs_x_serving.py`, a fixture recorded from the training
+engine). A swap from a 1171 network to an obs-X one: `RESTART=1` (sessions hold 1171-wide
+observations). v2+ recommendations carry
 an `anchors` histogram + `rec_anchor` + `refine`; trainer scoring snaps the user's
 raise size to the nearest legal anchor (`score_move_v2`).
 
@@ -610,8 +620,14 @@ against the network so that you can easily find your worst played hands"):
   numbers (`kind` "review", `dead_cents` per seat, `study_upto`, `net_cents`,
   `ev_net_cents`, `allin_ev`), so `openHand(…, {url, noLink})` replays it and
   `openInStudy` copies any spot. **The engine replay** (`engine_replay`, the home games' bet
-  rule) checks it and becomes the grading job (the HERO's decisions only — other players'
-  cards are unknown, and the actor's observation never uses them): dead money is cut from
+  rule) checks it and becomes the grading job — every decision whose cards are known: the
+  hero's and, since 2026-10-05, those of every hand SHOWN DOWN (owner: an opponent's all-in
+  call "should be graded"; the actor's observation uses only the actor's own cards, so a
+  shown hand grades like the hero's). The hand's accuracy / worst / mistakes and the drill
+  stay the HERO's (`_own_grades`); migration 3 (`_grade_shown_hands`) rebuilt the jobs of
+  hands read before — a graded hand gets an opponents-only job with `"merge": true`
+  (`store_grades(..., merge=True)` adds those marks and keeps yours; `_OWN_PENDING` keeps
+  such a hand from showing "checking…"). Dead money is cut from
   the poster's engine stack (the pot is that much short — noted), and it stops at the one
   rule ClubGG doesn't share — a player who CHECKED may raise a short all-in there (the
   engine keeps the TDA rule: call or fold) — so decisions before it are graded and Study
@@ -661,6 +677,20 @@ against the network so that you can easily find your worst played hands"):
   column fits, the result scrolls on its own, and the action list scrolls under the card --
   `keepInView` keeps ~3 actions in view on each side of the current one. Phones: one column,
   the result last. `scrollIntoView` is gone (it scrolled the dialog).
+- **The table shows each action where it happens** (2026-10-05; owner: "the hand history
+  thing is always like a step ahead on the table … highlighting me while being on the
+  previous player's action"): step k (`replayState(rec, k, swept)`) = the moment of action
+  k: ITS player in the light, the chips its street has seen in front of everyone (its own
+  bet included), that street's boards — the next street's cards come with its first action.
+  Step 0 = the flop just dealt ("X acts first"); the step after the last action is the
+  result (`END = N + (R || 1)`: an all-in's runout streets, else one "result" row in the
+  list); the banner, the network's card, the list's highlight, Study and the grade chip all
+  read the same action (`decisionAt`). The dealer button is a disc ON THE FELT beside the
+  button's nameplate, on the side facing the table (`.rp-dbtn`, was a "D" in the nameplate:
+  hard to spot); a phone / the fitted felt put it at the plate's corner away from the middle
+  (side seats sit by the boards) — measured clear of bets, cards and plates at 1349x920,
+  1024x640 and 375x812. Pinned by `test_homegame_client_windows.py::
+  test_the_replayer_shows_each_action_where_it_happened`.
 - **The mistakes drill** (2026-10-03; owner: the Trainer puts you back in the spots you got
   wrong, the biggest blunders most likely first but in a semi-random order, a spot you play
   right comes up less, one you miss again more — and a switch for equal priority):
@@ -825,8 +855,9 @@ Premium tables pass (2026-09-21 — `tests/python/homegame/test_homegame_premium
   hand record (`homegame_hands.summary`) is REPLAYABLE (`actions` carry the
   engine action id + chips + `auto` = the clock decided; seats carry
   `start_chips`; `ante_chips`, `flows`, `grades`). The client replayer is a
-  click-through (`openHand` in `games.ui.js`: position k = k actions played;
-  `replayState` rebuilds stacks / bets / pot / boards) and `openInStudy` copies
+  click-through (`openHand` in `games.history.js`: step k = the moment of the k-th
+  action, step 0 = the flop dealt — Hand review's "The table shows each action where it
+  happens"; `replayState` rebuilds stacks / bets / pot / boards) and `openInStudy` copies
   any position into Study by driving Study's own API (`/reset`, `/config`,
   `/seats` with `stacks_are_starting`, `/cards`, `/action` x k; hero = the
   actor when their cards are visible to the viewer; Study caps at 6 players).

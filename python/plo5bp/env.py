@@ -32,10 +32,11 @@ from plo5bp.actions import (
     NUM_ACTIONS,
     gate_mask_from_bounds,
 )
-from plo5bp.config import VARIANT_NLH, GameConfig
+from plo5bp.config import VARIANT_NLH, VARIANT_PLO5, GameConfig
 from plo5bp.encoding import (
     OBS_DIM,
     OBS_DIM_MINIMAL,
+    OBS_X_DIM,
     OBS_SEMANTICS_REV,
     encode_observation_minimal,
     encode_observation,
@@ -106,6 +107,7 @@ class BombPotEnv:
         config: GameConfig | None = None,
         ev_runout_samples: int = 0,
         obs_mode: str = "full",
+        obs_x_groups: int | None = None,
     ):
         self.config = config or GameConfig()
         mode = str(obs_mode or "full").strip().lower()
@@ -141,7 +143,13 @@ class BombPotEnv:
         # The engine encodes the PLO layouts (ML-008); `_encode` (numpy) stays
         # for NLH / PLO67 and as the tests' oracle.
         self._engine_encode = self.config.variant in _ENGINE_ENCODED_VARIANTS
-        self._last_obs_vec = np.zeros(self._obs_dim, dtype=np.float32)
+        # The obs-X tail the vSix7 lineage reads (2026-10-05; PLO5's full layout only): None =
+        # whatever the site serves NOW (`encoding.serving_obs_x()`, read at every decision --
+        # 0 everywhere but a site serving such a network), an int = these groups always.
+        self._obs_x_fixed = None if obs_x_groups is None else int(obs_x_groups)
+        if self._obs_x_fixed and not self._takes_obs_x():
+            raise ValueError("the obs-X tail follows PLO5's full layout only")
+        self._last_obs_vec = np.zeros(self.obs_dim, dtype=np.float32)
         self._last_mask = np.zeros(NUM_ACTIONS, dtype=bool)
         self._ev_runout_samples = int(ev_runout_samples)
         self._reset_seed: int = 0
@@ -272,7 +280,7 @@ class BombPotEnv:
         done = bool(self._rs.is_terminal())
         if done:
             rewards = self.terminal_rewards()
-            obs_vec = np.zeros(self._obs_dim, dtype=np.float32)
+            obs_vec = np.zeros(self.obs_dim, dtype=np.float32)
             mask = np.zeros(NUM_ACTIONS, dtype=bool)
             gate_mask = np.zeros(GATE_ACTIONS, dtype=bool)
             # Terminal: no actor, so the feature slots are zeros with or
@@ -362,7 +370,17 @@ class BombPotEnv:
 
     @property
     def obs_dim(self) -> int:
-        return self._obs_dim
+        return self._obs_dim + (OBS_X_DIM if self._obs_x() else 0)
+
+    def _takes_obs_x(self) -> bool:
+        return (self._obs_mode == "full" and self.config.variant == VARIANT_PLO5
+                and self._engine_encode)
+
+    def _obs_x(self) -> int:
+        """The obs-X groups of this env's observations right now (0 = none)."""
+        if not self._takes_obs_x():
+            return 0
+        return self._obs_x_fixed if self._obs_x_fixed is not None else _encoding.serving_obs_x()
 
     def current_actor(self) -> int | None:
         return self._rs.current_actor()
@@ -466,5 +484,7 @@ class BombPotEnv:
                 + list(raw["per_board_outcome"])
                 + list(raw["share_bounds"])
             )
-            vec = _engine_encode_state(self._rs, "full", outcome=outcome, obs_rev=rev)
+            x = self._obs_x()
+            vec = _engine_encode_state(self._rs, "full", outcome=outcome, obs_rev=rev,
+                                       **({"obs_x_groups": x} if x else {}))
         return np.asarray(vec, dtype=np.float32)

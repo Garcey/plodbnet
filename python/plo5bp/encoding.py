@@ -136,6 +136,59 @@ from plo5bp.sizing import (  # v7 STK-2 raise-ladder envelope
 
 OBS_DIM: int = 1171  # v7 batch-2 tail (stack+board+dual) appended after 1019
 
+# ---- Obs-X tail (2026-09-29 experiment; served since 2026-10-05) -------------
+# OPTIONAL dims appended after OBS_DIM: the vSix7 lineage was trained with them (the
+# training worktree's batched encoder). The tail is always OBS_X_DIM wide in the trainer's
+# column order; a group that is off stays all-zero. The engine here computes the groups the
+# served lineage reads -- RUN and LINE (rust_engine bindings/obs_x.rs, through
+# `encode_game_state`); the others are the trainer's experiments, listed for the layout.
+OBS_X_DIM: int = 75
+OBS_X_GROUPS: dict[str, int] = {"run": 1, "range": 2, "line": 4, "pos": 8, "runn": 16}
+# Column range of each group inside the tail (offset from OBS_DIM).
+OBS_X_SLICES: dict[str, tuple[int, int]] = {
+    "run": (0, 7),      # all-in equity with runouts vs 1 / 2 random 5-card hands
+    "range": (7, 17),   # current hand vs the top 50/20/5% of holdings, nut density
+    "line": (17, 63),   # per-seat raises / calls / checks, street raise counts
+    "pos": (63, 75),    # who still acts after hero, hero closes / opens the round
+    "runn": (7, 11),    # (equity vs as many random hands as are live: range's first 4)
+}
+#: The groups this engine computes (RUN | LINE).
+OBS_X_SERVED: int = 1 | 4
+
+
+def obs_x_column_mask(groups: int) -> np.ndarray:
+    """(OBS_DIM + OBS_X_DIM,) bool: True for every base column and for the tail columns of
+    the groups in `groups` (the columns a model trained with those groups may read)."""
+    keep = np.ones(OBS_DIM + OBS_X_DIM, dtype=bool)
+    for name, bit in OBS_X_GROUPS.items():
+        if not (groups & bit):
+            lo, hi = OBS_X_SLICES[name]
+            keep[OBS_DIM + lo:OBS_DIM + hi] = False
+    for name, bit in OBS_X_GROUPS.items():  # runn shares range's columns
+        if groups & bit:
+            lo, hi = OBS_X_SLICES[name]
+            keep[OBS_DIM + lo:OBS_DIM + hi] = True
+    return keep
+
+
+# The obs-X groups the site's single-table envs encode (`BombPotEnv` reads it at every
+# decision): set when a served network reads the tail (ui/models.py), 0 = the plain 1171
+# layout -- every other user of this package (training, eval, tests) keeps 0.
+_SERVING_OBS_X: list[int] = [0]
+
+
+def set_serving_obs_x(groups: int) -> None:
+    """The obs-X groups the serial env adds to its full-layout observations from now on
+    (0 = none). Only the engine's groups (OBS_X_SERVED) can be asked for."""
+    groups = int(groups or 0)
+    if groups & ~OBS_X_SERVED:
+        raise ValueError(f"obs-X groups {groups:#x}: the engine computes RUN (1) and LINE (4) only")
+    _SERVING_OBS_X[0] = groups
+
+
+def serving_obs_x() -> int:
+    return _SERVING_OBS_X[0]
+
 # ---- observation-SEMANTICS revision switch (PLO5BP_OBS_REV) -----------------
 # The 2026-09-20 review fixed features whose VALUES were wrong while the layout
 # stayed put (OBS_DIM 1171 / NLH 995 / minimal 796 are identical in both revs).

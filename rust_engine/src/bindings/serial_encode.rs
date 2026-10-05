@@ -31,13 +31,18 @@ const OUTCOME_BLOCK: usize = 22;
 /// - `obs_rev`: the observation-semantics revision to encode at; default the
 ///   state's own. The serial env passes the revision its Python side reads,
 ///   as its numpy encoders did.
+/// - `obs_x_groups` (2026-10-05): the obs-X tail the vSix7 lineage reads -- 0 (the
+///   default) = the plain layout; RUN 1 / LINE 4 (`obs_x.rs`) append its `OBS_X_DIM`
+///   columns after the full layout's 1171 (a group that is off stays zero), with
+///   `x_run_samples` Monte-Carlo runouts for RUN (48 = what the network trained on).
 ///
 /// PLO variants whose hands keep their size (PLO4/5/6); NLH encodes through
 /// numpy and PLO67's hands grow mid-hand (both are refused). A state with no
 /// actor (terminal, or a study street boundary) encodes as zeros, like the
 /// batched encoders' finished rows.
 #[pyfunction]
-#[pyo3(signature = (state, layout="full", opp_outcome_mc=1024, outcome=None, obs_rev=None))]
+#[pyo3(signature = (state, layout="full", opp_outcome_mc=1024, outcome=None, obs_rev=None, obs_x_groups=0, x_run_samples=48))]
+#[allow(clippy::too_many_arguments)]
 pub fn encode_game_state<'py>(
     py: Python<'py>,
     state: PyRef<'py, PyGameState>,
@@ -45,8 +50,18 @@ pub fn encode_game_state<'py>(
     opp_outcome_mc: usize,
     outcome: Option<Vec<f32>>,
     obs_rev: Option<u8>,
+    obs_x_groups: u32,
+    x_run_samples: usize,
 ) -> PyResult<Bound<'py, PyArray1<f32>>> {
     let layout = Layout::parse(layout)?;
+    if obs_x_groups != 0 {
+        obs_x::check_groups(obs_x_groups)?;
+        if layout != Layout::Full {
+            return Err(PyValueError::new_err(
+                "encode_game_state: the obs-X tail follows the full layout",
+            ));
+        }
+    }
     let g = state.get()?.clone();
     let config = state.config.clone();
     let obs_rev = match obs_rev {
@@ -81,7 +96,12 @@ pub fn encode_game_state<'py>(
     let mut eng = PyBatchedEngine::with_config(config, 1, mc, obs_rev);
     eng.require_plo("encode_game_state")?;
     eng.states[0] = Some(g);
-    let mut row = vec![0f32; layout.dim()];
+    let x_dim = if obs_x_groups != 0 {
+        obs_x::OBS_X_DIM
+    } else {
+        0
+    };
+    let mut row = vec![0f32; layout.dim() + x_dim];
     py.detach(|| {
         let mut packed = eng.pack_for(layout, &[0]);
         if let (Some(block), PackedRows::Full(f)) = (outcome.as_ref(), &mut packed) {
@@ -97,7 +117,15 @@ pub fn encode_game_state<'py>(
                 }
             }
         }
-        eng.encode_rows(&packed, Some(vec![&mut row[..]]), None, |_| true)
+        let (base, tail) = row.split_at_mut(layout.dim());
+        eng.encode_rows(&packed, Some(vec![base]), None, |_| true)?;
+        if let (true, PackedRows::Full(f), Some(st)) =
+            (obs_x_groups != 0, &packed, eng.states[0].as_ref())
+        {
+            let s = eng.config.num_seats;
+            obs_x::encode_x_tail(st, &f.obs, 0, s, obs_x_groups, x_run_samples, tail);
+        }
+        Ok(())
     })
     .map_err(|(_, col, v)| {
         PyRuntimeError::new_err(format!("encode_game_state: column {col} holds {v}"))

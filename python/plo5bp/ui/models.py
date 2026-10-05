@@ -263,6 +263,13 @@ def obs_rev_entry(variant: str) -> dict[str, Any]:
 # --- Actor / critic ---------------------------------------------------------------------------
 
 
+def obs_width(model: nn.Module) -> int:
+    """The observation width an actor was trained on (its first layer's input)."""
+    first = model.torso[0]
+    lin = first[0] if isinstance(first, nn.Sequential) else first
+    return int(lin.in_features)
+
+
 def actor_from_checkpoint(ckpt: Any, variant: str, source: Any = "?") -> tuple[nn.Module, bool, int, int]:
     """(actor, loaded, hidden_dim, num_layers) from an already-read checkpoint.
 
@@ -292,6 +299,13 @@ def actor_from_checkpoint(ckpt: Any, variant: str, source: Any = "?") -> tuple[n
         num_layers = 2
     try:
         model = build_actor_from_state_dict(state_dict, hidden_dim, num_layers)
+        # The vSix7 lineage reads the obs-X tail (2026-10-05): which groups it was trained
+        # with comes from the checkpoint, and only the engine's (RUN, LINE) can be served.
+        if obs_width(model) == OBS_DIM + _encoding.OBS_X_DIM:
+            groups = int(ckpt.get("obs_x_groups") or 0) if isinstance(ckpt, dict) else 0
+            if not groups or groups & ~_encoding.OBS_X_SERVED:
+                raise ValueError(f"obs-X groups {groups:#x} (the engine serves RUN 1 and LINE 4)")
+            model.obs_x_groups = groups
         return model, True, hidden_dim, num_layers
     except Exception as e:  # noqa: BLE001
         logger.warning(
@@ -337,7 +351,22 @@ def serve_obs_dim(variant: str, model: nn.Module | None = None) -> int:
         # The candidate may be any PLO5 net: its critic pairs with ITS actor.
         width = getattr(model, "obs_dim", None)
         return int(width) if isinstance(width, int) else OBS_DIM
+    if getattr(model, "obs_x_groups", 0):
+        # (an obs-X actor shares its adapter with the critic: the critic reads the tail too)
+        return OBS_DIM + _encoding.OBS_X_DIM
     return OBS_DIM
+
+
+def sync_serving_obs_x(formats: dict[str, Any]) -> int:
+    """Make the site's single-table envs encode the obs-X groups its served networks read
+    (2026-10-05: the vSix7 lineage), or none: the union over every loaded entry -- each
+    network's adapter keeps only its own groups. Call whenever `formats` changes."""
+    groups = 0
+    for entry in formats.values():
+        model = entry.get("model") if isinstance(entry, dict) else None
+        groups |= int(getattr(model, "obs_x_groups", 0) or 0)
+    _encoding.set_serving_obs_x(groups)
+    return groups
 
 
 def critic_from_checkpoint(
@@ -516,9 +545,10 @@ def smoke_test(fmt: str, entry: dict[str, Any]) -> None:
 
     engine = entry.get("engine_variant", fmt)
     cfg = GameConfig.nlh_default() if engine == VARIANT_NLH else GameConfig()
-    env = BombPotEnv(cfg)
-    obs, info = env.reset(12345, 0)
     model = entry["model"]
+    # (an obs-X network is tested on its own groups: it may not be served yet)
+    env = BombPotEnv(cfg, obs_x_groups=getattr(model, "obs_x_groups", 0) or None)
+    obs, info = env.reset(12345, 0)
     device = next(model.parameters()).device
     x = torch.from_numpy(entry["adapter"](obs)).unsqueeze(0).to(device)
     gm = torch.from_numpy(info.gate_mask).unsqueeze(0).to(device)
@@ -583,6 +613,7 @@ class ModelAdmin:
         if fmt == FORMAT_EXPERIMENTAL:
             entry["label"] = f"Candidate · {served_path.stem}"
         self.formats[fmt] = entry  # one assignment: readers see old or new, never a mix
+        sync_serving_obs_x(self.formats)  # (the envs' obs-X tail follows the served networks)
         if self.on_swap is not None:
             self.on_swap(fmt, entry)
         logger.info(

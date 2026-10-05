@@ -246,6 +246,8 @@ mod encode;
 mod encode_full;
 mod encode_minimal;
 mod features;
+// The obs-X tail the vSix7 lineage reads (2026-10-05; served through `encode_game_state`).
+mod obs_x;
 mod pack;
 mod rollout_ops;
 mod serial;
