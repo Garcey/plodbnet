@@ -21,6 +21,7 @@ import io
 import json
 import sys
 import zipfile
+import zlib
 from itertools import permutations
 
 import pytest
@@ -625,6 +626,71 @@ def test_hands_graded_before_get_the_shown_hands_marks_and_keep_yours(server, pu
     after = dict(pub.DB.one("SELECT acc_sum, acc_n, worst, mistakes FROM review_hands WHERE user_id=? AND hand_key=?", (uid, key)))
     assert after == before
     assert pub.DB.q("SELECT idx, score FROM review_mistakes WHERE user_id=? AND hand_key=?", (uid, key)) == drill
+
+
+def test_a_newer_network_grades_your_hands_again(server, pub, store, monkeypatch):
+    """(owner, 2026-10-05: "I would like my own uploaded hands to be regraded", after a
+    stronger network went live) Every grade keeps the network that made it; the summary
+    counts your hands an earlier one graded, and a regrade gives each its job back -- made
+    again from the hand's text -- so the marks, the numbers and the drill become the new
+    network's. A hand it can't grade again keeps its marks and isn't offered again."""
+    from plo5bp.ui import homegame as hg
+
+    model = _model()
+    monkeypatch.setattr(model, "checkpoint_sha256", "a" * 64, raising=False)
+    monkeypatch.setattr(hg, "_grading_model", lambda: model)
+    email = "newnet@example.com"
+    c = _login(server, email)
+    _comp(pub, email)
+    _upload(c, store, {"h.txt": SIDE_POT + "\n\n" + DEAD_MONEY})
+    uid = _uid(pub, email)
+    for r in pub.DB.q("SELECT hand_key, job FROM review_hands WHERE user_id=? AND job IS NOT NULL", (uid,)):
+        store.grade_one(uid, r["hand_key"], r["job"], model)
+    graded = {r["hand_key"]: r["graded_by"] for r in pub.DB.q(
+        "SELECT hand_key, graded_by FROM review_hands WHERE user_id=? AND graded_at IS NOT NULL", (uid,))}
+    assert len(graded) == 2 and set(graded.values()) == {"a" * 16}
+    assert c.get("/games/api/review/summary").json()["regrade"] == {"older": 0}
+    want = {k: c.get(f"/games/api/review/hands/{k}").json()["grades"] for k in graded}
+    # marks an earlier network made: one of your moves a blunder (in the drill), and a hand
+    # graded before networks were recorded
+    k1, k2 = sorted(graded)
+    rec = c.get(f"/games/api/review/hands/{k1}").json()
+    hero, mine = _hero_moves(rec)
+    store.store_grades(uid, k1, [{"i": mine[0], "seat": hero, "score": 1.0, "cat": "blunder"}], model_id="0" * 16)
+    pub.DB.q("UPDATE review_hands SET graded_by=NULL WHERE user_id=? AND hand_key=?", (uid, k2))
+    assert pub.DB.one("SELECT COUNT(*) n FROM review_mistakes WHERE user_id=? AND hand_key=?", (uid, k1))["n"] == 1
+    assert c.get("/games/api/review/summary").json()["regrade"] == {"older": 2}
+    r = c.post("/games/api/review/regrade", json={})
+    assert r.status_code == 200 and r.json() == {"queued": 2}
+    s = c.get("/games/api/review/summary").json()
+    assert s["grading_pending"] == 2 and s["regrade"] == {"older": 0}
+    assert c.post("/games/api/review/regrade", json={}).json() == {"queued": 0}  # (already on their way)
+    jobs = pub.DB.q("SELECT hand_key, job FROM review_hands WHERE user_id=? AND job IS NOT NULL", (uid,))
+    assert {j["job"] for j in jobs} == {store._REGRADE_JOB}
+    for j in jobs:  # (what the grader does)
+        store.grade_one(uid, j["hand_key"], j["job"], model)
+    for k in graded:
+        assert c.get(f"/games/api/review/hands/{k}").json()["grades"] == want[k]
+    row = pub.DB.one("SELECT acc_n, mistakes, graded_by FROM review_hands WHERE user_id=? AND hand_key=?", (uid, k1))
+    assert row["graded_by"] == "a" * 16 and row["acc_n"] == len([g for g in want[k1] if g["seat"] == hero])
+    drill = {x["idx"] for x in pub.DB.q("SELECT idx FROM review_mistakes WHERE user_id=? AND hand_key=?", (uid, k1))}
+    assert drill == {g["i"] for g in want[k1] if g["seat"] == hero and g["cat"] in store.MISTAKE_CATS}
+    s = c.get("/games/api/review/summary").json()
+    assert s["grading_pending"] == 0 and s["regrade"] == {"older": 0}
+    # a newer network still: a hand whose text this code can't follow keeps its marks
+    monkeypatch.setattr(model, "checkpoint_sha256", "b" * 64)
+    pub.DB.q("UPDATE review_hands SET raw=? WHERE user_id=? AND hand_key=?", (zlib.compress(b"not a hand"), uid, k2))
+    assert c.post("/games/api/review/regrade", json={}).json() == {"queued": 2}
+    for j in pub.DB.q("SELECT hand_key, job FROM review_hands WHERE user_id=? AND job IS NOT NULL", (uid,)):
+        store.grade_one(uid, j["hand_key"], j["job"], model)
+    assert c.get(f"/games/api/review/hands/{k2}").json()["grades"] == want[k2]
+    assert {r["graded_by"] for r in pub.DB.q("SELECT graded_by FROM review_hands WHERE user_id=?", (uid,))
+            if r["graded_by"]} == {"b" * 16}
+    assert c.get("/games/api/review/summary").json()["regrade"] == {"older": 0}
+    # without a network: nothing to offer, and a regrade waits for one
+    monkeypatch.setattr(hg, "_grading_model", lambda: None)
+    assert c.get("/games/api/review/summary").json()["regrade"] == {"older": 0}
+    assert c.post("/games/api/review/regrade", json={}).status_code == 503
 
 
 def test_your_hands_are_yours_alone_and_deleting_them_works(server, pub, store):

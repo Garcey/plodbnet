@@ -19,6 +19,13 @@ module keeps them:
   decision whose cards are known -- the player's own and, since 2026-10-05 (owner),
   the hands shown down. The player's numbers (accuracy, worst mark) and the mistakes
   drill count their own decisions only.
+- Regrading (2026-10-05, owner, after a stronger network went live: "I would like my own
+  uploaded hands to be regraded"): every grade records the network that made it
+  (``graded_by`` = its checkpoint's sha256, 16 hex); ``regrade`` queues the player's hands
+  an earlier network graded, and the grader rebuilds each one's job from the hand's text
+  and grades it with the network served now — the numbers and the drill follow the new
+  marks (a spot still a mistake keeps its learning state); a hand it can't redo keeps its
+  marks.
 - The network's choice at any decision of a stored hand (``choice``: the replayer
   asks; home-game hands too, through ``homegame_routes.api_hand_choice``).
 - The Trainer's "My tables" (``my_tables``, plugged in by ``trainer.set_my_tables_hook``):
@@ -176,6 +183,10 @@ def _grade_shown_hands(conn: Any) -> None:
 
 REVIEW_MIGRATIONS.append(
     pub.Migration(3, "grade the hands shown down", fn=_grade_shown_hands),
+)
+# (which network graded a hand: NULL = graded before this was kept -- an earlier network)
+REVIEW_MIGRATIONS.append(
+    pub.Migration(4, "review_hands.graded_by", fn=pub._add_column("review_hands", "graded_by", "TEXT")),
 )
 
 
@@ -409,12 +420,32 @@ def _grade_loop(ctx: Review) -> None:
             grade_one(int(r["user_id"]), str(r["hand_key"]), r["job"], model)
 
 
+#: The job of a hand graded again (``regrade``): the grader makes its real job from the
+#: hand's text first, so the request queuing thousands of hands stays one UPDATE.
+_REGRADE_JOB = '{"regrade":true}'
+
+
+def model_id(model: Any) -> str | None:
+    """Which network graded a hand: its checkpoint's sha256, 16 hex (as /health and
+    docs/models.md print it; ``models.build_entry`` sets it) — None if it has none."""
+    sha = getattr(model, "checkpoint_sha256", None)
+    return str(sha)[:16] if sha else None
+
+
 def grade_one(uid: int, key: str, job_json: str, model: Any) -> list[dict[str, Any]] | None:
     """Grade one stored hand's decisions (the player's own and the hands shown down) and
-    store the marks."""
+    store the marks. A regrade (``_REGRADE_JOB``) makes the job again from the hand's text
+    first; a hand the network can't grade again keeps the marks it had."""
     from plo5bp.ui import homegame as hg
 
     job = json.loads(job_json)
+    mid = model_id(model)
+    again = bool(job.get("regrade"))
+    if again:
+        job = _rebuilt_job(uid, key)
+        if job is None:
+            _regrade_failed(uid, key, mid)
+            return None
     try:
         grades = hg.grade_hand(job, model)
     except hg.NoGradingModel:
@@ -427,20 +458,47 @@ def grade_one(uid: int, key: str, job_json: str, model: Any) -> list[dict[str, A
             row = pub.DB.one("SELECT grade_attempts FROM review_hands WHERE user_id=? AND hand_key=?", (uid, key))
         if row is None or int(row["grade_attempts"]) < GRADE_MAX_ATTEMPTS:
             return None
+        if again:
+            _regrade_failed(uid, key, mid)
+            return None
         grades = None
-    store_grades(uid, key, grades, merge=bool(job.get("merge")))
+    store_grades(uid, key, grades, merge=bool(job.get("merge")), model_id=mid)
     return grades
+
+
+def _rebuilt_job(uid: int, key: str) -> dict[str, Any] | None:
+    """A stored hand's grading job made again from its text — every decision whose cards
+    are known — or None (no text kept, or this code can't follow the hand)."""
+    row = pub.DB.one("SELECT raw FROM review_hands WHERE user_id=? AND hand_key=?", (uid, key))
+    if row is None or row["raw"] is None:
+        return None
+    try:
+        p = hr.parse_hand(zlib.decompress(row["raw"]).decode("utf-8"))
+        job, _upto, _notes = hr.engine_replay(p, hr.ledger(p))
+    except Exception:  # noqa: BLE001 — the hand keeps the marks it has
+        logger.warning("hand review: %s can't be graded again", key, exc_info=True)
+        return None
+    return job
+
+
+def _regrade_failed(uid: int, key: str, mid: str | None) -> None:
+    """The network served now can't grade the hand again: its marks stay as they were (and
+    it isn't offered for a regrade with this network again)."""
+    logger.warning("hand review: %s keeps its earlier marks (the network served now can't grade it)", key)
+    pub.DB.q("UPDATE review_hands SET job=NULL, graded_by=? WHERE user_id=? AND hand_key=?", (mid, uid, key))
 
 
 def _hero_seat(rec: dict[str, Any]) -> int | None:
     return next((int(s["seat"]) for s in rec.get("seats") or [] if s.get("is_me")), None)
 
 
-def store_grades(uid: int, key: str, grades: list[dict[str, Any]] | None, *, merge: bool = False) -> None:
+def store_grades(uid: int, key: str, grades: list[dict[str, Any]] | None, *, merge: bool = False,
+                 model_id: str | None = None) -> None:
     """The hand's marks land in its record and its numbers — and its job is done. The
     numbers and the mistakes drill are the player's own decisions only (the record also
     holds the marks of the hands shown down). ``merge``: a job that graded only the hands
-    shown (migration 3) -- the player's marks stay exactly as they were."""
+    shown (migration 3) -- the player's marks stay exactly as they were (and so does
+    ``graded_by``: the network that made them). ``model_id``: the network grading now."""
     with pub.DB.transaction():
         row = pub.DB.one("SELECT record, played_ts FROM review_hands WHERE user_id=? AND hand_key=?", (uid, key))
         if row is None:
@@ -455,14 +513,17 @@ def store_grades(uid: int, key: str, grades: list[dict[str, Any]] | None, *, mer
             rec["grades"] = list(grades or [])
             if grades is None:
                 rec["grades_note"] = "could not be graded"
+            else:
+                rec.pop("grades_note", None)
         mine = _own_grades(rec)
         scores = [float(g["score"]) for g in mine]
         found = _mistake_rows(uid, key, int(row["played_ts"]), mine)
         pub.DB.q(
-            "UPDATE review_hands SET record=?, job=NULL, acc_sum=?, acc_n=?, worst=?, mistakes=?, graded_at=?"
-            " WHERE user_id=? AND hand_key=?",
+            "UPDATE review_hands SET record=?, job=NULL, acc_sum=?, acc_n=?, worst=?, mistakes=?, graded_at=?,"
+            " graded_by=CASE WHEN ? THEN graded_by ELSE ? END WHERE user_id=? AND hand_key=?",
             (json.dumps(rec, separators=(",", ":")), float(sum(scores)) if scores else None,
-             len(scores) or None, min(scores) if scores else None, len(found), pub._now(), uid, key),
+             len(scores) or None, min(scores) if scores else None, len(found), pub._now(),
+             int(merge), model_id, uid, key),
         )
         # (the drill's spots: a decision that is no longer a mistake leaves it; one that
         # still is keeps its learning state)
@@ -547,7 +608,17 @@ def summary(uid: int, start: str = "", end: str = "") -> dict[str, Any]:
         "uploads": uploads, "max_hands": MAX_HANDS_PER_USER,
         "max_upload_mb": hr.MAX_UPLOAD_BYTES // (1024 * 1024),
         "drill": drill_summary(uid),
+        # every hand an earlier network graded, whatever the dates (the page offers a regrade)
+        "regrade": {"older": _older_count(uid, _served_id())},
     }
+
+
+def _served_id() -> str | None:
+    """The id of the network grading now (None: no network, or one without a checkpoint)."""
+    from plo5bp.ui import homegame as hg
+
+    model = hg._grading_model()
+    return None if model is None else model_id(model)
 
 
 def _upload_view(r: Any) -> dict[str, Any]:
@@ -663,6 +734,40 @@ def hand(uid: int, key: str) -> dict[str, Any]:
     rec = json.loads(row["record"])
     rec["grading"] = bool(row["pending"])
     return rec
+
+
+#: The player's hands an EARLIER network graded (SQL; takes the served network's id):
+#: graded, their text kept, and not already waiting for their own marks (migration 3's
+#: shown-hands job is replaced -- the regrade grades those decisions too). NULL
+#: ``graded_by`` = graded before networks were recorded.
+_OLDER = ("graded_at IS NOT NULL AND raw IS NOT NULL AND (graded_by IS NULL OR graded_by <> ?)"
+          " AND (job IS NULL OR instr(job, '\"merge\":true') > 0)")
+
+
+def _older_count(uid: int, mid: str | None) -> int:
+    if mid is None:  # (a network with no checkpoint behind it: nothing to compare)
+        return 0
+    return int(pub.DB.one(f"SELECT COUNT(*) n FROM review_hands WHERE user_id=? AND {_OLDER}", (uid, mid))["n"])
+
+
+def regrade(uid: int) -> dict[str, Any]:
+    """Grade the player's hands again with the network served now — every one an earlier
+    network graded (owner, 2026-10-05: "I would like my own uploaded hands to be
+    regraded"). One UPDATE: each gets ``_REGRADE_JOB`` and the grader does the rest, the
+    page counting them down like an upload's. 503 without a network."""
+    from plo5bp.ui import homegame as hg
+
+    model = hg._grading_model()
+    if model is None:
+        raise HTTPException(status_code=503, detail="The network isn't loaded on the server right now — try again in a minute.")
+    mid = model_id(model)
+    with pub.DB.transaction():
+        n = _older_count(uid, mid)
+        if n:
+            pub.DB.q(f"UPDATE review_hands SET job=?, grade_attempts=0 WHERE user_id=? AND {_OLDER}",
+                     (_REGRADE_JOB, uid, mid))
+    CTX.grade_wake.set()
+    return {"queued": n}
 
 
 def delete_all(uid: int) -> dict[str, Any]:
@@ -976,6 +1081,15 @@ async def api_upload(request: Request, name: str = ""):
         raise HTTPException(status_code=413, detail=f"Uploads are limited to {hr.MAX_UPLOAD_BYTES // (1024 * 1024)} MB.")
     name = re.sub(r"[^\w .()\-]", "_", str(name or "upload.zip"))[:120] or "upload.zip"
     return await run_in_threadpool(queue_upload, uid, data, name)
+
+
+@router.post("/games/api/review/regrade")
+def api_regrade():
+    """Your hands an earlier network graded, graded again by the one served now
+    (``{"queued": n}``; the summary's ``grading_pending`` counts them down)."""
+    uid = _uid()
+    _require_paid(uid)
+    return regrade(uid)
 
 
 @router.get("/games/api/review/uploads/{upload_id}")

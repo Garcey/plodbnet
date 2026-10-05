@@ -248,7 +248,11 @@
     const luck = s.net_cents - s.ev_net_cents;
     const accTip = s.graded ? `${plural(s.graded, "decision")} graded` : s.grading_pending ? "being checked…" : "no decisions graded yet";
     const slot = $("rv-drill-slot");
-    if (slot) put(slot, drillCard(s.drill));  // (the drill is every mistake, whatever the dates)
+    if (slot) {  // (the drill is every mistake, the regrade every hand -- whatever the dates)
+      put(slot, html`${regradeCard(s.regrade)}${drillCard(s.drill)}`);
+      const rb = $("rv-regrade");
+      if (rb) rb.addEventListener("click", regradeAll);
+    }
     if (!s.hands) {
       const [a, b] = rangeDates();
       put($("rv-stats"), html`<div class="rv-note">${icon("i-info", "sm")} <span>No hands ${a && b ? `from ${dayLabel(a)} to ${dayLabel(b)}` : a ? `since ${dayLabel(a)}` : `up to ${dayLabel(b)}`}. <button type="button" class="linkish" id="rv-alltime">Show all time</button></span></div>`);
@@ -273,6 +277,33 @@
     return html`<div class="rv-drill"><span class="rv-drill-ico">${icon("i-cards")}</span>
       <div class="rv-drill-txt"><b>Drill your mistakes</b><small>The Trainer puts you back in the ${plural(d.mistakes, "spot")} you got wrong — the worst ones most often.${done ? ` ${done}.` : ""}</small></div>
       <a class="btn gold" id="rv-drill" href="/?mode=trainer&amp;drill=1">Start the drill</a></div>`;
+  }
+
+  // A newer network went live (owner, 2026-10-05: "I would like my own uploaded hands to be
+  // regraded"): the hands an earlier one graded can be graded again; the accuracy, the
+  // mistakes and the drill follow the new marks.
+  function regradeCard(r) {
+    const n = (r && r.older) || 0;
+    if (!n) return "";
+    const them = n === 1 ? "it" : "them";
+    return html`<div class="rv-drill rv-regrade"><span class="rv-drill-ico">${icon("i-bolt")}</span>
+      <div class="rv-drill-txt"><b>A newer network is grading</b><small>${plural(n, "hand")} of yours ${n === 1 ? "was" : "were"} graded by an earlier one. Grade ${them} again and see where today's network disagrees with you.</small></div>
+      <button class="btn" id="rv-regrade" type="button">Regrade ${them}</button></div>`;
+  }
+
+  async function regradeAll() {
+    const n = (R.summary && R.summary.regrade && R.summary.regrade.older) || 0;
+    if (!n) return;
+    const ok = await confirmDialog({ title: `Grade ${plural(n, "hand")} again?`, text: `The network served now checks every decision in ${n === 1 ? "it" : "them"} again — yours and the hands shown down. Your accuracy, your mistakes and the drill follow its marks; a spot that is still a mistake keeps its progress in the drill.`, okLabel: "Regrade" });
+    if (!ok) return;
+    try {
+      const r = await C().j(`${API}/regrade`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+      toast(r.queued ? `Regrading ${plural(r.queued, "hand")}…` : "Nothing to regrade — every hand is the current network's", r.queued ? "ok" : "");
+      load();
+    } catch (e) {
+      if (e.status === 402) return load();
+      toast(e.message, "err");
+    }
   }
 
   // ------------------------------------------------------------------ upload

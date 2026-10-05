@@ -641,6 +641,18 @@ against the network so that you can easily find your worst played hands"):
   model — a placeholder never grades; `PLO5BP_REVIEW_GRADING`, off in the tests). ~35 ms a
   hand to read (the exact equities), grading ~2 s for 350 hands. "Download my data" lists
   the hands; "Delete my account" deletes them (`ACCOUNT_HOOKS["hand_review"]`).
+- **Regrading (2026-10-05; owner, after vSix7_1786 went live: "I would like my own uploaded
+  hands to be regraded")**: every grade records its network (`review_hands.graded_by`,
+  migration 4 = the checkpoint's sha256, 16 hex — `models.build_entry` sets
+  `model.checkpoint_sha256`; NULL = graded before it was kept). The summary's
+  `regrade.older` counts the player's hands an earlier network graded (`_OLDER`: graded,
+  text kept, not already waiting for their own marks); the page shows "A newer network is
+  grading" above the drill card, and `POST /games/api/review/regrade` gives each
+  `_REGRADE_JOB` (one UPDATE) — the grader makes the real job again from the hand's text
+  (`_rebuilt_job`) and grades it with the served network: the marks (yours and the shown
+  hands'), the numbers and the drill follow (a spot still a mistake keeps its learning
+  state); a hand it can't follow keeps its marks and takes the new network's id (never
+  offered again). The page counts the regrade down like an upload's grading.
 - **Order and dates (2026-10-04; owner: "make sure the hand histories graph is always in
   chronological order … filter to specific date ranges of hands")**: hands go in the order
   they were PLAYED — `CHRONO` = `played_ts` (the time printed in the hand, ClubGG's clock =

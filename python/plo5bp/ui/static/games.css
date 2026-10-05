@@ -959,6 +959,9 @@ body.in-lobby.has-joinreq #toast-root { top: 64px; }
 .rv-drill-txt small { color: var(--tx-2); font-size: 12.5px; }
 .rv-drill .btn { flex: none; }
 #rv-drill-slot .rv-drill { margin-top: 0; }
+#rv-drill-slot .rv-drill + .rv-drill { margin-top: 10px; }
+.rv-regrade { background: linear-gradient(90deg, rgba(91, 149, 255, 0.1), rgba(91, 149, 255, 0.02)); border-color: rgba(91, 149, 255, 0.32); }
+.rv-regrade .rv-drill-ico { background: rgba(91, 149, 255, 0.14); color: var(--info); }
 .rv-main > div:empty { display: none; } /* (an empty progress / drill / graph slot leaves no gap) */
 /* the dates the numbers, the graph and the list are about: a period, or From / to days */
 .rv-range { display: flex; align-items: center; gap: 8px 12px; flex-wrap: wrap; }

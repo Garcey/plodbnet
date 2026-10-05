@@ -486,6 +486,9 @@ def build_entry(fmt: str, path: Path | None = None) -> FormatEntry:
             facts = file_facts(ckpt_path)
         except OSError:
             pass
+    if facts["sha256"]:
+        # (which network graded what: Hand review keeps it with every grade -- regrades)
+        model.checkpoint_sha256 = facts["sha256"]
     name = ckpt_path.name if ckpt_path is not None else None
     label = _LABELS.get(fmt, fmt)
     if fmt == FORMAT_EXPERIMENTAL and loaded and ckpt_path is not None:
