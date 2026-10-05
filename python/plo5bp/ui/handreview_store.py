@@ -15,8 +15,10 @@ module keeps them:
   move or a blunder, with its learning state: the Trainer's mistakes drill deals them
   back (``drill_next`` / ``drill_result``, plugged in by ``trainer.set_drill_hooks``).
 - One IMPORT worker (uploads are read one at a time, site-wide, off the request)
-  and one GRADER (the home games' ``grade_hand`` with the served PLO5 model; the
-  player's own decisions only — other players' cards are never known).
+  and one GRADER (the home games' ``grade_hand`` with the served PLO5 model): every
+  decision whose cards are known -- the player's own and, since 2026-10-05 (owner),
+  the hands shown down. The player's numbers (accuracy, worst mark) and the mistakes
+  drill count their own decisions only.
 - The network's choice at any decision of a stored hand (``choice``: the replayer
   asks; home-game hands too, through ``homegame_routes.api_hand_choice``).
 - The Trainer's "My tables" (``my_tables``, plugged in by ``trainer.set_my_tables_hook``):
@@ -95,6 +97,10 @@ REVIEW_MIGRATIONS: list[Any] = [
     )),
 ]
 
+#: A hand whose OWN decisions still wait for their marks (SQL): a job that only adds the
+#: marks of the hands shown down (``merge``, migration 3) leaves the player's as they are.
+_OWN_PENDING = "(job IS NOT NULL AND instr(job, '\"merge\":true') = 0)"
+
 #: The grades the mistakes drill deals back (a "wrong move" or a "blunder").
 MISTAKE_CATS = ("wrong", "blunder")
 
@@ -110,12 +116,18 @@ _MISTAKE_UPSERT = (
 )
 
 
+def _own_grades(rec: dict[str, Any]) -> list[dict[str, Any]]:
+    """A record's marks of the player's own decisions (it also holds the hands shown down's)."""
+    hero = next((int(s["seat"]) for s in rec.get("seats") or [] if s.get("is_me")), None)
+    return [g for g in rec.get("grades") or [] if hero is None or int(g.get("seat", -1)) == hero]
+
+
 def _backfill_mistakes(conn: Any) -> None:
     """Migration 2: the mistakes of the hands graded before the drill existed."""
     for uid, key, ts, record in conn.execute(
         "SELECT user_id, hand_key, played_ts, record FROM review_hands WHERE mistakes > 0"
     ).fetchall():
-        for row in _mistake_rows(uid, key, ts, json.loads(record).get("grades")):
+        for row in _mistake_rows(uid, key, ts, _own_grades(json.loads(record))):
             conn.execute(_MISTAKE_UPSERT, row)
 
 
@@ -131,6 +143,39 @@ REVIEW_MIGRATIONS.append(
         " missed INTEGER NOT NULL DEFAULT 0, last_cat TEXT, last_at TEXT,"
         " PRIMARY KEY (user_id, hand_key, idx))",
     ), fn=_backfill_mistakes),
+)
+
+
+def _grade_shown_hands(conn: Any) -> None:
+    """Migration 3 (2026-10-05, owner: a shown-down player's decisions graded too): every
+    stored hand with a showdown gets its grading job rebuilt from its text. A hand still
+    waiting takes the new job whole; a hand already graded gets one for the shown hands'
+    decisions only (``merge``: the player's marks, numbers and drill stay as they are)."""
+    rows = conn.execute(
+        "SELECT user_id, hand_key, raw, job FROM review_hands WHERE showdown=1 AND raw IS NOT NULL"
+    ).fetchall()
+    for uid, key, raw, old_job in rows:
+        try:
+            p = hr.parse_hand(zlib.decompress(raw).decode("utf-8"))
+            L = hr.ledger(p)
+            job, _upto, _notes = hr.engine_replay(p, L)
+        except Exception:  # noqa: BLE001 -- a hand this code can't rebuild keeps what it has
+            logger.warning("hand review: no shown-hands job for %s", key, exc_info=True)
+            continue
+        if old_job is not None:
+            conn.execute("UPDATE review_hands SET job=? WHERE user_id=? AND hand_key=?",
+                         (json.dumps(job, separators=(",", ":")), uid, key))
+            continue
+        for a in job["actions"]:
+            a[3] = bool(a[3]) and int(a[0]) != int(L.hero)
+        if any(a[3] for a in job["actions"]):
+            job["merge"] = True
+            conn.execute("UPDATE review_hands SET job=?, grade_attempts=0 WHERE user_id=? AND hand_key=?",
+                         (json.dumps(job, separators=(",", ":")), uid, key))
+
+
+REVIEW_MIGRATIONS.append(
+    pub.Migration(3, "grade the hands shown down", fn=_grade_shown_hands),
 )
 
 
@@ -256,7 +301,7 @@ def _row(uid: int, upload_id: int, b: hr.BuiltHand, raw_text: str) -> tuple:
         b.parsed.table_name[:80], int(b.net_cents), int(b.ev_net_cents), int(b.allin), int(b.pot_cents),
         int(bool(rec.get("showdown"))), int(b.decisions),
         json.dumps(rec, separators=(",", ":")),
-        json.dumps(b.job, separators=(",", ":")) if b.gradable else None,
+        json.dumps(b.job, separators=(",", ":")) if any(a[3] for a in b.job["actions"]) else None,
         zlib.compress(raw_text.encode("utf-8"), 6), upload_id, pub._now(),
     )
 
@@ -365,11 +410,13 @@ def _grade_loop(ctx: Review) -> None:
 
 
 def grade_one(uid: int, key: str, job_json: str, model: Any) -> list[dict[str, Any]] | None:
-    """Grade one stored hand's decisions (the player's own) and store the marks."""
+    """Grade one stored hand's decisions (the player's own and the hands shown down) and
+    store the marks."""
     from plo5bp.ui import homegame as hg
 
+    job = json.loads(job_json)
     try:
-        grades = hg.grade_hand(json.loads(job_json), model)
+        grades = hg.grade_hand(job, model)
     except hg.NoGradingModel:
         return None
     except Exception:  # noqa: BLE001 — a replay the grader can't follow: tried again, then settled
@@ -381,22 +428,36 @@ def grade_one(uid: int, key: str, job_json: str, model: Any) -> list[dict[str, A
         if row is None or int(row["grade_attempts"]) < GRADE_MAX_ATTEMPTS:
             return None
         grades = None
-    store_grades(uid, key, grades)
+    store_grades(uid, key, grades, merge=bool(job.get("merge")))
     return grades
 
 
-def store_grades(uid: int, key: str, grades: list[dict[str, Any]] | None) -> None:
-    """The hand's marks land in its record and its numbers — and its job is done."""
+def _hero_seat(rec: dict[str, Any]) -> int | None:
+    return next((int(s["seat"]) for s in rec.get("seats") or [] if s.get("is_me")), None)
+
+
+def store_grades(uid: int, key: str, grades: list[dict[str, Any]] | None, *, merge: bool = False) -> None:
+    """The hand's marks land in its record and its numbers — and its job is done. The
+    numbers and the mistakes drill are the player's own decisions only (the record also
+    holds the marks of the hands shown down). ``merge``: a job that graded only the hands
+    shown (migration 3) -- the player's marks stay exactly as they were."""
     with pub.DB.transaction():
         row = pub.DB.one("SELECT record, played_ts FROM review_hands WHERE user_id=? AND hand_key=?", (uid, key))
         if row is None:
             return
         rec = json.loads(row["record"])
-        rec["grades"] = list(grades or [])
-        if grades is None:
-            rec["grades_note"] = "could not be graded"
-        scores = [float(g["score"]) for g in rec["grades"]]
-        found = _mistake_rows(uid, key, int(row["played_ts"]), rec["grades"])
+        if merge:
+            if grades is not None:
+                hero = _hero_seat(rec)
+                shown = [g for g in grades if int(g.get("seat", -1)) != hero]
+                rec["grades"] = sorted(_own_grades(rec) + shown, key=lambda g: int(g["i"]))
+        else:
+            rec["grades"] = list(grades or [])
+            if grades is None:
+                rec["grades_note"] = "could not be graded"
+        mine = _own_grades(rec)
+        scores = [float(g["score"]) for g in mine]
+        found = _mistake_rows(uid, key, int(row["played_ts"]), mine)
         pub.DB.q(
             "UPDATE review_hands SET record=?, job=NULL, acc_sum=?, acc_n=?, worst=?, mistakes=?, graded_at=?"
             " WHERE user_id=? AND hand_key=?",
@@ -455,7 +516,7 @@ def summary(uid: int, start: str = "", end: str = "") -> dict[str, Any]:
         " COALESCE(SUM(allin),0) allins, COALESCE(SUM(showdown),0) showdowns,"
         " COALESCE(SUM(decisions),0) decisions, COALESCE(SUM(acc_sum),0) acc_sum,"
         " COALESCE(SUM(acc_n),0) acc_n, COALESCE(SUM(mistakes),0) mistakes,"
-        " COALESCE(SUM(CASE WHEN job IS NOT NULL THEN 1 ELSE 0 END),0) pending,"
+        f" COALESCE(SUM(CASE WHEN {_OWN_PENDING} THEN 1 ELSE 0 END),0) pending,"
         " COALESCE(SUM(net_cents * 1.0 / bb_cents),0) net_bb, COALESCE(SUM(ev_net_cents * 1.0 / bb_cents),0) ev_bb,"
         " MIN(played_ts) first_ts, MAX(played_ts) last_ts"
         f" FROM review_hands WHERE user_id=?{rng}", (uid, *rp),
@@ -566,7 +627,7 @@ def hands(uid: int, sort: str, direction: str, offset: int, limit: int, filt: st
     total = int(pub.DB.one(f"SELECT COUNT(*) n FROM review_hands WHERE {where}", (uid, *rp))["n"])
     rows = pub.DB.q(
         f"SELECT hand_key, played_at, played_ts, table_name, net_cents, ev_net_cents, allin, pot_cents, showdown,"
-        f" decisions, acc_sum, acc_n, worst, mistakes, job IS NOT NULL AS pending, record"
+        f" decisions, acc_sum, acc_n, worst, mistakes, {_OWN_PENDING} AS pending, record"
         f" FROM review_hands WHERE {where} ORDER BY {_SORTS[sort].format(d=d)} LIMIT ? OFFSET ?",
         (uid, *rp, limit, offset),
     )
@@ -595,7 +656,7 @@ _KEY_RE = re.compile(r"^[a-z]+:[A-Za-z0-9_\-]{1,64}$")
 def hand(uid: int, key: str) -> dict[str, Any]:
     if not _KEY_RE.match(key or ""):
         raise HTTPException(status_code=404, detail="Not Found")
-    row = pub.DB.one("SELECT record, job IS NOT NULL AS pending FROM review_hands WHERE user_id=? AND hand_key=?",
+    row = pub.DB.one(f"SELECT record, {_OWN_PENDING} AS pending FROM review_hands WHERE user_id=? AND hand_key=?",
                      (uid, key))
     if row is None:
         raise HTTPException(status_code=404, detail="Not Found")
@@ -925,7 +986,7 @@ def api_upload_status(upload_id: int):
         raise HTTPException(status_code=404, detail="Not Found")
     out = _upload_view(r)
     out["grading_pending"] = int(pub.DB.one(
-        "SELECT COUNT(*) n FROM review_hands WHERE user_id=? AND job IS NOT NULL", (uid,))["n"])
+        f"SELECT COUNT(*) n FROM review_hands WHERE user_id=? AND {_OWN_PENDING}", (uid,))["n"])
     return out
 
 

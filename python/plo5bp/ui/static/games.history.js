@@ -10,10 +10,11 @@
   const hasKeys = () => !!(globalThis.matchMedia && matchMedia("(hover: hover) and (pointer: fine)").matches);
 
   // ------------------------------------------------------------ hand replayer
-  // A CLICK-THROUGH, not a video: the hand opens on the flop with the first
-  // player to act; forward plays one action, back takes one away. Every player
-  // decision carries the network's verdict (same marks as the Trainer), and any
-  // position can be sent to the Study tab as a spot.
+  // A CLICK-THROUGH, not a video: the hand opens on the flop as dealt; forward
+  // plays one action (the table shows its moment), back takes one away, and the
+  // step after the last is the result. Every decision whose cards are known carries
+  // the network's verdict (same marks as the Trainer), and any position can be
+  // sent to the Study tab as a spot.
   const MARKS = { best: "✓✓", correct: "✓", inaccuracy: "~", wrong: "✗", blunder: "✗✗" };
   const MARK_LABEL = { best: "Best move", correct: "Correct", inaccuracy: "Inaccuracy", wrong: "Wrong move", blunder: "Blunder" };
   const kindOfAction = (x) => C().actionKind(x);
@@ -23,7 +24,13 @@
     return html`<span class="grade g-${g.cat}${small ? " sm" : ""}" title="${label} · ${Math.round(g.score)}/100 vs the network">${MARKS[g.cat] || "?"}${small ? "" : html` <em>${label}</em> <b>${Math.round(g.score)}</b>`}</span>`;
   }
 
-  function replayState(rec, k) {
+  // The table at a replay step (owner, 2026-10-05: "the hand history is always like a step
+  // ahead on the table"): step k shows the MOMENT of the k-th action -- its player in the light,
+  // the chips that street has seen in front of everyone, that street's boards (the next street's
+  // cards come with its first action). Step 0 is the flop just dealt. `swept` = the betting is
+  // over (an all-in's runout, or the result): the bets go into the pot and the bet nobody matched
+  // back to its owner.
+  function replayState(rec, k, swept) {
     const seats = {};
     // (a Hand review record may carry dead money: a missed blind posted into the pot)
     rec.seats.forEach((x) => { seats[x.seat] = { stack: x.start_cents - rec.ante_cents - (x.dead_cents || 0), bet: 0, folded: false }; });
@@ -37,10 +44,7 @@
       if (a.action === 0) p.folded = true;
       else { p.stack -= a.cents; p.bet += a.cents; pot += a.cents; }
     }
-    const next = rec.actions[k] || null;
-    if (next && String(next.street).toLowerCase() !== street) { street = String(next.street).toLowerCase(); clearBets(); }
-    const over = !next;
-    if (over) {
+    if (swept) {
       clearBets();
       // the bet nobody matched goes back to its owner, as at the table (2026-10-02): what
       // the biggest stake put in beyond every other seat's whole stake is no pot
@@ -51,8 +55,8 @@
         pot -= back;
       }
     }
-    const boardN = over ? Math.max(3, (rec.board_a || []).length) : street === "river" ? 5 : street === "turn" ? 4 : 3;
-    return { seats, pot, street, next, over, boardN, last: k > 0 ? rec.actions[k - 1] : null };
+    const boardN = street === "river" ? 5 : street === "turn" ? 4 : 3;
+    return { seats, pot, street, boardN, cur: k > 0 ? rec.actions[k - 1] || null : null };
   }
   // PLO67: a seat's cards on the street being replayed (0 flop, 1 turn, 2 river): the
   // first `counts[i]` of its cards in the order they came, shown high to low — or that
@@ -94,7 +98,8 @@
     // then the result (owner, 2026-09-29).
     const FROM = Number(rec.runout_from) || 0;
     const R = rec.equities && FROM >= 3 ? Math.max(0, 5 - FROM) : 0;
-    const END = N + R;
+    // (without a runout, one step past the last action: the result)
+    const END = N + (R || 1);
     const STREETS = ["flop", "turn", "river"];
     const pct = (x) => (x == null ? "–" : Math.round(x * 100) + "%");
     const gradeAt = {};
@@ -114,16 +119,21 @@
       <div class="rp-side"><div class="rsec flush-top rp-net empty" id="rp-net"><h4>The network's choice</h4><div id="rp-net-body" aria-live="polite"></div></div><div class="rsec flush-top rp-acts"><h4>Action</h4><div id="rp-list" class="rp-list"></div></div></div>`);
     const q = (id) => body.querySelector("#" + id);
 
+    // the decision a step is about (the selected action's; Study and the network's card read it)
+    const decisionAt = (step) => Math.max(0, Math.min(step - 1, N - 1));
     function paint() {
-      const st = replayState(rec, Math.min(k, N));
-      // all in: the street being run out and its equities (none on the result)
-      const j = R && k >= N ? k - N : -1;
+      // past the last action: an all-in's runout streets (each with its equities), then the
+      // result -- k === END, the step after the last action when nothing is run out
+      const j = k > N ? k - N : 0;
+      const over = k === END && k > N;
+      const st = replayState(rec, Math.min(k, N), k > N);
+      const cur = k <= N ? st.cur : null;  // the action this step shows
       let eqMap = null;
-      if (j >= 0) {
-        st.boardN = FROM + j;
-        st.over = j === R;
-        if (!st.over) eqMap = rec.equities[String(st.boardN)] || null;
+      if (R && k >= N) {
+        st.boardN = FROM + j;  // (the all-in's own street at its last action, then each one dealt)
+        if (!over) eqMap = rec.equities[String(st.boardN)] || null;
       }
+      if (over) st.boardN = Math.max(3, (rec.board_a || []).length);
       // seats around the felt, hero at the bottom (each one's place rides in data-vars:
       // --x / --y, games.css .rp-seat)
       const seats = rec.seats.map((x) => {
@@ -131,41 +141,51 @@
         const th = Math.PI / 2 + (rel * 2 * Math.PI) / n;
         const px = (50 + 44 * Math.cos(th)).toFixed(2), py = (50 + 40 * Math.sin(th)).toFixed(2);
         const p = st.seats[x.seat];
-        const acting = st.next && st.next.seat === x.seat;
+        const acting = !!(cur && cur.seat === x.seat);
         const known = x.hole && x.hole.length && x.hole[0] >= 0;
         const cards = p.folded && !known ? "" : html`<span class="mini-cards" data-cards="${replayHole(x, rec, st.boardN).join(",")}"></span>`;
-        const res = st.over ? html`<b class="num ${x.delta_cents > 0 ? "pos" : x.delta_cents < 0 ? "neg" : "muted"}">${x.delta_cents > 0 ? "+" : ""}${d2(x.delta_cents)}</b>` : "";
+        const res = over ? html`<b class="num ${x.delta_cents > 0 ? "pos" : x.delta_cents < 0 ? "neg" : "muted"}">${x.delta_cents > 0 ? "+" : ""}${d2(x.delta_cents)}</b>` : "";
         const e = eqMap && eqMap[String(x.seat)];
         const eq = e ? html`<span class="rp-eq num" title="${names[x.seat]}'s chance to win board 1 · board 2 from here"><span data-b="1">${pct(e[0])}</span><span data-b="2">${pct(e[1])}</span></span>` : "";
-        return html`<div class="rp-seat ${p.folded ? "folded" : ""} ${acting ? "acting" : ""}" data-vars="x:${px}%;y:${py}%">${cards}<div class="rp-plate">${avatar(x.name, x.name, "sm", x.avatar)}<div><b>${names[x.seat]}${x.seat === rec.button ? html` <i class="rp-d">D</i>` : ""}</b><span class="num">${d2(Math.max(0, p.stack))}</span></div></div>${eq}${p.bet > 0 ? html`<span class="rp-bet num">${d2(p.bet)}</span>` : ""}${res}</div>`;
+        // The dealer button: a disc on the felt beside the nameplate, on the side facing the
+        // table (owner, 2026-10-05: a "D" inside the nameplate was hard to spot)
+        // (a phone: at the plate's corner away from the middle -- the side seats sit by the boards)
+        const c = Math.cos(th), side = c < -0.15 ? "r" : c > 0.15 ? "l" : Math.sin(th) < 0 ? "r" : "l";
+        const vert = Math.abs(c) < 0.15 ? "" : Math.sin(th) > 0.1 ? "b" : "t";
+        const disc = x.seat === rec.button ? html`<i class="rp-dbtn ${side} ${vert}" title="${names[x.seat]} has the button">D</i>` : "";
+        return html`<div class="rp-seat ${p.folded ? "folded" : ""} ${acting ? "acting" : ""}" data-vars="x:${px}%;y:${py}%">${cards}<div class="rp-pw"><div class="rp-plate">${avatar(x.name, x.name, "sm", x.avatar)}<div><b>${names[x.seat]}</b><span class="num">${d2(Math.max(0, p.stack))}</span></div></div>${disc}</div>${eq}${p.bet > 0 ? html`<span class="rp-bet num">${d2(p.bet)}</span>` : ""}${res}</div>`;
       });
       // PLO67: the burns turned up by this street (a red one dealt everyone still in a card)
       const burns = (rec.burns || []).slice(0, Math.max(0, st.boardN - 2));
       const felt = q("rp-felt");
       put(felt, html`${seats}<div class="rp-center"><span class="rp-pot num">Pot ${d2(st.pot)}</span><span class="mini-cards" data-cards="${(rec.board_a || []).slice(0, st.boardN).join(",")}"></span><span class="mini-cards" data-cards="${(rec.board_b || []).slice(0, st.boardN).join(",")}"></span>${burns.length ? html`<span class="rp-burns" title="Burn cards, face up: a red one deals everyone still in the hand another card"><small>Burns</small><span class="mini-cards" data-cards="${burns.join(",")}"></span></span>` : ""}</div>`);
       fillMiniCards(felt);
-      // banner: the action just played (with its verdict) and who is up
-      const last = st.last, g = last && j < 1 ? gradeAt[k - 1] : null;
-      const dealtNow = j >= 1 ? STREETS[st.boardN - 3] : null;  // (a street the runout just dealt)
+      // banner: the action this step shows (with its verdict) and its street
+      const g = cur ? gradeAt[k - 1] : null;
+      const dealtNow = R && j >= 1 ? STREETS[st.boardN - 3] : null;  // (a street the runout just dealt)
+      const first = (rec.actions || [])[0];
       const left = dealtNow
         ? html`<span class="rp-act k-runout"><b>${dealtNow[0].toUpperCase() + dealtNow.slice(1)}</b> dealt${burnNote(rec, dealtNow)}</span>`
-        : last ? html`<span class="rp-act k-${kindOfAction(last)}"><b>${names[last.seat] || "?"}</b> ${last.label}${last.auto ? html` <small class="muted">(clock)</small>` : ""}</span>${gradeChip(g)}`
+        : over ? html`<span class="rp-act k-result"><b>${rec.showdown ? "Showdown" : "Won without showdown"}</b></span>`
+        : cur ? html`<span class="rp-act k-${kindOfAction(cur)}"><b>${names[cur.seat] || "?"}</b> ${cur.label}${cur.auto ? html` <small class="muted">(clock)</small>` : ""}</span>${gradeChip(g)}`
         : html`<span class="muted">Flop dealt — everyone anted ${d2(rec.ante_cents)}.</span>`;
-      const right = st.next ? html`<span class="muted">${String(st.street).toUpperCase()} · <b class="tx">${names[st.next.seat] || "?"}</b> to act</span>`
-        : !st.over ? html`<span class="pill">All in · running it out</span>`
-        : html`<span class="pill gold">Hand over</span>`;
+      const right = over ? html`<span class="pill gold">Hand over</span>`
+        : R && k >= N ? html`<span class="pill">All in · running it out</span>`
+        : cur ? html`<span class="muted">${String(cur.street).toUpperCase()}</span>`
+        : first ? html`<span class="muted">FLOP · <b class="tx">${names[first.seat] || "?"}</b> acts first</span>`
+        : "";
       put(q("rp-banner"), html`${left}<span class="spacer"></span>${right}`);
       q("rp-step").textContent = `${k} / ${END}`;
       q("rp-prev").disabled = q("rp-first").disabled = k === 0;
       q("rp-next").disabled = q("rp-last").disabled = k === END;
       body.querySelectorAll("#rp-list .log-row").forEach((r) => r.classList.toggle("on", Number(r.dataset.i) === k - 1));
-      const cur = body.querySelector("#rp-list .log-row.on");
-      if (cur) keepInView(cur);
-      q("rp-result").classList.toggle("pending", !st.over);
-      paintNet(j < 1 ? k - 1 : -1, j >= 1 ? "runout" : "start");
+      const on = body.querySelector("#rp-list .log-row.on");
+      if (on) keepInView(on);
+      q("rp-result").classList.toggle("pending", !over);
+      paintNet(cur ? k - 1 : -1, over ? "result" : k > N ? "runout" : "start");
       const sb = q("rp-study");
       if (sb && rec.study_upto != null) {
-        const past = Math.min(k, N) > rec.study_upto;
+        const past = decisionAt(k) > rec.study_upto;
         sb.disabled = past;
         sb.title = past ? "Study can't follow this hand past here: ClubGG allowed a raise after a short all-in that the network's rules don't" : "Send this exact spot to the Study tab";
       }
@@ -256,6 +276,7 @@
         : "cards not shown";
       const done = a ? html`<span><b>${names[a.seat] || "?"}</b> ${a.label}</span>`
         : at === "runout" ? html`<span class="muted">The board runs out</span>`
+        : at === "result" ? html`<span class="muted">The hand is over</span>`
         : html`<span class="muted">Step through the hand to see its reads</span>`;
       const skel = (w) => html`<span><i class="nc-skel" data-vars="w:${w}%"></i><i class="nc-skel"></i></span>`;
       return html`<div class="nc-pick"><small>It plays</small><i class="nc-skel nc-skel-pick" data-vars="w:42%"></i></div>
@@ -281,7 +302,7 @@
         <div class="nc-you"><span><b>${names[a.seat] || "?"}</b> ${a.label}</span>${gradeChip(gradeAt[i], true)}</div>`;
     }
 
-    // action list (click = jump to just after that action)
+    // action list (click = that action's moment on the table)
     const list = [];
     let street = null;
     (rec.actions || []).forEach((a2, i) => {
@@ -301,6 +322,9 @@
       STREETS.slice(0, (rec.burns || []).length).forEach((st) => {
         if (!seenStreets.has(st)) list.push(html`<div class="log-street">${st}${burnNote(rec, st)}</div>`);
       });
+      // the step after the last action: who won what
+      list.push(html`<div class="log-street">result</div>`);
+      list.push(html`<button type="button" class="log-row k-result" data-i="${N}"><span class="nm">${rec.showdown ? "Showdown" : "Hand over"}</span><span class="lb">the pots paid</span></button>`);
     }
     put(q("rp-list"), list.length ? html`${list}` : html`<div class="muted">No betting — everyone was all-in from the ante.</div>`);
     q("rp-list").addEventListener("click", (e) => { const r = e.target.closest(".log-row"); if (r) go(Number(r.dataset.i) + 1); });
@@ -315,7 +339,8 @@
     q("rp-prev").addEventListener("click", () => go(k - 1));
     q("rp-next").addEventListener("click", () => go(k + 1));
     q("rp-last").addEventListener("click", () => go(END));
-    if (q("rp-study")) q("rp-study").addEventListener("click", () => askStudy(rec, Math.min(k, N)));
+    // (the decision the table shows: the selected action's, as the network's card reads it)
+    if (q("rp-study")) q("rp-study").addEventListener("click", () => askStudy(rec, decisionAt(k)));
     // a link to this hand (FEAT-010): the table's page opens it for any club member,
     // with the usual reveal rules for the cards
     if (q("rp-link")) q("rp-link").addEventListener("click", async () => {

@@ -19,7 +19,9 @@ grader work on them unchanged. It is pure: no database, no request — the store
    never show, checks every actor against the history and that the engine's
    result is what ClubGG paid (to the cent, apart from dead money the engine has
    no slot for), then builds the record, the all-in EV (side pots included) and
-   the grading job (the player's own decisions only).
+   the grading job: every decision whose cards are known -- the player's own and,
+   since 2026-10-05 (owner), the shown-down hands' (the player's numbers and the
+   mistakes drill count only their own; ``handreview_store``).
 4. ``table_profile`` / ``draw_table`` — the Trainer's "My tables": a smoothed picture
    of the tables in a player's hands (players, ante, their own stack, everyone
    else's) and a table drawn from it.
@@ -795,7 +797,9 @@ def engine_replay(p: ParsedHand, L: Ledger) -> tuple[dict[str, Any], int, list[s
         if gate == GATE_CHECK_CALL and a.verb in ("checks", "calls") and abs(put_in - add) > per_cent and not dead_total:
             notes.append(f"action {k + 1}: the engine's call differs")
             break
-        job_actions.append([seat, int(gate), int(put_in) if gate == GATE_RAISE else 0, seat == L.hero])
+        # (graded: every decision whose cards we know -- the player's and the hands shown)
+        job_actions.append([seat, int(gate), int(put_in) if gate == GATE_RAISE else 0,
+                            seat == L.hero or seat in L.holes])
         upto = k + 1
     else:
         if not env.is_terminal():
@@ -836,7 +840,7 @@ def build_hand(p: ParsedHand) -> BuiltHand:
     ev_net, ev_detail = allin_ev(L, p, cache)
     job, upto, notes = engine_replay(p, L)
     decisions = sum(1 for _st, a in _flat_actions(p) if L.idx[a.name] == L.hero)
-    gradable = sum(1 for a in job["actions"] if a[3])
+    gradable = sum(1 for a in job["actions"] if a[3] and a[0] == L.hero)
     rec["net_cents"] = int(L.net(L.hero))
     rec["ev_net_cents"] = int(ev_net)
     rec["allin"] = ev_detail is not None

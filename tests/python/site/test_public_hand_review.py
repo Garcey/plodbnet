@@ -239,13 +239,19 @@ def test_every_hand_builds_and_its_money_adds_up(text):
             assert s["hole"] == []  # (a hand nobody showed is never in the record)
 
 
-def test_the_engine_replay_agrees_with_clubgg_and_grades_only_the_heros_decisions():
-    for text in (FOLD_OUT, SIDE_POT):
+def test_the_engine_replay_agrees_with_clubgg_and_grades_every_decision_whose_cards_are_known():
+    """The player's own decisions and, since 2026-10-05 (owner: a shown-down player's call
+    "should be graded"), the decisions of every hand shown down -- never a mucked hand's."""
+    for text, graded_seats in ((FOLD_OUT, 1), (SIDE_POT, 3)):
         b = hr.build_hand(hr.parse_hand(text))
         assert b.notes == []
         assert b.record["study_upto"] == len(b.record["actions"])
         hero = next(s["seat"] for s in b.record["seats"] if s["is_me"])
-        assert [a[3] for a in b.job["actions"]] == [a["seat"] == hero for a in b.record["actions"]]
+        known = {s["seat"] for s in b.record["seats"] if s.get("hole") and s["hole"][0] >= 0}
+        assert hero in known and len(known) == graded_seats
+        assert [a[3] for a in b.job["actions"]] == [a["seat"] in known for a in b.record["actions"]]
+        # (the hand's own numbers count the player's decisions only)
+        assert b.gradable == sum(1 for a in b.record["actions"] if a["seat"] == hero)
 
 
 def test_dead_money_is_in_the_pot_and_cut_from_the_posters_engine_stack():
@@ -546,8 +552,12 @@ def test_graded_hands_sort_worst_first(server, pub, store):
     _upload(c, store, {"h.txt": FOLD_OUT + "\n\n" + SIDE_POT})
     uid = int(pub.DB.one("SELECT id FROM users WHERE email=?", (email,))["id"])
     keys = [r["hand_key"] for r in pub.DB.q("SELECT hand_key FROM review_hands WHERE user_id=?", (uid,))]
-    store.store_grades(uid, keys[0], [{"i": 0, "seat": 0, "score": 92.0, "cat": "correct"}])
-    store.store_grades(uid, keys[1], [{"i": 0, "seat": 1, "score": 4.0, "cat": "blunder"}])
+    hero = {k: next(s["seat"] for s in c.get(f"/games/api/review/hands/{k}").json()["seats"] if s["is_me"])
+            for k in keys}
+    store.store_grades(uid, keys[0], [{"i": 0, "seat": hero[keys[0]], "score": 92.0, "cat": "correct"}])
+    # (a shown-down opponent's blunder is in the record, not in your numbers)
+    store.store_grades(uid, keys[1], [{"i": 0, "seat": hero[keys[1]], "score": 4.0, "cat": "blunder"},
+                                      {"i": 1, "seat": hero[keys[1]] + 1, "score": 1.0, "cat": "blunder"}])
     rows = c.get("/games/api/review/hands?sort=worst").json()["hands"]
     assert [r["key"] for r in rows] == [keys[1], keys[0]] and rows[0]["mistakes"] == 1
     assert c.get("/games/api/review/hands?filter=mistakes").json()["total"] == 1
@@ -568,8 +578,53 @@ def test_grading_a_stored_hand_with_the_network(server, pub, store):
     grades = store.grade_one(uid, row["hand_key"], row["job"], model)
     rec = c.get(f"/games/api/review/hands/{row['hand_key']}").json()
     hero = next(s["seat"] for s in rec["seats"] if s["is_me"])
-    assert grades and all(rec["actions"][g["i"]]["seat"] == hero for g in rec["grades"])
+    # every decision of the three hands shown down is graded; your numbers are yours
+    assert [g["i"] for g in rec["grades"]] == list(range(len(rec["actions"])))
+    mine = [g for g in rec["grades"] if g["seat"] == hero]
+    assert grades and 0 < len(mine) < len(rec["grades"])
+    acc = pub.DB.one("SELECT acc_n, acc_sum FROM review_hands WHERE user_id=?", (uid,))
+    assert acc["acc_n"] == len(mine) and acc["acc_sum"] == pytest.approx(sum(g["score"] for g in mine))
     assert rec["grading"] is False
+
+
+def test_hands_graded_before_get_the_shown_hands_marks_and_keep_yours(server, pub, store):
+    """Migration 3 (2026-10-05): a hand graded when only the player's decisions were gets a
+    job for the shown hands' decisions only; it lands beside the player's marks, which --
+    with the numbers and the mistakes drill -- stay exactly as they were, and the page never
+    shows the hand as waiting meanwhile."""
+    model = _model()
+    email = "regraded@example.com"
+    c = _login(server, email)
+    _comp(pub, email)
+    _upload(c, store, {"h.txt": SIDE_POT + "\n\n" + FOLD_OUT})
+    uid = _uid(pub, email)
+    rows = {r["hand_key"]: r["showdown"] for r in pub.DB.q("SELECT hand_key, showdown FROM review_hands WHERE user_id=?", (uid,))}
+    key = next(k for k, sd in rows.items() if sd)
+    rec = c.get(f"/games/api/review/hands/{key}").json()
+    hero, mine = _hero_moves(rec)
+    # as graded before: the player's decisions only (a blunder among them), the job done
+    old = [{"i": i, "seat": hero, "score": 3.0 if j == 0 else 80.0, "cat": "blunder" if j == 0 else "correct"}
+           for j, i in enumerate(mine)]
+    store.store_grades(uid, key, old)
+    pub.DB.q("UPDATE review_hands SET job=NULL WHERE user_id=?", (uid,))
+    before = dict(pub.DB.one("SELECT acc_sum, acc_n, worst, mistakes FROM review_hands WHERE user_id=? AND hand_key=?", (uid, key)))
+    drill = pub.DB.q("SELECT idx, score FROM review_mistakes WHERE user_id=? AND hand_key=?", (uid, key))
+    with pub.DB.transaction():
+        store._grade_shown_hands(pub.DB._conn)
+    job = pub.DB.one("SELECT job FROM review_hands WHERE user_id=? AND hand_key=?", (uid, key))["job"]
+    jj = json.loads(job)
+    assert jj["merge"] is True and all(a[3] == (a[0] != hero) for a in jj["actions"])
+    # (no job for a hand without a showdown; nothing shows as waiting)
+    assert pub.DB.one("SELECT COUNT(*) n FROM review_hands WHERE user_id=? AND job IS NOT NULL", (uid,))["n"] == 1
+    assert c.get("/games/api/review/summary").json()["grading_pending"] == 0
+    assert c.get(f"/games/api/review/hands/{key}").json()["grading"] is False
+    store.grade_one(uid, key, job, model)
+    rec = c.get(f"/games/api/review/hands/{key}").json()
+    assert [g for g in rec["grades"] if g["seat"] == hero] == old
+    assert {rec["actions"][g["i"]]["seat"] for g in rec["grades"]} == {s["seat"] for s in rec["seats"] if s["hole"][0] >= 0}
+    after = dict(pub.DB.one("SELECT acc_sum, acc_n, worst, mistakes FROM review_hands WHERE user_id=? AND hand_key=?", (uid, key)))
+    assert after == before
+    assert pub.DB.q("SELECT idx, score FROM review_mistakes WHERE user_id=? AND hand_key=?", (uid, key)) == drill
 
 
 def test_your_hands_are_yours_alone_and_deleting_them_works(server, pub, store):

@@ -283,6 +283,71 @@ def test_the_replayer_runs_an_all_in_out_street_by_street_with_its_equities(node
     assert hidden is False and got["nextOff"] is True
 
 
+def test_the_replayer_shows_each_action_where_it_happened(node, tmp_path):
+    """(owner, 2026-10-05) "The hand history is always like a step ahead on the table": a
+    step shows ITS action -- that player in the light, that street's chips and boards (the
+    river comes with the river's first action) -- the step after the last one is the
+    result, the dealer button is a disc on the felt (not a "D" in a nameplate), and a
+    shown-down player's graded decision carries its mark like yours."""
+    got = _run(tmp_path, r"""
+(async () => {
+  const seat = (i, name, delta) => ({ seat: i, name, is_me: i === 0, start_cents: 20000, delta_cents: delta,
+    hole: [20 + 5 * i, 21 + 5 * i, 22 + 5 * i, 23 + 5 * i, 24 + 5 * i], shown: true, folded: i === 1 });
+  const rec = { v: 3, hand_no: 6, variant: "plo5", hole_count: 5, button: 1, num_seats: 3, bb_cents: 100, ante_cents: 300,
+    pot_cents: 2700, showdown: true, board_a: [0, 4, 8, 12, 16], board_b: [1, 5, 9, 13, 17], burns: [],
+    actions: [{ seat: 1, street: "flop", action: 1, label: "Check", cents: 0 },
+              { seat: 2, street: "flop", action: 2, label: "Bet $3.00", cents: 300 },
+              { seat: 0, street: "flop", action: 1, label: "Call $3.00", cents: 300 },
+              { seat: 1, street: "flop", action: 0, label: "Fold", cents: 0 },
+              { seat: 2, street: "turn", action: 2, label: "Bet $6.00", cents: 600 },
+              { seat: 0, street: "turn", action: 1, label: "Call $6.00", cents: 600 },
+              { seat: 2, street: "river", action: 1, label: "Check", cents: 0 },
+              { seat: 0, street: "river", action: 1, label: "Check", cents: 0 }],
+    seats: [seat(0, "Host", 1200), seat(1, "Dana", -300), seat(2, "Rico", -900)], awards: [], flows: [],
+    grades: [{ i: 4, seat: 2, score: 96, cat: "best" }, { i: 5, seat: 0, score: 3, cat: "blunder" }] };
+  const B = boot((url) => (url.includes("/hands/6") ? rec : table()));
+  B.HG.cards.cardEl = () => B.W.doc.createElement("span");
+  B.HG.core.G.state = table(); B.HG.core.G.gameId = "T1";
+  await B.HG.ui.openHand("T1", 6); await flush();
+  const m = () => B.W.doc.querySelectorAll("#modal-root .modal").slice(-1)[0];
+  const look = () => ({ step: m().querySelector("#rp-step").textContent,
+    boards: m().querySelector(".rp-center").querySelectorAll(".mini-cards").map((e) => e.getAttribute("data-cards")),
+    lit: m().querySelectorAll(".rp-seat.acting .rp-plate b").map((e) => e.textContent),
+    bets: m().querySelectorAll(".rp-bet").map((e) => e.textContent),
+    banner: m().querySelector("#rp-banner").textContent,
+    on: m().querySelectorAll("#rp-list .log-row.on").map((r) => r.textContent),
+    pending: m().querySelector("#rp-result").classList.contains("pending") });
+  const out = { start: look() };
+  const row = (i) => m().querySelectorAll("#rp-list .log-row")[i];
+  row(5).click(); out.turnCall = look();
+  m().querySelector("#rp-next").click(); out.riverFirst = look();
+  m().querySelector("#rp-last").click(); out.end = look();
+  out.rows = m().querySelectorAll("#rp-list .log-row").length;
+  out.marks = m().querySelectorAll("#rp-list .log-row").map((r) => (r.querySelector(".grade") ? r.querySelector(".grade").textContent : ""));
+  const disc = m().querySelector(".rp-felt .rp-dbtn");
+  out.disc = disc ? [disc.textContent, disc.getAttribute("title")] : null;
+  out.plateD = m().querySelectorAll(".rp-plate .rp-d").length;
+  console.log(JSON.stringify(out));
+})();
+""")
+    st = got["start"]
+    assert st["step"] == "0 / 9" and st["lit"] == [] and "Rico acts first" not in st["banner"]
+    assert "Dana acts first" in st["banner"] and st["boards"] == ["0,4,8", "1,5,9"]
+    tc = got["turnCall"]  # the turn's last call: the turn, its chips, its caller
+    assert tc["step"] == "6 / 9" and tc["boards"] == ["0,4,8,12", "1,5,9,13"]
+    assert tc["lit"] == ["You"] and sorted(tc["bets"]) == ["$6.00", "$6.00"]
+    assert "Call $6.00" in tc["banner"] and "TURN" in tc["banner"] and "RIVER" not in tc["banner"]
+    assert tc["on"] == ["YouCall $6.00✗✗"]
+    rf = got["riverFirst"]  # the river's first action brings the river
+    assert rf["step"] == "7 / 9" and rf["boards"] == ["0,4,8,12,16", "1,5,9,13,17"]
+    assert rf["lit"] == ["Rico"] and rf["bets"] == [] and "RIVER" in rf["banner"]
+    end = got["end"]  # one step past the last action: the result
+    assert end["step"] == "9 / 9" and end["lit"] == [] and "Hand over" in end["banner"] and end["pending"] is False
+    assert end["on"] == ["Showdownthe pots paid"] and got["rows"] == 9
+    assert got["marks"][4] == "✓✓" and got["marks"][5] == "✗✗"  # (Rico's shown-down bet is marked too)
+    assert got["disc"] == ["D", "Dana has the button"] and got["plateD"] == 0
+
+
 def test_the_replayer_gives_back_the_bet_nobody_matched(node, tmp_path):
     """(owner, 2026-10-02) $200 bets the $180 pot, $150 folds, $100 calls all in: the
     $80 nobody matched goes back to the bettor when the betting closes — the replay

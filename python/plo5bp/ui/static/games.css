@@ -762,19 +762,24 @@ body.in-lobby.has-joinreq #toast-root { top: 64px; }
 .rp-main { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
 .rp-felt { position: relative; aspect-ratio: 2 / 1; border-radius: 999px; background: radial-gradient(ellipse at 50% 40%, var(--felt-1), var(--felt-2) 60%, var(--felt-3)); box-shadow: inset 0 0 0 6px var(--rail-2), inset 0 0 0 7px rgba(236, 201, 119, 0.3), inset 0 0 50px rgba(0, 0, 0, 0.5); margin: 26px 46px 34px; }
 .rp-seat { position: absolute; left: var(--x); top: var(--y); transform: translate(-50%, -50%); display: flex; flex-direction: column; align-items: center; gap: 3px; transition: opacity 0.2s; z-index: 2; } /* (--x / --y: games.history.js) */
-.rp-seat.folded { opacity: 0.4; }
+.rp-seat.folded > :not(.rp-pw), .rp-seat.folded .rp-plate { opacity: 0.4; } /* (not the dealer button: it stays easy to spot) */
+.rp-seat > *, .rp-plate { transition: opacity 0.2s; }
+.rp-pw { position: relative; }
 .rp-seat .mini-cards { --cw: 19px; gap: 1px; }
 .rp-plate { display: flex; align-items: center; gap: 7px; padding: 4px 10px 4px 4px; border-radius: 99px; background: rgba(12, 17, 25, 0.96); border: 1px solid rgba(255, 255, 255, 0.13); white-space: nowrap; }
 .rp-plate b { display: block; font-size: 12px; line-height: 1.15; }
 .rp-plate span { font-size: 11.5px; color: var(--gold); }
 .rp-seat.acting .rp-plate { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(24, 210, 195, 0.25), 0 0 16px rgba(24, 210, 195, 0.35); }
-.rp-d { display: inline-flex; align-items: center; justify-content: center; width: 15px; height: 15px; border-radius: 50%; background: #fff; color: #10151d; font: 800 9.5px var(--font); font-style: normal; vertical-align: 1px; }
+.rp-dbtn { position: absolute; top: 50%; display: flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; background: radial-gradient(circle at 35% 30%, #ffffff, #ececec 55%, #c8c8c8); color: #10151d; font: 800 11px var(--font); font-style: normal; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.55), inset 0 0 0 2px rgba(16, 21, 29, 0.12); } /* the dealer button, on the felt beside its nameplate (games.history.js) */
+.rp-dbtn.r { left: calc(100% + 7px); transform: translateY(-50%); }
+.rp-dbtn.l { right: calc(100% + 7px); transform: translateY(-50%); }
+.rp-felt.fit .rp-dbtn.r.t, .rp-felt.fit .rp-dbtn.r.b { left: auto; right: calc(100% + 5px); } .rp-felt.fit .rp-dbtn.l.t, .rp-felt.fit .rp-dbtn.l.b { right: auto; left: calc(100% + 5px); } /* (a felt shrunk to fit a short screen: the side seats sit by the boards -- the disc goes to the plate's OUTER side, by the rail) */
 .rp-bet { padding: 1px 8px; border-radius: 99px; background: rgba(3, 8, 10, 0.75); border: 1px solid rgba(255, 255, 255, 0.14); font-size: 11.5px; font-weight: 700; color: #fff; }
 /* an all-in runout's equities under a seat's plate, board 1 then board 2 (like the
    live felt's .seat-badge.k-eq) */
 .rp-eq { display: inline-flex; gap: 8px; padding: 1px 9px; border-radius: 99px; background: rgba(3, 8, 10, 0.82); border: 1px solid rgba(24, 210, 195, 0.5); font-family: var(--mono); font-size: 11.5px; font-weight: 700; color: #d8f7f3; white-space: nowrap; }
 .rp-eq span::before { content: attr(data-b) " "; color: var(--tx-3); font-weight: 600; }
-.rp-list .log-row.k-runout .nm { color: var(--accent); }
+.rp-list .log-row.k-runout .nm, .rp-list .log-row.k-result .nm { color: var(--accent); }
 .rp-center { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); display: flex; flex-direction: column; align-items: center; gap: 5px; }
 .rp-center .mini-cards { --cw: 30px; gap: 3px; min-height: 41px; }
 .rp-seat .mini-cards .card-f .hg-card-bigrank { font-size: calc(var(--cw) * 0.62); }
@@ -1011,6 +1016,9 @@ body.in-lobby.has-joinreq #toast-root { top: 64px; }
   .rp-plate span { font-size: 10px; }
   .rp-plate .av { width: 20px; height: 20px; font-size: 9px; }
   .rp-bet { font-size: 10.5px; padding: 0 6px; }
+  .rp-dbtn { width: 17px; height: 17px; font-size: 9px; }
+  .rp-dbtn.r { left: calc(100% + 3px); } .rp-dbtn.l { right: calc(100% + 3px); }
+  .rp-dbtn.t { top: 0; transform: translateY(-45%); } .rp-dbtn.b { top: auto; bottom: 0; transform: translateY(45%); } /* (a phone: at the plate's corner away from the middle -- the side seats sit by the pot and the boards) */
   .rp-eq { font-size: 10px; padding: 0 6px; gap: 5px; }
   .rp-center .mini-cards { --cw: 24px; min-height: 33px; }
   .rp-ctl { flex-wrap: wrap; row-gap: 8px; }
