@@ -905,6 +905,35 @@ Premium tables pass (2026-09-21 — `tests/python/homegame/test_homegame_premium
   inside the click (after the awaits a browser blocks it as a pop-up) and
   pointed at `/?mode=study` once the spot is loaded; blocked pop-ups fall back
   to a modal with a plain `target=_blank` link — the replayer never navigates.
+- **The network at a seat (2026-10-05 — `homegame_bot.py`, `test_homegame_bot.py`; owner:
+  "integrate the model into home games … only I get access")**: the site's OWNER only
+  (`_is_owner` = an admin, from the sign-in user cache else the DB, kept 60 s — a live
+  stream's view has no request in front of it), PLO5 tables only, with the served model.
+  Per seat, in memory (a reloaded table comes back with it off): `bot_mode` "" / "assist"
+  (its move lights up, the owner presses) / "auto" (it plays) and `bot_mix` (its favourite
+  move = the Trainer's recommendation, or its full strategy = `model_policy(deterministic=
+  False)` with a fresh secret seed under `trainer._TORCH_RNG_LOCK`). `POST …/bot {mode,
+  mix}`; a change of MODE is a "bot" line in the feed ("The network is playing X's seat." /
+  "… suggesting X's moves." / off) — never the strategy (owner: "more information than
+  necessary"; a strategy-only change says nothing). Only the owner's view carries `bot`, so
+  nobody else is offered the menu entry at all. TRANSPARENCY: `seat.bot` is in everyone's
+  view (a chip on the avatar, the crown's twin: `.av-bot`, ringed for assist), records carry
+  `action.bot` "auto" / "assist" (replayer tags NETWORK / SUGGESTED, the export notes it)
+  and those actions have `by_player` False — never graded (it would grade itself), so the
+  owner's accuracy stays their own. The decision: `_bot_replay` = the grader's replay of
+  the live hand (deck, start stacks, actions so far; full observation, trained bet rule,
+  raises clamped), then `compute_node_distribution` — the actor's own observation (its
+  Monte-Carlo inputs draw unknown cards from everything the actor can't see; no leak);
+  played through `_apply_action_locked`, which clamps into the table's window. AUTOPILOT:
+  `_bot_tick_locked` (the watchdog's first step) hands the job to the bot worker
+  (`_bot_loop`, `CTX.bot_q`, off every lock) and plays it once `BOT_DELAY_S` (1.2 s) has
+  passed since the TURN began (switched on late, it plays at once — the clock never beats
+  it); the owner's view offers no buttons meanwhile (`_action_view`) and a manual `/act` is
+  409; a move it can't work out checks / folds (a clock-less table never stalls). ASSIST:
+  `GET …/bot/suggest` (once per decision, `bot_cache`: a reload never redraws) → the dock
+  rings the button ("Network", its odds in the tooltip) and sets the size (games.play.js
+  `suggest` / `paintSuggestion`). Client: the seat menu's "The network…" (games.seat.js
+  `openBot`), the strip "The network is playing your seat" + "Play it myself".
 - **The club (2026-09-24; one per CLUB since 2026-09-25)**: a club is a private
   circle, so stats are OPEN inside it — `GET /games/api/community?club=` (every
   player's hands / net / accuracy, the pairwise `pairs` = "`to` is up `cents` on

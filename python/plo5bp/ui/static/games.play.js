@@ -197,6 +197,34 @@
     send("raise-go", { gate: "raise", raise_to_chips: to });
   }
 
+  // ------------------------------------------------- the network's suggestion
+  // "It suggests" (the site's owner only — homegame_bot.py): on your turn the network's move
+  // lights up ("Network" over the button, its odds in the button's tooltip) and its bet size
+  // is set — you still press the button. One answer per decision (the server keeps it).
+  function suggest(s, key) {
+    C().j(`/games/api/tables/${encodeURIComponent(s.id)}/bot/suggest`).then((g) => {
+      if (P.key !== key || !g) return;
+      P.sug = g;
+      const cur = C().G.state;
+      if (cur) paintSuggestion(cur, true);
+    }).catch(() => {});
+  }
+  function paintSuggestion(s, fresh) {
+    const g = P.sug;
+    const pct = (x) => Math.round((x || 0) * 100) + "%";
+    const owes = s.to_call_cents > 0;
+    const odds = g ? `The network: fold ${pct(g.probs.fold)} · ${owes ? "call" : "check"} ${pct(g.probs.check_call)} · ${owes || s.street_commit_chips > 0 ? "raise" : "bet"} ${pct(g.probs.raise)}${g.mix ? " — this time it drew this move from its mix" : ""}` : "";
+    [["fold-btn", "fold"], ["check-btn", "check_call"], ["raise-go", "raise"]].forEach(([id, k]) => {
+      const b = $(id), on = !!g && g.gate === k;
+      b.classList.toggle("rec", on);
+      if (on) b.title = odds; else b.removeAttribute("title");
+    });
+    if (fresh && g && g.gate === "raise" && g.raise_to_chips != null && s.legal.raise) {
+      C().G.raiseTouched = true;
+      setRaise(s, snapCents(s, g.raise_to_chips), "preset");
+    }
+  }
+
   // ------------------------------------------------------------------ render
   function preRow(s) {
     const owe = C().heroToCallCents(s), cur = C().G.preAction;
@@ -250,6 +278,10 @@
       if (s.is_host && !s.running && s.eligible_count >= 2) btns.push(["start", "Start game", "gold"]);
     }
     else if (!(busy && me.in_hand) && me.stack_cents <= s.stakes.ante_cents) { msg = html`<b>You're out of chips.</b> Reload to be dealt into the next hand.`; btns.push(["topup", "Add chips", "gold"]); }
+    else if (me.bot === "auto" && busy && me.in_hand && !me.folded && !me.all_in) {
+      msg = html`<b>The network is playing your seat.</b>`;
+      btns.push(["botoff", "Play it myself", ""]);
+    }
     else if (s.phase === "in_hand") msg = !me.in_hand ? "You'll be dealt in next hand." : me.folded ? "You folded — watching the rest of the hand." : me.all_in ? html`<b>You're all in.</b> Good luck.` : "";
     else if (s.runout.blocking) msg = (s.runout.shown_len || 0) >= 5 ? html`<b>Showdown</b>` : "Running it out…";
     else if (!s.running) {
@@ -306,6 +338,7 @@
     else if (k === "cancelreq") C().tablePost("request", { action: "cancel" }).catch(() => {});
     else if (k === "stay") C().tablePost("stay").catch(() => {});
     else if (k === "update") C().reloadForUpdate();
+    else if (k === "botoff") C().tablePost("bot", { mode: "off", mix: !!(s.bot && s.bot.mix) }).catch(() => {});
     else if (k === "guide" && HG.ui.openGuide) HG.ui.openGuide();
   }
 
@@ -407,13 +440,16 @@
   function render(s, prev, opts) {
     build();
     const mine = C().myTurn(s), alive = C().inHandAlive(s);
+    const me = Number.isInteger(s.my_seat) ? s.seats[s.my_seat] : null;
+    // the network plays your seat: no pre-actions, the strip says so (homegame_bot.py)
+    const auto = !!(me && me.bot === "auto");
     const bar = $("actbar");
     bar.classList.toggle("my-turn", mine);
     $("act-btns").hidden = !mine;
     if (!mine) P.sizingOpen = false;
     $("sizing").hidden = !(mine && s.legal.raise && (!compact() || P.sizingOpen));
-    $("pre-row").hidden = !(alive && !mine);
-    $("status-strip").hidden = mine || (alive && !mine);
+    $("pre-row").hidden = !(alive && !mine) || auto;
+    $("status-strip").hidden = mine || (alive && !mine && !auto);
     if (mine) {
       const key = `${s.id}:${s.hand_no}:${s.action_seq}`;
       const fresh = key !== P.key;
@@ -421,7 +457,6 @@
       P.key = key;
       paintButtons();
       const owe = s.to_call_cents || 0;
-      const me = s.seats[s.my_seat];
       $("call-lbl").textContent = owe > 0 ? (me && owe >= me.stack_cents ? "Call all-in" : "Call") : "Check";
       $("call-amt").textContent = owe > 0 ? C().fmtAmt(owe, s) : "";
       if (s.legal.raise) {
@@ -434,14 +469,19 @@
         // (a desktop's one-row panel has no line for these: the slider says them — HGT-035)
         $("sz-slider").title = `${$("sz-range").textContent} · ${$("sz-pot").textContent}`;
       }
+      // (after the size: the network's suggested size is set over the minimum)
+      const assist = !!(me && me.bot === "assist");
+      if (fresh) { P.sug = null; paintSuggestion(s); if (assist) suggest(s, key); }
+      else if (!assist && P.sug) { P.sug = null; paintSuggestion(s); }
     } else {
       P.key = null;
+      if (P.sug) { P.sug = null; paintSuggestion(s); }
       if (P.sending) { P.sending = null; paintButtons(); }
       $("act-clock").hidden = true;
-      if (alive) preRow(s);
+      if (alive && !auto) preRow(s);
       else { $("pre-row").dataset.sig = ""; strip(s); }
     }
-    if (mine || alive) { P.stripSig = ""; if (P.ticker) { clearInterval(P.ticker); P.ticker = null; P.dealAt = null; } }
+    if ((mine || alive) && !auto) { P.stripSig = ""; if (P.ticker) { clearInterval(P.ticker); P.ticker = null; P.dealAt = null; } }
     sides(s);
     banner(s);
     heroLabels(s);

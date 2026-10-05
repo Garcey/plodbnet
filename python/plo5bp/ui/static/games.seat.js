@@ -287,6 +287,50 @@
     });
   }
 
+  // ------------------------------------------------------------ the network
+  // The site's owner only (the view carries `bot` for them alone; the server checks too —
+  // homegame_bot.py): the network plays their seat, or suggests each move, its favourite
+  // move or its full strategy. Everyone at the table sees a chip on the seat while it is on.
+  function openBot() {
+    const s = C().G.state;
+    if (!s || !s.bot || !Number.isInteger(s.my_seat)) return;
+    const b = s.bot;
+    const body = h("div", { class: "stack-14" });
+    put(body, html`${b.available ? "" : html`<p class="flush">${b.why}</p>`}
+      <div class="field"><span>Your seat</span>${segHtml("bot-mode", [["", "You play"], ["assist", "It suggests"], ["auto", "It plays"]], b.mode || "")}</div>
+      <small class="muted" id="bot-mode-help"></small>
+      <div class="field"><span>How it plays</span>${segHtml("bot-mix", [["best", "Its favourite move"], ["mix", "Its full strategy"]], b.mix ? "mix" : "best")}</div>
+      <small class="muted" id="bot-mix-help"></small>
+      <small class="muted">Everyone at the table sees a chip on your seat while it is on, and the hand history marks every move it made or suggested. Those moves are never graded.</small>`);
+    const HELP = {
+      "": "You play your own hand.",
+      assist: "On your turn its move lights up and its bet size is set — you still press the button.",
+      auto: "It bets, calls and folds for you, about a second into each turn. Switch it off any time.",
+      best: "The same move every time: the one it rates best.",
+      mix: "It mixes its moves the way it was trained: each turn one is drawn from its odds.",
+    };
+    const pickOf = (id) => { const x = body.querySelector(`#${id} button.on`); return x ? x.dataset.v : ""; };
+    const help = () => {
+      body.querySelector("#bot-mode-help").textContent = HELP[pickOf("bot-mode")] || "";
+      body.querySelector("#bot-mix-help").textContent = HELP[pickOf("bot-mix") || "best"];
+    };
+    segWire(body);
+    ["bot-mode", "bot-mix"].forEach((id) => body.querySelector("#" + id).addEventListener("pick", help));
+    help();
+    openModal({
+      title: "The network", sub: "Let the network play your seat, or suggest your moves.", body, autofocus: false,
+      buttons: [{ label: "Cancel", cls: "ghost" }, {
+        label: "Save", cls: "primary",
+        onClick: async () => {
+          const mode = pickOf("bot-mode"), mix = pickOf("bot-mix") === "mix";
+          if (mode && !b.available) { toast(b.why || "The network can't play here", "err"); return false; }
+          await C().tablePost("bot", { mode: mode || "off", mix });
+          toast(mode === "auto" ? "The network plays your seat" : mode === "assist" ? "The network suggests your moves" : "The network is off", "ok");
+        },
+      }],
+    });
+  }
+
   // ------------------------------------------------------------ player card
   // Notes + colour tags are PRIVATE: they live in this browser only. Read once and kept
   // in memory (FE-008: the felt asks for every seat on every update); another tab of
@@ -539,6 +583,8 @@
     if (seated && s.status === "open") {
       items.push({ icon: "i-pluscircle", label: s.needs_approval ? "Request chips" : (s.settings && s.settings.allow_rathole) ? "Add or take off chips" : "Add chips", onClick: () => openTopUp() });
       if (s.auto_stack.mode !== "off" || s.auto_topup.mode !== "off") items.push({ icon: "i-wallet", label: "Automatic chips…", onClick: openAutoChips });
+      // (the site's owner only: the view carries `bot` for them alone)
+      if (s.bot) items.push({ icon: "i-cpu", label: me.bot === "auto" ? "The network plays your seat…" : me.bot === "assist" ? "The network suggests your moves…" : "The network…", onClick: openBot });
       if (me.sitting_out) items.push({ icon: "i-play", label: "I'm back", onClick: () => C().tablePost("sit_out", { on: false }).catch(() => {}) });
       else {
         items.push({ icon: "i-coffee", label: me.sit_out_next ? "Cancel sit-out" : "Sit out next hand", onClick: () => C().tablePost("sit_out", me.sit_out_next ? { on: false } : { on: true, next_hand: true }).catch(() => {}) });
@@ -554,5 +600,5 @@
     return items;
   }
 
-  Object.assign(UI, { openSit, openMove, pendingMove, openTopUp, openAutoChips, openPlayer, openRequest, openRequestDialog, openLeave, seatMenu, seatItems, noteFor, TAGS, exportNotes, importNotes, openReceipt });
+  Object.assign(UI, { openSit, openMove, pendingMove, openTopUp, openAutoChips, openPlayer, openRequest, openRequestDialog, openLeave, openBot, seatMenu, seatItems, noteFor, TAGS, exportNotes, importNotes, openReceipt });
 })();

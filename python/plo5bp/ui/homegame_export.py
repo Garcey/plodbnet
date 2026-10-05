@@ -136,8 +136,10 @@ def hand_text(rec: dict[str, Any], game_label: str) -> str:
                 continue
             seat = int(a.get("seat", -1))
             label = str(a.get("label") or "?")
-            out.append(f"{name.get(seat, f'Seat {seat + 1}')}: {label[:1].lower() + label[1:]}"
-                       + (" (on the clock)" if a.get("auto") else ""))
+            # (the network's moves at a seat it played or assisted — homegame_bot)
+            note = {"auto": " (played by the network)", "assist": " (with the network's suggestion)"}.get(
+                a.get("bot") or "", " (on the clock)" if a.get("auto") else "")
+            out.append(f"{name.get(seat, f'Seat {seat + 1}')}: {label[:1].lower() + label[1:]}{note}")
         if uncalled and street == last_street:
             who = int(uncalled.get("seat", -1))
             out.append(f"Uncalled bet ({money(uncalled.get('cents'))}) returned to "

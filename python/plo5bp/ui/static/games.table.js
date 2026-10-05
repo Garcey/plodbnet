@@ -695,7 +695,7 @@
     for (let i = 0; i < T.n; i++) {
       const e = el("div", "seat");
       e.dataset.seat = String(i);
-      e.innerHTML = html`<div class="seat-cards"></div><div class="seat-main"><div class="seat-av"><svg class="actor-timer" viewBox="0 0 100 100"><circle class="trk" cx="50" cy="50" r="46"/><circle class="arc" cx="50" cy="50" r="46"/></svg><span class="av-txt"></span><img class="av-img" alt="" hidden/><span class="av-count"></span><span class="av-crown">${icon("i-crown")}</span></div><div class="seat-plate"><span class="seat-pos"></span><div class="seat-name"></div><div class="seat-stack num"></div></div></div><div class="seat-badge"></div><div class="seat-hand"></div>`;
+      e.innerHTML = html`<div class="seat-cards"></div><div class="seat-main"><div class="seat-av"><svg class="actor-timer" viewBox="0 0 100 100"><circle class="trk" cx="50" cy="50" r="46"/><circle class="arc" cx="50" cy="50" r="46"/></svg><span class="av-txt"></span><img class="av-img" alt="" hidden/><span class="av-count"></span><span class="av-crown">${icon("i-crown")}</span><span class="av-bot">${icon("i-cpu")}</span></div><div class="seat-plate"><span class="seat-pos"></span><div class="seat-name"></div><div class="seat-stack num"></div></div></div><div class="seat-badge"></div><div class="seat-hand"></div>`;
       const sit = el("button", "seat-sit", html`${icon("i-plus")}<span>Sit</span>`);
       sit.type = "button";
       sit.hidden = true;  // the render shows it on empty seats (else a bare button flashes on load)
@@ -723,7 +723,7 @@
         avTxt: e.querySelector(".av-txt"), avImg: e.querySelector(".av-img"), avUrl: null,
         count: e.querySelector(".av-count"), arc,
         name: e.querySelector(".seat-name"), stack: e.querySelector(".seat-stack"), pos: e.querySelector(".seat-pos"),
-        badge: e.querySelector(".seat-badge"), hand: e.querySelector(".seat-hand"), sit,
+        badge: e.querySelector(".seat-badge"), hand: e.querySelector(".seat-hand"), sit, bot: e.querySelector(".av-bot"), botK: "",
         stackCents: null, cardEls: [], nameKey: null, folded: false,
       });
       const b = el("div", "bet", html`<span class="chips"></span><span class="amt"></span>`);
@@ -880,8 +880,8 @@
       setSeatCards(sv, null, false, ctx);
       sv.badge.className = "seat-badge"; sv.badge.textContent = ""; sv.badge.dataset.k = "";
       sv.hand.innerHTML = ""; sv.hand.dataset.h = "";
-      e.classList.remove("is-hero", "is-actor", "is-folded", "is-away", "is-winner", "is-out", "is-host", "t-warn", "t-crit", "t-bank");
-      sv.stackCents = null; sv.nameKey = null; sv.folded = false;
+      e.classList.remove("is-hero", "is-actor", "is-folded", "is-away", "is-winner", "is-out", "is-host", "is-bot", "is-bot-assist", "t-warn", "t-crit", "t-bank");
+      sv.stackCents = null; sv.nameKey = null; sv.folded = false; sv.botK = ""; sv.bot.title = "";
       if (sv.avUrl) { sv.avUrl = null; sv.avImg.hidden = true; sv.avImg.removeAttribute("src"); }
       return;
     }
@@ -908,7 +908,7 @@
     // tag (bottom-left) and "not connected" (bottom-right) — and the seat's spoken label
     {
       const tip = [seat.present === false ? "Not connected right now" : "", tag && tag !== "none" ? `Your tag: ${TAG_WORDS[tag] || tag}` : ""].filter(Boolean).join(" · ");
-      const says = `${seat.name}, ${fmt(seat.stack_cents, s)}${seat.is_host ? ", host" : ""}${seat.sitting_out ? ", sitting out" : ""}` +
+      const says = `${seat.name}, ${fmt(seat.stack_cents, s)}${seat.is_host ? ", host" : ""}${seat.bot === "auto" ? ", played by the network" : seat.bot === "assist" ? ", with the network's suggestions" : ""}${seat.sitting_out ? ", sitting out" : ""}` +
         `${seat.in_hand && seat.folded && s.phase === "in_hand" ? ", folded" : seat.in_hand && seat.all_in ? ", all-in" : ""}${seat.is_actor && s.phase === "in_hand" ? ", to act" : ""}${tip ? ". " + tip : ""}`;
       if (sv.main.title !== tip) sv.main.title = tip;
       if (sv.main.getAttribute("aria-label") !== says) sv.main.setAttribute("aria-label", says);
@@ -917,6 +917,17 @@
     const folded = dealtIn && !!seat.folded;
     e.classList.toggle("is-hero", !!seat.is_hero);
     e.classList.toggle("is-host", !!seat.is_host);
+    // The network plays this seat or suggests its moves (the site's owner only —
+    // homegame_bot.py): everybody at the table sees the chip on the avatar.
+    {
+      const bot = seat.bot || "";
+      e.classList.toggle("is-bot", bot === "auto");
+      e.classList.toggle("is-bot-assist", bot === "assist");
+      if (sv.botK !== bot) {
+        sv.botK = bot;
+        sv.bot.title = bot === "auto" ? "The network plays this seat" : bot === "assist" ? "Playing with the network's suggestions" : "";
+      }
+    }
     e.classList.toggle("is-actor", !!seat.is_actor && s.phase === "in_hand");
     e.classList.toggle("is-folded", folded);
     e.classList.toggle("is-away", !!seat.sitting_out);

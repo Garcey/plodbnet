@@ -813,6 +813,8 @@ body.in-lobby.has-joinreq #toast-root { top: 64px; }
 .rp-list .log-row { width: 100%; border: 0; background: transparent; color: inherit; text-align: left; padding: 5px 8px; border-radius: 8px; cursor: pointer; }
 .rp-list .log-row:hover { background: rgba(255, 255, 255, 0.05); }
 .rp-list .log-row.on { background: rgba(24, 210, 195, 0.12); box-shadow: inset 2px 0 0 var(--accent); }
+/* a move the network made or suggested (homegame_bot.py): never graded, so no mark — this tag */
+.rp-list .lb-bot { margin-left: 6px; padding: 0 6px; border-radius: 99px; font: 700 10px/16px var(--mono); letter-spacing: 0.4px; text-transform: uppercase; color: var(--accent); background: rgba(24, 210, 195, 0.12); }
 /* the network's choice at the decision just played (2026-10-03): its pick, its fold / call /
    raise mix (each segment's width = --w, set by games.history.js), its likeliest sizes, and
    the move that was made */

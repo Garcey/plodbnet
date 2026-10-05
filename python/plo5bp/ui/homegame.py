@@ -475,6 +475,12 @@ class Seat:
     queued_topup_cents: int = 0  # asked for mid-hand; lands when the hand ends
     queued_remove_cents: int = 0  # chips to take OFF the table when the hand ends
     leave_after_hand: bool = False  # finish this hand, then leave the seat
+    # The network at this seat (2026-10-05, the site's owner only — homegame_bot): ""
+    # off, "assist" (it shows its move, the player still acts) or "auto" (it acts);
+    # bot_mix = its full strategy (sampled) instead of its favourite move. In memory
+    # only: a reloaded table comes back with the network off.
+    bot_mode: str = ""
+    bot_mix: bool = False
 
 
 @dataclass
@@ -545,6 +551,12 @@ class HandState:
     # The verifiable shuffle this hand was dealt from, and its public facts.
     fair_hand: Any = None
     fair_hand_meta: dict = field(default_factory=dict)
+    # The network's part in this hand (homegame_bot): action index -> "auto" (it acted)
+    # or "assist" (the player acted with its move on the screen) — never graded; its
+    # move per decision (hand_no, action_seq); when autopilot first saw each decision.
+    bot_marks: dict = field(default_factory=dict)
+    bot_cache: dict = field(default_factory=dict)
+    bot_asked: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -887,6 +899,12 @@ class HomeGames:
         self.grade_thread: threading.Thread | None = None
         self.grade_lock = threading.Lock()
         self.grade_queued: set = set()
+        # The network playing a seat (homegame_bot): its moves are worked out here,
+        # off every table's lock.
+        self.bot_q: "queue.Queue[tuple | None]" = queue.Queue()
+        self.bot_thread: threading.Thread | None = None
+        self.bot_stop = threading.Event()
+        self.owner_cache: dict[int, tuple[float, bool]] = {}  # user id -> (until, the site's owner?)
         self.streams = KeyedCounter(MAX_STREAMS_PER_USER)  # open live streams per user (SEC-009)
         # Caches: picture URLs; chosen names and club nicknames (one lock); club roles
         # (dropped by any write to the clubs' tables); the last ledger check.
@@ -951,7 +969,7 @@ def _watchdog_table(t: LiveTable, now: float) -> None:
     errors: list[tuple[str, BaseException]] = []
     try:
         for step in (
-            _timeout_tick_locked, _settle_locked, _flush_result_locked,
+            _bot_tick_locked, _timeout_tick_locked, _settle_locked, _flush_result_locked,
             _apply_queued_topups_locked, _expire_requests_locked, _fair_tick_locked,
             _auto_deal_tick_locked, _retry_persist_locked,
         ):
@@ -1189,10 +1207,12 @@ def shutdown(timeout: float = 2.0) -> None:
     through ``_on_app_shutdown``)."""
     CTX.streams_stop.set()
     CTX.grader_stop.set()
-    g = CTX.grade_thread
-    if g is not None and g.is_alive() and g is not threading.current_thread():
-        g.join(timeout)
+    CTX.bot_stop.set()
+    for th in (CTX.grade_thread, CTX.bot_thread):
+        if th is not None and th.is_alive() and th is not threading.current_thread():
+            th.join(timeout)
     CTX.grade_thread = None
+    CTX.bot_thread = None
     _stop_watchdog(timeout)
 
 
@@ -3240,6 +3260,8 @@ def _shared_seat_rows(t: LiveTable, sh: _Shared) -> list[dict[str, Any]]:
             "sit_out_next": bool(p.sit_out_next) if p else False,
             "bank_left_secs": round(float(p.time_bank_left or 0.0), 1) if p else 0.0,
             "shown": bool(t.phase == "showdown" and i in t.shown_seats),
+            # everyone sees when the network plays a seat or suggests its moves (homegame_bot)
+            "bot": (p.bot_mode or None) if p else None,
         })
     return rows
 
@@ -3289,7 +3311,11 @@ def _action_view(t: LiveTable, sh: _Shared, viewer_seat: int | None) -> dict[str
     raise_bounds = {"min_chips": 0, "max_chips": 0, "min_cents": 0, "max_cents": 0}
     to_call_chips = 0
     info, raw, actor = t.info, sh.raw, sh.actor
-    if t.phase == "in_hand" and actor is not None and viewer_seat is not None and actor == viewer_seat and info is not None:
+    me = t.seats[viewer_seat] if viewer_seat is not None and 0 <= viewer_seat < len(t.seats) else None
+    # (the network plays this seat: nothing for its owner to press — homegame_bot)
+    autopilot = me is not None and me.bot_mode == "auto"
+    if (t.phase == "in_hand" and actor is not None and viewer_seat is not None and actor == viewer_seat
+            and info is not None and not autopilot):
         gm = info.gate_mask
         legal = {"fold": bool(gm[GATE_FOLD]), "check_call": bool(gm[GATE_CHECK_CALL]),
                  "raise": bool(gm[GATE_RAISE])}
@@ -3521,6 +3547,8 @@ def _view(t: LiveTable, viewer_id: int) -> dict[str, Any]:
         },
         "can_show": bool(can_show),
         "last_hand_no": last_hand_no if last_hand_no >= 1 else None,
+        # the viewer's own network settings — the site's owner only (homegame_bot)
+        "bot": _bot_view(t, viewer_id),
         "events": list(t.events),
         "reactions": [
             {"id": r["id"], "seat": r["seat"], "emote": r["emote"]}
@@ -3929,9 +3957,12 @@ def _record_hand_locked(
         returned = sum(int(c) for c in t.uncalled.values())
         pot_cents = chips_to_cents(sum(commit) - returned, t.bb_cents)
         actions = _history_entries(raw, t.bb_cents)
-        for k, a in enumerate(actions):  # who decided: the player, or the clock
+        for k, a in enumerate(actions):  # who decided: the player, the clock, or the network
             if k < len(t.hand_actions):
-                a["auto"] = not t.hand_actions[k][3]
+                mark = t.bot_marks.get(k)  # "auto" / "assist" (homegame_bot)
+                a["auto"] = not t.hand_actions[k][3] and not mark
+                if mark:
+                    a["bot"] = mark
         # who paid whom (runout.money_flows), by user id
         flow_holes: list[list[int] | None] = [None] * t.num_seats
         for i in range(t.num_seats):
@@ -4541,7 +4572,20 @@ def _act_locked(t: LiveTable, uid: int, gate: int, raise_chips: int) -> None:
     if actor is None or seat is None or actor != seat:
         raise HTTPException(status_code=409, detail="not your turn")  # (a race, not a bad request — HGB-022)
     me = t.seats[seat]
-    _apply_action_locked(t, gate, raise_chips, by_player=True)
+    if me is not None and me.bot_mode == "auto":
+        # (the network plays this seat: its owner switches it off to act — homegame_bot)
+        raise HTTPException(status_code=409, detail="the network is playing your seat — switch it off to act yourself")
+    # A move made with the network's suggestion on the screen is not the player's own:
+    # marked for the table's history and never graded (homegame_bot).
+    assisted = me is not None and me.bot_mode == "assist"
+    idx = len(t.hand_actions)
+    if assisted:
+        t.bot_marks[idx] = "assist"
+    try:
+        _apply_action_locked(t, gate, raise_chips, by_player=not assisted)
+    except BaseException:
+        t.bot_marks.pop(idx, None)
+        raise
     if me is not None:
         me.timeouts = 0  # acted for themselves: the timeout streak is over
 
@@ -6059,6 +6103,7 @@ SPLIT_MODULES = (
     "homegame_clubs",
     "homegame_stats",
     "homegame_pages",
+    "homegame_bot",
     "homegame_routes",
 )
 

@@ -167,7 +167,7 @@
       const left = dealtNow
         ? html`<span class="rp-act k-runout"><b>${dealtNow[0].toUpperCase() + dealtNow.slice(1)}</b> dealt${burnNote(rec, dealtNow)}</span>`
         : over ? html`<span class="rp-act k-result"><b>${rec.showdown ? "Showdown" : "Won without showdown"}</b></span>`
-        : cur ? html`<span class="rp-act k-${kindOfAction(cur)}"><b>${names[cur.seat] || "?"}</b> ${cur.label}${cur.auto ? html` <small class="muted">(clock)</small>` : ""}</span>${gradeChip(g)}`
+        : cur ? html`<span class="rp-act k-${kindOfAction(cur)}"><b>${names[cur.seat] || "?"}</b> ${cur.label}${cur.bot ? html` <small class="muted">(${cur.bot === "auto" ? "the network played it" : "with the network's suggestion"})</small>` : cur.auto ? html` <small class="muted">(clock)</small>` : ""}</span>${gradeChip(g)}`
         : html`<span class="muted">Flop dealt — everyone anted ${d2(rec.ante_cents)}.</span>`;
       const right = over ? html`<span class="pill gold">Hand over</span>`
         : R && k >= N ? html`<span class="pill">All in · running it out</span>`
@@ -307,7 +307,7 @@
     let street = null;
     (rec.actions || []).forEach((a2, i) => {
       if (a2.street !== street) { street = a2.street; list.push(html`<div class="log-street">${street}${burnNote(rec, street)}</div>`); }
-      list.push(html`<button type="button" class="log-row k-${kindOfAction(a2)}" data-i="${i}"><span class="nm">${names[a2.seat] || "?"}</span><span class="lb">${a2.label}</span>${gradeChip(gradeAt[i], true)}</button>`);
+      list.push(html`<button type="button" class="log-row k-${kindOfAction(a2)}" data-i="${i}"><span class="nm">${names[a2.seat] || "?"}</span><span class="lb">${a2.label}</span>${a2.bot ? html`<span class="lb-bot" title="${a2.bot === "auto" ? "The network made this move" : "Made with the network's suggestion on the screen"}">${a2.bot === "auto" ? "network" : "suggested"}</span>` : ""}${gradeChip(gradeAt[i], true)}</button>`);
     });
     if (R) {
       // all in: the runout's streets, each a step of its own (its equities on the felt)

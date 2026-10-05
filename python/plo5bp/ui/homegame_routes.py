@@ -44,7 +44,7 @@ __all__ = (
     "API_COST", "API_RATE", "AVATAR_RATE", "JOIN_RATE", "_RATE_SPEC", "_api_guard", "_in_table",
     "_limited", "_require_sync", "_scope_clubs", "_stream_sig", "_table_for", "_uid",
     "_user_or_404", "api_act", "api_auto_chips_self", "api_auto_stack", "api_auto_topup",
-    "api_avatar", "api_chat", "api_clear_avatar", "api_close", "api_club", "api_club_archive",
+    "api_avatar", "api_bot", "api_bot_suggest", "api_chat", "api_clear_avatar", "api_close", "api_club", "api_club_archive",
     "api_club_create", "api_club_decide", "api_club_invite_reset", "api_club_leave",
     "api_club_member", "api_club_nickname", "api_club_request", "api_club_settings",
     "api_clubs", "api_community", "api_create", "api_deal", "api_exclude", "api_fair_commit",
@@ -122,6 +122,7 @@ API_COST: dict[str, float] = {
     "/games/api/tables/{game_id}/hands/export": 20.0, "/games/api/tables/{game_id}/hands": 2.0,
     "/games/api/my/series": 3.0, "/games/api/players/{player_id}/series": 3.0,
     "/games/api/tables/{game_id}/hands/{hand_no}/choice": 3.0,
+    "/games/api/tables/{game_id}/bot/suggest": 3.0,
 }
 #: Join requests (each pops a toast at the club's open tables): 5, then one every 2 minutes.
 JOIN_RATE = RateLimiter(rate=1 / 120.0, burst=5)
@@ -748,6 +749,22 @@ def api_act(game_id: str, body: dict = Body({})):
             by = raise_to - int(raw["street_commit"][int(raw["actor"])])
         hg._act_locked(t, uid, gate, by)
     return hg._in_table(game_id, act, body=body, sync="action")
+
+
+@router.post("/games/api/tables/{game_id}/bot")
+def api_bot(game_id: str, body: dict = Body({})):
+    """The site's owner: the network at their seat (homegame_bot) — ``mode`` "off",
+    "assist" (it shows its move) or "auto" (it plays); ``mix`` = its full strategy."""
+    body = body or {}
+    mode, mix = body.get("mode"), hg._parse_bool(body, "mix", False)
+    return hg._in_table(game_id, lambda t, uid: hg._set_bot_locked(t, uid, mode, mix))
+
+
+@router.get("/games/api/tables/{game_id}/bot/suggest")
+def api_bot_suggest(game_id: str):
+    """The network's move for the owner's turn at a seat it assists (homegame_bot)."""
+    t = hg._table_for(game_id)
+    return hg._bot_suggestion(t, hg._uid())
 
 
 @router.post("/games/api/tables/{game_id}/host_fold")

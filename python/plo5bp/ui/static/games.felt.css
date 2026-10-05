@@ -189,6 +189,12 @@
 .av-crown { position: absolute; top: calc(var(--u) * -0.9); right: calc(var(--u) * -0.5); width: calc(var(--u) * 2.1); height: calc(var(--u) * 2.1); min-width: 14px; min-height: 14px; border-radius: 50%; background: linear-gradient(180deg, #f6d98e, var(--gold-2)); color: #2a1d02; display: none; align-items: center; justify-content: center; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5); z-index: 3; }
 .av-crown .ico { width: 62%; height: 62%; stroke-width: 2.2; }
 .seat.is-host .av-crown { display: flex; }
+/* the network plays this seat (a chip, the crown's twin) or suggests its moves (a ring) —
+   the site's owner only, and everybody at the table sees it (homegame_bot.py) */
+.av-bot { position: absolute; top: calc(var(--u) * -0.9); left: calc(var(--u) * -0.5); width: calc(var(--u) * 2.1); height: calc(var(--u) * 2.1); min-width: 14px; min-height: 14px; border-radius: 50%; background: var(--accent); color: #04302c; display: none; align-items: center; justify-content: center; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5); z-index: 3; }
+.av-bot .ico { width: 66%; height: 66%; stroke-width: 2.2; }
+.seat.is-bot .av-bot, .seat.is-bot-assist .av-bot { display: flex; }
+.seat.is-bot-assist .av-bot { background: #0d2326; color: var(--accent); box-shadow: 0 0 0 1.5px var(--accent), 0 2px 6px rgba(0, 0, 0, 0.5); }
 .seat-plate { position: relative; margin-top: calc(var(--u) * -1.3); min-width: calc(var(--u) * 11.5); max-width: calc(var(--u) * 15); padding: calc(var(--u) * 1.5) calc(var(--u) * 1.1) calc(var(--u) * 0.55); border-radius: calc(var(--u) * 1.2); text-align: center;
   background: linear-gradient(180deg, rgba(27, 36, 50, 0.97), rgba(12, 17, 25, 0.97)); border: 1px solid rgba(255, 255, 255, 0.11); box-shadow: 0 calc(var(--u) * 0.5) calc(var(--u) * 1.6) rgba(0, 0, 0, 0.55); z-index: 1; transition: border-color 0.25s, box-shadow 0.25s; }
 .seat-name { font-size: max(10px, calc(var(--u) * 1.2)); font-weight: 600; color: var(--tx); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.2; }
@@ -363,6 +369,14 @@
 .act.call { background: linear-gradient(180deg, #2f9e68, #1c6e46); box-shadow: 0 8px 22px rgba(53, 200, 120, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.25); }
 .act.raise { background: linear-gradient(180deg, #f3d382, #b88a2c); color: #2a1d02; box-shadow: 0 8px 22px rgba(236, 201, 119, 0.25), inset 0 1px 0 rgba(255, 255, 255, 0.5); }
 .act.raise.allin { background: linear-gradient(180deg, #f2566a, #a8233a); color: #fff; box-shadow: 0 8px 22px rgba(242, 86, 106, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.3); }
+/* the network's move on your turn — Study's choice for Hero, the home games' "It suggests"
+   (homegame_bot.py): a ring and a "Network" tag over the button (style.css has Study's copy) */
+.act.rec { overflow: visible; box-shadow: 0 0 0 2px var(--accent), 0 0 22px rgba(24, 210, 195, 0.4); }
+.act.rec::before {
+  content: "Network"; position: absolute; left: 50%; top: -9px; transform: translateX(-50%);
+  padding: 0 7px; border-radius: 99px; background: var(--accent); color: var(--on-accent);
+  font: 800 9.5px/16px var(--mono); letter-spacing: 0.7px; text-transform: uppercase; white-space: nowrap; pointer-events: none;
+}
 #actbar.my-turn #act-btns { animation: slideup 0.25s var(--ease); }
 /* sending (games.play.js send): the pressed button spins, the others wait */
 #act-btns { position: relative; }
