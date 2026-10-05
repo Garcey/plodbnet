@@ -782,34 +782,83 @@ body.in-lobby.has-joinreq #toast-root { top: 64px; }
 .rp-center > .mini-cards .card-f .cf-tl { display: flex; }
 .rp-center > .mini-cards .card-f .hg-card-bigrank { left: auto; top: auto; right: 10%; bottom: 5%; transform: none; font-size: calc(var(--cw) * 0.7); line-height: 0.9; opacity: 0.92; }
 .rp-pot { padding: 2px 12px; border-radius: 99px; background: rgba(3, 8, 10, 0.65); border: 1px solid rgba(255, 255, 255, 0.12); color: var(--gold); font-weight: 700; font-size: 12.5px; }
-.rp-banner { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-height: 44px; padding: 8px 12px; border-radius: 12px; background: rgba(255, 255, 255, 0.035); border: 1px solid var(--line); font-size: 13.5px; }
+.rp-banner { display: flex; align-items: center; gap: 10px; flex-wrap: nowrap; min-height: 44px; padding: 8px 12px; border-radius: 12px; background: rgba(255, 255, 255, 0.035); border: 1px solid var(--line); font-size: 13.5px; }
+.rp-banner > * { flex: none; }
+.rp-banner > .rp-act { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } /* (one line: the banner never grows a row and moves the buttons below it) */
 .rp-act b { color: var(--bright); }
 .rp-ctl { display: flex; align-items: center; gap: 8px; }
 .rp-ctl .btn { min-width: 46px; }
 .rp-step { min-width: 62px; text-align: center; color: var(--tx-2); font-size: 12.5px; }
-.rp-side { min-width: 0; display: flex; flex-direction: column; gap: 6px; }
-.rp-list { max-height: 360px; overflow: auto; padding-right: 4px; }
+/* Nothing in the dialog changes size while you step (owner, 2026-10-05: the network's card
+   coming and going made the dialog taller and pushed the action list down, so the buttons and
+   the rows moved): the card is ALWAYS there at one height (empty between reads), the action
+   list is shown whole, and the result has its place reserved under the buttons from the start
+   -- so the dialog's height is set once per hand. On a screen too short for all of it the
+   dialog stops at the screen's height: the felt shrinks (games.history.js fitFelt) so the left
+   column stays whole, the card stays where it is, and the action list scrolls under it. */
+.modal.rp-modal .m-body { min-height: 0; }
+.rp { flex: 1 1 auto; min-height: 0; grid-template-rows: minmax(0, 1fr); }
+.rp-main { min-height: 0; }
+.rp-main > .rp-felt { flex: none; }
+.rp-felt.fit { width: var(--fw); margin-left: auto; margin-right: auto; }
+.rp-felt.fit .rp-seat { scale: 0.88; } /* (a smaller felt, slightly smaller seats: they stay off the boards) */
+.rp-side { min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 6px; }
+.rp-acts { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+.rp-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding-right: 4px; }
 .rp-list .log-row { width: 100%; border: 0; background: transparent; color: inherit; text-align: left; padding: 5px 8px; border-radius: 8px; cursor: pointer; }
 .rp-list .log-row:hover { background: rgba(255, 255, 255, 0.05); }
 .rp-list .log-row.on { background: rgba(24, 210, 195, 0.12); box-shadow: inset 2px 0 0 var(--accent); }
 /* the network's choice at the decision just played (2026-10-03): its pick, its fold / call /
    raise mix (each segment's width = --w, set by games.history.js), its likeliest sizes, and
    the move that was made */
-.rp-net { padding: 10px 12px 9px; border-radius: 12px; background: rgba(24, 210, 195, 0.05); border: 1px solid rgba(24, 210, 195, 0.24); }
+.rp-net { padding: 10px 12px 9px; border-radius: 12px; background: rgba(24, 210, 195, 0.05); border: 1px solid rgba(24, 210, 195, 0.24); transition: background 0.2s, border-color 0.2s; }
 .rp-net h4 { margin-bottom: 6px; }
-.nc-pick { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+/* every row has a fixed height, so the card is one size in every state */
+.nc-pick { display: flex; align-items: center; gap: 8px; height: 22px; white-space: nowrap; overflow: hidden; }
 .nc-pick small, .nc-sizes small { color: var(--tx-3); font-size: 10.5px; letter-spacing: 0.9px; text-transform: uppercase; }
-.nc-pick b { color: var(--bright); font-size: 15px; }
+.nc-pick b { color: var(--bright); font-size: 15px; overflow: hidden; text-overflow: ellipsis; }
 .nc-bar { display: flex; height: 8px; margin: 8px 0 6px; border-radius: 99px; overflow: hidden; background: rgba(255, 255, 255, 0.06); }
 .nc-seg { width: var(--w); flex: none; }
 .nc-seg.nc-f { background: #6f7b8e; } .nc-seg.nc-c { background: #5b95ff; } .nc-seg.nc-r { background: var(--gold); }
-.nc-legend, .nc-sizes { display: flex; flex-wrap: wrap; align-items: baseline; gap: 3px 12px; font-size: 12px; color: var(--tx-2); }
-.nc-legend b, .nc-sizes b { color: var(--bright); font-family: var(--mono); font-weight: 700; }
+.nc-legend { display: flex; align-items: center; gap: 12px; height: 18px; white-space: nowrap; overflow: hidden; font-size: 12px; color: var(--tx-2); }
+.nc-legend b, .nc-szl b { color: var(--bright); font-family: var(--mono); font-weight: 700; }
 .nc-legend span::before { content: ""; display: inline-block; width: 8px; height: 8px; margin-right: 5px; border-radius: 2px; vertical-align: 0; }
 .nc-legend .nc-f::before { background: #6f7b8e; } .nc-legend .nc-c::before { background: #5b95ff; } .nc-legend .nc-r::before { background: var(--gold); }
-.nc-sizes { margin-top: 6px; }
-.nc-you { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; padding-top: 7px; border-top: 1px solid var(--line); font-size: 12.5px; color: var(--tx-2); }
+/* its likeliest sizes: up to three, one per line */
+.nc-sizes { display: flex; gap: 10px; height: 54px; margin-top: 6px; font-size: 12px; color: var(--tx-2); }
+.nc-sizes small { flex: none; width: 64px; line-height: 18px; }
+.nc-szl { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.nc-szl > span { display: flex; align-items: center; justify-content: space-between; gap: 8px; height: 18px; white-space: nowrap; overflow: hidden; }
+.nc-szl .nc-none { color: var(--tx-3); }
+.nc-you { display: flex; align-items: center; justify-content: space-between; gap: 8px; height: 30px; margin-top: 8px; padding-top: 7px; border-top: 1px solid var(--line); font-size: 12.5px; color: var(--tx-2); white-space: nowrap; }
+.nc-you > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .nc-you b { color: var(--bright); }
+/* no read here (cards never shown, the start, the run-out, a timed-out move): the same card,
+   drawn as an outline of what a read looks like -- an empty mix bar, the three gates without
+   numbers, blank size lines -- with the reason in place of the pick */
+.rp-net.empty { background: rgba(255, 255, 255, 0.022); border-color: var(--line); }
+.rp-net.empty h4 { color: var(--tx-3); }
+.nc-skel-pick { height: 11px; }
+.rp-net.empty .nc-bar { gap: 3px; background: transparent; }
+.rp-net.empty .nc-seg { background: rgba(255, 255, 255, 0.075); border-radius: 99px; }
+.rp-net.empty .nc-legend, .rp-net.empty .nc-legend b { color: var(--tx-3); }
+.rp-net.empty .nc-legend span::before { opacity: 0.3; }
+.nc-skel { display: block; width: var(--w, 70%); height: 7px; border-radius: 99px; background: rgba(255, 255, 255, 0.06); }
+.nc-szl > span .nc-skel + .nc-skel { width: 26px; flex: none; }
+.nc-tag { flex: none; padding: 0 8px; border-radius: 99px; border: 1px solid var(--line); color: var(--tx-3); font-size: 11px; line-height: 18px; }
+.rp-net.loading .nc-seg, .rp-net.loading .nc-skel { animation: nc-wait 1.2s ease-in-out infinite; }
+@keyframes nc-wait { 50% { opacity: 0.4; } }
+/* the result under the buttons: its place is kept from the start (an outline until the hand
+   is over), so it appearing does not move anything either */
+.rp-result { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); align-content: start; gap: 0 18px; flex: 0 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.rp-result:empty { display: none; }
+.rp-result > .rsec { margin-top: 0; }
+.rp-result.pending .settle-row { position: relative; }
+.rp-result.pending .settle-row > * { visibility: hidden; }
+.rp-result.pending .settle-row::before, .rp-result.pending .settle-row::after { content: ""; position: absolute; top: 50%; height: 7px; margin-top: -3.5px; border-radius: 99px; background: rgba(255, 255, 255, 0.055); }
+.rp-result.pending .settle-row::before { left: 0; width: 58%; }
+.rp-result.pending .settle-row::after { right: 0; width: 46px; background: rgba(236, 201, 119, 0.1); }
+.rp-result.pending h4::after { content: " · when the hand ends"; text-transform: none; letter-spacing: 0; font-weight: 500; }
 .grade { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px; border-radius: 99px; font-weight: 800; font-size: 12.5px; letter-spacing: 0.5px; border: 1px solid transparent; white-space: nowrap; }
 .grade em { font-style: normal; font-weight: 600; letter-spacing: 0; }
 .grade b { font-family: var(--mono); font-weight: 700; opacity: 0.85; }
@@ -919,7 +968,18 @@ body.in-lobby.has-joinreq #toast-root { top: 64px; }
   .rv-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .rv-pay { grid-template-columns: minmax(0, 1fr); }
   .rp-felt { margin: 22px 30px 30px; aspect-ratio: 1.5 / 1; }
-  .rp-list { max-height: 180px; }
+  /* one column: everything below the buttons flows down from them; the sheet keeps ONE height
+     (its body scrolls), so nothing below can move the buttons -- the result needs no reserved
+     place there and only shows once the hand is over */
+  .rp-result.pending { display: none; }
+  .rp-main, .rp-side { display: contents; }  /* (their parts flow in one column: felt, banner, buttons, card, actions...) */
+  .rp-result { order: 1; }                    /* (...and the result last, so it appearing moves nothing above it) */
+  .rp { flex: none; grid-template-rows: none; }  /* (the sheet's body scrolls; the list is shown whole) */
+  .rp-list, .rp-result { overflow: visible; }
+  .rp-banner { flex-wrap: wrap; min-height: 76px; } /* (two lines' room, a grade chip's too: a wrap does not move the buttons) */
+  .rp-banner > .rp-act { white-space: normal; }
+  .modal.rp-modal { height: 92%; }
+  .modal.rp-modal .m-body { flex: 1 1 auto; }
 }
 @media (max-width: 520px) {
   .pg-box { height: 108px; }

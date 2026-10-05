@@ -651,6 +651,16 @@ against the network so that you can easily find your worst played hands"):
   see the actor's cards (else 400) — and `network_choice` runs the served PLO5 model
   (`hg._grading_model()`; 503 without one). The observation is the grader's, bit for bit
   (`test_a_spot_rebuilt_from_the_record_is_the_node_the_grader_scored`).
+- **The replayer never moves while you step** (2026-10-05; owner: the network's card popping
+  in made the window taller, so the buttons and the action list moved): the card is always
+  there at ONE height (fixed-height rows; where there is no read -- cards never shown, the
+  start, the run-out, a timed-out move -- `netEmpty` draws it as an outline with the reason
+  on its bottom line); the whole action list shows; the result has its place reserved under
+  the buttons (`#rp-result.pending`: an outline until the hand is over). A screen too short for
+  all that: the dialog stops at the screen's height, `fitFelt` shrinks the felt until the left
+  column fits, the result scrolls on its own, and the action list scrolls under the card --
+  `keepInView` keeps ~3 actions in view on each side of the current one. Phones: one column,
+  the result last. `scrollIntoView` is gone (it scrolled the dialog).
 - **The mistakes drill** (2026-10-03; owner: the Trainer puts you back in the spots you got
   wrong, the biggest blunders most likely first but in a semi-random order, a spot you play
   right comes up less, one you miss again more — and a switch for equal priority):

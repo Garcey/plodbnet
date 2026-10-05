@@ -236,7 +236,9 @@ def test_the_replayer_runs_an_all_in_out_street_by_street_with_its_equities(node
     """(owner, 2026-09-29) "I would like all in equities to be shown in the hand
     histories": after the last action the replayer steps through the runout — each
     street's equities under the players' plates, then the result — and the action list
-    has a row per runout street."""
+    has a row per runout street. (2026-10-05: the result's place is kept from the start,
+    "pending" until the hand is over, and the network's card is always there -- drawn empty
+    where it has no read -- so nothing in the dialog changes size while stepping.)"""
     got = _run(tmp_path, r"""
 (async () => {
   const seat = (i, name, delta) => ({ seat: i, name, is_me: i === 0, start_cents: 20000, delta_cents: delta,
@@ -254,8 +256,9 @@ def test_the_replayer_runs_an_all_in_out_street_by_street_with_its_equities(node
   await B.HG.ui.openHand("T1", 9); await flush();
   const m = () => B.W.doc.querySelectorAll("#modal-root .modal").slice(-1)[0];
   const look = () => [m().querySelector("#rp-step").textContent, m().querySelectorAll(".rp-eq").map((e) => e.textContent),
-    m().querySelector("#rp-banner").textContent, m().querySelector("#rp-result").hidden];
+    m().querySelector("#rp-banner").textContent, m().querySelector("#rp-result").classList.contains("pending")];
   const out = { start: look() };
+  out.net = [m().querySelector("#rp-net").hidden, m().querySelector("#rp-net").classList.contains("empty")];
   out.rows = m().querySelectorAll("#rp-list .log-row.k-runout").map((r) => r.textContent);
   m().querySelectorAll("#rp-list .log-row")[2].click();  // just after the call: all in on the flop
   out.allin = look();
@@ -267,7 +270,8 @@ def test_the_replayer_runs_an_all_in_out_street_by_street_with_its_equities(node
   console.log(JSON.stringify(out));
 })();
 """)
-    assert got["start"][0] == "0 / 5" and got["start"][1] == []
+    assert got["start"][0] == "0 / 5" and got["start"][1] == [] and got["start"][3] is True
+    assert got["net"] == [False, True]  # (there from the start, empty before any decision)
     assert got["rows"] == ["All inrun out — the equities", "All inrun out — the result"]
     step, eqs, banner, hidden = got["allin"]
     assert step == "3 / 5" and eqs == ["62%41%", "38%59%"]
